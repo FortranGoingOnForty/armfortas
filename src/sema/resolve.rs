@@ -1037,6 +1037,28 @@ fn load_external_module(
         }
     }
 
+    // Replay use renames recorded by the writer (`@use_rename a = b from m`).
+    // Without this, `use stdlib_kinds, only: block_kind => int64` is lost
+    // when stdlib_bitsets is serialized, and submodule bodies can no
+    // longer resolve `block_kind` for kind selectors — `integer(block_kind)
+    // :: dummy` falls back to default kind=4 and silently truncates a
+    // 64-bit local to 32 bits.
+    for rename in &iface.renames {
+        let src_scope = st
+            .find_module_scope(&rename.source_module)
+            .or_else(|| load_external_module(st, &rename.source_module, search_paths, type_layouts));
+        let Some(src_scope) = src_scope else {
+            continue;
+        };
+        st.enter_scope(scope_id);
+        st.add_use_association(crate::sema::symtab::UseAssociation {
+            local_name: rename.local.clone(),
+            original_name: rename.original.clone(),
+            source_scope: src_scope,
+            is_submodule_access: false,
+        });
+    }
+
     // Populate variables and parameters.
     for var in &iface.variables {
         let kind = if var.is_parameter {
@@ -1199,8 +1221,29 @@ fn load_external_module(
                 "__amod_result_{}",
                 proc.result_name.as_deref().unwrap_or(&proc.name)
             );
+            // Sprint35-SMP Phase 3: prefer the .amod-preserved
+            // explicit-shape bounds when available so split-file
+            // submodule lowering of `res = …` allocates a runtime-shape
+            // result in the function prologue. Falls through to the
+            // legacy AssumedShape template when bounds aren't in .amod
+            // (rank-only, allocatable, or pointer results).
+            let parsed_bounds = proc
+                .result_array_bounds
+                .as_deref()
+                .and_then(amod::parse_array_bounds);
             let result_array_spec: Vec<ArraySpec> = if proc.result_rank == 0 {
                 Vec::new()
+            } else if let Some(specs) = parsed_bounds {
+                if specs.len() == proc.result_rank as usize {
+                    specs
+                } else {
+                    let template = if proc.result_allocatable || proc.result_pointer {
+                        ArraySpec::Deferred
+                    } else {
+                        ArraySpec::AssumedShape { lower: None }
+                    };
+                    vec![template; proc.result_rank as usize]
+                }
             } else {
                 let template = if proc.result_allocatable || proc.result_pointer {
                     ArraySpec::Deferred
@@ -1253,10 +1296,13 @@ fn load_external_module(
     // Register named generic interfaces. The specifics list rides
     // in `arg_names` to match how intra-file INTERFACE blocks are
     // stored by process_decls — `resolve_generic_call` reads it
-    // when dispatching a call through the generic name.
+    // when dispatching a call through the generic name. The access
+    // attribute is preserved from the .amod so that submodules can
+    // dispatch private parent interfaces via host association while
+    // ordinary `USE` consumers filter them out (F2018 §11.2.3).
     for iface_def in &iface.interfaces {
         let attrs = SymbolAttrs {
-            access: Access::Public,
+            access: iface_def.access,
             ..Default::default()
         };
         let define_result = st.define(Symbol {
@@ -1369,9 +1415,18 @@ fn inject_separate_module_procedure_args(
     };
 
     // Find the matching procedure scope inside the parent module.
+    // F2008-style submodules declare the procedure inside an explicit
+    // `interface ... end interface` block at module scope, which adds
+    // an intermediate Interface scope between the module and the
+    // procedure scope. Tolerate one Interface hop.
     let proc_lc = proc_name.to_lowercase();
     let iface_scope = st.all_scopes().iter().find_map(|scope| {
-        if scope.parent != Some(parent_module_scope) {
+        let direct_parent_matches = scope.parent == Some(parent_module_scope);
+        let via_interface = scope.parent.map(|pid| {
+            matches!(st.scope(pid).kind, ScopeKind::Interface)
+                && st.scope(pid).parent == Some(parent_module_scope)
+        }).unwrap_or(false);
+        if !direct_parent_matches && !via_interface {
             return None;
         }
         match &scope.kind {
@@ -1475,11 +1530,20 @@ fn exported_const_int_params(
     }
 
     for assoc in &scope.use_associations {
-        if let Some(sym) = st
+        // First try the source scope's own symbols, then chase through
+        // its USE chain.  stdlib_kinds re-exports `int32` from
+        // iso_fortran_env, so `use stdlib_kinds, only: bits_kind => int32`
+        // can't find `int32` in stdlib_kinds's own symbol table — it
+        // lives one hop further up.  Without the chase, kind selectors
+        // resolve to None and downstream layout falls back to default
+        // kind, which silently shrinks `integer(block_kind) :: blk`
+        // from 8 bytes to 4 inside derived types.
+        let sym = st
             .scope(assoc.source_scope)
             .symbols
             .get(&assoc.original_name)
-        {
+            .or_else(|| st.lookup_in(assoc.source_scope, &assoc.original_name));
+        if let Some(sym) = sym {
             if sym.attrs.parameter
                 && (sym.attrs.access != Access::Private || assoc.is_submodule_access)
             {
@@ -1534,11 +1598,12 @@ fn visible_const_int_params(
         if out.contains_key(&assoc.local_name) {
             continue;
         }
-        if let Some(sym) = st
+        let sym = st
             .scope(assoc.source_scope)
             .symbols
             .get(&assoc.original_name)
-        {
+            .or_else(|| st.lookup_in(assoc.source_scope, &assoc.original_name));
+        if let Some(sym) = sym {
             if sym.attrs.parameter
                 && (sym.attrs.access != Access::Private || assoc.is_submodule_access)
             {
@@ -1634,6 +1699,7 @@ fn collect_derived_type_layouts(
         &const_params,
         &const_derived_field_inits,
     );
+    resolve_proc_pointer_default_targets(st, scope_id, layouts);
     for sub in contains {
         let sub_scope_id = find_unit_scope(st, scope_id, &sub.node).unwrap_or(scope_id);
         collect_derived_type_layouts(
@@ -1961,6 +2027,109 @@ fn register_local_type_layouts(
                 layouts.insert(layout);
             }
         }
+    }
+}
+
+/// Resolve procedure-pointer default-init targets stored as bare
+/// source-level names into their link-time symbols.  A field declared
+/// `procedure(iface), pointer :: fn => default_hasher` lands in the
+/// layout with `FieldDefaultInit::ProcedurePointer("default_hasher")`,
+/// but `default_hasher` may itself be a USE-rename for a procedure
+/// living in a different module — `stdlib_hashmaps` aliases
+/// `fnv_1_hasher` from `stdlib_hashmap_wrappers` exactly this way.
+/// This pass walks every layout the file just registered, looks each
+/// proc-pointer target up in its owning type's host-module scope
+/// (chasing USE chains), and rewrites the stored string to the
+/// `afs_modproc_<origin_mod>_<proc>` mangle the runtime initializer
+/// emits via `global_addr`.  Without it the linker reports an
+/// undefined `_afs_modproc_<host_mod>_<alias>` reference at example
+/// link.
+fn resolve_proc_pointer_default_targets(
+    st: &SymbolTable,
+    scope_id: ScopeId,
+    layouts: &mut super::type_layout::TypeLayoutRegistry,
+) {
+    use super::type_layout::FieldDefaultInit;
+
+    for layout in layouts.layouts.values_mut() {
+        let owner = match layout.owner_module.as_deref() {
+            Some(m) => m,
+            None => continue,
+        };
+        let owner_scope = match st.find_module_scope(owner) {
+            Some(s) => s,
+            None => scope_id,
+        };
+        for field in layout.fields.iter_mut() {
+            let target_name = match &field.default_init {
+                Some(FieldDefaultInit::ProcedurePointer(name)) => name.clone(),
+                _ => continue,
+            };
+            let resolved = resolve_proc_pointer_link_symbol(st, owner_scope, &target_name);
+            field.default_init = Some(FieldDefaultInit::ProcedurePointer(resolved));
+        }
+    }
+}
+
+/// Walk the symbol table from `from_scope` to find the link-time
+/// symbol that the source name refers to.  Module procedures get the
+/// `afs_modproc_<origin_mod>_<proc>` mangle keyed on the procedure's
+/// declaring module; bare external/intrinsic references fall through
+/// unmodified.  USE associations are followed transitively so renames
+/// like `default_hasher => fnv_1_hasher` resolve to the underlying
+/// procedure's origin module.
+fn resolve_proc_pointer_link_symbol(
+    st: &SymbolTable,
+    from_scope: ScopeId,
+    target: &str,
+) -> String {
+    let key = target.to_lowercase();
+    let mut seen = std::collections::HashSet::new();
+    let mut current_scope = from_scope;
+    let mut current_name = key.clone();
+
+    loop {
+        if !seen.insert((current_scope, current_name.clone())) {
+            break;
+        }
+        let scope = st.scope(current_scope);
+
+        if let Some(sym) = scope.symbols.get(&current_name) {
+            return mangle_link_symbol_for(sym, scope, &current_name);
+        }
+
+        let assoc = scope
+            .use_associations
+            .iter()
+            .find(|a| a.local_name == current_name);
+        if let Some(assoc) = assoc {
+            current_scope = assoc.source_scope;
+            current_name = assoc.original_name.to_lowercase();
+            continue;
+        }
+
+        break;
+    }
+
+    target.to_string()
+}
+
+fn mangle_link_symbol_for(
+    sym: &super::symtab::Symbol,
+    scope: &super::symtab::Scope,
+    name_in_scope: &str,
+) -> String {
+    use super::symtab::{ScopeKind, SymbolKind};
+    match sym.kind {
+        SymbolKind::Function | SymbolKind::Subroutine => match &scope.kind {
+            ScopeKind::Module(module_name) | ScopeKind::Submodule(module_name) => format!(
+                "afs_modproc_{}_{}",
+                module_name.to_lowercase(),
+                name_in_scope
+            ),
+            _ => name_in_scope.to_string(),
+        },
+        _ => name_in_scope.to_string(),
     }
 }
 

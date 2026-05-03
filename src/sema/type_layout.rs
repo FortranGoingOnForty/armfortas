@@ -12,6 +12,15 @@ pub enum FieldDefaultInit {
     Integer(i128),
     Logical(bool),
     Derived(Vec<(String, FieldDefaultInit)>),
+    /// Procedure pointer initial association from a derived-type
+    /// component declared as `procedure(iface), pointer :: name =>
+    /// target_proc`.  Stores the target procedure name; lowering
+    /// resolves it to a function reference at construction time and
+    /// stores the address in the field slot (8 bytes).  Without this,
+    /// `instance%name(...)` calls jumped through whatever bytes
+    /// happened to land in the slot — the immediate motivator was
+    /// stdlib_hashmaps's `hasher => default_hasher` field.
+    ProcedurePointer(String),
 }
 
 pub fn derived_param_field_lookup_key(base: &str, field: &str) -> String {
@@ -131,6 +140,10 @@ impl TypeLayoutRegistry {
 
     pub fn get(&self, type_name: &str) -> Option<&TypeLayout> {
         self.layouts.get(&type_name.to_lowercase())
+    }
+
+    pub fn iter_layouts(&self) -> impl Iterator<Item = &TypeLayout> {
+        self.layouts.values()
     }
 
     pub fn insert(&mut self, mut layout: TypeLayout) {
@@ -712,7 +725,37 @@ pub fn compute_layout_with_attrs(
                         .product::<usize>()
                 };
                 let field_size = elem_size.saturating_mul(elem_count.max(1));
-                let default_init = if dims.is_empty() && !is_allocatable && !is_pointer {
+                // Procedure pointer components are parsed as
+                // TypeSpec::Type(<iface>) with `pointer` and `external`
+                // attrs, with the initial `=> target_proc` association
+                // landing in `ptr_init`.  These are 8-byte slots, not
+                // descriptors, and the initialization writes the
+                // function address — not a const integer or character.
+                let is_proc_pointer_component = is_pointer
+                    && attrs
+                        .iter()
+                        .any(|a| matches!(a, crate::ast::decl::Attribute::External))
+                    && elem_size == 8;
+                let default_init = if is_proc_pointer_component {
+                    if let Some(init_expr) = entity.ptr_init.as_ref() {
+                        if let crate::ast::expr::Expr::Name { name } = &init_expr.node {
+                            // Store the bare source-level target name.
+                            // A post-pass in `sema::resolve` (after
+                            // USE-rename associations are installed)
+                            // rewrites this to the link-time symbol
+                            // following the procedure's actual origin
+                            // module — required because a name like
+                            // `default_hasher` may be a `use ..., only:`
+                            // alias for `fnv_1_hasher` defined in a
+                            // sibling module.
+                            Some(FieldDefaultInit::ProcedurePointer(name.clone()))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else if dims.is_empty() && !is_allocatable && !is_pointer {
                     entity.init.as_ref().and_then(|init| {
                         eval_const_field_default_init_for_layout(
                             &ti,
@@ -750,11 +793,20 @@ pub fn compute_layout_with_attrs(
     }
 
     fn lowered_bound_proc_target(host_module: Option<&str>, target: &str) -> String {
+        // Body emission via `module_procedure_symbol_name` lowercases
+        // only the module name and preserves the procedure's source
+        // case (see `module_procedure_case_and_bind_label_survive_amod_
+        // import`). The TBP target stored in the type layout drives
+        // the call-site `bl <target>` and must match exactly. Without
+        // matching, `procedure :: pid => process_get_ID` defines
+        // `_afs_modproc_<mod>_process_get_ID` while every TBP dispatch
+        // looked up `_afs_modproc_<mod>_process_get_id` — caught at
+        // stdlib `example_process_5` link.
         if let Some(module_name) = host_module {
             format!(
                 "afs_modproc_{}_{}",
                 module_name.to_lowercase(),
-                target.to_lowercase()
+                target
             )
         } else {
             target.to_string()

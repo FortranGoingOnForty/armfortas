@@ -23,6 +23,87 @@ use crate::ir::lower::ModuleGlobalInfo;
 use crate::sema::symtab::*;
 use crate::sema::type_layout::TypeLayoutRegistry;
 
+/// Stringify a Vec<ArraySpec> as `(dim1; dim2; ...)` where each dim
+/// is `lower:upper` or just `upper`. Returns None if any dim is not
+/// `Explicit` (assumed-shape, deferred, etc. round-trip via the
+/// existing rank-based reconstruction in `load_external_module`).
+///
+/// Used to preserve runtime-shape result bounds across split-file
+/// submodule compilation. Examples:
+///   `(n)`             → `Explicit { lower: None, upper: Name(n) }`
+///   `(max(n, 0))`     → `Explicit { lower: None, upper: max(n,0) }`
+///   `(1:n, 1:m)`      → two-dim Explicit with both bounds
+fn stringify_array_bounds(specs: &[crate::ast::decl::ArraySpec]) -> Option<String> {
+    use crate::ast::decl::ArraySpec;
+    let mut parts: Vec<String> = Vec::with_capacity(specs.len());
+    for spec in specs {
+        match spec {
+            ArraySpec::Explicit { lower, upper } => {
+                let upper_s = upper.to_sexpr();
+                if let Some(lo) = lower {
+                    parts.push(format!("{}:{}", lo.to_sexpr(), upper_s));
+                } else {
+                    parts.push(upper_s);
+                }
+            }
+            _ => return None,
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(format!("({})", parts.join("; ")))
+}
+
+/// Parse a `(dim1; dim2; ...)`-encoded array bounds string back into
+/// a Vec<ArraySpec> by re-lexing and re-parsing each bound expression
+/// via the regular Fortran parser. Returns None if the string is
+/// malformed or any bound expr fails to parse — in that case the
+/// loader falls back to its rank-based AssumedShape reconstruction.
+pub(crate) fn parse_array_bounds(s: &str) -> Option<Vec<crate::ast::decl::ArraySpec>> {
+    use crate::ast::decl::ArraySpec;
+    let inner = s.strip_prefix('(').and_then(|s| s.strip_suffix(')'))?;
+    let mut specs = Vec::new();
+    for dim in inner.split(';') {
+        let dim = dim.trim();
+        if dim.is_empty() {
+            return None;
+        }
+        // Find the first `:` at depth 0 (parens/brackets) to split
+        // lower:upper. Don't split on `:` inside function calls.
+        let mut depth: i32 = 0;
+        let mut split_at: Option<usize> = None;
+        for (idx, ch) in dim.char_indices() {
+            match ch {
+                '(' | '[' => depth += 1,
+                ')' | ']' => depth -= 1,
+                ':' if depth == 0 => {
+                    split_at = Some(idx);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let (lower_str, upper_str) = match split_at {
+            Some(i) => (Some(&dim[..i]), &dim[i + 1..]),
+            None => (None, dim),
+        };
+        let upper = parse_simple_expr(upper_str.trim())?;
+        let lower = match lower_str {
+            Some(s) => Some(parse_simple_expr(s.trim())?),
+            None => None,
+        };
+        specs.push(ArraySpec::Explicit { lower, upper });
+    }
+    Some(specs)
+}
+
+fn parse_simple_expr(src: &str) -> Option<crate::ast::expr::SpannedExpr> {
+    let tokens = crate::lexer::Lexer::tokenize(src, 0).ok()?;
+    let mut parser = crate::parser::Parser::new(&tokens);
+    parser.parse_expr().ok()
+}
+
 fn hex_encode_bytes(bytes: &[u8]) -> String {
     let mut hex = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -59,6 +140,9 @@ fn encode_nested_field_default_init(init: &crate::sema::type_layout::FieldDefaul
                 .collect::<Vec<_>>()
                 .join(",");
             format!("D({rendered})")
+        }
+        FieldDefaultInit::ProcedurePointer(target) => {
+            format!("P{}", hex_encode_bytes(target.as_bytes()))
         }
     }
 }
@@ -117,6 +201,10 @@ fn decode_nested_field_default_init(
         }
         return Some(FieldDefaultInit::Derived(fields));
     }
+    if let Some(value) = encoded.strip_prefix('P') {
+        let decoded = String::from_utf8(hex_decode_bytes(value)?).ok()?;
+        return Some(FieldDefaultInit::ProcedurePointer(decoded));
+    }
     None
 }
 
@@ -170,6 +258,41 @@ pub fn write_amod(
         writeln!(out, "@uses {}", dep).unwrap();
     }
     if !deps.is_empty() {
+        writeln!(out).unwrap();
+    }
+
+    // ---- Use renames ----
+    // Record each `use M, only: a => b` as `@use_rename a = b from m`.
+    // Submodule bodies pulled in by host association need to resolve
+    // names like `block_kind` (renamed from `int64`) for kind selectors
+    // and intrinsic dispatch; without preserving the rename, the .amod
+    // can't reconstruct the kind constant and `integer(block_kind) ::
+    // dummy` falls back to the default kind.
+    let mut renames_out: Vec<(String, String, String)> = scope
+        .use_associations
+        .iter()
+        .filter_map(|ua| {
+            if ua.local_name == ua.original_name {
+                return None;
+            }
+            let src_scope = st.scope(ua.source_scope);
+            if let ScopeKind::Module(ref n) = src_scope.kind {
+                Some((
+                    ua.local_name.clone(),
+                    ua.original_name.clone(),
+                    n.to_lowercase(),
+                ))
+            } else {
+                None
+            }
+        })
+        .collect();
+    renames_out.sort();
+    renames_out.dedup();
+    for (local, original, src) in &renames_out {
+        writeln!(out, "@use_rename {} = {} from {}", local, original, src).unwrap();
+    }
+    if !renames_out.is_empty() {
         writeln!(out).unwrap();
     }
 
@@ -338,7 +461,17 @@ pub fn write_amod(
     }
 
     // ---- Interfaces ----
-    let ifaces: Vec<_> = syms
+    // Per F2018 §11.2.3, submodules see their parent module's PRIVATE
+    // generic interfaces. Emit every NamedInterface (and constructor
+    // interfaces represented as DerivedType with non-empty arg_names),
+    // tagging private ones with a `private` marker. Importing scopes
+    // that use the module without submodule access filter the private
+    // entries out via `Symbol::attrs.access == Private` (see
+    // SymbolTable::lookup_in_guarded). Without this, a submodule that
+    // dispatches a private parent generic emits a bare `bl _<name>`,
+    // since the loader-installed scope had no NamedInterface with that
+    // name to resolve against.
+    let ifaces: Vec<_> = all_syms
         .iter()
         .filter(|(_, sym)| {
             matches!(sym.kind, SymbolKind::NamedInterface)
@@ -346,7 +479,7 @@ pub fn write_amod(
         })
         .collect();
     for (name, sym) in &ifaces {
-        emit_interface(&mut out, name, sym);
+        emit_interface(&mut out, name, sym, scope);
     }
 
     out
@@ -539,6 +672,56 @@ fn emit_procedure(
         if let Some(result_var_name) = result_var_name {
             if !result_var_name.eq_ignore_ascii_case(name) {
                 write!(out, ", result_name={}", result_var_name).unwrap();
+            }
+        }
+        // Sprint35-SMP Phase 3: serialize the result variable's
+        // explicit-shape bounds so split-file submodule bodies (where
+        // the body's TU loads the parent module from .amod) can rebuild
+        // a same-shape ArraySpec at load time. Without this, the body's
+        // `res(i) = …` lowers against an AssumedShape result and the
+        // function prologue fails to allocate the runtime-shape buffer.
+        if !sym.attrs.allocatable && !sym.attrs.pointer && sym.attrs.result_rank > 0 {
+            let bounds = st
+                .scopes
+                .iter()
+                .find(|s| {
+                    let matches_name = match &s.kind {
+                        ScopeKind::Function(n) | ScopeKind::Subroutine(n) => {
+                            n.eq_ignore_ascii_case(name)
+                        }
+                        _ => false,
+                    };
+                    if !matches_name {
+                        return false;
+                    }
+                    let Some(parent_id) = s.parent else {
+                        return false;
+                    };
+                    parent_id == mod_scope_id
+                        || matches!(st.scope(parent_id).kind, ScopeKind::Interface)
+                            && st.scope(parent_id).parent == Some(mod_scope_id)
+                })
+                .and_then(|pscope| {
+                    let arg_set: std::collections::HashSet<String> = pscope
+                        .arg_order
+                        .iter()
+                        .map(|n| n.to_lowercase())
+                        .collect();
+                    pscope
+                        .symbols
+                        .iter()
+                        .find(|(key, sym)| {
+                            !arg_set.contains(*key)
+                                && matches!(
+                                    sym.kind,
+                                    SymbolKind::Variable | SymbolKind::Parameter
+                                )
+                        })
+                        .map(|(_, sym)| sym.attrs.array_spec.clone())
+                })
+                .and_then(|specs| stringify_array_bounds(&specs));
+            if let Some(s) = bounds {
+                write!(out, ", result_array_bounds=\"{}\"", s).unwrap();
             }
         }
     } else {
@@ -897,6 +1080,9 @@ fn emit_type(out: &mut String, name: &str, type_layouts: &TypeLayoutRegistry) {
                     let encoded = encode_nested_field_default_init(init);
                     format!(" @init=exprhex:{}", hex_encode_bytes(encoded.as_bytes()))
                 }
+                crate::sema::type_layout::FieldDefaultInit::ProcedurePointer(target) => {
+                    format!(" @init=procptr:{}", target)
+                }
             }
         }
         for fp in &layout.final_procs {
@@ -944,8 +1130,14 @@ fn collect_exported_type_closure(
     }
 }
 
-fn emit_interface(out: &mut String, name: &str, sym: &Symbol) {
-    writeln!(out, "@interface {}", name).unwrap();
+fn emit_interface(out: &mut String, name: &str, sym: &Symbol, scope: &Scope) {
+    let effective_private = match sym.attrs.access {
+        Access::Private => true,
+        Access::Public => false,
+        Access::Default => matches!(scope.default_access, Access::Private),
+    };
+    let suf = if effective_private { ", private" } else { "" };
+    writeln!(out, "@interface {}{}", name, suf).unwrap();
     let mut specifics = sym.arg_names.clone(); // arg_names repurposed for specific list
     specifics.sort();
     for s in &specifics {
@@ -1061,6 +1253,13 @@ pub struct AmodProc {
     /// references the result by its declared name rather than by the
     /// function name.
     pub result_name: Option<String>,
+    /// Stringified explicit-shape bounds for the result variable.
+    /// `(b1; b2; ...)` per dim, where each is `lower:upper` or just
+    /// `upper`. Preserves runtime-shape result sizing across split-file
+    /// submodule compilation: SMP body lowering needs `Explicit { upper:
+    /// Name(dummy) }` to allocate the result in the prologue. None for
+    /// scalar / allocatable / pointer / non-runtime-shape results.
+    pub result_array_bounds: Option<String>,
     pub pure: bool,
     pub elemental: bool,
     pub access: Access,
@@ -1099,6 +1298,19 @@ pub struct AmodVar {
 pub struct AmodInterface {
     pub name: String,
     pub specifics: Vec<String>,
+    pub access: Access,
+}
+
+/// One renamed USE association from this module's source: `use M, only: A => B`
+/// becomes `UseRename { local: "a", original: "b", source_module: "m" }`. The
+/// rename is recorded so downstream consumers (esp. submodules) can resolve
+/// the local name at .amod-load time. Without this the kind constant
+/// `block_kind => int64` is irrecoverable from a binary-only build.
+#[derive(Debug, Clone)]
+pub struct UseRename {
+    pub local: String,
+    pub original: String,
+    pub source_module: String,
 }
 
 /// Complete module interface parsed from an .amod file.
@@ -1106,6 +1318,7 @@ pub struct AmodInterface {
 pub struct ModuleInterface {
     pub module_name: String,
     pub dependencies: Vec<String>,
+    pub renames: Vec<UseRename>,
     pub variables: Vec<AmodVar>,
     pub procedures: Vec<AmodProc>,
     pub types: Vec<crate::sema::type_layout::TypeLayout>,
@@ -1165,6 +1378,7 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
     }
 
     let mut dependencies = Vec::new();
+    let mut renames: Vec<UseRename> = Vec::new();
     let mut variables = Vec::new();
     let mut procedures = Vec::new();
     let mut types = Vec::new();
@@ -1178,6 +1392,17 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
 
         if let Some(dep) = trimmed.strip_prefix("@uses ") {
             dependencies.push(dep.trim().to_string());
+        } else if let Some(rest) = trimmed.strip_prefix("@use_rename ") {
+            // `@use_rename <local> = <original> from <module>`
+            if let Some((lhs, mod_part)) = rest.split_once(" from ") {
+                if let Some((local, original)) = lhs.split_once(" = ") {
+                    renames.push(UseRename {
+                        local: local.trim().to_string(),
+                        original: original.trim().to_string(),
+                        source_module: mod_part.trim().to_string(),
+                    });
+                }
+            }
         } else if trimmed.starts_with("@var ") {
             variables.push(parse_var(trimmed, false));
         } else if trimmed.starts_with("@param ") {
@@ -1189,9 +1414,15 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
             let layout = parse_type(trimmed, &mut lines);
             types.push(layout);
         } else if let Some(name) = trimmed.strip_prefix("@interface ") {
-            // Generic interface block: header is `@interface <name>`,
+            // Generic interface block: header is `@interface <name>[, private]`,
             // body lists `@specific <proc>` until `@end interface`.
-            let iface_name = name.trim().to_string();
+            let header = name.trim();
+            let (iface_name, access) = match header.split_once(", ") {
+                Some((n, attr)) if attr.split(", ").any(|a| a == "private") => {
+                    (n.trim().to_string(), Access::Private)
+                }
+                _ => (header.to_string(), Access::Public),
+            };
             let mut specifics = Vec::new();
             for iline in lines.by_ref() {
                 let t = iline.trim();
@@ -1205,6 +1436,7 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
             interfaces.push(AmodInterface {
                 name: iface_name,
                 specifics,
+                access,
             });
         }
         // Skip unrecognized directives (forward compatibility).
@@ -1213,6 +1445,7 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
     Ok(ModuleInterface {
         module_name,
         dependencies,
+        renames,
         variables,
         procedures,
         types,
@@ -1320,6 +1553,45 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
     }
 }
 
+/// Split a comma-separated attribute list while honoring paren depth and
+/// double-quoted strings. The naive `split(", ")` mangled values like
+/// `result_array_bounds="(max(n, 0))"` because the inner `, ` between
+/// `n` and `0` matched the separator and split the value across two
+/// chunks — losing the bounds and forcing the resolver to fall back to
+/// AssumedShape, which broke runtime-shape result allocation for
+/// abbreviated SMP bodies pulling specs out of .amod.
+fn split_attrs_top_level(attrs: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth: i32 = 0;
+    let mut in_quote = false;
+    let mut start = 0usize;
+    let bytes = attrs.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let ch = bytes[i] as char;
+        match ch {
+            '"' if !in_quote => in_quote = true,
+            '"' if in_quote => in_quote = false,
+            '(' | '[' if !in_quote => depth += 1,
+            ')' | ']' if !in_quote => depth -= 1,
+            ',' if !in_quote && depth == 0 => {
+                let chunk = attrs[start..i].trim();
+                if !chunk.is_empty() {
+                    out.push(chunk.to_string());
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let tail = attrs[start..].trim();
+    if !tail.is_empty() {
+        out.push(tail.to_string());
+    }
+    out
+}
+
 fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) -> AmodProc {
     let is_func = header.starts_with("@function ");
     let rest = if is_func {
@@ -1330,8 +1602,36 @@ fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
 
     // Parse: name [-> return_type][, pure][, elemental]
     let (name_and_ret, attrs_str) = {
-        let parts: Vec<&str> = rest.splitn(2, ", ").collect();
-        (parts[0], parts.get(1).copied().unwrap_or(""))
+        // Use depth-aware split so attribute values containing commas
+        // inside parens (e.g. `result_array_bounds="(max(n, 0))"`)
+        // don't split prematurely on the inner `, `.
+        let mut depth: i32 = 0;
+        let mut in_quote = false;
+        let mut split_at: Option<usize> = None;
+        let bytes = rest.as_bytes();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let ch = bytes[i] as char;
+            match ch {
+                '"' if !in_quote => in_quote = true,
+                '"' if in_quote => in_quote = false,
+                '(' | '[' if !in_quote => depth += 1,
+                ')' | ']' if !in_quote => depth -= 1,
+                ',' if !in_quote && depth == 0 => {
+                    split_at = Some(i);
+                    break;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        match split_at {
+            Some(idx) => (
+                rest[..idx].trim_end(),
+                rest[idx + 1..].trim_start(),
+            ),
+            None => (rest.trim(), ""),
+        }
     };
 
     let (name, return_type) = if let Some(arrow_idx) = name_and_ret.find(" -> ") {
@@ -1342,29 +1642,30 @@ fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
         (name_and_ret.trim().to_string(), None)
     };
 
-    let pure = attrs_str.contains("pure");
-    let elemental = attrs_str.contains("elemental");
-    let result_allocatable = attrs_str.contains("result_allocatable");
-    let result_pointer = attrs_str.contains("result_pointer");
-    let result_rank = attrs_str
-        .split(", ")
+    let attr_chunks = split_attrs_top_level(attrs_str);
+    let pure = attr_chunks.iter().any(|a| a == "pure");
+    let elemental = attr_chunks.iter().any(|a| a == "elemental");
+    let result_allocatable = attr_chunks.iter().any(|a| a == "result_allocatable");
+    let result_pointer = attr_chunks.iter().any(|a| a == "result_pointer");
+    let result_rank = attr_chunks
+        .iter()
         .find_map(|attr| attr.strip_prefix("result_rank="))
         .and_then(|s| s.parse::<u8>().ok())
         .unwrap_or(0);
     // Sprint35-SMP Phase 2: optional `result_name=NAME` when the
     // source used a `result(NAME)` clause that differs from the
     // function name. Otherwise the result variable shares the name.
-    let result_name = attrs_str
-        .split(", ")
+    let result_name = attr_chunks
+        .iter()
         .find_map(|attr| attr.strip_prefix("result_name="))
         .map(|s| s.trim().to_string());
-    let access = if attrs_str.split(", ").any(|attr| attr == "private") {
+    let access = if attr_chunks.iter().any(|attr| attr == "private") {
         Access::Private
     } else {
         Access::Public
     };
-    let binding_label = attrs_str
-        .split(", ")
+    let binding_label = attr_chunks
+        .iter()
         .find_map(|attr| attr.strip_prefix("bind=").map(|label| label.to_string()));
 
     let kind = if is_func {
@@ -1388,6 +1689,11 @@ fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
         // them for optimization but not for correctness).
     }
 
+    let result_array_bounds = attr_chunks
+        .iter()
+        .find_map(|attr| attr.strip_prefix("result_array_bounds="))
+        .map(|s| s.trim_matches('"').to_string());
+
     AmodProc {
         name,
         kind,
@@ -1396,6 +1702,7 @@ fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
         result_pointer,
         result_rank,
         result_name,
+        result_array_bounds,
         pure,
         elemental,
         access,
@@ -1496,6 +1803,9 @@ fn parse_type(
         if let Some(value) = payload.strip_prefix("exprhex:") {
             let decoded = String::from_utf8(hex_decode_bytes(value)?).ok()?;
             return decode_nested_field_default_init(&decoded);
+        }
+        if let Some(value) = payload.strip_prefix("procptr:") {
+            return Some(FieldDefaultInit::ProcedurePointer(value.to_string()));
         }
         None
     }

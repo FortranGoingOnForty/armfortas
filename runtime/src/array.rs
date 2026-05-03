@@ -1336,6 +1336,115 @@ pub extern "C" fn afs_assign_allocatable(
     dest.set_scalar_tbp_lookup_ptr(source.scalar_tbp_lookup_ptr());
 }
 
+/// Element-converting allocatable assignment.
+///
+/// F2018 §10.2.1.3: when the LHS and RHS of an array assignment have
+/// different numeric element types, each element is converted to the
+/// LHS type. This entry point performs that conversion when the source
+/// descriptor's element kind differs from the destination's.
+///
+/// kind_tag: 0=i8, 1=i16, 2=i32, 3=i64, 4=f32, 5=f64
+#[no_mangle]
+pub extern "C" fn afs_assign_allocatable_convert(
+    dest: *mut ArrayDescriptor,
+    source: *const ArrayDescriptor,
+    dest_kind_tag: i32,
+    src_kind_tag: i32,
+) {
+    if dest.is_null() || source.is_null() {
+        return;
+    }
+    let dest_ref = unsafe { &mut *dest };
+    let source_ref = unsafe { &*source };
+
+    if !descriptor_looks_sane(dest_ref) {
+        *dest_ref = ArrayDescriptor::zeroed();
+    }
+
+    if !source_ref.is_allocated() && source_ref.base_addr.is_null() {
+        if dest_ref.is_allocated() && !dest_ref.base_addr.is_null() {
+            unsafe {
+                libc_free(dest_ref.base_addr);
+            }
+        }
+        *dest_ref = ArrayDescriptor::zeroed();
+        return;
+    }
+
+    let dest_elem_size: i64 = match dest_kind_tag {
+        0 => 1,
+        1 => 2,
+        2 | 4 => 4,
+        3 | 5 => 8,
+        _ => return,
+    };
+
+    let shapes_match = dest_ref.rank == source_ref.rank
+        && dest_ref.elem_size == dest_elem_size
+        && (0..dest_ref.rank as usize)
+            .all(|i| dest_ref.dims[i].extent() == source_ref.dims[i].extent());
+
+    if !shapes_match || !dest_ref.is_allocated() {
+        if dest_ref.is_allocated() && !dest_ref.base_addr.is_null() {
+            unsafe {
+                libc_free(dest_ref.base_addr);
+            }
+            dest_ref.base_addr = ptr::null_mut();
+            dest_ref.flags &= !DESC_ALLOCATED;
+        }
+        dest_ref.rank = source_ref.rank;
+        dest_ref.elem_size = dest_elem_size;
+        for i in 0..source_ref.rank as usize {
+            dest_ref.dims[i] = source_ref.dims[i];
+            dest_ref.dims[i].stride = 1;
+        }
+        let bytes = dest_ref.total_bytes();
+        if bytes > 0 {
+            let ptr = unsafe { libc_malloc(bytes as usize) };
+            if ptr.is_null() {
+                eprintln!("ALLOCATE (assignment): out of memory ({} bytes)", bytes);
+                std::process::exit(1);
+            }
+            dest_ref.base_addr = ptr;
+        }
+        dest_ref.flags = DESC_ALLOCATED | DESC_CONTIGUOUS;
+    }
+
+    let n: usize = (0..source_ref.rank as usize)
+        .map(|i| source_ref.dims[i].extent() as usize)
+        .product();
+    if n == 0 || source_ref.base_addr.is_null() || dest_ref.base_addr.is_null() {
+        return;
+    }
+
+    let src_p = source_ref.base_addr;
+    let dst_p = dest_ref.base_addr;
+    for i in 0..n {
+        let src_val_f64: f64 = unsafe {
+            match src_kind_tag {
+                0 => *(src_p.add(i) as *const i8) as f64,
+                1 => *(src_p.add(2 * i) as *const i16) as f64,
+                2 => *(src_p.add(4 * i) as *const i32) as f64,
+                3 => *(src_p.add(8 * i) as *const i64) as f64,
+                4 => *(src_p.add(4 * i) as *const f32) as f64,
+                5 => *(src_p.add(8 * i) as *const f64),
+                _ => return,
+            }
+        };
+        unsafe {
+            match dest_kind_tag {
+                0 => *(dst_p.add(i) as *mut i8) = src_val_f64 as i8,
+                1 => *(dst_p.add(2 * i) as *mut i16) = src_val_f64 as i16,
+                2 => *(dst_p.add(4 * i) as *mut i32) = src_val_f64 as i32,
+                3 => *(dst_p.add(8 * i) as *mut i64) = src_val_f64 as i64,
+                4 => *(dst_p.add(4 * i) as *mut f32) = src_val_f64 as f32,
+                5 => *(dst_p.add(8 * i) as *mut f64) = src_val_f64,
+                _ => return,
+            }
+        }
+    }
+}
+
 // ---- MOVE_ALLOC ----
 
 /// Transfer allocation from `from` to `to` (F2003 MOVE_ALLOC).
@@ -2083,7 +2192,9 @@ pub extern "C" fn afs_array_norm2_real4(desc: *const ArrayDescriptor) -> f32 {
     acc.sqrt() as f32
 }
 
-/// SUM(array) — sum all elements (real(8) version).
+/// SUM(array) — sum all elements (real version).
+/// Dispatches on `elem_size` so real(4) and real(8) arrays both sum
+/// correctly. Returns f64 (callers downcast for real(4) destinations).
 /// Respects strides for non-contiguous sections.
 #[no_mangle]
 pub extern "C" fn afs_array_sum_real8(desc: *const ArrayDescriptor) -> f64 {
@@ -2096,10 +2207,17 @@ pub extern "C" fn afs_array_sum_real8(desc: *const ArrayDescriptor) -> f64 {
     }
     let n = d.total_elements() as usize;
     let stride = d.dims[0].stride.max(1) as usize;
-    let ptr = d.base_addr as *const f64;
-    let mut sum = 0.0;
-    for i in 0..n {
-        sum += unsafe { *ptr.add(i * stride) };
+    let mut sum: f64 = 0.0;
+    if d.elem_size == 4 {
+        let ptr = d.base_addr as *const f32;
+        for i in 0..n {
+            sum += unsafe { *ptr.add(i * stride) } as f64;
+        }
+    } else {
+        let ptr = d.base_addr as *const f64;
+        for i in 0..n {
+            sum += unsafe { *ptr.add(i * stride) };
+        }
     }
     sum
 }
@@ -2148,7 +2266,100 @@ pub extern "C" fn afs_array_sum_int(desc: *const ArrayDescriptor) -> i64 {
     sum
 }
 
-/// PRODUCT(array) — product of all elements (real(8) version).
+/// Read one logical element from `mask` at logical index `i` (zero-based)
+/// honoring `mask.elem_size` (kind 1, 4, or any bit-width). Fortran maps
+/// `.true.` to a non-zero stored value; we treat any non-zero byte as true.
+unsafe fn mask_at(mask: &ArrayDescriptor, i: usize, stride: usize) -> bool {
+    let off = i * stride * mask.elem_size.max(1) as usize;
+    let p = mask.base_addr.add(off);
+    let es = mask.elem_size as usize;
+    match es {
+        1 => *p != 0,
+        2 => *(p as *const u16) != 0,
+        4 => *(p as *const u32) != 0,
+        8 => *(p as *const u64) != 0,
+        _ => *p != 0,
+    }
+}
+
+/// SUM(array, mask=mask) — sum elements where `mask(i)` is true (real).
+/// Width-dispatched on the array's elem_size; mask is read with its own
+/// kind from `mask.elem_size`.
+#[no_mangle]
+pub extern "C" fn afs_array_sum_real8_mask(
+    desc: *const ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+) -> f64 {
+    if desc.is_null() || mask.is_null() {
+        return 0.0;
+    }
+    let d = unsafe { &*desc };
+    let m = unsafe { &*mask };
+    if d.base_addr.is_null() || m.base_addr.is_null() {
+        return 0.0;
+    }
+    let n = d.total_elements() as usize;
+    let stride_d = d.dims[0].stride.max(1) as usize;
+    let stride_m = m.dims[0].stride.max(1) as usize;
+    let mut sum: f64 = 0.0;
+    if d.elem_size == 4 {
+        let ptr = d.base_addr as *const f32;
+        for i in 0..n {
+            if unsafe { mask_at(m, i, stride_m) } {
+                sum += unsafe { *ptr.add(i * stride_d) } as f64;
+            }
+        }
+    } else {
+        let ptr = d.base_addr as *const f64;
+        for i in 0..n {
+            if unsafe { mask_at(m, i, stride_m) } {
+                sum += unsafe { *ptr.add(i * stride_d) };
+            }
+        }
+    }
+    sum
+}
+
+/// SUM(array, mask=mask) — integer arrays. Dispatches on elem_size like
+/// the unmasked entry; returns i64 for any input kind.
+#[no_mangle]
+pub extern "C" fn afs_array_sum_int_mask(
+    desc: *const ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+) -> i64 {
+    if desc.is_null() || mask.is_null() {
+        return 0;
+    }
+    let d = unsafe { &*desc };
+    let mk = unsafe { &*mask };
+    if d.base_addr.is_null() || mk.base_addr.is_null() {
+        return 0;
+    }
+    let n = d.total_elements() as usize;
+    let stride_d = d.dims[0].stride.max(1) as usize;
+    let stride_m = mk.dims[0].stride.max(1) as usize;
+    let mut sum: i64 = 0;
+    macro_rules! sum_kind {
+        ($t:ty) => {{
+            let ptr = d.base_addr as *const $t;
+            for i in 0..n {
+                if unsafe { mask_at(mk, i, stride_m) } {
+                    sum = sum.wrapping_add(unsafe { *ptr.add(i * stride_d) } as i64);
+                }
+            }
+        }};
+    }
+    match d.elem_size {
+        1 => sum_kind!(i8),
+        2 => sum_kind!(i16),
+        8 => sum_kind!(i64),
+        _ => sum_kind!(i32),
+    }
+    sum
+}
+
+/// PRODUCT(array) — product of all elements (real version).
+/// Dispatches on `elem_size`; returns f64 for both real(4) and real(8).
 #[no_mangle]
 pub extern "C" fn afs_array_product_real8(desc: *const ArrayDescriptor) -> f64 {
     if desc.is_null() {
@@ -2160,10 +2371,17 @@ pub extern "C" fn afs_array_product_real8(desc: *const ArrayDescriptor) -> f64 {
     }
     let n = d.total_elements() as usize;
     let stride = d.dims[0].stride.max(1) as usize;
-    let ptr = d.base_addr as *const f64;
-    let mut prod = 1.0;
-    for i in 0..n {
-        prod *= unsafe { *ptr.add(i * stride) };
+    let mut prod: f64 = 1.0;
+    if d.elem_size == 4 {
+        let ptr = d.base_addr as *const f32;
+        for i in 0..n {
+            prod *= unsafe { *ptr.add(i * stride) } as f64;
+        }
+    } else {
+        let ptr = d.base_addr as *const f64;
+        for i in 0..n {
+            prod *= unsafe { *ptr.add(i * stride) };
+        }
     }
     prod
 }
@@ -2214,7 +2432,261 @@ pub extern "C" fn afs_array_product_int(desc: *const ArrayDescriptor) -> i64 {
     prod
 }
 
-/// MAXVAL(array) — maximum element (real(8) version). Respects strides.
+/// PRODUCT(array, mask=mask) — masked product (real). Dispatches on
+/// elem_size and reads mask via `mask_at` for any logical kind.
+#[no_mangle]
+pub extern "C" fn afs_array_product_real8_mask(
+    desc: *const ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+) -> f64 {
+    if desc.is_null() || mask.is_null() {
+        return 1.0;
+    }
+    let d = unsafe { &*desc };
+    let m = unsafe { &*mask };
+    if d.base_addr.is_null() || m.base_addr.is_null() {
+        return 1.0;
+    }
+    let n = d.total_elements() as usize;
+    let stride_d = d.dims[0].stride.max(1) as usize;
+    let stride_m = m.dims[0].stride.max(1) as usize;
+    let mut prod: f64 = 1.0;
+    if d.elem_size == 4 {
+        let ptr = d.base_addr as *const f32;
+        for i in 0..n {
+            if unsafe { mask_at(m, i, stride_m) } {
+                prod *= unsafe { *ptr.add(i * stride_d) } as f64;
+            }
+        }
+    } else {
+        let ptr = d.base_addr as *const f64;
+        for i in 0..n {
+            if unsafe { mask_at(m, i, stride_m) } {
+                prod *= unsafe { *ptr.add(i * stride_d) };
+            }
+        }
+    }
+    prod
+}
+
+/// PRODUCT(array, mask=mask) — masked product (integer). Dispatches on
+/// elem_size; returns i64 regardless of input kind.
+#[no_mangle]
+pub extern "C" fn afs_array_product_int_mask(
+    desc: *const ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+) -> i64 {
+    if desc.is_null() || mask.is_null() {
+        return 1;
+    }
+    let d = unsafe { &*desc };
+    let mk = unsafe { &*mask };
+    if d.base_addr.is_null() || mk.base_addr.is_null() {
+        return 1;
+    }
+    let n = d.total_elements() as usize;
+    let stride_d = d.dims[0].stride.max(1) as usize;
+    let stride_m = mk.dims[0].stride.max(1) as usize;
+    let mut prod: i64 = 1;
+    macro_rules! prod_kind {
+        ($t:ty) => {{
+            let ptr = d.base_addr as *const $t;
+            for i in 0..n {
+                if unsafe { mask_at(mk, i, stride_m) } {
+                    prod = prod.wrapping_mul(unsafe { *ptr.add(i * stride_d) } as i64);
+                }
+            }
+        }};
+    }
+    match d.elem_size {
+        1 => prod_kind!(i8),
+        2 => prod_kind!(i16),
+        8 => prod_kind!(i64),
+        _ => prod_kind!(i32),
+    }
+    prod
+}
+
+/// MAXVAL(array, mask=mask) — masked max (real). Returns -inf when no
+/// element is selected.
+#[no_mangle]
+pub extern "C" fn afs_array_maxval_real8_mask(
+    desc: *const ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+) -> f64 {
+    if desc.is_null() || mask.is_null() {
+        return f64::NEG_INFINITY;
+    }
+    let d = unsafe { &*desc };
+    let m = unsafe { &*mask };
+    if d.base_addr.is_null() || m.base_addr.is_null() {
+        return f64::NEG_INFINITY;
+    }
+    let n = d.total_elements() as usize;
+    if n == 0 {
+        return f64::NEG_INFINITY;
+    }
+    let stride_d = d.dims[0].stride.max(1) as usize;
+    let stride_m = m.dims[0].stride.max(1) as usize;
+    let mut best = f64::NEG_INFINITY;
+    if d.elem_size == 4 {
+        let ptr = d.base_addr as *const f32;
+        for i in 0..n {
+            if unsafe { mask_at(m, i, stride_m) } {
+                let v = unsafe { *ptr.add(i * stride_d) } as f64;
+                if v > best {
+                    best = v;
+                }
+            }
+        }
+    } else {
+        let ptr = d.base_addr as *const f64;
+        for i in 0..n {
+            if unsafe { mask_at(m, i, stride_m) } {
+                let v = unsafe { *ptr.add(i * stride_d) };
+                if v > best {
+                    best = v;
+                }
+            }
+        }
+    }
+    best
+}
+
+/// MINVAL(array, mask=mask) — masked min (real).
+#[no_mangle]
+pub extern "C" fn afs_array_minval_real8_mask(
+    desc: *const ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+) -> f64 {
+    if desc.is_null() || mask.is_null() {
+        return f64::INFINITY;
+    }
+    let d = unsafe { &*desc };
+    let m = unsafe { &*mask };
+    if d.base_addr.is_null() || m.base_addr.is_null() {
+        return f64::INFINITY;
+    }
+    let n = d.total_elements() as usize;
+    if n == 0 {
+        return f64::INFINITY;
+    }
+    let stride_d = d.dims[0].stride.max(1) as usize;
+    let stride_m = m.dims[0].stride.max(1) as usize;
+    let mut best = f64::INFINITY;
+    if d.elem_size == 4 {
+        let ptr = d.base_addr as *const f32;
+        for i in 0..n {
+            if unsafe { mask_at(m, i, stride_m) } {
+                let v = unsafe { *ptr.add(i * stride_d) } as f64;
+                if v < best {
+                    best = v;
+                }
+            }
+        }
+    } else {
+        let ptr = d.base_addr as *const f64;
+        for i in 0..n {
+            if unsafe { mask_at(m, i, stride_m) } {
+                let v = unsafe { *ptr.add(i * stride_d) };
+                if v < best {
+                    best = v;
+                }
+            }
+        }
+    }
+    best
+}
+
+/// MAXVAL(array, mask=mask) — masked max (integer).
+#[no_mangle]
+pub extern "C" fn afs_array_maxval_int_mask(
+    desc: *const ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+) -> i64 {
+    if desc.is_null() || mask.is_null() {
+        return i64::MIN;
+    }
+    let d = unsafe { &*desc };
+    let mk = unsafe { &*mask };
+    if d.base_addr.is_null() || mk.base_addr.is_null() {
+        return i64::MIN;
+    }
+    let n = d.total_elements() as usize;
+    if n == 0 {
+        return i64::MIN;
+    }
+    let stride_d = d.dims[0].stride.max(1) as usize;
+    let stride_m = mk.dims[0].stride.max(1) as usize;
+    let mut best = i64::MIN;
+    macro_rules! max_kind {
+        ($t:ty) => {{
+            let ptr = d.base_addr as *const $t;
+            for i in 0..n {
+                if unsafe { mask_at(mk, i, stride_m) } {
+                    let v = unsafe { *ptr.add(i * stride_d) } as i64;
+                    if v > best {
+                        best = v;
+                    }
+                }
+            }
+        }};
+    }
+    match d.elem_size {
+        1 => max_kind!(i8),
+        2 => max_kind!(i16),
+        8 => max_kind!(i64),
+        _ => max_kind!(i32),
+    }
+    best
+}
+
+/// MINVAL(array, mask=mask) — masked min (integer).
+#[no_mangle]
+pub extern "C" fn afs_array_minval_int_mask(
+    desc: *const ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+) -> i64 {
+    if desc.is_null() || mask.is_null() {
+        return i64::MAX;
+    }
+    let d = unsafe { &*desc };
+    let mk = unsafe { &*mask };
+    if d.base_addr.is_null() || mk.base_addr.is_null() {
+        return i64::MAX;
+    }
+    let n = d.total_elements() as usize;
+    if n == 0 {
+        return i64::MAX;
+    }
+    let stride_d = d.dims[0].stride.max(1) as usize;
+    let stride_m = mk.dims[0].stride.max(1) as usize;
+    let mut best = i64::MAX;
+    macro_rules! min_kind {
+        ($t:ty) => {{
+            let ptr = d.base_addr as *const $t;
+            for i in 0..n {
+                if unsafe { mask_at(mk, i, stride_m) } {
+                    let v = unsafe { *ptr.add(i * stride_d) } as i64;
+                    if v < best {
+                        best = v;
+                    }
+                }
+            }
+        }};
+    }
+    match d.elem_size {
+        1 => min_kind!(i8),
+        2 => min_kind!(i16),
+        8 => min_kind!(i64),
+        _ => min_kind!(i32),
+    }
+    best
+}
+
+/// MAXVAL(array) — maximum element (real version). Dispatches on
+/// `elem_size`; returns f64 for both real(4) and real(8).
+/// Respects strides.
 #[no_mangle]
 pub extern "C" fn afs_array_maxval_real8(desc: *const ArrayDescriptor) -> f64 {
     if desc.is_null() {
@@ -2229,18 +2701,32 @@ pub extern "C" fn afs_array_maxval_real8(desc: *const ArrayDescriptor) -> f64 {
         return f64::NEG_INFINITY;
     }
     let stride = d.dims[0].stride.max(1) as usize;
-    let ptr = d.base_addr as *const f64;
-    let mut max = unsafe { *ptr };
-    for i in 1..n {
-        let v = unsafe { *ptr.add(i * stride) };
-        if v > max {
-            max = v;
+    if d.elem_size == 4 {
+        let ptr = d.base_addr as *const f32;
+        let mut max = unsafe { *ptr } as f64;
+        for i in 1..n {
+            let v = unsafe { *ptr.add(i * stride) } as f64;
+            if v > max {
+                max = v;
+            }
         }
+        max
+    } else {
+        let ptr = d.base_addr as *const f64;
+        let mut max = unsafe { *ptr };
+        for i in 1..n {
+            let v = unsafe { *ptr.add(i * stride) };
+            if v > max {
+                max = v;
+            }
+        }
+        max
     }
-    max
 }
 
-/// MINVAL(array) — minimum element (real(8) version). Respects strides.
+/// MINVAL(array) — minimum element (real version). Dispatches on
+/// `elem_size`; returns f64 for both real(4) and real(8).
+/// Respects strides.
 #[no_mangle]
 pub extern "C" fn afs_array_minval_real8(desc: *const ArrayDescriptor) -> f64 {
     if desc.is_null() {
@@ -2255,15 +2741,27 @@ pub extern "C" fn afs_array_minval_real8(desc: *const ArrayDescriptor) -> f64 {
         return f64::INFINITY;
     }
     let stride = d.dims[0].stride.max(1) as usize;
-    let ptr = d.base_addr as *const f64;
-    let mut min = unsafe { *ptr };
-    for i in 1..n {
-        let v = unsafe { *ptr.add(i * stride) };
-        if v < min {
-            min = v;
+    if d.elem_size == 4 {
+        let ptr = d.base_addr as *const f32;
+        let mut min = unsafe { *ptr } as f64;
+        for i in 1..n {
+            let v = unsafe { *ptr.add(i * stride) } as f64;
+            if v < min {
+                min = v;
+            }
         }
+        min
+    } else {
+        let ptr = d.base_addr as *const f64;
+        let mut min = unsafe { *ptr };
+        for i in 1..n {
+            let v = unsafe { *ptr.add(i * stride) };
+            if v < min {
+                min = v;
+            }
+        }
+        min
     }
-    min
 }
 
 /// MAXVAL(array) — maximum element (integer version).
@@ -2588,10 +3086,12 @@ pub extern "C" fn afs_transpose_real8(
 
     let m = src.dims[0].extent() as usize;
     let n = src.dims[1].extent() as usize;
-    let sp = src.base_addr as *const f64;
+    let elem_size = src.elem_size.max(1);
 
-    // Allocate result as (n x m).
-    afs_allocate_1d(result, 8, (n * m) as i64);
+    // Allocate result as (n x m) using the source's element width so
+    // real(4) and real(8) (and complex(4)/(8) when routed here) all
+    // get the right buffer size and stride.
+    afs_allocate_1d(result, elem_size, (n * m) as i64);
     let res = unsafe { &mut *result };
     res.rank = 2;
     res.dims[0] = DimDescriptor {
@@ -2604,12 +3104,40 @@ pub extern "C" fn afs_transpose_real8(
         upper_bound: m as i64,
         stride: 1,
     };
-    let rp = res.base_addr as *mut f64;
 
-    for i in 0..m {
-        for j in 0..n {
-            unsafe {
-                *rp.add(j * m + i) = *sp.add(i * n + j);
+    if elem_size == 4 {
+        let sp = src.base_addr as *const f32;
+        let rp = res.base_addr as *mut f32;
+        for i in 0..m {
+            for j in 0..n {
+                unsafe {
+                    *rp.add(j * m + i) = *sp.add(i * n + j);
+                }
+            }
+        }
+    } else if elem_size == 8 {
+        let sp = src.base_addr as *const f64;
+        let rp = res.base_addr as *mut f64;
+        for i in 0..m {
+            for j in 0..n {
+                unsafe {
+                    *rp.add(j * m + i) = *sp.add(i * n + j);
+                }
+            }
+        }
+    } else {
+        // Generic byte-level copy for other widths (complex(4)=8 already
+        // handled above as f64 lanes; complex(8)=16 falls here).
+        let sb = elem_size as usize;
+        let sp = src.base_addr;
+        let rp = res.base_addr;
+        for i in 0..m {
+            for j in 0..n {
+                unsafe {
+                    let src_off = (i * n + j) * sb;
+                    let dst_off = (j * m + i) * sb;
+                    core::ptr::copy_nonoverlapping(sp.add(src_off), rp.add(dst_off), sb);
+                }
             }
         }
     }
@@ -2643,13 +3171,11 @@ pub extern "C" fn afs_matmul_real8(
     } else {
         db.dims[0].extent() as usize
     };
+    let elem_size = da.elem_size.max(1);
 
-    // For vector * matrix or matrix * vector, adjust dimensions.
-    let ap = da.base_addr as *const f64;
-    let bp = db.base_addr as *const f64;
-
-    // Allocate result.
-    afs_allocate_1d(result, 8, (m * n) as i64);
+    // Allocate result using the source element width so real(4) and
+    // real(8) inputs both produce correctly-sized output buffers.
+    afs_allocate_1d(result, elem_size, (m * n) as i64);
     let res = unsafe { &mut *result };
     res.rank = 2;
     res.dims[0] = DimDescriptor {
@@ -2662,19 +3188,134 @@ pub extern "C" fn afs_matmul_real8(
         upper_bound: n as i64,
         stride: 1,
     };
-    let rp = res.base_addr as *mut f64;
 
-    // Triple loop: C(i,j) = sum_l A(i,l) * B(l,j)
-    for i in 0..m {
+    // Fortran is column-major: A(m,k) stores A(i,l) at l*m + i,
+    // B(k,n) stores B(l,j) at j*k + l, C(m,n) stores C(i,j) at j*m + i.
+    if elem_size == 4 {
+        let ap = da.base_addr as *const f32;
+        let bp = db.base_addr as *const f32;
+        let rp = res.base_addr as *mut f32;
         for j in 0..n {
-            let mut sum = 0.0;
-            for l in 0..k {
-                let a_val = unsafe { *ap.add(i * k + l) };
-                let b_val = unsafe { *bp.add(l * n + j) };
-                sum += a_val * b_val;
+            for i in 0..m {
+                let mut sum: f64 = 0.0;
+                for l in 0..k {
+                    let a_val = unsafe { *ap.add(l * m + i) } as f64;
+                    let b_val = unsafe { *bp.add(j * k + l) } as f64;
+                    sum += a_val * b_val;
+                }
+                unsafe {
+                    *rp.add(j * m + i) = sum as f32;
+                }
             }
-            unsafe {
-                *rp.add(i * n + j) = sum;
+        }
+    } else {
+        let ap = da.base_addr as *const f64;
+        let bp = db.base_addr as *const f64;
+        let rp = res.base_addr as *mut f64;
+        for j in 0..n {
+            for i in 0..m {
+                let mut sum: f64 = 0.0;
+                for l in 0..k {
+                    let a_val = unsafe { *ap.add(l * m + i) };
+                    let b_val = unsafe { *bp.add(j * k + l) };
+                    sum += a_val * b_val;
+                }
+                unsafe {
+                    *rp.add(j * m + i) = sum;
+                }
+            }
+        }
+    }
+}
+
+/// MATMUL(a, b, result) — matrix multiplication (complex version).
+/// elem_size 8 → complex(4) (two f32 lanes); elem_size 16 → complex(8) (two f64 lanes).
+#[no_mangle]
+pub extern "C" fn afs_matmul_complex(
+    a: *const ArrayDescriptor,
+    b: *const ArrayDescriptor,
+    result: *mut ArrayDescriptor,
+) {
+    if a.is_null() || b.is_null() || result.is_null() {
+        return;
+    }
+    let da = unsafe { &*a };
+    let db = unsafe { &*b };
+    if da.base_addr.is_null() || db.base_addr.is_null() {
+        return;
+    }
+
+    let m = da.dims[0].extent() as usize;
+    let k = if da.rank >= 2 {
+        da.dims[1].extent() as usize
+    } else {
+        1
+    };
+    let n = if db.rank >= 2 {
+        db.dims[1].extent() as usize
+    } else {
+        db.dims[0].extent() as usize
+    };
+    let elem_size = da.elem_size.max(8);
+
+    afs_allocate_1d(result, elem_size, (m * n) as i64);
+    let res = unsafe { &mut *result };
+    res.rank = 2;
+    res.dims[0] = DimDescriptor {
+        lower_bound: 1,
+        upper_bound: m as i64,
+        stride: 1,
+    };
+    res.dims[1] = DimDescriptor {
+        lower_bound: 1,
+        upper_bound: n as i64,
+        stride: 1,
+    };
+
+    if elem_size == 8 {
+        // complex(4): pairs of f32 (re, im).
+        let ap = da.base_addr as *const f32;
+        let bp = db.base_addr as *const f32;
+        let rp = res.base_addr as *mut f32;
+        for j in 0..n {
+            for i in 0..m {
+                let mut sum_re: f64 = 0.0;
+                let mut sum_im: f64 = 0.0;
+                for l in 0..k {
+                    let a_re = unsafe { *ap.add(2 * (l * m + i)) } as f64;
+                    let a_im = unsafe { *ap.add(2 * (l * m + i) + 1) } as f64;
+                    let b_re = unsafe { *bp.add(2 * (j * k + l)) } as f64;
+                    let b_im = unsafe { *bp.add(2 * (j * k + l) + 1) } as f64;
+                    sum_re += a_re * b_re - a_im * b_im;
+                    sum_im += a_re * b_im + a_im * b_re;
+                }
+                unsafe {
+                    *rp.add(2 * (j * m + i)) = sum_re as f32;
+                    *rp.add(2 * (j * m + i) + 1) = sum_im as f32;
+                }
+            }
+        }
+    } else {
+        // complex(8): pairs of f64 (re, im).
+        let ap = da.base_addr as *const f64;
+        let bp = db.base_addr as *const f64;
+        let rp = res.base_addr as *mut f64;
+        for j in 0..n {
+            for i in 0..m {
+                let mut sum_re: f64 = 0.0;
+                let mut sum_im: f64 = 0.0;
+                for l in 0..k {
+                    let a_re = unsafe { *ap.add(2 * (l * m + i)) };
+                    let a_im = unsafe { *ap.add(2 * (l * m + i) + 1) };
+                    let b_re = unsafe { *bp.add(2 * (j * k + l)) };
+                    let b_im = unsafe { *bp.add(2 * (j * k + l) + 1) };
+                    sum_re += a_re * b_re - a_im * b_im;
+                    sum_im += a_re * b_im + a_im * b_re;
+                }
+                unsafe {
+                    *rp.add(2 * (j * m + i)) = sum_re;
+                    *rp.add(2 * (j * m + i) + 1) = sum_im;
+                }
             }
         }
     }
@@ -2726,16 +3367,18 @@ pub extern "C" fn afs_matmul_int(
     };
     let rp = res.base_addr as *mut i32;
 
-    for i in 0..m {
-        for j in 0..n {
+    // Fortran is column-major: A(m,k) stores A(i,l) at l*m + i,
+    // B(k,n) stores B(l,j) at j*k + l, C(m,n) stores C(i,j) at j*m + i.
+    for j in 0..n {
+        for i in 0..m {
             let mut sum: i64 = 0;
             for l in 0..k {
-                let a_val = unsafe { *ap.add(i * k + l) as i64 };
-                let b_val = unsafe { *bp.add(l * n + j) as i64 };
+                let a_val = unsafe { *ap.add(l * m + i) as i64 };
+                let b_val = unsafe { *bp.add(j * k + l) as i64 };
                 sum += a_val * b_val;
             }
             unsafe {
-                *rp.add(i * n + j) = sum as i32;
+                *rp.add(j * m + i) = sum as i32;
             }
         }
     }
@@ -2946,6 +3589,92 @@ pub extern "C" fn afs_array_abs_complex(
                 let re = *(sp_buf.add(i * 16) as *const f64);
                 let im = *(sp_buf.add(i * 16 + 8) as *const f64);
                 *(rp_buf.add(i * 8) as *mut f64) = (re * re + im * im).sqrt();
+            }
+        }
+    }
+}
+
+/// F2018 §16.9.43 CMPLX(re, im, kind) over real arrays.
+///
+/// Allocates a complex(out_lane_bytes) result of the same shape as `re_source`
+/// and writes one element per source element with re[i] in lane 0 and
+/// im[i] (or 0 when im_source is null) in lane 1. Handles cross-kind
+/// inputs (real(sp) ↔ real(dp)) by reading the per-side elem_size.
+///
+/// `out_lane_bytes` is 4 (single) or 8 (double); result elem_size is
+/// `2 * out_lane_bytes`.
+#[no_mangle]
+pub extern "C" fn afs_array_cmplx(
+    re_source: *const ArrayDescriptor,
+    im_source: *const ArrayDescriptor,
+    out_lane_bytes: i32,
+    result: *mut ArrayDescriptor,
+) {
+    if re_source.is_null() || result.is_null() {
+        return;
+    }
+    let re = unsafe { &*re_source };
+    if re.base_addr.is_null() {
+        return;
+    }
+    let im_opt = if im_source.is_null() {
+        None
+    } else {
+        let im = unsafe { &*im_source };
+        if im.base_addr.is_null() { None } else { Some(im) }
+    };
+    let lane = out_lane_bytes.max(4) as usize;
+    let elem_size = 2 * lane;
+    let mut dims = [DimDescriptor::default(); MAX_RANK];
+    for (i, dim) in dims.iter_mut().enumerate().take(re.rank as usize) {
+        *dim = DimDescriptor {
+            lower_bound: re.dims[i].lower_bound,
+            upper_bound: re.dims[i].upper_bound,
+            stride: 1,
+        };
+    }
+    let dims_ptr = if re.rank > 0 { dims.as_ptr() } else { ptr::null() };
+    afs_allocate_array(result, elem_size as i64, re.rank, dims_ptr, ptr::null_mut());
+
+    let res = unsafe { &mut *result };
+    let total = re.total_elements() as usize;
+    let re_elem = re.elem_size.max(1) as usize;
+    let im_elem = im_opt.map(|im| im.elem_size.max(1) as usize).unwrap_or(0);
+    let re_buf = re.base_addr as *const u8;
+    let im_buf = im_opt
+        .map(|im| im.base_addr as *const u8)
+        .unwrap_or(ptr::null());
+    let rp_buf = res.base_addr;
+    for i in 0..total {
+        let dst_off = i * elem_size;
+        unsafe {
+            // Read real lane as f64 from source kind.
+            let r_val: f64 = match re_elem {
+                4 => *(re_buf.add(i * 4) as *const f32) as f64,
+                8 => *(re_buf.add(i * 8) as *const f64),
+                _ => 0.0,
+            };
+            // Read imag lane (zero when source absent).
+            let i_val: f64 = if im_buf.is_null() {
+                0.0
+            } else {
+                match im_elem {
+                    4 => *(im_buf.add(i * 4) as *const f32) as f64,
+                    8 => *(im_buf.add(i * 8) as *const f64),
+                    _ => 0.0,
+                }
+            };
+            // Write per result kind.
+            match lane {
+                4 => {
+                    *(rp_buf.add(dst_off) as *mut f32) = r_val as f32;
+                    *(rp_buf.add(dst_off + 4) as *mut f32) = i_val as f32;
+                }
+                8 => {
+                    *(rp_buf.add(dst_off) as *mut f64) = r_val;
+                    *(rp_buf.add(dst_off + 8) as *mut f64) = i_val;
+                }
+                _ => {}
             }
         }
     }

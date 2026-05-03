@@ -313,12 +313,27 @@ impl SymbolTable {
         // every scope's UseAssociations and follow the source to pick
         // up the underlying symbol (NamedInterface for generic
         // dispatch, Function for ordinary calls, etc.).
+        //
+        // The source-scope lookup MUST chase through transitive USE
+        // chains: `stdlib_kinds` re-exports `int64` from
+        // `iso_fortran_env`, so `use stdlib_kinds, only: block_kind => int64`
+        // can't find `int64` in stdlib_kinds's own symbols — the kind
+        // constant lives one hop further up. Without the chase,
+        // `integer(block_kind) :: dummy` falls back to default kind=4
+        // inside the submodule body, silently truncating the local
+        // from 8 bytes to 4 even though the parent type's `block`
+        // field is correctly laid out.
         for scope in &self.scopes {
             for assoc in &scope.use_associations {
                 if assoc.local_name == key {
                     if let Some(sym) = self.scopes[assoc.source_scope]
                         .symbols
                         .get(&assoc.original_name)
+                    {
+                        return Some(sym);
+                    }
+                    if let Some(sym) =
+                        self.lookup_in(assoc.source_scope, &assoc.original_name)
                     {
                         return Some(sym);
                     }
