@@ -25579,6 +25579,56 @@ fn defined_assignment_routes_generic_function_result_to_typed_specific() {
 }
 
 #[test]
+fn type_bound_generic_dispatch_disambiguates_by_rank() {
+    // F2008 §12.4.4.1: distinguishable specifics in a generic must
+    // differ by rank or type of at least one passed-object argument.
+    // `resolve_bound_proc_actuals` checks TypeInfo + IR-shape but
+    // not rank; the IR-shape comparison over-matches because a
+    // scalar character descriptor and a rank-1 character array
+    // descriptor both peel to the same `Array(I8, _)` slot. The
+    // first-match-wins loop then bound the scalar specific for a
+    // rank-1 char actual and the callee dereferenced the rank-1
+    // descriptor's `data` field as a single character pointer —
+    // SEGV. The motivating repro was stdlib_stringlist_type's
+    // `prepend_carray` body calling
+    // `self%insert_at(list_head, lhs)` with a rank-1 `lhs`; the
+    // visible failure was step 5 of
+    // example_stringlist_type_concatenate_operator.
+    //
+    // Fix lives in `resolve_bound_proc_actuals`: a second pass over
+    // the candidates that already passed type+IR-shape, preferring
+    // the one whose formal rank matches the actual rank exactly.
+    // When no candidate satisfies the rank constraint we fall back
+    // to first-match-wins so legitimate elemental / assumed-rank /
+    // scalar-broadcast dispatches keep working — strictly no worse
+    // than the prior logic.
+    let src = write_program(
+        "module bagm\n  implicit none\n  type :: bag\n    integer :: tag = 0\n  contains\n    procedure :: insert_scalar\n    procedure :: insert_array\n    generic :: insert => insert_scalar, insert_array\n  end type\ncontains\n  subroutine insert_scalar(self, s)\n    class(bag), intent(inout) :: self\n    character(len=*), intent(in) :: s\n    if (s /= 'hi') error stop 1\n  end subroutine\n  subroutine insert_array(self, s)\n    class(bag), intent(inout) :: self\n    character(len=*), intent(in) :: s(:)\n    if (size(s) /= 2) error stop 2\n    if (s(1) /= '#1') error stop 3\n    if (s(2) /= '#2') error stop 4\n  end subroutine\nend module\n\nprogram p\n  use bagm\n  implicit none\n  type(bag) :: b\n  call b%insert(\"hi\")\n  call b%insert([\"#1\", \"#2\"])\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("tbp_rank_disambig", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("tbp-rank compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "tbp-rank compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("tbp-rank run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "tbp-rank: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn declared_init_reshape_populates_fixed_shape_stack_array() {
     // F2018 §16.9.169 RESHAPE used as a declared initializer for a
     // fixed-shape rank-2+ stack array. Pre-fix `init_decls` only
