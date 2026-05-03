@@ -13983,7 +13983,8 @@ fn actual_expr_rank(
         Expr::FunctionCall { callee, args } => {
             // Section result: rank = number of Range subscripts in args.
             if let Expr::Name { name } = &callee.node {
-                if let Some(info) = locals.get(&name.to_lowercase()) {
+                let key = name.to_lowercase();
+                if let Some(info) = locals.get(&key) {
                     if local_is_array_like(info) {
                         let n_ranges = args
                             .iter()
@@ -13996,6 +13997,15 @@ fn actual_expr_rank(
                             return Some(n_ranges);
                         }
                         return Some(local_declared_rank(info));
+                    }
+                }
+                // F2008 §4.5.10: a structure constructor invocation
+                // `T(...)` is always a scalar of type T. Recognising this
+                // lets the rank-aware specific dispatcher reject array
+                // formals when the actual is a derived-type constructor.
+                if let Some(sym) = st.find_symbol_any_scope(&key) {
+                    if matches!(sym.kind, crate::sema::symtab::SymbolKind::DerivedType) {
+                        return Some(0);
                     }
                 }
             }
