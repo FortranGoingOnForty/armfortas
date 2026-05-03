@@ -25454,6 +25454,131 @@ fn user_op_dispatch_recognises_derived_type_constructor_as_scalar() {
 }
 
 #[test]
+fn defined_assignment_routes_constructor_and_literal_to_correct_specific() {
+    // F2018 §10.2.1.4: defined-assignment dispatch is by declared TYPE
+    // (and kind) of the dummies. Pre-fix the type-information used to
+    // pick a specific had two holes:
+    //   1. `assignment_expr_type_info` returned None for a derived-type
+    //      constructor `T(...)` (the callee symbol is the type
+    //      definition, whose `type_info` is None). Fixed in the
+    //      `Expr::FunctionCall` arm by recognising the
+    //      `SymbolKind::DerivedType` case and returning
+    //      `Some(TypeInfo::Derived(name))`.
+    //   2. `try_defined_assignment` never appended the hidden i64
+    //      length argument required by F2018 §15.5.2.4 for a
+    //      `character(len=*)` formal, and never wrapped a literal RHS
+    //      in the by-ref slot the callee's prologue expects. Fixed by
+    //      consulting `char_len_star_params[resolved_specific]`,
+    //      routing char-star RHS through `lower_char_arg_by_ref`, and
+    //      appending the runtime length per flagged position.
+    //
+    // The motivating repros were stdlib_string_type's
+    // `s = string_type("hello")` (constructor RHS — was dispatching to
+    // `assign_string_char` with `len(rhs) == 0`) and `s = "Hello"`
+    // (literal RHS — was dispatching to `assign_string_char` with the
+    // hidden len uninitialised). Both must land on the right specific
+    // and propagate the full character length through to the body's
+    // `lhs%raw = rhs` assignment.
+    let src = write_program(
+        "module strtype\n  implicit none\n  type :: my_str\n    character(len=:), allocatable :: raw\n  end type\n  interface assignment(=)\n    module procedure assign_str_char\n    module procedure assign_str_str\n  end interface\n  interface my_str\n    module procedure new_my_str\n  end interface\ncontains\n  pure function new_my_str(c) result(new)\n    character(len=*), intent(in) :: c\n    type(my_str) :: new\n    new%raw = c\n  end function\n  subroutine assign_str_char(lhs, rhs)\n    type(my_str), intent(inout) :: lhs\n    character(len=*), intent(in) :: rhs\n    lhs%raw = rhs\n  end subroutine\n  subroutine assign_str_str(lhs, rhs)\n    type(my_str), intent(inout) :: lhs\n    type(my_str), intent(in) :: rhs\n    if (allocated(rhs%raw)) lhs%raw = rhs%raw\n  end subroutine\nend module\n\nprogram p\n  use strtype\n  implicit none\n  type(my_str) :: s\n  s = \"Hello\"\n  if (.not. allocated(s%raw)) error stop 1\n  if (len(s%raw) /= 5) error stop 2\n  if (s%raw /= \"Hello\") error stop 3\n  s = my_str(\"World!\")\n  if (.not. allocated(s%raw)) error stop 4\n  if (len(s%raw) /= 6) error stop 5\n  if (s%raw /= \"World!\") error stop 6\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("def_assign_ctor_and_literal", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("def-assign-ctor-literal compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "def-assign-ctor-literal compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("def-assign-ctor-literal run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "def-assign-ctor-literal: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn defined_assignment_routes_generic_function_result_to_typed_specific() {
+    // F2008 §12.5.1: a generic function call resolves to a specific
+    // by argument matching, and its return type is that specific's
+    // result type. `assignment_expr_type_info` previously returned
+    // None for any `FunctionCall` whose callee resolved to a
+    // `NamedInterface` (the interface symbol has no type_info), so
+    // `defined_assignment_arg_semantic_match`'s permissive
+    // `None => true` branch let a `character(*)` formal match a
+    // generic-function-result actual whose true return type was a
+    // derived type. The motivating repro: stdlib_string_type's
+    // `string = adjustl(string)` (adjustl returns string_type)
+    // dispatched to `assign_string_char` instead of
+    // `assign_string_string`, then the wrong-typed dispatch crashed
+    // inside the callee's `lhs%raw = rhs`.
+    //
+    // Fix: in the `FunctionCall` arm of `assignment_expr_type_info`,
+    // when the callee is a `NamedInterface`, walk the union of the
+    // specifics' result-variable type_info; return the common type
+    // when all specifics agree (sufficient for stdlib's elemental
+    // adjust/strip/trim family) and None otherwise so the dispatcher
+    // continues to use its existing permissive logic for genuinely
+    // ambiguous cases.
+    //
+    // This test models the stdlib shape: a single-specific generic
+    // returning a derived type, plus two assignment specifics that
+    // differ by RHS type. With the resolver in place, dispatch picks
+    // `assign_str_str`; without it, `assign_str_char` wins silently.
+    // The two specifics print sentinel markers so we can assert on
+    // which one was bound — checking the data round-trip end-to-end
+    // exercises a separate downstream bug in derived-type allocatable
+    // function-return semantics that the dispatch fix only exposes.
+    let src = write_program(
+        "module strtype\n  implicit none\n  type :: my_str\n    character(len=:), allocatable :: raw\n  end type\n  interface assignment(=)\n    module procedure assign_str_char\n    module procedure assign_str_str\n  end interface\n  interface upper_str\n    module procedure upper_my_str\n  end interface\ncontains\n  pure function upper_my_str(s) result(out)\n    type(my_str), intent(in) :: s\n    type(my_str) :: out\n    out%raw = \"OUT\"\n  end function\n  subroutine assign_str_char(lhs, rhs)\n    type(my_str), intent(inout) :: lhs\n    character(len=*), intent(in) :: rhs\n    print *, 'WRONG_SPECIFIC_CHAR'\n    lhs%raw = rhs\n  end subroutine\n  subroutine assign_str_str(lhs, rhs)\n    type(my_str), intent(inout) :: lhs\n    type(my_str), intent(in) :: rhs\n    print *, 'RIGHT_SPECIFIC_STR'\n    if (allocated(rhs%raw)) lhs%raw = rhs%raw\n  end subroutine\nend module\n\nprogram p\n  use strtype\n  implicit none\n  type(my_str) :: s, t\n  t%raw = \"hi\"\n  s = upper_str(t)\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("def_assign_generic_result", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("def-assign-generic-result compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "def-assign-generic-result compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("def-assign-generic-result run failed");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        run.status.success() && stdout.contains("ok"),
+        "def-assign-generic-result: status={:?} stdout={} stderr={}",
+        run.status,
+        stdout,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        stdout.contains("RIGHT_SPECIFIC_STR"),
+        "def-assign-generic-result dispatched wrong specific (expected assign_str_str): stdout={}",
+        stdout
+    );
+    assert!(
+        !stdout.contains("WRONG_SPECIFIC_CHAR"),
+        "def-assign-generic-result mis-dispatched to char specific: stdout={}",
+        stdout
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn declared_init_reshape_populates_fixed_shape_stack_array() {
     // F2018 §16.9.169 RESHAPE used as a declared initializer for a
     // fixed-shape rank-2+ stack array. Pre-fix `init_decls` only
