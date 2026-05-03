@@ -25297,6 +25297,83 @@ fn f2008_submodule_explicit_iface_smp_body_with_runtime_shape_result() {
 }
 
 #[test]
+fn user_op_dispatch_rank_filters_scalar_actual_to_scalar_specific() {
+    // F2018 §12.4.4 / §15.5.2: when a user-defined operator has both a
+    // scalar specific and a rank-1 array specific differing only in
+    // the operand rank, dispatch must select the scalar specific for a
+    // scalar actual and the rank-1 specific for an array actual. Both
+    // forms share the same `TypeInfo::Character`, so a TypeInfo-only
+    // semantic match is ambiguous; without a rank filter the dispatch
+    // picks alphabetically — `append_carray` before `append_char` —
+    // and the callee dereferences the scalar's character bytes as an
+    // array descriptor. stdlib_stringlist_type's `operator(//)` was
+    // the motivating repro: `a // "Hello"` segfaulted in
+    // `afs_string_allocated` reading garbage as a descriptor pointer.
+    //
+    // Two-module multi-file build matches the stdlib shape: the user
+    // module declares both specifics, the program imports the
+    // operator generic, and dispatch must land on the scalar one for
+    // a scalar character actual.
+    let dir = unique_dir("user_op_rank_filter");
+    let m = write_program_in(
+        &dir,
+        "m.f90",
+        "module m\n  implicit none\n  private\n  public :: bag, operator(//)\n  type :: bag\n     integer :: n = 0\n  end type\n  interface operator(//)\n     module procedure append_char\n     module procedure append_carray\n  end interface\ncontains\n  pure function append_char(lhs, rhs) result(c)\n     type(bag), intent(in) :: lhs\n     character(len=*), intent(in) :: rhs\n     character(len=:), allocatable :: c\n     c = 'scalar'\n  end function\n  pure function append_carray(lhs, rhs) result(c)\n     type(bag), intent(in) :: lhs\n     character(len=*), intent(in) :: rhs(:)\n     character(len=:), allocatable :: c\n     c = 'array'\n  end function\nend module\n",
+    );
+    let p = write_program_in(
+        &dir,
+        "p.f90",
+        "program p\n  use m, only : bag, operator(//)\n  implicit none\n  type(bag) :: b\n  character(len=:), allocatable :: r\n  r = b // 'Hello'\n  if (r /= 'scalar') error stop 1\n  r = b // ['#1', '#2']\n  if (r /= 'array') error stop 2\n  print *, 'ok'\nend program\n",
+    );
+    let mo = dir.join("m.o");
+    let po = dir.join("p.o");
+    let bin = dir.join("p");
+    for (src, obj) in [(&m, &mo), (&p, &po)] {
+        let r = Command::new(compiler("armfortas"))
+            .args([
+                "-c",
+                src.to_str().unwrap(),
+                "-I",
+                dir.to_str().unwrap(),
+                "-J",
+                dir.to_str().unwrap(),
+                "-o",
+                obj.to_str().unwrap(),
+            ])
+            .output()
+            .expect("compile failed");
+        assert!(
+            r.status.success(),
+            "compile {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&r.stderr)
+        );
+    }
+    let link = Command::new(compiler("armfortas"))
+        .args([
+            mo.to_str().unwrap(),
+            po.to_str().unwrap(),
+            "-o",
+            bin.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link failed");
+    assert!(
+        link.status.success(),
+        "link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+    let run = Command::new(&bin).output().expect("run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "rank-filter run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+#[test]
 fn declared_init_reshape_populates_fixed_shape_stack_array() {
     // F2018 §16.9.169 RESHAPE used as a declared initializer for a
     // fixed-shape rank-2+ stack array. Pre-fix `init_decls` only
