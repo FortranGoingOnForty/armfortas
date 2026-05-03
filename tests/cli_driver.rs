@@ -25629,6 +25629,53 @@ fn type_bound_generic_dispatch_disambiguates_by_rank() {
 }
 
 #[test]
+fn substring_write_with_inline_ichar_of_same_component_substring() {
+    // Regression: `a%raw(i:i) = char(ichar(a%raw(i:i)) - 32)` for
+    // `a%raw : character(:), allocatable` produced 5 garbage bytes
+    // instead of "HELLO". `lower_string_expr_ctx`'s `char` arm called
+    // the slim `lower_expr` shim (which hardcodes `type_layouts=None`,
+    // etc.) to lower its integer argument. Inside that, the recursive
+    // `ichar(a%raw(i:i))` reached `lower_string_expr_full` for the
+    // FunctionCall `a%raw(i:i)` with `type_layouts=None`;
+    // `expr_is_character_expr`'s ComponentAccess arm requires
+    // `type_layouts` to resolve the component's TypeInfo, so it
+    // returned false. The substring fast path at the top of the
+    // FunctionCall arm was bypassed, the fallback `lower_expr_full`
+    // produced a const-zero pointer, and `afs_ichar_ptr(0)` returned
+    // 0 → `char(0 - 32)` was written into each slot. Fix forwards the
+    // full lowering context (type_layouts/internal_funcs/host_refs/
+    // descriptor_params) so the inner ComponentAccess substring still
+    // resolves through the same fast path the outside-of-assignment
+    // case already used.
+    let src = write_program(
+        "program p\n  implicit none\n  type :: holder\n    character(:), allocatable :: raw\n  end type\n  type(holder) :: a\n  integer :: i\n  a%raw = \"hello\"\n  do i = 1, len(a%raw)\n    a%raw(i:i) = char(ichar(a%raw(i:i)) - 32)\n  end do\n  if (a%raw /= 'HELLO') error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("comp_substr_inline_ichar", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("comp-substr-inline-ichar compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "comp-substr-inline-ichar compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("comp-substr-inline-ichar run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "comp-substr-inline-ichar: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn declared_init_reshape_populates_fixed_shape_stack_array() {
     // F2018 §16.9.169 RESHAPE used as a declared initializer for a
     // fixed-shape rank-2+ stack array. Pre-fix `init_decls` only
