@@ -3086,7 +3086,7 @@ pub extern "C" fn afs_transpose_real8(
 
     let m = src.dims[0].extent() as usize;
     let n = src.dims[1].extent() as usize;
-    let elem_size = src.elem_size.max(1) as i64;
+    let elem_size = src.elem_size.max(1);
 
     // Allocate result as (n x m) using the source's element width so
     // real(4) and real(8) (and complex(4)/(8) when routed here) all
@@ -3171,7 +3171,7 @@ pub extern "C" fn afs_matmul_real8(
     } else {
         db.dims[0].extent() as usize
     };
-    let elem_size = da.elem_size.max(1) as i64;
+    let elem_size = da.elem_size.max(1);
 
     // Allocate result using the source element width so real(4) and
     // real(8) inputs both produce correctly-sized output buffers.
@@ -3256,7 +3256,7 @@ pub extern "C" fn afs_matmul_complex(
     } else {
         db.dims[0].extent() as usize
     };
-    let elem_size = da.elem_size.max(8) as i64;
+    let elem_size = da.elem_size.max(8);
 
     afs_allocate_1d(result, elem_size, (m * n) as i64);
     let res = unsafe { &mut *result };
