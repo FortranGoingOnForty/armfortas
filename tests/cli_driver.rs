@@ -25297,6 +25297,92 @@ fn f2008_submodule_explicit_iface_smp_body_with_runtime_shape_result() {
 }
 
 #[test]
+fn amod_proc_attrs_split_preserves_result_array_bounds_with_inner_comma() {
+    // Regression: stdlib_math_linspace's `linspace_n_1_cdp_cdp` is the
+    // abbreviated SMP body form
+    //   module procedure gen_cdp
+    //     real(dp) :: x(max(n, 0)), y(max(n, 0))
+    //     x = gen(start%re, end%re, n)   ! recurses to gen_rdp via generic
+    //     y = gen(start%im, end%im, n)
+    //     res = cmplx(x, y, kind=dp)
+    //   end procedure
+    // and pulls its result-variable spec out of the parent module's .amod
+    // (`result_array_bounds="(max(n, 0))"`).  The .amod proc-attr
+    // splitter used a naive `split(", ")` that broke on the inner comma
+    // in `max(n, 0)`, falling back to AssumedShape and skipping the
+    // function prologue's runtime-shape allocation. Surfaced as a
+    // bounds-check failure ("index 1 outside [1, 0]") at runtime in
+    // example_linspace_complex / example_logspace_complex once the
+    // upstream cmplx-of-arrays scalar-broadcast bug stopped masking it.
+    // Fix: depth-aware comma split that honors parens and quoted values.
+    let parent_src = write_program(
+        "module mtop\n  implicit none\n  integer, parameter :: dp = kind(0.0d0)\n  interface gen\n    pure module function gen_rdp(start, end, n) result(res)\n      real(dp), intent(in) :: start, end\n      integer, intent(in) :: n\n      real(dp) :: res(max(n, 0))\n    end function\n    pure module function gen_cdp(start, end, n) result(res)\n      complex(dp), intent(in) :: start, end\n      integer, intent(in) :: n\n      complex(dp) :: res(max(n, 0))\n    end function\n  end interface\nend module\n",
+        "f90",
+    );
+    let sub_src = write_program(
+        "submodule (mtop) mimpl\ncontains\n  module procedure gen_rdp\n    integer :: i\n    real(dp) :: step\n    if (n <= 0) return\n    if (n == 1) then\n      res(1) = end\n      return\n    end if\n    step = (end - start) / real(n - 1, dp)\n    res(1) = start\n    res(n) = end\n    do i = 2, n - 1\n      res(i) = start + step * real(i - 1, dp)\n    end do\n  end procedure\n  module procedure gen_cdp\n    real(dp) :: x(max(n, 0))\n    real(dp) :: y(max(n, 0))\n    x = gen(start%re, end%re, n)\n    y = gen(start%im, end%im, n)\n    res = cmplx(x, y, kind=dp)\n  end procedure\nend submodule\n",
+        "f90",
+    );
+    let main_src = write_program(
+        "program p\n  use mtop\n  implicit none\n  integer, parameter :: dp = kind(0.0d0)\n  complex(dp) :: a, b, z(11)\n  a = cmplx(10.0_dp, 5.0_dp, kind=dp)\n  b = cmplx(-10.0_dp, 15.0_dp, kind=dp)\n  z = gen(a, b, 11)\n  if (abs(real(z(1)) - 10.0d0) > 1.0d-12) error stop 1\n  if (abs(aimag(z(1)) - 5.0d0) > 1.0d-12) error stop 2\n  if (abs(real(z(11)) - (-10.0d0)) > 1.0d-12) error stop 3\n  if (abs(aimag(z(11)) - 15.0d0) > 1.0d-12) error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let parent_o = unique_path("amod_attrs_parent", "o");
+    let sub_o = unique_path("amod_attrs_sub", "o");
+    let main_o = unique_path("amod_attrs_main", "o");
+    let out = unique_path("amod_attrs_runtime_shape_max_bounds", "bin");
+    let mod_dir = unique_dir("amod_attrs_mods");
+    let work_dir = mod_dir.as_path();
+
+    let compile_one = |src: &std::path::Path, obj: &std::path::Path| {
+        let r = Command::new(compiler("armfortas"))
+            .args(["-c", src.to_str().unwrap(), "-o", obj.to_str().unwrap()])
+            .args(["-J", work_dir.to_str().unwrap()])
+            .args(["-I", work_dir.to_str().unwrap()])
+            .output()
+            .expect("compile failed to spawn");
+        assert!(
+            r.status.success(),
+            "compile of {:?} failed: {}",
+            src,
+            String::from_utf8_lossy(&r.stderr)
+        );
+    };
+    compile_one(&parent_src, &parent_o);
+    compile_one(&sub_src, &sub_o);
+    compile_one(&main_src, &main_o);
+    let link = Command::new(compiler("armfortas"))
+        .args([
+            main_o.to_str().unwrap(),
+            parent_o.to_str().unwrap(),
+            sub_o.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link failed to spawn");
+    assert!(
+        link.status.success(),
+        "link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "amod attr-split run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    for p in [&parent_src, &sub_src, &main_src, &parent_o, &sub_o, &main_o, &out] {
+        let _ = std::fs::remove_file(p);
+    }
+    let _ = std::fs::remove_dir_all(&mod_dir);
+}
+
+#[test]
 fn cmplx_whole_array_with_kind_keyword_returns_correct_kind_descriptor() {
     // F2018 §16.9.43: CMPLX(re, im, kind) is elemental — applied to
     // real arrays it yields a complex array of the requested kind.
