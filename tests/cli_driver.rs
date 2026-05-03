@@ -25297,6 +25297,49 @@ fn f2008_submodule_explicit_iface_smp_body_with_runtime_shape_result() {
 }
 
 #[test]
+fn defined_assignment_class_lhs_loads_descriptor_pointer_through_slot() {
+    // F2008 §7.2.1 / §15.5.2: a defined-assignment specific receiving
+    // `class(T), intent(inout) :: to` expects the caller to pass the
+    // 384-byte descriptor pointer for `to`. `try_defined_assignment`
+    // was emitting `lhs_val = lhs_info.addr` — for a class()-typed
+    // dummy that's the *slot* holding the descriptor pointer
+    // (one extra indirection). The callee then re-loaded the slot as
+    // if it were the descriptor and GEP'd field offsets against
+    // bytes from the data buffer — surfaced as
+    // afs_assign_char_fixed(... src=0x2020...$ ...) crashing in
+    // memmove. Every stdlib_system fs example
+    // (cwd/exists/delete_file/get_file/is_symlink/make_directory/
+    // remove_directory/error_state2) reached this through
+    // error_handling's `ierr_out = ierr`. Fix: load through the slot
+    // when the LHS local is descriptor-backed (class or
+    // allocatable/descriptor_arg).
+    let src = write_program(
+        "module mst\n  implicit none\n  type :: state_t\n     integer :: state = 0\n     character(len=512) :: message = repeat(' ', 512)\n     character(len=32) :: where_at = repeat(' ', 32)\n  end type\n  interface assignment(=)\n     module procedure state_assign_state\n  end interface\ncontains\n  elemental subroutine state_assign_state(to, from)\n     class(state_t), intent(inout) :: to\n     class(state_t), intent(in) :: from\n     to%state = from%state\n     to%message = from%message\n     to%where_at = from%where_at\n  end subroutine\n  pure subroutine error_handling(ierr, ierr_out)\n     class(state_t), intent(in) :: ierr\n     class(state_t), optional, intent(inout) :: ierr_out\n     if (present(ierr_out)) then\n        ierr_out = ierr\n     end if\n  end subroutine\n  pure subroutine set_cwd(path, err)\n     character(len=*), intent(in) :: path\n     type(state_t), optional, intent(inout) :: err\n     type(state_t) :: local\n     local%state = 2\n     local%message = 'Bad path: '//path\n     local%where_at = 'set_cwd'\n     call error_handling(local, err)\n  end subroutine\nend module\n\nprogram p\n  use mst\n  type(state_t) :: e\n  call set_cwd('./nope', e)\n  if (e%state /= 2) error stop 1\n  if (trim(e%message) /= 'Bad path: ./nope') error stop 2\n  if (trim(e%where_at) /= 'set_cwd') error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("class_assign_descriptor_load", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("class assign compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "class assign compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("class assign run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "class assign run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn print_tbp_returning_allocatable_char_writes_full_string() {
     // F2008 §4.5.4 TBP call inline in PRINT: `print *, e%method()` where
     // method returns `character(len=:), allocatable :: r`. Pre-fix the
