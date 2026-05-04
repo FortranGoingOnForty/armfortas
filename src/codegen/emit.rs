@@ -459,6 +459,13 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
             op_str(&inst.operands[1]),
             op_str(&inst.operands[2])
         ),
+        ArmOpcode::Madd => format!(
+            "madd {}, {}, {}, {}",
+            op_str(&inst.operands[0]),
+            op_str(&inst.operands[1]),
+            op_str(&inst.operands[2]),
+            op_str(&inst.operands[3])
+        ),
         ArmOpcode::Msub => format!(
             "msub {}, {}, {}, {}",
             op_str(&inst.operands[0]),

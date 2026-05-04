@@ -41,7 +41,8 @@ pub enum ArmOpcode {
     SubImm,  // SUB Xd, Xn, #imm
     Mul,     // MUL Xd, Xn, Xm
     Sdiv,    // SDIV Xd, Xn, Xm
-    Msub,    // MSUB Xd, Xn, Xm, Xa  (for imod: a - (a/b)*b)
+    Madd,    // MADD Xd, Xn, Xm, Xa   (Xa + Xn*Xm; produced by mul-add peephole)
+    Msub,    // MSUB Xd, Xn, Xm, Xa   (Xa - Xn*Xm; for imod and the mul-sub peephole)
     Neg,     // NEG Xd, Xm  (alias: SUB Xd, XZR, Xm)
 
     // ---- Logic ----
