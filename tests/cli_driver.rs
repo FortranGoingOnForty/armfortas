@@ -12126,6 +12126,52 @@ fn rank_n_section_scalar_broadcast_writes_every_element() {
 }
 
 #[test]
+fn complex_module_function_result_routes_through_hidden_buffer() {
+    // F2018 §15.6: a complex(k) function result is a value of category
+    // Complex(kind=k). Pre-fix, the IR-level return type was the
+    // [Float x 2] aggregate value; codegen packed the 8 (sp) or 16 (dp)
+    // bytes into x0 as if returning an integer. The caller's
+    // post-call memcpy then read x0 *as a pointer*, dereferencing the
+    // raw bit pattern of (3.0, 4.0) — usually SEGV, sometimes garbage.
+    // Fix routes complex scalar results through ComplexBuffer ABI:
+    // caller alloca's the 8/16-byte buffer, passes its address as a
+    // hidden first param; callee writes the two float lanes through
+    // that pointer and returns void.
+    //
+    // Simultaneously the hidden first param's IR type must be the
+    // typed complex pointer (`Ptr<[Float x 2]>`) rather than a generic
+    // byte buffer — otherwise generic dispatch on the result variable
+    // (e.g. `kahan_kernel(p, ...)` inside a complex-returning function)
+    // sees `Ptr<[I8 x 8]>` and rejects every complex-formal candidate.
+    let src = write_program(
+        "module m\n  implicit none\ncontains\n  pure elemental subroutine kk_csp(a, s, c)\n    complex, intent(in) :: a\n    complex, intent(inout) :: s, c\n    complex :: t, y\n    y = a - c\n    t = s + y\n    c = (t - s) - y\n    s = t\n  end subroutine\n  pure elemental subroutine kk_sp(a, s, c)\n    real, intent(in) :: a\n    real, intent(inout) :: s, c\n    real :: t, y\n    y = a - c\n    t = s + y\n    c = (t - s) - y\n    s = t\n  end subroutine\n  interface kahan_kernel\n    module procedure kk_sp\n    module procedure kk_csp\n  end interface\n  pure module function dot_kahan(a, b) result(p)\n    complex, intent(in) :: a(:), b(:)\n    complex :: p\n    integer :: i\n    complex :: c\n    c = (0.0, 0.0)\n    p = (0.0, 0.0)\n    do i = 1, size(a)\n      call kahan_kernel(a(i)*b(i), p, c)\n    end do\n  end function\n  function get_c() result(r)\n    complex :: r\n    r = (3.0, 4.0)\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  complex :: r, a(3), b(3)\n  r = get_c()\n  if (r%re /= 3.0) error stop 1\n  if (r%im /= 4.0) error stop 2\n  a = [(1.0,0.0), (2.0,0.0), (3.0,0.0)]\n  b = [(1.0,0.0), (2.0,0.0), (3.0,0.0)]\n  r = dot_kahan(a, b)\n  if (abs(r%re - 14.0) > 1.0e-5) error stop 3\n  if (abs(r%im) > 1.0e-5) error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("complex_module_function_hidden_buffer", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected 'ok': {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn rank_remap_pointer_assignment_builds_2d_descriptor() {
     // F2018 §10.2.2.3: `pmat(L1:U1, L2:U2) => array1d` reinterprets a
     // contiguous 1-D target as a 2-D array. The destination descriptor
