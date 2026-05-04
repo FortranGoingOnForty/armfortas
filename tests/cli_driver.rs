@@ -11960,6 +11960,46 @@ fn default_assumed_shape_dummy_rebases_lower_to_one_per_f2018() {
 }
 
 #[test]
+fn rank_n_array_compare_yields_same_shape_logical_descriptor_per_f2018() {
+    // F2018 §10.1.5: a relational op over an array operand yields a
+    // logical array of the SAME SHAPE — same rank, same extents — as
+    // the operand. F2018 §6.5.3.5(2): every fresh array expression
+    // is 1-based regardless of operand bounds.  Pre-fix
+    // `lower_rank1_array_compare_descriptor` hardcoded the result
+    // descriptor to rank=1 with `lower=1, upper=total_flat_size`,
+    // so for `m = (y > 3.)` over a rank-2 `y(2,3)` the mask had
+    // `(rank=1, lower=1, upper=6)` — fine for serial element walks
+    // but corrupting downstream code that reads the mask through a
+    // rank-2 dummy `mask(:,:)` (e.g. stdlib's `var(y, dim, mask)`).
+    let src = write_program(
+        "program p\n  implicit none\n  real :: y(2,3) = reshape([1.,2.,3.,4.,5.,6.], [2,3])\n  logical :: m(2,3)\n  m = y > 3.\n  if (.not. (size(shape(m)) == 2)) error stop 1\n  if (size(m,1) /= 2) error stop 2\n  if (size(m,2) /= 3) error stop 3\n  if (m(1,1) .or. m(2,1) .or. m(1,2)) error stop 4\n  if (.not. (m(2,2) .and. m(1,3) .and. m(2,3))) error stop 5\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("rank_n_compare_shape", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "run failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected 'ok': {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn rank_remap_pointer_assignment_builds_2d_descriptor() {
     // F2018 §10.2.2.3: `pmat(L1:U1, L2:U2) => array1d` reinterprets a
     // contiguous 1-D target as a 2-D array. The destination descriptor
