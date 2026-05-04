@@ -34513,6 +34513,50 @@ fn array_function_result_elem_type(
                 return None;
             }
 
+            // PRE-PROBE BAIL: if no resolution candidate has the
+            // ArrayDescriptor hidden-result ABI, this callee can't
+            // return an array — return None early without probing
+            // arguments. Probing each arg via
+            // `generic_dispatch_probe_value` recursively materialises
+            // section descriptors for any `arr(i:)` actuals, and that
+            // materialisation is unconditional (it emits IR even when
+            // the eventual answer is "no, ieor is scalar"). Skipping
+            // the probe for non-array-returning callees collapses the
+            // duplicate-section explosion observed in
+            // stdlib_hash_32bit_water's `int8_water_hash` (15.6MB
+            // stack frame from 20K+ wasted ArrayDescriptor allocas
+            // along nested-call argument chains).
+            //
+            // Safe because the only output of this function is the
+            // result element type when hidden_abi == ArrayDescriptor.
+            // If no candidate has that abi, the post-probe code at
+            // the original return point also returned None — we just
+            // skip the side effects.
+            {
+                let resolved_name_pre = name.clone();
+                let resolved_key_pre = resolved_name_pre.to_lowercase();
+                let (default_call_name, default_callee_key) =
+                    resolved_symbol_call_target(st, &resolved_key_pre, &resolved_name_pre);
+                let mut pre_abi_lookup_keys = procedure_abi_lookup_keys(
+                    st,
+                    &[default_call_name.as_str(), &default_callee_key, &key],
+                );
+                if let Some(generic_sym) = find_named_interface_symbol(st, &key) {
+                    for specific in &generic_sym.arg_names {
+                        pre_abi_lookup_keys.push(specific.to_lowercase());
+                    }
+                }
+                let any_array_returning = pre_abi_lookup_keys.iter().any(|k| {
+                    matches!(
+                        callee_hidden_result_abi(st, k),
+                        Some(HiddenResultAbi::ArrayDescriptor)
+                    )
+                });
+                if !any_array_returning {
+                    return None;
+                }
+            }
+
             let arg_slots = reorder_args_by_keyword_slots(args, &key, st);
             let present_args: Vec<crate::ast::expr::Argument> =
                 arg_slots.iter().flatten().cloned().collect();
