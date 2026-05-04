@@ -25769,6 +25769,91 @@ fn int64_array_scalar_broadcast_init_clears_upper_half() {
 }
 
 #[test]
+fn nested_call_chain_with_array_section_args_keeps_frame_bounded() {
+    // Regression: `array_function_result_elem_type` called
+    // `generic_dispatch_probe_value` on every argument before
+    // checking whether the callee even returns an array.  Each
+    // probe re-lowered the argument expression — including any
+    // `arr(i:)` section actuals, which materialise a fresh
+    // ArrayDescriptor (384 bytes) + DimDescriptor (24 bytes) on
+    // the stack via `afs_create_section`.  When the same
+    // expression is wrapped through a chain of scalar-returning
+    // calls (e.g. stdlib_hash_32bit_water's
+    // `watermum(ieor(waterr32(key(i:)), h), …)`) the probe recurses
+    // and emits the section materialisation N times per
+    // source-level slice — for `int8_water_hash` the prologue ended
+    // up at 958 × 16K = ~15.6MB of stack alloca, which crashed past
+    // the macOS guard page.  The fix bails out in
+    // `array_function_result_elem_type` before any probing when no
+    // candidate of the callee has the ArrayDescriptor hidden-result
+    // ABI (i.e. the call cannot return an array — `ieor`, `+`,
+    // user-defined scalar functions etc.), so the recursive probe
+    // chain collapses.
+    //
+    // Asserts: the `int8_water_hash`-shaped repro now runs to
+    // completion (rather than EXC_BAD_ACCESS in the prologue), and
+    // the emitted assembly's outer-function 16K stack-probe count
+    // is bounded — confirms the prologue alloca didn't reappear at
+    // pathological scale.  The exact probe count depends on the
+    // surrounding optimization passes; we assert "well under the
+    // pre-fix worst case" rather than a single number.
+    let src = write_program(
+        "module wmin\n  use iso_fortran_env, only: int8, int32, int64\n  implicit none\ncontains\n  pure function water_simple(key, seed) result(hash_code)\n    integer(int32) :: hash_code\n    integer(int8), intent(in) :: key(0:)\n    integer(int64), intent(in) :: seed\n    integer(int64) :: h, i\n    integer(int64), parameter :: waterp2 = int(z'8ebc6af1', int64), waterp3 = int(z'589965cd', int64)\n    h = seed; i = 0_int64\n    h = ieor(watermum(ieor(waterr32(key(i:)), h), &\n                      ieor(waterr32(key(i+4:)), waterp2)),   &\n             watermum(h, ieor(waterr16(key(i+8:)), waterp3)))\n    hash_code = int(h, int32)\n  contains\n    pure function watermum(a, b) result(r)\n      integer(int64) :: r\n      integer(int64), intent(in) :: a, b\n      r = a * b\n    end function\n    pure function waterr16(p) result(v)\n      integer(int64) :: v\n      integer(int8), intent(in) :: p(:)\n      v = transfer( [ p(1), p(2), 0_int8, 0_int8, 0_int8, 0_int8, 0_int8, 0_int8 ], v )\n    end function\n    pure function waterr32(p) result(v)\n      integer(int64) :: v\n      integer(int8), intent(in) :: p(:)\n      v = transfer( [ p(1), p(2), p(3), p(4), 0_int8, 0_int8, 0_int8, 0_int8 ], v )\n    end function\n  end function\nend module\n\nprogram p\n  use wmin\n  use iso_fortran_env, only: int8, int64\n  implicit none\n  integer(int8) :: arr(0:14) = [(int(j, int8), j=1,15)]\n  integer(int64) :: s = 0\n  integer :: j\n  print '(z16)', water_simple(arr, s)\nend program\n",
+        "f90",
+    );
+    let out = unique_path("water_hash_frame", "bin");
+    let asm = unique_path("water_hash_frame", "s");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("water-hash-frame compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "water-hash-frame compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let asm_compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-S", "-o", asm.to_str().unwrap()])
+        .output()
+        .expect("water-hash-frame -S failed to spawn");
+    assert!(
+        asm_compile.status.success(),
+        "water-hash-frame -S compile failed: {}",
+        String::from_utf8_lossy(&asm_compile.stderr)
+    );
+    let asm_text = std::fs::read_to_string(&asm).expect("read asm");
+    let outer_fn_marker = "_afs_modproc_wmin_water_simple:";
+    let outer_start = asm_text
+        .find(outer_fn_marker)
+        .expect("outer function symbol present in asm");
+    // Count the 16K stack-probe pattern within the outer function's
+    // prologue. The probe is `movz x16, #16384 ; sub sp, sp, x16`.
+    // Pre-fix: ~958. Post-fix: well under 50 for this shape.
+    let probes_to_next_label = asm_text[outer_start..]
+        .lines()
+        .take_while(|line| !line.trim_start().starts_with("_afs_modproc_") || line.contains("water_simple:"))
+        .filter(|line| line.contains("movz x16, #16384"))
+        .count();
+    assert!(
+        probes_to_next_label < 60,
+        "water_simple prologue still emits {} 16K stack probes (pre-fix was 380+, post-fix should be well under 60). \
+         The fix in array_function_result_elem_type may have regressed.",
+        probes_to_next_label
+    );
+    let run = Command::new(&out).output().expect("water-hash-frame run failed");
+    assert!(
+        run.status.success(),
+        "water-hash-frame run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&asm);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn allocate_deferred_char_writes_zero_to_stat() {
     // F2018 §9.7.1.3: after a successful ALLOCATE the stat-variable
     // must equal zero. The deferred-length character paths in
