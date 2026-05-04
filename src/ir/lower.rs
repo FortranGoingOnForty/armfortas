@@ -121,6 +121,15 @@ enum HiddenResultAbi {
     ArrayDescriptor,
     StringDescriptor,
     DerivedAggregate,
+    /// Complex scalar function result. Caller allocates an 8-byte
+    /// (real(sp)) or 16-byte (real(dp)) buffer, passes its address as
+    /// the hidden first param; callee writes the two float lanes
+    /// through that pointer and returns void. Without this, the
+    /// IR-level return type was `[Float x 2]` aggregate which codegen
+    /// packed into x0 as 8 bytes — the caller then memcpy'd from x0
+    /// treating the value AS a pointer (SEGV on first complex-returning
+    /// call to e.g. stdlib's `gamma_dist_pdf_csp`).
+    ComplexBuffer,
 }
 
 /// Info about a local variable.
@@ -991,6 +1000,17 @@ fn function_hidden_result_abi(
             {
                 return HiddenResultAbi::DerivedAggregate;
             }
+            // Complex scalar result with explicit declaration: route through
+            // the hidden output buffer ABI. Without this, codegen returns
+            // the [Float x 2] aggregate value packed in x0 and the caller
+            // memcpys that pattern as a pointer, dereferencing the bytes
+            // of the complex literal as an address (SEGV).
+            if matches!(type_spec, TypeSpec::Complex(_) | TypeSpec::DoubleComplex)
+                && !decl_is_pointer(&result_key, decls)
+                && bind.is_none()
+            {
+                return HiddenResultAbi::ComplexBuffer;
+            }
             return HiddenResultAbi::None;
         }
     }
@@ -1006,6 +1026,14 @@ fn function_hidden_result_abi(
         } else {
             HiddenResultAbi::StringDescriptor
         };
+    }
+    // Complex scalar result: route through the hidden-output-pointer ABI
+    // (caller alloca's 8 or 16 bytes, callee writes through the pointer).
+    // Without this, codegen emits `load %0; ret aggregate` and packs the
+    // 8 bytes into x0 — caller treats x0 as ptr and memcpy's from it,
+    // dereferencing the bit pattern of the complex value as an address.
+    if matches!(return_type, Some(TypeSpec::Complex(_)) | Some(TypeSpec::DoubleComplex)) {
+        return HiddenResultAbi::ComplexBuffer;
     }
     HiddenResultAbi::None
 }
@@ -4569,12 +4597,47 @@ fn lower_unit(
                             .and_then(|dt_name| type_layouts.get(&dt_name).map(|layout| layout.size.max(1) as u64))
                             .unwrap_or(8)
                     }
+                    HiddenResultAbi::ComplexBuffer => {
+                        // 8 bytes for complex(sp), 16 for complex(dp).
+                        match return_type {
+                            Some(TypeSpec::Complex(sel)) => {
+                                let kind = extract_kind_with_context(sel, 4, None, Some(st));
+                                if kind == 8 { 16 } else { 8 }
+                            }
+                            Some(TypeSpec::DoubleComplex) => 16,
+                            _ => 8,
+                        }
+                    }
                     HiddenResultAbi::None => 0,
                 };
-                let desc_ptr_ty = IrType::Ptr(Box::new(IrType::Array(
-                    Box::new(IrType::Int(IntWidth::I8)),
-                    desc_size,
-                )));
+                // For ComplexBuffer, type the hidden first param as a typed
+                // complex pointer (`Ptr<[Float x 2]>`) rather than a generic
+                // byte buffer. The result variable's `addr` is `ValueId(0)`,
+                // and any pass-by-reference of the result variable to a
+                // generic call site uses that addr's IR type for dispatch.
+                // A `Ptr<[i8 x 8]>` would mismatch a `complex(sp)` formal
+                // (Float vs I8 element), causing dispatch failures for
+                // calls like `kahan_kernel(..., p, ...)` inside
+                // complex-returning module functions.
+                let desc_ptr_ty = if hidden_result_abi == HiddenResultAbi::ComplexBuffer {
+                    let fw = match return_type {
+                        Some(TypeSpec::Complex(sel)) => {
+                            if extract_kind_with_context(sel, 4, None, Some(st)) == 8 {
+                                FloatWidth::F64
+                            } else {
+                                FloatWidth::F32
+                            }
+                        }
+                        Some(TypeSpec::DoubleComplex) => FloatWidth::F64,
+                        _ => FloatWidth::F32,
+                    };
+                    IrType::Ptr(Box::new(IrType::Array(Box::new(IrType::Float(fw)), 2)))
+                } else {
+                    IrType::Ptr(Box::new(IrType::Array(
+                        Box::new(IrType::Int(IntWidth::I8)),
+                        desc_size,
+                    )))
+                };
                 let sret = Param {
                     name: "_sret".into(),
                     ty: desc_ptr_ty,
@@ -4952,6 +5015,46 @@ fn lower_unit(
                     );
                     ctx.result_addr = Some(ValueId(0));
                     ctx.result_type = Some(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                } else if hidden_result_abi == HiddenResultAbi::ComplexBuffer {
+                    // The hidden first param is the caller-allocated complex
+                    // buffer. The body's `result = (...)` lowers through the
+                    // complex-assign path that memcpys 8/16 bytes into the
+                    // result variable's `addr` — pointing addr at the sret
+                    // param routes the write straight into the caller's buf.
+                    let fw = match return_type {
+                        Some(TypeSpec::Complex(sel)) => {
+                            if extract_kind_with_context(sel, 4, None, Some(st)) == 8 {
+                                FloatWidth::F64
+                            } else {
+                                FloatWidth::F32
+                            }
+                        }
+                        Some(TypeSpec::DoubleComplex) => FloatWidth::F64,
+                        _ => FloatWidth::F32,
+                    };
+                    let cplx_ty =
+                        IrType::Array(Box::new(IrType::Float(fw)), 2);
+                    ctx.locals.insert(
+                        result_name.clone(),
+                        LocalInfo {
+                            addr: ValueId(0),
+                            ty: cplx_ty.clone(),
+                            dims: vec![],
+                            allocatable: false,
+                            descriptor_arg: false,
+                            by_ref: false,
+                            char_kind: CharKind::None,
+                            derived_type: None,
+                            inline_const: None,
+                            is_pointer: false,
+                            runtime_dim_upper: vec![],
+                            is_class: false,
+                            logical_kind: None,
+                            last_dim_assumed_size: false,
+                        },
+                    );
+                    ctx.result_addr = Some(ValueId(0));
+                    ctx.result_type = Some(IrType::Ptr(Box::new(cplx_ty)));
                 } else if hidden_result_abi == HiddenResultAbi::StringDescriptor {
                     // Scalar character results use the hidden StringDescriptor
                     // ABI, but the body still writes to a normal local result
@@ -5120,7 +5223,7 @@ fn lower_unit(
                         derived_type_name_for_result_var(return_type, &result_name, decls);
                     let skip = if matches!(
                         hidden_result_abi,
-                        HiddenResultAbi::ArrayDescriptor | HiddenResultAbi::DerivedAggregate
+                        HiddenResultAbi::ArrayDescriptor | HiddenResultAbi::DerivedAggregate | HiddenResultAbi::ComplexBuffer
                     ) {
                         Some(ValueId(0))
                     } else if !result_is_pointer && derived_result_type.is_some() {
@@ -20750,6 +20853,10 @@ fn callee_hidden_result_abi(st: &SymbolTable, callee_name: &str) -> Option<Hidde
         }
         _ if sym.attrs.allocatable => Some(HiddenResultAbi::ArrayDescriptor),
         TypeInfo::Derived(_) if !sym.attrs.pointer => Some(HiddenResultAbi::DerivedAggregate),
+        // Complex scalar return: hidden output pointer, caller-allocated buffer.
+        // Mirrors function_hidden_result_abi (definition side) so calls
+        // resolved via SymbolTable see the same ABI as direct lowering.
+        TypeInfo::Complex { .. } if !sym.attrs.pointer => Some(HiddenResultAbi::ComplexBuffer),
         _ => None,
     }
 }
@@ -41103,6 +41210,21 @@ fn hidden_result_temp_bytes_for_callee(
                 first_procedure_lookup(abi_lookup_keys, |k| callee_return_derived_type_name(st, k))?;
             let layout = type_layouts?.get(&type_name)?;
             Some(layout.size.max(1) as u64)
+        }
+        HiddenResultAbi::ComplexBuffer => {
+            // Look up the callee's symbol to determine the complex kind
+            // (sp → 8 bytes, dp → 16 bytes). Defaults to sp (8) if the
+            // symbol can't be resolved — same fallback DerivedAggregate
+            // uses for missing layouts.
+            use crate::sema::symtab::TypeInfo;
+            let kind_bytes = abi_lookup_keys.iter().find_map(|k| {
+                let sym = st.find_symbol_any_scope(&k.to_lowercase())?;
+                match sym.type_info.as_ref()? {
+                    TypeInfo::Complex { kind } => Some(kind.unwrap_or(4) as u64 * 2),
+                    _ => None,
+                }
+            }).unwrap_or(8);
+            Some(kind_bytes)
         }
     }
 }
