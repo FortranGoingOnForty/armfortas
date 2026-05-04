@@ -2610,7 +2610,11 @@ fn collect_implicit_locals(
         // layer (e.g. module procedures, use-associated symbols whose
         // globals we don't synthesise, interface generics) are
         // skipped so we don't shadow them with a bogus implicit alloca.
-        if ctx.st.find_symbol_any_scope(&key).is_some() {
+        if ctx
+            .st
+            .lookup_local_then_any(ctx.proc_scope_id, &key)
+            .is_some()
+        {
             continue;
         }
 
@@ -13971,7 +13975,10 @@ fn try_defined_assignment(
     lhs_key: &str,
     rhs: &crate::ast::expr::SpannedExpr,
 ) -> bool {
-    let sym = match ctx.st.find_symbol_any_scope("assignment(=)") {
+    let sym = match ctx
+        .st
+        .lookup_local_then_any(ctx.proc_scope_id, "assignment(=)")
+    {
         Some(s) if s.kind == crate::sema::symtab::SymbolKind::NamedInterface => s,
         _ => return false,
     };
@@ -25972,7 +25979,7 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             };
             let src_key = src_name.to_lowercase();
             let Some(src_info) = ctx.locals.get(&src_key).cloned() else {
-                if let Some(sym) = ctx.st.find_symbol_any_scope(&src_key) {
+                if let Some(sym) = ctx.st.lookup_local_then_any(ctx.proc_scope_id, &src_key) {
                     if matches!(
                         sym.kind,
                         crate::sema::symtab::SymbolKind::Function
@@ -36199,7 +36206,10 @@ fn lower_array_assign(
         .is_some_and(|layout| derived_layout_needs_deep_copy(layout, ctx.type_layouts));
 
     let dest_symbol_allocatable = (!dest_name.is_empty())
-        .then(|| ctx.st.find_symbol_any_scope(&dest_name.to_lowercase()))
+        .then(|| {
+            ctx.st
+                .lookup_local_then_any(ctx.proc_scope_id, &dest_name.to_lowercase())
+        })
         .flatten()
         .map(|sym| sym.attrs.allocatable)
         .unwrap_or(false);

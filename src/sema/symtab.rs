@@ -282,6 +282,33 @@ impl SymbolTable {
         result
     }
 
+    /// Sprint 08: scope-correct lookup with all-scope fallback.
+    ///
+    /// Tries `lookup_in(proc_scope_id, name)` first — that walks
+    /// local → USE associations → transitive USE → host scope per
+    /// Fortran's normal name resolution order, returning the symbol
+    /// the source actually refers to. If `proc_scope_id` is `None`
+    /// (or the scoped lookup misses), falls back to
+    /// `find_symbol_any_scope`, which scans every scope without
+    /// regard to visibility.
+    ///
+    /// The fallback preserves prior behavior — this helper is a
+    /// stepping stone, not a behavior change. Call sites in
+    /// `src/ir/lower/**` should migrate to this helper as part of
+    /// killing `find_symbol_any_scope` (see `feedback_lookup_discipline.md`).
+    pub fn lookup_local_then_any(
+        &self,
+        proc_scope_id: Option<ScopeId>,
+        name: &str,
+    ) -> Option<&Symbol> {
+        if let Some(scope_id) = proc_scope_id {
+            if let Some(sym) = self.lookup_in(scope_id, name) {
+                return Some(sym);
+            }
+        }
+        self.find_symbol_any_scope(name)
+    }
+
     /// Search ALL scopes for a symbol by name.
     /// Used during lowering when the current scope may not be set correctly.
     /// Prefers parameter symbols (for kind resolution) but returns any match.
