@@ -6,10 +6,13 @@
 //! ## Module layout
 //!
 //! `lower` is undergoing a multi-sprint decomposition (see
-//! `.docs/sprints/sprint-04-lower-phase1-extractions.md`). Today
-//! everything lives in `core` and this module is a thin re-export. As
-//! features extract into focused submodules (`ctx`, `const_scalar`,
-//! `helpers`, ...) they get re-exported here.
+//! `.docs/sprints/sprint-04-lower-phase1-extractions.md`). The
+//! big body still lives in `core`; focused submodules peel off as
+//! the sprint progresses (`ctx` lifted in step 2). Public re-exports
+//! preserve the historical `crate::ir::lower::*` API.
 
 mod core;
+mod ctx;
+
 pub use core::*;
+pub(crate) use ctx::CharKind;
