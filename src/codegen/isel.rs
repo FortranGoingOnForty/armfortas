@@ -689,65 +689,11 @@ fn select_inst(
                 return;
             }
             InstKind::IAdd(a, b) => {
-                let dest_slot = ctx.lookup_wide_slot(inst.id);
-                let lhs_slot = ctx.lookup_wide_slot(*a);
-                let rhs_slot = ctx.lookup_wide_slot(*b);
-                emit_load_phys_i128_pair(
-                    mf,
-                    mb,
-                    MachineOperand::PhysReg(PhysReg::FP),
-                    lhs_slot as i64,
-                    PhysReg::Gp(16),
-                    PhysReg::Gp(17),
-                );
-                emit_i128_add_from_slot(
-                    mf,
-                    mb,
-                    MachineOperand::PhysReg(PhysReg::FP),
-                    rhs_slot as i64,
-                    PhysReg::Gp(16),
-                    PhysReg::Gp(17),
-                    PhysReg::Gp(8),
-                );
-                emit_store_phys_i128_pair(
-                    mf,
-                    mb,
-                    MachineOperand::PhysReg(PhysReg::FP),
-                    dest_slot as i64,
-                    PhysReg::Gp(16),
-                    PhysReg::Gp(17),
-                );
+                emit_i128_binop_via_slots(mf, ctx, mb, I128BinOp::Add, inst.id, *a, *b);
                 return;
             }
             InstKind::ISub(a, b) => {
-                let dest_slot = ctx.lookup_wide_slot(inst.id);
-                let lhs_slot = ctx.lookup_wide_slot(*a);
-                let rhs_slot = ctx.lookup_wide_slot(*b);
-                emit_load_phys_i128_pair(
-                    mf,
-                    mb,
-                    MachineOperand::PhysReg(PhysReg::FP),
-                    lhs_slot as i64,
-                    PhysReg::Gp(16),
-                    PhysReg::Gp(17),
-                );
-                emit_i128_sub_from_slot(
-                    mf,
-                    mb,
-                    MachineOperand::PhysReg(PhysReg::FP),
-                    rhs_slot as i64,
-                    PhysReg::Gp(16),
-                    PhysReg::Gp(17),
-                    PhysReg::Gp(8),
-                );
-                emit_store_phys_i128_pair(
-                    mf,
-                    mb,
-                    MachineOperand::PhysReg(PhysReg::FP),
-                    dest_slot as i64,
-                    PhysReg::Gp(16),
-                    PhysReg::Gp(17),
-                );
+                emit_i128_binop_via_slots(mf, ctx, mb, I128BinOp::Sub, inst.id, *a, *b);
                 return;
             }
             InstKind::INeg(a) => {
@@ -1565,45 +1511,19 @@ fn select_inst(
         }
 
         InstKind::Load(addr) => {
+            // Audit CRITICAL-2: dispatch on the IR result type so the
+            // load opcode width matches the value, not the pointer.
+            // Previously every integer load used `ldr w_, [_]` regardless
+            // of width, silently reading 4 bytes for an i8 load.
             let class = type_to_reg_class(&inst.ty);
             let dest = ctx.get_vreg(mf, inst.id, class);
-            // Pick the load opcode by element width. i8 → LDRSB
-            // (sign-extended into Wt), i16 → LDRSH, i32/Bool → LDR
-            // Wt, i64/ptr → LDR Xt, FP → LDR Dt/St. Audit
-            // CRITICAL-2: previously every integer load used the
-            // 32-bit `ldr w_, [_]` regardless of width, so an i8
-            // load read 4 bytes and the result depended on what
-            // happened to follow the byte in memory.
-            let opcode = match &inst.ty {
-                IrType::Int(IntWidth::I8) | IrType::Bool => ArmOpcode::LdrsbImm,
-                IrType::Int(IntWidth::I16) => ArmOpcode::LdrshImm,
-                IrType::Float(_) => ArmOpcode::LdrFpImm,
-                _ => ArmOpcode::LdrImm,
-            };
-
-            // If addr is an alloca, load directly from the frame slot.
-            if let Some(&offset) = ctx.alloca_offsets.get(addr) {
-                mf.block_mut(mb).insts.push(MachineInst {
-                    opcode,
-                    operands: vec![
-                        MachineOperand::VReg(dest),
-                        MachineOperand::PhysReg(PhysReg::FP),
-                        MachineOperand::FrameSlot(offset),
-                    ],
-                    def: Some(dest),
-                });
-            } else {
-                let base = ctx.lookup_vreg(*addr);
-                mf.block_mut(mb).insts.push(MachineInst {
-                    opcode,
-                    operands: vec![
-                        MachineOperand::VReg(dest),
-                        MachineOperand::VReg(base),
-                        MachineOperand::Imm(0),
-                    ],
-                    def: Some(dest),
-                });
-            }
+            let opcode = load_opcode_for(&inst.ty, class);
+            let (base_op, offset_op) = narrow_load_store_addr(ctx, *addr);
+            mf.block_mut(mb).insts.push(MachineInst {
+                opcode,
+                operands: vec![MachineOperand::VReg(dest), base_op, offset_op],
+                def: Some(dest),
+            });
         }
 
         InstKind::Store(val, addr) => {
@@ -1641,57 +1561,24 @@ fn select_inst(
             }
 
             let val_vreg = ctx.lookup_vreg(*val);
-            // Audit CRITICAL-2: pick the store opcode by the IR
-            // VALUE's declared type, not the pointer's pointee.
-            // Byte-level GEPs into derived types and array
-            // constructors use Ptr<i8> as a generic offset cursor
-            // even when the actual element being stored is i32 —
-            // checking the pointee in those cases would
-            // incorrectly emit STRB and write only 1 byte.
-            //
-            // The value's IR type is the source of truth for
-            // store width. STRB / STRH are only used when the
-            // value itself is i8/i16/Bool.
+            // Audit CRITICAL-2: dispatch on the *value*'s declared IR
+            // type, not the pointer's pointee — byte-level GEPs into
+            // derived types and array constructors reuse `Ptr<i8>` as a
+            // generic offset cursor, so dispatching by the pointee
+            // would silently truncate non-byte stores.
             let val_ty = func.value_type(*val);
-            let opcode = match &val_ty {
-                Some(IrType::Int(IntWidth::I8)) | Some(IrType::Bool) => ArmOpcode::StrbImm,
-                Some(IrType::Int(IntWidth::I16)) => ArmOpcode::StrhImm,
-                Some(IrType::Float(_)) => ArmOpcode::StrFpImm,
-                _ => {
-                    // Default to the value's reg class for any
-                    // other case (i32, i64, ptr).
-                    let val_class = mf.vregs.iter().find(|v| v.id == val_vreg).map(|v| v.class);
-                    let is_fp = matches!(val_class, Some(RegClass::Fp32) | Some(RegClass::Fp64));
-                    if is_fp {
-                        ArmOpcode::StrFpImm
-                    } else {
-                        ArmOpcode::StrImm
-                    }
-                }
-            };
-
-            if let Some(&offset) = ctx.alloca_offsets.get(addr) {
-                mf.block_mut(mb).insts.push(MachineInst {
-                    opcode,
-                    operands: vec![
-                        MachineOperand::VReg(val_vreg),
-                        MachineOperand::PhysReg(PhysReg::FP),
-                        MachineOperand::FrameSlot(offset),
-                    ],
-                    def: None,
-                });
-            } else {
-                let base = ctx.lookup_vreg(*addr);
-                mf.block_mut(mb).insts.push(MachineInst {
-                    opcode,
-                    operands: vec![
-                        MachineOperand::VReg(val_vreg),
-                        MachineOperand::VReg(base),
-                        MachineOperand::Imm(0),
-                    ],
-                    def: None,
-                });
-            }
+            let val_class = mf.vregs
+                .iter()
+                .find(|v| v.id == val_vreg)
+                .map(|v| v.class)
+                .unwrap_or(RegClass::Gp64);
+            let opcode = store_opcode_for(val_ty.as_ref(), val_class);
+            let (base_op, offset_op) = narrow_load_store_addr(ctx, *addr);
+            mf.block_mut(mb).insts.push(MachineInst {
+                opcode,
+                operands: vec![MachineOperand::VReg(val_vreg), base_op, offset_op],
+                def: None,
+            });
         }
 
         InstKind::GetElementPtr(base, indices) => {
@@ -2433,21 +2320,12 @@ fn emit_load_stack_arg_into_vreg(
     ty: &IrType,
     offset: i64,
 ) {
-    let opcode = match ty {
-        IrType::Int(IntWidth::I8) | IrType::Bool => ArmOpcode::LdrsbImm,
-        IrType::Int(IntWidth::I16) => ArmOpcode::LdrshImm,
-        IrType::Float(_) => ArmOpcode::LdrFpImm,
-        _ => match class {
-            RegClass::Fp64 | RegClass::Fp32 => ArmOpcode::LdrFpImm,
-            RegClass::Gp32 | RegClass::Gp64 => ArmOpcode::LdrImm,
-        },
-    };
-    let reg_base = MachineOperand::PhysReg(PhysReg::FP);
+    let opcode = load_opcode_for(ty, class);
     mf.block_mut(mb).insts.push(MachineInst {
         opcode,
         operands: vec![
             MachineOperand::VReg(dest),
-            reg_base,
+            MachineOperand::PhysReg(PhysReg::FP),
             MachineOperand::Imm(offset),
         ],
         def: Some(dest),
@@ -2462,15 +2340,7 @@ fn emit_store_stack_arg_from_vreg(
     ty: &IrType,
     offset: i64,
 ) {
-    let opcode = match ty {
-        IrType::Int(IntWidth::I8) | IrType::Bool => ArmOpcode::StrbImm,
-        IrType::Int(IntWidth::I16) => ArmOpcode::StrhImm,
-        IrType::Float(_) => ArmOpcode::StrFpImm,
-        _ => match class {
-            RegClass::Fp64 | RegClass::Fp32 => ArmOpcode::StrFpImm,
-            RegClass::Gp32 | RegClass::Gp64 => ArmOpcode::StrImm,
-        },
-    };
+    let opcode = store_opcode_for(Some(ty), class);
     mf.block_mut(mb).insts.push(MachineInst {
         opcode,
         operands: vec![
@@ -2688,6 +2558,116 @@ fn emit_float_binop(
 }
 
 /// Map IR type to register class.
+/// Pick the load opcode for a value of the given IR type and reg class.
+/// Narrow integer types use the sign-extending byte/half loads; floats
+/// route to the FP-imm load; everything else falls through to `LdrImm`
+/// or `LdrFpImm` per reg class. The reg-class fallback matters when
+/// `ty` is a generic pointer or aggregate (e.g., a stack-arg copy that
+/// only knows the destination's register kind).
+fn load_opcode_for(ty: &IrType, class: RegClass) -> ArmOpcode {
+    match ty {
+        IrType::Int(IntWidth::I8) | IrType::Bool => ArmOpcode::LdrsbImm,
+        IrType::Int(IntWidth::I16) => ArmOpcode::LdrshImm,
+        IrType::Float(_) => ArmOpcode::LdrFpImm,
+        _ => match class {
+            RegClass::Fp64 | RegClass::Fp32 => ArmOpcode::LdrFpImm,
+            RegClass::Gp32 | RegClass::Gp64 => ArmOpcode::LdrImm,
+        },
+    }
+}
+
+/// Mirror of `load_opcode_for` for stores. Audit CRITICAL-2: the
+/// `ty` here must be the *value's* declared IR type, not the pointer
+/// or pointee — byte-level GEPs reuse `ptr<i8>` as a generic offset
+/// cursor, so dispatching by pointee width would silently truncate
+/// non-byte stores. Pass `None` for `ty` when only the reg class is
+/// available; in that case the helper falls through to the class-only
+/// branch.
+fn store_opcode_for(ty: Option<&IrType>, class: RegClass) -> ArmOpcode {
+    match ty {
+        Some(IrType::Int(IntWidth::I8)) | Some(IrType::Bool) => ArmOpcode::StrbImm,
+        Some(IrType::Int(IntWidth::I16)) => ArmOpcode::StrhImm,
+        Some(IrType::Float(_)) => ArmOpcode::StrFpImm,
+        _ => match class {
+            RegClass::Fp64 | RegClass::Fp32 => ArmOpcode::StrFpImm,
+            RegClass::Gp32 | RegClass::Gp64 => ArmOpcode::StrImm,
+        },
+    }
+}
+
+/// Resolve an IR address value to the (base, offset) operand pair
+/// expected by `LdrImm`/`StrImm`-family instructions. Alloca addresses
+/// fold to `(FP, FrameSlot(offset))` so the assembler can pick the
+/// final stack-relative form; everything else becomes
+/// `(VReg(addr_vreg), Imm(0))`. Used by both narrow-width Load/Store
+/// arms in `select_inst`. The wide-i128 paths build their own operand
+/// pairs directly because they target the `emit_*_phys_i128_pair`
+/// helpers, which take `i64` offsets and only need a base operand.
+fn narrow_load_store_addr(
+    ctx: &ISelCtx,
+    addr: ValueId,
+) -> (MachineOperand, MachineOperand) {
+    if let Some(&offset) = ctx.alloca_offsets.get(&addr) {
+        (
+            MachineOperand::PhysReg(PhysReg::FP),
+            MachineOperand::FrameSlot(offset),
+        )
+    } else {
+        let base = ctx.lookup_vreg(addr);
+        (MachineOperand::VReg(base), MachineOperand::Imm(0))
+    }
+}
+
+/// Operation tag for `emit_i128_binop_via_slots`. Add and Sub share a
+/// load-binop-store skeleton that differs only in which intermediate
+/// helper does the arithmetic.
+#[derive(Clone, Copy)]
+enum I128BinOp {
+    Add,
+    Sub,
+}
+
+/// Lower an i128 IAdd/ISub: load `lhs_id`'s slot into x16/x17, run the
+/// matching `emit_i128_<op>_from_slot` against `rhs_id`, then store
+/// the result to `dest_id`'s slot. Replaces three near-identical 30-LOC
+/// blocks in the i128 dispatch (IAdd / ISub).
+fn emit_i128_binop_via_slots(
+    mf: &mut MachineFunction,
+    ctx: &ISelCtx,
+    mb: MBlockId,
+    op: I128BinOp,
+    dest_id: ValueId,
+    lhs_id: ValueId,
+    rhs_id: ValueId,
+) {
+    let dest_slot = ctx.lookup_wide_slot(dest_id);
+    let lhs_slot = ctx.lookup_wide_slot(lhs_id);
+    let rhs_slot = ctx.lookup_wide_slot(rhs_id);
+    let fp = || MachineOperand::PhysReg(PhysReg::FP);
+    emit_load_phys_i128_pair(mf, mb, fp(), lhs_slot as i64, PhysReg::Gp(16), PhysReg::Gp(17));
+    match op {
+        I128BinOp::Add => emit_i128_add_from_slot(
+            mf,
+            mb,
+            fp(),
+            rhs_slot as i64,
+            PhysReg::Gp(16),
+            PhysReg::Gp(17),
+            PhysReg::Gp(8),
+        ),
+        I128BinOp::Sub => emit_i128_sub_from_slot(
+            mf,
+            mb,
+            fp(),
+            rhs_slot as i64,
+            PhysReg::Gp(16),
+            PhysReg::Gp(17),
+            PhysReg::Gp(8),
+        ),
+    }
+    emit_store_phys_i128_pair(mf, mb, fp(), dest_slot as i64, PhysReg::Gp(16), PhysReg::Gp(17));
+}
+
 fn type_to_reg_class(ty: &IrType) -> RegClass {
     match ty {
         IrType::Float(FloatWidth::F32) => RegClass::Fp32,
