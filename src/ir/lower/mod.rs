@@ -17,6 +17,7 @@ mod ctx;
 mod helpers;
 mod intrinsic;
 mod intrinsic_sub;
+mod stmt;
 mod unit;
 
 pub use core::*;

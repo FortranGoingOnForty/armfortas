@@ -138,7 +138,7 @@ pub(crate) fn lower_unit(
                 init_decls(&mut b, &ctx.locals, decls, st, Some(type_layouts));
                 collect_label_blocks(&mut b, body, &mut ctx.label_blocks);
                 let _proc_scope_guard = ProcScopeGuard::enter(ctx.proc_scope_id);
-                lower_stmts(&mut b, &mut ctx, body);
+                super::stmt::lower_stmts(&mut b, &mut ctx, body);
                 drop(_proc_scope_guard);
                 if b.func().block(b.current_block()).terminator.is_none() {
                     insert_implicit_dealloc(
@@ -574,7 +574,7 @@ pub(crate) fn lower_unit(
                 // Pre-create blocks for all statement labels so GOTO can branch forward.
                 collect_label_blocks(&mut b, body, &mut ctx.label_blocks);
                 let _proc_scope_guard = ProcScopeGuard::enter(ctx.proc_scope_id);
-                lower_stmts(&mut b, &mut ctx, body);
+                super::stmt::lower_stmts(&mut b, &mut ctx, body);
                 drop(_proc_scope_guard);
                 if b.func().block(b.current_block()).terminator.is_none() {
                     insert_implicit_dealloc(
@@ -1217,7 +1217,7 @@ pub(crate) fn lower_unit(
                 }
                 collect_label_blocks(&mut b, body, &mut ctx.label_blocks);
                 let _proc_scope_guard = ProcScopeGuard::enter(ctx.proc_scope_id);
-                lower_stmts(&mut b, &mut ctx, body);
+                super::stmt::lower_stmts(&mut b, &mut ctx, body);
                 drop(_proc_scope_guard);
 
                 if b.func().block(b.current_block()).terminator.is_none() {
