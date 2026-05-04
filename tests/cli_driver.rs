@@ -11960,6 +11960,48 @@ fn default_assumed_shape_dummy_rebases_lower_to_one_per_f2018() {
 }
 
 #[test]
+fn optional_assumed_shape_dummy_rebases_lower_to_one_when_present() {
+    // F2018 §15.5.2.4(13) applies to optional assumed-shape dummies
+    // too: when the actual is present, the callee's view must rebase
+    // to lbound=1 (or the declared lower) regardless of caller bounds.
+    // Pre-fix `install_assumed_shape_lower_overrides` had to skip
+    // optional dummies entirely to avoid SEGV on the absence path
+    // (callers pass a null descriptor pointer); the runtime null
+    // check now guards the load+memcpy so absent calls fall through
+    // and present calls get the correct rebase.
+    let src = write_program(
+        "program p\n  implicit none\n  real, allocatable :: array(:)\n  allocate(array(-3:3))\n  array = 0.0\n  array(0) = 7.0\n  call probe(array)\n  call probe()\ncontains\n  subroutine probe(arr)\n    real, intent(in), optional :: arr(:)\n    if (present(arr)) then\n      if (lbound(arr, 1) /= 1) error stop 1\n      if (ubound(arr, 1) /= 7) error stop 2\n      if (size(arr) /= 7) error stop 3\n      if (arr(4) /= 7.0) error stop 4\n      print *, 'present-ok'\n    else\n      print *, 'absent-ok'\n    end if\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("optional_assumed_shape_rebase", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "run failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("present-ok") && stdout.contains("absent-ok"),
+        "expected both 'present-ok' and 'absent-ok': {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn rank_n_array_compare_yields_same_shape_logical_descriptor_per_f2018() {
     // F2018 §10.1.5: a relational op over an array operand yields a
     // logical array of the SAME SHAPE — same rank, same extents — as
