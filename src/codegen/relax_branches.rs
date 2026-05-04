@@ -429,4 +429,169 @@ mod tests {
             MachineOperand::BlockRef(t) if t == target
         ));
     }
+
+    /// In-range cbz stays as a single instruction.
+    #[test]
+    fn in_range_cbz_unchanged() {
+        let mut mf = MachineFunction::new("test".into());
+        let target = mf.new_block("after");
+        let test_reg = mf.new_vreg(crate::codegen::mir::RegClass::Gp32);
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::Cbz,
+            operands: vec![
+                MachineOperand::VReg(test_reg),
+                MachineOperand::BlockRef(target),
+            ],
+            def: None,
+        });
+
+        let block_count_before = mf.blocks.len();
+        relax_branches(&mut mf);
+        assert_eq!(mf.blocks.len(), block_count_before);
+        assert_eq!(mf.blocks[0].insts.len(), 1);
+        assert_eq!(mf.blocks[0].insts[0].opcode, ArmOpcode::Cbz);
+    }
+
+    /// Out-of-range cbz expands to: cbnz reg, skip; b far. Padding
+    /// pushes the target past ±1MB so the original cbz can no longer
+    /// reach it directly. The inverted opcode (Cbnz) jumps over the
+    /// unconditional `b`, which has the full ±128MB reach and never
+    /// itself needs further relaxation.
+    #[test]
+    fn out_of_range_cbz_expands_to_inverted_skip() {
+        let mut mf = MachineFunction::new("test".into());
+        let target = mf.new_block("after_padding");
+        let padding = mf.new_block("padding");
+        let test_reg = mf.new_vreg(crate::codegen::mir::RegClass::Gp32);
+
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::Cbz,
+            operands: vec![
+                MachineOperand::VReg(test_reg),
+                MachineOperand::BlockRef(target),
+            ],
+            def: None,
+        });
+        let pad_inst_count = (COND_BRANCH_LIMIT as usize) / 4 + 16;
+        let padding_pos = mf.blocks.iter().position(|b| b.id == padding).unwrap();
+        mf.blocks[padding_pos].insts = (0..pad_inst_count)
+            .map(|_| MachineInst {
+                opcode: ArmOpcode::Nop,
+                operands: vec![],
+                def: None,
+            })
+            .collect();
+        mf.blocks.swap(1, 2);
+
+        let blocks_before = mf.blocks.len();
+        relax_branches(&mut mf);
+        assert_eq!(mf.blocks.len(), blocks_before + 1);
+        let entry = &mf.blocks[0];
+        assert_eq!(entry.insts.len(), 2);
+        assert_eq!(entry.insts[0].opcode, ArmOpcode::Cbnz, "cbz inverts to cbnz");
+        assert_eq!(entry.insts[1].opcode, ArmOpcode::B);
+        assert!(matches!(
+            entry.insts[1].operands[0],
+            MachineOperand::BlockRef(t) if t == target
+        ));
+    }
+
+    /// Out-of-range cbnz inverts to cbz on the skip path.
+    #[test]
+    fn out_of_range_cbnz_expands_to_cbz_skip() {
+        let mut mf = MachineFunction::new("test".into());
+        let target = mf.new_block("after_padding");
+        let padding = mf.new_block("padding");
+        let test_reg = mf.new_vreg(crate::codegen::mir::RegClass::Gp64);
+
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::Cbnz,
+            operands: vec![
+                MachineOperand::VReg(test_reg),
+                MachineOperand::BlockRef(target),
+            ],
+            def: None,
+        });
+        let pad_inst_count = (COND_BRANCH_LIMIT as usize) / 4 + 16;
+        let padding_pos = mf.blocks.iter().position(|b| b.id == padding).unwrap();
+        mf.blocks[padding_pos].insts = (0..pad_inst_count)
+            .map(|_| MachineInst {
+                opcode: ArmOpcode::Nop,
+                operands: vec![],
+                def: None,
+            })
+            .collect();
+        mf.blocks.swap(1, 2);
+
+        relax_branches(&mut mf);
+        let entry = &mf.blocks[0];
+        assert_eq!(entry.insts[0].opcode, ArmOpcode::Cbz, "cbnz inverts to cbz");
+    }
+
+    /// In-range tbz stays as a single instruction.
+    #[test]
+    fn in_range_tbz_unchanged() {
+        let mut mf = MachineFunction::new("test".into());
+        let target = mf.new_block("after");
+        let test_reg = mf.new_vreg(crate::codegen::mir::RegClass::Gp64);
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::Tbz,
+            operands: vec![
+                MachineOperand::VReg(test_reg),
+                MachineOperand::Imm(5),
+                MachineOperand::BlockRef(target),
+            ],
+            def: None,
+        });
+
+        let block_count_before = mf.blocks.len();
+        relax_branches(&mut mf);
+        assert_eq!(mf.blocks.len(), block_count_before);
+        assert_eq!(mf.blocks[0].insts.len(), 1);
+        assert_eq!(mf.blocks[0].insts[0].opcode, ArmOpcode::Tbz);
+    }
+
+    /// Out-of-range tbz uses the tighter ±32KB limit and expands. Tbz
+    /// is the most range-restricted of the four conditional branches
+    /// we emit, so anything past 32K-ish bytes from the branch must
+    /// trip relaxation.
+    #[test]
+    fn out_of_range_tbz_expands_to_tbnz_skip() {
+        let mut mf = MachineFunction::new("test".into());
+        let target = mf.new_block("after_padding");
+        let padding = mf.new_block("padding");
+        let test_reg = mf.new_vreg(crate::codegen::mir::RegClass::Gp64);
+
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::Tbz,
+            operands: vec![
+                MachineOperand::VReg(test_reg),
+                MachineOperand::Imm(7),
+                MachineOperand::BlockRef(target),
+            ],
+            def: None,
+        });
+        // Tbz's ±32KB range is much tighter than the ±1MB cond-branch
+        // range — only ~8K nops are needed to overflow.
+        let pad_inst_count = (TBZ_BRANCH_LIMIT as usize) / 4 + 16;
+        let padding_pos = mf.blocks.iter().position(|b| b.id == padding).unwrap();
+        mf.blocks[padding_pos].insts = (0..pad_inst_count)
+            .map(|_| MachineInst {
+                opcode: ArmOpcode::Nop,
+                operands: vec![],
+                def: None,
+            })
+            .collect();
+        mf.blocks.swap(1, 2);
+
+        let blocks_before = mf.blocks.len();
+        relax_branches(&mut mf);
+        assert_eq!(mf.blocks.len(), blocks_before + 1);
+        let entry = &mf.blocks[0];
+        assert_eq!(entry.insts.len(), 2);
+        assert_eq!(entry.insts[0].opcode, ArmOpcode::Tbnz, "tbz inverts to tbnz");
+        // Bit operand survives the rewrite.
+        assert!(matches!(entry.insts[0].operands[1], MachineOperand::Imm(7)));
+        assert_eq!(entry.insts[1].opcode, ArmOpcode::B);
+    }
 }
