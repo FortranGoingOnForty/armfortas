@@ -12085,6 +12085,47 @@ fn ieee_is_nan_over_rank_n_array_dispatches_elementally() {
 }
 
 #[test]
+fn rank_n_section_scalar_broadcast_writes_every_element() {
+    // F2018 §7.5.1.2: `a(:,:,:) = scalar` must assign the scalar to
+    // EVERY element of the rank-N section.  `lower_multi_d_section_assign`
+    // walks per-dim coords and accumulates `byte_off = Σ coord_k *
+    // dim[k].stride * elem_size`.  Pre-fix `materialize_array_descriptor_for_info`
+    // hardcoded every dim's stride to 1, so for `a(2,3,4)` distinct
+    // (i,j,k) tuples collided on identical byte offsets and only
+    // `Σ extents - rank + 1` cells got written — 7 of 24 for [2,3,4],
+    // 9 of 24 for [4,6], 5 of 9 for [3,3].  stdlib's gamma_pdf example
+    // failed visibly because `shape(:,:,:) = 2.0` and `rate(:,:,:) = 1.0`
+    // only touched the first few elements; the rank-3 elemental call
+    // then read garbage (NaN, denormals) for the bulk of x.
+    let src = write_program(
+        "program p\n  implicit none\n  real :: a(2,3,4), b(4,6), c(3,3)\n  integer :: i\n  a(:,:,:) = 7.0\n  do i = 1, 24\n    if (a(mod(i-1,2)+1, mod((i-1)/2,3)+1, (i-1)/6+1) /= 7.0) error stop 1\n  end do\n  b(:,:) = 9.0\n  if (any(b /= 9.0)) error stop 2\n  c(:,:) = 11.0\n  if (any(c /= 11.0)) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("rank_n_section_broadcast", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "run failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected 'ok': {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn rank_remap_pointer_assignment_builds_2d_descriptor() {
     // F2018 §10.2.2.3: `pmat(L1:U1, L2:U2) => array1d` reinterprets a
     // contiguous 1-D target as a 2-D array. The destination descriptor
