@@ -21084,7 +21084,30 @@ fn lower_string_expr_full(
                         None
                     }
                 });
-                match key.as_str() {
+                // F2008 §13.7: a user-defined function or generic
+                // interface with the same name as an intrinsic
+                // procedure shadows the intrinsic. The integer-context
+                // intrinsic dispatch at lower_call (line ~44128)
+                // already gates `lower_char_intrinsic` on
+                // `has_named_interface`, but the string-context arm
+                // here had no such gate. stdlib_strings does
+                // `use stdlib_string_type, only: char` and then calls
+                // `char(value, pos=i)` against a `type(string_type)`
+                // — without this gate we emitted intrinsic
+                // `afs_char(integer)` reading the descriptor as an
+                // i64, returning the low byte of the data pointer
+                // (e.g. 0x50 → all 'P's in to_c_char_from_string's
+                // output). When a NamedInterface shadows the name,
+                // skip the intrinsic match arms and fall through to
+                // the user-defined function resolution path.
+                let user_named_interface_shadows_intrinsic =
+                    find_named_interface_symbol(st, &key).is_some();
+                let intrinsic_key = if user_named_interface_shadows_intrinsic {
+                    ""
+                } else {
+                    key.as_str()
+                };
+                match intrinsic_key {
                     "trim" => {
                         if let Some(arg) = first_char_arg {
                             let (src_ptr, len_val) = lower_string_expr_full(
