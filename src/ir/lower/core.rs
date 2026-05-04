@@ -37604,6 +37604,86 @@ fn lower_array_intrinsic(
             None
         }
     });
+
+    // Sprint 09: static-fold size/lbound/ubound when both the array's
+    // shape is compile-time-known AND (for the dim-form) the dim
+    // argument is a literal. Runs before `lower_array_expr_descriptor`
+    // so we never pay for the 384-byte descriptor materialization a
+    // foldable intrinsic would otherwise trigger via the always-Some
+    // `materialize_array_descriptor_for_info` branch in that helper.
+    if let Some(info) = first_arg_info.as_ref() {
+        if !local_uses_array_descriptor(info) {
+            let dim_arg_const = || -> Option<i64> {
+                let dim_expr = match name {
+                    "size" => args.iter().enumerate().find_map(|(i, a)| {
+                        match a.keyword.as_deref() {
+                            Some(k) if k.eq_ignore_ascii_case("dim") => {
+                                if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+                                    Some(e)
+                                } else {
+                                    None
+                                }
+                            }
+                            Some(_) => None,
+                            None if i == 1 => {
+                                if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+                                    Some(e)
+                                } else {
+                                    None
+                                }
+                            }
+                            None => None,
+                        }
+                    }),
+                    "lbound" | "ubound" => args.get(1).and_then(|a| {
+                        if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+                            Some(e)
+                        } else {
+                            None
+                        }
+                    }),
+                    _ => None,
+                }?;
+                eval_const_int(dim_expr)
+            };
+            match name {
+                "size" => {
+                    if let Some(dim) = dim_arg_const() {
+                        if dim >= 1 && (dim as usize) <= info.dims.len() {
+                            let extent = info.dims[dim as usize - 1].1;
+                            let r64 = b.const_i64(extent.max(0));
+                            return Some(b.int_trunc(r64, IntWidth::I32));
+                        }
+                    } else if args.len() == 1 {
+                        // SIZE(array) with no dim: fold to product of extents.
+                        let total: i64 = info.dims.iter().map(|(_, extent)| *extent).product();
+                        let r64 = b.const_i64(total.max(0));
+                        return Some(b.int_trunc(r64, IntWidth::I32));
+                    }
+                }
+                "lbound" => {
+                    if let Some(dim) = dim_arg_const() {
+                        if dim >= 1 && (dim as usize) <= info.dims.len() {
+                            let lower = info.dims[dim as usize - 1].0;
+                            let r64 = b.const_i64(lower);
+                            return Some(b.int_trunc(r64, IntWidth::I32));
+                        }
+                    }
+                }
+                "ubound" => {
+                    if let Some(dim) = dim_arg_const() {
+                        if dim >= 1 && (dim as usize) <= info.dims.len() {
+                            let (lower, extent) = info.dims[dim as usize - 1];
+                            let r64 = b.const_i64(lower + extent - 1);
+                            return Some(b.int_trunc(r64, IntWidth::I32));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     let desc_and_ty = lower_array_expr_descriptor(
         b,
         locals,
@@ -37655,7 +37735,10 @@ fn lower_array_intrinsic(
                 None => None,
             });
             if let Some(e) = dim_arg_expr {
-                // SIZE(array, dim)
+                // SIZE(array, dim) — static fold (info known + dim literal)
+                // is handled by the early-return block at the top of
+                // `lower_array_intrinsic`; this arm runs only when the
+                // static fold didn't fire (descriptor or runtime dim).
                 {
                     let dim = lower_expr(b, locals, e, st);
                     let result64 = if let Some(info) = first_arg_info.as_ref() {
@@ -37715,6 +37798,8 @@ fn lower_array_intrinsic(
             }
         }
         "lbound" => {
+            // Sprint 09: static fold handled by the early-return block
+            // at the top of `lower_array_intrinsic`.
             if args.len() >= 2 {
                 if let crate::ast::expr::SectionSubscript::Element(e) = &args[1].value {
                     let dim = lower_expr(b, locals, e, st);
@@ -37758,6 +37843,8 @@ fn lower_array_intrinsic(
             }
         }
         "ubound" => {
+            // Sprint 09: static fold handled by the early-return block
+            // at the top of `lower_array_intrinsic`.
             if args.len() >= 2 {
                 if let crate::ast::expr::SectionSubscript::Element(e) = &args[1].value {
                     let dim = lower_expr(b, locals, e, st);
