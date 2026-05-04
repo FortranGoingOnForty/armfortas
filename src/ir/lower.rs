@@ -34905,6 +34905,16 @@ fn is_elemental_math_intrinsic(name: &str) -> bool {
         | "logical" | "conjg" | "aimag" | "dimag"
         | "mod" | "modulo" | "sign" | "dim" | "max" | "min"
         | "ichar" | "iachar" | "achar" | "char"
+        // F2018 §17.11 IEEE elemental intrinsics from `ieee_arithmetic`.
+        // Without this dispatch, `ieee_is_nan(arr)` falls through to the
+        // scalar `lower_intrinsic` arm which emits `fcmp ne desc, desc`
+        // on the array's descriptor pointer — garbage that downstream
+        // either rejects (IR verifier, "fcmp on non-float") or lets
+        // through silently to corrupt the next allocaed slot.  stdlib
+        // hits this in the rank-N branch of `median_all_*` (`if any(
+        // ieee_is_nan(x))`) for `median`, `cov`, `sort_*`, etc.
+        | "ieee_is_nan" | "ieee_is_finite" | "ieee_is_negative"
+        | "ieee_is_normal" | "ieee_signbit" | "ieee_value"
         // F2018 §16.9 character elementals — scalar form is already
         // wired in lower_intrinsic; flagging them here lets reductions
         // like `sum(len_trim(strs))` materialize the per-element
@@ -35374,22 +35384,30 @@ fn lower_rank1_elemental_call_descriptor(
         | crate::sema::symtab::TypeInfo::Class(_) => return None,
         other => (type_info_to_ir_type(&other), None),
     };
-    let one_dim = b.const_i32(1);
-    let lower = b.call(
-        FuncRef::External("afs_array_lbound".into()),
-        vec![control_desc, one_dim],
-        IrType::Int(IntWidth::I64),
-    );
-    let upper = b.call(
-        FuncRef::External("afs_array_ubound".into()),
-        vec![control_desc, one_dim],
-        IrType::Int(IntWidth::I64),
-    );
+    // F2018 §16.9: an elemental call yields a result of the SAME SHAPE
+    // (rank + per-dim extents) as the array actuals. The previous
+    // rank-1-only allocator collapsed rank-N actuals to dim 1's
+    // extent, so a `(2,3)` source produced a 2-element mask and the
+    // remaining four elements wrote past the buffer.  Use the
+    // same-shape allocator so callees see the full rank-N descriptor.
     let elem_size = result_char_len
         .map(|len| b.const_i64(len))
         .unwrap_or_else(|| b.const_i64(ir_scalar_byte_size(&result_elem_ty)));
-    let result_desc =
-        allocate_rank1_array_descriptor_with_runtime_bounds(b, lower, upper, elem_size);
+    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let zero32_for_alloc = b.const_i32(0);
+    let sz384 = b.const_i64(384);
+    b.call(
+        FuncRef::External("memset".into()),
+        vec![result_desc, zero32_for_alloc, sz384],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+    let stat_for_alloc = b.alloca(IrType::Int(IntWidth::I32));
+    b.store(zero32_for_alloc, stat_for_alloc);
+    b.call(
+        FuncRef::External("afs_allocate_like_with_elem_size".into()),
+        vec![result_desc, control_desc, elem_size, stat_for_alloc],
+        IrType::Void,
+    );
 
     let n = b.call(
         FuncRef::External("afs_array_size".into()),
