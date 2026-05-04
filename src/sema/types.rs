@@ -1063,7 +1063,17 @@ pub fn intrinsic_result_type(name: &str, args: &[FortranType]) -> Option<Fortran
         // Status inquiry.
         "is_iostat_end" | "is_iostat_eor" => Some(FortranType::default_logical()),
 
-        // IEEE arithmetic.
+        // IEEE arithmetic (F2018 §17.11). The `ieee_is_*` predicates and
+        // `ieee_signbit` are elemental and return default logical; without
+        // these entries `local_intrinsic_call_type_info` returns None, so
+        // `lower_rank1_elemental_call_descriptor` can't compute the mask
+        // result element type and bails to the rank-1-only scalarization
+        // path (which corrupts rank-N callers).
+        "ieee_is_nan"
+        | "ieee_is_finite"
+        | "ieee_is_negative"
+        | "ieee_is_normal"
+        | "ieee_signbit" => Some(FortranType::default_logical()),
         "ieee_value" => args.first().cloned(),
 
         _ => None, // Unknown intrinsic.
