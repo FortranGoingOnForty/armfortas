@@ -1052,50 +1052,6 @@ pub extern "C" fn afs_allocate_1d(desc: *mut ArrayDescriptor, elem_size: i64, n:
     );
 }
 
-/// Allocate `dest` with the same shape as `source` but a caller-provided
-/// `elem_size`. Used when an operation produces a same-shape result with
-/// a different element type (e.g. a comparison `arr > scalar` whose
-/// result is a logical array regardless of `arr`'s element type).
-///
-/// The resulting destination is always contiguous.
-#[no_mangle]
-pub extern "C" fn afs_allocate_like_with_elem_size(
-    dest: *mut ArrayDescriptor,
-    source: *const ArrayDescriptor,
-    elem_size: i64,
-    stat: *mut i32,
-) {
-    if dest.is_null() || source.is_null() {
-        if !stat.is_null() {
-            unsafe {
-                *stat = 1;
-            }
-        }
-        return;
-    }
-
-    let source = unsafe { &*source };
-    // Preserve the operand's bounds verbatim (F2018 §10.1.5: result
-    // has the same shape as the operand). Stride is forced to 1
-    // because the result is freshly allocated and contiguous; the
-    // operand's stride may have been a section's memory step.
-    let mut dims = [DimDescriptor::default(); MAX_RANK];
-    for (i, dim) in dims.iter_mut().enumerate().take(source.rank as usize) {
-        *dim = DimDescriptor {
-            lower_bound: source.dims[i].lower_bound,
-            upper_bound: source.dims[i].upper_bound,
-            stride: 1,
-        };
-    }
-
-    let dims_ptr = if source.rank > 0 {
-        dims.as_ptr()
-    } else {
-        ptr::null()
-    };
-    afs_allocate_array(dest, elem_size, source.rank, dims_ptr, stat);
-}
-
 /// Allocate `dest` with the same shape and element size as `source`.
 ///
 /// The resulting destination is always contiguous, even when `source`

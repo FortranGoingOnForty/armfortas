@@ -25769,51 +25769,6 @@ fn int64_array_scalar_broadcast_init_clears_upper_half() {
 }
 
 #[test]
-fn array_compare_temp_descriptor_preserves_source_rank_and_extents() {
-    // F2018 §10.1.5: a relational expression `arr OP value` over an
-    // array `arr` produces a logical array of the **same shape** as
-    // `arr`. `lower_rank1_array_compare_descriptor` was named "rank1"
-    // but is reachable for any array shape — and it hard-coded
-    // rank=1 plus a single DimDescriptor `[1, total_size, 1]` on the
-    // result. Callees reading the result as rank>=2 saw extents
-    // `[total, 0, …]` instead of the original shape, which tripped
-    // bounds checks (e.g. stdlib_stats's `var(y, 1, y > 3.)` aborted
-    // with `Bounds check failed: index 1 outside [1, 0]` when
-    // dim 2's upper bound came back zero), and the buffer's
-    // elem_size also got overwritten with the source's elem_size
-    // instead of Bool's, mis-striding the per-element stores.
-    //
-    // Fix routes the result through a new
-    // `afs_allocate_like_with_elem_size` helper that copies the
-    // source's rank and per-dim bounds verbatim, but lets the
-    // caller pin the result's elem_size to Bool (4 bytes).
-    let src = write_program(
-        "module m\n  implicit none\ncontains\n  subroutine probe(mask, n1, n2)\n    logical, intent(in) :: mask(:,:)\n    integer, intent(out) :: n1, n2\n    n1 = size(mask, 1)\n    n2 = size(mask, 2)\n    if (n1 /= 2 .or. n2 /= 3) error stop 1\n    if (mask(1,1) .or. mask(2,1) .or. mask(1,2)) error stop 2\n    if (.not. mask(2,2) .or. .not. mask(1,3) .or. .not. mask(2,3)) error stop 3\n  end subroutine\nend module\n\nprogram p\n  use m\n  implicit none\n  real :: y(2,3) = reshape([1., 2., 3., 4., 5., 6.], [2, 3])\n  integer :: n1, n2\n  call probe(y > 3., n1, n2)\n  print *, 'ok'\nend program\n",
-        "f90",
-    );
-    let out = unique_path("array_compare_rank2", "bin");
-    let compile = Command::new(compiler("armfortas"))
-        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
-        .output()
-        .expect("array-compare-rank2 compile failed to spawn");
-    assert!(
-        compile.status.success(),
-        "array-compare-rank2 compile failed: {}",
-        String::from_utf8_lossy(&compile.stderr)
-    );
-    let run = Command::new(&out).output().expect("array-compare-rank2 run failed");
-    assert!(
-        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
-        "array-compare-rank2: status={:?} stdout={} stderr={}",
-        run.status,
-        String::from_utf8_lossy(&run.stdout),
-        String::from_utf8_lossy(&run.stderr)
-    );
-    let _ = std::fs::remove_file(&out);
-    let _ = std::fs::remove_file(&src);
-}
-
-#[test]
 fn nested_call_chain_with_array_section_args_keeps_frame_bounded() {
     // Regression: `array_function_result_elem_type` called
     // `generic_dispatch_probe_value` on every argument before

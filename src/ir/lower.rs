@@ -35710,14 +35710,7 @@ fn lower_rank1_array_compare_descriptor(
         IrType::Int(IntWidth::I64),
     );
 
-    // F2018 §10.1.5: relational ops yield a logical array of the SAME
-    // SHAPE as the operands. The function name says "rank1" but we
-    // accept any rank and walk the underlying buffer flat — copy the
-    // source descriptor's shape (rank + per-dim bounds) onto the
-    // result so callees that read `mask` as rank>=2 see the right
-    // extents instead of `[total, 0, …]`. Use the elem-size override
-    // helper because the source's elem_size (e.g. 8 for real64) does
-    // not match Bool's elem_size (4).
+    // Allocate the result descriptor with elem_size matching Bool (i32 = 4).
     let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
     let zero32 = b.const_i32(0);
     let sz384 = b.const_i64(384);
@@ -35726,15 +35719,25 @@ fn lower_rank1_array_compare_descriptor(
         vec![result_desc, zero32, sz384],
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
     );
-
+    let bounds = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 24));
     let zero64 = b.const_i64(0);
     let one64 = b.const_i64(1);
+    let lower_ptr = b.gep(bounds, vec![zero64], IrType::Int(IntWidth::I8));
+    let eight = b.const_i64(8);
+    let upper_ptr = b.gep(bounds, vec![eight], IrType::Int(IntWidth::I8));
+    let sixteen = b.const_i64(16);
+    let stride_ptr = b.gep(bounds, vec![sixteen], IrType::Int(IntWidth::I8));
+    b.store(one64, lower_ptr);
+    b.store(n, upper_ptr);
+    b.store(one64, stride_ptr);
+
     let stat = b.alloca(IrType::Int(IntWidth::I32));
     b.store(zero32, stat);
-    let bool_elem_size = b.const_i64(ir_scalar_byte_size(&IrType::Bool));
+    let elem_size = b.const_i64(ir_scalar_byte_size(&IrType::Bool));
+    let rank = b.const_i32(1);
     b.call(
-        FuncRef::External("afs_allocate_like_with_elem_size".into()),
-        vec![result_desc, source_desc, bool_elem_size, stat],
+        FuncRef::External("afs_allocate_array".into()),
+        vec![result_desc, elem_size, rank, bounds, stat],
         IrType::Void,
     );
 
