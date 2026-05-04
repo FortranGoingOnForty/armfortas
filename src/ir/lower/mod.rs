@@ -15,6 +15,7 @@ mod const_scalar;
 mod core;
 mod ctx;
 mod helpers;
+mod init;
 mod expr;
 mod intrinsic;
 mod intrinsic_sub;

@@ -3728,7 +3728,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     "",
                     ctx.st,
                 );
-                init_decls(
+                super::init::init_decls(
                     b,
                     &ctx.locals,
                     &effective_decls,
