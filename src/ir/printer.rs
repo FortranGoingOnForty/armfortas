@@ -288,6 +288,28 @@ fn print_inst_with_module_opt(inst: &Inst, module: Option<&Module>) -> String {
         InstKind::InsertField(agg, idx, val) => {
             format!("insert_field %{}, {}, %{}", agg.0, idx, val.0)
         }
+
+        // ---- SIMD vector ops ----
+        InstKind::VAdd(a, b) => format!("vadd %{}, %{}", a.0, b.0),
+        InstKind::VSub(a, b) => format!("vsub %{}, %{}", a.0, b.0),
+        InstKind::VMul(a, b) => format!("vmul %{}, %{}", a.0, b.0),
+        InstKind::VDiv(a, b) => format!("vdiv %{}, %{}", a.0, b.0),
+        InstKind::VNeg(a) => format!("vneg %{}", a.0),
+        InstKind::VAbs(a) => format!("vabs %{}", a.0),
+        InstKind::VFma(a, b, c) => format!("vfma %{}, %{}, %{}", a.0, b.0, c.0),
+        InstKind::VMin(a, b) => format!("vmin %{}, %{}", a.0, b.0),
+        InstKind::VMax(a, b) => format!("vmax %{}, %{}", a.0, b.0),
+        InstKind::VICmp(op, a, b) => format!("vicmp {:?} %{}, %{}", op, a.0, b.0),
+        InstKind::VFCmp(op, a, b) => format!("vfcmp {:?} %{}, %{}", op, a.0, b.0),
+        InstKind::VLoad(p) => format!("vload %{}", p.0),
+        InstKind::VStore(v, p) => format!("vstore %{}, %{}", v.0, p.0),
+        InstKind::VBitcast(v, ty) => format!("vbitcast %{} : {}", v.0, ty),
+        InstKind::VExtract(v, lane) => format!("vextract %{}, {}", v.0, lane),
+        InstKind::VInsert(v, lane, s) => format!("vinsert %{}, {}, %{}", v.0, lane, s.0),
+        InstKind::VBroadcast(s) => format!("vbroadcast %{}", s.0),
+        InstKind::VReduceSum(v) => format!("vreduce_sum %{}", v.0),
+        InstKind::VReduceMin(v) => format!("vreduce_min %{}", v.0),
+        InstKind::VReduceMax(v) => format!("vreduce_max %{}", v.0),
     };
 
     if inst.ty == super::types::IrType::Void {
