@@ -15,6 +15,7 @@ mod const_scalar;
 mod core;
 mod ctx;
 mod helpers;
+mod unit;
 
 pub use core::*;
 pub(crate) use ctx::CharKind;
