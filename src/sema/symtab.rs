@@ -7,7 +7,22 @@
 use crate::ast::decl::ArraySpec;
 use crate::ast::expr::SpannedExpr;
 use crate::lexer::Span;
+use std::borrow::Cow;
 use std::collections::HashMap;
+
+/// Sprint 07: borrow when the input is already canonical lowercase,
+/// allocate only when at least one ASCII uppercase byte needs folding.
+/// Symbol-table keys are stored in canonical lowercase, so most
+/// callers (lowering, type-spec resolution) hand us a pre-lowercased
+/// string — this skips ~one allocation per `lookup_in` /
+/// `find_symbol_any_scope` call on the hot lookup paths.
+fn ensure_ascii_lowercase(s: &str) -> Cow<'_, str> {
+    if s.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Owned(s.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(s)
+    }
+}
 
 /// Scope identifier — an index into the SymbolTable's scope list.
 pub type ScopeId = usize;
@@ -190,9 +205,14 @@ impl SymbolTable {
 
     /// Look up a name starting from a specific scope.
     pub fn lookup_in(&self, scope_id: ScopeId, name: &str) -> Option<&Symbol> {
-        let key = name.to_ascii_lowercase();
+        // Sprint 07: avoid the unconditional `to_ascii_lowercase`
+        // allocation. Symtab keys live in canonical lowercase, but
+        // most callers (lowering, type-spec resolution) already pass
+        // pre-canonicalized names — borrow when there's nothing to
+        // fold, allocate only when uppercase bytes are present.
+        let key = ensure_ascii_lowercase(name);
         let mut visited = Vec::new();
-        self.lookup_in_guarded(scope_id, &key, &mut visited)
+        self.lookup_in_guarded(scope_id, key.as_ref(), &mut visited)
     }
 
     fn lookup_in_guarded(
@@ -266,7 +286,8 @@ impl SymbolTable {
     /// Used during lowering when the current scope may not be set correctly.
     /// Prefers parameter symbols (for kind resolution) but returns any match.
     pub fn find_symbol_any_scope(&self, name: &str) -> Option<&Symbol> {
-        let key = name.to_ascii_lowercase();
+        let key_cow = ensure_ascii_lowercase(name);
+        let key: &str = key_cow.as_ref();
         // Track the best fallback seen so far. A typed
         // Function/Subroutine carries the most useful information
         // (return type, kind, ABI) for callers that use this helper to
@@ -280,7 +301,7 @@ impl SymbolTable {
         let mut fallback: Option<&Symbol> = None;
         let mut typed_callable: Option<&Symbol> = None;
         for scope in &self.scopes {
-            if let Some(sym) = scope.symbols.get(&key) {
+            if let Some(sym) = scope.symbols.get(key) {
                 if sym.attrs.parameter {
                     return Some(sym);
                 }

@@ -4,7 +4,18 @@
 //! using natural alignment rules (same as C struct layout on ARM64).
 
 use super::symtab::TypeInfo;
+use std::borrow::Cow;
 use std::collections::HashMap;
+
+/// Sprint 07: borrow when the input is already canonical lowercase,
+/// allocate only when at least one ASCII uppercase byte needs folding.
+fn ensure_ascii_lowercase(s: &str) -> Cow<'_, str> {
+    if s.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Owned(s.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(s)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FieldDefaultInit {
@@ -75,24 +86,28 @@ pub struct TypeLayout {
 
 impl TypeLayout {
     /// Look up a field by name and return its layout.
+    ///
+    /// Sprint 07: switched from per-iteration `to_lowercase()` to
+    /// `eq_ignore_ascii_case`. The original form allocated one
+    /// `String` for the query and one per field comparison; this form
+    /// allocates none. For the typical 5-15 field count the linear
+    /// scan stays the dominant cost — a HashMap-based field index
+    /// (full Sprint 07 scope) will land in a follow-up.
     pub fn field(&self, name: &str) -> Option<&FieldLayout> {
-        let key = name.to_lowercase();
-        self.fields.iter().find(|f| f.name.to_lowercase() == key)
+        self.fields.iter().find(|f| f.name.eq_ignore_ascii_case(name))
     }
 
     /// Look up a type-bound procedure by method name.
     pub fn bound_proc(&self, name: &str) -> Option<&BoundProc> {
-        let key = name.to_lowercase();
         self.bound_procs
             .iter()
-            .find(|p| p.method_name.to_lowercase() == key)
+            .find(|p| p.method_name.eq_ignore_ascii_case(name))
     }
 
     pub fn bound_proc_candidates(&self, name: &str) -> Vec<&BoundProc> {
-        let key = name.to_lowercase();
         self.bound_procs
             .iter()
-            .filter(|p| p.method_name.to_lowercase() == key)
+            .filter(|p| p.method_name.eq_ignore_ascii_case(name))
             .collect()
     }
 }
@@ -139,7 +154,8 @@ impl TypeLayoutRegistry {
     }
 
     pub fn get(&self, type_name: &str) -> Option<&TypeLayout> {
-        self.layouts.get(&type_name.to_lowercase())
+        let key = ensure_ascii_lowercase(type_name);
+        self.layouts.get(key.as_ref())
     }
 
     pub fn iter_layouts(&self) -> impl Iterator<Item = &TypeLayout> {
