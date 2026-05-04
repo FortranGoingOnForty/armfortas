@@ -34,12 +34,18 @@
 use super::emit::emit_inst_text;
 use super::mir::{ArmCond, ArmOpcode, MBlockId, MachineBlock, MachineFunction, MachineInst, MachineOperand};
 
-/// Maximum signed offset (in bytes) reachable by a `B.cond`. The
-/// 19-bit signed immediate is scaled by 4, giving ±(2^20) bytes.
-/// Subtract a safety margin so we never sit right on the edge: a
-/// downstream peephole insertion or fall-through fixup that nudges
-/// the offset by a single instruction shouldn't push us over.
+/// Maximum signed offset (in bytes) reachable by a `B.cond` and by
+/// `cbz/cbnz`. The 19-bit signed immediate is scaled by 4, giving
+/// ±(2^20) bytes. Subtract a safety margin so we never sit right on
+/// the edge: a downstream peephole insertion or fall-through fixup
+/// that nudges the offset by a single instruction shouldn't push us
+/// over.
 const COND_BRANCH_LIMIT: i64 = (1 << 20) - 64;
+
+/// Maximum signed offset reachable by `tbz`/`tbnz`. The 14-bit
+/// signed immediate is scaled by 4, giving ±(2^15) bytes — much
+/// tighter than the cond-branch / cbz limit. Same safety margin.
+const TBZ_BRANCH_LIMIT: i64 = (1 << 15) - 64;
 
 /// Iteration cap. In practice 1–2 passes suffice; if convergence
 /// genuinely doesn't happen, something pathological is going on and
@@ -75,23 +81,25 @@ fn relax_once(mf: &mut MachineFunction) -> bool {
     // and miss far branches that need relaxation.
     let block_offsets = compute_block_offsets(mf);
 
-    // Collect overflow sites (block_id, inst_idx, target, cond) before
-    // mutating anything. We also record the per-instruction prefix
-    // offset within each block so we can skip past wide-emit insts
-    // that precede the BCond.
-    let mut overflows: Vec<(MBlockId, usize, MBlockId, ArmCond)> = Vec::new();
+    // Collect overflow sites before mutating anything. We also record
+    // the per-instruction prefix offset within each block so we can
+    // skip past wide-emit insts that precede the conditional branch.
+    let mut overflows: Vec<OverflowSite> = Vec::new();
     for block in &mf.blocks {
         let block_offset = block_offsets[&block.id];
         let mut running = 0i64;
         for (inst_idx, inst) in block.insts.iter().enumerate() {
-            if inst.opcode == ArmOpcode::BCond {
-                if let (Some(target), Some(cond)) = (bcond_target(inst), bcond_cond(inst)) {
-                    if let Some(&target_offset) = block_offsets.get(&target) {
-                        let branch_offset = block_offset + running;
-                        let delta = target_offset - branch_offset;
-                        if delta.abs() > COND_BRANCH_LIMIT {
-                            overflows.push((block.id, inst_idx, target, cond));
-                        }
+            if let Some((target, limit, kind)) = relaxable_cond_branch(inst) {
+                if let Some(&target_offset) = block_offsets.get(&target) {
+                    let branch_offset = block_offset + running;
+                    let delta = target_offset - branch_offset;
+                    if delta.abs() > limit {
+                        overflows.push(OverflowSite {
+                            block_id: block.id,
+                            inst_idx,
+                            target,
+                            kind,
+                        });
                     }
                 }
             }
@@ -108,20 +116,92 @@ fn relax_once(mf: &mut MachineFunction) -> bool {
     // values — block-vec insertions happen at the back of the affected
     // block group.
     overflows.sort_by(|a, b| {
-        let a_pos = block_position(mf, a.0);
-        let b_pos = block_position(mf, b.0);
-        // Expand higher block positions first. Within one block, a
-        // single overflow per pass is the common case (BCond is
-        // typically the terminator), but if multiple do show up we
-        // expand the later inst_idx first.
-        b_pos.cmp(&a_pos).then(b.1.cmp(&a.1))
+        let a_pos = block_position(mf, a.block_id);
+        let b_pos = block_position(mf, b.block_id);
+        b_pos.cmp(&a_pos).then(b.inst_idx.cmp(&a.inst_idx))
     });
 
-    for (block_id, inst_idx, target, cond) in overflows {
-        expand_bcond_to_trampoline(mf, block_id, inst_idx, target, cond);
+    for site in overflows {
+        expand_to_trampoline(mf, site);
     }
 
     true
+}
+
+#[derive(Clone)]
+struct OverflowSite {
+    block_id: MBlockId,
+    inst_idx: usize,
+    target: MBlockId,
+    kind: RelaxKind,
+}
+
+#[derive(Clone)]
+enum RelaxKind {
+    /// `b.cond far` → `b.{!cond} skip; b far`
+    BCond { cond: ArmCond },
+    /// `cbz/cbnz reg far` → `cbnz/cbz reg skip; b far`
+    Cbz { invert_to: ArmOpcode, reg: MachineOperand },
+    /// `tbz/tbnz reg, #bit far` → `tbnz/tbz reg, #bit skip; b far`
+    Tbz {
+        invert_to: ArmOpcode,
+        reg: MachineOperand,
+        bit: i64,
+    },
+}
+
+/// Inspect a machine instruction; if it is a conditional branch that
+/// might need relaxation, return the target, the per-opcode range
+/// limit, and a kind descriptor capturing what the inverted form
+/// looks like. Returns `None` for non-branch instructions or branches
+/// whose targets are unrecoverable from operands.
+fn relaxable_cond_branch(inst: &MachineInst) -> Option<(MBlockId, i64, RelaxKind)> {
+    match inst.opcode {
+        ArmOpcode::BCond => {
+            let target = bcond_target(inst)?;
+            let cond = bcond_cond(inst)?;
+            Some((target, COND_BRANCH_LIMIT, RelaxKind::BCond { cond }))
+        }
+        ArmOpcode::Cbz | ArmOpcode::Cbnz => {
+            // Operands: [reg, BlockRef]
+            let target = match inst.operands.get(1)? {
+                MachineOperand::BlockRef(id) => *id,
+                _ => return None,
+            };
+            let reg = inst.operands.first()?.clone();
+            let invert_to = match inst.opcode {
+                ArmOpcode::Cbz => ArmOpcode::Cbnz,
+                _ => ArmOpcode::Cbz,
+            };
+            Some((target, COND_BRANCH_LIMIT, RelaxKind::Cbz { invert_to, reg }))
+        }
+        ArmOpcode::Tbz | ArmOpcode::Tbnz => {
+            // Operands: [reg, Imm(bit), BlockRef]
+            let bit = match inst.operands.get(1)? {
+                MachineOperand::Imm(v) => *v,
+                _ => return None,
+            };
+            let target = match inst.operands.get(2)? {
+                MachineOperand::BlockRef(id) => *id,
+                _ => return None,
+            };
+            let reg = inst.operands.first()?.clone();
+            let invert_to = match inst.opcode {
+                ArmOpcode::Tbz => ArmOpcode::Tbnz,
+                _ => ArmOpcode::Tbz,
+            };
+            Some((
+                target,
+                TBZ_BRANCH_LIMIT,
+                RelaxKind::Tbz {
+                    invert_to,
+                    reg,
+                    bit,
+                },
+            ))
+        }
+        _ => None,
+    }
 }
 
 /// Compute byte offsets for every block label, summing the actual
@@ -174,20 +254,21 @@ fn bcond_cond(inst: &MachineInst) -> Option<ArmCond> {
     })
 }
 
-/// Replace the `B.cond far_target` at `(block_id, inst_idx)` with the
-/// trampoline pattern. Allocates a fresh skip block and inserts it
-/// right after the original block in `mf.blocks`. The original
-/// block keeps every instruction up through the new
-/// `B.{!cond} skip; B far_target` pair; any instructions that
-/// followed the BCond in the same block move into the skip block
-/// (rare in practice — BCond is typically the terminator).
-fn expand_bcond_to_trampoline(
-    mf: &mut MachineFunction,
-    block_id: MBlockId,
-    inst_idx: usize,
-    far_target: MBlockId,
-    cond: ArmCond,
-) {
+/// Replace an out-of-range conditional branch at `(block_id, inst_idx)`
+/// with the trampoline pattern. Allocates a fresh skip block and
+/// inserts it right after the original block in `mf.blocks`. The
+/// inverted-condition branch jumps over the unconditional `b`, which
+/// has the full ±128MB reach of the unconditional encoding — so the
+/// trampoline itself never needs further relaxation regardless of
+/// which conditional opcode we started from.
+fn expand_to_trampoline(mf: &mut MachineFunction, site: OverflowSite) {
+    let OverflowSite {
+        block_id,
+        inst_idx,
+        target: far_target,
+        kind,
+    } = site;
+
     // Allocate a fresh skip-block id without disturbing any other
     // bookkeeping. We can't call `mf.new_block` directly because it
     // pushes onto the back of the vec; we want the skip block
@@ -196,14 +277,33 @@ fn expand_bcond_to_trampoline(
     let skip_id = MBlockId(mf.next_block_id());
     let skip_label = format!("{}_relax{}", mf.block(block_id).label, skip_id.0);
 
-    // Build the two replacement instructions.
-    let inverted_bcond = MachineInst {
-        opcode: ArmOpcode::BCond,
-        operands: vec![
-            MachineOperand::Cond(cond.inverse()),
-            MachineOperand::BlockRef(skip_id),
-        ],
-        def: None,
+    let inverted = match kind {
+        RelaxKind::BCond { cond } => MachineInst {
+            opcode: ArmOpcode::BCond,
+            operands: vec![
+                MachineOperand::Cond(cond.inverse()),
+                MachineOperand::BlockRef(skip_id),
+            ],
+            def: None,
+        },
+        RelaxKind::Cbz { invert_to, reg } => MachineInst {
+            opcode: invert_to,
+            operands: vec![reg, MachineOperand::BlockRef(skip_id)],
+            def: None,
+        },
+        RelaxKind::Tbz {
+            invert_to,
+            reg,
+            bit,
+        } => MachineInst {
+            opcode: invert_to,
+            operands: vec![
+                reg,
+                MachineOperand::Imm(bit),
+                MachineOperand::BlockRef(skip_id),
+            ],
+            def: None,
+        },
     };
     let unconditional_b = MachineInst {
         opcode: ArmOpcode::B,
@@ -212,13 +312,13 @@ fn expand_bcond_to_trampoline(
     };
 
     // Splice them in, preserving any instructions that followed the
-    // original BCond. Those trailing instructions (uncommon) move
+    // original branch. Those trailing instructions (uncommon) move
     // into the skip block to keep program order.
     let block_pos = block_position(mf, block_id);
     let trailing = {
         let block = &mut mf.blocks[block_pos];
         let trailing: Vec<MachineInst> = block.insts.drain(inst_idx + 1..).collect();
-        block.insts[inst_idx] = inverted_bcond;
+        block.insts[inst_idx] = inverted;
         block.insts.push(unconditional_b);
         trailing
     };

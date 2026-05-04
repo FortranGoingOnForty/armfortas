@@ -1020,6 +1020,41 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
             };
             format!("b.{} {}", cond, target)
         }
+        ArmOpcode::Cbz | ArmOpcode::Cbnz => {
+            let mnemonic = match inst.opcode {
+                ArmOpcode::Cbz => "cbz",
+                _ => "cbnz",
+            };
+            let target = if let MachineOperand::BlockRef(id) = &inst.operands[1] {
+                mf.block(*id).label.clone()
+            } else {
+                "???".into()
+            };
+            format!("{} {}, {}", mnemonic, op_str(&inst.operands[0]), target)
+        }
+        ArmOpcode::Tbz | ArmOpcode::Tbnz => {
+            let mnemonic = match inst.opcode {
+                ArmOpcode::Tbz => "tbz",
+                _ => "tbnz",
+            };
+            let bit = if let MachineOperand::Imm(v) = &inst.operands[1] {
+                *v
+            } else {
+                0
+            };
+            let target = if let MachineOperand::BlockRef(id) = &inst.operands[2] {
+                mf.block(*id).label.clone()
+            } else {
+                "???".into()
+            };
+            format!(
+                "{} {}, #{}, {}",
+                mnemonic,
+                op_str(&inst.operands[0]),
+                bit,
+                target
+            )
+        }
         ArmOpcode::Bl => {
             if let MachineOperand::Extern(name) = &inst.operands[0] {
                 // Mach-O convention: C symbols get a _ prefix.

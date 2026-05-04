@@ -131,6 +131,17 @@ pub enum ArmOpcode {
     // ---- Branch ----
     B,     // B label
     BCond, // B.cond label
+    // Compare-and-branch (single-instruction zero check). Operands:
+    //   [VReg|PhysReg of register to test, BlockRef target]
+    // Width inferred from the test register's class (Gp32 → cbz w; Gp64 → cbz x).
+    // ±1MB range (19-bit signed × 4), same as BCond — relaxed identically.
+    Cbz,
+    Cbnz,
+    // Test-bit-and-branch. Operands:
+    //   [VReg|PhysReg of test reg, Imm(bit_index 0..63), BlockRef target]
+    // ±32KB range (14-bit signed × 4), tighter than BCond — needs its own relax bound.
+    Tbz,
+    Tbnz,
     Bl,    // BL label  (call)
     Blr,   // BLR reg   (indirect call)
     Ret,   // RET
