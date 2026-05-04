@@ -2964,6 +2964,7 @@ fn alloca_size(ty: &IrType) -> u32 {
         }
         IrType::FuncPtr(_) => 8,
         IrType::Struct(_) => 8, // placeholder
+        IrType::Vector { .. } => 16, // 128-bit NEON
     }
 }
 
