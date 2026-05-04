@@ -25149,6 +25149,8 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                     IrType::Void,
                                 );
                             }
+                            let zero_i32 = b.const_i32(0);
+                            b.store(zero_i32, stat_addr);
                             continue;
                         }
                         if field.size == 384 && (field.allocatable || field.pointer) {
@@ -25522,6 +25524,8 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                     IrType::Void,
                                 );
                             }
+                            let zero_i32 = b.const_i32(0);
+                            b.store(zero_i32, stat_addr);
                             continue;
                         }
                         let elem_size_bytes = local_storage_size_bytes(&info, ctx.type_layouts);
