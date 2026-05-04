@@ -25769,6 +25769,57 @@ fn int64_array_scalar_broadcast_init_clears_upper_half() {
 }
 
 #[test]
+fn allocate_deferred_char_writes_zero_to_stat() {
+    // F2018 §9.7.1.3: after a successful ALLOCATE the stat-variable
+    // must equal zero. The deferred-length character paths in
+    // lower_allocate (both the bare-name and the
+    // ComponentAccess-component variants) called
+    // `init_allocated_string_descriptor` and `continue`d without ever
+    // touching `stat_addr` — so when the user passed `stat=stat`, the
+    // user's `integer :: stat` retained its uninitialized stack
+    // contents.
+    //
+    // Surfaced via stdlib_bitsets_64's `write_bitset_string_64`
+    // (`allocate(character(len=count_digits+bit_count+2)::string,
+    // stat=stat)` followed by `if (stat > 0) call error_handler(...)`):
+    // stat was 0x01000001 (16777217) so the success path emitted
+    // "There was an allocation fault for STRING." and ERROR STOP'd —
+    // this knocked out the four bitset I/O examples
+    // (write_bitset / read_bitset / input / output) at the macro
+    // sweep level even though the underlying allocation was fine.
+    //
+    // Fix writes a literal zero to stat_addr after
+    // init_allocated_string_descriptor in both deferred-char ALLOCATE
+    // arms.
+    let src = write_program(
+        "program p\n  implicit none\n  character(:), allocatable :: s\n  integer :: stat\n  integer :: n\n  ! Pre-stamp stat with garbage so the test catches \"never written\".\n  stat = 16777217\n  n = 37\n  allocate(character(len=n) :: s, stat=stat)\n  if (stat /= 0) error stop 1\n  if (len(s) /= 37) error stop 2\n  ! Same shape, but the LHS lives inside a derived component.\n  call inner()\n  print *, 'ok'\ncontains\n  subroutine inner()\n    type :: box_t\n      character(:), allocatable :: raw\n    end type\n    type(box_t) :: b\n    integer :: stat2\n    stat2 = 16777217\n    allocate(character(len=5) :: b%raw, stat=stat2)\n    if (stat2 /= 0) error stop 3\n    if (len(b%raw) /= 5) error stop 4\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("alloc_deferred_char_stat", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("alloc-deferred-char-stat compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "alloc-deferred-char-stat compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("alloc-deferred-char-stat run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "alloc-deferred-char-stat: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn user_generic_named_char_shadows_intrinsic_in_string_context() {
     // F2008 §13.7: a user-defined function or generic interface with
     // the same name as an intrinsic shadows the intrinsic. The
