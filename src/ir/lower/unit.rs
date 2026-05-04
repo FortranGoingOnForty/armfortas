@@ -111,7 +111,7 @@ pub(crate) fn lower_unit(
                 let mut b = FuncBuilder::new(&mut func);
                 install_common_locals(&mut b, &mut ctx.locals, decls);
                 install_equivalence_locals(&mut b, &mut ctx.locals, decls, &visible_param_consts, st);
-                alloc_decls(
+                super::alloc::alloc_decls(
                     &mut b,
                     &mut ctx.locals,
                     decls,
@@ -546,7 +546,7 @@ pub(crate) fn lower_unit(
                 // them available for initialization expressions that
                 // reference host vars.
                 install_host_ref_locals(&mut b, &mut ctx.locals, &host_ref_infos);
-                alloc_decls(
+                super::alloc::alloc_decls(
                     &mut b,
                     &mut ctx.locals,
                     decls,
@@ -1162,7 +1162,7 @@ pub(crate) fn lower_unit(
                 install_common_locals(&mut b, &mut ctx.locals, decls);
                 install_equivalence_locals(&mut b, &mut ctx.locals, decls, &visible_param_consts, st);
                 install_host_ref_locals(&mut b, &mut ctx.locals, &host_ref_infos);
-                alloc_decls(
+                super::alloc::alloc_decls(
                     &mut b,
                     &mut ctx.locals,
                     decls,

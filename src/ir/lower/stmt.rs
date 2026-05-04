@@ -3718,7 +3718,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 for k in &block_keys {
                     ctx.locals.remove(k);
                 }
-                alloc_decls(
+                super::alloc::alloc_decls(
                     b,
                     &mut ctx.locals,
                     &effective_decls,
