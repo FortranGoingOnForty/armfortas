@@ -3,9 +3,9 @@
 //! Walks the typed AST and produces SSA IR. Handles variable allocation,
 //! expression evaluation, assignments, and runtime calls for I/O.
 
-use super::builder::FuncBuilder;
-use super::inst::*;
-use super::types::*;
+use crate::ir::builder::FuncBuilder;
+use crate::ir::inst::*;
+use crate::ir::types::*;
 use crate::ast::decl::{Decl, TypeSpec};
 use crate::ast::expr::{BinaryOp, Expr, SpannedExpr, UnaryOp};
 use crate::ast::stmt::*;
@@ -45896,8 +45896,8 @@ fn fortran_type_to_ir_scalar_type(ft: &crate::sema::types::FortranType) -> Optio
 
 #[cfg(test)]
 mod tests {
-    use super::super::printer;
-    use super::super::verify;
+    use crate::ir::printer;
+    use crate::ir::verify;
     use super::*;
     use crate::lexer::Lexer;
     use crate::parser::Parser;
