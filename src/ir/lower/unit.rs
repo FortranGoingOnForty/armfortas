@@ -483,7 +483,7 @@ pub(crate) fn lower_unit(
                     else {
                         continue;
                     };
-                    let len_raw = lower_expr_with_optional_layouts(
+                    let len_raw = super::expr::lower_expr_with_optional_layouts(
                         &mut b,
                         &ctx.locals,
                         &len_expr,
@@ -952,7 +952,7 @@ pub(crate) fn lower_unit(
                     else {
                         continue;
                     };
-                    let len_raw = lower_expr(&mut b, &ctx.locals, &len_expr, ctx.st);
+                    let len_raw = super::expr::lower_expr(&mut b, &ctx.locals, &len_expr, ctx.st);
                     let len_addr = b.alloca(IrType::Int(IntWidth::I64));
                     let len_val = clamp_nonnegative_i64(&mut b, len_raw);
                     b.store(len_val, len_addr);

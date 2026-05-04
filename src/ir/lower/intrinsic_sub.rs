@@ -56,7 +56,7 @@ pub(crate) fn lower_intrinsic_subroutine(
     ) -> ValueId {
         if let Some(Some(arg)) = args.get(n) {
             if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
-                return lower_expr_ctx(b, ctx, e);
+                return super::expr::lower_expr_ctx(b, ctx, e);
             }
         }
         b.const_i32(default)
@@ -456,7 +456,7 @@ pub(crate) fn lower_intrinsic_subroutine(
                                 let crate::ast::expr::AcValue::Expr(extent_expr) = value else {
                                     continue;
                                 };
-                                let raw_extent = lower_expr_ctx(b, ctx, extent_expr);
+                                let raw_extent = super::expr::lower_expr_ctx(b, ctx, extent_expr);
                                 let extent = match b.func().value_type(raw_extent) {
                                     Some(IrType::Int(IntWidth::I64)) => raw_extent,
                                     _ => b.int_extend(raw_extent, IntWidth::I64, true),
