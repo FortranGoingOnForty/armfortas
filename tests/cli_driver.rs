@@ -12042,6 +12042,49 @@ fn rank_n_array_compare_yields_same_shape_logical_descriptor_per_f2018() {
 }
 
 #[test]
+fn ieee_is_nan_over_rank_n_array_dispatches_elementally() {
+    // F2018 §17.11: ieee_is_nan is elemental — applied to a rank-N
+    // numeric array it must yield a same-shape logical array. Without
+    // dispatch the scalar `lower_intrinsic` arm emits `fcmp ne desc,
+    // desc` over the array's descriptor pointer (garbage / IR verifier
+    // failure / wrong code), and the catch-all `any(..)` fallback
+    // walks the source as if rank-1, tripping a bounds check at
+    // index > size(arr,1) for rank-2+ inputs.  stdlib's median /
+    // cov / sort_* hit this in the `if any(ieee_is_nan(x))` guard
+    // when the matrix has more than `size(x,1)` total elements.
+    let src = write_program(
+        "program p\n  use, intrinsic :: ieee_arithmetic, only: ieee_is_nan\n  implicit none\n  real :: y(2,3) = reshape([1.,2.,3.,4.,5.,6.], [2,3])\n  real :: nan_val\n  nan_val = 0.0\n  nan_val = nan_val / nan_val\n  y(2,2) = nan_val\n  if (any(ieee_is_nan(y))) then\n    print *, 'has-nan-ok'\n  else\n    error stop 1\n  end if\n  y(2,2) = 4.0\n  if (.not. any(ieee_is_nan(y))) then\n    print *, 'no-nan-ok'\n  else\n    error stop 2\n  end if\nend program\n",
+        "f90",
+    );
+    let out = unique_path("ieee_is_nan_rank_n", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "run failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("has-nan-ok") && stdout.contains("no-nan-ok"),
+        "expected both 'has-nan-ok' and 'no-nan-ok': {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn rank_remap_pointer_assignment_builds_2d_descriptor() {
     // F2018 §10.2.2.3: `pmat(L1:U1, L2:U2) => array1d` reinterprets a
     // contiguous 1-D target as a 2-D array. The destination descriptor
