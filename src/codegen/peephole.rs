@@ -44,7 +44,7 @@
 //! After fusion the multiply is removed and the add/sub is replaced
 //! with the three-source instruction.
 
-use super::mir::{ArmOpcode, MachineFunction, MachineInst, MachineOperand, VRegId};
+use super::mir::{ArmOpcode, MachineFunction, MachineInst, MachineOperand, RegClass, VRegId};
 use std::collections::HashMap;
 
 /// Run all peephole passes on a machine function. Iterates to fixpoint
@@ -66,6 +66,7 @@ pub fn run_peephole(mf: &mut MachineFunction) {
         scaled_addressing_fusion(mf);
         fma_fusion(mf);
         madd_fusion(mf);
+        ldp_stp_fusion(mf);
         if total_inst_count(mf) == before {
             return;
         }
@@ -762,6 +763,280 @@ fn scaled_addressing_fuse_block(
     });
 }
 
+/// LDP/STP pair fusion.
+///
+/// Walks each basic block and fuses **immediately-adjacent** ldr/str
+/// pairs that share a base register and have offsets differing by
+/// exactly the access width. The two get rewritten as a single
+/// `LdpOffset` / `StpOffset` whose imm targets the LOWER address
+/// (Rt1 sits at imm, Rt2 at imm + width per ARM ARM C6.2.156).
+///
+/// Restrictions kept narrow on this first cut:
+/// * Only adjacent instructions in the block (no window scan; no
+///   intervening writes to base or memory). Broadening to a small
+///   window with proper aliasing analysis is a follow-up if the
+///   adjacent-only form proves too restrictive.
+/// * Same opcode and same width on both ops. We support 4-byte
+///   (`LdrImm`/`StrImm` Gp32, `LdrFpImm`/`StrFpImm` Fp32) and 8-byte
+///   (Gp64, Fp64) variants. The `LdrshImm`/`LdrsbImm`/`StrhImm`/
+///   `StrbImm` half/byte forms have no LDP/STP analogue and are
+///   skipped.
+/// * Both offsets must be plain `Imm(_)` (not `FrameSlot` — the
+///   prologue STP/LDP already covers callee-save spills, and frame
+///   slots get materialized to immediates downstream anyway).
+/// * For loads, the two destination registers must differ. ARM ARM
+///   declares `LDP Rt, Rt, ...` UNPREDICTABLE.
+/// * For loads, the first load's destination must not equal the base
+///   register. The fused LDP would still read the unmodified base,
+///   which silently breaks the original semantics where the second
+///   ldr saw the post-write base.
+/// * Combined offset must lie within signed 7-bit × width range.
+fn ldp_stp_fusion(mf: &mut MachineFunction) {
+    for mb_idx in 0..mf.blocks.len() {
+        ldp_stp_fuse_block(mf, mb_idx);
+    }
+}
+
+fn vreg_class(mf: &MachineFunction, v: VRegId) -> Option<RegClass> {
+    mf.vregs.get(v.0 as usize).map(|r| r.class)
+}
+
+fn class_byte_width(c: RegClass) -> u32 {
+    match c {
+        RegClass::Gp32 | RegClass::Fp32 => 4,
+        RegClass::Gp64 | RegClass::Fp64 => 8,
+    }
+}
+
+/// Width inferred from operand[0] of a load/store instruction. For
+/// loads the operand is the dest vreg; for stores it is the source
+/// vreg — both carry the access width via their RegClass.
+fn ldst_access_width(mf: &MachineFunction, inst: &MachineInst) -> Option<u32> {
+    let v = match inst.operands.first()? {
+        MachineOperand::VReg(v) => *v,
+        _ => return None,
+    };
+    let class = vreg_class(mf, v)?;
+    Some(class_byte_width(class))
+}
+
+fn ldp_imm_in_range(off: i64, width: u32) -> bool {
+    let stride = width as i64;
+    if off % stride != 0 {
+        return false;
+    }
+    let units = off / stride;
+    // signed 7-bit imm range: [-64, 63] units.
+    (-64..=63).contains(&units)
+}
+
+fn ldp_stp_fuse_block(mf: &mut MachineFunction, mb_idx: usize) {
+    let block_len = mf.blocks[mb_idx].insts.len();
+    if block_len < 2 {
+        return;
+    }
+
+    enum LdSt {
+        LdrInt,
+        LdrFp,
+        StrInt,
+        StrFp,
+    }
+    fn classify(op: ArmOpcode) -> Option<LdSt> {
+        Some(match op {
+            ArmOpcode::LdrImm => LdSt::LdrInt,
+            ArmOpcode::LdrFpImm => LdSt::LdrFp,
+            ArmOpcode::StrImm => LdSt::StrInt,
+            ArmOpcode::StrFpImm => LdSt::StrFp,
+            _ => return None,
+        })
+    }
+    fn paired_opcode(kind: &LdSt) -> ArmOpcode {
+        // STP and LDP are width-agnostic at the opcode level; the
+        // emit layer picks `ldp x/w/d/s` from operand[0]'s register
+        // class. (afs-as does the same.)
+        match kind {
+            LdSt::LdrInt | LdSt::LdrFp => ArmOpcode::LdpOffset,
+            LdSt::StrInt | LdSt::StrFp => ArmOpcode::StpOffset,
+        }
+    }
+
+    // Plan: collect (lower_idx, upper_idx, replacement) and, after the
+    // walk, rewrite lower_idx in place and mark upper_idx for removal.
+    struct PairPlan {
+        lower_idx: usize,
+        upper_idx: usize,
+        new_inst: MachineInst,
+    }
+    let mut plans: Vec<PairPlan> = Vec::new();
+    let mut consumed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+    let mut i = 0;
+    while i + 1 < block_len {
+        if consumed.contains(&i) {
+            i += 1;
+            continue;
+        }
+        let a = &mf.blocks[mb_idx].insts[i];
+        let b = &mf.blocks[mb_idx].insts[i + 1];
+        let (Some(ka), Some(kb)) = (classify(a.opcode), classify(b.opcode)) else {
+            i += 1;
+            continue;
+        };
+        // Must be the same opcode (loads can fuse only with loads,
+        // stores with stores, integer with integer, float with float).
+        if a.opcode != b.opcode {
+            i += 1;
+            continue;
+        }
+
+        if a.operands.len() < 3 || b.operands.len() < 3 {
+            i += 1;
+            continue;
+        }
+        let (av, bv) = (&a.operands[0], &b.operands[0]);
+        let (a_base, b_base) = (&a.operands[1], &b.operands[1]);
+        let (a_off_op, b_off_op) = (&a.operands[2], &b.operands[2]);
+        let (Some(a_off), Some(b_off)) = (
+            match a_off_op {
+                MachineOperand::Imm(v) => Some(*v),
+                _ => None,
+            },
+            match b_off_op {
+                MachineOperand::Imm(v) => Some(*v),
+                _ => None,
+            },
+        ) else {
+            i += 1;
+            continue;
+        };
+        if a_base != b_base {
+            i += 1;
+            continue;
+        }
+
+        let Some(width) = ldst_access_width(mf, a) else {
+            i += 1;
+            continue;
+        };
+        // Both ops must access the same width — the operand[0] vregs
+        // share a register class for legal LDP/STP.
+        let b_width = ldst_access_width(mf, b);
+        if Some(width) != b_width {
+            i += 1;
+            continue;
+        }
+        // Adjacent offsets: the higher one is exactly width above the lower.
+        let (lower_off, lower_idx_in_pair, upper_op_value) = if b_off == a_off + width as i64 {
+            (a_off, 0usize, bv.clone())
+        } else if a_off == b_off + width as i64 {
+            (b_off, 1usize, av.clone())
+        } else {
+            i += 1;
+            continue;
+        };
+        let lower_op_value = if lower_idx_in_pair == 0 { av.clone() } else { bv.clone() };
+
+        if !ldp_imm_in_range(lower_off, width) {
+            i += 1;
+            continue;
+        }
+
+        // For loads: forbid same-dest UNPREDICTABLE form, and forbid
+        // dest1 == base which would silently change the second load's
+        // address.
+        let (is_load, base_v) = match (&ka, a_base) {
+            (LdSt::LdrInt | LdSt::LdrFp, MachineOperand::VReg(v)) => (true, Some(*v)),
+            _ => (false, None),
+        };
+        if is_load {
+            let (MachineOperand::VReg(va), MachineOperand::VReg(vb)) = (av, bv) else {
+                i += 1;
+                continue;
+            };
+            if va == vb {
+                i += 1;
+                continue;
+            }
+            if let Some(b_v) = base_v {
+                // The first load (program order) is at index i. Its
+                // dest must not be the base — otherwise the second
+                // load (i+1) would be reading a different base.
+                let first_dest = match &mf.blocks[mb_idx].insts[i].operands[0] {
+                    MachineOperand::VReg(v) => *v,
+                    _ => {
+                        i += 1;
+                        continue;
+                    }
+                };
+                if first_dest == b_v {
+                    i += 1;
+                    continue;
+                }
+            }
+        }
+        let _ = kb; // suppress "unused" — symmetry only.
+
+        // Build the LdpOffset / StpOffset. Operands: [r1, r2, base, imm].
+        let new_opcode = paired_opcode(&ka);
+        let new_def = if is_load {
+            // LDP defines two regs but our MachineInst.def is single-
+            // value. Track the higher of the two so reg-allocator
+            // liveness sees at least one def; the actual two-write
+            // semantics live in the operand list. (Existing prologue
+            // LdpOffset uses this same shape.)
+            match &lower_op_value {
+                MachineOperand::VReg(_) => Some(match upper_op_value {
+                    MachineOperand::VReg(v) => v,
+                    _ => {
+                        i += 1;
+                        continue;
+                    }
+                }),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let new_inst = MachineInst {
+            opcode: new_opcode,
+            operands: vec![
+                lower_op_value,
+                upper_op_value,
+                a_base.clone(),
+                MachineOperand::Imm(lower_off),
+            ],
+            def: new_def,
+        };
+        plans.push(PairPlan {
+            lower_idx: i,
+            upper_idx: i + 1,
+            new_inst,
+        });
+        consumed.insert(i);
+        consumed.insert(i + 1);
+        i += 2;
+    }
+
+    if plans.is_empty() {
+        return;
+    }
+
+    // Apply rewrites. Order doesn't matter because plans don't
+    // overlap (consumed set ensures each index is in at most one).
+    let block = &mut mf.blocks[mb_idx];
+    let mut remove_idxs: std::collections::HashSet<usize> = plans.iter().map(|p| p.upper_idx).collect();
+    for plan in &plans {
+        block.insts[plan.lower_idx] = plan.new_inst.clone();
+    }
+    let mut idx = 0usize;
+    block.insts.retain(|_| {
+        let keep = !remove_idxs.remove(&idx);
+        idx += 1;
+        keep
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1116,6 +1391,151 @@ mod tests {
         scaled_addressing_fusion(&mut mf);
         assert_eq!(mf.blocks[0].insts.len(), 4);
         assert_eq!(mf.blocks[0].insts[3].opcode, ArmOpcode::LdrImm);
+    }
+
+    fn mf_with_classes(insts: Vec<MachineInst>, classes: &[RegClass]) -> MachineFunction {
+        let mut mf = MachineFunction::new("test".into());
+        for c in classes {
+            mf.new_vreg(*c);
+        }
+        let bid = MBlockId(0);
+        mf.blocks = vec![MachineBlock {
+            id: bid,
+            label: "entry".into(),
+            insts,
+        }];
+        mf
+    }
+
+    /// Two adjacent `ldr x_, [base, #imm]` with offsets 0 and 8 fuse to `ldp`.
+    #[test]
+    fn ldp_fusion_int64_pair() {
+        // vregs: 0,1,2 = Gp64
+        let classes = vec![RegClass::Gp64; 3];
+        let ldr1 = MachineInst {
+            opcode: ArmOpcode::LdrImm,
+            operands: vec![vreg(0), vreg(2), MachineOperand::Imm(0)],
+            def: Some(vid(0)),
+        };
+        let ldr2 = MachineInst {
+            opcode: ArmOpcode::LdrImm,
+            operands: vec![vreg(1), vreg(2), MachineOperand::Imm(8)],
+            def: Some(vid(1)),
+        };
+        let mut mf = mf_with_classes(vec![ldr1, ldr2], &classes);
+        ldp_stp_fusion(&mut mf);
+        let block = &mf.blocks[0];
+        assert_eq!(block.insts.len(), 1);
+        assert_eq!(block.insts[0].opcode, ArmOpcode::LdpOffset);
+        // Lower-offset (0) load goes into Rt1 = vreg(0); higher (8) into Rt2 = vreg(1).
+        assert_eq!(block.insts[0].operands[0], vreg(0));
+        assert_eq!(block.insts[0].operands[1], vreg(1));
+        assert_eq!(block.insts[0].operands[2], vreg(2));
+        assert_eq!(block.insts[0].operands[3], MachineOperand::Imm(0));
+    }
+
+    /// Two adjacent `str d_, [base, #imm]` with descending offsets fuse to `stp d`.
+    #[test]
+    fn stp_fusion_f64_pair_descending() {
+        let classes = vec![RegClass::Fp64, RegClass::Fp64, RegClass::Gp64];
+        let str_high = MachineInst {
+            opcode: ArmOpcode::StrFpImm,
+            operands: vec![vreg(0), vreg(2), MachineOperand::Imm(-16)],
+            def: None,
+        };
+        let str_low = MachineInst {
+            opcode: ArmOpcode::StrFpImm,
+            operands: vec![vreg(1), vreg(2), MachineOperand::Imm(-24)],
+            def: None,
+        };
+        let mut mf = mf_with_classes(vec![str_high, str_low], &classes);
+        ldp_stp_fusion(&mut mf);
+        let block = &mf.blocks[0];
+        assert_eq!(block.insts.len(), 1);
+        assert_eq!(block.insts[0].opcode, ArmOpcode::StpOffset);
+        // Lower-offset (-24) source goes into Rt1, so Rt1 = vreg(1).
+        assert_eq!(block.insts[0].operands[0], vreg(1));
+        assert_eq!(block.insts[0].operands[1], vreg(0));
+        assert_eq!(block.insts[0].operands[3], MachineOperand::Imm(-24));
+    }
+
+    /// Different bases — no fusion.
+    #[test]
+    fn ldp_no_fusion_different_base() {
+        let classes = vec![RegClass::Gp64; 4];
+        let ldr1 = MachineInst {
+            opcode: ArmOpcode::LdrImm,
+            operands: vec![vreg(0), vreg(2), MachineOperand::Imm(0)],
+            def: Some(vid(0)),
+        };
+        let ldr2 = MachineInst {
+            opcode: ArmOpcode::LdrImm,
+            operands: vec![vreg(1), vreg(3), MachineOperand::Imm(8)],
+            def: Some(vid(1)),
+        };
+        let mut mf = mf_with_classes(vec![ldr1, ldr2], &classes);
+        ldp_stp_fusion(&mut mf);
+        assert_eq!(mf.blocks[0].insts.len(), 2);
+        assert_eq!(mf.blocks[0].insts[0].opcode, ArmOpcode::LdrImm);
+    }
+
+    /// Non-adjacent offsets (gap of 16 instead of 8) — no fusion.
+    #[test]
+    fn ldp_no_fusion_non_adjacent() {
+        let classes = vec![RegClass::Gp64; 3];
+        let ldr1 = MachineInst {
+            opcode: ArmOpcode::LdrImm,
+            operands: vec![vreg(0), vreg(2), MachineOperand::Imm(0)],
+            def: Some(vid(0)),
+        };
+        let ldr2 = MachineInst {
+            opcode: ArmOpcode::LdrImm,
+            operands: vec![vreg(1), vreg(2), MachineOperand::Imm(16)],
+            def: Some(vid(1)),
+        };
+        let mut mf = mf_with_classes(vec![ldr1, ldr2], &classes);
+        ldp_stp_fusion(&mut mf);
+        assert_eq!(mf.blocks[0].insts.len(), 2);
+    }
+
+    /// Mixed-width pair (i32 + i64) — no fusion since LDP needs matching widths.
+    #[test]
+    fn ldp_no_fusion_mixed_width() {
+        let classes = vec![RegClass::Gp32, RegClass::Gp64, RegClass::Gp64];
+        let ldr1 = MachineInst {
+            opcode: ArmOpcode::LdrImm,
+            operands: vec![vreg(0), vreg(2), MachineOperand::Imm(0)],
+            def: Some(vid(0)),
+        };
+        let ldr2 = MachineInst {
+            opcode: ArmOpcode::LdrImm,
+            operands: vec![vreg(1), vreg(2), MachineOperand::Imm(4)],
+            def: Some(vid(1)),
+        };
+        let mut mf = mf_with_classes(vec![ldr1, ldr2], &classes);
+        ldp_stp_fusion(&mut mf);
+        assert_eq!(mf.blocks[0].insts.len(), 2);
+    }
+
+    /// LDR with dest == base — must not fuse (the second load would otherwise read
+    /// the now-overwritten base).
+    #[test]
+    fn ldp_no_fusion_dest_equals_base() {
+        let classes = vec![RegClass::Gp64; 2];
+        // dest of first load is the base
+        let ldr1 = MachineInst {
+            opcode: ArmOpcode::LdrImm,
+            operands: vec![vreg(1), vreg(1), MachineOperand::Imm(0)],
+            def: Some(vid(1)),
+        };
+        let ldr2 = MachineInst {
+            opcode: ArmOpcode::LdrImm,
+            operands: vec![vreg(0), vreg(1), MachineOperand::Imm(8)],
+            def: Some(vid(0)),
+        };
+        let mut mf = mf_with_classes(vec![ldr1, ldr2], &classes);
+        ldp_stp_fusion(&mut mf);
+        assert_eq!(mf.blocks[0].insts.len(), 2);
     }
 
     /// StrImm gets folded too (mirror of the load path).
