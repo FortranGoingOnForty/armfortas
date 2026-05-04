@@ -463,10 +463,9 @@ impl SymbolTable {
 
     /// Find a module scope by name (for USE resolution within the same file).
     pub fn find_module_scope(&self, name: &str) -> Option<ScopeId> {
-        let key = name.to_lowercase();
         self.scopes.iter().find_map(|s| {
             if let ScopeKind::Module(ref n) = s.kind {
-                if n.to_lowercase() == key {
+                if n.eq_ignore_ascii_case(name) {
                     Some(s.id)
                 } else {
                     None
