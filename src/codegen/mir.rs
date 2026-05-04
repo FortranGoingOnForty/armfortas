@@ -122,6 +122,14 @@ pub enum ArmOpcode {
     LdrsbImm,  // LDRSB Wt, [Xn, #imm] (load 8-bit byte, sign-extended)
     StrFpImm,  // STR Dt, [Xn, #imm]  (float store)
     LdrFpImm,  // LDR Dt, [Xn, #imm]  (float load)
+    // Register-offset loads/stores: address = base + index << shift.
+    // Operands: [dest, base, idx, Imm(shift)]. Shift ∈ {0,1,2,3}.
+    // Sprint 05: emitted by `scaled_addressing_fusion` from a
+    // Movz+Mul+AddReg+Ldr/Str sequence when elem_size ∈ {1,2,4,8}.
+    LdrReg,    // LDR Xt|Wt, [Xn, Xm, lsl #shift]
+    StrReg,    // STR Xt|Wt, [Xn, Xm, lsl #shift]
+    LdrFpReg,  // LDR Dt|St, [Xn, Xm, lsl #shift]
+    StrFpReg,  // STR Dt|St, [Xn, Xm, lsl #shift]
     StpPre,    // STP Xt1, Xt2, [Xn, #imm]!  (pre-index)
     LdpPost,   // LDP Xt1, Xt2, [Xn], #imm   (post-index)
     StpOffset, // STP Xt1, Xt2, [Xn, #imm]   (signed offset, no writeback)

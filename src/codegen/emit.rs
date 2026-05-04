@@ -846,6 +846,28 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
                 )
             }
         }
+        // Sprint 05: scaled-register-offset addressing. Operands are
+        // [dest, base, idx, Imm(shift)]. Shift 0 elides the `, lsl
+        // #0` suffix per the assembler convention.
+        ArmOpcode::LdrReg | ArmOpcode::LdrFpReg | ArmOpcode::StrReg | ArmOpcode::StrFpReg => {
+            let dest = op_str(&inst.operands[0]);
+            let base = op_str(&inst.operands[1]);
+            let idx = op_str(&inst.operands[2]);
+            let shift = match &inst.operands[3] {
+                MachineOperand::Imm(v) => *v,
+                _ => 0,
+            };
+            let mnemonic = match inst.opcode {
+                ArmOpcode::LdrReg | ArmOpcode::LdrFpReg => "ldr",
+                ArmOpcode::StrReg | ArmOpcode::StrFpReg => "str",
+                _ => unreachable!(),
+            };
+            if shift == 0 {
+                format!("{} {}, [{}, {}]", mnemonic, dest, base, idx)
+            } else {
+                format!("{} {}, [{}, {}, lsl #{}]", mnemonic, dest, base, idx, shift)
+            }
+        }
 
         ArmOpcode::StpPre => {
             let frame_size = mf.frame.size as i64;

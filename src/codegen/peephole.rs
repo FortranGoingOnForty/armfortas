@@ -59,6 +59,11 @@ pub fn run_peephole(mf: &mut MachineFunction) {
     const MAX_ROUNDS: u32 = 8;
     for _ in 0..MAX_ROUNDS {
         let before = total_inst_count(mf);
+        // Scaled-addressing fusion first so it can consume the
+        // Mul + AddReg pair before madd_fusion would collapse them
+        // into a Madd. A single load-with-shift beats a fused madd
+        // followed by a plain ldr.
+        scaled_addressing_fusion(mf);
         fma_fusion(mf);
         madd_fusion(mf);
         if total_inst_count(mf) == before {
@@ -502,6 +507,261 @@ fn madd_fuse_block(mf: &mut MachineFunction, mb_idx: usize) {
     });
 }
 
+/// ARM64 scaled-register addressing fusion.
+///
+/// Rewrites the 4-instruction sequence emitted by GEP+Load/Store
+/// lowering when `elem_size` is a power of two ≤ 8:
+///
+/// ```text
+/// movz tmp, #elem_size, 0      ; (or const-materializing equivalent)
+/// mul  scaled, idx, tmp
+/// add  addr, base, scaled
+/// ldr  dest, [addr]            ; LdrImm/LdrFpImm/StrImm/StrFpImm, offset 0
+/// ```
+///
+/// into a single instruction:
+///
+/// ```text
+/// ldr  dest, [base, idx, lsl #shift]
+/// ```
+///
+/// Preconditions checked per fusion site:
+/// * `tmp` has exactly one use (the mul) and is defined by a single
+///   `Movz` whose chunk value ∈ {1, 2, 4, 8} with shift 0.
+/// * `scaled` (the mul result) has exactly one use (the add).
+/// * `addr` (the add result) has exactly one use (the load/store).
+/// * The load/store's offset operand is `Imm(0)`.
+/// * All four instructions live in the same machine block.
+///
+/// Multi-use intermediates (e.g. the same GEP feeds two loads) keep
+/// the unfused form — duplicating the index calculation across each
+/// consumer would increase code size, not decrease it.
+fn scaled_addressing_fusion(mf: &mut MachineFunction) {
+    // Compute use counts function-wide. The fold removes 3
+    // instructions (Movz, Mul, AddReg) and rewrites a 4th. If any of
+    // those defs is consumed in *another* block (cross-block live
+    // value), we must not fold — the consumer would lose its
+    // operand. A per-block count understates true uses when the
+    // value is live-out, which is what the cross-block path needs to
+    // reject. Counting once per function is cheap and correct.
+    let use_count = compute_global_use_counts(mf);
+    for mb_idx in 0..mf.blocks.len() {
+        scaled_addressing_fuse_block(mf, mb_idx, &use_count);
+    }
+}
+
+fn compute_global_use_counts(mf: &MachineFunction) -> HashMap<VRegId, usize> {
+    let mut use_count: HashMap<VRegId, usize> = HashMap::new();
+    for block in &mf.blocks {
+        for inst in &block.insts {
+            // operand[0] is the def for instructions that have one.
+            let skip_first = inst.def.is_some();
+            for (i, op) in inst.operands.iter().enumerate() {
+                if skip_first && i == 0 {
+                    continue;
+                }
+                if let MachineOperand::VReg(v) = op {
+                    *use_count.entry(*v).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    use_count
+}
+
+fn scaled_addressing_fuse_block(
+    mf: &mut MachineFunction,
+    mb_idx: usize,
+    use_count: &HashMap<VRegId, usize>,
+) {
+    let block = &mf.blocks[mb_idx];
+
+    // Map vreg → (block-local index of defining instruction, opcode).
+    let mut defs: HashMap<VRegId, (usize, ArmOpcode)> = HashMap::new();
+    for (i, inst) in block.insts.iter().enumerate() {
+        if let Some(d) = inst.def {
+            defs.insert(d, (i, inst.opcode));
+        }
+    }
+
+    struct FusionPlan {
+        ldst_idx: usize,
+        add_idx: usize,
+        mul_idx: usize,
+        movz_idx: usize,
+        new_opcode: ArmOpcode,
+        // [dest, base, idx, Imm(shift)]
+        dest_op: MachineOperand,
+        dest_def: Option<VRegId>,
+        base: VRegId,
+        idx: VRegId,
+        shift: i64,
+    }
+    let mut plans: Vec<FusionPlan> = Vec::new();
+
+    for (i, inst) in block.insts.iter().enumerate() {
+        let new_opcode = match inst.opcode {
+            ArmOpcode::LdrImm => ArmOpcode::LdrReg,
+            ArmOpcode::LdrFpImm => ArmOpcode::LdrFpReg,
+            ArmOpcode::StrImm => ArmOpcode::StrReg,
+            ArmOpcode::StrFpImm => ArmOpcode::StrFpReg,
+            _ => continue,
+        };
+        // Format: [dest_or_src, base, offset]. Offset must be Imm(0).
+        if inst.operands.len() < 3 {
+            continue;
+        }
+        let offset_zero = matches!(&inst.operands[2], MachineOperand::Imm(0));
+        if !offset_zero {
+            continue;
+        }
+        let base_addr = match &inst.operands[1] {
+            MachineOperand::VReg(v) => *v,
+            _ => continue,
+        };
+
+        // The base address must come from a single-use AddReg.
+        let (add_idx, add_op) = match defs.get(&base_addr) {
+            Some(&(idx, op)) => (idx, op),
+            None => continue,
+        };
+        if add_op != ArmOpcode::AddReg {
+            continue;
+        }
+        if use_count.get(&base_addr).copied().unwrap_or(0) != 1 {
+            continue;
+        }
+
+        let add_inst = &block.insts[add_idx];
+        if add_inst.operands.len() < 3 {
+            continue;
+        }
+        let add_lhs = match &add_inst.operands[1] {
+            MachineOperand::VReg(v) => *v,
+            _ => continue,
+        };
+        let add_rhs = match &add_inst.operands[2] {
+            MachineOperand::VReg(v) => *v,
+            _ => continue,
+        };
+
+        // The scaled-index operand: defined by a single-use Mul. Try
+        // either commuted order — `add base, scaled` or `add scaled,
+        // base` (isel emits the former, but be defensive).
+        let try_pair = |scaled: VRegId, base: VRegId| -> Option<(usize, VRegId, VRegId, i64, usize)> {
+            let &(mul_idx, mul_op) = defs.get(&scaled)?;
+            if mul_op != ArmOpcode::Mul {
+                return None;
+            }
+            if use_count.get(&scaled).copied().unwrap_or(0) != 1 {
+                return None;
+            }
+            let mul_inst = &block.insts[mul_idx];
+            if mul_inst.operands.len() < 3 {
+                return None;
+            }
+            let m_lhs = match &mul_inst.operands[1] {
+                MachineOperand::VReg(v) => *v,
+                _ => return None,
+            };
+            let m_rhs = match &mul_inst.operands[2] {
+                MachineOperand::VReg(v) => *v,
+                _ => return None,
+            };
+            // The constant operand of the Mul — must be defined by a
+            // single-use Movz with chunk ∈ {1,2,4,8} at shift 0.
+            let try_const = |const_v: VRegId, idx_v: VRegId| -> Option<(VRegId, i64, usize)> {
+                let &(movz_idx, movz_op) = defs.get(&const_v)?;
+                if movz_op != ArmOpcode::Movz {
+                    return None;
+                }
+                if use_count.get(&const_v).copied().unwrap_or(0) != 1 {
+                    return None;
+                }
+                let movz_inst = &block.insts[movz_idx];
+                // Movz operands: [dest, Imm(chunk), Shift(amount)]. We
+                // require shift==0 and chunk ∈ {1,2,4,8}.
+                if movz_inst.operands.len() < 3 {
+                    return None;
+                }
+                let chunk = match &movz_inst.operands[1] {
+                    MachineOperand::Imm(v) => *v,
+                    _ => return None,
+                };
+                let shift_amount = match &movz_inst.operands[2] {
+                    MachineOperand::Shift(s) => *s,
+                    _ => return None,
+                };
+                if shift_amount != 0 {
+                    return None;
+                }
+                let lsl_shift: i64 = match chunk {
+                    1 => 0,
+                    2 => 1,
+                    4 => 2,
+                    8 => 3,
+                    _ => return None,
+                };
+                Some((idx_v, lsl_shift, movz_idx))
+            };
+            try_const(m_rhs, m_lhs)
+                .or_else(|| try_const(m_lhs, m_rhs))
+                .map(|(idx, shift, movz_idx)| (mul_idx, base, idx, shift, movz_idx))
+        };
+
+        let resolved = try_pair(add_rhs, add_lhs).or_else(|| try_pair(add_lhs, add_rhs));
+        let Some((mul_idx, base_v, idx_v, shift, movz_idx)) = resolved else {
+            continue;
+        };
+
+        plans.push(FusionPlan {
+            ldst_idx: i,
+            add_idx,
+            mul_idx,
+            movz_idx,
+            new_opcode,
+            dest_op: inst.operands[0].clone(),
+            dest_def: inst.def,
+            base: base_v,
+            idx: idx_v,
+            shift,
+        });
+    }
+
+    if plans.is_empty() {
+        return;
+    }
+
+    // Apply: rewrite the load/store in place; mark the mul/add/movz
+    // for removal. Iterate in reverse ldst_idx order so removals
+    // before the rewrite don't shift indices.
+    plans.sort_by_key(|plan| std::cmp::Reverse(plan.ldst_idx));
+    let mut remove_idxs: std::collections::HashSet<usize> = plans
+        .iter()
+        .flat_map(|p| [p.add_idx, p.mul_idx, p.movz_idx])
+        .collect();
+
+    let block = &mut mf.blocks[mb_idx];
+    for plan in &plans {
+        block.insts[plan.ldst_idx] = MachineInst {
+            opcode: plan.new_opcode,
+            operands: vec![
+                plan.dest_op.clone(),
+                MachineOperand::VReg(plan.base),
+                MachineOperand::VReg(plan.idx),
+                MachineOperand::Imm(plan.shift),
+            ],
+            def: plan.dest_def,
+        };
+    }
+    let mut idx = 0usize;
+    block.insts.retain(|_| {
+        let keep = !remove_idxs.remove(&idx);
+        idx += 1;
+        keep
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -756,5 +1016,136 @@ mod tests {
         // No fusion — fmul has 2 uses.
         assert_eq!(mf.blocks[0].insts.len(), 3);
         assert_eq!(mf.blocks[0].insts[0].opcode, ArmOpcode::FmulS);
+    }
+
+    /// LdrFpImm fed by AddReg(base, Mul(idx, Movz(8))) → LdrFpReg with lsl=3.
+    #[test]
+    fn scaled_addressing_real8_load() {
+        let movz = MachineInst {
+            opcode: ArmOpcode::Movz,
+            operands: vec![vreg(0), MachineOperand::Imm(8), MachineOperand::Shift(0)],
+            def: Some(vid(0)),
+        };
+        let mul = MachineInst {
+            opcode: ArmOpcode::Mul,
+            operands: vec![vreg(1), vreg(2), vreg(0)], // scaled = idx(2) * const(0)
+            def: Some(vid(1)),
+        };
+        let add = MachineInst {
+            opcode: ArmOpcode::AddReg,
+            operands: vec![vreg(3), vreg(4), vreg(1)], // addr = base(4) + scaled(1)
+            def: Some(vid(3)),
+        };
+        let ldr = MachineInst {
+            opcode: ArmOpcode::LdrFpImm,
+            operands: vec![vreg(5), vreg(3), MachineOperand::Imm(0)], // ldr d5, [addr, #0]
+            def: Some(vid(5)),
+        };
+        let mut mf = mf_with_insts(vec![movz, mul, add, ldr]);
+        scaled_addressing_fusion(&mut mf);
+        let block = &mf.blocks[0];
+        assert_eq!(block.insts.len(), 1, "movz/mul/add should be removed");
+        assert_eq!(block.insts[0].opcode, ArmOpcode::LdrFpReg);
+        assert_eq!(block.insts[0].operands[0], vreg(5)); // dest
+        assert_eq!(block.insts[0].operands[1], vreg(4)); // base
+        assert_eq!(block.insts[0].operands[2], vreg(2)); // idx
+        assert_eq!(block.insts[0].operands[3], MachineOperand::Imm(3)); // log2(8) = 3
+    }
+
+    /// Multi-use Mul result → no fold (the mul result is consumed twice).
+    #[test]
+    fn scaled_addressing_no_fold_on_multi_use_mul() {
+        let movz = MachineInst {
+            opcode: ArmOpcode::Movz,
+            operands: vec![vreg(0), MachineOperand::Imm(8), MachineOperand::Shift(0)],
+            def: Some(vid(0)),
+        };
+        let mul = MachineInst {
+            opcode: ArmOpcode::Mul,
+            operands: vec![vreg(1), vreg(2), vreg(0)],
+            def: Some(vid(1)),
+        };
+        let add = MachineInst {
+            opcode: ArmOpcode::AddReg,
+            operands: vec![vreg(3), vreg(4), vreg(1)],
+            def: Some(vid(3)),
+        };
+        let ldr = MachineInst {
+            opcode: ArmOpcode::LdrFpImm,
+            operands: vec![vreg(5), vreg(3), MachineOperand::Imm(0)],
+            def: Some(vid(5)),
+        };
+        // Second consumer of the mul result — extra reference to vreg(1).
+        let extra = MachineInst {
+            opcode: ArmOpcode::AddReg,
+            operands: vec![vreg(6), vreg(7), vreg(1)],
+            def: Some(vid(6)),
+        };
+        let mut mf = mf_with_insts(vec![movz, mul, add, ldr, extra]);
+        scaled_addressing_fusion(&mut mf);
+        // Nothing fused.
+        assert_eq!(mf.blocks[0].insts.len(), 5);
+        assert_eq!(mf.blocks[0].insts[3].opcode, ArmOpcode::LdrFpImm);
+    }
+
+    /// Non-power-of-two const (e.g. element size 12 from a 3-int derived
+    /// type) must NOT fold — there's no `lsl` encoding for it.
+    #[test]
+    fn scaled_addressing_no_fold_on_non_power_of_two() {
+        let movz = MachineInst {
+            opcode: ArmOpcode::Movz,
+            operands: vec![vreg(0), MachineOperand::Imm(12), MachineOperand::Shift(0)],
+            def: Some(vid(0)),
+        };
+        let mul = MachineInst {
+            opcode: ArmOpcode::Mul,
+            operands: vec![vreg(1), vreg(2), vreg(0)],
+            def: Some(vid(1)),
+        };
+        let add = MachineInst {
+            opcode: ArmOpcode::AddReg,
+            operands: vec![vreg(3), vreg(4), vreg(1)],
+            def: Some(vid(3)),
+        };
+        let ldr = MachineInst {
+            opcode: ArmOpcode::LdrImm,
+            operands: vec![vreg(5), vreg(3), MachineOperand::Imm(0)],
+            def: Some(vid(5)),
+        };
+        let mut mf = mf_with_insts(vec![movz, mul, add, ldr]);
+        scaled_addressing_fusion(&mut mf);
+        assert_eq!(mf.blocks[0].insts.len(), 4);
+        assert_eq!(mf.blocks[0].insts[3].opcode, ArmOpcode::LdrImm);
+    }
+
+    /// StrImm gets folded too (mirror of the load path).
+    #[test]
+    fn scaled_addressing_int4_store() {
+        let movz = MachineInst {
+            opcode: ArmOpcode::Movz,
+            operands: vec![vreg(0), MachineOperand::Imm(4), MachineOperand::Shift(0)],
+            def: Some(vid(0)),
+        };
+        let mul = MachineInst {
+            opcode: ArmOpcode::Mul,
+            operands: vec![vreg(1), vreg(2), vreg(0)],
+            def: Some(vid(1)),
+        };
+        let add = MachineInst {
+            opcode: ArmOpcode::AddReg,
+            operands: vec![vreg(3), vreg(4), vreg(1)],
+            def: Some(vid(3)),
+        };
+        let str_inst = MachineInst {
+            opcode: ArmOpcode::StrImm,
+            operands: vec![vreg(5), vreg(3), MachineOperand::Imm(0)],
+            def: None, // store has no def
+        };
+        let mut mf = mf_with_insts(vec![movz, mul, add, str_inst]);
+        scaled_addressing_fusion(&mut mf);
+        let block = &mf.blocks[0];
+        assert_eq!(block.insts.len(), 1);
+        assert_eq!(block.insts[0].opcode, ArmOpcode::StrReg);
+        assert_eq!(block.insts[0].operands[3], MachineOperand::Imm(2)); // log2(4) = 2
     }
 }
