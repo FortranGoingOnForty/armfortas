@@ -15,7 +15,8 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use super::core::{ConstScalar, ModuleGlobalInfo};
+use super::const_scalar::ConstScalar;
+use super::core::ModuleGlobalInfo;
 
 pub(super) type AmbiguousUseWarnings = Rc<RefCell<HashSet<(String, String, String)>>>;
 

@@ -11,6 +11,7 @@
 //! the sprint progresses (`ctx` lifted in step 2). Public re-exports
 //! preserve the historical `crate::ir::lower::*` API.
 
+mod const_scalar;
 mod core;
 mod ctx;
 
