@@ -439,6 +439,30 @@ fn key_of(
         | InstKind::Undef(..)
         | InstKind::ExtractField(..)
         | InstKind::InsertField(..) => None,
+
+        // Vector ops opt out of GVN until the vectorizer lands and we
+        // can characterize aliasing / commutativity properly. Same
+        // policy as CSE keying.
+        InstKind::VAdd(..)
+        | InstKind::VSub(..)
+        | InstKind::VMul(..)
+        | InstKind::VDiv(..)
+        | InstKind::VNeg(..)
+        | InstKind::VAbs(..)
+        | InstKind::VFma(..)
+        | InstKind::VMin(..)
+        | InstKind::VMax(..)
+        | InstKind::VICmp(..)
+        | InstKind::VFCmp(..)
+        | InstKind::VLoad(..)
+        | InstKind::VStore(..)
+        | InstKind::VBitcast(..)
+        | InstKind::VExtract(..)
+        | InstKind::VInsert(..)
+        | InstKind::VBroadcast(..)
+        | InstKind::VReduceSum(..)
+        | InstKind::VReduceMin(..)
+        | InstKind::VReduceMax(..) => None,
     }
 }
 

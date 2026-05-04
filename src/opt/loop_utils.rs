@@ -314,6 +314,28 @@ pub fn remap_inst_kind(kind: &InstKind, map: &HashMap<ValueId, ValueId>) -> Inst
         }
         InstKind::ExtractField(v, idx) => InstKind::ExtractField(r(v), *idx),
         InstKind::InsertField(v, idx, fld) => InstKind::InsertField(r(v), *idx, r(fld)),
+
+        // ---- SIMD vector ops ----
+        InstKind::VAdd(a, b) => InstKind::VAdd(r(a), r(b)),
+        InstKind::VSub(a, b) => InstKind::VSub(r(a), r(b)),
+        InstKind::VMul(a, b) => InstKind::VMul(r(a), r(b)),
+        InstKind::VDiv(a, b) => InstKind::VDiv(r(a), r(b)),
+        InstKind::VNeg(a) => InstKind::VNeg(r(a)),
+        InstKind::VAbs(a) => InstKind::VAbs(r(a)),
+        InstKind::VFma(a, b, c) => InstKind::VFma(r(a), r(b), r(c)),
+        InstKind::VMin(a, b) => InstKind::VMin(r(a), r(b)),
+        InstKind::VMax(a, b) => InstKind::VMax(r(a), r(b)),
+        InstKind::VICmp(op, a, b) => InstKind::VICmp(*op, r(a), r(b)),
+        InstKind::VFCmp(op, a, b) => InstKind::VFCmp(*op, r(a), r(b)),
+        InstKind::VLoad(p) => InstKind::VLoad(r(p)),
+        InstKind::VStore(v, p) => InstKind::VStore(r(v), r(p)),
+        InstKind::VBitcast(v, ty) => InstKind::VBitcast(r(v), ty.clone()),
+        InstKind::VExtract(v, lane) => InstKind::VExtract(r(v), *lane),
+        InstKind::VInsert(v, lane, s) => InstKind::VInsert(r(v), *lane, r(s)),
+        InstKind::VBroadcast(s) => InstKind::VBroadcast(r(s)),
+        InstKind::VReduceSum(v) => InstKind::VReduceSum(r(v)),
+        InstKind::VReduceMin(v) => InstKind::VReduceMin(r(v)),
+        InstKind::VReduceMax(v) => InstKind::VReduceMax(r(v)),
     }
 }
 

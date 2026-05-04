@@ -191,6 +191,32 @@ fn inst_uses_param(kind: &InstKind, param_id: ValueId) -> bool {
         }
         InstKind::InsertField(agg, _, val) => *agg == param_id || *val == param_id,
         InstKind::Call(FuncRef::Internal(_), _) => false,
+
+        // Vector ops — fall through to the generic operand walk so we
+        // don't accidentally treat a vector inst as not using the
+        // param if a future vectorizer makes it consume one.
+        kind @ (InstKind::VAdd(..)
+        | InstKind::VSub(..)
+        | InstKind::VMul(..)
+        | InstKind::VDiv(..)
+        | InstKind::VNeg(..)
+        | InstKind::VAbs(..)
+        | InstKind::VFma(..)
+        | InstKind::VMin(..)
+        | InstKind::VMax(..)
+        | InstKind::VICmp(..)
+        | InstKind::VFCmp(..)
+        | InstKind::VLoad(..)
+        | InstKind::VStore(..)
+        | InstKind::VBitcast(..)
+        | InstKind::VExtract(..)
+        | InstKind::VInsert(..)
+        | InstKind::VBroadcast(..)
+        | InstKind::VReduceSum(..)
+        | InstKind::VReduceMin(..)
+        | InstKind::VReduceMax(..)) => {
+            crate::ir::walk::inst_uses(kind).contains(&param_id)
+        }
     }
 }
 
