@@ -15,6 +15,8 @@ mod const_scalar;
 mod core;
 mod ctx;
 mod helpers;
+mod intrinsic;
+mod intrinsic_sub;
 mod unit;
 
 pub use core::*;
