@@ -1052,6 +1052,49 @@ pub extern "C" fn afs_allocate_1d(desc: *mut ArrayDescriptor, elem_size: i64, n:
     );
 }
 
+/// Allocate `dest` with the same SHAPE (rank + extents) as `source`,
+/// but a caller-provided `elem_size` and a 1-based bound view per
+/// F2018 §10.1.5 / §6.5.3.5(2): elemental and relational array
+/// expressions yield a result whose lower bound is 1 in every
+/// dimension regardless of the operand's bounds.  Used by the
+/// rank-N relational path so callees receiving the mask through
+/// e.g. `mask(:,:)` see a coherent rank-N descriptor instead of
+/// the rank-1 placeholder the old path emitted.
+#[no_mangle]
+pub extern "C" fn afs_allocate_like_with_elem_size(
+    dest: *mut ArrayDescriptor,
+    source: *const ArrayDescriptor,
+    elem_size: i64,
+    stat: *mut i32,
+) {
+    if dest.is_null() || source.is_null() {
+        if !stat.is_null() {
+            unsafe {
+                *stat = 1;
+            }
+        }
+        return;
+    }
+
+    let source = unsafe { &*source };
+    let mut dims = [DimDescriptor::default(); MAX_RANK];
+    for (i, dim) in dims.iter_mut().enumerate().take(source.rank as usize) {
+        let extent = source.dims[i].extent();
+        *dim = DimDescriptor {
+            lower_bound: 1,
+            upper_bound: extent,
+            stride: 1,
+        };
+    }
+
+    let dims_ptr = if source.rank > 0 {
+        dims.as_ptr()
+    } else {
+        ptr::null()
+    };
+    afs_allocate_array(dest, elem_size, source.rank, dims_ptr, stat);
+}
+
 /// Allocate `dest` with the same shape and element size as `source`.
 ///
 /// The resulting destination is always contiguous, even when `source`
