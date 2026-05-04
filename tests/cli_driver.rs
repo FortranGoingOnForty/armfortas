@@ -25676,6 +25676,53 @@ fn substring_write_with_inline_ichar_of_same_component_substring() {
 }
 
 #[test]
+fn ishft_negative_shift_on_negative_int16_returns_logical_shift() {
+    // F2018 §16.9.95: ISHFT does a *logical* shift on the bit
+    // representation of the integer. For a negative int8/int16 value
+    // sign-extended into the AArch64 32-bit register
+    // (e.g. -32767_int16 = 0x8001 lives as 0xFFFF8001 in w-reg),
+    // a naive `lshr` over the register shifted the upper sign-fill
+    // bits in alongside, producing 0x00FFFF80 (16777088) instead of
+    // 0x0080 (128).
+    //
+    // Surfaced via stdlib's `radix_sort_u16_helper`, which does
+    // `b1 = ishft(arr(i), -radix_bits_i16)` with `arr(i)` in
+    // `[-32767, ...]`. The helper then indexes
+    // `c1(b1)` against a 0:255 counts array — the bogus -128 result
+    // tripped a bounds check on the radix bucket lookup.
+    //
+    // Fix: mask args[0] to its kind's width before the lshr so the
+    // shift sees the unsigned bit pattern of the int16, not the
+    // sign-extended w-reg representation.
+    let src = write_program(
+        "program p\n  use iso_fortran_env, only: int16\n  implicit none\n  integer(int16) :: a16\n  integer :: r\n  a16 = -32767_int16\n  r = ishft(a16, -8_int16)\n  if (r /= 128) error stop 1\n  ! Also exercise positive shift and zero shift on negative int16.\n  if (ishft(a16, 0_int16) /= -32767_int16) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("ishft_neg_i16", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("ishft-neg-i16 compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "ishft-neg-i16 compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("ishft-neg-i16 run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "ishft-neg-i16: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn int64_array_scalar_broadcast_init_clears_upper_half() {
     // Regression: `integer(int64) :: counts(-128:127); counts(:) = 0`
     // emitted a broadcast loop that stored an i32 zero at every
