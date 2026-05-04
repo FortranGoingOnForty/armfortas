@@ -19210,15 +19210,14 @@ fn install_assumed_shape_lower_overrides(
         let entity_is_allocatable_or_pointer = attrs
             .iter()
             .any(|a| matches!(a, Attribute::Allocatable | Attribute::Pointer));
-        // Optional dummies need a present-check before dereferencing
-        // the descriptor pointer (callers pass null when absent). The
-        // override unconditionally loads + memcpys from that pointer,
-        // which faults on absent. Skipping for optionals is a small
-        // F2018 conformance gap — when the optional IS present, the
-        // callee sees the caller's bounds rather than the rebased
-        // view — but matches the prior behavior and avoids a SEGV
-        // on the absence path. Revisit if a stdlib idiom surfaces
-        // that needs F2018-correct lbound through optional dummies.
+        // Optional dummies receive a null descriptor pointer when
+        // the actual is absent (F2018 §15.5.2.12). The unconditional
+        // load + memcpy from that pointer would fault — guard with a
+        // runtime null check so absent optionals fall through to the
+        // procedure body unchanged (`present()` still detects null
+        // because we only redirect `info.addr` to the local copy on
+        // the present path; the original null stays in the slot when
+        // absent).
         let entity_is_optional = attrs
             .iter()
             .any(|a| matches!(a, Attribute::Optional));
@@ -19231,9 +19230,6 @@ fn install_assumed_shape_lower_overrides(
                 continue;
             }
             if entity_is_allocatable_or_pointer || info.is_pointer {
-                continue;
-            }
-            if entity_is_optional {
                 continue;
             }
             let Some(specs) = entity.array_spec.as_ref().or(attr_dims) else {
@@ -19279,6 +19275,25 @@ fn install_assumed_shape_lower_overrides(
                 Box::new(IrType::Int(IntWidth::I8)),
                 384,
             ));
+
+            // For optional dummies, the actual may be absent — caller
+            // passes a null descriptor pointer in that case. Guard the
+            // memcpy + rewrite with a runtime null check; on the absent
+            // path we leave `slot` holding the original null so that
+            // `present()` and downstream null-checks behave unchanged.
+            let rebase_done_bb = if entity_is_optional {
+                let zero_i64 = b.const_i64(0);
+                let incoming_addr = b.ptr_to_int(original_desc_ptr);
+                let is_present = b.icmp(CmpOp::Ne, incoming_addr, zero_i64);
+                let bb_present = b.create_block("aslbr_present");
+                let bb_done = b.create_block("aslbr_done");
+                b.cond_branch(is_present, bb_present, vec![], bb_done, vec![]);
+                b.set_block(bb_present);
+                Some(bb_done)
+            } else {
+                None
+            };
+
             let bytes = b.const_i64(384);
             b.call(
                 FuncRef::External("memcpy".into()),
@@ -19318,6 +19333,11 @@ fn install_assumed_shape_lower_overrides(
                 b.store(new_up, up_p);
             }
             b.store(local_desc, slot);
+
+            if let Some(done_bb) = rebase_done_bb {
+                b.branch(done_bb, vec![]);
+                b.set_block(done_bb);
+            }
         }
     }
 }
