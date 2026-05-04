@@ -25676,6 +25676,52 @@ fn substring_write_with_inline_ichar_of_same_component_substring() {
 }
 
 #[test]
+fn int64_array_scalar_broadcast_init_clears_upper_half() {
+    // Regression: `integer(int64) :: counts(-128:127); counts(:) = 0`
+    // emitted a broadcast loop that stored an i32 zero at every
+    // 8-byte stride, leaving the upper 4 bytes of each i64 slot with
+    // stack garbage. A later `counts(b) = counts(b) + 1` round-tripped
+    // those 4 garbage bytes through a 64-bit load/add/store, so the
+    // counter accumulated bogus high-bit values.
+    //
+    // Surfaced via stdlib's `radix_sort_u8_helper` (counting-sort path
+    // for int8 arrays): for input `[-128, 127, 0, -1, 1]` the helper's
+    // counts grew to `sum(counts) = 272088089462046725` instead of 5,
+    // and the write-back loop overshot N=5 with "Bounds check failed:
+    // index 6 outside [1, 5]" on `arr(i) = …`.
+    //
+    // Fix coerces the broadcast scalar to the destination element
+    // type before the inner store so the store width matches the
+    // slot stride; the broadcast loop now writes 0_i64 each iteration.
+    let src = write_program(
+        "module m\n  use iso_fortran_env, only: int64\n  implicit none\ncontains\n  subroutine helper(arr)\n    integer(int64), intent(out) :: arr(-128:127)\n    arr(:) = 0\n  end subroutine\nend module\n\nprogram p\n  use m\n  use iso_fortran_env, only: int64\n  implicit none\n  integer(int64) :: counts(-128:127)\n  integer :: i, b\n  call helper(counts)\n  do i = -128, 127\n    if (counts(i) /= 0_int64) error stop 1\n  end do\n  ! Mirror the radix_sort counting pattern.\n  do b = 1, 5\n    counts(merge(-128, merge(127, merge(0, merge(-1, 1, b == 4), b == 3), b == 2), b == 1)) = &\n      counts(merge(-128, merge(127, merge(0, merge(-1, 1, b == 4), b == 3), b == 2), b == 1)) + 1\n  end do\n  if (sum(counts) /= 5) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("int64_broadcast_init", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("int64-broadcast-init compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "int64-broadcast-init compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("int64-broadcast-init run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "int64-broadcast-init: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn user_generic_named_char_shadows_intrinsic_in_string_context() {
     // F2008 §13.7: a user-defined function or generic interface with
     // the same name as an intrinsic shadows the intrinsic. The
