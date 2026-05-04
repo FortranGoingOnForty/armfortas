@@ -89,6 +89,27 @@ pub fn inst_uses(kind: &InstKind) -> Vec<ValueId> {
 
         InstKind::ExtractField(agg, _) => vec![*agg],
         InstKind::InsertField(agg, _, val) => vec![*agg, *val],
+
+        // ---- SIMD vector ops ----
+        InstKind::VAdd(a, b)
+        | InstKind::VSub(a, b)
+        | InstKind::VMul(a, b)
+        | InstKind::VDiv(a, b)
+        | InstKind::VMin(a, b)
+        | InstKind::VMax(a, b) => vec![*a, *b],
+        InstKind::VNeg(a)
+        | InstKind::VAbs(a)
+        | InstKind::VLoad(a)
+        | InstKind::VBitcast(a, _)
+        | InstKind::VExtract(a, _)
+        | InstKind::VBroadcast(a)
+        | InstKind::VReduceSum(a)
+        | InstKind::VReduceMin(a)
+        | InstKind::VReduceMax(a) => vec![*a],
+        InstKind::VFma(a, b, c) => vec![*a, *b, *c],
+        InstKind::VICmp(_, a, b) | InstKind::VFCmp(_, a, b) => vec![*a, *b],
+        InstKind::VStore(v, p) => vec![*v, *p],
+        InstKind::VInsert(v, _, s) => vec![*v, *s],
     }
 }
 
@@ -234,6 +255,43 @@ pub fn for_each_operand_mut(kind: &mut InstKind, mut r: impl FnMut(&mut ValueId)
         InstKind::InsertField(agg, _, val) => {
             r(agg);
             r(val);
+        }
+
+        // ---- SIMD vector ops ----
+        InstKind::VAdd(a, b)
+        | InstKind::VSub(a, b)
+        | InstKind::VMul(a, b)
+        | InstKind::VDiv(a, b)
+        | InstKind::VMin(a, b)
+        | InstKind::VMax(a, b) => {
+            r(a);
+            r(b);
+        }
+        InstKind::VNeg(a)
+        | InstKind::VAbs(a)
+        | InstKind::VLoad(a)
+        | InstKind::VBitcast(a, _)
+        | InstKind::VExtract(a, _)
+        | InstKind::VBroadcast(a)
+        | InstKind::VReduceSum(a)
+        | InstKind::VReduceMin(a)
+        | InstKind::VReduceMax(a) => r(a),
+        InstKind::VFma(a, b, c) => {
+            r(a);
+            r(b);
+            r(c);
+        }
+        InstKind::VICmp(_, a, b) | InstKind::VFCmp(_, a, b) => {
+            r(a);
+            r(b);
+        }
+        InstKind::VStore(v, p) => {
+            r(v);
+            r(p);
+        }
+        InstKind::VInsert(v, _, s) => {
+            r(v);
+            r(s);
         }
     }
 }
