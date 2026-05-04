@@ -25676,6 +25676,52 @@ fn substring_write_with_inline_ichar_of_same_component_substring() {
 }
 
 #[test]
+fn user_generic_named_char_shadows_intrinsic_in_string_context() {
+    // F2008 §13.7: a user-defined function or generic interface with
+    // the same name as an intrinsic shadows the intrinsic. The
+    // integer-context dispatch already gated `lower_char_intrinsic`
+    // on `find_named_interface_symbol`, but the string-context
+    // intrinsic match in `lower_string_expr_full` had no such gate.
+    //
+    // Surfaced via stdlib's `to_c_char_from_string`: it does
+    // `use stdlib_string_type, only: char` and inside the body
+    // calls `char(value, pos=i)` against a `type(string_type)`.
+    // Without this gate we emitted intrinsic `afs_char(integer)`
+    // reading the first 8 bytes of the descriptor as an i64,
+    // producing the low byte of the descriptor's data pointer
+    // (a constant value like 0x50 → "PPPPPPPPPPPPP" in the
+    // example_to_c_char output). The PASS direction (size matched
+    // since both came from `len(value)+1`) hid the silent corruption
+    // until the byte-by-byte equality check fired error stop.
+    let src = write_program(
+        "module shadow_mod\n  implicit none\n  type :: box_t\n    integer :: tag = 99\n  end type\n  interface char\n    module procedure char_box\n  end interface\ncontains\n  pure function char_box(b) result(c)\n    type(box_t), intent(in) :: b\n    character(1) :: c\n    c = '!'\n  end function\nend module\n\nprogram p\n  use shadow_mod, only: box_t, char\n  implicit none\n  type(box_t) :: b\n  character(1) :: u, n\n  u = char(b)\n  n = char(72)\n  if (u /= '!') error stop 1\n  if (n /= 'H') error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("user_char_shadow", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("user-char-shadow compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "user-char-shadow compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("user-char-shadow run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "user-char-shadow: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn strided_section_scalar_broadcast_writes_every_strided_slot() {
     // Regression: `arr(1::7) = SCALAR` for a fixed-shape integer
     // array only wrote arr(1), leaving arr(8), arr(15) untouched.
