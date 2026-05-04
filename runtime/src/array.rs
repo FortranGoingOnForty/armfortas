@@ -1075,20 +1075,15 @@ pub extern "C" fn afs_allocate_like_with_elem_size(
     }
 
     let source = unsafe { &*source };
-    // F2018 §10.1.5: relational/elemental array results have the
-    // SAME SHAPE (extents) as the operand but standard 1-based
-    // bounds. The operand may have arbitrary lower/upper bounds
-    // (e.g. `array(-200:200)`); the result must report
-    // `(1:extent)` so callees taking the result through an
-    // assumed-shape dummy iterate `do i = 1, size(...)` without
-    // tripping a bounds check on indices past the original upper
-    // bound.
+    // Preserve the operand's bounds verbatim (F2018 §10.1.5: result
+    // has the same shape as the operand). Stride is forced to 1
+    // because the result is freshly allocated and contiguous; the
+    // operand's stride may have been a section's memory step.
     let mut dims = [DimDescriptor::default(); MAX_RANK];
     for (i, dim) in dims.iter_mut().enumerate().take(source.rank as usize) {
-        let extent = source.dims[i].extent();
         *dim = DimDescriptor {
-            lower_bound: 1,
-            upper_bound: extent,
+            lower_bound: source.dims[i].lower_bound,
+            upper_bound: source.dims[i].upper_bound,
             stride: 1,
         };
     }
