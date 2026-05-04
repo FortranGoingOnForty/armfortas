@@ -19170,6 +19170,23 @@ fn install_assumed_shape_lower_overrides(
     type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
 ) {
     use crate::ast::decl::{ArraySpec, Attribute};
+    // Per F2018 §15.5.2.4(13), every assumed-shape dim has its own
+    // local lower bound: the declared one if specified, else 1 — the
+    // caller's bounds are NOT visible inside the procedure. We rebase
+    // the descriptor view by allocating a local 384-byte copy of the
+    // caller's descriptor and rewriting each AssumedShape dim's lower
+    // (and adjusting upper to preserve extent). base_addr / stride
+    // are preserved by the memcpy so element writes still propagate
+    // back to the caller. Skipping this rebase for `arr(:)` (because
+    // "the caller's 1 is already 1") was a longstanding bug that
+    // surfaced whenever a caller passed an array with non-1 lower
+    // (e.g. `array(-200:200)` into `pure subroutine f(x); real :: x(:)`):
+    // `lbound(x, 1)` inside f returned -200, breaking standard-conforming
+    // callees that rely on F2018's local-rebasing guarantee.
+    enum LowerTarget<'a> {
+        One,
+        Expr(&'a crate::ast::expr::SpannedExpr),
+    }
     for decl in decls {
         let Decl::TypeDecl {
             attrs, entities, ..
@@ -19184,6 +19201,27 @@ fn install_assumed_shape_lower_overrides(
                 None
             }
         });
+        // Allocatable / pointer dummies are deferred-shape, not
+        // assumed-shape: their bounds come from the caller's
+        // ALLOCATE (or pointer assignment), and reallocations
+        // performed by the callee must propagate back. A local
+        // descriptor copy would prevent that propagation. F2018
+        // §15.5.2.5 / §15.5.2.6 are the relevant clauses.
+        let entity_is_allocatable_or_pointer = attrs
+            .iter()
+            .any(|a| matches!(a, Attribute::Allocatable | Attribute::Pointer));
+        // Optional dummies need a present-check before dereferencing
+        // the descriptor pointer (callers pass null when absent). The
+        // override unconditionally loads + memcpys from that pointer,
+        // which faults on absent. Skipping for optionals is a small
+        // F2018 conformance gap — when the optional IS present, the
+        // callee sees the caller's bounds rather than the rebased
+        // view — but matches the prior behavior and avoids a SEGV
+        // on the absence path. Revisit if a stdlib idiom surfaces
+        // that needs F2018-correct lbound through optional dummies.
+        let entity_is_optional = attrs
+            .iter()
+            .any(|a| matches!(a, Attribute::Optional));
         for entity in entities {
             let key = entity.name.to_lowercase();
             let Some(info) = locals.get(&key) else {
@@ -19192,32 +19230,44 @@ fn install_assumed_shape_lower_overrides(
             if !info.by_ref || !info.descriptor_arg {
                 continue;
             }
+            if entity_is_allocatable_or_pointer || info.is_pointer {
+                continue;
+            }
+            if entity_is_optional {
+                continue;
+            }
             let Some(specs) = entity.array_spec.as_ref().or(attr_dims) else {
                 continue;
             };
 
-            // Per-dim: Some(expr) when this dim's declared lower bound is
-            // an explicit non-default (i.e. not literal 1) assumed-shape lower.
-            // Other shapes (Explicit, Deferred, AssumedSize, AssumedRank) take
-            // their lower from info.dims / static path and don't need patching.
-            let mut overrides: Vec<Option<&crate::ast::expr::SpannedExpr>> =
-                Vec::with_capacity(specs.len());
+            // For each dim:
+            //   AssumedShape { lower: None }    → target = 1
+            //   AssumedShape { lower: Some(e) } → target = e (folded if const)
+            //   anything else (Explicit, Deferred, AssumedSize, AssumedRank)
+            //                                   → no override needed
+            let mut overrides: Vec<Option<LowerTarget>> = Vec::with_capacity(specs.len());
             let mut any = false;
             for spec in specs.iter() {
-                let lower_expr = match spec {
-                    ArraySpec::AssumedShape { lower: Some(e) } => Some(e),
+                let target = match spec {
+                    // Bare `(:)` from the parser is `Deferred` — sema is
+                    // supposed to reclassify but doesn't propagate to the
+                    // decls reaching this pass. For non-allocatable,
+                    // non-pointer dummies (already filtered above) this
+                    // means assumed-shape with default lower bound = 1.
+                    ArraySpec::Deferred
+                    | ArraySpec::AssumedShape { lower: None } => Some(LowerTarget::One),
+                    ArraySpec::AssumedShape { lower: Some(e) } => {
+                        match eval_const_scalar(e, visible_param_consts) {
+                            Some(ConstScalar::Int(1)) => Some(LowerTarget::One),
+                            _ => Some(LowerTarget::Expr(e)),
+                        }
+                    }
                     _ => None,
                 };
-                let non_default = lower_expr.and_then(|e| {
-                    match eval_const_scalar(e, visible_param_consts) {
-                        Some(ConstScalar::Int(1)) => None,
-                        _ => Some(e),
-                    }
-                });
-                if non_default.is_some() {
+                if target.is_some() {
                     any = true;
                 }
-                overrides.push(non_default);
+                overrides.push(target);
             }
             if !any {
                 continue;
@@ -19235,20 +19285,25 @@ fn install_assumed_shape_lower_overrides(
                 vec![local_desc, original_desc_ptr, bytes],
                 IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
             );
-            for (i, lower_expr) in overrides.iter().enumerate() {
-                let Some(lower_expr) = lower_expr else {
+            for (i, target) in overrides.iter().enumerate() {
+                let Some(target) = target else {
                     continue;
                 };
-                let new_lo_raw = lower_expr_with_optional_layouts(
-                    b,
-                    locals,
-                    lower_expr,
-                    st,
-                    Some(type_layouts),
-                );
-                let new_lo_i64 = match b.func().value_type(new_lo_raw) {
-                    Some(IrType::Int(IntWidth::I64)) => new_lo_raw,
-                    _ => b.int_extend(new_lo_raw, IntWidth::I64, true),
+                let new_lo_i64 = match target {
+                    LowerTarget::One => b.const_i64(1),
+                    LowerTarget::Expr(e) => {
+                        let raw = lower_expr_with_optional_layouts(
+                            b,
+                            locals,
+                            e,
+                            st,
+                            Some(type_layouts),
+                        );
+                        match b.func().value_type(raw) {
+                            Some(IrType::Int(IntWidth::I64)) => raw,
+                            _ => b.int_extend(raw, IntWidth::I64, true),
+                        }
+                    }
                 };
                 let dim_offset = 24i64 + (i as i64) * 24;
                 let off_lo = b.const_i64(dim_offset);
