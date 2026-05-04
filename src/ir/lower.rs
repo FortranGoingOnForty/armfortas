@@ -38245,8 +38245,18 @@ fn lower_array_assign(
             }
         }
 
-        // a = scalar: broadcast scalar to all elements.
-        let scalar = lower_expr_ctx_tl(b, ctx, value);
+        // a = scalar: broadcast scalar to all elements. Coerce the
+        // scalar to the destination element type so the store width
+        // matches the slot stride — without this, an i32 literal `0`
+        // assigned to an `integer(int64) :: counts(...)` array left
+        // the upper 4 bytes of every slot uninitialized, and a later
+        // `counts(b) = counts(b) + 1` round-tripped 4 bytes of stack
+        // garbage from the high half. Surfaced via stdlib's
+        // `radix_sort_u8_helper` where `counts(:) = 0` followed by
+        // `counts(bin_idx) = counts(bin_idx) + 1` produced bogus
+        // accumulation that overshot the input length on read-back.
+        let scalar_raw = lower_expr_ctx_tl(b, ctx, value);
+        let scalar = coerce_to_type(b, scalar_raw, &dest_info.ty);
         let dest_base = array_base_addr(b, dest_info);
         let n = array_total_elems_value(b, dest_info);
 
