@@ -11922,6 +11922,44 @@ fn assumed_shape_lower_override_propagates_through_nested_calls() {
 }
 
 #[test]
+fn default_assumed_shape_dummy_rebases_lower_to_one_per_f2018() {
+    // F2018 §15.5.2.4(13): a dummy declared `arr(:)` (no explicit
+    // lower bound) must see lbound=1 inside the procedure regardless
+    // of the caller's actual lower bound.  Pre-fix `install_assumed_
+    // shape_lower_overrides` skipped default `(:)` dummies, so a
+    // caller's `array(-200:200)` flowed through and `lbound(arr,1)`
+    // returned -200 — non-conforming, and the source of cascading
+    // bounds-check failures whenever stdlib code did `do i=1,size(arr)`
+    // expecting 1-based indexing.
+    let src = write_program(
+        "program p\n  implicit none\n  real, allocatable :: array(:)\n  allocate(array(-5:5))\n  array = 0.0\n  array(0) = 42.0\n  call probe(array)\ncontains\n  subroutine probe(arr)\n    real, intent(in) :: arr(:)\n    if (lbound(arr, 1) /= 1) error stop 1\n    if (ubound(arr, 1) /= 11) error stop 2\n    if (size(arr) /= 11) error stop 3\n    ! caller's array(0) was element index 6 in 1-based view\n    if (arr(6) /= 42.0) error stop 4\n    print *, 'ok'\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("default_assumed_shape_rebase", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "run failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected 'ok': {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn rank_remap_pointer_assignment_builds_2d_descriptor() {
     // F2018 §10.2.2.3: `pmat(L1:U1, L2:U2) => array1d` reinterprets a
     // contiguous 1-D target as a 2-D array. The destination descriptor
