@@ -1936,10 +1936,74 @@ fn select_inst(
             });
         }
 
+        InstKind::VMin(a, b) | InstKind::VMax(a, b) => {
+            let va = ctx.lookup_vreg(*a);
+            let vb = ctx.lookup_vreg(*b);
+            let dest = ctx.get_vreg(mf, inst.id, RegClass::V128);
+            let is_max = matches!(inst.kind, InstKind::VMax(..));
+            let opcode = match VShape::from_ir(&inst.ty) {
+                Some(VShape::V4S) => {
+                    if is_max {
+                        ArmOpcode::SmaxV4S
+                    } else {
+                        ArmOpcode::SminV4S
+                    }
+                }
+                _ => ArmOpcode::Nop,
+            };
+            mf.block_mut(mb).insts.push(MachineInst {
+                opcode,
+                operands: vec![
+                    MachineOperand::VReg(dest),
+                    MachineOperand::VReg(va),
+                    MachineOperand::VReg(vb),
+                ],
+                def: Some(dest),
+            });
+        }
+        InstKind::VReduceMin(v) | InstKind::VReduceMax(v) => {
+            let src = ctx.lookup_vreg(*v);
+            let is_max = matches!(inst.kind, InstKind::VReduceMax(..));
+            match &inst.ty {
+                IrType::Int(IntWidth::I32) => {
+                    let tmp = mf.new_vreg(RegClass::V128);
+                    let opcode = if is_max {
+                        ArmOpcode::Smaxv4S
+                    } else {
+                        ArmOpcode::Sminv4S
+                    };
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode,
+                        operands: vec![MachineOperand::VReg(tmp), MachineOperand::VReg(src)],
+                        def: Some(tmp),
+                    });
+                    let class = type_to_reg_class(&inst.ty);
+                    let dest = ctx.get_vreg(mf, inst.id, class);
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode: ArmOpcode::Umov4S,
+                        operands: vec![
+                            MachineOperand::VReg(dest),
+                            MachineOperand::VReg(tmp),
+                            MachineOperand::Imm(0),
+                        ],
+                        def: Some(dest),
+                    });
+                }
+                _ => {
+                    let class = type_to_reg_class(&inst.ty);
+                    let dest = ctx.get_vreg(mf, inst.id, class);
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode: ArmOpcode::Nop,
+                        operands: vec![MachineOperand::VReg(dest), MachineOperand::VReg(src)],
+                        def: Some(dest),
+                    });
+                }
+            }
+        }
+
         // Remaining: ExtractField, InsertField, and other vector ops
-        // (VInsert, VMin, VMax, VICmp, VFCmp, VBitcast, VReduceMin,
-        // VReduceMax) — placeholder. Land per-op as the vectorizer
-        // grows in Stage 4.
+        // (VInsert, VICmp, VFCmp, VBitcast) — placeholder. Land
+        // per-op as the vectorizer grows in Stage 4.
         _ => {
             let class = type_to_reg_class(&inst.ty);
             let _dest = ctx.get_vreg(mf, inst.id, class);
