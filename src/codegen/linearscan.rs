@@ -52,6 +52,17 @@ const GP_CALLEE_SAVED: std::ops::RangeInclusive<u8> = 19..=28;
 /// Callee-saved FP register range.
 const FP_CALLEE_SAVED: std::ops::RangeInclusive<u8> = 8..=15;
 
+/// Bytes a single spill of a vreg of class `class` occupies. NEON
+/// vectors need 16; everything else fits in 8. Used to size frame
+/// slots so the LdrQ/StrQ pair on a V128 spill operates on a slot
+/// that's actually 16 bytes wide and 16-byte aligned.
+fn spill_slot_size(class: RegClass) -> u32 {
+    match class {
+        RegClass::V128 => 16,
+        _ => 8,
+    }
+}
+
 /// Result of register allocation.
 pub struct AllocResult {
     /// VRegId → assigned PhysReg (None if spilled).
@@ -158,7 +169,15 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
                 let last_idx = active.len() - 1;
                 if spill_end > interval.end {
                     // Spill the furthest active interval, give its register to us.
-                    let offset = mf.alloc_local(8);
+                    // The victim's class is what determines its slot size — not
+                    // ours, since we're taking the victim's physreg.
+                    let victim_class = mf
+                        .vregs
+                        .iter()
+                        .find(|v| v.id == victim)
+                        .map(|v| v.class)
+                        .unwrap_or(RegClass::Gp64);
+                    let offset = mf.alloc_local(spill_slot_size(victim_class));
                     spills.insert(victim, offset);
                     assignments.remove(&victim);
 
@@ -178,13 +197,14 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
                     active.push((spill_reg, interval.end, interval.vreg));
                     active.sort_by_key(|&(_, end, _)| end);
                 } else {
-                    // Current interval ends later — spill it.
-                    let offset = mf.alloc_local(8);
+                    // Current interval ends later — spill it. Use the
+                    // current interval's class for slot sizing.
+                    let offset = mf.alloc_local(spill_slot_size(interval.class));
                     spills.insert(interval.vreg, offset);
                 }
             } else {
                 // No active intervals — shouldn't happen but spill to be safe.
-                let offset = mf.alloc_local(8);
+                let offset = mf.alloc_local(spill_slot_size(interval.class));
                 spills.insert(interval.vreg, offset);
             }
         }
