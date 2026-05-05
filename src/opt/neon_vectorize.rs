@@ -102,17 +102,26 @@ enum BodyOp {
     },
 }
 
-/// Concrete plan: single-statement element-wise body with up to
-/// two array loads (or one load + one invariant scalar) plus one
-/// array store.
+/// One element-wise statement (one store) inside a multi-statement
+/// vectorizable body. All statements in a `VectorPlan` share the
+/// same lane count and element type.
 #[derive(Debug, Clone)]
-struct VectorPlan {
-    lanes: u8,
-    elem_ty: IrType,
+struct Statement {
     /// What expression feeds the store.
     op: BodyOp,
     /// Original Store instruction ID to be rewritten to VStore.
     store: ValueId,
+}
+
+/// Concrete plan: one or more element-wise statements (each up to
+/// two array loads or one load + one invariant scalar plus one
+/// array store) sharing the same iteration space and element type.
+#[derive(Debug, Clone)]
+struct VectorPlan {
+    lanes: u8,
+    elem_ty: IrType,
+    /// Every statement that feeds a store in the body.
+    statements: Vec<Statement>,
     /// Original `iadd iv, 1` step instruction in the body.
     step_iadd: ValueId,
     /// The `1` ConstInt used as the step (for replacement with V).
@@ -226,22 +235,30 @@ fn build_vector_plan(
         return None;
     }
 
-    // Find the unique store instruction.
-    let mut stores = body.insts.iter().filter_map(|inst| match inst.kind {
-        InstKind::Store(value, ptr) => Some((inst.id, inst.span, value, ptr)),
-        _ => None,
-    });
-    let (store_id, span, stored_value, dest_ptr) = stores.next()?;
-    if stores.next().is_some() {
+    // Walk every store. Each one must have a destination access that
+    // covers the full iteration space and an element type identical
+    // to the first store's. Each statement is classified independently
+    // (Copy or Binop) and contributes one entry to `statements`.
+    let stores: Vec<(ValueId, crate::lexer::Span, ValueId, ValueId)> = body
+        .insts
+        .iter()
+        .filter_map(|inst| match inst.kind {
+            InstKind::Store(value, ptr) => Some((inst.id, inst.span, value, ptr)),
+            _ => None,
+        })
+        .collect();
+    if stores.is_empty() {
         return None;
     }
 
-    let dest = classify_array_access(func, dest_ptr, shape.iv_param)?;
-    if !covers_full_array(shape, &dest) {
+    // Pin the lane shape on the first destination; reject any later
+    // store whose dest disagrees.
+    let first_dest = classify_array_access(func, stores[0].3, shape.iv_param)?;
+    if !covers_full_array(shape, &first_dest) {
         return None;
     }
-    let lanes = lane_count_for(&dest.elem_ty)?;
-    if (dest.len as u64) % (lanes as u64) != 0 {
+    let lanes = lane_count_for(&first_dest.elem_ty)?;
+    if (first_dest.len as u64) % (lanes as u64) != 0 {
         return None;
     }
     let trip = shape
@@ -251,49 +268,26 @@ fn build_vector_plan(
     if trip <= 0 || (trip as u64) % (lanes as u64) != 0 {
         return None;
     }
+    let elem_ty = first_dest.elem_ty.clone();
+    let span = stores[0].1;
 
-    // Decode `stored_value` as either a pure load (copy form) or a
-    // binop on two operands (which may each be an array load or an
-    // invariant scalar).
     let defs = inst_map(func);
-    let stored_inst = defs.get(&stored_value)?;
-    let op = match stored_inst.kind {
-        InstKind::Load(_) => {
-            let source = classify_binop_operand(
-                func,
-                stored_value,
-                shape.iv_param,
-                &dest,
-                loop_defs,
-            )?;
-            // A copy must have a real array load on the right; an
-            // invariant scalar splat goes through the older bulk
-            // path.
-            match source {
-                BinopOperand::ArrayLoad(_) => BodyOp::Copy { source },
-                BinopOperand::InvariantScalar(_) => return None,
-            }
+    let mut statements = Vec::with_capacity(stores.len());
+    for (store_id, _, stored_value, dest_ptr) in &stores {
+        let dest = classify_array_access(func, *dest_ptr, shape.iv_param)?;
+        if !covers_full_array(shape, &dest) {
+            return None;
         }
-        InstKind::IAdd(l, r) => {
-            binop_body(stored_value, BinaryKind::Add, l, r, func, shape, &dest, loop_defs)?
+        if dest.elem_ty != elem_ty {
+            return None;
         }
-        InstKind::ISub(l, r) => {
-            binop_body(stored_value, BinaryKind::Sub, l, r, func, shape, &dest, loop_defs)?
-        }
-        InstKind::IMul(l, r) => {
-            binop_body(stored_value, BinaryKind::Mul, l, r, func, shape, &dest, loop_defs)?
-        }
-        InstKind::FAdd(l, r) => {
-            binop_body(stored_value, BinaryKind::Add, l, r, func, shape, &dest, loop_defs)?
-        }
-        InstKind::FSub(l, r) => {
-            binop_body(stored_value, BinaryKind::Sub, l, r, func, shape, &dest, loop_defs)?
-        }
-        InstKind::FMul(l, r) => {
-            binop_body(stored_value, BinaryKind::Mul, l, r, func, shape, &dest, loop_defs)?
-        }
-        _ => return None,
-    };
+        let stored_inst = defs.get(stored_value)?;
+        let op = classify_body_op(*stored_value, &stored_inst.kind, func, shape, &dest, loop_defs)?;
+        statements.push(Statement {
+            op,
+            store: *store_id,
+        });
+    }
 
     // Find the iv-increment in the body.
     let body_term = match &body.terminator {
@@ -323,14 +317,55 @@ fn build_vector_plan(
 
     Some(VectorPlan {
         lanes,
-        elem_ty: dest.elem_ty,
-        op,
-        store: store_id,
+        elem_ty,
+        statements,
         step_iadd: step_inst.id,
         step_const,
         iv_int_width,
         span,
     })
+}
+
+/// Classify the expression `stored_value = ...` feeding one store as
+/// either a `Copy` (pure load) or a `Binop`. Returns `None` for any
+/// shape we don't yet vectorize.
+fn classify_body_op(
+    stored_value: ValueId,
+    kind: &InstKind,
+    func: &Function,
+    shape: &CountedLoop,
+    dest: &ArrayAccess,
+    loop_defs: &HashSet<ValueId>,
+) -> Option<BodyOp> {
+    match kind {
+        InstKind::Load(_) => {
+            let source =
+                classify_binop_operand(func, stored_value, shape.iv_param, dest, loop_defs)?;
+            match source {
+                BinopOperand::ArrayLoad(_) => Some(BodyOp::Copy { source }),
+                BinopOperand::InvariantScalar(_) => None,
+            }
+        }
+        InstKind::IAdd(l, r) => {
+            binop_body(stored_value, BinaryKind::Add, *l, *r, func, shape, dest, loop_defs)
+        }
+        InstKind::ISub(l, r) => {
+            binop_body(stored_value, BinaryKind::Sub, *l, *r, func, shape, dest, loop_defs)
+        }
+        InstKind::IMul(l, r) => {
+            binop_body(stored_value, BinaryKind::Mul, *l, *r, func, shape, dest, loop_defs)
+        }
+        InstKind::FAdd(l, r) => {
+            binop_body(stored_value, BinaryKind::Add, *l, *r, func, shape, dest, loop_defs)
+        }
+        InstKind::FSub(l, r) => {
+            binop_body(stored_value, BinaryKind::Sub, *l, *r, func, shape, dest, loop_defs)
+        }
+        InstKind::FMul(l, r) => {
+            binop_body(stored_value, BinaryKind::Mul, *l, *r, func, shape, dest, loop_defs)
+        }
+        _ => None,
+    }
 }
 
 /// Classify a body that is `dest(i) = lhs op rhs`. At least one
@@ -548,58 +583,55 @@ fn apply_vector_plan(func: &mut Function, shape: &CountedLoop, plan: VectorPlan)
         }
     }
 
-    // 2. Walk every operand of the body op. For `ArrayLoad`s, rewrite
-    //    the scalar Load to a VLoad in place. For `InvariantScalar`s,
-    //    emit a `VBroadcast` in the preheader and remember the new
-    //    vector value so we can swap it into the binop.
-    for op in op_operands(&plan.op) {
-        rewrite_array_load(func, shape.body, op, &v_ty);
-    }
-    let (lhs_subst, rhs_subst) = match &plan.op {
-        BodyOp::Copy { .. } => (None, None),
-        BodyOp::Binop { lhs, rhs, .. } => (
-            broadcast_if_invariant(func, shape.preheader, lhs, &v_ty, plan.span),
-            broadcast_if_invariant(func, shape.preheader, rhs, &v_ty, plan.span),
-        ),
-    };
-
-    // 3. Rewrite the binop into the matching V-op, swapping in the
-    //    broadcast vectors for any invariant-scalar operands. Pure
-    //    `Copy` form has no binop to rewrite.
-    if let BodyOp::Binop {
-        binop_id,
-        kind: binop_kind,
-        ..
-    } = &plan.op
-    {
-        let body_block = func.block_mut(shape.body);
-        if let Some(inst) = body_block.insts.iter_mut().find(|i| i.id == *binop_id) {
-            let new_kind = match (inst.kind.clone(), binop_kind) {
-                (InstKind::IAdd(l, r), BinaryKind::Add)
-                | (InstKind::FAdd(l, r), BinaryKind::Add) => {
-                    InstKind::VAdd(lhs_subst.unwrap_or(l), rhs_subst.unwrap_or(r))
-                }
-                (InstKind::ISub(l, r), BinaryKind::Sub)
-                | (InstKind::FSub(l, r), BinaryKind::Sub) => {
-                    InstKind::VSub(lhs_subst.unwrap_or(l), rhs_subst.unwrap_or(r))
-                }
-                (InstKind::IMul(l, r), BinaryKind::Mul)
-                | (InstKind::FMul(l, r), BinaryKind::Mul) => {
-                    InstKind::VMul(lhs_subst.unwrap_or(l), rhs_subst.unwrap_or(r))
-                }
-                _ => inst.kind.clone(),
-            };
-            inst.kind = new_kind;
-            inst.ty = v_ty.clone();
+    // 2. For each statement, vectorize: rewrite array loads to VLoads,
+    //    emit any required preheader VBroadcasts, rewrite the binop
+    //    into a v-op, and finally rewrite the store into a VStore.
+    for stmt in plan.statements.clone() {
+        for op in op_operands(&stmt.op) {
+            rewrite_array_load(func, shape.body, op, &v_ty);
         }
-        func.register_type(*binop_id, v_ty.clone());
-    }
+        let (lhs_subst, rhs_subst) = match &stmt.op {
+            BodyOp::Copy { .. } => (None, None),
+            BodyOp::Binop { lhs, rhs, .. } => (
+                broadcast_if_invariant(func, shape.preheader, lhs, &v_ty, plan.span),
+                broadcast_if_invariant(func, shape.preheader, rhs, &v_ty, plan.span),
+            ),
+        };
 
-    // 4. Rewrite the Store into a VStore.
-    let body_block = func.block_mut(shape.body);
-    if let Some(inst) = body_block.insts.iter_mut().find(|i| i.id == plan.store) {
-        if let InstKind::Store(val, ptr) = inst.kind {
-            inst.kind = InstKind::VStore(val, ptr);
+        if let BodyOp::Binop {
+            binop_id,
+            kind: binop_kind,
+            ..
+        } = &stmt.op
+        {
+            let body_block = func.block_mut(shape.body);
+            if let Some(inst) = body_block.insts.iter_mut().find(|i| i.id == *binop_id) {
+                let new_kind = match (inst.kind.clone(), binop_kind) {
+                    (InstKind::IAdd(l, r), BinaryKind::Add)
+                    | (InstKind::FAdd(l, r), BinaryKind::Add) => {
+                        InstKind::VAdd(lhs_subst.unwrap_or(l), rhs_subst.unwrap_or(r))
+                    }
+                    (InstKind::ISub(l, r), BinaryKind::Sub)
+                    | (InstKind::FSub(l, r), BinaryKind::Sub) => {
+                        InstKind::VSub(lhs_subst.unwrap_or(l), rhs_subst.unwrap_or(r))
+                    }
+                    (InstKind::IMul(l, r), BinaryKind::Mul)
+                    | (InstKind::FMul(l, r), BinaryKind::Mul) => {
+                        InstKind::VMul(lhs_subst.unwrap_or(l), rhs_subst.unwrap_or(r))
+                    }
+                    _ => inst.kind.clone(),
+                };
+                inst.kind = new_kind;
+                inst.ty = v_ty.clone();
+            }
+            func.register_type(*binop_id, v_ty.clone());
+        }
+
+        let body_block = func.block_mut(shape.body);
+        if let Some(inst) = body_block.insts.iter_mut().find(|i| i.id == stmt.store) {
+            if let InstKind::Store(val, ptr) = inst.kind {
+                inst.kind = InstKind::VStore(val, ptr);
+            }
         }
     }
 }
