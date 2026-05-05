@@ -13379,21 +13379,16 @@ fn find_named_interface_symbol<'a>(
     st: &'a SymbolTable,
     name: &str,
 ) -> Option<&'a crate::sema::symtab::Symbol> {
+    // F2018 §15.5.5.2 — a generic name shadows the intrinsic only when it is
+    // visible in the current scope (host scope, local declaration, or
+    // use-association honoring only-lists).  Walking *all* scopes would treat
+    // a NamedInterface in any merely-loaded module as in scope, so e.g.
+    // `use stdlib_string_type, only: string_type` would drag in that module's
+    // generic `trim` interface and force trim(character) through a
+    // string_type-only specific that returns empty.
     let key = name.to_ascii_lowercase();
-    if let Some(sym) = st.lookup(&key) {
-        return is_named_interface_like(sym).then_some(sym);
-    }
-    for scope in st.all_scopes() {
-        if let Some(sym) = scope.symbols.get(&key) {
-            if is_named_interface_like(sym) {
-                return Some(sym);
-            }
-        }
-    }
-    match st.find_symbol_any_scope(&key) {
-        Some(sym) if is_named_interface_like(sym) => Some(sym),
-        _ => None,
-    }
+    let sym = st.lookup(&key)?;
+    is_named_interface_like(sym).then_some(sym)
 }
 
 #[derive(Clone, Debug)]
