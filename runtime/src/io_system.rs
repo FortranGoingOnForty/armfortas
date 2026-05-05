@@ -70,7 +70,7 @@ enum Form {
     Unformatted,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum Action {
     Read,
     Write,
@@ -2213,6 +2213,12 @@ pub extern "C" fn afs_inquire_file(
     action_buf_len: i64,
     recl_out: *mut i64,
     size_out: *mut i64,
+    read_buf: *mut u8,
+    read_buf_len: i64,
+    write_buf: *mut u8,
+    write_buf_len: i64,
+    readwrite_buf: *mut u8,
+    readwrite_buf_len: i64,
 ) {
     let fname = unsafe_str(filename, filename_len);
 
@@ -2246,10 +2252,28 @@ pub extern "C" fn afs_inquire_file(
             action_buf_len,
             recl_out,
         );
+        write_action_capabilities(
+            Some(u.action),
+            read_buf,
+            read_buf_len,
+            write_buf,
+            write_buf_len,
+            readwrite_buf,
+            readwrite_buf_len,
+        );
     } else {
         write_inquire_string(access_buf, access_buf_len, "UNDEFINED");
         write_inquire_string(form_buf, form_buf_len, "UNDEFINED");
         write_inquire_string(action_buf, action_buf_len, "UNDEFINED");
+        write_action_capabilities(
+            None,
+            read_buf,
+            read_buf_len,
+            write_buf,
+            write_buf_len,
+            readwrite_buf,
+            readwrite_buf_len,
+        );
     }
 
     // File size via metadata.
@@ -2287,6 +2311,12 @@ pub extern "C" fn afs_inquire_unit(
     action_buf_len: i64,
     recl_out: *mut i64,
     size_out: *mut i64,
+    read_buf: *mut u8,
+    read_buf_len: i64,
+    write_buf: *mut u8,
+    write_buf_len: i64,
+    readwrite_buf: *mut u8,
+    readwrite_buf_len: i64,
 ) {
     let state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     let unit_entry = state.units.get(&unit);
@@ -2314,6 +2344,15 @@ pub extern "C" fn afs_inquire_unit(
             action_buf_len,
             recl_out,
         );
+        write_action_capabilities(
+            Some(u.action),
+            read_buf,
+            read_buf_len,
+            write_buf,
+            write_buf_len,
+            readwrite_buf,
+            readwrite_buf_len,
+        );
 
         if !size_out.is_null() {
             let sz = if !u.filename.is_empty() {
@@ -2332,6 +2371,15 @@ pub extern "C" fn afs_inquire_unit(
         write_inquire_string(access_buf, access_buf_len, "UNDEFINED");
         write_inquire_string(form_buf, form_buf_len, "UNDEFINED");
         write_inquire_string(action_buf, action_buf_len, "UNDEFINED");
+        write_action_capabilities(
+            None,
+            read_buf,
+            read_buf_len,
+            write_buf,
+            write_buf_len,
+            readwrite_buf,
+            readwrite_buf_len,
+        );
         if !size_out.is_null() {
             unsafe {
                 *size_out = -1;
@@ -2344,6 +2392,30 @@ pub extern "C" fn afs_inquire_unit(
             *iostat = 0;
         }
     }
+}
+
+/// Fill READ=, WRITE=, READWRITE= INQUIRE specifiers based on a unit's
+/// declared `Action`.  Per F2018 §12.10.2, READ returns YES if the unit
+/// can be read, NO otherwise, and similarly for WRITE.  Disconnected
+/// units (`action = None`) report UNKNOWN for all three.
+fn write_action_capabilities(
+    action: Option<Action>,
+    read_buf: *mut u8,
+    read_buf_len: i64,
+    write_buf: *mut u8,
+    write_buf_len: i64,
+    readwrite_buf: *mut u8,
+    readwrite_buf_len: i64,
+) {
+    let (read_cap, write_cap, rw_cap) = match action {
+        Some(Action::Read) => ("YES", "NO", "NO"),
+        Some(Action::Write) => ("NO", "YES", "NO"),
+        Some(Action::ReadWrite) => ("YES", "YES", "YES"),
+        None => ("UNKNOWN", "UNKNOWN", "UNKNOWN"),
+    };
+    write_inquire_string(read_buf, read_buf_len, read_cap);
+    write_inquire_string(write_buf, write_buf_len, write_cap);
+    write_inquire_string(readwrite_buf, readwrite_buf_len, rw_cap);
 }
 
 /// Write ACCESS, FORM, ACTION, RECL for a connected unit.

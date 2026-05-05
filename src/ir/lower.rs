@@ -27081,6 +27081,9 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
             let (access_ptr, access_len) = lower_string_spec(b, "access");
             let (form_ptr, form_len) = lower_string_spec(b, "form");
             let (action_ptr, action_len) = lower_string_spec(b, "action");
+            let (read_ptr, read_len) = lower_string_spec(b, "read");
+            let (write_ptr, write_len) = lower_string_spec(b, "write");
+            let (readwrite_ptr, readwrite_len) = lower_string_spec(b, "readwrite");
             let recl_addr = lower_ref_spec(b, "recl");
             let size_spec = spec_by_keyword("size");
             let (size_addr, size_storeback) = if let Some(spec) = size_spec {
@@ -27117,6 +27120,12 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                         action_len,
                         recl_addr,
                         size_addr,
+                        read_ptr,
+                        read_len,
+                        write_ptr,
+                        write_len,
+                        readwrite_ptr,
+                        readwrite_len,
                     ],
                     IrType::Void,
                 );
@@ -27140,6 +27149,12 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                         action_len,
                         recl_addr,
                         size_addr,
+                        read_ptr,
+                        read_len,
+                        write_ptr,
+                        write_len,
+                        readwrite_ptr,
+                        readwrite_len,
                     ],
                     IrType::Void,
                 );
