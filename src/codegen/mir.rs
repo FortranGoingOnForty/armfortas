@@ -161,6 +161,11 @@ pub enum ArmOpcode {
     // Vector load/store (128-bit Q register)
     LdrQ,     // LDR Qt, [Xn, #imm]
     StrQ,     // STR Qt, [Xn, #imm]
+    /// `mov.16b vN, vM` — 128-bit register-to-register copy.
+    /// Used by regalloc when moving a V128 vreg between physical
+    /// regs; FmovReg only handles the low 64 bits and would corrupt
+    /// the upper lanes of a V128.
+    Mov16B,
     FmsubS,
     FmsubD, // FMSUB:  dest = Sa - Sn*Sm
     FnmsubS,
