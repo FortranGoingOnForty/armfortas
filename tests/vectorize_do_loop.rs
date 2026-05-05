@@ -82,16 +82,36 @@ fn o3_vectorizes_full_extent_do_loop_and_keeps_objects_deterministic() {
         "O2 should keep the scalar loop for this ordinary DO map:\n{}",
         o2_ir
     );
+    // Two valid vectorization shapes at O3:
+    //   * NeonVectorize rewrites the inner body to vload/vadd/vstore
+    //     on 128-bit lanes (preferred — no call overhead).
+    //   * The older Vectorize pass replaces the loop with a single
+    //     afs_array_add_i32 kernel call (fallback).
+    let o3_neon = o3_ir.contains("vstore") && o3_ir.contains("vadd");
+    let o3_kernel = o3_ir.contains("call @afs_array_add_i32(");
     assert!(
-        o3_ir.contains("call @afs_array_add_i32(") && !o3_ir.contains("do_check_"),
-        "O3 should replace the scalar loop with a bulk kernel call:\n{}",
+        o3_neon || o3_kernel,
+        "O3 should vectorize the scalar loop (vload/vadd/vstore or bulk kernel call):\n{}",
         o3_ir
     );
-    assert!(
-        o3_asm.contains("_afs_array_add_i32"),
-        "O3 assembly should reference the bulk add kernel:\n{}",
-        o3_asm
-    );
+    if o3_kernel {
+        assert!(
+            !o3_ir.contains("do_check_"),
+            "kernel-form O3 should remove the loop CFG entirely:\n{}",
+            o3_ir
+        );
+        assert!(
+            o3_asm.contains("_afs_array_add_i32"),
+            "kernel-form O3 assembly should reference the bulk add kernel:\n{}",
+            o3_asm
+        );
+    } else {
+        assert!(
+            o3_asm.contains("ldr q") || o3_asm.contains("add.4s") || o3_asm.contains("str q"),
+            "neon-form O3 assembly should reference 128-bit vector ops:\n{}",
+            o3_asm
+        );
+    }
     assert_eq!(
         o3_obj_a, o3_obj_b,
         "O3 vectorized object snapshot should stay deterministic"
