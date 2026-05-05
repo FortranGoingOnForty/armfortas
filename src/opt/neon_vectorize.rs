@@ -945,7 +945,19 @@ fn inst_map(func: &Function) -> HashMap<ValueId, &Inst> {
 /// accumulator (i.e. dot-product fold).
 #[derive(Debug, Clone)]
 enum AccumulateSource {
-    Sum { load_id: ValueId },
+    Sum {
+        load_id: ValueId,
+    },
+    /// `acc' = acc + neg(load)` or `acc' = acc + abs(load)`. The
+    /// pre-existing `Sum` rewriter rewrites the load → vload; we
+    /// also rewrite the unary `INeg`/`FNeg` → `VNeg` and
+    /// `FAbs` → `VAbs` so the pre-fold value flows through the
+    /// vector lanes.
+    SumWithUnary {
+        load_id: ValueId,
+        unary_id: ValueId,
+        kind: UnaryKind,
+    },
     Dot {
         imul_id: ValueId,
         load_a: ValueId,
@@ -1216,6 +1228,40 @@ fn detect_reduction_plan(
                 load_id: value_inst.id,
             }
         }
+        // Sum reductions over `acc + (-load)` / `acc + abs(load)` —
+        // the unary applies per-element and lifts cleanly to VNeg /
+        // VAbs.
+        (IrType::Int(_), InstKind::INeg(load_v))
+        | (IrType::Float(_), InstKind::FNeg(load_v))
+        | (IrType::Float(_), InstKind::FAbs(load_v))
+            if matches!(reduce, ReductionKind::Sum) =>
+        {
+            let unary_kind = match value_inst.kind {
+                InstKind::FAbs(_) => UnaryKind::Abs,
+                _ => UnaryKind::Neg,
+            };
+            let load_inst = defs.get(load_v)?;
+            let load_ptr = match load_inst.kind {
+                InstKind::Load(p) => p,
+                _ => return None,
+            };
+            let access = classify_array_access(func, load_ptr, iv_param)?;
+            if access.elem_ty != elem_ty {
+                return None;
+            }
+            let upper = access
+                .lower
+                .checked_add(access.len as i64)
+                .and_then(|v| v.checked_sub(1))?;
+            if iv_init != access.lower || iv_bound != upper {
+                return None;
+            }
+            AccumulateSource::SumWithUnary {
+                load_id: load_inst.id,
+                unary_id: value_inst.id,
+                kind: unary_kind,
+            }
+        }
         (IrType::Int(_), InstKind::IMul(la, lb))
         | (IrType::Float(_), InstKind::FMul(la, lb)) => {
             let load_a_inst = defs.get(la)?;
@@ -1414,6 +1460,7 @@ fn apply_reduction_plan(func: &mut Function, lp: &NaturalLoop, plan: ReductionPl
 
     // 4. Rewrite the per-iteration source value:
     //    - Sum: one Load → VLoad.
+    //    - SumWithUnary: Load → VLoad and unary → VNeg / VAbs.
     //    - Dot: two Loads → VLoad each, plus IMul/FMul → VMul.
     match plan.source.clone() {
         AccumulateSource::Sum { load_id } => {
@@ -1425,6 +1472,32 @@ fn apply_reduction_plan(func: &mut Function, lp: &NaturalLoop, plan: ReductionPl
                 }
             }
             func.register_type(load_id, v_ty.clone());
+        }
+        AccumulateSource::SumWithUnary {
+            load_id,
+            unary_id,
+            kind,
+        } => {
+            let body_block = func.block_mut(plan.body);
+            if let Some(inst) = body_block.insts.iter_mut().find(|i| i.id == load_id) {
+                if let InstKind::Load(ptr) = inst.kind {
+                    inst.kind = InstKind::VLoad(ptr);
+                    inst.ty = v_ty.clone();
+                }
+            }
+            func.register_type(load_id, v_ty.clone());
+            let body_block = func.block_mut(plan.body);
+            if let Some(inst) = body_block.insts.iter_mut().find(|i| i.id == unary_id) {
+                let new_kind = match (inst.kind.clone(), kind) {
+                    (InstKind::INeg(s), UnaryKind::Neg)
+                    | (InstKind::FNeg(s), UnaryKind::Neg) => InstKind::VNeg(s),
+                    (InstKind::FAbs(s), UnaryKind::Abs) => InstKind::VAbs(s),
+                    (other, _) => other,
+                };
+                inst.kind = new_kind;
+                inst.ty = v_ty.clone();
+            }
+            func.register_type(unary_id, v_ty.clone());
         }
         AccumulateSource::Dot {
             imul_id,
