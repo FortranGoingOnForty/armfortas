@@ -34628,6 +34628,93 @@ fn lower_transfer_array_expr_descriptor(
     Some((desc, mold_ir_ty))
 }
 
+/// F2018 §16.9.231: lower SUM(ARRAY, DIM=k) to an
+/// `afs_array_sum_*_dim` runtime call producing a fresh
+/// rank-(N-1) descriptor. Returns None when DIM is absent (scalar
+/// SUM(ARRAY) lives in the standard intrinsic path) or when the
+/// optional MASK is supplied (no mask runtime support yet).
+fn lower_array_sum_dim_descriptor(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    args: &[crate::ast::expr::Argument],
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) -> Option<(ValueId, IrType)> {
+    use crate::ast::expr::SectionSubscript;
+    if args.is_empty() {
+        return None;
+    }
+    let SectionSubscript::Element(array_expr) = &args[0].value else {
+        return None;
+    };
+    // F2018 §16.9.231(2): DIM is the second positional or keyword `dim=`.
+    let mut dim_expr: Option<&crate::ast::expr::SpannedExpr> = None;
+    let mut has_mask = false;
+    for (i, arg) in args.iter().enumerate() {
+        let kw = arg.keyword.as_deref().map(|s| s.to_lowercase());
+        match (i, kw.as_deref()) {
+            (1, None) | (_, Some("dim")) => {
+                if let SectionSubscript::Element(e) = &arg.value {
+                    dim_expr = Some(e);
+                }
+            }
+            (_, Some("mask")) | (2, None) => {
+                has_mask = true;
+            }
+            _ => {}
+        }
+    }
+    let dim_expr = dim_expr?;
+    if has_mask {
+        // sum(array, dim, mask) needs a mask-aware helper; no runtime
+        // path yet, so let the scalar fallback handle it (which
+        // still gives a wrong answer, but doesn't regress).
+        return None;
+    }
+
+    let (src_desc, elem_ty) = lower_array_expr_descriptor(
+        b,
+        locals,
+        array_expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    )?;
+
+    let dim_raw = lower_expr_with_optional_layouts(b, locals, dim_expr, st, type_layouts);
+    let dim_val = match b.func().value_type(dim_raw) {
+        Some(IrType::Int(IntWidth::I32)) => dim_raw,
+        Some(IrType::Int(_)) => b.int_trunc(dim_raw, IntWidth::I32),
+        _ => dim_raw,
+    };
+
+    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let zero_i32 = b.const_i32(0);
+    let sz384 = b.const_i64(384);
+    b.call(
+        FuncRef::External("memset".into()),
+        vec![result_desc, zero_i32, sz384],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+
+    let helper = if elem_ty.is_float() {
+        "afs_array_sum_real8_dim"
+    } else {
+        "afs_array_sum_int_dim"
+    };
+    b.call(
+        FuncRef::External(helper.into()),
+        vec![src_desc, dim_val, result_desc],
+        IrType::Void,
+    );
+    Some((result_desc, elem_ty))
+}
+
 /// F2018 §16.9.144: lower PACK(ARRAY, MASK [, VECTOR]) to an
 /// `afs_array_pack` runtime call producing a fresh rank-1 descriptor.
 /// Returns the result descriptor address and the element IR type
@@ -36588,6 +36675,26 @@ fn lower_array_expr_descriptor(
                 }
                 if name.eq_ignore_ascii_case("transfer") {
                     if let Some(result) = lower_transfer_array_expr_descriptor(
+                        b,
+                        locals,
+                        args,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
+                    ) {
+                        return Some(result);
+                    }
+                }
+                // F2018 §16.9.231: SUM(ARRAY, DIM=k) reduces along dim k
+                // and returns rank N-1. Without an array path the standard
+                // intrinsic lowering treats it as scalar SUM(ARRAY) and
+                // ignores DIM, broadcasting the single total back into a
+                // rank-N-1 destination — the symptom is `mean = sum(y, 1)`
+                // returning [21, 21, 21] instead of [3, 7, 11].
+                if name.eq_ignore_ascii_case("sum") {
+                    if let Some(result) = lower_array_sum_dim_descriptor(
                         b,
                         locals,
                         args,
