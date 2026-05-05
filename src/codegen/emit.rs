@@ -1878,6 +1878,35 @@ mod tests {
     }
 
     #[test]
+    fn emit_dup_el_4s_broadcasts_fp_lane_zero() {
+        // Splatting an Fp32 scalar (which lives in v2's lane 0) into
+        // a 4×f32 vector uses the lane-dup form. The gp form
+        // `dup.4s v0, s2` is rejected by the assembler. afs-as
+        // dialect: bare `vN[L]` (no `.s` suffix), with the lane
+        // element width encoded into the `dup.4s` mnemonic.
+        let asm = emit_one(
+            ArmOpcode::DupEl4S,
+            vec![
+                MachineOperand::VReg(crate::codegen::mir::VRegId(0)),
+                MachineOperand::VReg(crate::codegen::mir::VRegId(2)),
+            ],
+        );
+        assert_eq!(asm, "dup.4s v0, v2[0]");
+    }
+
+    #[test]
+    fn emit_dup_el_2d_broadcasts_fp_lane_zero() {
+        let asm = emit_one(
+            ArmOpcode::DupEl2D,
+            vec![
+                MachineOperand::VReg(crate::codegen::mir::VRegId(0)),
+                MachineOperand::VReg(crate::codegen::mir::VRegId(2)),
+            ],
+        );
+        assert_eq!(asm, "dup.2d v0, v2[0]");
+    }
+
+    #[test]
     fn emit_ldr_q_form() {
         let asm = emit_one(
             ArmOpcode::LdrQ,
