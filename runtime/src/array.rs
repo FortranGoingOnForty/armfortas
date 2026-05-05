@@ -1561,41 +1561,52 @@ pub extern "C" fn afs_create_section(
     let specs_slice = unsafe { std::slice::from_raw_parts(specs, n_dims as usize) };
 
     result.elem_size = source.elem_size;
-    result.rank = n_dims;
     result.flags = DESC_CONTIGUOUS; // sections may not be contiguous
                                     // Don't set DESC_ALLOCATED — section doesn't own the data.
 
     // Compute base address offset and new dims.
+    //
+    // The descriptor convention here is that `dim[k].stride` already encodes
+    // the *memory step in elements* between adjacent positions along dim k —
+    // see materialize_array_descriptor_for_info in src/ir/lower.rs which
+    // builds dim[k].stride = product(extents[0..k]) for a contiguous array.
+    // So byte_offset and surviving-dim memory strides are computed directly
+    // from src_dim.stride; no extra column-major multiplier is needed.
+    //
+    // SectionSpec.stride == 0 is a sentinel for *rank-reducing* scalar
+    // selection (e.g. the `1` in `y(1,:)`). Those dims contribute to the
+    // base offset but do NOT appear in the result descriptor.
     let mut byte_offset: i64 = 0;
-    let mut source_multiplier: i64 = 1;
+    let mut result_rank: i32 = 0;
 
     for (i, spec) in specs_slice.iter().enumerate() {
         let src_dim = &source.dims[i];
 
         // Offset from source lower bound to section start.
         let start_idx = spec.start - src_dim.lower_bound;
-        byte_offset += start_idx * source_multiplier * src_dim.stride * source.elem_size;
+        byte_offset += start_idx * src_dim.stride * source.elem_size;
 
-        // New dimension bounds. Extent = max(0, (end - start) / stride + 1).
-        // For negative strides, start > end and (end-start)/stride is positive.
-        // For a positive stride where start > end, result is empty (extent 0).
-        let extent = if spec.stride == 0 {
-            1
-        } else if (spec.stride > 0 && spec.start > spec.end)
-            || (spec.stride < 0 && spec.start < spec.end)
-        {
-            0 // empty section
-        } else {
-            (spec.end - spec.start) / spec.stride + 1
-        };
-        result.dims[i] = DimDescriptor {
-            lower_bound: 1, // sections are always 1-based
-            upper_bound: extent,
-            stride: src_dim.stride * spec.stride,
-        };
-
-        source_multiplier *= src_dim.extent();
+        if spec.stride != 0 {
+            // Slice: keep this dim. Extent = max(0, (end - start) / stride + 1).
+            // For negative strides, start > end and (end-start)/stride is positive.
+            // For a positive stride where start > end, result is empty (extent 0).
+            let extent = if (spec.stride > 0 && spec.start > spec.end)
+                || (spec.stride < 0 && spec.start < spec.end)
+            {
+                0 // empty section
+            } else {
+                (spec.end - spec.start) / spec.stride + 1
+            };
+            result.dims[result_rank as usize] = DimDescriptor {
+                lower_bound: 1, // sections are always 1-based
+                upper_bound: extent,
+                stride: src_dim.stride * spec.stride,
+            };
+            result_rank += 1;
+        }
     }
+
+    result.rank = result_rank;
 
     // Result base_addr = source base_addr + offset.
     if !source.base_addr.is_null() {
@@ -1605,8 +1616,8 @@ pub extern "C" fn afs_create_section(
         result.base_addr = ptr::null_mut();
     }
 
-    // Check contiguity.
-    let is_contig = (0..n_dims as usize).all(|i| result.dims[i].stride == 1);
+    // Check contiguity: contiguous iff every surviving dim has stride 1.
+    let is_contig = (0..result_rank as usize).all(|i| result.dims[i].stride == 1);
     if !is_contig {
         result.flags &= !DESC_CONTIGUOUS;
     }
