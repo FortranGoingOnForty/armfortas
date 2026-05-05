@@ -1817,35 +1817,67 @@ fn select_inst(
             });
         }
         InstKind::VReduceSum(v) => {
-            // Cross-lane sum. F4S → faddv s0, v.4s; F2D → faddp d0, v.2d.
-            // Integer 4S → addv s0, v.4s.
+            // Cross-lane sum. The reduction instruction writes its
+            // 32/64-bit result into the FP register file (sN/dN view
+            // of vN). For float results that's already what we want;
+            // for int results we follow up with a `umov.s/.d` move
+            // from the FP lane back into a GP register.
+            //
+            //   F4S → faddv s_dest, v_src.4s
+            //   F2D → faddp d_dest, v_src.2d
+            //   int(I32) → addv s_tmp, v_src.4s; umov.s w_dest, v_tmp[0]
+            //   int(I64) → addv s_tmp, v_src.4s; umov.s w_dest, v_tmp[0]
+            //              (4-lane i32 sum widens into a single i32; the
+            //              caller is expected to sign-extend if it
+            //              wanted i64 semantics — matches scalar IAdd)
             let src = ctx.lookup_vreg(*v);
-            let class = type_to_reg_class(&inst.ty);
-            let dest = ctx.get_vreg(mf, inst.id, class);
-            // Read the SOURCE vector's shape from the operand's IR type.
-            let src_shape = mf
-                .vregs
-                .get(src.0 as usize)
-                .map(|_| ())
-                .and_then(|_| {
-                    // We don't have direct access to the IR type of the
-                    // operand here (only its vreg). For now derive
-                    // shape from the destination's expected type
-                    // semantics: scalar i32 / f32 / i64 / f64.
-                    match &inst.ty {
-                        IrType::Int(IntWidth::I32) => Some(ArmOpcode::Addv4S),
-                        IrType::Int(IntWidth::I64) => Some(ArmOpcode::Addv4S),
-                        IrType::Float(FloatWidth::F32) => Some(ArmOpcode::Faddv4S),
-                        IrType::Float(FloatWidth::F64) => Some(ArmOpcode::FaddpV2D),
-                        _ => None,
-                    }
-                });
-            let opcode = src_shape.unwrap_or(ArmOpcode::Nop);
-            mf.block_mut(mb).insts.push(MachineInst {
-                opcode,
-                operands: vec![MachineOperand::VReg(dest), MachineOperand::VReg(src)],
-                def: Some(dest),
-            });
+            match &inst.ty {
+                IrType::Float(FloatWidth::F32) | IrType::Float(FloatWidth::F64) => {
+                    let class = type_to_reg_class(&inst.ty);
+                    let dest = ctx.get_vreg(mf, inst.id, class);
+                    let opcode = match &inst.ty {
+                        IrType::Float(FloatWidth::F32) => ArmOpcode::Faddv4S,
+                        IrType::Float(FloatWidth::F64) => ArmOpcode::FaddpV2D,
+                        _ => unreachable!(),
+                    };
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode,
+                        operands: vec![MachineOperand::VReg(dest), MachineOperand::VReg(src)],
+                        def: Some(dest),
+                    });
+                }
+                IrType::Int(_) => {
+                    // Step 1: addv into a fresh V128 vreg (so its
+                    // physical placement is in the FP bank).
+                    let tmp = mf.new_vreg(RegClass::V128);
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode: ArmOpcode::Addv4S,
+                        operands: vec![MachineOperand::VReg(tmp), MachineOperand::VReg(src)],
+                        def: Some(tmp),
+                    });
+                    // Step 2: umov.s w_dest, v_tmp[0].
+                    let class = type_to_reg_class(&inst.ty);
+                    let dest = ctx.get_vreg(mf, inst.id, class);
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode: ArmOpcode::Umov4S,
+                        operands: vec![
+                            MachineOperand::VReg(dest),
+                            MachineOperand::VReg(tmp),
+                            MachineOperand::Imm(0),
+                        ],
+                        def: Some(dest),
+                    });
+                }
+                _ => {
+                    let class = type_to_reg_class(&inst.ty);
+                    let dest = ctx.get_vreg(mf, inst.id, class);
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode: ArmOpcode::Nop,
+                        operands: vec![MachineOperand::VReg(dest), MachineOperand::VReg(src)],
+                        def: Some(dest),
+                    });
+                }
+            }
         }
         InstKind::VExtract(v, lane) => {
             let src = ctx.lookup_vreg(*v);
@@ -2155,7 +2187,11 @@ fn emit_branch_arg_copies(
     // Helper to choose the right move opcode for a vreg's class.
     fn move_opcode_for(class: RegClass) -> ArmOpcode {
         match class {
-            RegClass::Fp64 | RegClass::Fp32 | RegClass::V128 => ArmOpcode::FmovReg,
+            // V128 needs `mov.16b` to copy all 128 bits — `fmov d, d`
+            // would corrupt the upper lanes. Fp64/Fp32 still use
+            // `fmov` which is the canonical narrow form.
+            RegClass::V128 => ArmOpcode::Mov16B,
+            RegClass::Fp64 | RegClass::Fp32 => ArmOpcode::FmovReg,
             RegClass::Gp64 | RegClass::Gp32 => ArmOpcode::MovReg,
         }
     }
