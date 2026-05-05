@@ -225,9 +225,25 @@ pub fn compute_liveness(mf: &MachineFunction) -> LivenessResult {
                 if let Some(def) = &inst.def {
                     scratch_in.remove(def);
                 }
-                // Add uses.
-                for op in &inst.operands {
+                // Add uses. Operand 0 of a defining instruction is
+                // the destination — read-modify-write is not a thing
+                // in this MIR (a `mov vreg_dst, vreg_src` reads only
+                // vreg_src), so skipping operand 0 when it equals the
+                // def avoids extending the def vreg's live range
+                // backward over its own def. Without this skip, every
+                // dest vreg appears live across its def all the way
+                // to block start, which breaks the live-range
+                // splitter (it sees crosses_call=true on intervals
+                // that should expire before the call).
+                for (op_idx, op) in inst.operands.iter().enumerate() {
                     if let MachineOperand::VReg(vid) = op {
+                        if op_idx == 0 {
+                            if let Some(def) = &inst.def {
+                                if vid == def {
+                                    continue;
+                                }
+                            }
+                        }
                         scratch_in.insert(*vid);
                     }
                 }
