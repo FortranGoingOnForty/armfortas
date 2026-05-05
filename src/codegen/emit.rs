@@ -1202,6 +1202,26 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
             fp32_scalar(&inst.operands[0]),
             v_reg_bare(&inst.operands[1]),
         ),
+        ArmOpcode::FmaxvV4S => format!(
+            "fmaxv.4s {}, {}",
+            fp32_scalar(&inst.operands[0]),
+            v_reg_bare(&inst.operands[1]),
+        ),
+        ArmOpcode::FminvV4S => format!(
+            "fminv.4s {}, {}",
+            fp32_scalar(&inst.operands[0]),
+            v_reg_bare(&inst.operands[1]),
+        ),
+        ArmOpcode::FmaxpV2DScalar => format!(
+            "fmaxp.2d {}, {}",
+            fp64_scalar(&inst.operands[0]),
+            v_reg_bare(&inst.operands[1]),
+        ),
+        ArmOpcode::FminpV2DScalar => format!(
+            "fminp.2d {}, {}",
+            fp64_scalar(&inst.operands[0]),
+            v_reg_bare(&inst.operands[1]),
+        ),
         ArmOpcode::Uminv4S => format!(
             "uminv.4s {}, {}",
             fp32_scalar(&inst.operands[0]),
