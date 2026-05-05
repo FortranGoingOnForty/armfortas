@@ -138,6 +138,11 @@ pub enum ArmOpcode {
 
     // Cross-lane reductions
     FaddpV2S, // FADDP Sd, Vn.2s     (pair-add → scalar; 2-lane f32)
+    /// `FADDP.4S Vd, Vn, Vm` — 3-operand pairwise add over four
+    /// f32 lanes. For cross-lane f32 sum reduction we use this with
+    /// `Vn = Vm = v_src` then follow with FaddpV2S to fold the
+    /// remaining two lanes (NEON has no `faddv.4s`).
+    FaddpV4S,
     FaddpV2D, // FADDP Dd, Vn.2d     (pair-add → scalar; 2-lane f64)
     Faddv4S,  // FADDV Sd, Vn.4s     (across 4 f32 lanes → scalar)
     Sminv4S,  // SMINV Sd, Vn.4s
