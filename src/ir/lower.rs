@@ -13380,15 +13380,34 @@ fn find_named_interface_symbol<'a>(
     name: &str,
 ) -> Option<&'a crate::sema::symtab::Symbol> {
     // F2018 §15.5.5.2 — a generic name shadows the intrinsic only when it is
-    // visible in the current scope (host scope, local declaration, or
-    // use-association honoring only-lists).  Walking *all* scopes would treat
-    // a NamedInterface in any merely-loaded module as in scope, so e.g.
-    // `use stdlib_string_type, only: string_type` would drag in that module's
-    // generic `trim` interface and force trim(character) through a
-    // string_type-only specific that returns empty.
+    // visible to the caller.  st.lookup respects use-only and host scoping;
+    // st.current may be stale during lowering, so we additionally accept any
+    // scope in the unit that *use-associates the name itself*.  That matches
+    // the explicit `use M, only: trim` (or bare `use M` re-exporting trim)
+    // pattern while rejecting `use stdlib_string_type, only: string_type`
+    // — which doesn't import `trim`, even though stdlib_string_type's
+    // module scope happens to be loaded for type-info resolution.
     let key = name.to_ascii_lowercase();
-    let sym = st.lookup(&key)?;
-    is_named_interface_like(sym).then_some(sym)
+    if let Some(sym) = st.lookup(&key) {
+        if is_named_interface_like(sym) {
+            return Some(sym);
+        }
+    }
+    let imported_here = st
+        .all_scopes()
+        .iter()
+        .any(|scope| scope.use_associations.iter().any(|a| a.local_name == key));
+    if !imported_here {
+        return None;
+    }
+    for scope in st.all_scopes() {
+        if let Some(sym) = scope.symbols.get(&key) {
+            if is_named_interface_like(sym) {
+                return Some(sym);
+            }
+        }
+    }
+    None
 }
 
 #[derive(Clone, Debug)]
