@@ -69,6 +69,12 @@ enum BinaryKind {
     Mul,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnaryKind {
+    Neg,
+    Abs,
+}
+
 /// One operand of the body's binop, classified as either an array
 /// `Load` that becomes a `VLoad` or a loop-invariant scalar that
 /// becomes a `VBroadcast` hoisted into the preheader.
@@ -92,6 +98,14 @@ enum BodyOp {
     /// result is stored directly. `InvariantScalar` is rejected
     /// here: a constant fill goes through the older bulk path.
     Copy { source: BinopOperand },
+    /// `dest(i) = -src` or `dest(i) = abs(src)` — single-operand
+    /// element-wise op. `src` must be an `ArrayLoad` (negating an
+    /// invariant scalar would be a constant fill).
+    Unary {
+        source: BinopOperand,
+        unary_id: ValueId,
+        kind: UnaryKind,
+    },
     /// `dest(i) = lhs op rhs` — a single element-wise binop with at
     /// least one array load.
     Binop {
@@ -327,8 +341,8 @@ fn build_vector_plan(
 }
 
 /// Classify the expression `stored_value = ...` feeding one store as
-/// either a `Copy` (pure load) or a `Binop`. Returns `None` for any
-/// shape we don't yet vectorize.
+/// either a `Copy` (pure load), a `Unary` (neg/abs), or a `Binop`.
+/// Returns `None` for any shape we don't yet vectorize.
 fn classify_body_op(
     stored_value: ValueId,
     kind: &InstKind,
@@ -345,6 +359,12 @@ fn classify_body_op(
                 BinopOperand::ArrayLoad(_) => Some(BodyOp::Copy { source }),
                 BinopOperand::InvariantScalar(_) => None,
             }
+        }
+        InstKind::INeg(src) | InstKind::FNeg(src) => {
+            unary_body(stored_value, UnaryKind::Neg, *src, func, shape, dest, loop_defs)
+        }
+        InstKind::FAbs(src) => {
+            unary_body(stored_value, UnaryKind::Abs, *src, func, shape, dest, loop_defs)
         }
         InstKind::IAdd(l, r) => {
             binop_body(stored_value, BinaryKind::Add, *l, *r, func, shape, dest, loop_defs)
@@ -365,6 +385,29 @@ fn classify_body_op(
             binop_body(stored_value, BinaryKind::Mul, *l, *r, func, shape, dest, loop_defs)
         }
         _ => None,
+    }
+}
+
+/// Classify a body that is `dest(i) = -src` or `dest(i) = abs(src)`.
+/// `src` must be an array load (a unary on an invariant scalar would
+/// just be a constant fill).
+fn unary_body(
+    unary_id: ValueId,
+    kind: UnaryKind,
+    src_v: ValueId,
+    func: &Function,
+    shape: &CountedLoop,
+    dest: &ArrayAccess,
+    loop_defs: &HashSet<ValueId>,
+) -> Option<BodyOp> {
+    let source = classify_binop_operand(func, src_v, shape.iv_param, dest, loop_defs)?;
+    match source {
+        BinopOperand::ArrayLoad(_) => Some(BodyOp::Unary {
+            source,
+            unary_id,
+            kind,
+        }),
+        BinopOperand::InvariantScalar(_) => None,
     }
 }
 
@@ -591,12 +634,32 @@ fn apply_vector_plan(func: &mut Function, shape: &CountedLoop, plan: VectorPlan)
             rewrite_array_load(func, shape.body, op, &v_ty);
         }
         let (lhs_subst, rhs_subst) = match &stmt.op {
-            BodyOp::Copy { .. } => (None, None),
+            BodyOp::Copy { .. } | BodyOp::Unary { .. } => (None, None),
             BodyOp::Binop { lhs, rhs, .. } => (
                 broadcast_if_invariant(func, shape.preheader, lhs, &v_ty, plan.span),
                 broadcast_if_invariant(func, shape.preheader, rhs, &v_ty, plan.span),
             ),
         };
+
+        if let BodyOp::Unary {
+            unary_id,
+            kind: unary_kind,
+            ..
+        } = &stmt.op
+        {
+            let body_block = func.block_mut(shape.body);
+            if let Some(inst) = body_block.insts.iter_mut().find(|i| i.id == *unary_id) {
+                let new_kind = match (inst.kind.clone(), unary_kind) {
+                    (InstKind::INeg(s), UnaryKind::Neg)
+                    | (InstKind::FNeg(s), UnaryKind::Neg) => InstKind::VNeg(s),
+                    (InstKind::FAbs(s), UnaryKind::Abs) => InstKind::VAbs(s),
+                    _ => inst.kind.clone(),
+                };
+                inst.kind = new_kind;
+                inst.ty = v_ty.clone();
+            }
+            func.register_type(*unary_id, v_ty.clone());
+        }
 
         if let BodyOp::Binop {
             binop_id,
@@ -636,10 +699,11 @@ fn apply_vector_plan(func: &mut Function, shape: &CountedLoop, plan: VectorPlan)
     }
 }
 
-/// Iterate the operands of a body op (one for `Copy`, two for `Binop`).
+/// Iterate the operands of a body op (one for `Copy`/`Unary`, two
+/// for `Binop`).
 fn op_operands(op: &BodyOp) -> Vec<&BinopOperand> {
     match op {
-        BodyOp::Copy { source } => vec![source],
+        BodyOp::Copy { source } | BodyOp::Unary { source, .. } => vec![source],
         BodyOp::Binop { lhs, rhs, .. } => vec![lhs, rhs],
     }
 }
