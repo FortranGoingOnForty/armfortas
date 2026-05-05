@@ -4,8 +4,8 @@
 //! constraints, label validation, and standard conformance. Runs after
 //! symbol resolution (resolve.rs) and type checking (types.rs).
 
-use super::symtab::*;
-use super::types::expr_type;
+use crate::sema::symtab::*;
+use crate::sema::types::expr_type;
 use crate::ast::decl::{Attribute, Decl, TypeAttr, TypeSpec};
 use crate::ast::expr::Expr;
 use crate::ast::stmt::*;
