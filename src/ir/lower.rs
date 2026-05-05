@@ -23959,6 +23959,21 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                 })
                 .unwrap_or(true);
 
+            // Resolve `iostat=ios` so that on a successful write we can
+            // explicitly zero the user's variable.  Without this the slot
+            // is left at whatever stack garbage the caller saw, and the
+            // canonical stdlib pattern `if (ios/=0) call error_stop` then
+            // fires unconditionally — see savetxt/loadtxt in stdlib_io.
+            let iostat_addr = controls
+                .iter()
+                .find(|c| {
+                    c.keyword
+                        .as_deref()
+                        .map(|k| k.eq_ignore_ascii_case("iostat"))
+                        .unwrap_or(false)
+                })
+                .map(|c| lower_arg_by_ref_ctx(b, ctx, &c.value));
+
             if let Some(ctrl) = controls.first() {
                 if let Some((buf_ptr, buf_len)) = internal_io_buffer(b, ctx, ctrl) {
                     if is_list_directed {
@@ -23985,6 +24000,10 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                             vec![adv],
                             IrType::Void,
                         );
+                    }
+                    if let Some(addr) = iostat_addr {
+                        let zero = b.const_i32(0);
+                        b.store(zero, addr);
                     }
                     return;
                 }
@@ -24028,6 +24047,11 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                     vec![adv],
                     IrType::Void,
                 );
+            }
+
+            if let Some(addr) = iostat_addr {
+                let zero = b.const_i32(0);
+                b.store(zero, addr);
             }
         }
 
