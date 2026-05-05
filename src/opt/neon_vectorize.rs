@@ -69,14 +69,31 @@ enum BinaryKind {
     Mul,
 }
 
-/// Concrete plan: single-statement element-wise body with two array
-/// loads plus one array store.
+/// One operand of the body's binop, classified as either an array
+/// `Load` that becomes a `VLoad` or a loop-invariant scalar that
+/// becomes a `VBroadcast` hoisted into the preheader.
+#[derive(Debug, Clone)]
+enum BinopOperand {
+    /// A scalar `Load` whose pointer is `gep base, [iv-derived]`.
+    /// `load_id` is the original IR Load instruction we'll rewrite
+    /// to a VLoad.
+    ArrayLoad(ValueId),
+    /// A loop-invariant scalar value defined outside the loop. We
+    /// will emit a `VBroadcast` in the preheader to splat it across
+    /// every lane and rewrite the binop to consume that vector.
+    InvariantScalar(ValueId),
+}
+
+/// Concrete plan: single-statement element-wise body with up to
+/// two array loads (or one load + one invariant scalar) plus one
+/// array store.
 #[derive(Debug, Clone)]
 struct VectorPlan {
     lanes: u8,
     elem_ty: IrType,
-    /// Original Load instruction IDs to be rewritten to VLoad.
-    loads: Vec<ValueId>,
+    /// The two operands of the binop, in left/right order.
+    lhs: BinopOperand,
+    rhs: BinopOperand,
     /// Original binop instruction ID and its op kind.
     binop: (ValueId, BinaryKind),
     /// Original Store instruction ID to be rewritten to VStore.
@@ -233,12 +250,15 @@ fn build_vector_plan(
         _ => return None,
     };
 
-    let lhs_load = classify_loaded_array(func, lhs_v, shape.iv_param)?;
-    let rhs_load = classify_loaded_array(func, rhs_v, shape.iv_param)?;
-    if !arrays_compatible(&dest, &lhs_load.access) || !arrays_compatible(&dest, &rhs_load.access) {
+    let lhs_op = classify_binop_operand(func, lhs_v, shape.iv_param, &dest, loop_defs)?;
+    let rhs_op = classify_binop_operand(func, rhs_v, shape.iv_param, &dest, loop_defs)?;
+    // At least one side must be an array load — pure scalar+scalar
+    // is meaningless to vectorize over a counted loop.
+    if matches!(lhs_op, BinopOperand::InvariantScalar(_))
+        && matches!(rhs_op, BinopOperand::InvariantScalar(_))
+    {
         return None;
     }
-    let _ = loop_defs; // suppression: helper is used to validate escape only above.
 
     // Find the iv-increment in the body.
     let body_term = match &body.terminator {
@@ -269,7 +289,8 @@ fn build_vector_plan(
     Some(VectorPlan {
         lanes,
         elem_ty: dest.elem_ty,
-        loads: vec![lhs_load.load_id, rhs_load.load_id],
+        lhs: lhs_op,
+        rhs: rhs_op,
         binop: (stored_value, kind),
         store: store_id,
         step_iadd: step_inst.id,
@@ -277,6 +298,36 @@ fn build_vector_plan(
         iv_int_width,
         span,
     })
+}
+
+/// Classify one operand of the body's binop as either a load from
+/// the destination array's iteration space (which becomes a `VLoad`)
+/// or a value defined entirely outside the loop (which becomes a
+/// preheader `VBroadcast`).
+fn classify_binop_operand(
+    func: &Function,
+    value: ValueId,
+    iv_param: ValueId,
+    dest: &ArrayAccess,
+    loop_defs: &HashSet<ValueId>,
+) -> Option<BinopOperand> {
+    if let Some(load) = classify_loaded_array(func, value, iv_param) {
+        if !arrays_compatible(dest, &load.access) {
+            return None;
+        }
+        return Some(BinopOperand::ArrayLoad(load.load_id));
+    }
+    // Not an array load: only valid if it is loop-invariant.
+    if loop_defs.contains(&value) {
+        return None;
+    }
+    // Type must match the destination element type so the broadcast
+    // produces a vector compatible with the rewritten binop.
+    let ty = func.value_type(value)?;
+    if ty != dest.elem_ty {
+        return None;
+    }
+    Some(BinopOperand::InvariantScalar(value))
 }
 
 #[derive(Debug, Clone)]
@@ -436,30 +487,46 @@ fn apply_vector_plan(func: &mut Function, shape: &CountedLoop, plan: VectorPlan)
         }
     }
 
-    // 2. Rewrite the two scalar Loads into VLoads with vector type.
-    for &load_id in &plan.loads {
-        let body_block = func.block_mut(shape.body);
-        if let Some(inst) = body_block.insts.iter_mut().find(|i| i.id == load_id) {
-            if let InstKind::Load(ptr) = inst.kind {
-                inst.kind = InstKind::VLoad(ptr);
-                inst.ty = v_ty.clone();
+    // 2a. For each `ArrayLoad` operand, rewrite the scalar Load into
+    //     a VLoad with vector type.
+    for op in [&plan.lhs, &plan.rhs] {
+        if let BinopOperand::ArrayLoad(load_id) = op {
+            let body_block = func.block_mut(shape.body);
+            if let Some(inst) = body_block.insts.iter_mut().find(|i| i.id == *load_id) {
+                if let InstKind::Load(ptr) = inst.kind {
+                    inst.kind = InstKind::VLoad(ptr);
+                    inst.ty = v_ty.clone();
+                }
             }
+            func.register_type(*load_id, v_ty.clone());
         }
-        func.register_type(load_id, v_ty.clone());
     }
 
-    // 3. Rewrite the binop into the matching V-op.
+    // 2b. For each `InvariantScalar` operand, emit a `VBroadcast` in
+    //     the preheader and remember the new vector value so we can
+    //     rewrite the binop to consume it instead of the scalar.
+    let lhs_subst = broadcast_if_invariant(func, shape.preheader, &plan.lhs, &v_ty, plan.span);
+    let rhs_subst = broadcast_if_invariant(func, shape.preheader, &plan.rhs, &v_ty, plan.span);
+
+    // 3. Rewrite the binop into the matching V-op, swapping in the
+    //    broadcast vectors for any invariant-scalar operands.
     let (binop_id, binop_kind) = plan.binop;
     {
         let body_block = func.block_mut(shape.body);
         if let Some(inst) = body_block.insts.iter_mut().find(|i| i.id == binop_id) {
             let new_kind = match (inst.kind.clone(), binop_kind) {
                 (InstKind::IAdd(l, r), BinaryKind::Add)
-                | (InstKind::FAdd(l, r), BinaryKind::Add) => InstKind::VAdd(l, r),
+                | (InstKind::FAdd(l, r), BinaryKind::Add) => {
+                    InstKind::VAdd(lhs_subst.unwrap_or(l), rhs_subst.unwrap_or(r))
+                }
                 (InstKind::ISub(l, r), BinaryKind::Sub)
-                | (InstKind::FSub(l, r), BinaryKind::Sub) => InstKind::VSub(l, r),
+                | (InstKind::FSub(l, r), BinaryKind::Sub) => {
+                    InstKind::VSub(lhs_subst.unwrap_or(l), rhs_subst.unwrap_or(r))
+                }
                 (InstKind::IMul(l, r), BinaryKind::Mul)
-                | (InstKind::FMul(l, r), BinaryKind::Mul) => InstKind::VMul(l, r),
+                | (InstKind::FMul(l, r), BinaryKind::Mul) => {
+                    InstKind::VMul(lhs_subst.unwrap_or(l), rhs_subst.unwrap_or(r))
+                }
                 _ => inst.kind.clone(),
             };
             inst.kind = new_kind;
@@ -475,6 +542,39 @@ fn apply_vector_plan(func: &mut Function, shape: &CountedLoop, plan: VectorPlan)
             inst.kind = InstKind::VStore(val, ptr);
         }
     }
+}
+
+/// If `op` is an `InvariantScalar`, append a `VBroadcast` to the
+/// loop's preheader (just before its terminator) and return the
+/// resulting vector value. Returns `None` for `ArrayLoad` operands —
+/// those are rewritten in place by the load loop.
+fn broadcast_if_invariant(
+    func: &mut Function,
+    preheader: BlockId,
+    op: &BinopOperand,
+    v_ty: &IrType,
+    span: crate::lexer::Span,
+) -> Option<ValueId> {
+    let scalar = match op {
+        BinopOperand::InvariantScalar(v) => *v,
+        BinopOperand::ArrayLoad(_) => return None,
+    };
+    let new_id = func.next_value_id();
+    func.register_type(new_id, v_ty.clone());
+    let pre_block = func.block_mut(preheader);
+    // Insert the broadcast just before the preheader's terminator
+    // (which is the unconditional branch into the header).
+    let pos = pre_block.insts.len();
+    pre_block.insts.insert(
+        pos,
+        Inst {
+            id: new_id,
+            kind: InstKind::VBroadcast(scalar),
+            ty: v_ty.clone(),
+            span,
+        },
+    );
+    Some(new_id)
 }
 
 fn inst_map(func: &Function) -> HashMap<ValueId, &Inst> {
@@ -676,6 +776,165 @@ mod tests {
             matches!(i.kind, InstKind::ConstInt(4, IntWidth::I32))
         });
         assert!(has_v_step, "step should now be ConstInt(4)");
+    }
+
+    /// Build `c(i) = a(i) + scale` over i32(32) where `scale` is a
+    /// loop-invariant ConstInt defined in the entry/preheader. The
+    /// vectorizer should classify `scale` as `InvariantScalar`, hoist
+    /// a `VBroadcast` into the preheader, and rewrite the binop to
+    /// consume the broadcast vector.
+    fn build_array_add_scalar_loop() -> (Module, BlockId, BlockId) {
+        let mut module = Module::new("m".into());
+        let mut func = Function::new("__prog_vec".into(), vec![], IrType::Void);
+        let entry = func.entry;
+        let header = func.create_block("do_check");
+        let body = func.create_block("do_body");
+        let exit = func.create_block("do_exit");
+
+        let arr_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I32)), 32);
+        let arr_ptr_ty = IrType::Ptr(Box::new(arr_ty.clone()));
+        let a = push_inst(&mut func, entry, InstKind::Alloca(arr_ty.clone()), arr_ptr_ty.clone());
+        let c = push_inst(&mut func, entry, InstKind::Alloca(arr_ty.clone()), arr_ptr_ty.clone());
+
+        let scale = push_inst(
+            &mut func,
+            entry,
+            InstKind::ConstInt(7, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        let one_i32 = push_inst(
+            &mut func,
+            entry,
+            InstKind::ConstInt(1, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        let hi_i32 = push_inst(
+            &mut func,
+            entry,
+            InstKind::ConstInt(32, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        let one_i64 = push_inst(
+            &mut func,
+            entry,
+            InstKind::ConstInt(1, IntWidth::I64),
+            IrType::Int(IntWidth::I64),
+        );
+        func.block_mut(entry).terminator = Some(Terminator::Branch(header, vec![one_i32]));
+
+        let iv = func.next_value_id();
+        func.register_type(iv, IrType::Int(IntWidth::I32));
+        func.block_mut(header).params.push(BlockParam {
+            id: iv,
+            ty: IrType::Int(IntWidth::I32),
+        });
+        let cmp = push_inst(
+            &mut func,
+            header,
+            InstKind::ICmp(CmpOp::Le, iv, hi_i32),
+            IrType::Bool,
+        );
+        func.block_mut(header).terminator = Some(Terminator::CondBranch {
+            cond: cmp,
+            true_dest: body,
+            true_args: vec![],
+            false_dest: exit,
+            false_args: vec![],
+        });
+
+        let idx64 = push_inst(
+            &mut func,
+            body,
+            InstKind::IntExtend(iv, IntWidth::I64, true),
+            IrType::Int(IntWidth::I64),
+        );
+        let offset = push_inst(
+            &mut func,
+            body,
+            InstKind::ISub(idx64, one_i64),
+            IrType::Int(IntWidth::I64),
+        );
+        let elem_ptr_ty = IrType::Ptr(Box::new(IrType::Int(IntWidth::I32)));
+        let a_ptr = push_inst(
+            &mut func,
+            body,
+            InstKind::GetElementPtr(a, vec![offset]),
+            elem_ptr_ty.clone(),
+        );
+        let a_val = push_inst(
+            &mut func,
+            body,
+            InstKind::Load(a_ptr),
+            IrType::Int(IntWidth::I32),
+        );
+        let sum = push_inst(
+            &mut func,
+            body,
+            InstKind::IAdd(a_val, scale),
+            IrType::Int(IntWidth::I32),
+        );
+        let c_ptr = push_inst(
+            &mut func,
+            body,
+            InstKind::GetElementPtr(c, vec![offset]),
+            elem_ptr_ty.clone(),
+        );
+        push_inst(&mut func, body, InstKind::Store(sum, c_ptr), IrType::Void);
+        let next = push_inst(
+            &mut func,
+            body,
+            InstKind::IAdd(iv, one_i32),
+            IrType::Int(IntWidth::I32),
+        );
+        func.block_mut(body).terminator = Some(Terminator::Branch(header, vec![next]));
+        func.block_mut(exit).terminator = Some(Terminator::Return(None));
+        module.add_function(func);
+        (module, entry, body)
+    }
+
+    #[test]
+    fn broadcasts_invariant_scalar_into_preheader() {
+        let (mut module, preheader, body) = build_array_add_scalar_loop();
+        let changed = NeonVectorize.run(&mut module);
+        assert!(
+            changed,
+            "neon_vectorize should fire on a(i) + invariant scalar"
+        );
+
+        let func = &module.functions[0];
+        let pre_block = func.block(preheader);
+        let body_block = func.block(body);
+
+        let n_vbroadcast = pre_block
+            .insts
+            .iter()
+            .filter(|i| matches!(i.kind, InstKind::VBroadcast(_)))
+            .count();
+        assert_eq!(
+            n_vbroadcast, 1,
+            "the invariant scalar should be broadcast once in the preheader"
+        );
+
+        let n_vload = body_block
+            .insts
+            .iter()
+            .filter(|i| matches!(i.kind, InstKind::VLoad(_)))
+            .count();
+        assert_eq!(n_vload, 1, "only the array operand becomes a VLoad");
+
+        let n_vadd = body_block
+            .insts
+            .iter()
+            .filter(|i| matches!(i.kind, InstKind::VAdd(..)))
+            .count();
+        assert_eq!(n_vadd, 1, "the IAdd should become a VAdd");
+
+        let n_vstore = body_block
+            .insts
+            .iter()
+            .filter(|i| matches!(i.kind, InstKind::VStore(..)))
+            .count();
+        assert_eq!(n_vstore, 1, "the Store should become a VStore");
     }
 
     #[test]
