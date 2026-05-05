@@ -595,8 +595,136 @@ pub fn coalesce_moves(mf: &mut MachineFunction) {
     }
 }
 
+/// Resolve the entry-block argument-receipt parallel copy. The
+/// function prologue copies incoming arg registers (x0..x7,
+/// d0..d7) into the registers that the allocator chose for the
+/// parameter vregs. Emitted naively this is a sequential `mov`
+/// chain, which corrupts values whenever a destination aliases a
+/// later source — e.g. `mov x4, x3; mov x3, x4` clobbers x4 before
+/// the second move can read it. Historically this was hidden
+/// because parameter vregs landed in callee-saved registers
+/// (x19..x28) that never alias x0..x7; once the allocator started
+/// preferring caller-saved destinations, the latent hazard
+/// surfaced.
+///
+/// Find the leading run of phys-to-phys movs in the entry block
+/// (after the frame setup) whose source is an incoming arg
+/// register, and run the same parallel-copy resolver
+/// (`rewrite_call_arg_copies`) used for pre-call argument setup.
+pub fn parallelize_entry_arg_moves(mf: &mut MachineFunction) {
+    if mf.blocks.is_empty() {
+        return;
+    }
+    let original = std::mem::take(&mut mf.blocks[0].insts);
+    let mut rebuilt: Vec<MachineInst> = Vec::with_capacity(original.len());
+    let mut iter = original.into_iter().peekable();
+
+    // Pass through the prologue (StpPre/AddImm/SubImm).
+    while let Some(inst) = iter.peek() {
+        if matches!(
+            inst.opcode,
+            ArmOpcode::StpPre | ArmOpcode::AddImm | ArmOpcode::SubImm
+        ) {
+            rebuilt.push(iter.next().unwrap());
+        } else {
+            break;
+        }
+    }
+
+    // Process arg-receipt parallel groups. Tolerate intervening
+    // store instructions (which read but don't write registers in
+    // the parallel-copy graph) so a result-address spill or
+    // partial-receipt store doesn't fragment the receipts. Stop
+    // once any instruction overwrites an incoming arg register —
+    // beyond that point those values are no longer the original
+    // arg values and parallel-copy resolution would be unsound.
+    let mut pending: Vec<MachineInst> = Vec::new();
+    loop {
+        match iter.peek() {
+            None => break,
+            Some(inst) if is_arg_receipt_copy(inst) => {
+                pending.push(iter.next().unwrap());
+            }
+            Some(inst) if is_transparent_to_arg_receipts(inst) => {
+                if !pending.is_empty() {
+                    rebuilt.extend(rewrite_call_arg_copies(std::mem::take(&mut pending)));
+                }
+                rebuilt.push(iter.next().unwrap());
+            }
+            Some(_) => break,
+        }
+    }
+    if !pending.is_empty() {
+        rebuilt.extend(rewrite_call_arg_copies(pending));
+    }
+    rebuilt.extend(iter);
+    mf.blocks[0].insts = rebuilt;
+}
+
+/// An instruction is *transparent* to the arg-receipt parallel
+/// copy if executing it cannot change the value held in any
+/// incoming arg register (x0..x7 / d0..d7). Stores qualify (they
+/// only read), as does any compute whose destination lies outside
+/// the arg-reg range. Anything that writes into x0..x7 forms a
+/// barrier — the receipts that come after it are reading
+/// post-clobber values, so reordering across the barrier is
+/// unsound.
+fn is_transparent_to_arg_receipts(inst: &MachineInst) -> bool {
+    if is_store_opcode(inst.opcode) {
+        return true;
+    }
+    if is_branch_or_call_opcode(inst.opcode) {
+        return false;
+    }
+    match inst.operands.first() {
+        Some(MachineOperand::PhysReg(dst)) => !is_call_arg_reg(*dst),
+        _ => true,
+    }
+}
+
+fn is_store_opcode(op: ArmOpcode) -> bool {
+    matches!(
+        op,
+        ArmOpcode::StrImm
+            | ArmOpcode::StrhImm
+            | ArmOpcode::StrbImm
+            | ArmOpcode::StrFpImm
+            | ArmOpcode::StrReg
+            | ArmOpcode::StrFpReg
+            | ArmOpcode::StrQ
+            | ArmOpcode::StpPre
+            | ArmOpcode::StpOffset
+    )
+}
+
+fn is_branch_or_call_opcode(op: ArmOpcode) -> bool {
+    matches!(
+        op,
+        ArmOpcode::B
+            | ArmOpcode::BCond
+            | ArmOpcode::Bl
+            | ArmOpcode::Blr
+            | ArmOpcode::Ret
+            | ArmOpcode::Cbz
+            | ArmOpcode::Cbnz
+            | ArmOpcode::Tbz
+            | ArmOpcode::Tbnz
+    )
+}
+
 /// Reorder physical argument-register copies immediately before calls so later
 /// sources are not clobbered by earlier destination writes.
+///
+/// For an indirect call (`BLR Xn`), the target register `Xn` is a
+/// live use of the call. If `Xn` lies in the argument-register
+/// range (x0..x7) and one of the pending arg-copy moves writes to
+/// it, the function pointer would be clobbered before the branch.
+/// Save it to a non-arg scratch register (`x10`, distinct from
+/// `x9` that `rewrite_call_arg_copies` uses for cycle-breaking) and
+/// rewrite the BLR's operand. This was hidden as long as
+/// indirect-call targets landed in callee-saved registers (which
+/// can never alias x0..x7) but surfaces once non-call-crossing
+/// values prefer caller-saved.
 pub fn parallelize_call_arg_moves(mf: &mut MachineFunction) {
     for block in &mut mf.blocks {
         let mut rebuilt: Vec<MachineInst> = Vec::with_capacity(block.insts.len());
@@ -606,16 +734,59 @@ pub fn parallelize_call_arg_moves(mf: &mut MachineFunction) {
                 while start > 0 && is_call_arg_copy(&rebuilt[start - 1]) {
                     start -= 1;
                 }
+                let mut adjusted = inst;
+                if matches!(adjusted.opcode, ArmOpcode::Blr) {
+                    let target_phys = match adjusted.operands.first() {
+                        Some(MachineOperand::PhysReg(t)) => Some(*t),
+                        _ => None,
+                    };
+                    if let Some(target) = target_phys {
+                        if is_call_arg_reg(target) {
+                            let target_alias = phys_reg_alias(target);
+                            let writes_target = rebuilt[start..].iter().any(|i| {
+                                matches!(i.operands.first(),
+                                    Some(MachineOperand::PhysReg(d))
+                                        if phys_reg_alias(*d) == target_alias)
+                            });
+                            if writes_target {
+                                let scratch = blr_target_scratch(target);
+                                let save = MachineInst {
+                                    opcode: move_opcode_for_phys(target),
+                                    operands: vec![
+                                        MachineOperand::PhysReg(scratch),
+                                        MachineOperand::PhysReg(target),
+                                    ],
+                                    def: None,
+                                };
+                                rebuilt.insert(start, save);
+                                adjusted.operands[0] = MachineOperand::PhysReg(scratch);
+                                start += 1;
+                            }
+                        }
+                    }
+                }
                 if start < rebuilt.len() {
                     let pending = rebuilt.split_off(start);
                     rebuilt.extend(rewrite_call_arg_copies(pending));
                 }
-                rebuilt.push(inst);
+                rebuilt.push(adjusted);
             } else {
                 rebuilt.push(inst);
             }
         }
         block.insts = rebuilt;
+    }
+}
+
+/// Scratch used to preserve a BLR target across parallel arg
+/// setup. Distinct from the `x9` / `d29` used by
+/// `rewrite_call_arg_copies` for cycle-breaking so the two scratch
+/// uses never collide.
+fn blr_target_scratch(target: PhysReg) -> PhysReg {
+    match target {
+        PhysReg::Gp(_) => PhysReg::Gp(10),
+        PhysReg::Gp32(_) => PhysReg::Gp32(10),
+        _ => panic!("blr_target_scratch: BLR target is always a 64/32-bit GP register"),
     }
 }
 
@@ -627,6 +798,17 @@ fn is_call_arg_copy(inst: &MachineInst) -> bool {
             inst.operands.as_slice(),
             [MachineOperand::PhysReg(dst), MachineOperand::PhysReg(src)]
                 if is_call_arg_reg(*dst) && !matches!(src, PhysReg::Xzr | PhysReg::Wzr)
+        )
+}
+
+/// Mirror of `is_call_arg_copy` for the function-entry direction:
+/// a phys-to-phys mov whose *source* is an incoming arg register.
+fn is_arg_receipt_copy(inst: &MachineInst) -> bool {
+    matches!(inst.opcode, ArmOpcode::MovReg | ArmOpcode::FmovReg)
+        && matches!(
+            inst.operands.as_slice(),
+            [MachineOperand::PhysReg(_), MachineOperand::PhysReg(src)]
+                if is_call_arg_reg(*src)
         )
 }
 
@@ -969,6 +1151,171 @@ mod tests {
                 MachineOperand::PhysReg(PhysReg::Gp(0)),
                 MachineOperand::PhysReg(PhysReg::Gp(4)),
             ]
+        );
+    }
+
+    #[test]
+    fn parallelize_entry_arg_moves_resolves_swap_in_receipts() {
+        let mut mf = MachineFunction::new("test".into());
+        // Frame setup.
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::StpPre,
+            operands: vec![],
+            def: None,
+        });
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::AddImm,
+            operands: vec![],
+            def: None,
+        });
+        // Arg-receipt swap: mov x4, x3; mov x3, x4. Naive
+        // sequential emit would corrupt; the parallelizer must
+        // route through scratch x9.
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::MovReg,
+            operands: vec![
+                MachineOperand::PhysReg(PhysReg::Gp(4)),
+                MachineOperand::PhysReg(PhysReg::Gp(3)),
+            ],
+            def: None,
+        });
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::MovReg,
+            operands: vec![
+                MachineOperand::PhysReg(PhysReg::Gp(3)),
+                MachineOperand::PhysReg(PhysReg::Gp(4)),
+            ],
+            def: None,
+        });
+        parallelize_entry_arg_moves(&mut mf);
+        let body: Vec<&[MachineOperand]> = mf.blocks[0].insts[2..]
+            .iter()
+            .map(|i| i.operands.as_slice())
+            .collect();
+        // Expect the parallelizer to insert a scratch save then
+        // emit the two receipts without clobbering.
+        assert_eq!(body.len(), 3, "swap pair should expand to 3 insts");
+        assert_eq!(
+            body[0],
+            &[
+                MachineOperand::PhysReg(PhysReg::Gp(9)),
+                MachineOperand::PhysReg(PhysReg::Gp(3)),
+            ]
+        );
+    }
+
+    #[test]
+    fn parallelize_entry_arg_moves_tolerates_intervening_store() {
+        let mut mf = MachineFunction::new("test".into());
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::StpPre,
+            operands: vec![],
+            def: None,
+        });
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::AddImm,
+            operands: vec![],
+            def: None,
+        });
+        // mov x10, x0  (transparent: dst x10 outside arg-reg range)
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::MovReg,
+            operands: vec![
+                MachineOperand::PhysReg(PhysReg::Gp(10)),
+                MachineOperand::PhysReg(PhysReg::Gp(0)),
+            ],
+            def: None,
+        });
+        // str x10, [fp, #-56]  (store, transparent — reads x10)
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::StrImm,
+            operands: vec![
+                MachineOperand::PhysReg(PhysReg::Gp(10)),
+                MachineOperand::PhysReg(PhysReg::FP),
+                MachineOperand::Imm(-56),
+            ],
+            def: None,
+        });
+        // Swap pair after the store — must still be parallelized.
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::MovReg,
+            operands: vec![
+                MachineOperand::PhysReg(PhysReg::Gp(4)),
+                MachineOperand::PhysReg(PhysReg::Gp(3)),
+            ],
+            def: None,
+        });
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::MovReg,
+            operands: vec![
+                MachineOperand::PhysReg(PhysReg::Gp(3)),
+                MachineOperand::PhysReg(PhysReg::Gp(4)),
+            ],
+            def: None,
+        });
+        parallelize_entry_arg_moves(&mut mf);
+        // The store should still appear (kept in place); the swap
+        // pair should have expanded to 3 movs via scratch.
+        let opcodes: Vec<ArmOpcode> = mf.blocks[0].insts.iter().map(|i| i.opcode).collect();
+        assert!(
+            opcodes.contains(&ArmOpcode::StrImm),
+            "store should be preserved across parallelization"
+        );
+        let mov_count = opcodes
+            .iter()
+            .filter(|&&op| op == ArmOpcode::MovReg)
+            .count();
+        assert_eq!(
+            mov_count, 4,
+            "expected 4 movs (1 receipt + 3 from swap expansion), got {}",
+            mov_count
+        );
+    }
+
+    #[test]
+    fn parallelize_call_arg_moves_routes_blr_target_through_scratch() {
+        let mut mf = MachineFunction::new("test".into());
+        // ldr x0, [...] — function pointer loaded into x0
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::LdrImm,
+            operands: vec![
+                MachineOperand::PhysReg(PhysReg::Gp(0)),
+                MachineOperand::PhysReg(PhysReg::FP),
+                MachineOperand::Imm(-8),
+            ],
+            def: None,
+        });
+        // mov x0, x12 — arg-setup also targets x0 (clobbers fn ptr).
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::MovReg,
+            operands: vec![
+                MachineOperand::PhysReg(PhysReg::Gp(0)),
+                MachineOperand::PhysReg(PhysReg::Gp(12)),
+            ],
+            def: None,
+        });
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::Blr,
+            operands: vec![MachineOperand::PhysReg(PhysReg::Gp(0))],
+            def: None,
+        });
+        parallelize_call_arg_moves(&mut mf);
+        // First inst should now be `mov x10, x0` (preserve the fn
+        // pointer to scratch); the BLR's operand should be x10.
+        assert_eq!(mf.blocks[0].insts[0].opcode, ArmOpcode::LdrImm);
+        assert_eq!(mf.blocks[0].insts[1].opcode, ArmOpcode::MovReg);
+        assert_eq!(
+            mf.blocks[0].insts[1].operands,
+            vec![
+                MachineOperand::PhysReg(PhysReg::Gp(10)),
+                MachineOperand::PhysReg(PhysReg::Gp(0)),
+            ]
+        );
+        let blr = mf.blocks[0].insts.last().unwrap();
+        assert_eq!(blr.opcode, ArmOpcode::Blr);
+        assert_eq!(
+            blr.operands,
+            vec![MachineOperand::PhysReg(PhysReg::Gp(10))]
         );
     }
 }
