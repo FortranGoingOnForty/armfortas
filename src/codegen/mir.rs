@@ -427,10 +427,20 @@ impl Default for StackFrame {
 impl StackFrame {
     /// Allocate a local variable slot. Returns a negative offset from FP.
     /// Locals grow downward from FP: first local at [FP-8], etc.
+    ///
+    /// Alignment ladders 4 → 8 → 16 by size. The 16 case matters for
+    /// 128-bit NEON vector spills — Apple Silicon's `LDR Q` / `STR Q`
+    /// require 16-byte alignment; an 8-byte cap silently produces
+    /// addresses that may fault on slow paths.
     pub fn alloc_local(&mut self, size: u32) -> i32 {
-        let align = if size >= 8 { 8i32 } else { 4 };
+        let align = if size >= 16 {
+            16i32
+        } else if size >= 8 {
+            8
+        } else {
+            4
+        };
         self.next_offset += size as i32;
-        // Align the running offset.
         self.next_offset = (self.next_offset + align - 1) & !(align - 1);
         let offset = -self.next_offset; // negative from FP
         self.locals.push(FrameSlot { offset, size });
