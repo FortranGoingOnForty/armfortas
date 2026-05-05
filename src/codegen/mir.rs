@@ -125,6 +125,8 @@ pub enum ArmOpcode {
     FnegV2D,
     FabsV4S,
     FabsV2D,
+    FsqrtV4S,
+    FsqrtV2D,
     FmlaV4S, // FMLA Vd.4s, Vn.4s, Vm.4s   (Vd += Vn*Vm)
     FmlaV2D,
     FminV4S,
