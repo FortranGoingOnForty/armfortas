@@ -29,7 +29,23 @@ impl Pass for Gvn {
             .collect();
         let mut changed = false;
         for func in &mut module.functions {
-            if gvn_function(func, &pure_calls) {
+            // Sprint 15 Stage 2: congruence closure via fixpoint.
+            // After the first pass merges some values, downstream
+            // instructions may now have equivalent operands; their
+            // keys must be recomputed with the new `replacements`
+            // table. Iterating gvn_function until it stops mutating
+            // achieves the fixpoint without rewriting the per-block
+            // dominator-tree walk. Cap at 8 rounds to bound the worst
+            // case (in practice 1-2 rounds covers it).
+            let mut local_changed = false;
+            for _ in 0..8 {
+                if gvn_function(func, &pure_calls) {
+                    local_changed = true;
+                } else {
+                    break;
+                }
+            }
+            if local_changed {
                 changed = true;
             }
         }
