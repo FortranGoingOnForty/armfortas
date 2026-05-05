@@ -1,5 +1,12 @@
 ! Element-wise sqrt over a load: c(i) = sqrt(a(i)).
 ! Lifts to VSqrt and lowers to fsqrt.4s / fsqrt.2d.
+!
+! CHECK: 1.0000000E0
+! CHECK: 2.0000000E0
+! CHECK: 4.0000000E0
+! CHECK: 1.000000000000000E0
+! CHECK: 2.000000000000000E0
+! CHECK: 4.000000000000000E0
 program test_do_loop_vectorize_sqrt
   implicit none
   integer :: i
