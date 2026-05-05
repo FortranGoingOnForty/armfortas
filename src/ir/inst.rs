@@ -167,6 +167,7 @@ pub enum InstKind {
     VDiv(ValueId, ValueId),
     VNeg(ValueId),
     VAbs(ValueId),
+    VSqrt(ValueId),
     VFma(ValueId, ValueId, ValueId), // a*b + c
     VMin(ValueId, ValueId),
     VMax(ValueId, ValueId),

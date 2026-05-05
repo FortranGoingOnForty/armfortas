@@ -296,6 +296,7 @@ fn print_inst_with_module_opt(inst: &Inst, module: Option<&Module>) -> String {
         InstKind::VDiv(a, b) => format!("vdiv %{}, %{}", a.0, b.0),
         InstKind::VNeg(a) => format!("vneg %{}", a.0),
         InstKind::VAbs(a) => format!("vabs %{}", a.0),
+        InstKind::VSqrt(a) => format!("vsqrt %{}", a.0),
         InstKind::VFma(a, b, c) => format!("vfma %{}, %{}, %{}", a.0, b.0, c.0),
         InstKind::VMin(a, b) => format!("vmin %{}, %{}", a.0, b.0),
         InstKind::VMax(a, b) => format!("vmax %{}, %{}", a.0, b.0),

@@ -99,6 +99,7 @@ pub fn inst_uses(kind: &InstKind) -> Vec<ValueId> {
         | InstKind::VMax(a, b) => vec![*a, *b],
         InstKind::VNeg(a)
         | InstKind::VAbs(a)
+        | InstKind::VSqrt(a)
         | InstKind::VLoad(a)
         | InstKind::VBitcast(a, _)
         | InstKind::VExtract(a, _)
@@ -269,6 +270,7 @@ pub fn for_each_operand_mut(kind: &mut InstKind, mut r: impl FnMut(&mut ValueId)
         }
         InstKind::VNeg(a)
         | InstKind::VAbs(a)
+        | InstKind::VSqrt(a)
         | InstKind::VLoad(a)
         | InstKind::VBitcast(a, _)
         | InstKind::VExtract(a, _)

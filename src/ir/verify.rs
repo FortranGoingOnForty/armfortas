@@ -612,7 +612,7 @@ fn check_type_consistency(func: &Function, inst: &Inst, errors: &mut Vec<VerifyE
                 }
             }
         }
-        InstKind::VNeg(a) | InstKind::VAbs(a) => {
+        InstKind::VNeg(a) | InstKind::VAbs(a) | InstKind::VSqrt(a) => {
             if let Some(ta) = func.value_type(*a) {
                 if ta != inst.ty {
                     errors.push(VerifyError {
