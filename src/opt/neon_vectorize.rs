@@ -888,12 +888,8 @@ fn detect_reduction_plan(
         _ => return None,
     };
     let acc_ty = header_block.params[1].ty.clone();
-    // FP reductions need `faddv.4s` / `faddp.2d` — not yet supported
-    // by afs-as, so restrict reductions to integer accumulators for
-    // now. Once afs-as grows the missing Faddv encoding the float
-    // path here can drop the gate.
     let elem_ty = match acc_ty.clone() {
-        IrType::Int(_) => acc_ty,
+        IrType::Int(_) | IrType::Float(_) => acc_ty,
         _ => return None,
     };
     let lanes = lane_count_for(&elem_ty)?;
