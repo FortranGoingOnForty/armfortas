@@ -1122,7 +1122,243 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
             };
             format!("brk #{}", imm)
         }
+
+        // ---- NEON SIMD vector ops (Sprint 12 Stage 2) ----
+        //
+        // Each op forwards to a small helper so the lane-shape suffix
+        // (.4s / .2d / .s[n] / .d[n]) lives in one place.
+        ArmOpcode::AddV4S => fmt_vbinop(inst, "add", "4s"),
+        ArmOpcode::AddV2D => fmt_vbinop(inst, "add", "2d"),
+        ArmOpcode::SubV4S => fmt_vbinop(inst, "sub", "4s"),
+        ArmOpcode::SubV2D => fmt_vbinop(inst, "sub", "2d"),
+        ArmOpcode::MulV4S => fmt_vbinop(inst, "mul", "4s"),
+        ArmOpcode::NegV4S => fmt_vunop(inst, "neg", "4s"),
+        ArmOpcode::NegV2D => fmt_vunop(inst, "neg", "2d"),
+        ArmOpcode::FaddV4S => fmt_vbinop(inst, "fadd", "4s"),
+        ArmOpcode::FaddV2D => fmt_vbinop(inst, "fadd", "2d"),
+        ArmOpcode::FsubV4S => fmt_vbinop(inst, "fsub", "4s"),
+        ArmOpcode::FsubV2D => fmt_vbinop(inst, "fsub", "2d"),
+        ArmOpcode::FmulV4S => fmt_vbinop(inst, "fmul", "4s"),
+        ArmOpcode::FmulV2D => fmt_vbinop(inst, "fmul", "2d"),
+        ArmOpcode::FdivV4S => fmt_vbinop(inst, "fdiv", "4s"),
+        ArmOpcode::FdivV2D => fmt_vbinop(inst, "fdiv", "2d"),
+        ArmOpcode::FnegV4S => fmt_vunop(inst, "fneg", "4s"),
+        ArmOpcode::FnegV2D => fmt_vunop(inst, "fneg", "2d"),
+        ArmOpcode::FabsV4S => fmt_vunop(inst, "fabs", "4s"),
+        ArmOpcode::FabsV2D => fmt_vunop(inst, "fabs", "2d"),
+        ArmOpcode::FmlaV4S => fmt_vbinop(inst, "fmla", "4s"),
+        ArmOpcode::FmlaV2D => fmt_vbinop(inst, "fmla", "2d"),
+        ArmOpcode::FminV4S => fmt_vbinop(inst, "fmin", "4s"),
+        ArmOpcode::FminV2D => fmt_vbinop(inst, "fmin", "2d"),
+        ArmOpcode::FmaxV4S => fmt_vbinop(inst, "fmax", "4s"),
+        ArmOpcode::FmaxV2D => fmt_vbinop(inst, "fmax", "2d"),
+        ArmOpcode::SminV4S => fmt_vbinop(inst, "smin", "4s"),
+        ArmOpcode::SmaxV4S => fmt_vbinop(inst, "smax", "4s"),
+        ArmOpcode::UminV4S => fmt_vbinop(inst, "umin", "4s"),
+        ArmOpcode::UmaxV4S => fmt_vbinop(inst, "umax", "4s"),
+
+        ArmOpcode::FaddpV2S => format!(
+            "faddp {}, {}",
+            fp32_scalar(&inst.operands[0]),
+            v_reg(&inst.operands[1], "2s"),
+        ),
+        ArmOpcode::FaddpV2D => format!(
+            "faddp {}, {}",
+            fp64_scalar(&inst.operands[0]),
+            v_reg(&inst.operands[1], "2d"),
+        ),
+        ArmOpcode::Faddv4S => format!(
+            "faddv {}, {}",
+            fp32_scalar(&inst.operands[0]),
+            v_reg(&inst.operands[1], "4s"),
+        ),
+        ArmOpcode::Sminv4S => format!(
+            "sminv {}, {}",
+            fp32_scalar(&inst.operands[0]),
+            v_reg(&inst.operands[1], "4s"),
+        ),
+        ArmOpcode::Smaxv4S => format!(
+            "smaxv {}, {}",
+            fp32_scalar(&inst.operands[0]),
+            v_reg(&inst.operands[1], "4s"),
+        ),
+        ArmOpcode::Uminv4S => format!(
+            "uminv {}, {}",
+            fp32_scalar(&inst.operands[0]),
+            v_reg(&inst.operands[1], "4s"),
+        ),
+        ArmOpcode::Umaxv4S => format!(
+            "umaxv {}, {}",
+            fp32_scalar(&inst.operands[0]),
+            v_reg(&inst.operands[1], "4s"),
+        ),
+        ArmOpcode::Addv4S => format!(
+            "addv {}, {}",
+            fp32_scalar(&inst.operands[0]),
+            v_reg(&inst.operands[1], "4s"),
+        ),
+
+        ArmOpcode::DupGen4S => format!(
+            "dup {}, {}",
+            v_reg(&inst.operands[0], "4s"),
+            op_str(&inst.operands[1]),
+        ),
+        ArmOpcode::DupGen2D => format!(
+            "dup {}, {}",
+            v_reg(&inst.operands[0], "2d"),
+            op_str(&inst.operands[1]),
+        ),
+        ArmOpcode::DupEl4S => format!(
+            "dup {}, {}",
+            v_reg(&inst.operands[0], "4s"),
+            v_lane(&inst.operands[1], "s", 0),
+        ),
+        ArmOpcode::DupEl2D => format!(
+            "dup {}, {}",
+            v_reg(&inst.operands[0], "2d"),
+            v_lane(&inst.operands[1], "d", 0),
+        ),
+        ArmOpcode::Ins4S => {
+            let lane = imm_u8(&inst.operands[1]);
+            format!(
+                "ins {}, {}",
+                v_lane(&inst.operands[0], "s", lane),
+                op_str(&inst.operands[2]),
+            )
+        }
+        ArmOpcode::Ins2D => {
+            let lane = imm_u8(&inst.operands[1]);
+            format!(
+                "ins {}, {}",
+                v_lane(&inst.operands[0], "d", lane),
+                op_str(&inst.operands[2]),
+            )
+        }
+        ArmOpcode::Umov4S => {
+            let lane = imm_u8(&inst.operands[2]);
+            format!(
+                "umov {}, {}",
+                op_str(&inst.operands[0]),
+                v_lane(&inst.operands[1], "s", lane),
+            )
+        }
+        ArmOpcode::Umov2D => {
+            let lane = imm_u8(&inst.operands[2]);
+            format!(
+                "umov {}, {}",
+                op_str(&inst.operands[0]),
+                v_lane(&inst.operands[1], "d", lane),
+            )
+        }
+        ArmOpcode::FmovEl4S => {
+            let lane = imm_u8(&inst.operands[2]);
+            format!(
+                "mov {}, {}",
+                fp32_scalar(&inst.operands[0]),
+                v_lane(&inst.operands[1], "s", lane),
+            )
+        }
+        ArmOpcode::FmovEl2D => {
+            let lane = imm_u8(&inst.operands[2]);
+            format!(
+                "mov {}, {}",
+                fp64_scalar(&inst.operands[0]),
+                v_lane(&inst.operands[1], "d", lane),
+            )
+        }
+
+        ArmOpcode::LdrQ => format!(
+            "ldr {}, [{}, {}]",
+            q_reg(&inst.operands[0]),
+            op_str(&inst.operands[1]),
+            op_str(&inst.operands[2]),
+        ),
+        ArmOpcode::StrQ => format!(
+            "str {}, [{}, {}]",
+            q_reg(&inst.operands[0]),
+            op_str(&inst.operands[1]),
+            op_str(&inst.operands[2]),
+        ),
     }
+}
+
+// ---- NEON formatting helpers ----
+
+fn v_reg(op: &MachineOperand, shape: &str) -> String {
+    match op {
+        MachineOperand::VReg(id) => format!("v{}.{}", id.0, shape),
+        MachineOperand::PhysReg(PhysReg::Fp(n)) | MachineOperand::PhysReg(PhysReg::Fp32(n)) => {
+            format!("v{}.{}", n, shape)
+        }
+        _ => format!("{}.{}", op_str(op), shape),
+    }
+}
+
+fn q_reg(op: &MachineOperand) -> String {
+    match op {
+        MachineOperand::VReg(id) => format!("q{}", id.0),
+        MachineOperand::PhysReg(PhysReg::Fp(n)) | MachineOperand::PhysReg(PhysReg::Fp32(n)) => {
+            format!("q{}", n)
+        }
+        _ => format!("q{}", op_str(op)),
+    }
+}
+
+fn v_lane(op: &MachineOperand, lane_ty: &str, lane: u8) -> String {
+    match op {
+        MachineOperand::VReg(id) => format!("v{}.{}[{}]", id.0, lane_ty, lane),
+        MachineOperand::PhysReg(PhysReg::Fp(n)) | MachineOperand::PhysReg(PhysReg::Fp32(n)) => {
+            format!("v{}.{}[{}]", n, lane_ty, lane)
+        }
+        _ => format!("v{}.{}[{}]", op_str(op), lane_ty, lane),
+    }
+}
+
+fn fp32_scalar(op: &MachineOperand) -> String {
+    match op {
+        MachineOperand::VReg(id) => format!("s{}", id.0),
+        MachineOperand::PhysReg(PhysReg::Fp(n)) | MachineOperand::PhysReg(PhysReg::Fp32(n)) => {
+            format!("s{}", n)
+        }
+        _ => op_str(op),
+    }
+}
+
+fn fp64_scalar(op: &MachineOperand) -> String {
+    match op {
+        MachineOperand::VReg(id) => format!("d{}", id.0),
+        MachineOperand::PhysReg(PhysReg::Fp(n)) | MachineOperand::PhysReg(PhysReg::Fp32(n)) => {
+            format!("d{}", n)
+        }
+        _ => op_str(op),
+    }
+}
+
+fn imm_u8(op: &MachineOperand) -> u8 {
+    if let MachineOperand::Imm(v) = op {
+        *v as u8
+    } else {
+        0
+    }
+}
+
+fn fmt_vbinop(inst: &MachineInst, mnemonic: &str, shape: &str) -> String {
+    format!(
+        "{} {}, {}, {}",
+        mnemonic,
+        v_reg(&inst.operands[0], shape),
+        v_reg(&inst.operands[1], shape),
+        v_reg(&inst.operands[2], shape),
+    )
+}
+
+fn fmt_vunop(inst: &MachineInst, mnemonic: &str, shape: &str) -> String {
+    format!(
+        "{} {}, {}",
+        mnemonic,
+        v_reg(&inst.operands[0], shape),
+        v_reg(&inst.operands[1], shape),
+    )
 }
 
 /// Format a machine operand as assembly text.
@@ -1518,5 +1754,133 @@ mod tests {
             "internal-only functions should not keep external linkage:\n{}",
             asm
         );
+    }
+
+    // ---- NEON SIMD emit smoke tests (Sprint 12 Stage 2) ----
+    //
+    // The vectorizer doesn't generate any of these yet, but the emit
+    // formatters can be exercised directly by hand-building a
+    // MachineInst and feeding it through `emit_inst`. These tests
+    // pin the assembly text form so future codegen wiring has a
+    // golden reference.
+
+    use crate::codegen::mir::{ArmOpcode, MachineFunction, MachineInst, MachineOperand, RegClass};
+
+    fn emit_one(opcode: ArmOpcode, operands: Vec<MachineOperand>) -> String {
+        let mut mf = MachineFunction::new("t".into());
+        mf.new_block("entry");
+        let inst = MachineInst {
+            opcode,
+            operands,
+            def: None,
+        };
+        emit_inst(&inst, &mf)
+    }
+
+    #[test]
+    fn emit_fadd_v_4s_form() {
+        let mut mf = MachineFunction::new("t".into());
+        let v0 = mf.new_vreg(RegClass::V128);
+        let v1 = mf.new_vreg(RegClass::V128);
+        let v2 = mf.new_vreg(RegClass::V128);
+        let asm = emit_one(
+            ArmOpcode::FaddV4S,
+            vec![
+                MachineOperand::VReg(v0),
+                MachineOperand::VReg(v1),
+                MachineOperand::VReg(v2),
+            ],
+        );
+        let _ = mf;
+        assert_eq!(asm, "fadd v0.4s, v1.4s, v2.4s");
+    }
+
+    #[test]
+    fn emit_fadd_v_2d_form() {
+        let asm = emit_one(
+            ArmOpcode::FaddV2D,
+            vec![
+                MachineOperand::VReg(crate::codegen::mir::VRegId(0)),
+                MachineOperand::VReg(crate::codegen::mir::VRegId(1)),
+                MachineOperand::VReg(crate::codegen::mir::VRegId(2)),
+            ],
+        );
+        assert_eq!(asm, "fadd v0.2d, v1.2d, v2.2d");
+    }
+
+    #[test]
+    fn emit_fmla_v_4s_form() {
+        let asm = emit_one(
+            ArmOpcode::FmlaV4S,
+            vec![
+                MachineOperand::VReg(crate::codegen::mir::VRegId(0)),
+                MachineOperand::VReg(crate::codegen::mir::VRegId(1)),
+                MachineOperand::VReg(crate::codegen::mir::VRegId(2)),
+            ],
+        );
+        assert_eq!(asm, "fmla v0.4s, v1.4s, v2.4s");
+    }
+
+    #[test]
+    fn emit_addv_4s_reduction_form() {
+        let asm = emit_one(
+            ArmOpcode::Addv4S,
+            vec![
+                MachineOperand::VReg(crate::codegen::mir::VRegId(0)),
+                MachineOperand::VReg(crate::codegen::mir::VRegId(1)),
+            ],
+        );
+        assert_eq!(asm, "addv s0, v1.4s");
+    }
+
+    #[test]
+    fn emit_dup_gen_4s_broadcasts_w_register() {
+        let asm = emit_one(
+            ArmOpcode::DupGen4S,
+            vec![
+                MachineOperand::VReg(crate::codegen::mir::VRegId(0)),
+                MachineOperand::PhysReg(crate::codegen::mir::PhysReg::Gp32(2)),
+            ],
+        );
+        assert_eq!(asm, "dup v0.4s, w2");
+    }
+
+    #[test]
+    fn emit_ldr_q_form() {
+        let asm = emit_one(
+            ArmOpcode::LdrQ,
+            vec![
+                MachineOperand::VReg(crate::codegen::mir::VRegId(0)),
+                MachineOperand::PhysReg(crate::codegen::mir::PhysReg::Gp(1)),
+                MachineOperand::Imm(16),
+            ],
+        );
+        assert_eq!(asm, "ldr q0, [x1, #16]");
+    }
+
+    #[test]
+    fn emit_str_q_form() {
+        let asm = emit_one(
+            ArmOpcode::StrQ,
+            vec![
+                MachineOperand::VReg(crate::codegen::mir::VRegId(0)),
+                MachineOperand::PhysReg(crate::codegen::mir::PhysReg::Gp(1)),
+                MachineOperand::Imm(0),
+            ],
+        );
+        assert_eq!(asm, "str q0, [x1, #0]");
+    }
+
+    #[test]
+    fn emit_umov_extracts_lane() {
+        let asm = emit_one(
+            ArmOpcode::Umov4S,
+            vec![
+                MachineOperand::PhysReg(crate::codegen::mir::PhysReg::Gp32(3)),
+                MachineOperand::VReg(crate::codegen::mir::VRegId(0)),
+                MachineOperand::Imm(2),
+            ],
+        );
+        assert_eq!(asm, "umov w3, v0.s[2]");
     }
 }
