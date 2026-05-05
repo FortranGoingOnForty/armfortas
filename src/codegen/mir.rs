@@ -147,6 +147,16 @@ pub enum ArmOpcode {
     Faddv4S,  // FADDV Sd, Vn.4s     (across 4 f32 lanes → scalar)
     Sminv4S,  // SMINV Sd, Vn.4s
     Smaxv4S,
+    /// `FMAXV.4S Sd, Vn` — across-lane f32 max reduction → scalar.
+    FmaxvV4S,
+    /// `FMINV.4S Sd, Vn` — across-lane f32 min reduction → scalar.
+    FminvV4S,
+    /// `FMAXP.2D Dd, Vn` — pairwise f64 max reduction (2 lanes → scalar).
+    /// NEON has no `fmaxv.2d`; for two f64 lanes the pairwise form is
+    /// the across-lane reduction.
+    FmaxpV2DScalar,
+    /// `FMINP.2D Dd, Vn` — pairwise f64 min reduction (2 lanes → scalar).
+    FminpV2DScalar,
     /// `ADDP.2D Vd, Vn, Vm` — pairwise integer add over two i64 lanes.
     /// Used for i64 cross-lane reduction: `addp.2d v_dst, v_src, v_src`
     /// puts the sum of the two lanes in v_dst[0].
