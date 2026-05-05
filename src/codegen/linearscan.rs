@@ -89,48 +89,75 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
     // non-reproducible builds across compiles.
     let mut active_gp: Vec<(u8, u32, VRegId)> = Vec::new();
     let mut active_fp: Vec<(u8, u32, VRegId)> = Vec::new();
-    let mut free_gp: Vec<u8> = GP_ALLOC_ORDER.to_vec();
-    let mut free_fp: Vec<u8> = FP_ALLOC_ORDER.to_vec();
+    // Two free pools per class. Non-call-crossing intervals draw
+    // from caller-saved first (no save/restore overhead in the
+    // prologue/epilogue); the callee-saved tier is reserved for
+    // call-crossing intervals, with caller-tier exhaustion as a
+    // fall-through. Previously this was a single Vec consumed via
+    // pop(), which returned the *last* element first — quietly
+    // inverting the policy documented above on GP_ALLOC_ORDER and
+    // forcing every function with even a single allocated vreg to
+    // mark x28/x27/... as callee_saved_used.
+    let split_pool = |order: &[u8], callee: &std::ops::RangeInclusive<u8>| -> (Vec<u8>, Vec<u8>) {
+        let mut caller = Vec::new();
+        let mut callees = Vec::new();
+        for &r in order {
+            if callee.contains(&r) {
+                callees.push(r);
+            } else {
+                caller.push(r);
+            }
+        }
+        (caller, callees)
+    };
+    let (mut free_gp_caller, mut free_gp_callee) =
+        split_pool(&GP_ALLOC_ORDER, &GP_CALLEE_SAVED);
+    let (mut free_fp_caller, mut free_fp_callee) =
+        split_pool(&FP_ALLOC_ORDER, &FP_CALLEE_SAVED);
     let mut callee_saved_used: HashSet<PhysReg> = HashSet::new();
 
     for interval in &liveness.intervals {
         let is_fp = matches!(interval.class, RegClass::Fp32 | RegClass::Fp64);
 
-        // Expire old intervals whose end < current start.
         if is_fp {
-            expire_intervals(&mut active_fp, &mut free_fp, interval.start);
+            expire_intervals(
+                &mut active_fp,
+                &mut free_fp_caller,
+                &mut free_fp_callee,
+                &FP_CALLEE_SAVED,
+                interval.start,
+            );
         } else {
-            expire_intervals(&mut active_gp, &mut free_gp, interval.start);
+            expire_intervals(
+                &mut active_gp,
+                &mut free_gp_caller,
+                &mut free_gp_callee,
+                &GP_CALLEE_SAVED,
+                interval.start,
+            );
         }
 
-        // Try to assign a register.
-        // If the interval crosses a call, ONLY use callee-saved registers.
-        // Caller-saved registers would be clobbered by the call.
-        let (active, free) = if is_fp {
-            (&mut active_fp, &mut free_fp)
+        let (active, free_caller, free_callee) = if is_fp {
+            (&mut active_fp, &mut free_fp_caller, &mut free_fp_callee)
         } else {
-            (&mut active_gp, &mut free_gp)
+            (&mut active_gp, &mut free_gp_caller, &mut free_gp_callee)
         };
 
         let reg_opt = if interval.crosses_call {
-            // Must use callee-saved. Find one in the free list.
-            let callee_range = if is_fp {
-                &FP_CALLEE_SAVED
-            } else {
-                &GP_CALLEE_SAVED
-            };
-            let idx = free.iter().position(|r| callee_range.contains(r));
-            idx.map(|i| free.remove(i))
+            // Must use callee-saved (caller-saved would be clobbered
+            // by the call).
+            free_callee.pop()
         } else if let Some(hint) = interval.hint {
-            // Try the hinted register first (reduces unnecessary moves).
-            let idx = free.iter().position(|&r| r == hint);
-            if let Some(i) = idx {
-                Some(free.remove(i))
+            // Try the hinted register first across both tiers.
+            if let Some(i) = free_caller.iter().position(|&r| r == hint) {
+                Some(free_caller.remove(i))
+            } else if let Some(i) = free_callee.iter().position(|&r| r == hint) {
+                Some(free_callee.remove(i))
             } else {
-                free.pop() // hint unavailable, use any free
+                free_caller.pop().or_else(|| free_callee.pop())
             }
         } else {
-            free.pop()
+            free_caller.pop().or_else(|| free_callee.pop())
         };
 
         if let Some(reg) = reg_opt {
@@ -897,12 +924,22 @@ fn rewrite_call_arg_copies(pending_moves: Vec<MachineInst>) -> Vec<MachineInst> 
     rewritten
 }
 
-fn expire_intervals(active: &mut Vec<(u8, u32, VRegId)>, free: &mut Vec<u8>, pos: u32) {
+fn expire_intervals(
+    active: &mut Vec<(u8, u32, VRegId)>,
+    free_caller: &mut Vec<u8>,
+    free_callee: &mut Vec<u8>,
+    callee_range: &std::ops::RangeInclusive<u8>,
+    pos: u32,
+) {
     let mut i = 0;
     while i < active.len() {
         if active[i].1 < pos {
             let (reg, _, _) = active.remove(i);
-            free.push(reg);
+            if callee_range.contains(&reg) {
+                free_callee.push(reg);
+            } else {
+                free_caller.push(reg);
+            }
         } else {
             i += 1;
         }
@@ -1152,6 +1189,38 @@ mod tests {
                 MachineOperand::PhysReg(PhysReg::Gp(4)),
             ]
         );
+    }
+
+    #[test]
+    fn linear_scan_prefers_caller_saved_when_no_calls_cross() {
+        // No call-crossing intervals — every assigned vreg should
+        // land on a caller-saved register and callee_saved_used
+        // should stay empty (no prologue STP/LDP overhead).
+        let mut func = Function::new("test".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func);
+            let x = b.const_i32(1);
+            let y = b.const_i32(2);
+            let z = b.iadd(x, y);
+            let _w = b.iadd(z, x);
+            b.ret_void();
+        }
+        let mut mf = select_function(&func);
+        let result = linear_scan(&mut mf);
+        assert!(
+            result.callee_saved_used.is_empty(),
+            "no callee-saved expected for call-free function, got {:?}",
+            result.callee_saved_used
+        );
+        for phys in result.assignments.values() {
+            if let PhysReg::Gp(n) | PhysReg::Gp32(n) = phys {
+                assert!(
+                    !GP_CALLEE_SAVED.contains(n),
+                    "vreg landed on callee-saved x{} despite caller-saved availability",
+                    n
+                );
+            }
+        }
     }
 
     #[test]
