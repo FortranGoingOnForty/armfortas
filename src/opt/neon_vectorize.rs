@@ -1203,11 +1203,18 @@ fn detect_reduction_plan(
         (accumulate_inst.id, acc_rhs)
     };
     let value_inst = defs.get(&value_v)?;
-    // Classify `value_v` as a load (Sum) or an imul/fmul of two
-    // loads (Dot). For Max/Min only the single-load form is
-    // accepted — the dot-product fold is meaningless under min/max.
+    // Classify `value_v` as a load (Sum / Min / Max), an
+    // unary-of-load (Sum / Min / Max — folds to VNeg / VAbs), or
+    // an imul/fmul of two loads (Sum-only Dot fold). The
+    // dot-product fold is meaningless under min/max.
     if !matches!(reduce, ReductionKind::Sum)
-        && !matches!(value_inst.kind, InstKind::Load(_))
+        && !matches!(
+            value_inst.kind,
+            InstKind::Load(_)
+                | InstKind::INeg(_)
+                | InstKind::FNeg(_)
+                | InstKind::FAbs(_)
+        )
     {
         return None;
     }
@@ -1228,14 +1235,12 @@ fn detect_reduction_plan(
                 load_id: value_inst.id,
             }
         }
-        // Sum reductions over `acc + (-load)` / `acc + abs(load)` —
-        // the unary applies per-element and lifts cleanly to VNeg /
-        // VAbs.
+        // Reductions over `acc + (-load)` / `acc + abs(load)` (Sum)
+        // or `max/min(acc, abs(load))` (Min/Max) — the unary
+        // applies per-element and lifts cleanly to VNeg / VAbs.
         (IrType::Int(_), InstKind::INeg(load_v))
         | (IrType::Float(_), InstKind::FNeg(load_v))
-        | (IrType::Float(_), InstKind::FAbs(load_v))
-            if matches!(reduce, ReductionKind::Sum) =>
-        {
+        | (IrType::Float(_), InstKind::FAbs(load_v)) => {
             let unary_kind = match value_inst.kind {
                 InstKind::FAbs(_) => UnaryKind::Abs,
                 _ => UnaryKind::Neg,
