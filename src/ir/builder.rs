@@ -447,6 +447,48 @@ impl<'a> FuncBuilder<'a> {
         self.emit(InstKind::InsertField(agg, field, value), ty)
     }
 
+    // ---- SIMD vector ops (Sprint 12) ----
+
+    pub fn vadd(&mut self, lhs: ValueId, rhs: ValueId) -> ValueId {
+        let ty = self.func.value_type(lhs).unwrap_or(IrType::Void);
+        self.emit(InstKind::VAdd(lhs, rhs), ty)
+    }
+
+    pub fn vsub(&mut self, lhs: ValueId, rhs: ValueId) -> ValueId {
+        let ty = self.func.value_type(lhs).unwrap_or(IrType::Void);
+        self.emit(InstKind::VSub(lhs, rhs), ty)
+    }
+
+    pub fn vmul(&mut self, lhs: ValueId, rhs: ValueId) -> ValueId {
+        let ty = self.func.value_type(lhs).unwrap_or(IrType::Void);
+        self.emit(InstKind::VMul(lhs, rhs), ty)
+    }
+
+    pub fn vfma(&mut self, a: ValueId, b: ValueId, c: ValueId) -> ValueId {
+        let ty = self.func.value_type(a).unwrap_or(IrType::Void);
+        self.emit(InstKind::VFma(a, b, c), ty)
+    }
+
+    pub fn vload(&mut self, addr: ValueId, ty: IrType) -> ValueId {
+        self.emit(InstKind::VLoad(addr), ty)
+    }
+
+    pub fn vstore(&mut self, value: ValueId, addr: ValueId) -> ValueId {
+        self.emit(InstKind::VStore(value, addr), IrType::Void)
+    }
+
+    pub fn vbroadcast(&mut self, scalar: ValueId, vector_ty: IrType) -> ValueId {
+        self.emit(InstKind::VBroadcast(scalar), vector_ty)
+    }
+
+    pub fn vreduce_sum(&mut self, vector: ValueId, scalar_ty: IrType) -> ValueId {
+        self.emit(InstKind::VReduceSum(vector), scalar_ty)
+    }
+
+    pub fn vextract(&mut self, vector: ValueId, lane: u8, scalar_ty: IrType) -> ValueId {
+        self.emit(InstKind::VExtract(vector, lane), scalar_ty)
+    }
+
     // ---- Terminators ----
 
     pub fn ret(&mut self, value: Option<ValueId>) {
