@@ -2265,6 +2265,244 @@ pub extern "C" fn afs_array_sum_real8(desc: *const ArrayDescriptor) -> f64 {
     sum
 }
 
+/// Walk every element of an n-dimensional array `src`, computing the
+/// flat byte offset of each element relative to `src.base_addr` and
+/// the corresponding flat dst index after collapsing dimension
+/// `reduce_dim` (1-based) — the dst array has rank `src.rank - 1` with
+/// extents copied from src skipping the reduction dim.
+///
+/// The closure `accum(byte_offset, dst_flat_idx)` is invoked once per
+/// element. Caller supplies the accumulator/store logic for whatever
+/// reduction is being computed (sum, product, maxval, minval, etc.).
+fn for_each_reduce_along_dim<F: FnMut(usize, usize)>(
+    src: &ArrayDescriptor,
+    reduce_dim: i32,
+    mut accum: F,
+) {
+    let rank = src.rank as usize;
+    if rank == 0 {
+        return;
+    }
+    let reduce_dim_idx = reduce_dim as usize - 1;
+    if reduce_dim_idx >= rank {
+        return;
+    }
+    let mut extents: [i64; 15] = [0; 15];
+    let mut strides: [i64; 15] = [0; 15];
+    // Layout of dst dims (rank - 1) — extents from src minus reduce_dim;
+    // computed running stride for column-major dst layout.
+    let mut dst_extents: [i64; 15] = [0; 15];
+    let mut dst_running_stride: [i64; 15] = [0; 15];
+    let mut k = 0usize;
+    let mut acc = 1i64;
+    for i in 0..rank {
+        extents[i] = src.dims[i].extent();
+        strides[i] = src.dims[i].stride.max(1);
+        if i == reduce_dim_idx {
+            continue;
+        }
+        dst_extents[k] = extents[i];
+        dst_running_stride[k] = acc;
+        acc *= extents[i];
+        k += 1;
+    }
+    let mut idx: [i64; 15] = [0; 15];
+    let total = (0..rank).map(|i| extents[i]).product::<i64>();
+    if total <= 0 {
+        return;
+    }
+    for _ in 0..total {
+        let mut byte_off: i64 = 0;
+        let mut dst_flat: i64 = 0;
+        let mut dk = 0usize;
+        for d in 0..rank {
+            byte_off += idx[d] * strides[d] * src.elem_size;
+            if d != reduce_dim_idx {
+                dst_flat += idx[d] * dst_running_stride[dk];
+                dk += 1;
+            }
+        }
+        accum(byte_off as usize, dst_flat as usize);
+        // Increment idx in column-major order (innermost = idx[0]).
+        for d in 0..rank {
+            idx[d] += 1;
+            if idx[d] < extents[d] {
+                break;
+            }
+            idx[d] = 0;
+        }
+    }
+}
+
+/// SUM(array, DIM=k) — reduce along dimension k, allocate `dst` with
+/// rank `src.rank - 1` and extents = src extents minus the reduction
+/// dim, then write the per-slice sums into dst. Caller passes a
+/// zeroed 384-byte descriptor; this helper populates rank/dims/flags
+/// and malloc's the result buffer. Real version (real4 + real8
+/// dispatching on `src.elem_size`).
+#[no_mangle]
+pub extern "C" fn afs_array_sum_real8_dim(
+    src: *const ArrayDescriptor,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+) {
+    if src.is_null() || dst.is_null() {
+        return;
+    }
+    let s = unsafe { &*src };
+    let d = unsafe { &mut *dst };
+    if s.base_addr.is_null() {
+        return;
+    }
+    if !d.is_allocated() {
+        let new_rank = (s.rank - 1).max(0);
+        let mut dim_buf: [DimDescriptor; 15] = [DimDescriptor {
+            lower_bound: 0,
+            upper_bound: 0,
+            stride: 0,
+        }; 15];
+        let mut k = 0usize;
+        let mut acc: i64 = 1;
+        for i in 0..s.rank as usize {
+            if i + 1 == dim as usize {
+                continue;
+            }
+            let extent = s.dims[i].extent();
+            dim_buf[k].lower_bound = 1;
+            dim_buf[k].upper_bound = extent;
+            dim_buf[k].stride = acc;
+            acc *= extent;
+            k += 1;
+        }
+        let dim_ptr = if new_rank > 0 {
+            dim_buf.as_ptr()
+        } else {
+            ptr::null()
+        };
+        let mut stat: i32 = 0;
+        afs_allocate_array(dst, s.elem_size, new_rank, dim_ptr, &mut stat);
+        if stat != 0 || d.base_addr.is_null() {
+            return;
+        }
+    }
+    let dst_total = d.total_elements() as usize;
+    if s.elem_size == 4 {
+        let buf = d.base_addr as *mut f32;
+        for i in 0..dst_total {
+            unsafe { *buf.add(i) = 0.0; }
+        }
+        let src_ptr = s.base_addr as *const u8;
+        for_each_reduce_along_dim(s, dim, |byte_off, dst_flat| {
+            let v = unsafe { *(src_ptr.add(byte_off) as *const f32) };
+            unsafe { *buf.add(dst_flat) += v; }
+        });
+    } else {
+        let buf = d.base_addr as *mut f64;
+        for i in 0..dst_total {
+            unsafe { *buf.add(i) = 0.0; }
+        }
+        let src_ptr = s.base_addr as *const u8;
+        for_each_reduce_along_dim(s, dim, |byte_off, dst_flat| {
+            let v = unsafe { *(src_ptr.add(byte_off) as *const f64) };
+            unsafe { *buf.add(dst_flat) += v; }
+        });
+    }
+}
+
+/// SUM(array, DIM=k) — integer version, dispatching on
+/// `src.elem_size` (1/2/4/8). Result element width matches
+/// `src.elem_size`. Auto-allocates `dst` if not already allocated.
+#[no_mangle]
+pub extern "C" fn afs_array_sum_int_dim(
+    src: *const ArrayDescriptor,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+) {
+    if src.is_null() || dst.is_null() {
+        return;
+    }
+    let s = unsafe { &*src };
+    let d = unsafe { &mut *dst };
+    if s.base_addr.is_null() {
+        return;
+    }
+    if !d.is_allocated() {
+        let new_rank = (s.rank - 1).max(0);
+        let mut dim_buf: [DimDescriptor; 15] = [DimDescriptor {
+            lower_bound: 0,
+            upper_bound: 0,
+            stride: 0,
+        }; 15];
+        let mut k = 0usize;
+        let mut acc: i64 = 1;
+        for i in 0..s.rank as usize {
+            if i + 1 == dim as usize {
+                continue;
+            }
+            let extent = s.dims[i].extent();
+            dim_buf[k].lower_bound = 1;
+            dim_buf[k].upper_bound = extent;
+            dim_buf[k].stride = acc;
+            acc *= extent;
+            k += 1;
+        }
+        let dim_ptr = if new_rank > 0 {
+            dim_buf.as_ptr()
+        } else {
+            ptr::null()
+        };
+        let mut stat: i32 = 0;
+        afs_allocate_array(dst, s.elem_size, new_rank, dim_ptr, &mut stat);
+        if stat != 0 || d.base_addr.is_null() {
+            return;
+        }
+    }
+    let dst_total = d.total_elements() as usize;
+    let src_ptr = s.base_addr as *const u8;
+    match s.elem_size {
+        1 => {
+            let buf = d.base_addr as *mut i8;
+            for i in 0..dst_total {
+                unsafe { *buf.add(i) = 0; }
+            }
+            for_each_reduce_along_dim(s, dim, |byte_off, dst_flat| {
+                let v = unsafe { *(src_ptr.add(byte_off) as *const i8) };
+                unsafe { *buf.add(dst_flat) = (*buf.add(dst_flat)).wrapping_add(v); }
+            });
+        }
+        2 => {
+            let buf = d.base_addr as *mut i16;
+            for i in 0..dst_total {
+                unsafe { *buf.add(i) = 0; }
+            }
+            for_each_reduce_along_dim(s, dim, |byte_off, dst_flat| {
+                let v = unsafe { *(src_ptr.add(byte_off) as *const i16) };
+                unsafe { *buf.add(dst_flat) = (*buf.add(dst_flat)).wrapping_add(v); }
+            });
+        }
+        4 => {
+            let buf = d.base_addr as *mut i32;
+            for i in 0..dst_total {
+                unsafe { *buf.add(i) = 0; }
+            }
+            for_each_reduce_along_dim(s, dim, |byte_off, dst_flat| {
+                let v = unsafe { *(src_ptr.add(byte_off) as *const i32) };
+                unsafe { *buf.add(dst_flat) = (*buf.add(dst_flat)).wrapping_add(v); }
+            });
+        }
+        _ => {
+            let buf = d.base_addr as *mut i64;
+            for i in 0..dst_total {
+                unsafe { *buf.add(i) = 0; }
+            }
+            for_each_reduce_along_dim(s, dim, |byte_off, dst_flat| {
+                let v = unsafe { *(src_ptr.add(byte_off) as *const i64) };
+                unsafe { *buf.add(dst_flat) = (*buf.add(dst_flat)).wrapping_add(v); }
+            });
+        }
+    }
+}
+
 /// SUM(array) — sum all elements (integer version).
 /// Dispatches on `elem_size` so integer(1/2/4/8) arrays all sum correctly.
 /// Respects strides for non-contiguous sections.
