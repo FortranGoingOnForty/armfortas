@@ -802,6 +802,18 @@ enum AccumulateSource {
     },
 }
 
+/// What kind of accumulator combine the body performs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReductionKind {
+    /// `acc' = acc + value` (or `acc - value`, treated as Sum after
+    /// negation — not yet supported).
+    Sum,
+    /// `acc' = max(acc, load)` lowered as `select(icmp ge, acc, load)`.
+    Max,
+    /// `acc' = min(acc, load)` lowered as `select(icmp le, acc, load)`.
+    Min,
+}
+
 /// A sum-reduction loop:
 ///   `do i = lo, hi; s = s + a(i); end do` (or fadd for floats).
 /// or a dot-product fold:
@@ -826,8 +838,16 @@ struct ReductionPlan {
     acc_init: ValueId,
     /// What computes the per-iteration value to fold into `acc`.
     source: AccumulateSource,
-    /// Original `acc' = acc + load` (or `acc + imul`) instruction.
+    /// What combine op the body performs (sum / min / max).
+    reduce: ReductionKind,
+    /// Original `acc' = ...` instruction (the IAdd, FAdd, or
+    /// `select(icmp, ...)` whose result feeds back into the header).
+    /// For min/max the icmp is part of the rewrite too — we hoist
+    /// the `select+icmp` pair into a single `vmin`/`vmax`.
     accumulate_id: ValueId,
+    /// For Min/Max, the icmp instruction we'll discard during the
+    /// rewrite (its result is dead once the select becomes vmin/vmax).
+    cmp_id: Option<ValueId>,
     /// Original `iv' = iv + 1` instruction.
     step_iadd: ValueId,
     /// The `1` ConstInt operand of the iv step.
@@ -939,27 +959,78 @@ fn detect_reduction_plan(
     }
 
     let defs = inst_map(func);
-    // The acc-update is `acc' = acc + load_or_value`. Match either
-    // IAdd or FAdd depending on element type.
+    // The acc-update is one of:
+    //   acc' = acc + value         (Sum / Dot, IAdd or FAdd)
+    //   acc' = select(icmp_ge_or_gt acc, value, acc, value)  (Max)
+    //   acc' = select(icmp_le_or_lt acc, value, acc, value)  (Min)
     let accumulate_inst = defs.get(&body_term_arg_acc)?;
-    let (acc_lhs, acc_rhs) = match (&elem_ty, &accumulate_inst.kind) {
-        (IrType::Int(_), InstKind::IAdd(l, r)) => (*l, *r),
-        (IrType::Float(_), InstKind::FAdd(l, r)) => (*l, *r),
+    let (reduce, cmp_id, acc_lhs, acc_rhs) = match (&elem_ty, &accumulate_inst.kind) {
+        (IrType::Int(_), InstKind::IAdd(l, r)) => (ReductionKind::Sum, None, *l, *r),
+        (IrType::Float(_), InstKind::FAdd(l, r)) => (ReductionKind::Sum, None, *l, *r),
+        (_, InstKind::Select(c, t, f)) => {
+            // Look at the predicate: it must be `icmp <op> acc, load`
+            // (or `icmp <op> load, acc`). The arms must be `(acc,
+            // load)` for max/min (so the select picks acc when the
+            // predicate is true).
+            let cmp_inst = defs.get(c)?;
+            let (cmp_op, cmp_a, cmp_b) = match cmp_inst.kind {
+                InstKind::ICmp(op, a, b) => (op, a, b),
+                _ => return None,
+            };
+            // Identify which side of the icmp / select is the acc
+            // and infer Max vs Min.
+            //
+            //   select(acc >= value, acc, value) → max(acc, value)
+            //   select(acc <= value, acc, value) → min(acc, value)
+            //   select(value >= acc, value, acc) → max(acc, value)
+            //   select(value <= acc, value, acc) → min(acc, value)
+            //
+            // For NEON SmaxV4S/SminV4S the operand order doesn't
+            // matter (commutative).
+            let (kind, acc_side, value_side) = if cmp_a == acc_param && *t == acc_param {
+                let kind = match cmp_op {
+                    CmpOp::Ge | CmpOp::Gt => ReductionKind::Max,
+                    CmpOp::Le | CmpOp::Lt => ReductionKind::Min,
+                    _ => return None,
+                };
+                (kind, *t, *f)
+            } else if cmp_b == acc_param && *t != acc_param && *f == acc_param {
+                let kind = match cmp_op {
+                    CmpOp::Le | CmpOp::Lt => ReductionKind::Max,
+                    CmpOp::Ge | CmpOp::Gt => ReductionKind::Min,
+                    _ => return None,
+                };
+                (kind, *f, *t)
+            } else {
+                return None;
+            };
+            (kind, Some(cmp_inst.id), acc_side, value_side)
+        }
         _ => return None,
     };
-    // One side must be the acc_param. The other is either a single
-    // load (sum reduction) or an imul/fmul of two loads (dot
-    // product).
-    let (accumulate_id, value_v) = if acc_lhs == acc_param {
-        (accumulate_inst.id, acc_rhs)
-    } else if acc_rhs == acc_param {
-        (accumulate_inst.id, acc_lhs)
+    // For Sum / Dot (IAdd/FAdd), one operand must be acc_param. For
+    // Max/Min the `acc_lhs` is already the acc and `acc_rhs` is the
+    // value (set up by the match arm above).
+    let (accumulate_id, value_v) = if matches!(reduce, ReductionKind::Sum) {
+        if acc_lhs == acc_param {
+            (accumulate_inst.id, acc_rhs)
+        } else if acc_rhs == acc_param {
+            (accumulate_inst.id, acc_lhs)
+        } else {
+            return None;
+        }
     } else {
-        return None;
+        (accumulate_inst.id, acc_rhs)
     };
     let value_inst = defs.get(&value_v)?;
     // Classify `value_v` as a load (Sum) or an imul/fmul of two
-    // loads (Dot).
+    // loads (Dot). For Max/Min only the single-load form is
+    // accepted — the dot-product fold is meaningless under min/max.
+    if !matches!(reduce, ReductionKind::Sum)
+        && !matches!(value_inst.kind, InstKind::Load(_))
+    {
+        return None;
+    }
     let source = match (&elem_ty, &value_inst.kind) {
         (_, InstKind::Load(load_ptr)) => {
             let access = classify_array_access(func, *load_ptr, iv_param)?;
@@ -1032,17 +1103,24 @@ fn detect_reduction_plan(
     let step_iadd = step_inst.id;
 
     // Validate that `acc_param` doesn't have any *other* uses inside
-    // the loop besides the accumulate inst — otherwise the rewrite
-    // gets ambiguous.
+    // the loop besides the accumulate inst (and, for Min/Max, the
+    // companion icmp that we'll discard during rewrite).
     let acc_extra_uses: usize = func
         .blocks
         .iter()
         .filter(|b| lp.body.contains(&b.id))
         .flat_map(|b| b.insts.iter())
-        .filter(|inst| inst.id != accumulate_id)
+        .filter(|inst| inst.id != accumulate_id && Some(inst.id) != cmp_id)
         .filter(|inst| inst_uses(&inst.kind).contains(&acc_param))
         .count();
     if acc_extra_uses != 0 {
+        return None;
+    }
+    // Min/Max codegen is wired only for i32 (4xi32 → s_tmp via
+    // smaxv/sminv). Restrict accordingly.
+    if !matches!(reduce, ReductionKind::Sum)
+        && !matches!(elem_ty, IrType::Int(IntWidth::I32))
+    {
         return None;
     }
 
@@ -1070,7 +1148,9 @@ fn detect_reduction_plan(
         acc_param_idx: 1,
         acc_init,
         source,
+        reduce,
         accumulate_id,
+        cmp_id,
         step_iadd,
         step_const,
         iv_int_width,
@@ -1186,31 +1266,58 @@ fn apply_reduction_plan(func: &mut Function, lp: &NaturalLoop, plan: ReductionPl
         }
     }
 
-    // 5. Rewrite the accumulate IAdd/FAdd → VAdd (both operands now
-    //    vectors: the acc_param block param is vector, the source
-    //    value is vector).
+    // 5. Rewrite the accumulate inst:
+    //    - Sum: IAdd/FAdd → VAdd
+    //    - Max: select(icmp, acc, value) → VMax(acc, value)
+    //    - Min: select(icmp, acc, value) → VMin(acc, value)
+    //    For Min/Max we also drop the icmp predicate's type since
+    //    its result is no longer used (regalloc will dead-code it).
     let body_block = func.block_mut(plan.body);
     if let Some(inst) = body_block.insts.iter_mut().find(|i| i.id == plan.accumulate_id) {
-        let new_kind = match inst.kind.clone() {
-            InstKind::IAdd(l, r) | InstKind::FAdd(l, r) => InstKind::VAdd(l, r),
-            other => other,
+        let acc_v = plan.acc_param;
+        let new_kind = match (inst.kind.clone(), plan.reduce) {
+            (InstKind::IAdd(l, r), ReductionKind::Sum)
+            | (InstKind::FAdd(l, r), ReductionKind::Sum) => InstKind::VAdd(l, r),
+            (InstKind::Select(_, t, f), ReductionKind::Max) => {
+                // The detection guarantees one arm is acc, the
+                // other is the value (now a vector). Use whichever
+                // arm equals acc.
+                if t == acc_v {
+                    InstKind::VMax(t, f)
+                } else {
+                    InstKind::VMax(f, t)
+                }
+            }
+            (InstKind::Select(_, t, f), ReductionKind::Min) => {
+                if t == acc_v {
+                    InstKind::VMin(t, f)
+                } else {
+                    InstKind::VMin(f, t)
+                }
+            }
+            (other, _) => other,
         };
         inst.kind = new_kind;
         inst.ty = v_ty.clone();
     }
     func.register_type(plan.accumulate_id, v_ty.clone());
 
-    // 6. Insert `acc_scalar = vreduce_sum(acc_param)` at the top of
+    // 6. Insert `acc_scalar = vreduce_*(acc_param)` at the top of
     //    the exit block, then walk every block NOT in the loop and
     //    rewrite acc_param → acc_scalar.
     let acc_scalar = func.next_value_id();
     func.register_type(acc_scalar, plan.elem_ty.clone());
+    let reduce_kind = match plan.reduce {
+        ReductionKind::Sum => InstKind::VReduceSum(plan.acc_param),
+        ReductionKind::Max => InstKind::VReduceMax(plan.acc_param),
+        ReductionKind::Min => InstKind::VReduceMin(plan.acc_param),
+    };
     let exit_block = func.block_mut(plan.exit);
     exit_block.insts.insert(
         0,
         Inst {
             id: acc_scalar,
-            kind: InstKind::VReduceSum(plan.acc_param),
+            kind: reduce_kind,
             ty: plan.elem_ty.clone(),
             span: plan.span,
         },
