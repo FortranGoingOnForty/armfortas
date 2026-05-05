@@ -63,14 +63,56 @@ fn spill_slot_size(class: RegClass) -> u32 {
     }
 }
 
+/// Where a split interval's *post-call* half lives. `Allocated`
+/// is the win — the post-half got a register, so the only memory
+/// traffic is the str/ldr that bridges the call.  `Spilled` is the
+/// fall-back: the post-half couldn't be allocated to a register
+/// either, so post-call uses load directly from `bridge_slot`
+/// (which is the same slot the pre-half wrote into before the
+/// call), and we omit the redundant ldr.
+#[derive(Debug, Clone, Copy)]
+pub enum PostHalf {
+    Allocated(PhysReg),
+    Spilled,
+}
+
+/// One record per call boundary at which a live range was split.
+/// Drives `apply_allocation` to (a) rewrite operands of `vreg`
+/// based on whether they precede or follow the call, and the
+/// post-pass `insert_split_bridges` to (b) emit `str pre_phys,
+/// [bridge_slot]` before the call plus, if the post-half got a
+/// register, `ldr post_phys, [bridge_slot]` after.
+///
+/// `call_position` is the BL/BLR's instruction position in the
+/// liveness numbering — used by apply_allocation to compare with
+/// each operand's cur_pos. `call_index` is the same call's
+/// 0-based walk-order ordinal among all calls in the function —
+/// used by insert_split_bridges to match the BL/BLR by ordinal,
+/// since intervening passes (apply_allocation's spill code) shift
+/// numerical positions but preserve walk order.
+#[derive(Debug, Clone)]
+pub struct SplitRecord {
+    pub vreg: VRegId,
+    pub call_position: u32,
+    pub call_index: u32,
+    pub pre_phys: PhysReg,
+    pub post: PostHalf,
+    pub bridge_slot: i32,
+}
+
 /// Result of register allocation.
 pub struct AllocResult {
-    /// VRegId → assigned PhysReg (None if spilled).
+    /// VRegId → assigned PhysReg. For a split vreg, this holds the
+    /// pre-call (first-half) physreg; the post-half lives in the
+    /// matching `SplitRecord`.
     pub assignments: HashMap<VRegId, PhysReg>,
     /// Spilled vregs → stack frame offset.
     pub spills: HashMap<VRegId, i32>,
     /// Callee-saved registers that were used and need save/restore.
     pub callee_saved_used: Vec<PhysReg>,
+    /// Live-range splits performed at call boundaries. Sorted by
+    /// `(vreg, call_position)` for deterministic lookup.
+    pub split_records: Vec<SplitRecord>,
 }
 
 /// Run linear scan register allocation on a machine function.
@@ -116,7 +158,79 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
         split_pool(&FP_ALLOC_ORDER, &FP_CALLEE_SAVED);
     let mut callee_saved_used: HashSet<PhysReg> = HashSet::new();
 
-    for interval in &liveness.intervals {
+    // Hard-coded PhysReg writes: positions where the instruction's
+    // operand 0 is a PhysReg (e.g. arg-setup `mov PhysReg(x1),
+    // VReg(value)` immediately before a BL). The allocator must not
+    // assign a physreg P to a vreg V if any such write to P falls
+    // strictly inside V's live range — V's value would be clobbered
+    // before its use. Indexed by phys-reg-alias (Gp/Fp + reg num);
+    // 32-bit and 64-bit views share an alias since they share the
+    // same physical register.
+    let mut phys_writes_gp: HashMap<u8, Vec<u32>> = HashMap::new();
+    let mut phys_writes_fp: HashMap<u8, Vec<u32>> = HashMap::new();
+    {
+        let mut p: u32 = 0;
+        for block in &mf.blocks {
+            for inst in &block.insts {
+                if let Some(MachineOperand::PhysReg(phys)) = inst.operands.first() {
+                    match phys {
+                        PhysReg::Gp(n) | PhysReg::Gp32(n) => {
+                            phys_writes_gp.entry(*n).or_default().push(p);
+                        }
+                        PhysReg::Fp(n) | PhysReg::Fp32(n) => {
+                            phys_writes_fp.entry(*n).or_default().push(p);
+                        }
+                        _ => {}
+                    }
+                }
+                p += 2;
+            }
+        }
+    }
+    let writes_in_range = |phys_n: u8, is_fp: bool, start: u32, end: u32| -> bool {
+        let map = if is_fp {
+            &phys_writes_fp
+        } else {
+            &phys_writes_gp
+        };
+        if let Some(positions) = map.get(&phys_n) {
+            // A write at position p clobbers any vreg whose interval
+            // is alive at p. Use strict-greater-than-start so the
+            // vreg's own def position doesn't count, and
+            // less-than-end so the final use position doesn't count
+            // (the use happens before the next instruction's write).
+            positions.iter().any(|&pp| pp > start && pp < end)
+        } else {
+            false
+        }
+    };
+    let pop_compatible = |free: &mut Vec<u8>,
+                          is_fp: bool,
+                          start: u32,
+                          end: u32|
+     -> Option<u8> {
+        for i in (0..free.len()).rev() {
+            if !writes_in_range(free[i], is_fp, start, end) {
+                return Some(free.remove(i));
+            }
+        }
+        None
+    };
+    // Tracks live-range splits in progress: each entry maps a
+    // synthetic post-half vreg to (original vreg, call position,
+    // bridge slot). After allocation we walk this map to
+    // materialize SplitRecords using whatever physreg/slot the
+    // post-half ended up with.
+    let mut splits_in_progress: HashMap<VRegId, (VRegId, u32, i32)> = HashMap::new();
+
+    // Worklist of intervals to allocate. Starts as a clone of the
+    // pre-sorted liveness intervals; splitting inserts post-half
+    // intervals at their sorted position so the linear-scan
+    // invariant (process in start-position order) is preserved.
+    let mut worklist: Vec<super::liveness::LiveInterval> = liveness.intervals.clone();
+    let mut idx = 0;
+    while idx < worklist.len() {
+        let interval = worklist[idx].clone();
         let is_fp = matches!(interval.class, RegClass::Fp32 | RegClass::Fp64);
 
         if is_fp {
@@ -143,22 +257,90 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
             (&mut active_gp, &mut free_gp_caller, &mut free_gp_callee)
         };
 
+        let iv_start = interval.start;
+        let iv_end = interval.end;
         let reg_opt = if interval.crosses_call {
             // Must use callee-saved (caller-saved would be clobbered
             // by the call).
-            free_callee.pop()
+            pop_compatible(free_callee, is_fp, iv_start, iv_end)
         } else if let Some(hint) = interval.hint {
             // Try the hinted register first across both tiers.
-            if let Some(i) = free_caller.iter().position(|&r| r == hint) {
-                Some(free_caller.remove(i))
-            } else if let Some(i) = free_callee.iter().position(|&r| r == hint) {
-                Some(free_callee.remove(i))
+            let hint_ok = !writes_in_range(hint, is_fp, iv_start, iv_end);
+            if hint_ok {
+                if let Some(i) = free_caller.iter().position(|&r| r == hint) {
+                    Some(free_caller.remove(i))
+                } else if let Some(i) = free_callee.iter().position(|&r| r == hint) {
+                    Some(free_callee.remove(i))
+                } else {
+                    pop_compatible(free_caller, is_fp, iv_start, iv_end)
+                        .or_else(|| pop_compatible(free_callee, is_fp, iv_start, iv_end))
+                }
             } else {
-                free_caller.pop().or_else(|| free_callee.pop())
+                pop_compatible(free_caller, is_fp, iv_start, iv_end)
+                    .or_else(|| pop_compatible(free_callee, is_fp, iv_start, iv_end))
             }
         } else {
-            free_caller.pop().or_else(|| free_callee.pop())
+            pop_compatible(free_caller, is_fp, iv_start, iv_end)
+                .or_else(|| pop_compatible(free_callee, is_fp, iv_start, iv_end))
         };
+
+        // Live-range splitting: a call-crossing interval that
+        // can't grab a callee-saved register would otherwise be
+        // full-spilled. If it has a single call crossing AND a
+        // caller-saved register is available right now, split at
+        // the call boundary instead — the pre-half goes to the
+        // caller-saved register, the post-half is allocated as a
+        // fresh interval, and we bridge the call with str/ldr to
+        // a frame slot. Net win: the longer-lived half between
+        // the def and the call avoids spill loads on every use.
+        if reg_opt.is_none()
+            && interval.crosses_call
+            && interval.call_crossings.len() == 1
+            && !free_caller.is_empty()
+        {
+            let call_pos = interval.call_crossings[0];
+            let bridge_slot = mf.alloc_local(spill_slot_size(interval.class));
+            let synthetic = mf.new_vreg(interval.class);
+            splits_in_progress.insert(synthetic, (interval.vreg, call_pos, bridge_slot));
+            // Pre-half: shrink the original to end before the call.
+            // Now non-call-crossing, so it can take a caller-saved.
+            let pre_half = super::liveness::LiveInterval {
+                vreg: interval.vreg,
+                class: interval.class,
+                start: interval.start,
+                end: call_pos.saturating_sub(1),
+                crosses_call: false,
+                call_crossings: Vec::new(),
+                hint: interval.hint,
+            };
+            // Post-half: a fresh synthetic vreg covering the
+            // post-call range. Single original crossing → no
+            // crossings remain; cannot recurse-split.
+            let post_half = super::liveness::LiveInterval {
+                vreg: synthetic,
+                class: interval.class,
+                start: call_pos.saturating_add(1),
+                end: interval.end,
+                crosses_call: false,
+                call_crossings: Vec::new(),
+                hint: None,
+            };
+            worklist[idx] = pre_half;
+            // Insert post-half at its sorted position.
+            let post_start = post_half.start;
+            let post_vreg = post_half.vreg.0;
+            let mut insert_at = idx + 1;
+            while insert_at < worklist.len() {
+                let w = &worklist[insert_at];
+                if (w.start, w.vreg.0) > (post_start, post_vreg) {
+                    break;
+                }
+                insert_at += 1;
+            }
+            worklist.insert(insert_at, post_half);
+            // Re-process the truncated pre-half at the same index.
+            continue;
+        }
 
         if let Some(reg) = reg_opt {
             // Register available.
@@ -235,7 +417,60 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
                 spills.insert(interval.vreg, offset);
             }
         }
+        idx += 1;
     }
+
+    // Materialize SplitRecords from the in-progress map. Each
+    // synthetic post-half vreg either landed on a phys (the win
+    // case) or was spilled (the fall-back). Either way we have a
+    // bridge slot that links the two halves across the call.
+    //
+    // Build a position→call-index map from the BL/BLR walk so
+    // we can attach a stable ordinal to each split. `liveness`
+    // already enumerated calls in walk order, so its
+    // `call_positions` would do — but liveness exposes only
+    // intervals.  Re-derive locally; the call positions are
+    // small.
+    let call_positions_walk: Vec<u32> = {
+        let mut p: u32 = 0;
+        let mut cps = Vec::new();
+        for block in &mf.blocks {
+            for inst in &block.insts {
+                if matches!(inst.opcode, ArmOpcode::Bl | ArmOpcode::Blr) {
+                    cps.push(p);
+                }
+                p += 2;
+            }
+        }
+        cps
+    };
+    let mut split_records: Vec<SplitRecord> = splits_in_progress
+        .into_iter()
+        .filter_map(|(synthetic, (orig, call_pos, bridge_slot))| {
+            let pre_phys = *assignments.get(&orig)?;
+            let post = if let Some(&p) = assignments.get(&synthetic) {
+                PostHalf::Allocated(p)
+            } else if spills.contains_key(&synthetic) {
+                PostHalf::Spilled
+            } else {
+                // No allocation either way — shouldn't happen, but
+                // skip the record rather than emit garbage.
+                return None;
+            };
+            assignments.remove(&synthetic);
+            spills.remove(&synthetic);
+            let call_index = call_positions_walk.binary_search(&call_pos).ok()? as u32;
+            Some(SplitRecord {
+                vreg: orig,
+                call_position: call_pos,
+                call_index,
+                pre_phys,
+                post,
+                bridge_slot,
+            })
+        })
+        .collect();
+    split_records.sort_by_key(|r| (r.vreg.0, r.call_position));
 
     // Sort callee-saved for consistent prologue/epilogue ordering.
     let mut callee_saved: Vec<PhysReg> = callee_saved_used.into_iter().collect();
@@ -248,8 +483,19 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
     AllocResult {
         assignments,
         spills,
+        split_records,
         callee_saved_used: callee_saved,
     }
+}
+
+/// Position-resolved assignment for a vreg. A vreg that wasn't
+/// split has the same assignment everywhere; a split vreg's
+/// assignment depends on whether the use is before or after the
+/// call boundary, and the post-call assignment may itself be a
+/// memory slot (the spilled-post fall-back).
+enum LogicalAssignment {
+    Reg(PhysReg),
+    Slot(i32),
 }
 
 /// Apply allocation result: rewrite VReg operands to PhysReg, insert spill code.
@@ -281,6 +527,30 @@ pub fn apply_allocation(
         }
     }
 
+    // Position-aware lookup: returns the logical assignment of
+    // `vid` at `cur_pos`, consulting split_records first so that
+    // post-call uses pick up the post-half's location instead of
+    // the pre-half's (now-clobbered) caller-saved register.
+    let logical_assignment = |vid: VRegId, cur_pos: u32| -> Option<LogicalAssignment> {
+        for r in &result.split_records {
+            if r.vreg != vid {
+                continue;
+            }
+            if cur_pos > r.call_position {
+                return Some(match r.post {
+                    PostHalf::Allocated(p) => LogicalAssignment::Reg(p),
+                    PostHalf::Spilled => LogicalAssignment::Slot(r.bridge_slot),
+                });
+            }
+            return Some(LogicalAssignment::Reg(r.pre_phys));
+        }
+        if let Some(p) = result.assignments.get(&vid) {
+            Some(LogicalAssignment::Reg(*p))
+        } else {
+            result.spills.get(&vid).copied().map(LogicalAssignment::Slot)
+        }
+    };
+
     for block_idx in 0..mf.blocks.len() {
         let mut new_insts = Vec::new();
         let insts = std::mem::take(&mut mf.blocks[block_idx].insts);
@@ -289,8 +559,12 @@ pub fn apply_allocation(
             let mut rewritten = inst.clone();
             let cur_pos = inst_pos.get(&(block_idx, inst_idx)).copied().unwrap_or(0);
 
-            // Find GP registers NOT occupied by any live interval at this position.
-            // These are safe to use as temporary spill registers.
+            // Find GP registers NOT in use at this position. A
+            // vreg's register is in use during its full live range
+            // unless the vreg was split — in which case the
+            // pre-half occupies pre_phys during [start,
+            // call_position] and the post-half occupies post_phys
+            // during (call_position, end].
             //
             // Iterate `result.assignments` in **deterministic vreg
             // order**, not raw HashMap iteration order — the latter
@@ -303,13 +577,80 @@ pub fn apply_allocation(
             let mut sorted_assignments: Vec<(VRegId, PhysReg)> =
                 result.assignments.iter().map(|(&v, &p)| (v, p)).collect();
             sorted_assignments.sort_by_key(|(v, _)| v.0);
+            // Build the set of phys regs in use at cur_pos. For
+            // split vregs, pre_phys is in use up to call_position,
+            // post_phys (if Allocated) takes over after.
+            let mut used_gp: HashSet<u8> = HashSet::new();
+            let mut used_fp: HashSet<u8> = HashSet::new();
+            let mark_used = |phys: PhysReg, gp: &mut HashSet<u8>, fp: &mut HashSet<u8>| match phys {
+                PhysReg::Gp(n) | PhysReg::Gp32(n) => {
+                    gp.insert(n);
+                }
+                PhysReg::Fp(n) | PhysReg::Fp32(n) => {
+                    fp.insert(n);
+                }
+                _ => {}
+            };
             for (vreg, phys) in &sorted_assignments {
                 if let Some(&(start, end)) = intervals.get(vreg) {
                     if cur_pos < start || cur_pos > end {
-                        // This vreg's register is free at this point.
-                        match phys {
-                            PhysReg::Gp(n) | PhysReg::Gp32(n) => gp_temps.push(*n),
-                            PhysReg::Fp(n) | PhysReg::Fp32(n) => fp_temps.push(*n),
+                        continue;
+                    }
+                    // Split vregs: pre_phys covers [start,
+                    // call_position]; post_phys covers
+                    // (call_position, end]. assignments[vreg] is
+                    // the pre_phys (we removed the synthetic).
+                    let split = result.split_records.iter().find(|r| r.vreg == *vreg);
+                    if let Some(rec) = split {
+                        if cur_pos <= rec.call_position {
+                            mark_used(rec.pre_phys, &mut used_gp, &mut used_fp);
+                        }
+                        if let PostHalf::Allocated(p) = rec.post {
+                            if cur_pos > rec.call_position {
+                                mark_used(p, &mut used_gp, &mut used_fp);
+                            }
+                        }
+                    } else {
+                        mark_used(*phys, &mut used_gp, &mut used_fp);
+                    }
+                }
+            }
+            for (_, phys) in &sorted_assignments {
+                match phys {
+                    PhysReg::Gp(n) | PhysReg::Gp32(n) => {
+                        if !used_gp.contains(n) && !gp_temps.contains(n) {
+                            gp_temps.push(*n);
+                        }
+                    }
+                    PhysReg::Fp(n) | PhysReg::Fp32(n) => {
+                        if !used_fp.contains(n) && !fp_temps.contains(n) {
+                            fp_temps.push(*n);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // post_phys registers from split records are also
+            // candidates for temp use when *they're* not in use.
+            for r in &result.split_records {
+                if let PostHalf::Allocated(p) = r.post {
+                    let in_use = match p {
+                        PhysReg::Gp(n) | PhysReg::Gp32(n) => used_gp.contains(&n),
+                        PhysReg::Fp(n) | PhysReg::Fp32(n) => used_fp.contains(&n),
+                        _ => true,
+                    };
+                    if !in_use {
+                        match p {
+                            PhysReg::Gp(n) | PhysReg::Gp32(n) => {
+                                if !gp_temps.contains(&n) {
+                                    gp_temps.push(n);
+                                }
+                            }
+                            PhysReg::Fp(n) | PhysReg::Fp32(n) => {
+                                if !fp_temps.contains(&n) {
+                                    fp_temps.push(n);
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -327,13 +668,16 @@ pub fn apply_allocation(
                 }
             }
 
-            // For spilled vregs used as inputs: borrow a temp register.
+            // For spilled (or post-spilled-after-split) vreg uses:
+            // borrow a temp register and load from the slot.
             let mut loads = Vec::new();
             let mut gp_temp_idx = 0usize;
             let mut fp_temp_idx = 0usize;
             for (i, op) in inst.operands.iter().enumerate() {
                 if let MachineOperand::VReg(vid) = op {
-                    if let Some(&offset) = result.spills.get(vid) {
+                    if let Some(LogicalAssignment::Slot(offset)) =
+                        logical_assignment(*vid, cur_pos)
+                    {
                         let class = vreg_classes.get(vid).copied().unwrap_or(RegClass::Gp64);
                         let (temp_reg, load_op) =
                             if matches!(class, RegClass::Fp32 | RegClass::Fp64) {
@@ -371,7 +715,12 @@ pub fn apply_allocation(
                     && inst
                         .def
                         .as_ref()
-                        .map(|d| result.spills.contains_key(d))
+                        .map(|d| {
+                            matches!(
+                                logical_assignment(*d, cur_pos),
+                                Some(LogicalAssignment::Slot(_))
+                            )
+                        })
                         .unwrap_or(false)
                 {
                     continue;
@@ -388,11 +737,15 @@ pub fn apply_allocation(
                 rewritten.operands[*op_idx] = MachineOperand::PhysReg(*scratch);
             }
 
-            // Rewrite assigned vregs to physical registers.
+            // Rewrite assigned vregs to physical registers using
+            // the position-aware lookup so split vregs pick up the
+            // correct half.
             for op in &mut rewritten.operands {
                 if let MachineOperand::VReg(vid) = op {
-                    if let Some(phys) = result.assignments.get(vid) {
-                        *op = MachineOperand::PhysReg(*phys);
+                    if let Some(LogicalAssignment::Reg(phys)) =
+                        logical_assignment(*vid, cur_pos)
+                    {
+                        *op = MachineOperand::PhysReg(phys);
                     }
                 }
             }
@@ -400,7 +753,9 @@ pub fn apply_allocation(
             // Handle def — use a temp that doesn't alias any input temp.
             let def_temp_idx = gp_temp_idx.max(fp_temp_idx);
             let def_spill = if let Some(def_vid) = &inst.def {
-                if let Some(&offset) = result.spills.get(def_vid) {
+                if let Some(LogicalAssignment::Slot(offset)) =
+                    logical_assignment(*def_vid, cur_pos)
+                {
                     let class = vreg_classes.get(def_vid).copied().unwrap_or(RegClass::Gp64);
                     let temp_reg = if matches!(class, RegClass::Fp32 | RegClass::Fp64) {
                         let r = fp_temps
@@ -438,7 +793,21 @@ pub fn apply_allocation(
                 None
             };
 
-            rewritten.def = None;
+            // Bridge instructions for live-range splits are
+            // emitted by `insert_split_bridges`, which runs *after*
+            // `parallelize_call_arg_moves` so the canonical
+            // arg-setup mov sequence isn't fragmented by an
+            // interposed store and the parallel-copy resolver can
+            // see all the arg-setup movs as one block.
+            //
+            // Keep `def` populated even though operands are now all
+            // PhysReg: `parallelize_call_arg_moves` consults it to
+            // distinguish *arg-setup* movs (`def == None`) from
+            // *vreg-defining* movs that just happen to have arg-reg
+            // physregs after allocation. The two have different
+            // semantics — arg-setups read source registers in
+            // parallel-copy fashion, while vreg-defining movs feed
+            // their result into a later read sequentially.
             new_insts.push(rewritten);
 
             // Store after def for spilled vregs.
@@ -619,6 +988,82 @@ pub fn coalesce_moves(mf: &mut MachineFunction) {
             }
             true
         });
+    }
+}
+
+/// Emit the str/ldr pairs that bridge live-range splits across
+/// each call boundary. Runs *after* `parallelize_call_arg_moves`
+/// so the parallel-copy resolver sees an unfragmented arg-setup
+/// sequence (an interposed `str` between an arg-copy and the BL
+/// would otherwise stop the scan-back at the wrong point and the
+/// resolver would miss arg-copies that need cycle-breaking).
+///
+/// For each `SplitRecord` whose `call_position` equals the
+/// position of a `Bl`/`Blr` in the function: insert a `str
+/// pre_phys, [fp, bridge_slot]` immediately before the call and,
+/// if the post-half got its own register, an `ldr post_phys, [fp,
+/// bridge_slot]` immediately after.  Spilled post-halves rely on
+/// the existing per-use spill-load path, which already loads from
+/// `bridge_slot` thanks to `apply_allocation`'s position-aware
+/// operand rewrite.
+pub fn insert_split_bridges(mf: &mut MachineFunction, splits: &[SplitRecord]) {
+    if splits.is_empty() {
+        return;
+    }
+    let mut call_seen: u32 = 0;
+    for block_idx in 0..mf.blocks.len() {
+        let mut new_insts = Vec::with_capacity(mf.blocks[block_idx].insts.len());
+        let original = std::mem::take(&mut mf.blocks[block_idx].insts);
+        for inst in original.into_iter() {
+            let is_call = matches!(inst.opcode, ArmOpcode::Bl | ArmOpcode::Blr);
+            if is_call {
+                let idx = call_seen;
+                for r in splits {
+                    if r.call_index != idx {
+                        continue;
+                    }
+                    let store_op = match r.pre_phys {
+                        PhysReg::Fp(_) | PhysReg::Fp32(_) => ArmOpcode::StrFpImm,
+                        _ => ArmOpcode::StrImm,
+                    };
+                    new_insts.push(MachineInst {
+                        opcode: store_op,
+                        operands: vec![
+                            MachineOperand::PhysReg(r.pre_phys),
+                            MachineOperand::PhysReg(PhysReg::FP),
+                            MachineOperand::Imm(r.bridge_slot as i64),
+                        ],
+                        def: None,
+                    });
+                }
+            }
+            new_insts.push(inst);
+            if is_call {
+                let idx = call_seen;
+                for r in splits {
+                    if r.call_index != idx {
+                        continue;
+                    }
+                    if let PostHalf::Allocated(p) = r.post {
+                        let load_op = match p {
+                            PhysReg::Fp(_) | PhysReg::Fp32(_) => ArmOpcode::LdrFpImm,
+                            _ => ArmOpcode::LdrImm,
+                        };
+                        new_insts.push(MachineInst {
+                            opcode: load_op,
+                            operands: vec![
+                                MachineOperand::PhysReg(p),
+                                MachineOperand::PhysReg(PhysReg::FP),
+                                MachineOperand::Imm(r.bridge_slot as i64),
+                            ],
+                            def: None,
+                        });
+                    }
+                }
+                call_seen += 1;
+            }
+        }
+        mf.blocks[block_idx].insts = new_insts;
     }
 }
 
@@ -820,7 +1265,16 @@ fn blr_target_scratch(target: PhysReg) -> PhysReg {
 // ---- Helpers ----
 
 fn is_call_arg_copy(inst: &MachineInst) -> bool {
-    matches!(inst.opcode, ArmOpcode::MovReg | ArmOpcode::FmovReg)
+    // `def == None` is the load-bearing signal: arg-setup movs are
+    // emitted by isel as `mov PhysReg(arg_reg), VReg(value)` (no
+    // vreg defined, just a physreg write), while vreg-defining movs
+    // (e.g. `mov VReg(v), PhysReg(x0)` to capture a return value)
+    // have `def == Some(_)`. After allocation both look like
+    // `mov PhysReg, PhysReg`, but they have different semantics:
+    // arg-setup movs participate in parallel-copy resolution; vreg
+    // movs feed their result sequentially into a later read.
+    inst.def.is_none()
+        && matches!(inst.opcode, ArmOpcode::MovReg | ArmOpcode::FmovReg)
         && matches!(
             inst.operands.as_slice(),
             [MachineOperand::PhysReg(dst), MachineOperand::PhysReg(src)]
@@ -1386,5 +1840,63 @@ mod tests {
             blr.operands,
             vec![MachineOperand::PhysReg(PhysReg::Gp(10))]
         );
+    }
+
+    #[test]
+    fn linear_scan_splits_call_crossing_when_callee_saved_exhausted() {
+        // 12 vregs all live across a single BL forces the
+        // allocator past the 10-deep callee-saved pool. Without
+        // splitting the overflow vregs full-spill; with splitting
+        // they go pre-call→caller-saved → str/ldr-bridge →
+        // post-call→caller-saved (so each split is two halves on
+        // caller-saved registers, no whole-range memory traffic).
+        let mut mf = MachineFunction::new("test".into());
+        let vs: Vec<VRegId> = (0..12).map(|_| mf.new_vreg(RegClass::Gp64)).collect();
+        for (i, &v) in vs.iter().enumerate() {
+            mf.blocks[0].insts.push(MachineInst {
+                opcode: ArmOpcode::Movz,
+                operands: vec![MachineOperand::VReg(v), MachineOperand::Imm(i as i64 + 1)],
+                def: Some(v),
+            });
+        }
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::Bl,
+            operands: vec![MachineOperand::Extern("_foo".into())],
+            def: None,
+        });
+        for &v in &vs {
+            mf.blocks[0].insts.push(MachineInst {
+                opcode: ArmOpcode::MovReg,
+                operands: vec![
+                    MachineOperand::PhysReg(PhysReg::Gp(0)),
+                    MachineOperand::VReg(v),
+                ],
+                def: None,
+            });
+        }
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::Ret,
+            operands: vec![],
+            def: None,
+        });
+        let result = linear_scan(&mut mf);
+        assert!(
+            !result.split_records.is_empty(),
+            "expected splits when 12 call-crossing vregs collide with the 10-deep callee-saved pool"
+        );
+        for r in &result.split_records {
+            // pre-half must be on a caller-saved register; that's
+            // the entire point of splitting (the callee-saved tier
+            // is exhausted at split time).
+            if let PhysReg::Gp(n) | PhysReg::Gp32(n) = r.pre_phys {
+                assert!(
+                    !GP_CALLEE_SAVED.contains(&n),
+                    "split pre_phys should be caller-saved, got x{}",
+                    n
+                );
+            }
+            // bridge_slot must be a real frame offset.
+            assert!(r.bridge_slot < 0, "bridge_slot should be FP-negative");
+        }
     }
 }
