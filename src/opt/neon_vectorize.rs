@@ -1299,14 +1299,6 @@ fn detect_reduction_plan(
         return None;
     }
 
-    // Scalar tail for reduction loops is wired only for Sum (the
-    // peel walks the body snapshot and chains the iadd/fadd via
-    // running scalar acc). Min/Max would also need the cmp+select
-    // pattern in the snapshot — leave that for a follow-up.
-    if tail_count > 0 && !matches!(reduce, ReductionKind::Sum) {
-        return None;
-    }
-
     // The accumulate_inst result must not be used inside the loop
     // (other than as the body terminator's arg). All in-loop uses
     // would conflict with our vector rewrite.
