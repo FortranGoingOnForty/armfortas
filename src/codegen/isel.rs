@@ -546,6 +546,7 @@ fn select_call_inst(
         let (src_reg, opcode) = match class {
             RegClass::Fp64 => (PhysReg::Fp(0), ArmOpcode::FmovReg),
             RegClass::Fp32 => (PhysReg::Fp32(0), ArmOpcode::FmovReg),
+            RegClass::V128 => (PhysReg::Fp(0), ArmOpcode::FmovReg),
             RegClass::Gp32 => (PhysReg::Gp32(0), ArmOpcode::MovReg),
             RegClass::Gp64 => (PhysReg::Gp(0), ArmOpcode::MovReg),
         };
@@ -927,6 +928,14 @@ fn select_inst(
                         ],
                         def: Some(dest),
                     });
+                }
+                RegClass::V128 => {
+                    // Sprint 12 Stage 1 reserves the type/instr; no
+                    // path produces a V128 Undef yet. Bail rather
+                    // than emit a half-baked NEON zero — when the
+                    // vectorizer arrives it will have its own
+                    // VBroadcast(const 0) lowering.
+                    unreachable!("V128 Undef emission not implemented (Sprint 12 Stage 4 work)");
                 }
             }
         }
@@ -2059,7 +2068,7 @@ fn emit_branch_arg_copies(
     // Helper to choose the right move opcode for a vreg's class.
     fn move_opcode_for(class: RegClass) -> ArmOpcode {
         match class {
-            RegClass::Fp64 | RegClass::Fp32 => ArmOpcode::FmovReg,
+            RegClass::Fp64 | RegClass::Fp32 | RegClass::V128 => ArmOpcode::FmovReg,
             RegClass::Gp64 | RegClass::Gp32 => ArmOpcode::MovReg,
         }
     }
@@ -2571,6 +2580,7 @@ fn load_opcode_for(ty: &IrType, class: RegClass) -> ArmOpcode {
         IrType::Float(_) => ArmOpcode::LdrFpImm,
         _ => match class {
             RegClass::Fp64 | RegClass::Fp32 => ArmOpcode::LdrFpImm,
+            RegClass::V128 => ArmOpcode::LdrQ,
             RegClass::Gp32 | RegClass::Gp64 => ArmOpcode::LdrImm,
         },
     }
@@ -2590,6 +2600,7 @@ fn store_opcode_for(ty: Option<&IrType>, class: RegClass) -> ArmOpcode {
         Some(IrType::Float(_)) => ArmOpcode::StrFpImm,
         _ => match class {
             RegClass::Fp64 | RegClass::Fp32 => ArmOpcode::StrFpImm,
+            RegClass::V128 => ArmOpcode::StrQ,
             RegClass::Gp32 | RegClass::Gp64 => ArmOpcode::StrImm,
         },
     }

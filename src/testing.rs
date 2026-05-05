@@ -752,6 +752,7 @@ fn format_reg_class(class: RegClass) -> &'static str {
         RegClass::Gp32 => "gp32",
         RegClass::Fp64 => "fp64",
         RegClass::Fp32 => "fp32",
+        RegClass::V128 => "v128",
     }
 }
 

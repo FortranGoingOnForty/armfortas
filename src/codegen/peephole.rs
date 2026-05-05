@@ -805,6 +805,7 @@ fn class_byte_width(c: RegClass) -> u32 {
     match c {
         RegClass::Gp32 | RegClass::Fp32 => 4,
         RegClass::Gp64 | RegClass::Fp64 => 8,
+        RegClass::V128 => 16,
     }
 }
 
