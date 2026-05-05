@@ -971,6 +971,7 @@ fn detect_reduction_plan(
             let cmp_inst = defs.get(c)?;
             let (cmp_op, cmp_a, cmp_b) = match cmp_inst.kind {
                 InstKind::ICmp(op, a, b) => (op, a, b),
+                InstKind::FCmp(op, a, b) => (op, a, b),
                 _ => return None,
             };
             // Identify which side of the icmp / select is the acc
@@ -1112,10 +1113,17 @@ fn detect_reduction_plan(
     if acc_extra_uses != 0 {
         return None;
     }
-    // Min/Max codegen is wired only for i32 (4xi32 → s_tmp via
-    // smaxv/sminv). Restrict accordingly.
+    // Min/Max codegen is wired for i32 (smaxv/sminv.4s + umov.s),
+    // f32 (fmaxv/fminv.4s direct to scalar fp reg), and f64 (no
+    // fmaxv.2d on NEON; fmaxp/fminp.2d gives the across-lane reduce
+    // for the two f64 lanes).
     if !matches!(reduce, ReductionKind::Sum)
-        && !matches!(elem_ty, IrType::Int(IntWidth::I32))
+        && !matches!(
+            elem_ty,
+            IrType::Int(IntWidth::I32)
+                | IrType::Float(FloatWidth::F32)
+                | IrType::Float(FloatWidth::F64)
+        )
     {
         return None;
     }
