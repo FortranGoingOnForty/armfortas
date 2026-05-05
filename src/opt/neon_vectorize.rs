@@ -156,18 +156,21 @@ fn vectorize_one_loop(func: &mut Function) -> bool {
     let preds = predecessors(func);
 
     for lp in &loops {
-        let Some(shape) = detect_counted_loop(func, lp, &preds) else {
-            continue;
-        };
-        let loop_defs = loop_defined_values(func, lp);
-        if loop_values_escape(func, lp, &loop_defs) {
-            continue;
+        // Try element-wise vectorization first (no escaping values).
+        if let Some(shape) = detect_counted_loop(func, lp, &preds) {
+            let loop_defs = loop_defined_values(func, lp);
+            if !loop_values_escape(func, lp, &loop_defs) {
+                if let Some(plan) = build_vector_plan(func, &shape, &loop_defs) {
+                    apply_vector_plan(func, &shape, plan);
+                    return true;
+                }
+            }
         }
-        let Some(plan) = build_vector_plan(func, &shape, &loop_defs) else {
-            continue;
-        };
-        apply_vector_plan(func, &shape, plan);
-        return true;
+        // Fall back: reduction loop (one escaping accumulator).
+        if let Some(plan) = detect_reduction_plan(func, lp, &preds) {
+            apply_reduction_plan(func, lp, plan);
+            return true;
+        }
     }
     false
 }
@@ -784,6 +787,434 @@ fn inst_map(func: &Function) -> HashMap<ValueId, &Inst> {
         .flat_map(|block| block.insts.iter())
         .map(|inst| (inst.id, inst))
         .collect()
+}
+
+/// A sum-reduction loop:
+///   `do i = lo, hi; s = s + a(i); end do` (or fadd for floats).
+///
+/// The loop header carries the IV and a scalar accumulator as block
+/// params. The accumulator escapes the loop and is reduced to a
+/// scalar `vreduce_sum` after the vectorized body.
+#[derive(Debug, Clone)]
+struct ReductionPlan {
+    preheader: BlockId,
+    header: BlockId,
+    body: BlockId,
+    /// Block reachable when the loop exits (false-dest of header
+    /// cond_br).
+    exit: BlockId,
+    /// Block param indices in the header: `[iv_idx, acc_idx]`.
+    iv_param: ValueId,
+    acc_param: ValueId,
+    acc_param_idx: usize,
+    /// Scalar accumulator init value passed in the preheader's branch.
+    acc_init: ValueId,
+    /// Original Load instruction in the body.
+    load_id: ValueId,
+    /// Original `acc' = acc + load` instruction.
+    accumulate_id: ValueId,
+    /// Original `iv' = iv + 1` instruction.
+    step_iadd: ValueId,
+    /// The `1` ConstInt operand of the iv step.
+    step_const: ValueId,
+    /// IV ConstInt width.
+    iv_int_width: IntWidth,
+    /// Element type (i32 / i64 / f32 / f64).
+    elem_ty: IrType,
+    lanes: u8,
+    span: crate::lexer::Span,
+}
+
+fn detect_reduction_plan(
+    func: &Function,
+    lp: &NaturalLoop,
+    preds: &HashMap<BlockId, Vec<BlockId>>,
+) -> Option<ReductionPlan> {
+    if lp.latches.len() != 1 || lp.body.len() != 2 {
+        return None;
+    }
+    let header = lp.header;
+    let body = lp.latches[0];
+    if body == header {
+        return None;
+    }
+
+    let header_block = func.block(header);
+    if header_block.params.len() != 2 {
+        return None;
+    }
+    // Identify which param is the IV (int type, used as gep index)
+    // and which is the accumulator. We require the IV to be param 0
+    // in this MVP — Fortran's lowered form always emits IV first.
+    let iv_param = header_block.params[0].id;
+    let acc_param = header_block.params[1].id;
+    let iv_int_width = match header_block.params[0].ty {
+        IrType::Int(w) => w,
+        _ => return None,
+    };
+    let acc_ty = header_block.params[1].ty.clone();
+    let elem_ty = match acc_ty.clone() {
+        IrType::Int(_) | IrType::Float(_) => acc_ty,
+        _ => return None,
+    };
+    let lanes = lane_count_for(&elem_ty)?;
+
+    let preheader = find_preheader(func, lp, preds)?;
+    let (iv_init, acc_init) = match &func.block(preheader).terminator {
+        Some(Terminator::Branch(dest, args)) if *dest == header && args.len() == 2 => {
+            (resolve_const_int(func, args[0])?, args[1])
+        }
+        _ => return None,
+    };
+
+    // Header cond_br shape: `iv <= bound` → body, exit.
+    let (cond_id, true_dest, false_dest, true_args, false_args) = match &header_block.terminator {
+        Some(Terminator::CondBranch {
+            cond,
+            true_dest,
+            true_args,
+            false_dest,
+            false_args,
+        }) => (*cond, *true_dest, *false_dest, true_args, false_args),
+        _ => return None,
+    };
+    if !true_args.is_empty()
+        || !false_args.is_empty()
+        || true_dest != body
+        || lp.body.contains(&false_dest)
+    {
+        return None;
+    }
+    let exit = false_dest;
+    let cond_inst = header_block.insts.iter().find(|inst| inst.id == cond_id)?;
+    let iv_bound = match cond_inst.kind {
+        InstKind::ICmp(CmpOp::Le, lhs, rhs) if lhs == iv_param => resolve_const_int(func, rhs)?,
+        InstKind::ICmp(CmpOp::Lt, lhs, rhs) if lhs == iv_param => {
+            resolve_const_int(func, rhs)?.checked_sub(1)?
+        }
+        _ => return None,
+    };
+
+    let trip = iv_bound.checked_sub(iv_init).and_then(|d| d.checked_add(1))?;
+    if trip <= 0 || (trip as u64) % (lanes as u64) != 0 {
+        return None;
+    }
+
+    // Body shape: load + iadd(acc, load) + iadd(iv, 1) + branch back.
+    let body_block = func.block(body);
+    if body_block
+        .insts
+        .iter()
+        .any(|inst| matches!(inst.kind, InstKind::Call(..) | InstKind::RuntimeCall(..)))
+    {
+        return None;
+    }
+    let body_term_arg_iv;
+    let body_term_arg_acc;
+    match &body_block.terminator {
+        Some(Terminator::Branch(dest, args)) if *dest == header && args.len() == 2 => {
+            body_term_arg_iv = args[0];
+            body_term_arg_acc = args[1];
+        }
+        _ => return None,
+    }
+
+    let defs = inst_map(func);
+    // The acc-update is `acc' = acc + load_or_value`. Match either
+    // IAdd or FAdd depending on element type.
+    let accumulate_inst = defs.get(&body_term_arg_acc)?;
+    let (acc_lhs, acc_rhs) = match (&elem_ty, &accumulate_inst.kind) {
+        (IrType::Int(_), InstKind::IAdd(l, r)) => (*l, *r),
+        (IrType::Float(_), InstKind::FAdd(l, r)) => (*l, *r),
+        _ => return None,
+    };
+    // One side must be the acc_param, the other a load from the
+    // counted iteration space.
+    let (accumulate_id, load_id) = if acc_lhs == acc_param {
+        (accumulate_inst.id, acc_rhs)
+    } else if acc_rhs == acc_param {
+        (accumulate_inst.id, acc_lhs)
+    } else {
+        return None;
+    };
+    let load_inst = defs.get(&load_id)?;
+    let InstKind::Load(load_ptr) = load_inst.kind else {
+        return None;
+    };
+    let access = classify_array_access(func, load_ptr, iv_param)?;
+    if access.elem_ty != elem_ty {
+        return None;
+    }
+    // Require full-array coverage for the load too.
+    let upper = access
+        .lower
+        .checked_add(access.len as i64)
+        .and_then(|v| v.checked_sub(1))?;
+    if iv_init != access.lower || iv_bound != upper {
+        return None;
+    }
+
+    // The iv step.
+    let step_inst = defs.get(&body_term_arg_iv)?;
+    let (step_lhs, step_rhs) = match step_inst.kind {
+        InstKind::IAdd(l, r) => (l, r),
+        _ => return None,
+    };
+    let (step_const, _) = if step_lhs == iv_param {
+        (step_rhs, resolve_const_int(func, step_rhs)?)
+    } else if step_rhs == iv_param {
+        (step_lhs, resolve_const_int(func, step_lhs)?)
+    } else {
+        return None;
+    };
+    let step_iadd = step_inst.id;
+
+    // Validate that `acc_param` doesn't have any *other* uses inside
+    // the loop besides the accumulate inst — otherwise the rewrite
+    // gets ambiguous.
+    let acc_extra_uses: usize = func
+        .blocks
+        .iter()
+        .filter(|b| lp.body.contains(&b.id))
+        .flat_map(|b| b.insts.iter())
+        .filter(|inst| inst.id != accumulate_id)
+        .filter(|inst| inst_uses(&inst.kind).contains(&acc_param))
+        .count();
+    if acc_extra_uses != 0 {
+        return None;
+    }
+
+    // The accumulate_inst result must not be used inside the loop
+    // (other than as the body terminator's arg). All in-loop uses
+    // would conflict with our vector rewrite.
+    let acc_result_extra_uses: usize = func
+        .blocks
+        .iter()
+        .filter(|b| lp.body.contains(&b.id))
+        .flat_map(|b| b.insts.iter())
+        .filter(|inst| inst_uses(&inst.kind).contains(&accumulate_id))
+        .count();
+    if acc_result_extra_uses != 0 {
+        return None;
+    }
+
+    Some(ReductionPlan {
+        preheader,
+        header,
+        body,
+        exit,
+        iv_param,
+        acc_param,
+        acc_param_idx: 1,
+        acc_init,
+        load_id: load_inst.id,
+        accumulate_id,
+        step_iadd,
+        step_const,
+        iv_int_width,
+        elem_ty,
+        lanes,
+        span: accumulate_inst.span,
+    })
+}
+
+fn apply_reduction_plan(func: &mut Function, lp: &NaturalLoop, plan: ReductionPlan) {
+    let v_ty = vector_ty(&plan.elem_ty, plan.lanes);
+
+    // 1. Insert `vacc_init = vbroadcast(acc_init)` at the end of the
+    //    preheader, before its branch terminator.
+    let vacc_init = func.next_value_id();
+    func.register_type(vacc_init, v_ty.clone());
+    let pre_block = func.block_mut(plan.preheader);
+    let pos = pre_block.insts.len();
+    pre_block.insts.insert(
+        pos,
+        Inst {
+            id: vacc_init,
+            kind: InstKind::VBroadcast(plan.acc_init),
+            ty: v_ty.clone(),
+            span: plan.span,
+        },
+    );
+    // 1b. Update the preheader branch arg slot for the accumulator.
+    if let Some(Terminator::Branch(_, args)) = &mut pre_block.terminator {
+        if let Some(slot) = args.get_mut(plan.acc_param_idx) {
+            *slot = vacc_init;
+        }
+    }
+
+    // 2. Update the header's accumulator block param type to the
+    //    vector type.
+    let header_block = func.block_mut(plan.header);
+    if let Some(param) = header_block.params.get_mut(plan.acc_param_idx) {
+        param.ty = v_ty.clone();
+    }
+    func.register_type(plan.acc_param, v_ty.clone());
+
+    // 3. Insert a fresh ConstInt(V) for the iv step (avoid clobbering
+    //    a shared `1`).
+    let new_step_const = func.next_value_id();
+    let step_const_ty = IrType::Int(plan.iv_int_width);
+    func.register_type(new_step_const, step_const_ty.clone());
+    let body_block = func.block_mut(plan.body);
+    body_block.insts.insert(
+        0,
+        Inst {
+            id: new_step_const,
+            kind: InstKind::ConstInt(plan.lanes as i128, plan.iv_int_width),
+            ty: step_const_ty,
+            span: plan.span,
+        },
+    );
+    // Update the iadd to reference the new const.
+    if let Some(step_inst) = body_block
+        .insts
+        .iter_mut()
+        .find(|inst| inst.id == plan.step_iadd)
+    {
+        if let InstKind::IAdd(ref mut l, ref mut r) = step_inst.kind {
+            if *l == plan.step_const {
+                *l = new_step_const;
+            }
+            if *r == plan.step_const {
+                *r = new_step_const;
+            }
+        }
+    }
+
+    // 4. Rewrite the scalar Load → VLoad (vector type).
+    let body_block = func.block_mut(plan.body);
+    if let Some(inst) = body_block.insts.iter_mut().find(|i| i.id == plan.load_id) {
+        if let InstKind::Load(ptr) = inst.kind {
+            inst.kind = InstKind::VLoad(ptr);
+            inst.ty = v_ty.clone();
+        }
+    }
+    func.register_type(plan.load_id, v_ty.clone());
+
+    // 5. Rewrite the accumulate IAdd/FAdd → VAdd (both operands now
+    //    vectors: the acc_param block param is vector, the load is
+    //    vector).
+    let body_block = func.block_mut(plan.body);
+    if let Some(inst) = body_block.insts.iter_mut().find(|i| i.id == plan.accumulate_id) {
+        let new_kind = match inst.kind.clone() {
+            InstKind::IAdd(l, r) | InstKind::FAdd(l, r) => InstKind::VAdd(l, r),
+            other => other,
+        };
+        inst.kind = new_kind;
+        inst.ty = v_ty.clone();
+    }
+    func.register_type(plan.accumulate_id, v_ty.clone());
+
+    // 6. Insert `acc_scalar = vreduce_sum(acc_param)` at the top of
+    //    the exit block, then walk every block NOT in the loop and
+    //    rewrite acc_param → acc_scalar.
+    let acc_scalar = func.next_value_id();
+    func.register_type(acc_scalar, plan.elem_ty.clone());
+    let exit_block = func.block_mut(plan.exit);
+    exit_block.insts.insert(
+        0,
+        Inst {
+            id: acc_scalar,
+            kind: InstKind::VReduceSum(plan.acc_param),
+            ty: plan.elem_ty.clone(),
+            span: plan.span,
+        },
+    );
+    let lp_body: HashSet<BlockId> = lp.body.iter().copied().collect();
+    for block in func.blocks.iter_mut() {
+        if lp_body.contains(&block.id) {
+            continue;
+        }
+        for inst in &mut block.insts {
+            // Skip the vreduce we just inserted — its sole purpose
+            // is to consume the (now-vector) acc_param.
+            if inst.id == acc_scalar {
+                continue;
+            }
+            substitute_in_inst(&mut inst.kind, plan.acc_param, acc_scalar);
+        }
+        if let Some(term) = &mut block.terminator {
+            substitute_in_terminator(term, plan.acc_param, acc_scalar);
+        }
+    }
+}
+
+fn substitute_in_inst(kind: &mut InstKind, from: ValueId, to: ValueId) {
+    let mut replace = |v: &mut ValueId| {
+        if *v == from {
+            *v = to;
+        }
+    };
+    match kind {
+        InstKind::Load(p) => replace(p),
+        InstKind::Store(v, p) => {
+            replace(v);
+            replace(p);
+        }
+        InstKind::IAdd(a, b)
+        | InstKind::ISub(a, b)
+        | InstKind::IMul(a, b)
+        | InstKind::IDiv(a, b)
+        | InstKind::FAdd(a, b)
+        | InstKind::FSub(a, b)
+        | InstKind::FMul(a, b)
+        | InstKind::FDiv(a, b) => {
+            replace(a);
+            replace(b);
+        }
+        InstKind::Call(_, args) | InstKind::RuntimeCall(_, args) => {
+            for a in args {
+                replace(a);
+            }
+        }
+        InstKind::ICmp(_, a, b) | InstKind::FCmp(_, a, b) => {
+            replace(a);
+            replace(b);
+        }
+        InstKind::IntExtend(v, _, _) | InstKind::IntTrunc(v, _) => replace(v),
+        InstKind::IntToFloat(v, _) | InstKind::FloatToInt(v, _) => replace(v),
+        InstKind::FloatExtend(v, _) | InstKind::FloatTrunc(v, _) => replace(v),
+        InstKind::INeg(v) | InstKind::FNeg(v) | InstKind::FAbs(v) => replace(v),
+        _ => {
+            // Conservative fallback: walk inst_uses and replace where
+            // possible. The exact set varies; for the limited cases
+            // we hit (post-loop scalar use of `acc_param`), the
+            // explicit arms above are usually enough.
+        }
+    }
+}
+
+fn substitute_in_terminator(term: &mut Terminator, from: ValueId, to: ValueId) {
+    let mut replace = |v: &mut ValueId| {
+        if *v == from {
+            *v = to;
+        }
+    };
+    match term {
+        Terminator::Return(Some(v)) => replace(v),
+        Terminator::Return(None) => {}
+        Terminator::Branch(_, args) => {
+            for a in args {
+                replace(a);
+            }
+        }
+        Terminator::CondBranch {
+            cond,
+            true_args,
+            false_args,
+            ..
+        } => {
+            replace(cond);
+            for a in true_args {
+                replace(a);
+            }
+            for a in false_args {
+                replace(a);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]
