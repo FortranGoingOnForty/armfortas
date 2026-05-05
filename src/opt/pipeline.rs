@@ -25,6 +25,7 @@ use super::jump_thread::JumpThread;
 use super::licm::Licm;
 use super::lsf::LocalLsf;
 use super::mem2reg::Mem2Reg;
+use super::neon_vectorize::NeonVectorize;
 use super::pass::PassManager;
 use super::peel::LoopPeel;
 use super::preheader::PreheaderInsert;
@@ -239,6 +240,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(LoopInterchange));
             pm.add(Box::new(LoopFission));
             pm.add(Box::new(LoopFusion));
+            pm.add(Box::new(NeonVectorize));
             pm.add(Box::new(Vectorize));
             pm.add(Box::new(LoopUnroll));
             pm.add(Box::new(Gvn)); // keep O3/Ofast aligned with O2/Os value numbering
@@ -273,6 +275,7 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(LoopInterchange));
             pm.add(Box::new(LoopFission));
             pm.add(Box::new(LoopFusion));
+            pm.add(Box::new(NeonVectorize));
             pm.add(Box::new(Vectorize));
             pm.add(Box::new(LoopUnroll));
             pm.add(Box::new(FastMathReassoc));
