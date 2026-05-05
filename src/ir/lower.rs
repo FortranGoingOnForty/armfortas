@@ -1038,6 +1038,57 @@ fn function_hidden_result_abi(
     HiddenResultAbi::None
 }
 
+/// Resolve the complex kind (4 → sp, 8 → dp) for a function whose
+/// result is routed through `HiddenResultAbi::ComplexBuffer`. Reads the
+/// result variable's explicit declaration first (covers the `result(r)`
+/// + `complex(dp) :: r` shape that submodule procedures use), falling
+/// back to the function's return-type prefix when no explicit declaration
+/// is present. Without this, a body `complex(dp) :: p` declaration with
+/// no return-type prefix silently defaulted to kind=4, sizing the hidden
+/// buffer at 8 bytes and typing the IR pointer as `Ptr<[F32 x 2]>` —
+/// generic dispatch then rejected every `complex(dp)` formal because
+/// the result variable was misclassified as complex(sp).
+fn complex_result_kind(
+    function_name: &str,
+    result: &Option<String>,
+    return_type: Option<&TypeSpec>,
+    decls: &[crate::ast::decl::SpannedDecl],
+    st: &SymbolTable,
+) -> u8 {
+    let result_key = result
+        .as_deref()
+        .unwrap_or(function_name)
+        .to_ascii_lowercase();
+    for decl in decls {
+        let Decl::TypeDecl {
+            type_spec,
+            entities,
+            ..
+        } = &decl.node
+        else {
+            continue;
+        };
+        let matches_result = entities
+            .iter()
+            .any(|e| e.name.to_ascii_lowercase() == result_key);
+        if !matches_result {
+            continue;
+        }
+        match type_spec {
+            TypeSpec::Complex(sel) => {
+                return extract_kind_with_context(sel, 4, None, Some(st));
+            }
+            TypeSpec::DoubleComplex => return 8,
+            _ => {}
+        }
+    }
+    match return_type {
+        Some(TypeSpec::Complex(sel)) => extract_kind_with_context(sel, 4, None, Some(st)),
+        Some(TypeSpec::DoubleComplex) => 8,
+        _ => 4,
+    }
+}
+
 /// Walk a program unit and any nested `contains` to collect the
 /// names of functions whose result variable is lowered through the
 /// 384-byte array descriptor hidden-result ABI. Scalar character
@@ -4599,14 +4650,8 @@ fn lower_unit(
                     }
                     HiddenResultAbi::ComplexBuffer => {
                         // 8 bytes for complex(sp), 16 for complex(dp).
-                        match return_type {
-                            Some(TypeSpec::Complex(sel)) => {
-                                let kind = extract_kind_with_context(sel, 4, None, Some(st));
-                                if kind == 8 { 16 } else { 8 }
-                            }
-                            Some(TypeSpec::DoubleComplex) => 16,
-                            _ => 8,
-                        }
+                        let kind = complex_result_kind(name, result, return_type.as_ref(), decls, st);
+                        if kind == 8 { 16 } else { 8 }
                     }
                     HiddenResultAbi::None => 0,
                 };
@@ -4620,17 +4665,8 @@ fn lower_unit(
                 // calls like `kahan_kernel(..., p, ...)` inside
                 // complex-returning module functions.
                 let desc_ptr_ty = if hidden_result_abi == HiddenResultAbi::ComplexBuffer {
-                    let fw = match return_type {
-                        Some(TypeSpec::Complex(sel)) => {
-                            if extract_kind_with_context(sel, 4, None, Some(st)) == 8 {
-                                FloatWidth::F64
-                            } else {
-                                FloatWidth::F32
-                            }
-                        }
-                        Some(TypeSpec::DoubleComplex) => FloatWidth::F64,
-                        _ => FloatWidth::F32,
-                    };
+                    let kind = complex_result_kind(name, result, return_type.as_ref(), decls, st);
+                    let fw = if kind == 8 { FloatWidth::F64 } else { FloatWidth::F32 };
                     IrType::Ptr(Box::new(IrType::Array(Box::new(IrType::Float(fw)), 2)))
                 } else {
                     IrType::Ptr(Box::new(IrType::Array(
@@ -5021,17 +5057,8 @@ fn lower_unit(
                     // complex-assign path that memcpys 8/16 bytes into the
                     // result variable's `addr` — pointing addr at the sret
                     // param routes the write straight into the caller's buf.
-                    let fw = match return_type {
-                        Some(TypeSpec::Complex(sel)) => {
-                            if extract_kind_with_context(sel, 4, None, Some(st)) == 8 {
-                                FloatWidth::F64
-                            } else {
-                                FloatWidth::F32
-                            }
-                        }
-                        Some(TypeSpec::DoubleComplex) => FloatWidth::F64,
-                        _ => FloatWidth::F32,
-                    };
+                    let kind = complex_result_kind(name, result, return_type.as_ref(), decls, st);
+                    let fw = if kind == 8 { FloatWidth::F64 } else { FloatWidth::F32 };
                     let cplx_ty =
                         IrType::Array(Box::new(IrType::Float(fw)), 2);
                     ctx.locals.insert(
