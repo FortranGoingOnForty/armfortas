@@ -11,6 +11,7 @@ use super::allocatable::{
     allocate_item_needs_explicit_shape, expr_selects_component, leaf_field_layout,
     validate_allocatable_item,
 };
+use super::pointer::validate_pointer_assignment;
 use super::pure_elemental::{
     check_pure_expr_calls, reject_pure_nonlocal_definition, validate_elemental_args,
     validate_pure_call,
@@ -1689,98 +1690,6 @@ fn validate_assignment_target(ctx: &mut Ctx, target: &crate::ast::expr::SpannedE
 }
 
 /// Validate pointer assignment: LHS must be pointer, RHS must be target/pointer.
-fn validate_pointer_assignment(
-    ctx: &mut Ctx,
-    target: &crate::ast::expr::SpannedExpr,
-    value: &crate::ast::expr::SpannedExpr,
-    span: Span,
-) {
-    // Component-access target (`p%ptr_field => x`): check the leaf
-    // component's attributes through the type-layout registry.  If
-    // layouts aren't available (older callers) or the chain can't be
-    // resolved, skip the check rather than flag the base variable.
-    if expr_selects_component(target) {
-        if let Some(leaf) = leaf_field_layout(ctx, target) {
-            if !leaf.field.pointer {
-                ctx.error(
-                    span,
-                    format!(
-                        "pointer assignment target component '{}' must have pointer attribute",
-                        leaf.field.name
-                    ),
-                );
-            }
-        }
-    } else if let Some(name) = extract_base_name(target) {
-        let is_pointer = ctx.lookup(&name).map(|s| s.attrs.pointer).unwrap_or(true);
-        if !is_pointer {
-            ctx.error(
-                span,
-                format!(
-                    "pointer assignment target '{}' must have pointer attribute",
-                    name
-                ),
-            );
-        }
-    }
-
-    // RHS must have target attribute or be a pointer (or null()/function call).
-    if expr_selects_component(value) {
-        // Look up the leaf component's attributes.  F2018 §8.5.14
-        // says a subobject of a TARGET base (or an allocated
-        // ALLOCATABLE) is itself a valid target, so accept when any
-        // ancestor on the path carries one of those attributes.
-        if let Some(leaf) = leaf_field_layout(ctx, value) {
-            let ok = leaf.field.pointer
-                || leaf.field.allocatable
-                || leaf.field.target
-                || leaf.ancestor_is_target
-                || leaf.ancestor_is_allocatable;
-            if !ok {
-                ctx.error(span, format!(
-                    "pointer assignment source component '{}' must have target or pointer attribute",
-                    leaf.field.name
-                ));
-            }
-        }
-        return;
-    }
-    if let Some(name) = extract_base_name(value) {
-        // Skip if the value is a function call — could be null() or pointer-valued function.
-        if matches!(value.node, Expr::FunctionCall { .. }) {
-            return;
-        }
-        // Dummy procedure arguments are valid RHS targets per F2003
-        // (their addresses are implicitly available). The generic
-        // target/pointer check below doesn't see the "dummy
-        // procedure" attribute directly; accept any Function/
-        // Subroutine symbol and any variable declared via
-        // `procedure(iface)` (parsed with Attribute::External).
-        if let Some(sym) = ctx.lookup(&name) {
-            use crate::sema::symtab::SymbolKind;
-            if matches!(sym.kind, SymbolKind::Function | SymbolKind::Subroutine) {
-                return;
-            }
-            if sym.attrs.external {
-                return;
-            }
-        }
-        let ok = ctx
-            .lookup(&name)
-            .map(|s| s.attrs.target || s.attrs.pointer)
-            .unwrap_or(true);
-        if !ok {
-            ctx.error(
-                span,
-                format!(
-                    "pointer assignment source '{}' must have target or pointer attribute",
-                    name
-                ),
-            );
-        }
-    }
-}
-
 /// Validate that an ALLOCATE/DEALLOCATE item is allocatable or pointer.
 ///
 /// For a component access like `pools(i)%tokens(n)`, the target is

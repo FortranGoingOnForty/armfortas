@@ -12,6 +12,7 @@
 
 mod allocatable;
 mod core;
+mod pointer;
 mod pure_elemental;
 
 pub use core::*;
