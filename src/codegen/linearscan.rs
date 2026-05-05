@@ -743,32 +743,48 @@ pub fn apply_allocation(
                         logical_assignment(*vid, cur_pos)
                     {
                         let class = vreg_classes.get(vid).copied().unwrap_or(RegClass::Gp64);
-                        let (temp_reg, load_op) =
-                            if matches!(class, RegClass::Fp32 | RegClass::Fp64) {
+                        let (temp_reg, load_op) = match class {
+                            RegClass::Fp32 => {
                                 let r = fp_temps
                                     .get(fp_temp_idx)
                                     .copied()
                                     .unwrap_or(FP_SPILL_SCRATCH[0]);
                                 fp_temp_idx += 1;
-                                let phys = if matches!(class, RegClass::Fp32) {
-                                    PhysReg::Fp32(r)
-                                } else {
-                                    PhysReg::Fp(r)
-                                };
-                                (phys, ArmOpcode::LdrFpImm)
-                            } else {
+                                (PhysReg::Fp32(r), ArmOpcode::LdrFpImm)
+                            }
+                            RegClass::Fp64 => {
+                                let r = fp_temps
+                                    .get(fp_temp_idx)
+                                    .copied()
+                                    .unwrap_or(FP_SPILL_SCRATCH[0]);
+                                fp_temp_idx += 1;
+                                (PhysReg::Fp(r), ArmOpcode::LdrFpImm)
+                            }
+                            RegClass::V128 => {
+                                let r = fp_temps
+                                    .get(fp_temp_idx)
+                                    .copied()
+                                    .unwrap_or(FP_SPILL_SCRATCH[0]);
+                                fp_temp_idx += 1;
+                                (PhysReg::Fp(r), ArmOpcode::LdrQ)
+                            }
+                            RegClass::Gp32 => {
                                 let r = gp_temps
                                     .get(gp_temp_idx)
                                     .copied()
                                     .unwrap_or(GP_SPILL_SCRATCH[0]);
                                 gp_temp_idx += 1;
-                                let phys = if matches!(class, RegClass::Gp32) {
-                                    PhysReg::Gp32(r)
-                                } else {
-                                    PhysReg::Gp(r)
-                                };
-                                (phys, ArmOpcode::LdrImm)
-                            };
+                                (PhysReg::Gp32(r), ArmOpcode::LdrImm)
+                            }
+                            RegClass::Gp64 => {
+                                let r = gp_temps
+                                    .get(gp_temp_idx)
+                                    .copied()
+                                    .unwrap_or(GP_SPILL_SCRATCH[0]);
+                                gp_temp_idx += 1;
+                                (PhysReg::Gp(r), ArmOpcode::LdrImm)
+                            }
+                        };
                         loads.push((i, temp_reg, load_op, offset));
                     }
                 }
@@ -821,24 +837,33 @@ pub fn apply_allocation(
                     logical_assignment(*def_vid, cur_pos)
                 {
                     let class = vreg_classes.get(def_vid).copied().unwrap_or(RegClass::Gp64);
-                    let temp_reg = if matches!(class, RegClass::Fp32 | RegClass::Fp64) {
-                        let r = fp_temps
-                            .get(def_temp_idx)
-                            .copied()
-                            .unwrap_or(FP_SPILL_SCRATCH[0]);
-                        if matches!(class, RegClass::Fp32) {
+                    let temp_reg = match class {
+                        RegClass::Fp32 => {
+                            let r = fp_temps
+                                .get(def_temp_idx)
+                                .copied()
+                                .unwrap_or(FP_SPILL_SCRATCH[0]);
                             PhysReg::Fp32(r)
-                        } else {
+                        }
+                        RegClass::Fp64 | RegClass::V128 => {
+                            let r = fp_temps
+                                .get(def_temp_idx)
+                                .copied()
+                                .unwrap_or(FP_SPILL_SCRATCH[0]);
                             PhysReg::Fp(r)
                         }
-                    } else {
-                        let r = gp_temps
-                            .get(def_temp_idx)
-                            .copied()
-                            .unwrap_or(GP_SPILL_SCRATCH[0]);
-                        if matches!(class, RegClass::Gp32) {
+                        RegClass::Gp32 => {
+                            let r = gp_temps
+                                .get(def_temp_idx)
+                                .copied()
+                                .unwrap_or(GP_SPILL_SCRATCH[0]);
                             PhysReg::Gp32(r)
-                        } else {
+                        }
+                        RegClass::Gp64 => {
+                            let r = gp_temps
+                                .get(def_temp_idx)
+                                .copied()
+                                .unwrap_or(GP_SPILL_SCRATCH[0]);
                             PhysReg::Gp(r)
                         }
                     };
@@ -870,6 +895,7 @@ pub fn apply_allocation(
             if let Some((scratch, offset, class)) = def_spill {
                 let store_op = match class {
                     RegClass::Fp32 | RegClass::Fp64 => ArmOpcode::StrFpImm,
+                    RegClass::V128 => ArmOpcode::StrQ,
                     _ => ArmOpcode::StrImm,
                 };
                 new_insts.push(MachineInst {
