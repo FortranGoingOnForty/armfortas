@@ -112,12 +112,37 @@ impl PureCallPolicy {
 /// or a non-Internal `Call` / `RuntimeCall`.  The existing
 /// argument-policy machinery already handles the "reads through
 /// argument pointer" case via `ReadOnlyWrapperPtr`.
+/// External math intrinsics whose `Call` sites are pure functions of
+/// their by-value arguments — emitting one is identical to emitting
+/// any other equivalent one, so they don't disqualify their hosting
+/// function from GVN's pure-call CSE policy. Names match the libm /
+/// armfortas runtime symbols emitted by lower.
+const PURE_EXTERNAL_INTRINSICS: &[&str] = &[
+    // libm scalar math (single + double).
+    "sinf", "cosf", "tanf", "asinf", "acosf", "atanf", "atan2f",
+    "sinhf", "coshf", "tanhf", "expf", "expm1f", "logf", "log2f",
+    "log10f", "log1pf", "sqrtf", "cbrtf", "fabsf", "ceilf", "floorf",
+    "roundf", "truncf", "powf", "fmodf", "hypotf", "copysignf",
+    "sin", "cos", "tan", "asin", "acos", "atan", "atan2",
+    "sinh", "cosh", "tanh", "exp", "expm1", "log", "log2",
+    "log10", "log1p", "sqrt", "cbrt", "fabs", "ceil", "floor",
+    "round", "trunc", "pow", "fmod", "hypot", "copysign",
+];
+
+fn is_pure_external_intrinsic(name: &str) -> bool {
+    PURE_EXTERNAL_INTRINSICS.iter().any(|n| *n == name)
+}
+
 fn reads_non_argument_memory(func: &Function) -> bool {
     for block in &func.blocks {
         for inst in &block.insts {
             match &inst.kind {
                 InstKind::GlobalAddr(_) => return true,
-                InstKind::Call(FuncRef::External(_), _) => return true,
+                InstKind::Call(FuncRef::External(name), _)
+                    if !is_pure_external_intrinsic(name) =>
+                {
+                    return true;
+                }
                 InstKind::RuntimeCall(_, _) => return true,
                 _ => {}
             }
