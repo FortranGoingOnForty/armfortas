@@ -6,6 +6,13 @@
 ! Here trip = 31, V = 4, so head_count = 28 and tail_count = 3.
 ! The result array elements 1..28 are filled by the vector head,
 ! and 29..31 are filled by the peeled tail.
+!
+! sum(3i, 1..31) = 1488; c(1)=3, c(28)=84, c(29)=87, c(31)=93.
+! CHECK: 1488
+! CHECK: 3
+! CHECK: 84
+! CHECK: 87
+! CHECK: 93
 program test_do_loop_vectorize_scalar_tail
   implicit none
   integer :: i
