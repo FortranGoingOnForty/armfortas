@@ -1157,113 +1157,116 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
         ArmOpcode::UminV4S => fmt_vbinop(inst, "umin", "4s"),
         ArmOpcode::UmaxV4S => fmt_vbinop(inst, "umax", "4s"),
 
+        // afs-as dialect: cross-lane reductions encode the shape in
+        // the mnemonic suffix; the destination is a scalar `s/d` and
+        // the source is the bare vector register.
         ArmOpcode::FaddpV2S => format!(
-            "faddp {}, {}",
+            "faddp.2s {}, {}",
             fp32_scalar(&inst.operands[0]),
-            v_reg(&inst.operands[1], "2s"),
+            v_reg_bare(&inst.operands[1]),
         ),
         ArmOpcode::FaddpV2D => format!(
-            "faddp {}, {}",
+            "faddp.2d {}, {}",
             fp64_scalar(&inst.operands[0]),
-            v_reg(&inst.operands[1], "2d"),
+            v_reg_bare(&inst.operands[1]),
         ),
         ArmOpcode::Faddv4S => format!(
-            "faddv {}, {}",
+            "faddv.4s {}, {}",
             fp32_scalar(&inst.operands[0]),
-            v_reg(&inst.operands[1], "4s"),
+            v_reg_bare(&inst.operands[1]),
         ),
         ArmOpcode::Sminv4S => format!(
-            "sminv {}, {}",
+            "sminv.4s {}, {}",
             fp32_scalar(&inst.operands[0]),
-            v_reg(&inst.operands[1], "4s"),
+            v_reg_bare(&inst.operands[1]),
         ),
         ArmOpcode::Smaxv4S => format!(
-            "smaxv {}, {}",
+            "smaxv.4s {}, {}",
             fp32_scalar(&inst.operands[0]),
-            v_reg(&inst.operands[1], "4s"),
+            v_reg_bare(&inst.operands[1]),
         ),
         ArmOpcode::Uminv4S => format!(
-            "uminv {}, {}",
+            "uminv.4s {}, {}",
             fp32_scalar(&inst.operands[0]),
-            v_reg(&inst.operands[1], "4s"),
+            v_reg_bare(&inst.operands[1]),
         ),
         ArmOpcode::Umaxv4S => format!(
-            "umaxv {}, {}",
+            "umaxv.4s {}, {}",
             fp32_scalar(&inst.operands[0]),
-            v_reg(&inst.operands[1], "4s"),
+            v_reg_bare(&inst.operands[1]),
         ),
         ArmOpcode::Addv4S => format!(
-            "addv {}, {}",
+            "addv.4s {}, {}",
             fp32_scalar(&inst.operands[0]),
-            v_reg(&inst.operands[1], "4s"),
+            v_reg_bare(&inst.operands[1]),
         ),
 
         ArmOpcode::DupGen4S => format!(
-            "dup {}, {}",
-            v_reg(&inst.operands[0], "4s"),
+            "dup.4s {}, {}",
+            v_reg_bare(&inst.operands[0]),
             op_str(&inst.operands[1]),
         ),
         ArmOpcode::DupGen2D => format!(
-            "dup {}, {}",
-            v_reg(&inst.operands[0], "2d"),
+            "dup.2d {}, {}",
+            v_reg_bare(&inst.operands[0]),
             op_str(&inst.operands[1]),
         ),
         ArmOpcode::DupEl4S => format!(
-            "dup {}, {}",
-            v_reg(&inst.operands[0], "4s"),
-            v_lane(&inst.operands[1], "s", 0),
+            "dup.4s {}, {}",
+            v_reg_bare(&inst.operands[0]),
+            v_lane_bare(&inst.operands[1], "s", 0),
         ),
         ArmOpcode::DupEl2D => format!(
-            "dup {}, {}",
-            v_reg(&inst.operands[0], "2d"),
-            v_lane(&inst.operands[1], "d", 0),
+            "dup.2d {}, {}",
+            v_reg_bare(&inst.operands[0]),
+            v_lane_bare(&inst.operands[1], "d", 0),
         ),
         ArmOpcode::Ins4S => {
             let lane = imm_u8(&inst.operands[1]);
             format!(
-                "ins {}, {}",
-                v_lane(&inst.operands[0], "s", lane),
+                "ins.s {}, {}",
+                v_lane_bare(&inst.operands[0], "s", lane),
                 op_str(&inst.operands[2]),
             )
         }
         ArmOpcode::Ins2D => {
             let lane = imm_u8(&inst.operands[1]);
             format!(
-                "ins {}, {}",
-                v_lane(&inst.operands[0], "d", lane),
+                "ins.d {}, {}",
+                v_lane_bare(&inst.operands[0], "d", lane),
                 op_str(&inst.operands[2]),
             )
         }
         ArmOpcode::Umov4S => {
             let lane = imm_u8(&inst.operands[2]);
             format!(
-                "umov {}, {}",
+                "umov.s {}, {}",
                 op_str(&inst.operands[0]),
-                v_lane(&inst.operands[1], "s", lane),
+                v_lane_bare(&inst.operands[1], "s", lane),
             )
         }
         ArmOpcode::Umov2D => {
             let lane = imm_u8(&inst.operands[2]);
             format!(
-                "umov {}, {}",
+                "umov.d {}, {}",
                 op_str(&inst.operands[0]),
-                v_lane(&inst.operands[1], "d", lane),
+                v_lane_bare(&inst.operands[1], "d", lane),
             )
         }
         ArmOpcode::FmovEl4S => {
             let lane = imm_u8(&inst.operands[2]);
             format!(
-                "mov {}, {}",
+                "mov.s {}, {}",
                 fp32_scalar(&inst.operands[0]),
-                v_lane(&inst.operands[1], "s", lane),
+                v_lane_bare(&inst.operands[1], "s", lane),
             )
         }
         ArmOpcode::FmovEl2D => {
             let lane = imm_u8(&inst.operands[2]);
             format!(
-                "mov {}, {}",
+                "mov.d {}, {}",
                 fp64_scalar(&inst.operands[0]),
-                v_lane(&inst.operands[1], "d", lane),
+                v_lane_bare(&inst.operands[1], "d", lane),
             )
         }
 
@@ -1343,22 +1346,50 @@ fn imm_u8(op: &MachineOperand) -> u8 {
 }
 
 fn fmt_vbinop(inst: &MachineInst, mnemonic: &str, shape: &str) -> String {
+    // afs-as dialect: shape suffix is part of the mnemonic, operand
+    // registers are bare (`fadd.4s v0, v1, v2`). Encodes to the same
+    // bytes as the Apple/GNU `fadd v0.4s, v1.4s, v2.4s` form.
     format!(
-        "{} {}, {}, {}",
+        "{}.{} {}, {}, {}",
         mnemonic,
-        v_reg(&inst.operands[0], shape),
-        v_reg(&inst.operands[1], shape),
-        v_reg(&inst.operands[2], shape),
+        shape,
+        v_reg_bare(&inst.operands[0]),
+        v_reg_bare(&inst.operands[1]),
+        v_reg_bare(&inst.operands[2]),
     )
 }
 
 fn fmt_vunop(inst: &MachineInst, mnemonic: &str, shape: &str) -> String {
     format!(
-        "{} {}, {}",
+        "{}.{} {}, {}",
         mnemonic,
-        v_reg(&inst.operands[0], shape),
-        v_reg(&inst.operands[1], shape),
+        shape,
+        v_reg_bare(&inst.operands[0]),
+        v_reg_bare(&inst.operands[1]),
     )
+}
+
+fn v_reg_bare(op: &MachineOperand) -> String {
+    match op {
+        MachineOperand::VReg(id) => format!("v{}", id.0),
+        MachineOperand::PhysReg(PhysReg::Fp(n)) | MachineOperand::PhysReg(PhysReg::Fp32(n)) => {
+            format!("v{}", n)
+        }
+        _ => op_str(op),
+    }
+}
+
+fn v_lane_bare(op: &MachineOperand, _lane_ty: &str, lane: u8) -> String {
+    // afs-as dialect for `umov.s w3, v0[2]` — bare reg with `[lane]`
+    // suffix; the element-size width is encoded into the mnemonic
+    // (`umov.s` / `umov.d`).
+    match op {
+        MachineOperand::VReg(id) => format!("v{}[{}]", id.0, lane),
+        MachineOperand::PhysReg(PhysReg::Fp(n)) | MachineOperand::PhysReg(PhysReg::Fp32(n)) => {
+            format!("v{}[{}]", n, lane)
+        }
+        _ => format!("{}[{}]", op_str(op), lane),
+    }
 }
 
 /// Format a machine operand as assembly text.
@@ -1792,7 +1823,8 @@ mod tests {
             ],
         );
         let _ = mf;
-        assert_eq!(asm, "fadd v0.4s, v1.4s, v2.4s");
+        // afs-as dialect: shape suffix on mnemonic, bare regs.
+        assert_eq!(asm, "fadd.4s v0, v1, v2");
     }
 
     #[test]
@@ -1805,7 +1837,7 @@ mod tests {
                 MachineOperand::VReg(crate::codegen::mir::VRegId(2)),
             ],
         );
-        assert_eq!(asm, "fadd v0.2d, v1.2d, v2.2d");
+        assert_eq!(asm, "fadd.2d v0, v1, v2");
     }
 
     #[test]
@@ -1818,7 +1850,7 @@ mod tests {
                 MachineOperand::VReg(crate::codegen::mir::VRegId(2)),
             ],
         );
-        assert_eq!(asm, "fmla v0.4s, v1.4s, v2.4s");
+        assert_eq!(asm, "fmla.4s v0, v1, v2");
     }
 
     #[test]
@@ -1830,7 +1862,7 @@ mod tests {
                 MachineOperand::VReg(crate::codegen::mir::VRegId(1)),
             ],
         );
-        assert_eq!(asm, "addv s0, v1.4s");
+        assert_eq!(asm, "addv.4s s0, v1");
     }
 
     #[test]
@@ -1842,7 +1874,7 @@ mod tests {
                 MachineOperand::PhysReg(crate::codegen::mir::PhysReg::Gp32(2)),
             ],
         );
-        assert_eq!(asm, "dup v0.4s, w2");
+        assert_eq!(asm, "dup.4s v0, w2");
     }
 
     #[test]
@@ -1881,6 +1913,6 @@ mod tests {
                 MachineOperand::Imm(2),
             ],
         );
-        assert_eq!(asm, "umov w3, v0.s[2]");
+        assert_eq!(asm, "umov.s w3, v0[2]");
     }
 }
