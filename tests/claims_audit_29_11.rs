@@ -267,21 +267,55 @@ fn o3_vectorizes_realworld_explicit_do_stage() {
     );
 
     assert!(
-        o2_ir.matches("do_check_").count() >= 2 && !o2_ir.contains("call @afs_array_add_i32("),
+        o2_ir.matches("do_check_").count() >= 2
+            && !o2_ir.contains("call @afs_array_add_i32(")
+            && !o2_ir.contains("vadd"),
         "O2 should still keep the explicit scalar loop for this real-world stage:\n{}",
         o2_ir
     );
+    // O3 vectorization can land in either of two forms now:
+    //   * The newer NeonVectorize pass rewrites the inner body to
+    //     vload/vadd/vstore on 128-bit lanes (preferred — no call
+    //     overhead, fewer iterations).
+    //   * The older Vectorize pass redirects the whole loop to the
+    //     bulk runtime kernel `afs_array_add_i32` (fallback for
+    //     shapes the NEON pass does not yet handle).
+    // Either is a valid "vectorization" claim for this loop; the
+    // load-bearing invariant is that the explicit do_check chain
+    // shrinks and the loop body becomes vector-shaped (or a kernel
+    // call) instead of scalar load/iadd/store.
+    let o3_neon = o3_ir.contains("vstore") && o3_ir.contains("vadd");
+    let o3_kernel = o3_ir.contains("call @afs_array_add_i32(");
+    // For the kernel form the loop CFG is replaced by a single call,
+    // so the do_check block count drops. For the NEON form the loop
+    // CFG is preserved (vector ops live inside the body), so the
+    // assertion is just that the body is vector-shaped, not that
+    // the CFG shrank.
     assert!(
-        o3_ir.contains("call @afs_array_add_i32(")
-            && o3_ir.matches("do_check_").count() < o2_ir.matches("do_check_").count(),
-        "O3 should redirect the real-world explicit DO loop to the bulk add kernel:\n{}",
+        o3_kernel || o3_neon,
+        "O3 should vectorize the real-world explicit DO loop (vload/vadd/vstore or bulk kernel call):\n{}",
         o3_ir
     );
-    assert!(
-        o3_asm.contains("_afs_array_add_i32"),
-        "vectorized O3 assembly should reference the bulk add kernel:\n{}",
-        o3_asm
-    );
+    if o3_kernel {
+        assert!(
+            o3_ir.matches("do_check_").count() < o2_ir.matches("do_check_").count(),
+            "kernel-form O3 should replace the explicit DO with a single call:\n{}",
+            o3_ir
+        );
+    }
+    if o3_kernel {
+        assert!(
+            o3_asm.contains("_afs_array_add_i32"),
+            "kernel-form O3 assembly should reference the bulk add kernel:\n{}",
+            o3_asm
+        );
+    } else {
+        assert!(
+            o3_asm.contains("add.4s") || o3_asm.contains("ldr q") || o3_asm.contains("str q"),
+            "neon-form O3 assembly should reference 128-bit vector ops:\n{}",
+            o3_asm
+        );
+    }
     assert_eq!(
         o3_obj_a, o3_obj_b,
         "vectorized O3 object snapshot should stay deterministic"
