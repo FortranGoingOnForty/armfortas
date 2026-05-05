@@ -1008,6 +1008,19 @@ struct ReductionPlan {
     /// Element type (i32 / i64 / f32 / f64).
     elem_ty: IrType,
     lanes: u8,
+    /// IV's lower bound (preheader passes this as the initial iv).
+    iv_init: i64,
+    /// Number of vector iterations × `lanes`. When `tail_count > 0`,
+    /// the head runs vectorized for `head_count` iterations and the
+    /// remaining `tail_count` iterations are peeled as scalar code
+    /// after the post-loop `vreduce_*`.
+    head_count: i64,
+    tail_count: i64,
+    /// Header's `icmp le|lt iv, hi_const` instruction id, plus the
+    /// const id feeding its RHS. Needed when `tail_count > 0` to
+    /// retarget the bound to `iv_init + head_count - 1`.
+    cond_id: ValueId,
+    bound_const_id: ValueId,
     span: crate::lexer::Span,
 }
 
@@ -1073,18 +1086,25 @@ fn detect_reduction_plan(
     }
     let exit = false_dest;
     let cond_inst = header_block.insts.iter().find(|inst| inst.id == cond_id)?;
-    let iv_bound = match cond_inst.kind {
-        InstKind::ICmp(CmpOp::Le, lhs, rhs) if lhs == iv_param => resolve_const_int(func, rhs)?,
+    let (iv_bound, bound_const_id) = match cond_inst.kind {
+        InstKind::ICmp(CmpOp::Le, lhs, rhs) if lhs == iv_param => {
+            (resolve_const_int(func, rhs)?, rhs)
+        }
         InstKind::ICmp(CmpOp::Lt, lhs, rhs) if lhs == iv_param => {
-            resolve_const_int(func, rhs)?.checked_sub(1)?
+            (resolve_const_int(func, rhs)?.checked_sub(1)?, rhs)
         }
         _ => return None,
     };
 
     let trip = iv_bound.checked_sub(iv_init).and_then(|d| d.checked_add(1))?;
-    if trip <= 0 || (trip as u64) % (lanes as u64) != 0 {
+    if trip <= 0 {
         return None;
     }
+    let head_count = trip - (trip % lanes as i64);
+    if head_count == 0 {
+        return None;
+    }
+    let tail_count = trip - head_count;
 
     // Body shape: load + iadd(acc, load) + iadd(iv, 1) + branch back.
     let body_block = func.block(body);
@@ -1279,6 +1299,14 @@ fn detect_reduction_plan(
         return None;
     }
 
+    // Scalar tail for reduction loops is wired only for Sum (the
+    // peel walks the body snapshot and chains the iadd/fadd via
+    // running scalar acc). Min/Max would also need the cmp+select
+    // pattern in the snapshot — leave that for a follow-up.
+    if tail_count > 0 && !matches!(reduce, ReductionKind::Sum) {
+        return None;
+    }
+
     // The accumulate_inst result must not be used inside the loop
     // (other than as the body terminator's arg). All in-loop uses
     // would conflict with our vector rewrite.
@@ -1311,12 +1339,25 @@ fn detect_reduction_plan(
         iv_int_width,
         elem_ty,
         lanes,
+        iv_init,
+        head_count,
+        tail_count,
+        cond_id,
+        bound_const_id,
         span: accumulate_inst.span,
     })
 }
 
 fn apply_reduction_plan(func: &mut Function, lp: &NaturalLoop, plan: ReductionPlan) {
     let v_ty = vector_ty(&plan.elem_ty, plan.lanes);
+
+    // 0. Snapshot the body before any in-place mutation. Used by the
+    //    scalar-tail peel below (sum reductions only).
+    let body_snapshot: Option<Vec<Inst>> = if plan.tail_count > 0 {
+        Some(func.block(plan.body).insts.clone())
+    } else {
+        None
+    };
 
     // 1. Insert `vacc_init = vbroadcast(acc_init)` at the end of the
     //    preheader, before its branch terminator.
@@ -1492,6 +1533,133 @@ fn apply_reduction_plan(func: &mut Function, lp: &NaturalLoop, plan: ReductionPl
         }
         if let Some(term) = &mut block.terminator {
             substitute_in_terminator(term, plan.acc_param, acc_scalar);
+        }
+    }
+
+    // 7. Reduction scalar tail (sum only). Peel `tail_count` scalar
+    //    iterations into the exit block so they accumulate from
+    //    `acc_scalar` into a chained `final_acc`. Then retarget
+    //    post-tail consumers of `acc_scalar` to `final_acc`.
+    if plan.tail_count > 0 {
+        if let Some(snapshot) = body_snapshot {
+            apply_reduction_scalar_tail(func, &plan, &snapshot, acc_scalar, &lp_body);
+        }
+    }
+}
+
+/// Peel `plan.tail_count` scalar iterations of the body into the
+/// exit block (just after the `vreduce_*`), each iteration chaining
+/// from the previous accumulator. The first iteration's seed is
+/// `acc_scalar`; the last produces `final_acc`. After peeling, every
+/// non-loop, non-peel use of `acc_scalar` is rewritten to
+/// `final_acc`.
+fn apply_reduction_scalar_tail(
+    func: &mut Function,
+    plan: &ReductionPlan,
+    body_snapshot: &[Inst],
+    acc_scalar: ValueId,
+    lp_body: &HashSet<BlockId>,
+) {
+    let int_ty = IrType::Int(plan.iv_int_width);
+
+    // Insert the new head-bound const at the top of the preheader.
+    let new_bound = plan.iv_init + plan.head_count - 1;
+    let new_bound_id = func.next_value_id();
+    func.register_type(new_bound_id, int_ty.clone());
+    func.block_mut(plan.preheader).insts.insert(
+        0,
+        Inst {
+            id: new_bound_id,
+            kind: InstKind::ConstInt(new_bound as i128, plan.iv_int_width),
+            ty: int_ty.clone(),
+            span: plan.span,
+        },
+    );
+
+    // Rewrite the original icmp's RHS to point at the new bound.
+    if let Some(inst) = func
+        .block_mut(plan.header)
+        .insts
+        .iter_mut()
+        .find(|i| i.id == plan.cond_id)
+    {
+        if let InstKind::ICmp(_, _, rhs) = &mut inst.kind {
+            if *rhs == plan.bound_const_id {
+                *rhs = new_bound_id;
+            }
+        }
+    }
+
+    let step_inst_id = plan.step_iadd;
+    let mut peeled: Vec<Inst> = Vec::new();
+    let mut peel_ids: HashSet<ValueId> = HashSet::new();
+    let mut current_acc = acc_scalar;
+
+    for t in 0..plan.tail_count {
+        let tail_iv = plan.iv_init + plan.head_count + t;
+        let tail_iv_const_id = func.next_value_id();
+        func.register_type(tail_iv_const_id, int_ty.clone());
+        peeled.push(Inst {
+            id: tail_iv_const_id,
+            kind: InstKind::ConstInt(tail_iv as i128, plan.iv_int_width),
+            ty: int_ty.clone(),
+            span: plan.span,
+        });
+        peel_ids.insert(tail_iv_const_id);
+
+        let mut val_map: HashMap<ValueId, ValueId> = HashMap::new();
+        val_map.insert(plan.iv_param, tail_iv_const_id);
+        val_map.insert(plan.acc_param, current_acc);
+
+        for inst in body_snapshot {
+            // Skip the IV step iadd — peel iterations don't bump iv.
+            if inst.id == step_inst_id {
+                continue;
+            }
+            let new_id = func.next_value_id();
+            func.register_type(new_id, inst.ty.clone());
+            let new_kind = remap_inst_kind(&inst.kind, &val_map);
+            val_map.insert(inst.id, new_id);
+            peel_ids.insert(new_id);
+            peeled.push(Inst {
+                id: new_id,
+                kind: new_kind,
+                ty: inst.ty.clone(),
+                span: inst.span,
+            });
+        }
+        current_acc = val_map[&plan.accumulate_id];
+    }
+    let final_acc = current_acc;
+
+    // Splice peeled insts into the exit block, just after `acc_scalar`
+    // (which is at exit[0]).
+    let exit = func.block_mut(plan.exit);
+    let acc_pos = exit
+        .insts
+        .iter()
+        .position(|i| i.id == acc_scalar)
+        .unwrap_or(0);
+    let after = acc_pos + 1;
+    let tail = exit.insts.split_off(after);
+    exit.insts.extend(peeled);
+    exit.insts.extend(tail);
+
+    // Retarget non-loop, non-peel uses of acc_scalar → final_acc.
+    if final_acc != acc_scalar {
+        for block in func.blocks.iter_mut() {
+            if lp_body.contains(&block.id) {
+                continue;
+            }
+            for inst in &mut block.insts {
+                if peel_ids.contains(&inst.id) || inst.id == acc_scalar {
+                    continue;
+                }
+                substitute_in_inst(&mut inst.kind, acc_scalar, final_acc);
+            }
+            if let Some(term) = &mut block.terminator {
+                substitute_in_terminator(term, acc_scalar, final_acc);
+            }
         }
     }
 }
