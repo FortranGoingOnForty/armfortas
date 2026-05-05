@@ -45995,14 +45995,24 @@ fn lower_expr_full(
 
         Expr::ComplexLiteral { real, imag } => {
             // Complex numbers are stored as a 2-element float array on the stack.
-            // Determine float width from the literal parts: if either uses a 'd'/'D'
-            // exponent it's double precision (f64), otherwise single (f32).
+            // Determine float width from the literal parts: a 'd'/'D' exponent
+            // forces double precision; otherwise consult the kind suffix and
+            // resolve named kinds (`dp`, `real64`, etc.) through the local /
+            // param-const / symbol-table lookup. Pre-fix, only `1.0d0` mapped
+            // to F64 — the modern `_dp` / `_real64` spellings landed on F32
+            // and complex literals like `(3.0_dp, 4.0_dp)` silently
+            // float-truncated their lanes, producing 0.0 in the high bits
+            // when the surrounding context expects complex(dp).
             let is_double = |e: &crate::ast::expr::SpannedExpr| -> bool {
-                if let Expr::RealLiteral { text, .. } = &e.node {
-                    text.to_lowercase().contains('d')
-                } else {
-                    false
+                if let Expr::RealLiteral { text, kind } = &e.node {
+                    if text.to_lowercase().contains('d') {
+                        return true;
+                    }
+                    if let Some(kind_str) = kind {
+                        return real_kind_to_width_in_context(kind_str, Some(locals), None, Some(st)) == 8;
+                    }
                 }
+                false
             };
             let fw = if is_double(real) || is_double(imag) {
                 FloatWidth::F64
