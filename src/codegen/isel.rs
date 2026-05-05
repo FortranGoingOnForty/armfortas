@@ -1785,7 +1785,195 @@ fn select_inst(
             });
         }
 
-        // Remaining: ExtractField, InsertField — placeholder.
+        // ---- SIMD vector ops (Sprint 12 Stage 2 isel hookup) ----
+        //
+        // The vectorizer (Stage 4) is what will start producing
+        // these. Each arm picks a NEON ArmOpcode based on the result
+        // vector's lane shape. Mixed-shape ops (e.g. integer 8×i16
+        // narrow lanes) aren't selected here — Stage 4 will only
+        // emit the four shapes covered by `VShape`.
+        InstKind::VAdd(a, b) => emit_vbinop(mf, ctx, mb, inst, *a, *b, |s| match s {
+            VShape::V4S => ArmOpcode::AddV4S,
+            VShape::V2D => ArmOpcode::AddV2D,
+            VShape::F4S => ArmOpcode::FaddV4S,
+            VShape::F2D => ArmOpcode::FaddV2D,
+        }),
+        InstKind::VSub(a, b) => emit_vbinop(mf, ctx, mb, inst, *a, *b, |s| match s {
+            VShape::V4S => ArmOpcode::SubV4S,
+            VShape::V2D => ArmOpcode::SubV2D,
+            VShape::F4S => ArmOpcode::FsubV4S,
+            VShape::F2D => ArmOpcode::FsubV2D,
+        }),
+        InstKind::VMul(a, b) => emit_vbinop(mf, ctx, mb, inst, *a, *b, |s| match s {
+            VShape::V4S => ArmOpcode::MulV4S,
+            // NEON has no integer 2D mul — Stage 4 should not request
+            // it; if it does we fall through to a placeholder.
+            VShape::V2D => ArmOpcode::Nop,
+            VShape::F4S => ArmOpcode::FmulV4S,
+            VShape::F2D => ArmOpcode::FmulV2D,
+        }),
+        InstKind::VDiv(a, b) => emit_vbinop(mf, ctx, mb, inst, *a, *b, |s| match s {
+            // No integer NEON divide — emit a placeholder; the
+            // vectorizer should refuse to pick V128 lanes for VDiv
+            // on integer types. Float forms exist.
+            VShape::V4S | VShape::V2D => ArmOpcode::Nop,
+            VShape::F4S => ArmOpcode::FdivV4S,
+            VShape::F2D => ArmOpcode::FdivV2D,
+        }),
+        InstKind::VNeg(a) => emit_vunop(mf, ctx, mb, inst, *a, |s| match s {
+            VShape::V4S => ArmOpcode::NegV4S,
+            VShape::V2D => ArmOpcode::NegV2D,
+            VShape::F4S => ArmOpcode::FnegV4S,
+            VShape::F2D => ArmOpcode::FnegV2D,
+        }),
+        InstKind::VAbs(a) => emit_vunop(mf, ctx, mb, inst, *a, |s| match s {
+            VShape::F4S => ArmOpcode::FabsV4S,
+            VShape::F2D => ArmOpcode::FabsV2D,
+            // NEON `abs` exists for integer too but the four-shape
+            // alias isn't generated yet; placeholder.
+            VShape::V4S | VShape::V2D => ArmOpcode::Nop,
+        }),
+        InstKind::VFma(a, b, c) => {
+            // FMLA is dest += a*b. Conventional 3-operand call
+            // assumes dest is a fresh vreg — emit a copy-from-c
+            // followed by FMLA. Stage 4 should fold the copy when it
+            // tracks SSA destinations more carefully.
+            let shape = match VShape::from_ir(&inst.ty) {
+                Some(s) if s.is_float() => s,
+                _ => {
+                    // unsupported shape — placeholder
+                    let dest = ctx.get_vreg(mf, inst.id, RegClass::V128);
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode: ArmOpcode::Nop,
+                        operands: vec![],
+                        def: Some(dest),
+                    });
+                    return;
+                }
+            };
+            let opcode = match shape {
+                VShape::F4S => ArmOpcode::FmlaV4S,
+                VShape::F2D => ArmOpcode::FmlaV2D,
+                _ => unreachable!(),
+            };
+            let va = ctx.lookup_vreg(*a);
+            let vb = ctx.lookup_vreg(*b);
+            let vc = ctx.lookup_vreg(*c);
+            let dest = ctx.get_vreg(mf, inst.id, RegClass::V128);
+            // dest = c (init accumulator)
+            mf.block_mut(mb).insts.push(MachineInst {
+                opcode: ArmOpcode::FmovReg,
+                operands: vec![MachineOperand::VReg(dest), MachineOperand::VReg(vc)],
+                def: Some(dest),
+            });
+            // dest += a * b
+            mf.block_mut(mb).insts.push(MachineInst {
+                opcode,
+                operands: vec![
+                    MachineOperand::VReg(dest),
+                    MachineOperand::VReg(va),
+                    MachineOperand::VReg(vb),
+                ],
+                def: Some(dest),
+            });
+        }
+        InstKind::VLoad(addr) => {
+            let dest = ctx.get_vreg(mf, inst.id, RegClass::V128);
+            let base = ctx.lookup_vreg(*addr);
+            mf.block_mut(mb).insts.push(MachineInst {
+                opcode: ArmOpcode::LdrQ,
+                operands: vec![
+                    MachineOperand::VReg(dest),
+                    MachineOperand::VReg(base),
+                    MachineOperand::Imm(0),
+                ],
+                def: Some(dest),
+            });
+        }
+        InstKind::VStore(val, addr) => {
+            let v = ctx.lookup_vreg(*val);
+            let base = ctx.lookup_vreg(*addr);
+            mf.block_mut(mb).insts.push(MachineInst {
+                opcode: ArmOpcode::StrQ,
+                operands: vec![
+                    MachineOperand::VReg(v),
+                    MachineOperand::VReg(base),
+                    MachineOperand::Imm(0),
+                ],
+                def: None,
+            });
+        }
+        InstKind::VBroadcast(scalar) => {
+            let s = ctx.lookup_vreg(*scalar);
+            let dest = ctx.get_vreg(mf, inst.id, RegClass::V128);
+            let opcode = match VShape::from_ir(&inst.ty) {
+                Some(VShape::V4S) | Some(VShape::F4S) => ArmOpcode::DupGen4S,
+                Some(VShape::V2D) | Some(VShape::F2D) => ArmOpcode::DupGen2D,
+                None => ArmOpcode::Nop,
+            };
+            mf.block_mut(mb).insts.push(MachineInst {
+                opcode,
+                operands: vec![MachineOperand::VReg(dest), MachineOperand::VReg(s)],
+                def: Some(dest),
+            });
+        }
+        InstKind::VReduceSum(v) => {
+            // Cross-lane sum. F4S → faddv s0, v.4s; F2D → faddp d0, v.2d.
+            // Integer 4S → addv s0, v.4s.
+            let src = ctx.lookup_vreg(*v);
+            let class = type_to_reg_class(&inst.ty);
+            let dest = ctx.get_vreg(mf, inst.id, class);
+            // Read the SOURCE vector's shape from the operand's IR type.
+            let src_shape = mf
+                .vregs
+                .get(src.0 as usize)
+                .map(|_| ())
+                .and_then(|_| {
+                    // We don't have direct access to the IR type of the
+                    // operand here (only its vreg). For now derive
+                    // shape from the destination's expected type
+                    // semantics: scalar i32 / f32 / i64 / f64.
+                    match &inst.ty {
+                        IrType::Int(IntWidth::I32) => Some(ArmOpcode::Addv4S),
+                        IrType::Int(IntWidth::I64) => Some(ArmOpcode::Addv4S),
+                        IrType::Float(FloatWidth::F32) => Some(ArmOpcode::Faddv4S),
+                        IrType::Float(FloatWidth::F64) => Some(ArmOpcode::FaddpV2D),
+                        _ => None,
+                    }
+                });
+            let opcode = src_shape.unwrap_or(ArmOpcode::Nop);
+            mf.block_mut(mb).insts.push(MachineInst {
+                opcode,
+                operands: vec![MachineOperand::VReg(dest), MachineOperand::VReg(src)],
+                def: Some(dest),
+            });
+        }
+        InstKind::VExtract(v, lane) => {
+            let src = ctx.lookup_vreg(*v);
+            let class = type_to_reg_class(&inst.ty);
+            let dest = ctx.get_vreg(mf, inst.id, class);
+            let opcode = match &inst.ty {
+                IrType::Int(IntWidth::I32) => ArmOpcode::Umov4S,
+                IrType::Int(IntWidth::I64) => ArmOpcode::Umov2D,
+                IrType::Float(FloatWidth::F32) => ArmOpcode::FmovEl4S,
+                IrType::Float(FloatWidth::F64) => ArmOpcode::FmovEl2D,
+                _ => ArmOpcode::Nop,
+            };
+            mf.block_mut(mb).insts.push(MachineInst {
+                opcode,
+                operands: vec![
+                    MachineOperand::VReg(dest),
+                    MachineOperand::VReg(src),
+                    MachineOperand::Imm(*lane as i64),
+                ],
+                def: Some(dest),
+            });
+        }
+
+        // Remaining: ExtractField, InsertField, and other vector ops
+        // (VInsert, VMin, VMax, VICmp, VFCmp, VBitcast, VReduceMin,
+        // VReduceMax) — placeholder. Land per-op as the vectorizer
+        // grows in Stage 4.
         _ => {
             let class = type_to_reg_class(&inst.ty);
             let _dest = ctx.get_vreg(mf, inst.id, class);
@@ -2535,6 +2723,58 @@ fn emit_binop(
     });
 }
 
+/// Emit a NEON vector binary op. The `pick` closure resolves the
+/// concrete `ArmOpcode` from the result vector's lane shape — that
+/// keeps the per-op InstKind arms one-line.
+fn emit_vbinop(
+    mf: &mut MachineFunction,
+    ctx: &mut ISelCtx,
+    mb: MBlockId,
+    inst: &Inst,
+    a: ValueId,
+    b: ValueId,
+    pick: impl FnOnce(VShape) -> ArmOpcode,
+) {
+    let dest = ctx.get_vreg(mf, inst.id, RegClass::V128);
+    let va = ctx.lookup_vreg(a);
+    let vb = ctx.lookup_vreg(b);
+    let opcode = match VShape::from_ir(&inst.ty) {
+        Some(s) => pick(s),
+        None => ArmOpcode::Nop,
+    };
+    mf.block_mut(mb).insts.push(MachineInst {
+        opcode,
+        operands: vec![
+            MachineOperand::VReg(dest),
+            MachineOperand::VReg(va),
+            MachineOperand::VReg(vb),
+        ],
+        def: Some(dest),
+    });
+}
+
+/// Emit a NEON vector unary op (one source, one result, both V128).
+fn emit_vunop(
+    mf: &mut MachineFunction,
+    ctx: &mut ISelCtx,
+    mb: MBlockId,
+    inst: &Inst,
+    a: ValueId,
+    pick: impl FnOnce(VShape) -> ArmOpcode,
+) {
+    let dest = ctx.get_vreg(mf, inst.id, RegClass::V128);
+    let va = ctx.lookup_vreg(a);
+    let opcode = match VShape::from_ir(&inst.ty) {
+        Some(s) => pick(s),
+        None => ArmOpcode::Nop,
+    };
+    mf.block_mut(mb).insts.push(MachineInst {
+        opcode,
+        operands: vec![MachineOperand::VReg(dest), MachineOperand::VReg(va)],
+        def: Some(dest),
+    });
+}
+
 /// Emit a float binary op, selecting single or double precision.
 #[allow(clippy::too_many_arguments)]
 fn emit_float_binop(
@@ -2683,11 +2923,42 @@ fn type_to_reg_class(ty: &IrType) -> RegClass {
     match ty {
         IrType::Float(FloatWidth::F32) => RegClass::Fp32,
         IrType::Float(FloatWidth::F64) => RegClass::Fp64,
+        IrType::Vector { .. } => RegClass::V128,
         IrType::Int(IntWidth::I8)
         | IrType::Int(IntWidth::I16)
         | IrType::Int(IntWidth::I32)
         | IrType::Bool => RegClass::Gp32,
         _ => RegClass::Gp64,
+    }
+}
+
+/// Vector lane shape for NEON opcode dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VShape {
+    /// 4 × i32
+    V4S,
+    /// 2 × i64
+    V2D,
+    /// 4 × f32
+    F4S,
+    /// 2 × f64
+    F2D,
+}
+
+impl VShape {
+    fn from_ir(ty: &IrType) -> Option<Self> {
+        let (lanes, elem) = ty.vector_shape()?;
+        match (lanes, elem) {
+            (4, IrType::Int(IntWidth::I32)) => Some(Self::V4S),
+            (2, IrType::Int(IntWidth::I64)) => Some(Self::V2D),
+            (4, IrType::Float(FloatWidth::F32)) => Some(Self::F4S),
+            (2, IrType::Float(FloatWidth::F64)) => Some(Self::F2D),
+            _ => None,
+        }
+    }
+
+    fn is_float(self) -> bool {
+        matches!(self, Self::F4S | Self::F2D)
     }
 }
 
@@ -3603,5 +3874,48 @@ mod tests {
             alloca_size(&IrType::Array(Box::new(IrType::Int(IntWidth::I32)), 3)),
             12
         );
+    }
+
+    // ---- VShape mapping tests (Sprint 12 Stage 2 isel hookup) ----
+
+    #[test]
+    fn vshape_recognizes_4xi32() {
+        let ty = IrType::Vector {
+            lanes: 4,
+            elem: Box::new(IrType::Int(IntWidth::I32)),
+        };
+        assert_eq!(VShape::from_ir(&ty), Some(VShape::V4S));
+        assert!(!VShape::V4S.is_float());
+    }
+
+    #[test]
+    fn vshape_recognizes_2xf64() {
+        let ty = IrType::Vector {
+            lanes: 2,
+            elem: Box::new(IrType::Float(FloatWidth::F64)),
+        };
+        assert_eq!(VShape::from_ir(&ty), Some(VShape::F2D));
+        assert!(VShape::F2D.is_float());
+    }
+
+    #[test]
+    fn vshape_rejects_unsupported_shape() {
+        // 3 lanes is not a NEON shape; we already verified that
+        // verify.rs rejects it. VShape::from_ir simply returns None
+        // and the isel arm falls back to Nop.
+        let ty = IrType::Vector {
+            lanes: 3,
+            elem: Box::new(IrType::Int(IntWidth::I32)),
+        };
+        assert_eq!(VShape::from_ir(&ty), None);
+    }
+
+    #[test]
+    fn vector_type_to_reg_class_returns_v128() {
+        let ty = IrType::Vector {
+            lanes: 4,
+            elem: Box::new(IrType::Float(FloatWidth::F32)),
+        };
+        assert_eq!(type_to_reg_class(&ty), RegClass::V128);
     }
 }
