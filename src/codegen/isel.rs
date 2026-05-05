@@ -1726,6 +1726,12 @@ fn select_inst(
             // alias isn't generated yet; placeholder.
             VShape::V4S | VShape::V2D => ArmOpcode::Nop,
         }),
+        InstKind::VSqrt(a) => emit_vunop(mf, ctx, mb, inst, *a, |s| match s {
+            VShape::F4S => ArmOpcode::FsqrtV4S,
+            VShape::F2D => ArmOpcode::FsqrtV2D,
+            // sqrt is float-only.
+            VShape::V4S | VShape::V2D => ArmOpcode::Nop,
+        }),
         InstKind::VFma(a, b, c) => {
             // FMLA is dest += a*b. Conventional 3-operand call
             // assumes dest is a fresh vreg — emit a copy-from-c
