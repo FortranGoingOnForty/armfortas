@@ -13463,6 +13463,50 @@ fn runtime_shape_array_function_result_auto_allocates_on_entry() {
 }
 
 #[test]
+fn fixed_shape_array_function_result_auto_allocates_on_entry() {
+    // F2018 §15.5.2.4: a function whose result is an explicit-shape
+    // array with constant bounds (e.g. `real :: res(3)`) flows through
+    // the same `HiddenResultAbi::ArrayDescriptor` ABI as runtime-shape
+    // results — the caller passes a 384-byte descriptor, the body
+    // expects `afs_array_lbound` / `afs_array_ubound` to return the
+    // declared bounds. Pre-fix `allocate_runtime_shape_array_result`
+    // early-returned when every spec was a compile-time integer, so
+    // the descriptor stayed zeroed and the body's first write
+    // (`res(1) = ...`) tripped `index 1 outside [1, 0]`. Reproduces
+    // stdlib's `cross_product_rsp`, every `merge_*` helper with a
+    // fixed-shape result, etc.
+    let src = write_program(
+        "module mm\ncontains\n  pure function cross(a, b) result(res)\n    real, intent(in) :: a(3), b(3)\n    real :: res(3)\n    res(1) = a(2)*b(3) - a(3)*b(2)\n    res(2) = a(3)*b(1) - a(1)*b(3)\n    res(3) = a(1)*b(2) - a(2)*b(1)\n  end function\nend module\n\nprogram t\n  use mm\n  implicit none\n  real :: a(3) = [1., 0., 0.]\n  real :: b(3) = [0., 1., 0.]\n  real :: c(3)\n  c = cross(a, b)\n  if (abs(c(1)) > 1.0e-6) error stop 1\n  if (abs(c(2)) > 1.0e-6) error stop 2\n  if (abs(c(3) - 1.0) > 1.0e-6) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("fixed_shape_array_result", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("fixed-shape array result compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "fixed-shape array result should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("fixed-shape array result run failed");
+    assert!(
+        run.status.success(),
+        "fixed-shape array result should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn all_compare_mixed_kind_generic_rank2_returns_descriptors() {
     // F2018 §10.1.5 + §16.9.5: `all(eye(4) == diag([1,1,1,1]))` from
     // stdlib's example_eye2. Reproduces three issues at once: generic-
