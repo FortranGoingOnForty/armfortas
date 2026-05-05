@@ -39,22 +39,15 @@ fn o3_vectorizes_sum_with_unary_load() {
         },
         Stage::OptIr,
     );
-    // Expect the unary lifted into the vector lane (vneg / vabs)
-    // inside the body, plus a vreduce_sum at exit.
     assert!(
-        o3_ir.contains("vneg"),
-        "expected vneg in IR:\n{}",
-        o3_ir
-    );
-    assert!(
-        o3_ir.contains("vabs"),
-        "expected vabs in IR:\n{}",
+        o3_ir.contains("vneg") && o3_ir.contains("vabs"),
+        "expected both vneg and vabs in IR:\n{}",
         o3_ir
     );
     assert_eq!(
         o3_ir.matches("vreduce_sum").count(),
-        2,
-        "expected two vreduce_sum:\n{}",
+        4,
+        "expected four vreduce_sum:\n{}",
         o3_ir
     );
 
@@ -68,11 +61,24 @@ fn o3_vectorizes_sum_with_unary_load() {
         .map(|l| l.trim())
         .filter(|l| !l.is_empty())
         .collect();
-    assert_eq!(trimmed.len(), 2, "expected two output lines:\n{}", stdout);
+    assert_eq!(trimmed.len(), 4, "expected four output lines:\n{}", stdout);
+    // sum(-i for i=1..32) = -528.
     assert_eq!(trimmed[0], "-528", "neg sum wrong: got {:?}", trimmed[0]);
+    // sum(|i-16| for i=1..32) = 240 + 16 = 256.
     assert!(
         trimmed[1].starts_with("2.56"),
-        "abs sum wrong: got {:?}",
+        "f32 abs sum wrong: got {:?}",
         trimmed[1]
+    );
+    assert!(
+        trimmed[2].starts_with("2.56"),
+        "f64 abs sum wrong: got {:?}",
+        trimmed[2]
+    );
+    // Trip = 31; head 28 + tail 3, sum |i-16| for i=1..31 = 240.
+    assert!(
+        trimmed[3].starts_with("2.4"),
+        "f32 abs+tail wrong: got {:?}",
+        trimmed[3]
     );
 }
