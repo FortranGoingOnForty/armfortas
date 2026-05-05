@@ -2,6 +2,11 @@
 ! has two array loads feeding a sub feeding the accumulator add.
 ! Lifts both loads to VLoad, the sub to VSub, the add to VAdd, and
 ! finishes with vreduce_sum.
+!
+! All three reductions equal sum(i, i=1..32) = 528.
+! CHECK: 528
+! CHECK: 5.2800000E2
+! CHECK: 5.280000000000000E2
 program test_do_loop_vectorize_reduce_sum_diff
   implicit none
   integer :: i, s_int
