@@ -1163,6 +1163,8 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
         ArmOpcode::FnegV2D => fmt_vunop(inst, "fneg", "2d"),
         ArmOpcode::FabsV4S => fmt_vunop(inst, "fabs", "4s"),
         ArmOpcode::FabsV2D => fmt_vunop(inst, "fabs", "2d"),
+        ArmOpcode::FsqrtV4S => fmt_vunop(inst, "fsqrt", "4s"),
+        ArmOpcode::FsqrtV2D => fmt_vunop(inst, "fsqrt", "2d"),
         ArmOpcode::FmlaV4S => fmt_vbinop(inst, "fmla", "4s"),
         ArmOpcode::FmlaV2D => fmt_vbinop(inst, "fmla", "2d"),
         ArmOpcode::FminV4S => fmt_vbinop(inst, "fmin", "4s"),
