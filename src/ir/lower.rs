@@ -19672,7 +19672,7 @@ fn allocate_runtime_shape_array_result(
     result_desc: ValueId,
     elem_ty: &IrType,
     decls: &[crate::ast::decl::SpannedDecl],
-    visible_param_consts: &HashMap<String, ConstScalar>,
+    _visible_param_consts: &HashMap<String, ConstScalar>,
     st: &SymbolTable,
     type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
 ) {
@@ -19717,22 +19717,22 @@ fn allocate_runtime_shape_array_result(
         return;
     }
 
-    let mut any_runtime = false;
+    // Bail on non-Explicit specs (assumed-shape, deferred, etc.) — those
+    // shapes aren't a function result we can size in the prologue.
     for spec in &specs {
-        let ArraySpec::Explicit { upper, .. } = spec else {
+        let ArraySpec::Explicit { .. } = spec else {
             return;
         };
-        if matches!(upper.node, Expr::IntegerLiteral { .. }) {
-            continue;
-        }
-        if eval_const_scalar(upper, visible_param_consts).is_some() {
-            continue;
-        }
-        any_runtime = true;
     }
-    if !any_runtime {
-        return;
-    }
+    // Both runtime-shape (`integer :: n; real :: r(n)`) AND fixed-shape
+    // (`real :: r(3)`) results need the descriptor populated here.
+    // ArrayDescriptor ABI means the body uses `afs_array_lbound` /
+    // `afs_array_ubound` for every subscript bounds-check and base-addr
+    // load — without prologue allocation, the descriptor stays zero and
+    // every `r(i) = ...` trips `index 1 outside [1, 0]`. Pre-fix this
+    // function early-returned when all bounds were const, leaving stdlib
+    // helpers like `cross_product_rsp(a,b) result(res); real :: res(3)`
+    // crashing on first write to the result.
 
     let mut lowers: Vec<ValueId> = Vec::with_capacity(specs.len());
     let mut uppers: Vec<ValueId> = Vec::with_capacity(specs.len());
