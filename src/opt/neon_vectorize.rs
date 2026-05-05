@@ -77,6 +77,12 @@ enum BinaryKind {
     Mul,
     /// Float-only — NEON has no integer vector divide.
     Div,
+    /// Element-wise `max(lhs, rhs)`. IR shape is
+    /// `select(cmp ge|gt lhs, rhs, lhs, rhs)`.
+    Max,
+    /// Element-wise `min(lhs, rhs)`. IR shape is
+    /// `select(cmp le|lt lhs, rhs, lhs, rhs)`.
+    Min,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -433,6 +439,37 @@ fn classify_body_op(
             }
             binop_body(stored_value, BinaryKind::Div, *l, *r, func, shape, dest, loop_defs)
         }
+        // Element-wise `c(i) = max(a(i), b(i))` and `min(...)`. The
+        // IR shape is `select(cmp(la, lb), t, f)` where {t, f} is
+        // {la, lb}. Only fires when the cmp's operands match the
+        // select's true/false arms (in some order); all four slots
+        // must be classifiable as load or invariant scalar.
+        InstKind::Select(cmp_v, t, f) => {
+            let defs = inst_map(func);
+            let cmp_inst = defs.get(cmp_v)?;
+            let (cmp_op, cmp_a, cmp_b) = match cmp_inst.kind {
+                InstKind::ICmp(op, a, b) | InstKind::FCmp(op, a, b) => (op, a, b),
+                _ => return None,
+            };
+            // The select's arms must be exactly the cmp's operands in
+            // some order so the result is `max` or `min` of them.
+            let bk = if cmp_a == *t && cmp_b == *f {
+                match cmp_op {
+                    CmpOp::Ge | CmpOp::Gt => BinaryKind::Max,
+                    CmpOp::Le | CmpOp::Lt => BinaryKind::Min,
+                    _ => return None,
+                }
+            } else if cmp_a == *f && cmp_b == *t {
+                match cmp_op {
+                    CmpOp::Ge | CmpOp::Gt => BinaryKind::Min,
+                    CmpOp::Le | CmpOp::Lt => BinaryKind::Max,
+                    _ => return None,
+                }
+            } else {
+                return None;
+            };
+            binop_body(stored_value, bk, *t, *f, func, shape, dest, loop_defs)
+        }
         _ => None,
     }
 }
@@ -755,6 +792,12 @@ fn apply_vector_plan(func: &mut Function, shape: &CountedLoop, plan: VectorPlan)
                     }
                     (InstKind::FDiv(l, r), BinaryKind::Div) => {
                         InstKind::VDiv(lhs_subst.unwrap_or(l), rhs_subst.unwrap_or(r))
+                    }
+                    (InstKind::Select(_, t, f), BinaryKind::Max) => {
+                        InstKind::VMax(lhs_subst.unwrap_or(t), rhs_subst.unwrap_or(f))
+                    }
+                    (InstKind::Select(_, t, f), BinaryKind::Min) => {
+                        InstKind::VMin(lhs_subst.unwrap_or(t), rhs_subst.unwrap_or(f))
                     }
                     _ => inst.kind.clone(),
                 };
