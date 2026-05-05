@@ -142,6 +142,10 @@ pub enum ArmOpcode {
     Faddv4S,  // FADDV Sd, Vn.4s     (across 4 f32 lanes → scalar)
     Sminv4S,  // SMINV Sd, Vn.4s
     Smaxv4S,
+    /// `ADDP.2D Vd, Vn, Vm` — pairwise integer add over two i64 lanes.
+    /// Used for i64 cross-lane reduction: `addp.2d v_dst, v_src, v_src`
+    /// puts the sum of the two lanes in v_dst[0].
+    AddpV2D,
     Uminv4S,
     Umaxv4S,
     Addv4S,   // integer cross-lane add over 4×i32
