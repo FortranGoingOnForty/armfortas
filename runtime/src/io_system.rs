@@ -23,6 +23,17 @@ fn io_state() -> &'static Mutex<IoState> {
     STATE.get_or_init(|| Mutex::new(IoState::new()))
 }
 
+fn scratch_filename(unit: i32) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let dir = std::env::temp_dir();
+    dir.join(format!("afs_scratch_{pid}_{}_{seq}.tmp", unit.unsigned_abs()))
+        .to_string_lossy()
+        .into_owned()
+}
+
 #[inline]
 fn read_i128_ptr(src: *const i128) -> Option<i128> {
     if src.is_null() {
@@ -94,6 +105,8 @@ struct Unit {
     formatted_read_record: Option<String>,
     /// Cursor within a cached formatted input record for ADVANCE='NO' reads.
     formatted_read_cursor: usize,
+    /// True for STATUS='SCRATCH' units: backing file is deleted on close or exit.
+    scratch: bool,
 }
 
 impl Unit {
@@ -226,6 +239,7 @@ impl IoState {
                 read_tokens: Vec::new(),
                 formatted_read_record: None,
                 formatted_read_cursor: 0,
+                scratch: false,
             },
         );
         units.insert(
@@ -242,6 +256,7 @@ impl IoState {
                 read_tokens: Vec::new(),
                 formatted_read_record: None,
                 formatted_read_cursor: 0,
+                scratch: false,
             },
         );
         units.insert(
@@ -258,6 +273,7 @@ impl IoState {
                 read_tokens: Vec::new(),
                 formatted_read_record: None,
                 formatted_read_cursor: 0,
+                scratch: false,
             },
         );
 
@@ -346,6 +362,7 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
     let unit = cb.unit;
     let fname = unsafe_str(cb.filename, cb.filename_len);
     let status_str = unsafe_str(cb.status, cb.status_len).to_lowercase();
+    let is_scratch = status_str.trim() == "scratch";
     let action_str = unsafe_str(cb.action, cb.action_len).to_lowercase();
     let access_str = unsafe_str(cb.access, cb.access_len).to_lowercase();
     let form_str = unsafe_str(cb.form, cb.form_len).to_lowercase();
@@ -378,10 +395,16 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
         )
     });
     let fname = if missing_filename {
-        existing_unit
-            .as_ref()
-            .map(|(filename, _, _, _, _)| filename.clone())
-            .unwrap_or(fname)
+        if is_scratch {
+            // STATUS='SCRATCH': F2018 §12.5.6.13 — implementation chooses the
+            // backing path; file must not be FILE=, must be deleted on close.
+            scratch_filename(actual_unit)
+        } else {
+            existing_unit
+                .as_ref()
+                .map(|(filename, _, _, _, _)| filename.clone())
+                .unwrap_or(fname)
+        }
     } else {
         fname
     };
@@ -546,6 +569,7 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
                     read_tokens: Vec::new(),
                     formatted_read_record: None,
                     formatted_read_cursor: 0,
+                    scratch: is_scratch,
                 },
             );
 
@@ -626,10 +650,12 @@ pub extern "C" fn afs_close_ex(unit: i32, status: *const u8, status_len: i64, io
     if let Some(mut u) = state.units.remove(&unit) {
         let _ = u.flush();
         let filename = u.filename.clone();
+        // STATUS='SCRATCH' units always delete on close (F2018 §12.5.6.13).
+        let delete = delete_on_close || u.scratch;
         drop(u);
 
         let mut close_status = 0;
-        if delete_on_close
+        if delete
             && !matches!(filename.as_str(), "stdin" | "stdout" | "stderr")
             && !filename.is_empty()
         {
@@ -2434,6 +2460,16 @@ pub extern "C" fn afs_io_finalize() {
     if let Ok(mut state) = io_state().try_lock() {
         for (_, unit) in state.units.iter_mut() {
             let _ = unit.flush();
+        }
+        // Delete any STATUS='SCRATCH' backing files left open at exit.
+        let scratch_paths: Vec<String> = state
+            .units
+            .values()
+            .filter(|u| u.scratch && !u.filename.is_empty())
+            .map(|u| u.filename.clone())
+            .collect();
+        for path in scratch_paths {
+            let _ = std::fs::remove_file(&path);
         }
     }
 }
