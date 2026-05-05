@@ -789,8 +789,23 @@ fn inst_map(func: &Function) -> HashMap<ValueId, &Inst> {
         .collect()
 }
 
+/// What feeds the accumulator on each iteration. `Sum` is a single
+/// load; `Dot` multiplies two loads, then adds the product to the
+/// accumulator (i.e. dot-product fold).
+#[derive(Debug, Clone)]
+enum AccumulateSource {
+    Sum { load_id: ValueId },
+    Dot {
+        imul_id: ValueId,
+        load_a: ValueId,
+        load_b: ValueId,
+    },
+}
+
 /// A sum-reduction loop:
 ///   `do i = lo, hi; s = s + a(i); end do` (or fadd for floats).
+/// or a dot-product fold:
+///   `do i = lo, hi; s = s + a(i)*b(i); end do`.
 ///
 /// The loop header carries the IV and a scalar accumulator as block
 /// params. The accumulator escapes the loop and is reduced to a
@@ -809,9 +824,9 @@ struct ReductionPlan {
     acc_param_idx: usize,
     /// Scalar accumulator init value passed in the preheader's branch.
     acc_init: ValueId,
-    /// Original Load instruction in the body.
-    load_id: ValueId,
-    /// Original `acc' = acc + load` instruction.
+    /// What computes the per-iteration value to fold into `acc`.
+    source: AccumulateSource,
+    /// Original `acc' = acc + load` (or `acc + imul`) instruction.
     accumulate_id: ValueId,
     /// Original `iv' = iv + 1` instruction.
     step_iadd: ValueId,
@@ -928,31 +943,74 @@ fn detect_reduction_plan(
         (IrType::Float(_), InstKind::FAdd(l, r)) => (*l, *r),
         _ => return None,
     };
-    // One side must be the acc_param, the other a load from the
-    // counted iteration space.
-    let (accumulate_id, load_id) = if acc_lhs == acc_param {
+    // One side must be the acc_param. The other is either a single
+    // load (sum reduction) or an imul/fmul of two loads (dot
+    // product).
+    let (accumulate_id, value_v) = if acc_lhs == acc_param {
         (accumulate_inst.id, acc_rhs)
     } else if acc_rhs == acc_param {
         (accumulate_inst.id, acc_lhs)
     } else {
         return None;
     };
-    let load_inst = defs.get(&load_id)?;
-    let InstKind::Load(load_ptr) = load_inst.kind else {
-        return None;
+    let value_inst = defs.get(&value_v)?;
+    // Classify `value_v` as a load (Sum) or an imul/fmul of two
+    // loads (Dot).
+    let source = match (&elem_ty, &value_inst.kind) {
+        (_, InstKind::Load(load_ptr)) => {
+            let access = classify_array_access(func, *load_ptr, iv_param)?;
+            if access.elem_ty != elem_ty {
+                return None;
+            }
+            let upper = access
+                .lower
+                .checked_add(access.len as i64)
+                .and_then(|v| v.checked_sub(1))?;
+            if iv_init != access.lower || iv_bound != upper {
+                return None;
+            }
+            AccumulateSource::Sum {
+                load_id: value_inst.id,
+            }
+        }
+        (IrType::Int(_), InstKind::IMul(la, lb))
+        | (IrType::Float(_), InstKind::FMul(la, lb)) => {
+            let load_a_inst = defs.get(la)?;
+            let load_b_inst = defs.get(lb)?;
+            let InstKind::Load(ptr_a) = load_a_inst.kind else {
+                return None;
+            };
+            let InstKind::Load(ptr_b) = load_b_inst.kind else {
+                return None;
+            };
+            let acc_a = classify_array_access(func, ptr_a, iv_param)?;
+            let acc_b = classify_array_access(func, ptr_b, iv_param)?;
+            if acc_a.elem_ty != elem_ty || acc_b.elem_ty != elem_ty {
+                return None;
+            }
+            let upper_a = acc_a
+                .lower
+                .checked_add(acc_a.len as i64)
+                .and_then(|v| v.checked_sub(1))?;
+            let upper_b = acc_b
+                .lower
+                .checked_add(acc_b.len as i64)
+                .and_then(|v| v.checked_sub(1))?;
+            if iv_init != acc_a.lower
+                || iv_bound != upper_a
+                || iv_init != acc_b.lower
+                || iv_bound != upper_b
+            {
+                return None;
+            }
+            AccumulateSource::Dot {
+                imul_id: value_inst.id,
+                load_a: load_a_inst.id,
+                load_b: load_b_inst.id,
+            }
+        }
+        _ => return None,
     };
-    let access = classify_array_access(func, load_ptr, iv_param)?;
-    if access.elem_ty != elem_ty {
-        return None;
-    }
-    // Require full-array coverage for the load too.
-    let upper = access
-        .lower
-        .checked_add(access.len as i64)
-        .and_then(|v| v.checked_sub(1))?;
-    if iv_init != access.lower || iv_bound != upper {
-        return None;
-    }
 
     // The iv step.
     let step_inst = defs.get(&body_term_arg_iv)?;
@@ -1007,7 +1065,7 @@ fn detect_reduction_plan(
         acc_param,
         acc_param_idx: 1,
         acc_init,
-        load_id: load_inst.id,
+        source,
         accumulate_id,
         step_iadd,
         step_const,
@@ -1082,19 +1140,51 @@ fn apply_reduction_plan(func: &mut Function, lp: &NaturalLoop, plan: ReductionPl
         }
     }
 
-    // 4. Rewrite the scalar Load → VLoad (vector type).
-    let body_block = func.block_mut(plan.body);
-    if let Some(inst) = body_block.insts.iter_mut().find(|i| i.id == plan.load_id) {
-        if let InstKind::Load(ptr) = inst.kind {
-            inst.kind = InstKind::VLoad(ptr);
-            inst.ty = v_ty.clone();
+    // 4. Rewrite the per-iteration source value:
+    //    - Sum: one Load → VLoad.
+    //    - Dot: two Loads → VLoad each, plus IMul/FMul → VMul.
+    match plan.source.clone() {
+        AccumulateSource::Sum { load_id } => {
+            let body_block = func.block_mut(plan.body);
+            if let Some(inst) = body_block.insts.iter_mut().find(|i| i.id == load_id) {
+                if let InstKind::Load(ptr) = inst.kind {
+                    inst.kind = InstKind::VLoad(ptr);
+                    inst.ty = v_ty.clone();
+                }
+            }
+            func.register_type(load_id, v_ty.clone());
+        }
+        AccumulateSource::Dot {
+            imul_id,
+            load_a,
+            load_b,
+        } => {
+            for load_id in [load_a, load_b] {
+                let body_block = func.block_mut(plan.body);
+                if let Some(inst) = body_block.insts.iter_mut().find(|i| i.id == load_id) {
+                    if let InstKind::Load(ptr) = inst.kind {
+                        inst.kind = InstKind::VLoad(ptr);
+                        inst.ty = v_ty.clone();
+                    }
+                }
+                func.register_type(load_id, v_ty.clone());
+            }
+            let body_block = func.block_mut(plan.body);
+            if let Some(inst) = body_block.insts.iter_mut().find(|i| i.id == imul_id) {
+                let new_kind = match inst.kind.clone() {
+                    InstKind::IMul(l, r) | InstKind::FMul(l, r) => InstKind::VMul(l, r),
+                    other => other,
+                };
+                inst.kind = new_kind;
+                inst.ty = v_ty.clone();
+            }
+            func.register_type(imul_id, v_ty.clone());
         }
     }
-    func.register_type(plan.load_id, v_ty.clone());
 
     // 5. Rewrite the accumulate IAdd/FAdd → VAdd (both operands now
-    //    vectors: the acc_param block param is vector, the load is
-    //    vector).
+    //    vectors: the acc_param block param is vector, the source
+    //    value is vector).
     let body_block = func.block_mut(plan.body);
     if let Some(inst) = body_block.insts.iter_mut().find(|i| i.id == plan.accumulate_id) {
         let new_kind = match inst.kind.clone() {
