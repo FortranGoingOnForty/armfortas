@@ -31338,6 +31338,24 @@ fn lower_formatted_char_read_item(
 fn lower_fmt_push(b: &mut FuncBuilder, ctx: &mut LowerCtx, item: &crate::ast::expr::SpannedExpr) {
     let is_char = expr_is_character_expr(b, &ctx.locals, item, ctx.st, Some(ctx.type_layouts));
 
+    // Whole-array Name reference: iterate elements and push each.  Without
+    // this, `write(u, fmt) d` for `real :: d(2)` would fall through to the
+    // scalar arms below and emit a single push of the array address as an
+    // integer, leaving the format engine starved of values and the on-disk
+    // record empty.  Mirrors the array-handling in lower_write_items for
+    // list-directed I/O.
+    if !is_char {
+        if let Expr::Name { name } = &item.node {
+            let key = name.to_lowercase();
+            if let Some(info) = ctx.locals.get(&key).cloned() {
+                if local_is_array_like(&info) {
+                    lower_whole_array_fmt_push(b, &info);
+                    return;
+                }
+            }
+        }
+    }
+
     if is_char || matches!(item.node, Expr::StringLiteral { .. }) {
         let (ptr, len) = lower_string_expr_ctx(b, ctx, item);
         b.call(
@@ -32265,6 +32283,99 @@ fn lower_section_write_nd(
 /// arr` and equivalent forms. Without this the array's base
 /// pointer leaks into the Ptr<_> arm of the scalar write
 /// dispatcher and gets mis-routed to afs_write_string.
+/// Iterate a whole-array Name and push each element through the formatted
+/// I/O API (`afs_fmt_push_*`).  Mirrors `lower_whole_array_write` but emits
+/// pushes with the right widening rules for the format engine.
+fn lower_whole_array_fmt_push(b: &mut FuncBuilder, info: &LocalInfo) {
+    let base = array_base_addr(b, info);
+    let elem_bytes = ir_scalar_byte_size(&info.ty);
+    let n = array_total_elems_value(b, info);
+
+    let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let zero = b.const_i64(0);
+    b.store(zero, i_addr);
+
+    let bb_check = b.create_block("fmt_arr_check");
+    let bb_body = b.create_block("fmt_arr_body");
+    let bb_exit = b.create_block("fmt_arr_exit");
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let i = b.load(i_addr);
+    let done = b.icmp(CmpOp::Ge, i, n);
+    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+    b.set_block(bb_body);
+    let i_val = b.load(i_addr);
+    let elem_bytes_v = b.const_i64(elem_bytes);
+    let byte_off = b.imul(i_val, elem_bytes_v);
+    let ptr = b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
+    let elem = b.load_typed(ptr, info.ty.clone());
+    match &info.ty {
+        IrType::Int(IntWidth::I128) => {
+            let slot = b.alloca(IrType::Int(IntWidth::I128));
+            b.store(elem, slot);
+            b.call(
+                FuncRef::External("afs_fmt_push_int128".into()),
+                vec![slot],
+                IrType::Void,
+            );
+        }
+        IrType::Int(IntWidth::I64) => {
+            b.call(
+                FuncRef::External("afs_fmt_push_int".into()),
+                vec![elem],
+                IrType::Void,
+            );
+        }
+        IrType::Int(_) => {
+            let widened = b.int_extend(elem, IntWidth::I64, true);
+            b.call(
+                FuncRef::External("afs_fmt_push_int".into()),
+                vec![widened],
+                IrType::Void,
+            );
+        }
+        IrType::Float(FloatWidth::F32) => {
+            let widened = b.float_extend(elem, FloatWidth::F64);
+            b.call(
+                FuncRef::External("afs_fmt_push_real".into()),
+                vec![widened],
+                IrType::Void,
+            );
+        }
+        IrType::Float(_) => {
+            b.call(
+                FuncRef::External("afs_fmt_push_real".into()),
+                vec![elem],
+                IrType::Void,
+            );
+        }
+        IrType::Bool => {
+            let int_val = b.int_extend(elem, IntWidth::I32, false);
+            b.call(
+                FuncRef::External("afs_fmt_push_logical".into()),
+                vec![int_val],
+                IrType::Void,
+            );
+        }
+        _ => {
+            let widened = b.int_extend(elem, IntWidth::I64, true);
+            b.call(
+                FuncRef::External("afs_fmt_push_int".into()),
+                vec![widened],
+                IrType::Void,
+            );
+        }
+    }
+    let one = b.const_i64(1);
+    let next = b.iadd(i_val, one);
+    b.store(next, i_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
+}
+
 fn lower_whole_array_write(
     b: &mut FuncBuilder,
     _ctx: &mut LowerCtx,
