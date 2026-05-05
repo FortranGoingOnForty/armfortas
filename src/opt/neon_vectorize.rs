@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 use crate::ir::inst::*;
 use crate::ir::types::{FloatWidth, IntWidth, IrType};
 
-use super::loop_utils::{find_preheader, loop_defined_values, resolve_const_int};
+use super::loop_utils::{find_preheader, loop_defined_values, remap_inst_kind, resolve_const_int};
 use super::pass::Pass;
 use super::util::{find_natural_loops, inst_uses, predecessors, terminator_uses, NaturalLoop};
 
@@ -52,6 +52,14 @@ struct CountedLoop {
     iv_param: ValueId,
     iv_init: i64,
     iv_bound: i64,
+    /// The header's `icmp le|lt iv, hi_const` instruction id. Needed
+    /// when scalar-tail peeling has to retarget the loop's bound to
+    /// `iv_init + head_count - 1`.
+    cond_id: ValueId,
+    /// The ConstInt feeding the icmp's RHS. `apply_vector_plan` does
+    /// not mutate it in place (could be aliased) but inserts a fresh
+    /// const and rewires the icmp.
+    bound_const_id: ValueId,
 }
 
 #[derive(Debug, Clone)]
@@ -144,6 +152,12 @@ struct VectorPlan {
     step_const: ValueId,
     /// Width of the IV ConstInt (i32 for typical 1..N loops).
     iv_int_width: IntWidth,
+    /// Number of vector iterations × `lanes` = head iteration count.
+    /// When `tail_count == 0` the loop fully vectorizes; otherwise we
+    /// peel `tail_count` scalar iterations into the exit block.
+    head_count: i64,
+    /// Remaining iterations after the head (always `< lanes`).
+    tail_count: i64,
     /// Span to use for synthesised instructions.
     span: crate::lexer::Span,
 }
@@ -221,10 +235,12 @@ fn detect_counted_loop(
         return None;
     }
     let cond_inst = header_block.insts.iter().find(|inst| inst.id == cond_id)?;
-    let iv_bound = match cond_inst.kind {
-        InstKind::ICmp(CmpOp::Le, lhs, rhs) if lhs == iv_param => resolve_const_int(func, rhs)?,
+    let (iv_bound, bound_const_id) = match cond_inst.kind {
+        InstKind::ICmp(CmpOp::Le, lhs, rhs) if lhs == iv_param => {
+            (resolve_const_int(func, rhs)?, rhs)
+        }
         InstKind::ICmp(CmpOp::Lt, lhs, rhs) if lhs == iv_param => {
-            resolve_const_int(func, rhs)?.checked_sub(1)?
+            (resolve_const_int(func, rhs)?.checked_sub(1)?, rhs)
         }
         _ => return None,
     };
@@ -235,6 +251,8 @@ fn detect_counted_loop(
         iv_param,
         iv_init,
         iv_bound,
+        cond_id,
+        bound_const_id,
     })
 }
 
@@ -277,16 +295,22 @@ fn build_vector_plan(
         return None;
     }
     let lanes = lane_count_for(&first_dest.elem_ty)?;
-    if (first_dest.len as u64) % (lanes as u64) != 0 {
-        return None;
-    }
     let trip = shape
         .iv_bound
         .checked_sub(shape.iv_init)
         .and_then(|d| d.checked_add(1))?;
-    if trip <= 0 || (trip as u64) % (lanes as u64) != 0 {
+    if trip <= 0 {
         return None;
     }
+    // Head count is the largest multiple of `lanes` that fits within
+    // the trip; the remainder runs as scalar tail peeled into the
+    // exit block.
+    let head_count = trip - (trip % lanes as i64);
+    if head_count == 0 {
+        // Not a single full vector iteration would run — bail.
+        return None;
+    }
+    let tail_count = trip - head_count;
     let elem_ty = first_dest.elem_ty.clone();
     let span = stores[0].1;
 
@@ -337,6 +361,8 @@ fn build_vector_plan(
     Some(VectorPlan {
         lanes,
         elem_ty,
+        head_count,
+        tail_count,
         statements,
         step_iadd: step_inst.id,
         step_const,
@@ -609,6 +635,27 @@ fn vector_ty(elem: &IrType, lanes: u8) -> IrType {
 fn apply_vector_plan(func: &mut Function, shape: &CountedLoop, plan: VectorPlan) {
     let v_ty = vector_ty(&plan.elem_ty, plan.lanes);
 
+    // 0. If we'll be peeling scalar tail iterations, snapshot the body's
+    //    instruction list BEFORE we mutate it in place. The snapshot
+    //    holds the original (scalar) Load/Store/Binop shape that the
+    //    peel walks per remainder iteration. Take a clone of the Vec
+    //    so subsequent in-place mutation doesn't disturb the snapshot.
+    let body_snapshot: Option<Vec<Inst>> = if plan.tail_count > 0 {
+        Some(func.block(shape.body).insts.clone())
+    } else {
+        None
+    };
+    // Identify the exit block (the false-dest of the header's
+    // cond_br) so we know where to peel into.
+    let exit_block_id: Option<BlockId> = if plan.tail_count > 0 {
+        match &func.block(shape.header).terminator {
+            Some(Terminator::CondBranch { false_dest, .. }) => Some(*false_dest),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
     // 1. Replace the step `iadd iv, 1` constant operand with V (using
     //    a fresh ConstInt to avoid clobbering shared `1` constants).
     let new_step_const = func.next_value_id();
@@ -715,6 +762,110 @@ fn apply_vector_plan(func: &mut Function, shape: &CountedLoop, plan: VectorPlan)
             }
         }
     }
+
+    // 3. Scalar tail. If `tail_count` remainder iterations live at the
+    //    end of the loop, retarget the original icmp's bound to
+    //    `iv_init + head_count - 1` and peel the remaining scalar
+    //    iterations into the head of the exit block.
+    if plan.tail_count > 0 {
+        if let (Some(snapshot), Some(exit_block)) = (body_snapshot, exit_block_id) {
+            apply_scalar_tail_peel(func, shape, &plan, &snapshot, exit_block);
+        }
+    }
+}
+
+/// Insert a fresh ConstInt for the head bound (`iv_init + head_count
+/// - 1`) into the preheader and rewire the original icmp's RHS to
+/// reference it; then peel `tail_count` scalar copies of the body
+/// into the top of the exit block, with the IV substituted by a
+/// constant per iteration.
+fn apply_scalar_tail_peel(
+    func: &mut Function,
+    shape: &CountedLoop,
+    plan: &VectorPlan,
+    body_snapshot: &[Inst],
+    exit_block: BlockId,
+) {
+    let int_ty = IrType::Int(plan.iv_int_width);
+
+    // Insert the new bound const (iv_init + head_count - 1) at the
+    // top of the preheader. It dominates the header's icmp.
+    let new_bound = shape.iv_init + plan.head_count - 1;
+    let new_bound_id = func.next_value_id();
+    func.register_type(new_bound_id, int_ty.clone());
+    let pre_block = func.block_mut(shape.preheader);
+    pre_block.insts.insert(
+        0,
+        Inst {
+            id: new_bound_id,
+            kind: InstKind::ConstInt(new_bound as i128, plan.iv_int_width),
+            ty: int_ty.clone(),
+            span: plan.span,
+        },
+    );
+
+    // Rewrite the icmp's RHS to point at the new bound const.
+    let header_block = func.block_mut(shape.header);
+    if let Some(inst) = header_block
+        .insts
+        .iter_mut()
+        .find(|i| i.id == shape.cond_id)
+    {
+        match &mut inst.kind {
+            InstKind::ICmp(_, _, rhs) => {
+                if *rhs == shape.bound_const_id {
+                    *rhs = new_bound_id;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Skip the step iadd in the snapshot: the peel doesn't need to
+    // bump the IV.
+    let step_inst_id = plan.step_iadd;
+
+    // Build a vector of `(new_inst_id, new_kind, ty, span)` per peel
+    // iteration, then prepend them to the exit block's insts.
+    let mut peeled: Vec<Inst> = Vec::new();
+    for t in 0..plan.tail_count {
+        let tail_iv = shape.iv_init + plan.head_count + t;
+        let tail_iv_const_id = func.next_value_id();
+        func.register_type(tail_iv_const_id, int_ty.clone());
+        peeled.push(Inst {
+            id: tail_iv_const_id,
+            kind: InstKind::ConstInt(tail_iv as i128, plan.iv_int_width),
+            ty: int_ty.clone(),
+            span: plan.span,
+        });
+
+        let mut val_map: HashMap<ValueId, ValueId> = HashMap::new();
+        val_map.insert(shape.iv_param, tail_iv_const_id);
+
+        for inst in body_snapshot {
+            // Skip the step iadd — peel iterations don't bump the IV.
+            if inst.id == step_inst_id {
+                continue;
+            }
+            let new_id = func.next_value_id();
+            func.register_type(new_id, inst.ty.clone());
+            let new_kind = remap_inst_kind(&inst.kind, &val_map);
+            val_map.insert(inst.id, new_id);
+            peeled.push(Inst {
+                id: new_id,
+                kind: new_kind,
+                ty: inst.ty.clone(),
+                span: inst.span,
+            });
+        }
+    }
+
+    // Prepend peeled insts at the top of the exit block.
+    let exit = func.block_mut(exit_block);
+    let existing = std::mem::take(&mut exit.insts);
+    let mut new_insts = peeled;
+    new_insts.extend(existing);
+    exit.insts = new_insts;
 }
 
 /// Iterate the operands of a body op (one for `Copy`/`Unary`, two
@@ -1911,9 +2062,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_divisible_trip_count() {
-        // length 31 → not divisible by V=4. The pass should bail out
-        // and leave the loop alone.
+    fn peels_scalar_tail_for_non_divisible_trip_count() {
+        // length 31 → not divisible by V=4. The pass vectorizes 28
+        // iterations (head_count = 7 × 4) and peels 3 scalar
+        // iterations into the exit block.
         let mut module = Module::new("m".into());
         let mut func = Function::new("__prog_vec".into(), vec![], IrType::Void);
         let entry = func.entry;
@@ -2028,6 +2180,35 @@ mod tests {
         module.add_function(func);
 
         let changed = NeonVectorize.run(&mut module);
-        assert!(!changed, "trip count not divisible by V should not be vectorized");
+        assert!(changed, "scalar tail should let the head vectorize");
+
+        let func = &module.functions[0];
+        let body_block = func.block(body);
+
+        // Body has at least one VLoad and one VStore (vectorized head).
+        let n_vload = body_block
+            .insts
+            .iter()
+            .filter(|i| matches!(i.kind, InstKind::VLoad(_)))
+            .count();
+        assert!(n_vload >= 2, "two array loads should become VLoads");
+        let n_vstore = body_block
+            .insts
+            .iter()
+            .filter(|i| matches!(i.kind, InstKind::VStore(..)))
+            .count();
+        assert_eq!(n_vstore, 1, "the destination store should become a VStore");
+
+        // Exit block has 3 peeled scalar Stores (one per tail iter).
+        let exit_block = func.block(exit);
+        let exit_stores = exit_block
+            .insts
+            .iter()
+            .filter(|i| matches!(i.kind, InstKind::Store(..)))
+            .count();
+        assert_eq!(
+            exit_stores, 3,
+            "three scalar stores should be peeled into the exit block"
+        );
     }
 }
