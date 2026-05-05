@@ -802,6 +802,12 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
             v_reg_bare(&inst.operands[1]),
             v_reg_bare(&inst.operands[2]),
         ),
+        ArmOpcode::FaddpV4S => format!(
+            "faddp.4s {}, {}, {}",
+            v_reg_bare(&inst.operands[0]),
+            v_reg_bare(&inst.operands[1]),
+            v_reg_bare(&inst.operands[2]),
+        ),
 
         ArmOpcode::LdrImm | ArmOpcode::LdrFpImm | ArmOpcode::LdrsbImm | ArmOpcode::LdrshImm => {
             let dest = op_str(&inst.operands[0]);
