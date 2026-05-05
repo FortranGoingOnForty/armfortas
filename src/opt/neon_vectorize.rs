@@ -67,6 +67,8 @@ enum BinaryKind {
     Add,
     Sub,
     Mul,
+    /// Float-only — NEON has no integer vector divide.
+    Div,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -384,6 +386,16 @@ fn classify_body_op(
         InstKind::FMul(l, r) => {
             binop_body(stored_value, BinaryKind::Mul, *l, *r, func, shape, dest, loop_defs)
         }
+        InstKind::FDiv(l, r) => {
+            // Integer divide has no NEON form; only floats. The
+            // binop_body classifier doesn't itself check element
+            // type, but `lane_count_for` already required the dest
+            // to be Float for this code path to reach here.
+            if !matches!(dest.elem_ty, IrType::Float(_)) {
+                return None;
+            }
+            binop_body(stored_value, BinaryKind::Div, *l, *r, func, shape, dest, loop_defs)
+        }
         _ => None,
     }
 }
@@ -681,6 +693,9 @@ fn apply_vector_plan(func: &mut Function, shape: &CountedLoop, plan: VectorPlan)
                     (InstKind::IMul(l, r), BinaryKind::Mul)
                     | (InstKind::FMul(l, r), BinaryKind::Mul) => {
                         InstKind::VMul(lhs_subst.unwrap_or(l), rhs_subst.unwrap_or(r))
+                    }
+                    (InstKind::FDiv(l, r), BinaryKind::Div) => {
+                        InstKind::VDiv(lhs_subst.unwrap_or(l), rhs_subst.unwrap_or(r))
                     }
                     _ => inst.kind.clone(),
                 };
