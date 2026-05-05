@@ -10,5 +10,6 @@
 //! (`crate::sema::resolve::resolve_file`, ...).
 
 mod core;
+mod statement_functions;
 
 pub use core::*;
