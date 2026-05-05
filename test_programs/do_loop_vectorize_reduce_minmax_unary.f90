@@ -8,6 +8,9 @@
 ! For a(i) = i - 16 over i=1..32, the magnitudes range over
 ! 0..16 (with 0 appearing once at i=16). max(|.|) = 16,
 ! min(|.|) = 0.
+!
+! CHECK: 1.6000000E1
+! CHECK: 0.0000000E0
 program test_do_loop_vectorize_reduce_minmax_unary
   implicit none
   integer :: i
