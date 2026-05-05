@@ -33,6 +33,7 @@ pub mod loop_tree;
 pub mod loop_utils;
 pub mod lsf;
 pub mod mem2reg;
+pub mod neon_vectorize;
 pub mod pass;
 pub mod peel;
 pub mod pipeline;
