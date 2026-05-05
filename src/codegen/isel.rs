@@ -1832,16 +1832,36 @@ fn select_inst(
             //              wanted i64 semantics — matches scalar IAdd)
             let src = ctx.lookup_vreg(*v);
             match &inst.ty {
-                IrType::Float(FloatWidth::F32) | IrType::Float(FloatWidth::F64) => {
+                IrType::Float(FloatWidth::F32) => {
+                    // NEON has no `faddv.4s`. Reduce 4 f32 lanes
+                    // with two pairwise adds:
+                    //   1) `faddp.4s v_tmp, v_src, v_src`
+                    //         → [a+b, c+d, a+b, c+d]
+                    //   2) `faddp.2s s_dest, v_tmp`
+                    //         → (a+b)+(c+d) — the full sum
+                    let tmp = mf.new_vreg(RegClass::V128);
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode: ArmOpcode::FaddpV4S,
+                        operands: vec![
+                            MachineOperand::VReg(tmp),
+                            MachineOperand::VReg(src),
+                            MachineOperand::VReg(src),
+                        ],
+                        def: Some(tmp),
+                    });
                     let class = type_to_reg_class(&inst.ty);
                     let dest = ctx.get_vreg(mf, inst.id, class);
-                    let opcode = match &inst.ty {
-                        IrType::Float(FloatWidth::F32) => ArmOpcode::Faddv4S,
-                        IrType::Float(FloatWidth::F64) => ArmOpcode::FaddpV2D,
-                        _ => unreachable!(),
-                    };
                     mf.block_mut(mb).insts.push(MachineInst {
-                        opcode,
+                        opcode: ArmOpcode::FaddpV2S,
+                        operands: vec![MachineOperand::VReg(dest), MachineOperand::VReg(tmp)],
+                        def: Some(dest),
+                    });
+                }
+                IrType::Float(FloatWidth::F64) => {
+                    let class = type_to_reg_class(&inst.ty);
+                    let dest = ctx.get_vreg(mf, inst.id, class);
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode: ArmOpcode::FaddpV2D,
                         operands: vec![MachineOperand::VReg(dest), MachineOperand::VReg(src)],
                         def: Some(dest),
                     });
