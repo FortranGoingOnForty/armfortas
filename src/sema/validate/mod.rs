@@ -11,5 +11,6 @@
 //! `FortranStandard`, ...) so the rest of the compiler isn't disturbed.
 
 mod core;
+mod pure_elemental;
 
 pub use core::*;
