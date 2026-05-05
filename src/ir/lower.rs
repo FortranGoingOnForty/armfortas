@@ -39086,7 +39086,10 @@ fn lower_array_section(
                 b.store(stride_val, p16);
             }
             crate::ast::expr::SectionSubscript::Element(e) => {
-                // Single element subscript in a section context — treat as start=end=val, stride=1.
+                // Single element subscript in a section context is a *rank-reducing*
+                // scalar selection. We mark it with stride=0 (sentinel) so
+                // afs_create_section knows to drop this dim from the result and fold
+                // the source-extent multiplier into the surviving dims' memory stride.
                 let raw = lower_expr_with_optional_layouts(b, locals, e, st, type_layouts);
                 let val = widen_idx_to_i64(b, raw);
                 let off0 = b.const_i64(base_offset);
@@ -39097,8 +39100,8 @@ fn lower_array_section(
                 let p16 = b.gep(specs, vec![off16], IrType::Int(IntWidth::I8));
                 b.store(val, p0);
                 b.store(val, p8);
-                let one = b.const_i64(1);
-                b.store(one, p16);
+                let zero = b.const_i64(0);
+                b.store(zero, p16);
             }
         }
     }
