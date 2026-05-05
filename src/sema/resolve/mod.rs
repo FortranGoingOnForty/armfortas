@@ -11,5 +11,6 @@
 
 mod core;
 mod statement_functions;
+mod use_resolution;
 
 pub use core::*;
