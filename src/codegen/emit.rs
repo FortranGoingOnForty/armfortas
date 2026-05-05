@@ -791,6 +791,11 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
             op_str(&inst.operands[0]),
             op_str(&inst.operands[1])
         ),
+        ArmOpcode::Mov16B => format!(
+            "mov.16b {}, {}",
+            v_reg_bare(&inst.operands[0]),
+            v_reg_bare(&inst.operands[1]),
+        ),
 
         ArmOpcode::LdrImm | ArmOpcode::LdrFpImm | ArmOpcode::LdrsbImm | ArmOpcode::LdrshImm => {
             let dest = op_str(&inst.operands[0]);
