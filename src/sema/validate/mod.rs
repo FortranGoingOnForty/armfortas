@@ -10,6 +10,7 @@
 //! (`crate::sema::validate::validate_file`, `is_intrinsic_name`,
 //! `FortranStandard`, ...) so the rest of the compiler isn't disturbed.
 
+mod allocatable;
 mod core;
 mod pure_elemental;
 

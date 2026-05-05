@@ -7,6 +7,10 @@
 use crate::sema::symtab::*;
 use crate::sema::types::expr_type;
 
+use super::allocatable::{
+    allocate_item_needs_explicit_shape, expr_selects_component, leaf_field_layout,
+    validate_allocatable_item,
+};
 use super::pure_elemental::{
     check_pure_expr_calls, reject_pure_nonlocal_definition, validate_elemental_args,
     validate_pure_call,
@@ -1786,150 +1790,6 @@ fn validate_pointer_assignment(
 /// check.  If the chain can't be resolved (registry missing, cross-
 /// TU stale .amod, etc.) we skip rather than produce a misleading
 /// error.
-fn validate_allocatable_item(ctx: &mut Ctx, item: &crate::ast::expr::SpannedExpr, stmt_name: &str) {
-    if expr_selects_component(item) {
-        if let Some(leaf) = leaf_field_layout(ctx, item) {
-            if !leaf.field.allocatable && !leaf.field.pointer {
-                ctx.error(
-                    item.span,
-                    format!(
-                    "only allocatable or pointer components can appear in {}, but '{}' is neither",
-                    stmt_name.to_uppercase(), leaf.field.name
-                ),
-                );
-            }
-        }
-        return;
-    }
-    let base_name = extract_base_name(item);
-    if let Some(ref name) = base_name {
-        let ok = ctx
-            .lookup(name)
-            .map(|s| s.attrs.allocatable || s.attrs.pointer)
-            .unwrap_or(true); // unknown symbol — skip
-        if !ok {
-            ctx.error(
-                item.span,
-                format!(
-                    "only allocatable or pointer variables can appear in {}, but '{}' is neither",
-                    stmt_name.to_uppercase(),
-                    name
-                ),
-            );
-        }
-    }
-}
-
-fn allocate_item_needs_explicit_shape(ctx: &Ctx<'_>, item: &crate::ast::expr::SpannedExpr) -> bool {
-    match &item.node {
-        Expr::Name { name } => ctx
-            .allocatable_array_targets
-            .contains(&(ctx.scope_id, name.to_lowercase())),
-        Expr::ParenExpr { inner } => allocate_item_needs_explicit_shape(ctx, inner),
-        Expr::ComponentAccess { .. } => leaf_field_layout(ctx, item)
-            .map(|leaf| leaf.field.declared_array)
-            .unwrap_or(false),
-        _ => false,
-    }
-}
-
-/// Does this expression select into a derived-type component
-/// anywhere in its path? e.g. `pools(i)%tokens(n)` → true,
-/// `pools(i)` → false, `pools` → false.
-fn expr_selects_component(expr: &crate::ast::expr::SpannedExpr) -> bool {
-    match &expr.node {
-        Expr::ComponentAccess { .. } => true,
-        Expr::FunctionCall { callee, .. } => expr_selects_component(callee),
-        _ => false,
-    }
-}
-
-/// Resolved metadata for the leaf of a component access.
-struct LeafComponent<'a> {
-    field: &'a crate::sema::type_layout::FieldLayout,
-    /// Any ancestor on the path (including the base variable or any
-    /// intermediate component) has the TARGET attribute.  F2018
-    /// §8.5.14: a subobject of a TARGET is itself a valid target.
-    ancestor_is_target: bool,
-    /// Any ancestor is ALLOCATABLE — per §8.5.14, an allocated
-    /// subobject of an allocatable is also a valid target.
-    ancestor_is_allocatable: bool,
-}
-
-/// Walk an expression down to its leaf component access and return
-/// that component's FieldLayout (with attribute metadata).  Returns
-/// `None` if the expression has no component access, or if the
-/// chain's derived-type path can't be resolved through the symbol
-/// table + layout registry (for example, a field whose type is a
-/// derived type that wasn't in the registry — uncommon but possible
-/// when a cross-TU .amod is stale).
-fn leaf_field_layout<'a>(
-    ctx: &'a Ctx,
-    expr: &crate::ast::expr::SpannedExpr,
-) -> Option<LeafComponent<'a>> {
-    let layouts = ctx.type_layouts?;
-    // Collect the component chain from outermost to innermost.
-    let mut chain: Vec<&str> = Vec::new();
-    let mut cur = expr;
-    let base_name = loop {
-        match &cur.node {
-            Expr::ComponentAccess { base, component } => {
-                chain.push(component.as_str());
-                cur = base;
-            }
-            Expr::FunctionCall { callee, .. } => {
-                cur = callee;
-            }
-            Expr::Name { name } => break name.as_str(),
-            _ => return None,
-        }
-    };
-    chain.reverse();
-    if chain.is_empty() {
-        return None;
-    }
-    // Resolve the base variable's derived type via the symbol table.
-    let sym = ctx.lookup(base_name)?;
-    let base_type = match sym.type_info.as_ref()? {
-        crate::sema::symtab::TypeInfo::Derived(name) => name.clone(),
-        _ => return None,
-    };
-    // Seed ancestor flags from the base variable's own attributes.
-    let mut ancestor_is_target = sym.attrs.target;
-    let mut ancestor_is_allocatable = sym.attrs.allocatable;
-    let mut current_type = base_type;
-    let mut leaf: Option<&crate::sema::type_layout::FieldLayout> = None;
-    for (i, comp) in chain.iter().enumerate() {
-        let layout = layouts.get(&current_type)?;
-        let field = layout.field(comp)?;
-        // On non-terminal components, accumulate TARGET / ALLOCATABLE
-        // so the leaf check can honour inherited target-ness.
-        let is_terminal = i + 1 == chain.len();
-        if !is_terminal {
-            if field.target {
-                ancestor_is_target = true;
-            }
-            if field.allocatable {
-                ancestor_is_allocatable = true;
-            }
-        }
-        leaf = Some(field);
-        match &field.type_info {
-            crate::sema::symtab::TypeInfo::Derived(name) => {
-                current_type = name.clone();
-            }
-            _ => {
-                // Scalar / intrinsic-typed leaf — no further resolution.
-            }
-        }
-    }
-    leaf.map(|field| LeafComponent {
-        field,
-        ancestor_is_target,
-        ancestor_is_allocatable,
-    })
-}
-
 /// Check if a call in a pure procedure is to a known impure procedure.
 /// Symbol-level pure tracking isn't yet wired into the symbol table,
 /// so this is conservative: we warn if the callee resolves to an
