@@ -13,7 +13,7 @@ pub struct LiveInterval {
     pub class: RegClass,
     pub start: u32,         // first instruction position (definition)
     pub end: u32,           // last instruction position (final use)
-    pub crosses_call: bool, // true if a BL instruction falls within [start, end]
+    pub crosses_call: bool, // true if a BL/BLR falls within [start, end]
     /// Preferred physical register (hint). If set, the allocator tries this register first.
     /// Used to avoid unnecessary moves (e.g., arg values prefer xN, return values prefer x0).
     pub hint: Option<u8>,
@@ -278,11 +278,14 @@ pub fn compute_liveness(mf: &MachineFunction) -> LivenessResult {
         }
     }
 
-    // Collect positions of all call instructions.
+    // Collect positions of all call instructions. Both direct
+    // (`Bl`) and indirect (`Blr`) calls clobber every caller-saved
+    // register and must contribute to `crosses_call` so the
+    // allocator pins those intervals to callee-saved.
     let mut call_positions: Vec<u32> = Vec::new();
     for (block_idx, block) in mf.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
-            if inst.opcode == ArmOpcode::Bl {
+            if matches!(inst.opcode, ArmOpcode::Bl | ArmOpcode::Blr) {
                 call_positions.push(inst_positions[block_idx][i]);
             }
         }
@@ -373,6 +376,53 @@ mod tests {
         assert!(
             result.intervals.iter().any(|i| i.class == RegClass::Fp64),
             "should have Fp64 intervals"
+        );
+    }
+
+    #[test]
+    fn intervals_crossing_blr_are_marked_call_crossing() {
+        // Construct: def vreg %0 → BLR %0 → use %0. Since %0 is
+        // both the BLR target and a value live across the call,
+        // its interval must be marked crosses_call so the
+        // allocator pins it to a callee-saved register (or
+        // accepts the spill rather than burying the value in a
+        // caller-saved that the BLR will clobber).
+        let mut mf = MachineFunction::new("test".into());
+        let v0 = mf.new_vreg(RegClass::Gp64);
+        let v1 = mf.new_vreg(RegClass::Gp64);
+        // Define %0.
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::Movz,
+            operands: vec![MachineOperand::VReg(v0), MachineOperand::Imm(42)],
+            def: Some(v0),
+        });
+        // BLR through %0 (an indirect call).
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::Blr,
+            operands: vec![MachineOperand::VReg(v0)],
+            def: None,
+        });
+        // Use %0 again post-call (forces the interval to cross
+        // the BLR position).
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::MovReg,
+            operands: vec![MachineOperand::VReg(v1), MachineOperand::VReg(v0)],
+            def: Some(v1),
+        });
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::Ret,
+            operands: vec![],
+            def: None,
+        });
+        let result = compute_liveness(&mf);
+        let interval = result
+            .intervals
+            .iter()
+            .find(|i| i.vreg == v0)
+            .expect("vreg 0 must have an interval");
+        assert!(
+            interval.crosses_call,
+            "interval crossing BLR must be marked crosses_call"
         );
     }
 
