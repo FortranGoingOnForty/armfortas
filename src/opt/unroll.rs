@@ -158,6 +158,29 @@ struct LoopShape {
     iv_bound: i64, // inclusive upper bound
     trip_count: usize,
     exit_args: Vec<ValueId>, // args from cmp_block's false branch to exit
+    /// Optional second header block-param representing a reduction
+    /// accumulator (sum, product, ...). When present, the unroller
+    /// threads its value across iterations: each iteration's body
+    /// reads the previous iteration's latch result instead of the
+    /// header's join.
+    reduction: Option<ReductionInfo>,
+}
+
+/// Per-loop reduction lane. mem2reg promotes a sum/product accumulator
+/// into a header block param; the latch's `br header(iv_next, new_acc)`
+/// passes the per-iteration update on the second lane. To unroll such a
+/// loop we need to know:
+///
+///  * which header param carries the accumulator (`acc_param`),
+///  * its preheader-supplied initial value (`acc_init`),
+///  * what value the latch passes back as the new accumulator
+///    (`latch_acc_value`) — that's the SSA value defined inside the
+///    body that the unroller substitutes through across iterations.
+#[derive(Debug, Clone, Copy)]
+struct ReductionInfo {
+    acc_param: ValueId,
+    acc_init: ValueId,
+    latch_acc_value: ValueId,
 }
 
 fn is_do_concurrent_loop(
@@ -198,16 +221,23 @@ fn detect_simple_loop(
 
     let header = nl.header;
 
-    // ---- header must have exactly 1 block param (the IV) ----------------
+    // ---- header must have 1 (pure IV) or 2 (IV + reduction acc)
+    //      block params ---------------------------------------------------
     let hdr = func.block(header);
-    if hdr.params.len() != 1 {
+    if hdr.params.is_empty() || hdr.params.len() > 2 {
         return None;
     }
-    let iv_param = hdr.params[0].id;
-    let iv_ty = hdr.params[0].ty.clone();
+    // mem2reg places the IV at index 0 and the reduction accumulator (if
+    // any) at index 1. We rely on that ordering — it matches the
+    // canonical lowering for `do i = 1, n; s = s + a(i); end do`.
+    let iv_param_idx = 0usize;
+    let acc_param_idx: Option<usize> = if hdr.params.len() == 2 { Some(1) } else { None };
+    let iv_param = hdr.params[iv_param_idx].id;
+    let iv_ty = hdr.params[iv_param_idx].ty.clone();
     if !matches!(iv_ty, IrType::Int(_)) {
         return None;
     }
+    let acc_param: Option<ValueId> = acc_param_idx.map(|i| hdr.params[i].id);
 
     // ---- find preheader -------------------------------------------------
     let header_preds = preds.get(&header)?;
@@ -223,11 +253,20 @@ fn detect_simple_loop(
     }
     let preheader = outside[0];
 
-    // Preheader must branch to header with exactly 1 arg (the initial IV).
+    // Preheader must branch to header with exactly N args matching the
+    // header's param count. The IV arg is a const; the accumulator init
+    // can be any SSA value (typically a ConstInt(0) for sum, but we
+    // don't enforce that — we only need to capture the value to feed
+    // into iteration 0's body substitution).
     let ph_blk = func.block(preheader);
-    let iv_init = match &ph_blk.terminator {
-        Some(Terminator::Branch(dest, args)) if *dest == header && args.len() == 1 => {
-            resolve_const_int(func, args[0])?
+    let expected_ph_args = hdr.params.len();
+    let (iv_init, acc_init) = match &ph_blk.terminator {
+        Some(Terminator::Branch(dest, args))
+            if *dest == header && args.len() == expected_ph_args =>
+        {
+            let iv_init = resolve_const_int(func, args[iv_param_idx])?;
+            let acc_init = acc_param_idx.map(|i| args[i]);
+            (iv_init, acc_init)
         }
         _ => return None,
     };
@@ -268,10 +307,9 @@ fn detect_simple_loop(
         return None;
     }
 
-    // ---- latch: stride-1 increment, passes only iv back to header ------
-    if !check_latch(func, latch, header, iv_param) {
-        return None;
-    }
+    // ---- latch: stride-1 increment, passes iv (and optionally acc)
+    //      back to header ------------------------------------------------
+    let latch_info = check_latch(func, latch, header, iv_param, iv_param_idx, acc_param_idx)?;
 
     // ---- compute body_blocks: body − {header, cmp_block, latch} --------
     //
@@ -324,6 +362,30 @@ fn detect_simple_loop(
         return None;
     }
 
+    let reduction = match (acc_param, acc_init, latch_info.latch_acc_value) {
+        (Some(p), Some(init), Some(latch_val)) => {
+            // The latch accumulator value must be defined inside one
+            // of the body_blocks — otherwise it lives in the latch
+            // (which the unroller doesn't clone) and we'd drop the
+            // reduction op. Bail in that case rather than miscompile.
+            let defined_in_body = body_blocks
+                .iter()
+                .any(|&b| func.block(b).insts.iter().any(|i| i.id == latch_val));
+            if !defined_in_body {
+                return None;
+            }
+            Some(ReductionInfo {
+                acc_param: p,
+                acc_init: init,
+                latch_acc_value: latch_val,
+            })
+        }
+        (None, None, None) => None,
+        // Inconsistent state — fall through and reject the loop. Should
+        // not happen because the lane indices line up at the top.
+        _ => return None,
+    };
+
     Some(LoopShape {
         preheader,
         header,
@@ -337,6 +399,7 @@ fn detect_simple_loop(
         iv_bound,
         trip_count: trip_count_i64 as usize,
         exit_args,
+        reduction,
     })
 }
 
@@ -501,37 +564,80 @@ fn detect_bound_and_exit(
 ///   %i_next = iadd %iv, const(1)
 ///   br header(%i_next)
 /// ```
-fn check_latch(func: &Function, latch: BlockId, header: BlockId, iv: ValueId) -> bool {
+/// Validate the latch terminator and (when applicable) capture the
+/// reduction lane.
+///
+/// Accepts either:
+///   * `br header(%iv_next)` — pure-IV loop, returns
+///     `Some(LatchInfo { latch_acc_value: None })`.
+///   * `br header(%iv_next, %new_acc)` — reduction loop, where
+///     `acc_lane_idx` (passed by the caller as 0 or 1) tells us which
+///     branch arg index carries the accumulator. Returns
+///     `Some(LatchInfo { latch_acc_value: Some(%new_acc) })`.
+///
+/// In both cases the IV stride must be `iadd iv, const(1)` defined in
+/// the latch.
+fn check_latch(
+    func: &Function,
+    latch: BlockId,
+    header: BlockId,
+    iv: ValueId,
+    iv_lane_idx: usize,
+    acc_lane_idx: Option<usize>,
+) -> Option<LatchInfo> {
     let blk = func.block(latch);
 
-    // Terminator must be unconditional branch to header with exactly 1 arg.
-    let iv_next = match &blk.terminator {
-        Some(Terminator::Branch(dest, args)) if *dest == header && args.len() == 1 => args[0],
-        _ => return false,
+    let expected_args = if acc_lane_idx.is_some() { 2 } else { 1 };
+    let args = match &blk.terminator {
+        Some(Terminator::Branch(dest, args))
+            if *dest == header && args.len() == expected_args =>
+        {
+            args.clone()
+        }
+        _ => return None,
     };
 
-    // That arg must be defined as iadd %iv, const(1) in this block.
+    let iv_next = args[iv_lane_idx];
+    let acc_value = acc_lane_idx.map(|i| args[i]);
+
+    // The iv lane's value must be defined as `iadd %iv, const(1)`
+    // inside the latch.
+    let mut iv_ok = false;
     for inst in &blk.insts {
         if inst.id == iv_next {
-            match &inst.kind {
-                InstKind::IAdd(a, b) => {
-                    let (is_iv, other) = if *a == iv {
-                        (true, *b)
-                    } else if *b == iv {
-                        (true, *a)
-                    } else {
-                        (false, *a)
-                    };
-                    if !is_iv {
-                        return false;
-                    }
-                    return resolve_const_int(func, other) == Some(1);
+            if let InstKind::IAdd(a, b) = &inst.kind {
+                let (is_iv, other) = if *a == iv {
+                    (true, *b)
+                } else if *b == iv {
+                    (true, *a)
+                } else {
+                    (false, *a)
+                };
+                if !is_iv {
+                    return None;
                 }
-                _ => return false,
+                if resolve_const_int(func, other) != Some(1) {
+                    return None;
+                }
+                iv_ok = true;
+            } else {
+                return None;
             }
+            break;
         }
     }
-    false
+    if !iv_ok {
+        return None;
+    }
+
+    Some(LatchInfo {
+        latch_acc_value: acc_value,
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LatchInfo {
+    latch_acc_value: Option<ValueId>,
 }
 
 /// Return true if any instruction result defined in the latch is used
@@ -665,16 +771,29 @@ fn do_unroll(func: &mut Function, shape: LoopShape) {
     let mut iter_blocks: Vec<Vec<BlockId>> = Vec::with_capacity(tc);
     let mut iter_substs: Vec<HashMap<ValueId, ValueId>> = Vec::with_capacity(tc);
 
+    // Reduction threading: prev_acc carries iteration k-1's latch
+    // accumulator value into iteration k's body substitution. For
+    // iteration 0 it's seeded from the preheader's branch arg; after
+    // each iteration completes, it's updated to that iter's body
+    // output (looked up through the iter's subst by the original
+    // latch_acc_value's ID).
+    let mut prev_acc: Option<ValueId> = shape.reduction.as_ref().map(|r| r.acc_init);
+
     for k in 0..tc {
         let iv_val = shape.iv_init + k as i64;
 
-        // Build substitution map seeded with iv_param → const(iv_val).
-        // For each body block, we clone instructions into a fresh block.
+        // Build substitution map seeded with iv_param → const(iv_val)
+        // and (when present) acc_param → previous iteration's latch
+        // accumulator value.
         let mut subst: HashMap<ValueId, ValueId> = HashMap::new();
 
         // Emit the IV constant (will be placed in each new block's first inst).
         let iv_const_id = func.next_value_id();
         subst.insert(shape.iv_param, iv_const_id);
+
+        if let (Some(r), Some(prev)) = (shape.reduction.as_ref(), prev_acc) {
+            subst.insert(r.acc_param, prev);
+        }
 
         let mut blk_ids = Vec::with_capacity(nb.max(1));
         if nb == 0 {
@@ -709,6 +828,21 @@ fn do_unroll(func: &mut Function, shape: LoopShape) {
                 blk_ids.push(bid);
             }
         }
+        // After this iteration's body has been cloned, look up the
+        // post-substitution form of the latch's accumulator value —
+        // that becomes the seed for the next iteration's acc_param
+        // substitution. If the latch's acc value wasn't defined in
+        // this body (e.g. an invariant or pre-loop value), fall back
+        // to the original ID; the unroller's other safety checks
+        // ensure that's still well-defined post-pruning.
+        if let Some(r) = shape.reduction.as_ref() {
+            prev_acc = Some(
+                subst
+                    .get(&r.latch_acc_value)
+                    .copied()
+                    .unwrap_or(r.latch_acc_value),
+            );
+        }
         iter_blocks.push(blk_ids);
         iter_substs.push(subst);
     }
@@ -742,9 +876,25 @@ fn do_unroll(func: &mut Function, shape: LoopShape) {
             shape.exit
         };
 
-        // Args to pass when branching to the exit block.
+        // Args to pass when branching to the exit block. For
+        // reduction loops, the original `exit_args` references the
+        // header's acc_param — pruned along with the rest of the
+        // header. Replace the acc_param entry with the final
+        // iteration's accumulator value (`prev_acc`, set up after
+        // the per-iter cloning loop ran iteration N-1). Other
+        // entries are left alone, falling through to the verifier
+        // if they reference values that would survive (today's only
+        // supported shape has exactly the acc lane).
         let exit_args = if after_iter == shape.exit {
-            shape.exit_args.clone()
+            if let (Some(r), Some(final_acc)) = (shape.reduction.as_ref(), prev_acc) {
+                shape
+                    .exit_args
+                    .iter()
+                    .map(|&v| if v == r.acc_param { final_acc } else { v })
+                    .collect()
+            } else {
+                shape.exit_args.clone()
+            }
         } else {
             vec![]
         };
@@ -1082,9 +1232,13 @@ mod tests {
     }
 
     #[test]
-    fn does_not_unroll_two_param_header() {
+    fn unrolls_reduction_loop_threading_accumulator() {
         // A reduction loop has 2 block params (iv + accumulator).
-        // We should not unroll it.
+        // The unroller should clone the body once per iteration and
+        // thread the accumulator value across iterations: iter 0
+        // reads `acc_init`, iter 1 reads iter 0's `new_acc`, etc. The
+        // final branch to `exit` passes the last iteration's
+        // accumulator value to the exit block param.
         let mut m = Module::new("test".into());
         let mut f = Function::new("reduce".into(), vec![], IrType::Void);
         let header_id = f.create_block("header");
@@ -1179,9 +1333,55 @@ mod tests {
 
         let pass = LoopUnroll;
         let changed = pass.run(&mut m);
+        assert!(changed, "reduction loop should now unroll");
+
+        let f = &m.functions[0];
+
+        // The exit block must still exist and its (only) predecessor
+        // path now feeds it a non-acc-param value — i.e. a value
+        // defined in one of the cloned iteration blocks.
+        let exit_blk = f
+            .blocks
+            .iter()
+            .find(|b| b.id == exit_id)
+            .expect("exit survives");
+        assert_eq!(exit_blk.params.len(), 1, "exit still has its acc_out param");
+
+        // Find the predecessor block whose terminator branches to the
+        // exit block. Its single arg should be the unrolled chain's
+        // final accumulator value, NOT the original `acc` header
+        // param (which is now unreachable).
+        let mut found_branch_to_exit = false;
+        for blk in &f.blocks {
+            if let Some(Terminator::Branch(dest, args)) = &blk.terminator {
+                if *dest == exit_id {
+                    found_branch_to_exit = true;
+                    assert_eq!(args.len(), 1, "exit takes one arg (the accumulator)");
+                    assert_ne!(args[0], acc, "must not reference the pruned header acc param");
+                    assert_ne!(args[0], iv, "must not reference the pruned header iv param");
+                    break;
+                }
+            }
+        }
         assert!(
-            !changed,
-            "reduction loop with 2 header params should not be unrolled"
+            found_branch_to_exit,
+            "must find an unrolled iter block branching to the original exit"
+        );
+
+        // Trip count = 4 → expect 4 cloned IAdd-of-acc instructions in
+        // the function (one per iteration). The original latch's IAdd
+        // is now under an Unreachable terminator and will be pruned by
+        // a later DCE pass; for this test we just count the clones.
+        let total_iadds: usize = f
+            .blocks
+            .iter()
+            .flat_map(|b| b.insts.iter())
+            .filter(|inst| matches!(inst.kind, InstKind::IAdd(..)))
+            .count();
+        assert!(
+            total_iadds >= 4,
+            "expected at least 4 IAdd insts (one acc-update per iteration), found {}",
+            total_iadds
         );
     }
 
