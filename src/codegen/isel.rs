@@ -1961,14 +1961,13 @@ fn select_inst(
             let vb = ctx.lookup_vreg(*b);
             let dest = ctx.get_vreg(mf, inst.id, RegClass::V128);
             let is_max = matches!(inst.kind, InstKind::VMax(..));
-            let opcode = match VShape::from_ir(&inst.ty) {
-                Some(VShape::V4S) => {
-                    if is_max {
-                        ArmOpcode::SmaxV4S
-                    } else {
-                        ArmOpcode::SminV4S
-                    }
-                }
+            let opcode = match (VShape::from_ir(&inst.ty), is_max) {
+                (Some(VShape::V4S), true) => ArmOpcode::SmaxV4S,
+                (Some(VShape::V4S), false) => ArmOpcode::SminV4S,
+                (Some(VShape::F4S), true) => ArmOpcode::FmaxV4S,
+                (Some(VShape::F4S), false) => ArmOpcode::FminV4S,
+                (Some(VShape::F2D), true) => ArmOpcode::FmaxV2D,
+                (Some(VShape::F2D), false) => ArmOpcode::FminV2D,
                 _ => ArmOpcode::Nop,
             };
             mf.block_mut(mb).insts.push(MachineInst {
@@ -2006,6 +2005,38 @@ fn select_inst(
                             MachineOperand::VReg(tmp),
                             MachineOperand::Imm(0),
                         ],
+                        def: Some(dest),
+                    });
+                }
+                IrType::Float(FloatWidth::F32) => {
+                    // fmaxv.4s / fminv.4s s_dest, v_src
+                    let class = type_to_reg_class(&inst.ty);
+                    let dest = ctx.get_vreg(mf, inst.id, class);
+                    let opcode = if is_max {
+                        ArmOpcode::FmaxvV4S
+                    } else {
+                        ArmOpcode::FminvV4S
+                    };
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode,
+                        operands: vec![MachineOperand::VReg(dest), MachineOperand::VReg(src)],
+                        def: Some(dest),
+                    });
+                }
+                IrType::Float(FloatWidth::F64) => {
+                    // NEON has no fmaxv.2d; the pairwise scalar form
+                    // (fmaxp.2d d_dest, v_src) is the across-lane
+                    // reduction for two f64 lanes.
+                    let class = type_to_reg_class(&inst.ty);
+                    let dest = ctx.get_vreg(mf, inst.id, class);
+                    let opcode = if is_max {
+                        ArmOpcode::FmaxpV2DScalar
+                    } else {
+                        ArmOpcode::FminpV2DScalar
+                    };
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode,
+                        operands: vec![MachineOperand::VReg(dest), MachineOperand::VReg(src)],
                         def: Some(dest),
                     });
                 }
