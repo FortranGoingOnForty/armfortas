@@ -1799,9 +1799,15 @@ fn select_inst(
         InstKind::VBroadcast(scalar) => {
             let s = ctx.lookup_vreg(*scalar);
             let dest = ctx.get_vreg(mf, inst.id, RegClass::V128);
+            // Float scalars live in S/D registers — splatting from
+            // those uses the lane-dup form (`dup.4s vN, vM.s[0]`).
+            // Integer scalars live in W/X registers — splatting from
+            // those uses the gp-dup form (`dup.4s vN, wM`).
             let opcode = match VShape::from_ir(&inst.ty) {
-                Some(VShape::V4S) | Some(VShape::F4S) => ArmOpcode::DupGen4S,
-                Some(VShape::V2D) | Some(VShape::F2D) => ArmOpcode::DupGen2D,
+                Some(VShape::V4S) => ArmOpcode::DupGen4S,
+                Some(VShape::V2D) => ArmOpcode::DupGen2D,
+                Some(VShape::F4S) => ArmOpcode::DupEl4S,
+                Some(VShape::F2D) => ArmOpcode::DupEl2D,
                 None => ArmOpcode::Nop,
             };
             mf.block_mut(mb).insts.push(MachineInst {
