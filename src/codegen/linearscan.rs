@@ -158,70 +158,53 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
         split_pool(&FP_ALLOC_ORDER, &FP_CALLEE_SAVED);
     let mut callee_saved_used: HashSet<PhysReg> = HashSet::new();
 
-    // Hard-coded PhysReg writes: positions where the instruction's
-    // operand 0 is a PhysReg (e.g. arg-setup `mov PhysReg(x1),
-    // VReg(value)` immediately before a BL). The allocator must not
-    // assign a physreg P to a vreg V if any such write to P falls
-    // strictly inside V's live range — V's value would be clobbered
-    // before its use. Indexed by phys-reg-alias (Gp/Fp + reg num);
-    // 32-bit and 64-bit views share an alias since they share the
-    // same physical register.
-    let mut phys_writes_gp: HashMap<u8, Vec<u32>> = HashMap::new();
-    let mut phys_writes_fp: HashMap<u8, Vec<u32>> = HashMap::new();
-    {
-        let mut p: u32 = 0;
-        for block in &mf.blocks {
-            for inst in &block.insts {
-                if let Some(MachineOperand::PhysReg(phys)) = inst.operands.first() {
-                    match phys {
-                        PhysReg::Gp(n) | PhysReg::Gp32(n) => {
-                            phys_writes_gp.entry(*n).or_default().push(p);
-                        }
-                        PhysReg::Fp(n) | PhysReg::Fp32(n) => {
-                            phys_writes_fp.entry(*n).or_default().push(p);
-                        }
-                        _ => {}
-                    }
-                }
-                p += 2;
-            }
-        }
-    }
-    let writes_in_range = |phys_n: u8, is_fp: bool, start: u32, end: u32| -> bool {
-        let map = if is_fp {
-            &phys_writes_fp
-        } else {
-            &phys_writes_gp
-        };
-        if let Some(positions) = map.get(&phys_n) {
-            // A write at position p clobbers any vreg whose interval
-            // is alive at p. Use strict-greater-than-start so the
-            // vreg's own def position doesn't count, and
-            // less-than-end so the final use position doesn't count
-            // (the use happens before the next instruction's write).
-            positions.iter().any(|&pp| pp > start && pp < end)
-        } else {
-            false
-        }
-    };
-    let pop_compatible = |free: &mut Vec<u8>,
-                          is_fp: bool,
-                          start: u32,
-                          end: u32|
-     -> Option<u8> {
-        for i in (0..free.len()).rev() {
-            if !writes_in_range(free[i], is_fp, start, end) {
-                return Some(free.remove(i));
-            }
-        }
-        None
-    };
     // Tracks live-range splits in progress: each entry maps a
     // synthetic post-half vreg to (original vreg, call position,
     // bridge slot). After allocation we walk this map to
     // materialize SplitRecords using whatever physreg/slot the
     // post-half ended up with.
     let mut splits_in_progress: HashMap<VRegId, (VRegId, u32, i32)> = HashMap::new();
+
+    // Per-vreg actual def/use position range, computed by direct
+    // walk of the MIR. Used by the splitter to sanity-check
+    // crosses_call before deciding to split: the global liveness
+    // dataflow has a quirk that extends every dest vreg's live
+    // range backward over its own def (op0 of `mov vreg_dst,
+    // vreg_src` is treated as both def and use), inflating short
+    // vreg-to-vreg copy chains to span entire blocks. The
+    // splitter would then see a "call crossing" for a vreg whose
+    // real def/use range is well before any call. Splitting such a
+    // vreg corrupts the chain. We don't fix the dataflow globally
+    // — other regalloc decisions depend on the inflated ranges in
+    // ways that surface latent bugs in arg-setup emission — but we
+    // do consult this tighter map before committing to a split.
+    let mut vreg_actual_range: HashMap<VRegId, (u32, u32)> = HashMap::new();
+    {
+        let mut p: u32 = 0;
+        for block in &mf.blocks {
+            for inst in &block.insts {
+                let mut touched: Vec<VRegId> = Vec::new();
+                if let Some(d) = inst.def {
+                    touched.push(d);
+                }
+                for op in &inst.operands {
+                    if let MachineOperand::VReg(v) = op {
+                        touched.push(*v);
+                    }
+                }
+                for v in touched {
+                    let entry = vreg_actual_range.entry(v).or_insert((p, p));
+                    if p < entry.0 {
+                        entry.0 = p;
+                    }
+                    if p > entry.1 {
+                        entry.1 = p;
+                    }
+                }
+                p += 2;
+            }
+        }
+    }
 
     // Worklist of intervals to allocate. Starts as a clone of the
     // pre-sorted liveness intervals; splitting inserts post-half
@@ -257,31 +240,21 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
             (&mut active_gp, &mut free_gp_caller, &mut free_gp_callee)
         };
 
-        let iv_start = interval.start;
-        let iv_end = interval.end;
         let reg_opt = if interval.crosses_call {
             // Must use callee-saved (caller-saved would be clobbered
             // by the call).
-            pop_compatible(free_callee, is_fp, iv_start, iv_end)
+            free_callee.pop()
         } else if let Some(hint) = interval.hint {
             // Try the hinted register first across both tiers.
-            let hint_ok = !writes_in_range(hint, is_fp, iv_start, iv_end);
-            if hint_ok {
-                if let Some(i) = free_caller.iter().position(|&r| r == hint) {
-                    Some(free_caller.remove(i))
-                } else if let Some(i) = free_callee.iter().position(|&r| r == hint) {
-                    Some(free_callee.remove(i))
-                } else {
-                    pop_compatible(free_caller, is_fp, iv_start, iv_end)
-                        .or_else(|| pop_compatible(free_callee, is_fp, iv_start, iv_end))
-                }
+            if let Some(i) = free_caller.iter().position(|&r| r == hint) {
+                Some(free_caller.remove(i))
+            } else if let Some(i) = free_callee.iter().position(|&r| r == hint) {
+                Some(free_callee.remove(i))
             } else {
-                pop_compatible(free_caller, is_fp, iv_start, iv_end)
-                    .or_else(|| pop_compatible(free_callee, is_fp, iv_start, iv_end))
+                free_caller.pop().or_else(|| free_callee.pop())
             }
         } else {
-            pop_compatible(free_caller, is_fp, iv_start, iv_end)
-                .or_else(|| pop_compatible(free_callee, is_fp, iv_start, iv_end))
+            free_caller.pop().or_else(|| free_callee.pop())
         };
 
         // Live-range splitting: a call-crossing interval that
@@ -293,9 +266,22 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
         // fresh interval, and we bridge the call with str/ldr to
         // a frame slot. Net win: the longer-lived half between
         // the def and the call avoids spill loads on every use.
+        // Cross-check `crosses_call` against the actual def/use
+        // range from the MIR walk: a vreg whose real range doesn't
+        // straddle the supposed crossing point is a false positive
+        // from inflated liveness, and must NOT be split.
+        let real_crosses = if let Some(&(real_start, real_end)) =
+            vreg_actual_range.get(&interval.vreg)
+        {
+            interval.call_crossings.len() == 1
+                && interval.call_crossings[0] > real_start
+                && interval.call_crossings[0] < real_end
+        } else {
+            false
+        };
         if reg_opt.is_none()
             && interval.crosses_call
-            && interval.call_crossings.len() == 1
+            && real_crosses
             && !free_caller.is_empty()
         {
             let call_pos = interval.call_crossings[0];
@@ -799,15 +785,7 @@ pub fn apply_allocation(
             // arg-setup mov sequence isn't fragmented by an
             // interposed store and the parallel-copy resolver can
             // see all the arg-setup movs as one block.
-            //
-            // Keep `def` populated even though operands are now all
-            // PhysReg: `parallelize_call_arg_moves` consults it to
-            // distinguish *arg-setup* movs (`def == None`) from
-            // *vreg-defining* movs that just happen to have arg-reg
-            // physregs after allocation. The two have different
-            // semantics — arg-setups read source registers in
-            // parallel-copy fashion, while vreg-defining movs feed
-            // their result into a later read sequentially.
+            rewritten.def = None;
             new_insts.push(rewritten);
 
             // Store after def for spilled vregs.
@@ -1265,16 +1243,7 @@ fn blr_target_scratch(target: PhysReg) -> PhysReg {
 // ---- Helpers ----
 
 fn is_call_arg_copy(inst: &MachineInst) -> bool {
-    // `def == None` is the load-bearing signal: arg-setup movs are
-    // emitted by isel as `mov PhysReg(arg_reg), VReg(value)` (no
-    // vreg defined, just a physreg write), while vreg-defining movs
-    // (e.g. `mov VReg(v), PhysReg(x0)` to capture a return value)
-    // have `def == Some(_)`. After allocation both look like
-    // `mov PhysReg, PhysReg`, but they have different semantics:
-    // arg-setup movs participate in parallel-copy resolution; vreg
-    // movs feed their result sequentially into a later read.
-    inst.def.is_none()
-        && matches!(inst.opcode, ArmOpcode::MovReg | ArmOpcode::FmovReg)
+    matches!(inst.opcode, ArmOpcode::MovReg | ArmOpcode::FmovReg)
         && matches!(
             inst.operands.as_slice(),
             [MachineOperand::PhysReg(dst), MachineOperand::PhysReg(src)]
