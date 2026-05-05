@@ -3,6 +3,14 @@
 ! shape is `select(cmp(la, lb), t, f)` where {t, f} = {la, lb};
 ! the matcher lifts both loads to vload and rewrites select to
 ! VMax/VMin. Tested for i32, f32, f64.
+!
+! Lanes 1, 16, 17, 32 — i32 max gives {32,17,17,32}; min {1,16,16,1}.
+! CHECK: 32 17 17 32
+! CHECK: 1 16 16 1
+! CHECK: 3.2000000E1     1.7000000E1     1.7000000E1     3.2000000E1
+! CHECK: 1.0000000E0     1.6000000E1     1.6000000E1     1.0000000E0
+! CHECK: 3.200000000000000E1     1.700000000000000E1     1.700000000000000E1     3.200000000000000E1
+! CHECK: 1.000000000000000E0     1.600000000000000E1     1.600000000000000E1     1.000000000000000E0
 program test_do_loop_vectorize_minmax_binary
   implicit none
   integer :: i
