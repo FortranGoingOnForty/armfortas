@@ -83,6 +83,7 @@ enum BinaryKind {
 enum UnaryKind {
     Neg,
     Abs,
+    Sqrt,
 }
 
 /// One operand of the body's binop, classified as either an array
@@ -396,6 +397,13 @@ fn classify_body_op(
         }
         InstKind::FAbs(src) => {
             unary_body(stored_value, UnaryKind::Abs, *src, func, shape, dest, loop_defs)
+        }
+        InstKind::FSqrt(src) => {
+            // sqrt is float-only.
+            if !matches!(dest.elem_ty, IrType::Float(_)) {
+                return None;
+            }
+            unary_body(stored_value, UnaryKind::Sqrt, *src, func, shape, dest, loop_defs)
         }
         InstKind::IAdd(l, r) => {
             binop_body(stored_value, BinaryKind::Add, *l, *r, func, shape, dest, loop_defs)
@@ -715,6 +723,7 @@ fn apply_vector_plan(func: &mut Function, shape: &CountedLoop, plan: VectorPlan)
                     (InstKind::INeg(s), UnaryKind::Neg)
                     | (InstKind::FNeg(s), UnaryKind::Neg) => InstKind::VNeg(s),
                     (InstKind::FAbs(s), UnaryKind::Abs) => InstKind::VAbs(s),
+                    (InstKind::FSqrt(s), UnaryKind::Sqrt) => InstKind::VSqrt(s),
                     _ => inst.kind.clone(),
                 };
                 inst.kind = new_kind;
