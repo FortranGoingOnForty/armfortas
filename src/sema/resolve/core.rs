@@ -3,7 +3,7 @@
 //! First pass: collect declarations, create scopes, process USE/IMPLICIT.
 //! This establishes the symbol table that type checking (Sprint 13) will use.
 
-use super::symtab::*;
+use crate::sema::symtab::*;
 use crate::ast::decl;
 use crate::ast::decl::{ArraySpec, Attribute, Decl, OnlyItem, SpannedDecl, TypeSpec};
 use crate::ast::unit::*;
@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 thread_local! {
     /// Track externally loaded module interfaces so resolve_file can
     /// return them to the driver for globals extraction.
-    static LOADED_EXTERNAL_MODULES: RefCell<Vec<super::amod::ModuleInterface>> = const { RefCell::new(Vec::new()) };
+    static LOADED_EXTERNAL_MODULES: RefCell<Vec<crate::sema::amod::ModuleInterface>> = const { RefCell::new(Vec::new()) };
 }
 
 fn merge_specific_names(into: &mut Vec<String>, additional: &[String]) {
@@ -50,8 +50,8 @@ fn merged_visible_generic_specifics(
 /// resolution.
 pub struct ResolveResult {
     pub st: SymbolTable,
-    pub type_layouts: super::type_layout::TypeLayoutRegistry,
-    pub external_modules: Vec<super::amod::ModuleInterface>,
+    pub type_layouts: crate::sema::type_layout::TypeLayoutRegistry,
+    pub external_modules: Vec<crate::sema::amod::ModuleInterface>,
 }
 
 pub fn resolve_file(
@@ -59,10 +59,10 @@ pub fn resolve_file(
     module_search_paths: &[std::path::PathBuf],
 ) -> Result<ResolveResult, SemaError> {
     let mut st = SymbolTable::new();
-    let mut layouts = super::type_layout::TypeLayoutRegistry::new();
+    let mut layouts = crate::sema::type_layout::TypeLayoutRegistry::new();
 
     // Register intrinsic modules (iso_c_binding, iso_fortran_env) so USE can find them.
-    super::intrinsic_modules::register_intrinsic_modules(&mut st);
+    crate::sema::intrinsic_modules::register_intrinsic_modules(&mut st);
 
     // First pass: create module scopes so USE can find them.
     for unit in units {
@@ -181,7 +181,7 @@ fn resolve_unit(
     st: &mut SymbolTable,
     unit: &SpannedUnit,
     module_search_paths: &[std::path::PathBuf],
-    layouts: &mut super::type_layout::TypeLayoutRegistry,
+    layouts: &mut crate::sema::type_layout::TypeLayoutRegistry,
 ) -> Result<(), SemaError> {
     match &unit.node {
         ProgramUnit::Program {
@@ -629,7 +629,7 @@ fn process_uses(
     st: &mut SymbolTable,
     uses: &[SpannedDecl],
     module_search_paths: &[std::path::PathBuf],
-    type_layouts: &mut super::type_layout::TypeLayoutRegistry,
+    type_layouts: &mut crate::sema::type_layout::TypeLayoutRegistry,
 ) -> Result<(), SemaError> {
     for use_decl in uses {
         if let Decl::UseStmt {
@@ -727,7 +727,7 @@ fn ensure_uses_loaded(
     st: &mut SymbolTable,
     uses: &[SpannedDecl],
     module_search_paths: &[std::path::PathBuf],
-    type_layouts: &mut super::type_layout::TypeLayoutRegistry,
+    type_layouts: &mut crate::sema::type_layout::TypeLayoutRegistry,
 ) {
     for use_decl in uses {
         if let Decl::UseStmt { module, .. } = &use_decl.node {
@@ -742,7 +742,7 @@ fn preload_stmt_uses(
     st: &mut SymbolTable,
     stmts: &[crate::ast::stmt::SpannedStmt],
     module_search_paths: &[std::path::PathBuf],
-    type_layouts: &mut super::type_layout::TypeLayoutRegistry,
+    type_layouts: &mut crate::sema::type_layout::TypeLayoutRegistry,
 ) {
     use crate::ast::stmt::Stmt;
 
@@ -971,7 +971,7 @@ fn load_external_module(
     st: &mut SymbolTable,
     module_name: &str,
     search_paths: &[std::path::PathBuf],
-    type_layouts: &mut super::type_layout::TypeLayoutRegistry,
+    type_layouts: &mut crate::sema::type_layout::TypeLayoutRegistry,
 ) -> Option<ScopeId> {
     use crate::lexer::{Position, Span};
     use crate::sema::amod;
@@ -1339,7 +1339,7 @@ fn load_external_module(
 fn compute_all_layouts(
     units: &[SpannedUnit],
     st: &SymbolTable,
-    layouts: &mut super::type_layout::TypeLayoutRegistry,
+    layouts: &mut crate::sema::type_layout::TypeLayoutRegistry,
 ) {
     let inherited_params = HashMap::new();
     let mut visible_param_cache: HashMap<ScopeId, HashMap<String, i64>> = HashMap::new();
@@ -1646,7 +1646,7 @@ fn collect_derived_type_layouts(
     unit: &ProgramUnit,
     scope_id: ScopeId,
     st: &SymbolTable,
-    layouts: &mut super::type_layout::TypeLayoutRegistry,
+    layouts: &mut crate::sema::type_layout::TypeLayoutRegistry,
     inherited_params: &HashMap<String, i64>,
     visible_param_cache: &mut HashMap<ScopeId, HashMap<String, i64>>,
     exported_param_cache: &mut HashMap<ScopeId, HashMap<String, i64>>,
@@ -1895,10 +1895,10 @@ fn collect_const_int_params(
 
 fn collect_const_derived_field_inits(
     decls: &[SpannedDecl],
-    layouts: &super::type_layout::TypeLayoutRegistry,
+    layouts: &crate::sema::type_layout::TypeLayoutRegistry,
     const_params: &HashMap<String, i64>,
-) -> HashMap<String, super::type_layout::FieldDefaultInit> {
-    use super::type_layout::{
+) -> HashMap<String, crate::sema::type_layout::FieldDefaultInit> {
+    use crate::sema::type_layout::{
         derived_param_field_lookup_key, eval_const_field_default_init_for_layout, FieldDefaultInit,
     };
 
@@ -1981,9 +1981,9 @@ fn collect_const_derived_field_inits(
 fn register_local_type_layouts(
     decls: &[SpannedDecl],
     host_module: Option<&str>,
-    layouts: &mut super::type_layout::TypeLayoutRegistry,
+    layouts: &mut crate::sema::type_layout::TypeLayoutRegistry,
     const_params: &HashMap<String, i64>,
-    const_derived_field_inits: &HashMap<String, super::type_layout::FieldDefaultInit>,
+    const_derived_field_inits: &HashMap<String, crate::sema::type_layout::FieldDefaultInit>,
 ) {
     for decl in decls {
         if let Decl::DerivedTypeDef {
@@ -2000,7 +2000,7 @@ fn register_local_type_layouts(
             let is_abstract = attrs
                 .iter()
                 .any(|attr| matches!(attr, crate::ast::decl::TypeAttr::Abstract));
-            let layout = super::type_layout::compute_layout_with_attrs(
+            let layout = crate::sema::type_layout::compute_layout_with_attrs(
                 name,
                 host_module,
                 type_bound_procs,
@@ -2047,9 +2047,9 @@ fn register_local_type_layouts(
 fn resolve_proc_pointer_default_targets(
     st: &SymbolTable,
     scope_id: ScopeId,
-    layouts: &mut super::type_layout::TypeLayoutRegistry,
+    layouts: &mut crate::sema::type_layout::TypeLayoutRegistry,
 ) {
-    use super::type_layout::FieldDefaultInit;
+    use crate::sema::type_layout::FieldDefaultInit;
 
     for layout in layouts.layouts.values_mut() {
         let owner = match layout.owner_module.as_deref() {
@@ -2115,11 +2115,11 @@ fn resolve_proc_pointer_link_symbol(
 }
 
 fn mangle_link_symbol_for(
-    sym: &super::symtab::Symbol,
-    scope: &super::symtab::Scope,
+    sym: &crate::sema::symtab::Symbol,
+    scope: &crate::sema::symtab::Scope,
     name_in_scope: &str,
 ) -> String {
-    use super::symtab::{ScopeKind, SymbolKind};
+    use crate::sema::symtab::{ScopeKind, SymbolKind};
     match sym.kind {
         SymbolKind::Function | SymbolKind::Subroutine => match &scope.kind {
             ScopeKind::Module(module_name) | ScopeKind::Submodule(module_name) => format!(
@@ -2358,7 +2358,7 @@ fn process_contains(
     st: &mut SymbolTable,
     contains: &[SpannedUnit],
     module_search_paths: &[std::path::PathBuf],
-    layouts: &mut super::type_layout::TypeLayoutRegistry,
+    layouts: &mut crate::sema::type_layout::TypeLayoutRegistry,
 ) -> Result<(), SemaError> {
     for unit in contains {
         // Register the subprogram name in the current scope before descending.
