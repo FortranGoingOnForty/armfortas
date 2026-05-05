@@ -6,6 +6,13 @@
 ! - Negated sum:   `s = s + (-a(i))`
 !
 ! Composes with scalar tail (trip not divisible by V).
+!
+! sum(-i for i=1..32) = -528; sum(|i-16|, 1..32) = 256;
+! sum(|i-16|, 1..31) = 240.
+! CHECK: -528
+! CHECK: 2.5600000E2
+! CHECK: 2.560000000000000E2
+! CHECK: 2.4000000E2
 program test_do_loop_vectorize_reduce_sum_unary
   implicit none
   integer :: i, s_neg, a(32)
