@@ -14,6 +14,12 @@ pub struct LiveInterval {
     pub start: u32,         // first instruction position (definition)
     pub end: u32,           // last instruction position (final use)
     pub crosses_call: bool, // true if a BL/BLR falls within [start, end]
+    /// Sorted positions of every BL/BLR strictly inside (start, end).
+    /// Empty when `crosses_call` is false. Populated as the
+    /// foundation for live-range splitting: knowing exactly where
+    /// an interval crosses calls lets the allocator split it at
+    /// those boundaries rather than spilling the whole range.
+    pub call_crossings: Vec<u32>,
     /// Preferred physical register (hint). If set, the allocator tries this register first.
     /// Used to avoid unnecessary moves (e.g., arg values prefer xN, return values prefer x0).
     pub hint: Option<u8>,
@@ -306,14 +312,24 @@ pub fn compute_liveness(mf: &MachineFunction) -> LivenessResult {
             let end = ends[idx]?;
             let vreg = VRegId(idx as u32);
             let class = vreg_classes[idx];
-            // Check if any call falls within [start, end].
-            let crosses_call = call_positions.iter().any(|&cp| cp > start && cp < end);
+            // Collect every call within (start, end). These are
+            // candidate split points for the live-range splitter
+            // when callee-saved is exhausted; for today's allocator
+            // the boolean flag is what's consumed, but the
+            // splitter (sprint 18) needs the per-position list.
+            let call_crossings: Vec<u32> = call_positions
+                .iter()
+                .copied()
+                .filter(|&cp| cp > start && cp < end)
+                .collect();
+            let crosses_call = !call_crossings.is_empty();
             Some(LiveInterval {
                 vreg,
                 class,
                 start,
                 end,
                 crosses_call,
+                call_crossings,
                 hint: None,
             })
         })
@@ -423,6 +439,12 @@ mod tests {
         assert!(
             interval.crosses_call,
             "interval crossing BLR must be marked crosses_call"
+        );
+        assert_eq!(
+            interval.call_crossings.len(),
+            1,
+            "interval should record exactly one BLR crossing, got {:?}",
+            interval.call_crossings
         );
     }
 
