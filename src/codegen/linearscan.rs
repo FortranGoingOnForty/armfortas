@@ -719,6 +719,10 @@ fn spill_scratch(class: RegClass, idx: usize) -> (PhysReg, ArmOpcode) {
             PhysReg::Fp32(FP_SPILL_SCRATCH[idx % 3]),
             ArmOpcode::LdrFpImm,
         ),
+        // 128-bit vector spills/fills via LdrQ — same FP scratch
+        // bank (the V registers ARE the 128-bit form of the same
+        // physical D/S registers).
+        RegClass::V128 => (PhysReg::Fp(FP_SPILL_SCRATCH[idx % 3]), ArmOpcode::LdrQ),
         RegClass::Gp32 => (PhysReg::Gp32(GP_SPILL_SCRATCH[idx % 3]), ArmOpcode::LdrImm),
         RegClass::Gp64 => (PhysReg::Gp(GP_SPILL_SCRATCH[idx % 3]), ArmOpcode::LdrImm),
     }
