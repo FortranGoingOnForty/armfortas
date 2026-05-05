@@ -8,6 +8,10 @@
 ! Trip = 31, V = 4 (f32) → head 28 iters + 3 scalar tail.
 ! Trip = 31, V = 2 (f64) → head 30 iters + 1 scalar tail.
 ! Sum 1..31 = 31 * 32 / 2 = 496.
+! CHECK: 496
+! CHECK: 496
+! CHECK: 4.9600000E2
+! CHECK: 4.960000000000000E2
 program test_do_loop_vectorize_reduce_sum_tail
   implicit none
   integer :: i
