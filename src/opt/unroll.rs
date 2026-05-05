@@ -1026,6 +1026,7 @@ fn remap_kind(kind: &InstKind, subst: &HashMap<ValueId, ValueId>) -> InstKind {
         InstKind::VDiv(a, b) => InstKind::VDiv(r(a), r(b)),
         InstKind::VNeg(a) => InstKind::VNeg(r(a)),
         InstKind::VAbs(a) => InstKind::VAbs(r(a)),
+        InstKind::VSqrt(a) => InstKind::VSqrt(r(a)),
         InstKind::VFma(a, b, c) => InstKind::VFma(r(a), r(b), r(c)),
         InstKind::VMin(a, b) => InstKind::VMin(r(a), r(b)),
         InstKind::VMax(a, b) => InstKind::VMax(r(a), r(b)),

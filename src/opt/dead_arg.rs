@@ -201,6 +201,7 @@ fn inst_uses_param(kind: &InstKind, param_id: ValueId) -> bool {
         | InstKind::VDiv(..)
         | InstKind::VNeg(..)
         | InstKind::VAbs(..)
+        | InstKind::VSqrt(..)
         | InstKind::VFma(..)
         | InstKind::VMin(..)
         | InstKind::VMax(..)

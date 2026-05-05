@@ -554,6 +554,7 @@ fn key_of(
         | InstKind::VDiv(..)
         | InstKind::VNeg(..)
         | InstKind::VAbs(..)
+        | InstKind::VSqrt(..)
         | InstKind::VFma(..)
         | InstKind::VMin(..)
         | InstKind::VMax(..)
