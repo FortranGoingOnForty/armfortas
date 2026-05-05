@@ -13507,6 +13507,88 @@ fn fixed_shape_array_function_result_auto_allocates_on_entry() {
 }
 
 #[test]
+fn sum_along_dim_returns_reduced_array() {
+    // F2018 §16.9.231: SUM(arr, dim=k) reduces along dim k and
+    // returns a rank-(N-1) array. For a 2x3 matrix [[1,3,5],[2,4,6]]
+    // sum(y, 1) = [3, 7, 11], sum(y, 2) = [9, 12]. Pre-fix,
+    // sum-with-dim broadcast the whole-array sum (21) to every
+    // element of the result, which propagated to var/cov in
+    // stdlib_stats and silently produced wrong moments.
+    let src = write_program(
+        "program t\n  implicit none\n  real :: y(2,3) = reshape([1.,2.,3.,4.,5.,6.], [2,3])\n  real :: r1(3), r2(2)\n  r1 = sum(y, 1)\n  r2 = sum(y, 2)\n  if (any(abs(r1 - [3., 7., 11.]) > 1.0e-6)) error stop 1\n  if (any(abs(r2 - [9., 12.]) > 1.0e-6)) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("sum_along_dim", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("sum-with-dim compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "sum-with-dim should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("sum-with-dim run failed");
+    assert!(
+        run.status.success(),
+        "sum-with-dim should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn rank_reducing_section_arithmetic_uses_strided_descriptor() {
+    // F2018 §9.5.3.4: a subscript like `y(1,:)` is a *rank-reducing*
+    // selection — the leading scalar index drops the first dim and
+    // the result is rank-1 with column-major memory stride
+    // (= extent of the dropped dim). Pre-fix, `afs_create_section`
+    // preserved the source rank, leaving a rank-2 descriptor with
+    // both extents intact and dim[0].stride=1; the binop loop in
+    // `lower_array_expr_descriptor` then iterated flat over the
+    // total element count using only dim[0].stride and read garbage
+    // from the wrong memory positions. Confirmed shape: y(1,:)-m
+    // returned [-0.5,-1.5,-2.5] instead of [-0.5,-0.5,-0.5].
+    let src = write_program(
+        "program t\n  implicit none\n  real :: y(2,3) = reshape([1.,2.,3.,4.,5.,6.], [2,3])\n  real :: m(3) = [1.5, 3.5, 5.5]\n  real :: m2(2) = [10., 20.]\n  real :: r1(3), r2(2)\n  r1 = y(1,:) - m\n  r2 = y(:,2) - m2\n  if (any(abs(r1 - [-0.5, -0.5, -0.5]) > 1.0e-6)) error stop 1\n  if (any(abs(r2 - [-7., -16.]) > 1.0e-6)) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("rank_reducing_section_arith", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("rank-reducing section arith compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "rank-reducing section arith should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("rank-reducing section arith run failed");
+    assert!(
+        run.status.success(),
+        "rank-reducing section arith should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn all_compare_mixed_kind_generic_rank2_returns_descriptors() {
     // F2018 §10.1.5 + §16.9.5: `all(eye(4) == diag([1,1,1,1]))` from
     // stdlib's example_eye2. Reproduces three issues at once: generic-
