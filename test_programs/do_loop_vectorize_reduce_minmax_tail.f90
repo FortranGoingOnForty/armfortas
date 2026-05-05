@@ -9,6 +9,13 @@
 ! Trip = 31, V = 4 (i32) → head 28 + tail 3.
 ! Trip = 31, V = 4 (f32) → head 28 + tail 3.
 ! Trip = 31, V = 2 (f64) → head 30 + tail 1.
+!
+! mx32 = max(100-i, 1..31) = 99; mn32 = min(...) = 69;
+! rmx32 = 99.0; rmn64 = min(i-100, 1..31) = -99.0.
+! CHECK: 99
+! CHECK: 69
+! CHECK: 9.9000000E1
+! CHECK: -9.900000000000000E1
 program test_do_loop_vectorize_reduce_minmax_tail
   implicit none
   integer :: i, mn32, mx32
