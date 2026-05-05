@@ -158,6 +158,50 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
         split_pool(&FP_ALLOC_ORDER, &FP_CALLEE_SAVED);
     let mut callee_saved_used: HashSet<PhysReg> = HashSet::new();
 
+    // Hard-coded PhysReg writes inside instructions: positions
+    // where operand 0 is a PhysReg, e.g. arg-setup
+    // `mov PhysReg(x_i), VReg(value)` immediately before each BL.
+    // The splitter consults this map to avoid pre_phys candidates
+    // that will be clobbered by an arg-setup inside the pre-half's
+    // range — picking such a register would corrupt the bridge str
+    // because by the time the bridge runs the register no longer
+    // holds the pre-half value. We only constrain the splitter
+    // here (not the general allocator) to keep the inflated-
+    // liveness compensations elsewhere intact.
+    let mut phys_writes_gp: HashMap<u8, Vec<u32>> = HashMap::new();
+    let mut phys_writes_fp: HashMap<u8, Vec<u32>> = HashMap::new();
+    {
+        let mut p: u32 = 0;
+        for block in &mf.blocks {
+            for inst in &block.insts {
+                if let Some(MachineOperand::PhysReg(phys)) = inst.operands.first() {
+                    match phys {
+                        PhysReg::Gp(n) | PhysReg::Gp32(n) => {
+                            phys_writes_gp.entry(*n).or_default().push(p);
+                        }
+                        PhysReg::Fp(n) | PhysReg::Fp32(n) => {
+                            phys_writes_fp.entry(*n).or_default().push(p);
+                        }
+                        _ => {}
+                    }
+                }
+                p += 2;
+            }
+        }
+    }
+    let phys_written_in = |phys_n: u8, is_fp: bool, start: u32, end: u32| -> bool {
+        let map = if is_fp {
+            &phys_writes_fp
+        } else {
+            &phys_writes_gp
+        };
+        if let Some(positions) = map.get(&phys_n) {
+            positions.iter().any(|&pp| pp > start && pp <= end)
+        } else {
+            false
+        }
+    };
+
     // Tracks live-range splits in progress: each entry maps a
     // synthetic post-half vreg to (original vreg, call position,
     // bridge slot). After allocation we walk this map to
@@ -279,26 +323,54 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
         } else {
             false
         };
+        // Find a caller-saved that survives the pre-half range
+        // unclobbered. Reject any register P such that an
+        // instruction inside (interval.start, call_pos - 1] writes
+        // P — by the time the bridge str fires (right above the
+        // arg-setup block), P would no longer hold the pre-half's
+        // value and the bridge would capture garbage.
+        let safe_pre_phys = if !free_caller.is_empty() && interval.call_crossings.len() == 1 {
+            let cp = interval.call_crossings[0];
+            let pre_end = cp.saturating_sub(1);
+            free_caller.iter().rposition(|&r| {
+                !phys_written_in(r, is_fp, interval.start, pre_end)
+            })
+        } else {
+            None
+        };
         if reg_opt.is_none()
             && interval.crosses_call
             && real_crosses
-            && !free_caller.is_empty()
+            && safe_pre_phys.is_some()
         {
             let call_pos = interval.call_crossings[0];
             let bridge_slot = mf.alloc_local(spill_slot_size(interval.class));
             let synthetic = mf.new_vreg(interval.class);
             splits_in_progress.insert(synthetic, (interval.vreg, call_pos, bridge_slot));
-            // Pre-half: shrink the original to end before the call.
-            // Now non-call-crossing, so it can take a caller-saved.
-            let pre_half = super::liveness::LiveInterval {
-                vreg: interval.vreg,
-                class: interval.class,
-                start: interval.start,
-                end: call_pos.saturating_sub(1),
-                crosses_call: false,
-                call_crossings: Vec::new(),
-                hint: interval.hint,
+            // Pull the safe register out of the caller-saved pool
+            // and assign it directly: re-running through the normal
+            // assignment path could pick a different register that
+            // *isn't* phys-write-safe (free_caller.pop() doesn't
+            // filter), which would defeat the whole point.
+            let safe_reg = free_caller.remove(safe_pre_phys.unwrap());
+            let pre_phys = if is_fp {
+                match interval.class {
+                    RegClass::Fp32 => PhysReg::Fp32(safe_reg),
+                    _ => PhysReg::Fp(safe_reg),
+                }
+            } else {
+                match interval.class {
+                    RegClass::Gp32 => PhysReg::Gp32(safe_reg),
+                    _ => PhysReg::Gp(safe_reg),
+                }
             };
+            assignments.insert(interval.vreg, pre_phys);
+            // Pre-half ends before the call — track so this slot
+            // becomes free for any post-call interval that needs a
+            // caller-saved.
+            active.push((safe_reg, call_pos.saturating_sub(1), interval.vreg));
+            active.sort_by_key(|&(_, end, _)| end);
+
             // Post-half: a fresh synthetic vreg covering the
             // post-call range. Single original crossing → no
             // crossings remain; cannot recurse-split.
@@ -311,7 +383,6 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
                 call_crossings: Vec::new(),
                 hint: None,
             };
-            worklist[idx] = pre_half;
             // Insert post-half at its sorted position.
             let post_start = post_half.start;
             let post_vreg = post_half.vreg.0;
@@ -324,7 +395,7 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
                 insert_at += 1;
             }
             worklist.insert(insert_at, post_half);
-            // Re-process the truncated pre-half at the same index.
+            idx += 1;
             continue;
         }
 
@@ -996,6 +1067,18 @@ pub fn insert_split_bridges(mf: &mut MachineFunction, splits: &[SplitRecord]) {
             let is_call = matches!(inst.opcode, ArmOpcode::Bl | ArmOpcode::Blr);
             if is_call {
                 let idx = call_seen;
+                // Place bridge `str pre_phys, [fp, slot]` *above* the
+                // canonical arg-setup mov sequence. Arg-setup movs
+                // can write to caller-saved physregs that are also
+                // some split's `pre_phys` — by the time we reach the
+                // BL, those registers no longer hold the pre-half's
+                // value. Scan back over arg-setup movs and insert
+                // bridges at the top of that block.
+                let mut insert_at = new_insts.len();
+                while insert_at > 0 && is_call_arg_copy(&new_insts[insert_at - 1]) {
+                    insert_at -= 1;
+                }
+                let mut bridges: Vec<MachineInst> = Vec::new();
                 for r in splits {
                     if r.call_index != idx {
                         continue;
@@ -1004,7 +1087,7 @@ pub fn insert_split_bridges(mf: &mut MachineFunction, splits: &[SplitRecord]) {
                         PhysReg::Fp(_) | PhysReg::Fp32(_) => ArmOpcode::StrFpImm,
                         _ => ArmOpcode::StrImm,
                     };
-                    new_insts.push(MachineInst {
+                    bridges.push(MachineInst {
                         opcode: store_op,
                         operands: vec![
                             MachineOperand::PhysReg(r.pre_phys),
@@ -1013,6 +1096,9 @@ pub fn insert_split_bridges(mf: &mut MachineFunction, splits: &[SplitRecord]) {
                         ],
                         def: None,
                     });
+                }
+                for (offset, b) in bridges.into_iter().enumerate() {
+                    new_insts.insert(insert_at + offset, b);
                 }
             }
             new_insts.push(inst);
