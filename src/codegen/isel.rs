@@ -1846,16 +1846,15 @@ fn select_inst(
                         def: Some(dest),
                     });
                 }
-                IrType::Int(_) => {
-                    // Step 1: addv into a fresh V128 vreg (so its
-                    // physical placement is in the FP bank).
+                IrType::Int(IntWidth::I32) => {
+                    // 4×i32 → scalar via `addv.4s s_tmp, v_src` then
+                    // `umov.s w_dest, v_tmp[0]`.
                     let tmp = mf.new_vreg(RegClass::V128);
                     mf.block_mut(mb).insts.push(MachineInst {
                         opcode: ArmOpcode::Addv4S,
                         operands: vec![MachineOperand::VReg(tmp), MachineOperand::VReg(src)],
                         def: Some(tmp),
                     });
-                    // Step 2: umov.s w_dest, v_tmp[0].
                     let class = type_to_reg_class(&inst.ty);
                     let dest = ctx.get_vreg(mf, inst.id, class);
                     mf.block_mut(mb).insts.push(MachineInst {
@@ -1865,6 +1864,42 @@ fn select_inst(
                             MachineOperand::VReg(tmp),
                             MachineOperand::Imm(0),
                         ],
+                        def: Some(dest),
+                    });
+                }
+                IrType::Int(IntWidth::I64) => {
+                    // 2×i64 → scalar via pairwise add (`addp.2d
+                    // v_tmp, v_src, v_src`) then `umov.d x_dest,
+                    // v_tmp[0]`. NEON has no `addv.2d`, so the
+                    // pairwise form is the canonical i64 reduce.
+                    let tmp = mf.new_vreg(RegClass::V128);
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode: ArmOpcode::AddpV2D,
+                        operands: vec![
+                            MachineOperand::VReg(tmp),
+                            MachineOperand::VReg(src),
+                            MachineOperand::VReg(src),
+                        ],
+                        def: Some(tmp),
+                    });
+                    let class = type_to_reg_class(&inst.ty);
+                    let dest = ctx.get_vreg(mf, inst.id, class);
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode: ArmOpcode::Umov2D,
+                        operands: vec![
+                            MachineOperand::VReg(dest),
+                            MachineOperand::VReg(tmp),
+                            MachineOperand::Imm(0),
+                        ],
+                        def: Some(dest),
+                    });
+                }
+                IrType::Int(_) => {
+                    let class = type_to_reg_class(&inst.ty);
+                    let dest = ctx.get_vreg(mf, inst.id, class);
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode: ArmOpcode::Nop,
+                        operands: vec![MachineOperand::VReg(dest), MachineOperand::VReg(src)],
                         def: Some(dest),
                     });
                 }
