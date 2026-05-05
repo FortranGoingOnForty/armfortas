@@ -25,6 +25,12 @@ pub enum RegClass {
     Fp64,
     /// FP/SIMD single (S0-S31).
     Fp32,
+    /// 128-bit NEON vector (Q0-Q31). Covers 4×f32, 2×f64, 4×i32,
+    /// 2×i64, etc. — every shape in `IrType::Vector`. Codegen
+    /// shares the same physical bank as Fp32/Fp64 (the V registers
+    /// are the 128-bit form of D/S), so the regalloc assigns them
+    /// from the same pool but at 128-bit width.
+    V128,
 }
 
 /// ARM64 opcodes that we emit.
@@ -89,6 +95,72 @@ pub enum ArmOpcode {
     // 3-source: dest = Sa ± Sn*Sm.
     FmaddS,
     FmaddD, // FMADD:  dest = Sa + Sn*Sm
+
+    // ---- NEON SIMD vector arithmetic (Sprint 12 Stage 2) ----
+    //
+    // Each opcode encodes the lane shape so emit/encoding stays
+    // table-driven. Naming convention: `<Op><LaneCount><LaneType>`.
+    // Examples: `FaddV4S` is "fadd Vd.4s, Vn.4s, Vm.4s", `FmlaV2D`
+    // is "fmla Vd.2d, Vn.2d, Vm.2d".
+    //
+    // Operands across this family: dest VReg of class V128 plus the
+    // expected source operands for that op. Lane shape is implicit
+    // in the opcode; emit just dispatches.
+    AddV4S,  // ADD Vd.4s, Vn.4s, Vm.4s    (integer)
+    AddV2D,  // ADD Vd.2d, Vn.2d, Vm.2d
+    SubV4S,
+    SubV2D,
+    MulV4S,  // MUL Vd.4s, Vn.4s, Vm.4s    (integer; 2D not in NEON)
+    NegV4S,
+    NegV2D,
+    FaddV4S, // FADD Vd.4s, Vn.4s, Vm.4s
+    FaddV2D, // FADD Vd.2d, Vn.2d, Vm.2d
+    FsubV4S,
+    FsubV2D,
+    FmulV4S,
+    FmulV2D,
+    FdivV4S,
+    FdivV2D,
+    FnegV4S,
+    FnegV2D,
+    FabsV4S,
+    FabsV2D,
+    FmlaV4S, // FMLA Vd.4s, Vn.4s, Vm.4s   (Vd += Vn*Vm)
+    FmlaV2D,
+    FminV4S,
+    FminV2D,
+    FmaxV4S,
+    FmaxV2D,
+    SminV4S, // SMIN (signed integer)
+    SmaxV4S,
+    UminV4S,
+    UmaxV4S,
+
+    // Cross-lane reductions
+    FaddpV2S, // FADDP Sd, Vn.2s     (pair-add → scalar; 2-lane f32)
+    FaddpV2D, // FADDP Dd, Vn.2d     (pair-add → scalar; 2-lane f64)
+    Faddv4S,  // FADDV Sd, Vn.4s     (across 4 f32 lanes → scalar)
+    Sminv4S,  // SMINV Sd, Vn.4s
+    Smaxv4S,
+    Uminv4S,
+    Umaxv4S,
+    Addv4S,   // integer cross-lane add over 4×i32
+
+    // Lane move / broadcast
+    DupGen4S, // DUP Vd.4s, Wn       (broadcast scalar to 4 lanes)
+    DupGen2D, // DUP Vd.2d, Xn
+    DupEl4S,  // DUP Vd.4s, Vn.s[0]  (broadcast lane 0 to 4 lanes)
+    DupEl2D,
+    Ins4S,    // INS Vd.s[lane], Wn  (insert scalar into one lane)
+    Ins2D,
+    Umov4S,   // UMOV Wd, Vn.s[lane] (extract lane to scalar)
+    Umov2D,
+    FmovEl4S, // FMOV Sd, Vn.s[lane] (extract f32 lane)
+    FmovEl2D,
+
+    // Vector load/store (128-bit Q register)
+    LdrQ,     // LDR Qt, [Xn, #imm]
+    StrQ,     // STR Qt, [Xn, #imm]
     FmsubS,
     FmsubD, // FMSUB:  dest = Sa - Sn*Sm
     FnmsubS,
