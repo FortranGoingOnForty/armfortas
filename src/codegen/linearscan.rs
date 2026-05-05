@@ -805,15 +805,7 @@ pub fn apply_allocation(
                 {
                     continue;
                 }
-                new_insts.push(MachineInst {
-                    opcode: *load_op,
-                    operands: vec![
-                        MachineOperand::PhysReg(*scratch),
-                        MachineOperand::PhysReg(PhysReg::FP),
-                        MachineOperand::Imm(*offset as i64),
-                    ],
-                    def: None,
-                });
+                emit_spill_access(&mut new_insts, *load_op, *scratch, *offset as i64);
                 rewritten.operands[*op_idx] = MachineOperand::PhysReg(*scratch);
             }
 
@@ -898,20 +890,69 @@ pub fn apply_allocation(
                     RegClass::V128 => ArmOpcode::StrQ,
                     _ => ArmOpcode::StrImm,
                 };
-                new_insts.push(MachineInst {
-                    opcode: store_op,
-                    operands: vec![
-                        MachineOperand::PhysReg(scratch),
-                        MachineOperand::PhysReg(PhysReg::FP),
-                        MachineOperand::Imm(offset as i64),
-                    ],
-                    def: None,
-                });
+                emit_spill_access(&mut new_insts, store_op, scratch, offset as i64);
             }
         }
 
         mf.blocks[block_idx].insts = new_insts;
     }
+}
+
+/// Emit a spill load or store, materializing the FP-relative
+/// address through `x8` when the offset is out of the LDR/STR
+/// immediate's reach. ARM64's LDUR / STUR (used as a fallback for
+/// negative immediates) only encode signed 9-bit offsets
+/// `(-256, 255)`. For wider frames we substitute
+/// `sub x8, x29, #|offset|; ldr/str rt, [x8, #0]`. Positive
+/// out-of-scaled-range offsets get the symmetric `add` treatment.
+fn emit_spill_access(
+    insts: &mut Vec<MachineInst>,
+    op: ArmOpcode,
+    rt: PhysReg,
+    offset: i64,
+) {
+    // Most spill ops encode comfortably with FP-relative immediates.
+    // Only fall back to address materialization when out of LDUR
+    // range. (Positive offsets up to 65520 step 16 are handled by
+    // LDR's scaled form; negatives must use LDUR; we materialize
+    // anything outside the union.)
+    let in_range = (-256..=255).contains(&offset);
+    if in_range {
+        insts.push(MachineInst {
+            opcode: op,
+            operands: vec![
+                MachineOperand::PhysReg(rt),
+                MachineOperand::PhysReg(PhysReg::FP),
+                MachineOperand::Imm(offset),
+            ],
+            def: None,
+        });
+        return;
+    }
+    let addr = PhysReg::Gp(8);
+    let (mat_op, abs) = if offset >= 0 {
+        (ArmOpcode::AddImm, offset)
+    } else {
+        (ArmOpcode::SubImm, -offset)
+    };
+    insts.push(MachineInst {
+        opcode: mat_op,
+        operands: vec![
+            MachineOperand::PhysReg(addr),
+            MachineOperand::PhysReg(PhysReg::FP),
+            MachineOperand::Imm(abs),
+        ],
+        def: None,
+    });
+    insts.push(MachineInst {
+        opcode: op,
+        operands: vec![
+            MachineOperand::PhysReg(rt),
+            MachineOperand::PhysReg(addr),
+            MachineOperand::Imm(0),
+        ],
+        def: None,
+    });
 }
 
 /// Insert callee-saved register saves in prologue and restores in epilogue.
