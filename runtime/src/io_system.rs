@@ -590,6 +590,13 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
                     *iostat = e.raw_os_error().unwrap_or(1);
                 }
             } else {
+                // Release the io_state mutex before exit. process::exit invokes
+                // libc atexit handlers — including afs_io_finalize, which locks
+                // io_state to flush units. Holding the lock here while exiting
+                // deadlocked on macOS where the atexit thread re-entered the
+                // same mutex (sample-trace: pthread_mutex_firstfit_lock_wait
+                // → __psynch_mutexwait, hangs forever).
+                drop(state);
                 eprintln!("OPEN: {}: {}", fname, e);
                 std::process::exit(1);
             }
@@ -634,6 +641,8 @@ pub extern "C" fn afs_close_ex(unit: i32, status: *const u8, status_len: i64, io
         if !iostat.is_null() {
             unsafe { *iostat = close_status };
         } else if close_status != 0 {
+            // Release lock before exit (afs_io_finalize atexit re-locks). See afs_open.
+            drop(state);
             eprintln!("CLOSE: {}: {}", filename, io::Error::from_raw_os_error(close_status));
             std::process::exit(1);
         }
@@ -2417,9 +2426,15 @@ pub extern "C" fn afs_io_init() {
 /// Finalize the I/O subsystem. Flush and close all open units.
 #[no_mangle]
 pub extern "C" fn afs_io_finalize() {
-    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    for (_, unit) in state.units.iter_mut() {
-        let _ = unit.flush();
+    // Use try_lock instead of lock: process::exit invokes libc atexit handlers,
+    // and any I/O routine that exited while holding io_state would deadlock here.
+    // If the caller is already holding the lock during exit, their drop has already
+    // unwound or process::exit released their mutex first; in the rare case where
+    // the lock is genuinely contested, skip flush rather than hang the program.
+    if let Ok(mut state) = io_state().try_lock() {
+        for (_, unit) in state.units.iter_mut() {
+            let _ = unit.flush();
+        }
     }
 }
 
