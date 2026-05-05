@@ -4655,25 +4655,10 @@ fn lower_unit(
                     }
                     HiddenResultAbi::None => 0,
                 };
-                // For ComplexBuffer, type the hidden first param as a typed
-                // complex pointer (`Ptr<[Float x 2]>`) rather than a generic
-                // byte buffer. The result variable's `addr` is `ValueId(0)`,
-                // and any pass-by-reference of the result variable to a
-                // generic call site uses that addr's IR type for dispatch.
-                // A `Ptr<[i8 x 8]>` would mismatch a `complex(sp)` formal
-                // (Float vs I8 element), causing dispatch failures for
-                // calls like `kahan_kernel(..., p, ...)` inside
-                // complex-returning module functions.
-                let desc_ptr_ty = if hidden_result_abi == HiddenResultAbi::ComplexBuffer {
-                    let kind = complex_result_kind(name, result, return_type.as_ref(), decls, st);
-                    let fw = if kind == 8 { FloatWidth::F64 } else { FloatWidth::F32 };
-                    IrType::Ptr(Box::new(IrType::Array(Box::new(IrType::Float(fw)), 2)))
-                } else {
-                    IrType::Ptr(Box::new(IrType::Array(
-                        Box::new(IrType::Int(IntWidth::I8)),
-                        desc_size,
-                    )))
-                };
+                let desc_ptr_ty = IrType::Ptr(Box::new(IrType::Array(
+                    Box::new(IrType::Int(IntWidth::I8)),
+                    desc_size,
+                )));
                 let sret = Param {
                     name: "_sret".into(),
                     ty: desc_ptr_ty,
@@ -5053,18 +5038,30 @@ fn lower_unit(
                     ctx.result_type = Some(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
                 } else if hidden_result_abi == HiddenResultAbi::ComplexBuffer {
                     // The hidden first param is the caller-allocated complex
-                    // buffer. The body's `result = (...)` lowers through the
-                    // complex-assign path that memcpys 8/16 bytes into the
-                    // result variable's `addr` — pointing addr at the sret
-                    // param routes the write straight into the caller's buf.
+                    // buffer typed as `Ptr<[i8 x 8/16]>` so the call-site IR
+                    // type matches the caller's byte-buffer alloca. The body
+                    // needs a *typed* complex pointer (`Ptr<[Float x 2]>`)
+                    // for two reasons:
+                    //   1. The complex-assign path stores two Float lanes —
+                    //      a typed pointer keeps load/store types consistent
+                    //      with the IR verifier.
+                    //   2. Generic dispatch on the result variable consults
+                    //      `b.func().value_type(addr)` to match candidates;
+                    //      a `Ptr<[Float x 2]>` is recognised as complex,
+                    //      while `Ptr<[i8 x 8]>` matches no complex formal.
+                    // GEP at byte offset 0 with a Float-array result type
+                    // produces the typed view without changing the runtime
+                    // address.
                     let kind = complex_result_kind(name, result, return_type.as_ref(), decls, st);
                     let fw = if kind == 8 { FloatWidth::F64 } else { FloatWidth::F32 };
                     let cplx_ty =
                         IrType::Array(Box::new(IrType::Float(fw)), 2);
+                    let zero_off = b.const_i64(0);
+                    let typed_addr = b.gep(ValueId(0), vec![zero_off], cplx_ty.clone());
                     ctx.locals.insert(
                         result_name.clone(),
                         LocalInfo {
-                            addr: ValueId(0),
+                            addr: typed_addr,
                             ty: cplx_ty.clone(),
                             dims: vec![],
                             allocatable: false,
@@ -5080,7 +5077,7 @@ fn lower_unit(
                             last_dim_assumed_size: false,
                         },
                     );
-                    ctx.result_addr = Some(ValueId(0));
+                    ctx.result_addr = Some(typed_addr);
                     ctx.result_type = Some(IrType::Ptr(Box::new(cplx_ty)));
                 } else if hidden_result_abi == HiddenResultAbi::StringDescriptor {
                     // Scalar character results use the hidden StringDescriptor
@@ -16037,22 +16034,13 @@ fn emit_resolved_operator_call(
     let callee_char_len_star_args =
         first_procedure_lookup(&abi_lookup_keys, |k| callee_char_len_star_mask(st, k));
     let hidden_result = hidden_abi.and_then(|abi| {
-        let bytes = hidden_result_temp_bytes_for_callee(st, type_layouts, &abi_lookup_keys, abi)?;
-        let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), bytes));
-        let zero_i32 = b.const_i32(0);
-        let size = b.const_i64(bytes as i64);
-        b.call(
-            FuncRef::External("memset".into()),
-            vec![desc, zero_i32, size],
-            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-        );
-        Some(desc)
+        allocate_hidden_result_buffer(b, st, type_layouts, &abi_lookup_keys, abi)
     });
 
     let mut call_args = Vec::with_capacity(2 + hidden_result.is_some() as usize + 4);
     let mut char_actual_lens = [None, None];
-    if let Some(desc) = hidden_result {
-        call_args.push(desc);
+    if let Some((raw, _typed)) = hidden_result {
+        call_args.push(raw);
     }
 
     for (i, (expr, actual)) in [(&left_expr, lhs), (&right_expr, rhs)]
@@ -16206,8 +16194,8 @@ fn emit_resolved_operator_call(
     };
     let call_result = b.call(func_ref, call_args, ret_ty);
 
-    if let Some(desc) = hidden_result {
-        return desc;
+    if let Some((_raw, typed)) = hidden_result {
+        return typed;
     }
 
     if let Some(tl) = type_layouts {
@@ -23105,9 +23093,30 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                     );
                                     b.store(coerced, tgt);
                                 } else if is_complex_ty(&info.ty) {
-                                    // Complex assignment: RHS returns a ptr to [f32/f64 x 2] buffer.
-                                    // Memcpy the 8 or 16 bytes into the destination slot.
-                                    let src = lower_expr_ctx_tl(b, ctx, value);
+                                    // Complex assignment: most RHS shapes
+                                    // return a ptr to [f32/f64 x 2] buffer
+                                    // (ComplexLiteral, complex var read,
+                                    // complex op result), which we memcpy
+                                    // straight in. But scalar int/real
+                                    // RHS (e.g. `res = 0`) returns the
+                                    // value directly — coerce it through
+                                    // the int/real → complex path which
+                                    // materializes a fresh buffer.
+                                    let src_raw = lower_expr_ctx_tl(b, ctx, value);
+                                    let src = match b.func().value_type(src_raw) {
+                                        Some(IrType::Ptr(_)) => src_raw,
+                                        _ => {
+                                            let coerced = coerce_to_type(b, src_raw, &info.ty);
+                                            // coerce_to_type for scalar →
+                                            // complex returns the loaded
+                                            // aggregate value. Stash it in
+                                            // a fresh buffer so the memcpy
+                                            // below has a real source ptr.
+                                            let buf = b.alloca(info.ty.clone());
+                                            b.store(coerced, buf);
+                                            buf
+                                        }
+                                    };
                                     let bytes = complex_byte_size(&info.ty);
                                     let sz = b.const_i64(bytes);
                                     if info.by_ref {
@@ -41222,6 +41231,43 @@ fn emit_memcpy_bytes(b: &mut FuncBuilder, dest: ValueId, src: ValueId, bytes: i6
     );
 }
 
+/// Allocate the caller-side hidden output buffer for a function with
+/// `HiddenResultAbi`. The buffer is typed as a byte array (`[i8 x N]`)
+/// so the call's IR-level signature matches the callee's `_sret`
+/// parameter (also typed as `Ptr<[i8 x N]>`). For ComplexBuffer ABI
+/// the second return value is a *typed* `Ptr<[Float x 2]>` view of
+/// the same buffer (via GEP at byte offset 0); the first is the raw
+/// byte pointer. Callers pass the byte pointer as the hidden arg and
+/// use the typed pointer as the call expression's value, so downstream
+/// complex-aware handling (assignment memcpy, fadd lane unpack, etc.)
+/// sees a complex pointer rather than a generic byte buffer.
+fn allocate_hidden_result_buffer(
+    b: &mut FuncBuilder,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    abi_lookup_keys: &[String],
+    abi: HiddenResultAbi,
+) -> Option<(ValueId, ValueId)> {
+    let bytes = hidden_result_temp_bytes_for_callee(st, type_layouts, abi_lookup_keys, abi)?;
+    let raw = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), bytes));
+    let zero_i32 = b.const_i32(0);
+    let size = b.const_i64(bytes as i64);
+    b.call(
+        FuncRef::External("memset".into()),
+        vec![raw, zero_i32, size],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+    let typed = if abi == HiddenResultAbi::ComplexBuffer {
+        let fw = if bytes == 16 { FloatWidth::F64 } else { FloatWidth::F32 };
+        let cplx_ty = IrType::Array(Box::new(IrType::Float(fw)), 2);
+        let zero = b.const_i64(0);
+        b.gep(raw, vec![zero], cplx_ty)
+    } else {
+        raw
+    };
+    Some((raw, typed))
+}
+
 fn hidden_result_temp_bytes_for_callee(
     st: &SymbolTable,
     type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
@@ -42679,6 +42725,22 @@ fn emit_scalar_allocate_source_init_on_success(
     if let Some(type_name) = derived_type {
         let src = lower_expr_ctx_tl(b, ctx, source_expr);
         emit_derived_value_copy(b, ctx.type_layouts, type_name, dest_base, src);
+    } else if is_complex_ty(dest_ty) {
+        // `allocate(mean_, source = cf(...))` for a scalar
+        // complex(allocatable). cf returns the complex result through
+        // a hidden output buffer — `lower_expr_ctx_tl` produces the
+        // pointer to that buffer, not the [Float x 2] aggregate
+        // value. A plain `store` would copy the pointer bits into the
+        // destination's first 8 bytes (verifier rejects the type
+        // mismatch); memcpy the 8/16 bytes from the buffer instead.
+        let raw = lower_expr_ctx_tl(b, ctx, source_expr);
+        let bytes = complex_byte_size(dest_ty);
+        let sz = b.const_i64(bytes);
+        b.call(
+            FuncRef::External("memcpy".into()),
+            vec![dest_base, raw, sz],
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        );
     } else {
         let raw = lower_expr_ctx_tl(b, ctx, source_expr);
         let coerced = coerce_to_type(b, raw, dest_ty);
@@ -45053,21 +45115,13 @@ fn lower_expr_full(
                     if let Some(hidden_abi) = first_procedure_lookup(&abi_lookup_keys, |k| {
                         callee_hidden_result_abi(st, k)
                     }) {
-                        if let Some(bytes) = hidden_result_temp_bytes_for_callee(
+                        if let Some((raw, typed)) = allocate_hidden_result_buffer(
+                            b,
                             st,
                             type_layouts,
                             &abi_lookup_keys,
                             hidden_abi,
                         ) {
-                            let desc =
-                                b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), bytes));
-                            let zero_i32 = b.const_i32(0);
-                            let size = b.const_i64(bytes as i64);
-                            b.call(
-                                FuncRef::External("memset".into()),
-                                vec![desc, zero_i32, size],
-                                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                            );
                             emit_named_function_call(
                                 b,
                                 locals,
@@ -45078,11 +45132,11 @@ fn lower_expr_full(
                                 descriptor_params,
                                 name,
                                 original_args,
-                                Some(desc),
+                                Some(raw),
                                 true,
                                 IrType::Void,
                             );
-                            return desc;
+                            return typed;
                         }
                     }
                 }
@@ -45425,23 +45479,13 @@ fn lower_expr_full(
                                         callee_hidden_result_abi(st, k)
                                     })
                                 {
-                                    if let Some(bytes) = hidden_result_temp_bytes_for_callee(
+                                    if let Some((raw, typed)) = allocate_hidden_result_buffer(
+                                        b,
                                         st,
                                         type_layouts,
                                         &abi_lookup_keys,
                                         hidden_abi,
                                     ) {
-                                        let desc = b.alloca(IrType::Array(
-                                            Box::new(IrType::Int(IntWidth::I8)),
-                                            bytes,
-                                        ));
-                                        let zero_i32 = b.const_i32(0);
-                                        let size = b.const_i64(bytes as i64);
-                                        b.call(
-                                            FuncRef::External("memset".into()),
-                                            vec![desc, zero_i32, size],
-                                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                                        );
                                         emit_bound_function_call(
                                             b,
                                             locals,
@@ -45454,10 +45498,10 @@ fn lower_expr_full(
                                             base,
                                             component,
                                             args,
-                                            Some(desc),
+                                            Some(raw),
                                             IrType::Void,
                                         );
-                                        return desc;
+                                        return typed;
                                     }
                                 }
                                 let callee_value_args =
