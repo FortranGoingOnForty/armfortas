@@ -258,7 +258,14 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
     let mut idx = 0;
     while idx < worklist.len() {
         let interval = worklist[idx].clone();
-        let is_fp = matches!(interval.class, RegClass::Fp32 | RegClass::Fp64);
+        // V128 lives in the same physical V/Q register file as
+        // Fp32/Fp64; the regalloc must draw from the FP pool for
+        // any of these classes or the vector vreg ends up in a Gp
+        // register and emit prints `ldr qx21` (invalid asm).
+        let is_fp = matches!(
+            interval.class,
+            RegClass::Fp32 | RegClass::Fp64 | RegClass::V128
+        );
 
         if is_fp {
             expire_intervals(
