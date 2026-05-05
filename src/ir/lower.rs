@@ -22901,8 +22901,9 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                         // unresolved `_reshape`/`_transpose` externals.
                                         let callee_is_transformational_intrinsic =
                                             if let Expr::Name { name: cname } = &callee.node {
+                                                let lname = cname.to_ascii_lowercase();
                                                 matches!(
-                                                    cname.to_ascii_lowercase().as_str(),
+                                                    lname.as_str(),
                                                     "reshape"
                                                         | "matmul"
                                                         | "transpose"
@@ -22919,6 +22920,21 @@ fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
                                                         // a single complex(4) const-zero
                                                         // buffer — wrong shape and wrong kind.
                                                         | "cmplx"
+                                                )
+                                                || (
+                                                    // sum(arr, dim) is rank-N-1: route to
+                                                    // lower_array_assign so the sum-dim arm
+                                                    // in lower_array_expr_descriptor fills
+                                                    // the result descriptor. Plain sum(arr)
+                                                    // is scalar; that arm returns None and
+                                                    // assignment falls through to scalar
+                                                    // broadcast.
+                                                    lname == "sum"
+                                                    && call_args.iter().enumerate().any(|(i, a)| {
+                                                        let kw = a.keyword.as_deref().map(|s| s.to_lowercase());
+                                                        matches!(kw.as_deref(), Some("dim"))
+                                                            || (i == 1 && kw.is_none())
+                                                    })
                                                 )
                                             } else {
                                                 false
