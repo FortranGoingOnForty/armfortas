@@ -972,6 +972,14 @@ enum AccumulateSource {
         load_a: ValueId,
         load_b: ValueId,
     },
+    /// `acc' = acc + (a(i) - b(i))` — sum of differences (variance,
+    /// MSE, L1-distance numerator). The body has two loads and one
+    /// `ISub`/`FSub` feeding `IAdd`/`FAdd` into the accumulator.
+    SumOfDiff {
+        sub_id: ValueId,
+        load_a: ValueId,
+        load_b: ValueId,
+    },
 }
 
 /// What kind of accumulator combine the body performs.
@@ -1312,6 +1320,44 @@ fn detect_reduction_plan(
                 load_b: load_b_inst.id,
             }
         }
+        // `acc + (a(i) - b(i))` — sum of differences. Two loads, one
+        // sub feeding the accumulator's add.
+        (IrType::Int(_), InstKind::ISub(la, lb))
+        | (IrType::Float(_), InstKind::FSub(la, lb)) => {
+            let load_a_inst = defs.get(la)?;
+            let load_b_inst = defs.get(lb)?;
+            let InstKind::Load(ptr_a) = load_a_inst.kind else {
+                return None;
+            };
+            let InstKind::Load(ptr_b) = load_b_inst.kind else {
+                return None;
+            };
+            let acc_a = classify_array_access(func, ptr_a, iv_param)?;
+            let acc_b = classify_array_access(func, ptr_b, iv_param)?;
+            if acc_a.elem_ty != elem_ty || acc_b.elem_ty != elem_ty {
+                return None;
+            }
+            let upper_a = acc_a
+                .lower
+                .checked_add(acc_a.len as i64)
+                .and_then(|v| v.checked_sub(1))?;
+            let upper_b = acc_b
+                .lower
+                .checked_add(acc_b.len as i64)
+                .and_then(|v| v.checked_sub(1))?;
+            if iv_init != acc_a.lower
+                || iv_bound != upper_a
+                || iv_init != acc_b.lower
+                || iv_bound != upper_b
+            {
+                return None;
+            }
+            AccumulateSource::SumOfDiff {
+                sub_id: value_inst.id,
+                load_a: load_a_inst.id,
+                load_b: load_b_inst.id,
+            }
+        }
         _ => return None,
     };
 
@@ -1538,6 +1584,32 @@ fn apply_reduction_plan(func: &mut Function, lp: &NaturalLoop, plan: ReductionPl
                 inst.ty = v_ty.clone();
             }
             func.register_type(imul_id, v_ty.clone());
+        }
+        AccumulateSource::SumOfDiff {
+            sub_id,
+            load_a,
+            load_b,
+        } => {
+            for load_id in [load_a, load_b] {
+                let body_block = func.block_mut(plan.body);
+                if let Some(inst) = body_block.insts.iter_mut().find(|i| i.id == load_id) {
+                    if let InstKind::Load(ptr) = inst.kind {
+                        inst.kind = InstKind::VLoad(ptr);
+                        inst.ty = v_ty.clone();
+                    }
+                }
+                func.register_type(load_id, v_ty.clone());
+            }
+            let body_block = func.block_mut(plan.body);
+            if let Some(inst) = body_block.insts.iter_mut().find(|i| i.id == sub_id) {
+                let new_kind = match inst.kind.clone() {
+                    InstKind::ISub(l, r) | InstKind::FSub(l, r) => InstKind::VSub(l, r),
+                    other => other,
+                };
+                inst.kind = new_kind;
+                inst.ty = v_ty.clone();
+            }
+            func.register_type(sub_id, v_ty.clone());
         }
     }
 
