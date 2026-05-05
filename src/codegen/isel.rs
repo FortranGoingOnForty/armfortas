@@ -3918,4 +3918,82 @@ mod tests {
         };
         assert_eq!(type_to_reg_class(&ty), RegClass::V128);
     }
+
+    /// End-to-end: build a tiny IR function that adds two 4×f32
+    /// vectors and walk through isel. The result MachineFunction
+    /// must contain at least one `FaddV4S` opcode.
+    #[test]
+    fn isel_lowers_vadd_4xf32_to_faddv4s() {
+        use crate::codegen::mir::ArmOpcode;
+
+        let v_ty = IrType::Vector {
+            lanes: 4,
+            elem: Box::new(IrType::Float(FloatWidth::F32)),
+        };
+        let mut func = Function::new("vadd_test".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func);
+            // Two pointer params synthesized via alloca for the
+            // smoke test — keeps the body small but exercises the
+            // VLoad / VAdd / VStore chain.
+            let p_a = b.alloca(v_ty.clone());
+            let p_b = b.alloca(v_ty.clone());
+            let p_dst = b.alloca(v_ty.clone());
+            let va = b.vload(p_a, v_ty.clone());
+            let vb = b.vload(p_b, v_ty.clone());
+            let vc = b.vadd(va, vb);
+            b.vstore(vc, p_dst);
+            b.ret_void();
+        }
+
+        let mf = select_function(&func);
+        let opcodes: Vec<ArmOpcode> =
+            mf.blocks.iter().flat_map(|b| b.insts.iter()).map(|i| i.opcode).collect();
+        assert!(
+            opcodes.contains(&ArmOpcode::FaddV4S),
+            "expected FaddV4S in MIR, got {:?}",
+            opcodes
+        );
+        assert!(
+            opcodes.contains(&ArmOpcode::LdrQ),
+            "expected LdrQ in MIR, got {:?}",
+            opcodes
+        );
+        assert!(
+            opcodes.contains(&ArmOpcode::StrQ),
+            "expected StrQ in MIR, got {:?}",
+            opcodes
+        );
+    }
+
+    #[test]
+    fn isel_lowers_vfma_2xf64_to_fmlav2d() {
+        use crate::codegen::mir::ArmOpcode;
+
+        let v_ty = IrType::Vector {
+            lanes: 2,
+            elem: Box::new(IrType::Float(FloatWidth::F64)),
+        };
+        let mut func = Function::new("vfma_test".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func);
+            let p_a = b.alloca(v_ty.clone());
+            let p_b = b.alloca(v_ty.clone());
+            let p_c = b.alloca(v_ty.clone());
+            let va = b.vload(p_a, v_ty.clone());
+            let vb = b.vload(p_b, v_ty.clone());
+            let vc = b.vload(p_c, v_ty.clone());
+            let _ = b.vfma(va, vb, vc);
+            b.ret_void();
+        }
+
+        let mf = select_function(&func);
+        let opcodes: Vec<ArmOpcode> =
+            mf.blocks.iter().flat_map(|b| b.insts.iter()).map(|i| i.opcode).collect();
+        assert!(
+            opcodes.contains(&ArmOpcode::FmlaV2D),
+            "expected FmlaV2D, got {:?}",
+            opcodes
+        );
+    }
 }
