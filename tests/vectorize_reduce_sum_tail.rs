@@ -39,18 +39,21 @@ fn o3_vectorizes_sum_reductions_with_scalar_tail() {
         },
         Stage::OptIr,
     );
-    // Both reductions should leave a VAdd in the body and a
-    // vreduce_sum at exit followed by peeled scalar iadd ops that
-    // chain from the reduce result.
+    // All four reductions should leave a vreduce_sum at exit
+    // followed by peeled scalar iadd/fadd ops chaining from the
+    // reduce result.
     assert_eq!(
         o3_ir.matches("vreduce_sum").count(),
-        2,
-        "expected two vreduce_sum (i32 + i64):\n{}",
+        4,
+        "expected four vreduce_sum (i32, i64, f32, f64):\n{}",
         o3_ir
     );
     assert!(
-        o3_ir.contains("<4 x i32>") && o3_ir.contains("<2 x i64>"),
-        "expected i32 and i64 vector accumulators in IR:\n{}",
+        o3_ir.contains("<4 x i32>")
+            && o3_ir.contains("<2 x i64>")
+            && o3_ir.contains("<4 x f32>")
+            && o3_ir.contains("<2 x f64>"),
+        "expected i32/i64/f32/f64 vector accumulators in IR:\n{}",
         o3_ir
     );
 
@@ -64,8 +67,18 @@ fn o3_vectorizes_sum_reductions_with_scalar_tail() {
         .map(|l| l.trim())
         .filter(|l| !l.is_empty())
         .collect();
-    assert_eq!(trimmed.len(), 2, "expected two output lines:\n{}", stdout);
+    assert_eq!(trimmed.len(), 4, "expected four output lines:\n{}", stdout);
     // 1 + 2 + ... + 31 = 31 * 32 / 2 = 496.
     assert_eq!(trimmed[0], "496", "i32 sum wrong: got {:?}", trimmed[0]);
     assert_eq!(trimmed[1], "496", "i64 sum wrong: got {:?}", trimmed[1]);
+    assert!(
+        trimmed[2].starts_with("4.96"),
+        "f32 sum wrong: got {:?}",
+        trimmed[2]
+    );
+    assert!(
+        trimmed[3].starts_with("4.96"),
+        "f64 sum wrong: got {:?}",
+        trimmed[3]
+    );
 }
