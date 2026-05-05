@@ -796,6 +796,12 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
             v_reg_bare(&inst.operands[0]),
             v_reg_bare(&inst.operands[1]),
         ),
+        ArmOpcode::AddpV2D => format!(
+            "addp.2d {}, {}, {}",
+            v_reg_bare(&inst.operands[0]),
+            v_reg_bare(&inst.operands[1]),
+            v_reg_bare(&inst.operands[2]),
+        ),
 
         ArmOpcode::LdrImm | ArmOpcode::LdrFpImm | ArmOpcode::LdrsbImm | ArmOpcode::LdrshImm => {
             let dest = op_str(&inst.operands[0]);
