@@ -54,6 +54,10 @@ enum AbiArgLoc {
     Fp(u8),
     Fp32(u8),
     GpPair(u8),
+    /// 128-bit NEON vector via `v0-v7`. Per AAPCS64, vectors share
+    /// the same physical bank as floats; the V form is the 128-bit
+    /// view of the same register.
+    V128(u8),
     Stack(i64),
 }
 
@@ -81,6 +85,7 @@ fn abi_stack_layout(ty: &IrType) -> (i64, i64) {
         IrType::Int(IntWidth::I32) => (4, 4),
         IrType::Int(IntWidth::I16) => (2, 2),
         IrType::Int(IntWidth::I8) | IrType::Bool => (1, 1),
+        IrType::Vector { .. } => (16, 16),
         _ => (8, 8),
     }
 }
@@ -134,6 +139,21 @@ fn classify_abi_arg(ty: &IrType, state: &mut AbiArgState) -> AbiArgLoc {
                 AbiArgLoc::Gp32(reg)
             } else {
                 state.gp_idx = 8;
+                let (size, align) = abi_stack_layout(ty);
+                let offset = align_to(state.stack_offset, align);
+                state.stack_offset = offset + size;
+                AbiArgLoc::Stack(offset)
+            }
+        }
+        IrType::Vector { .. } => {
+            // AAPCS64 §6.4.2: vector args pass in v0-v7, sharing the
+            // same idx counter as float args (the V registers ARE the
+            // 128-bit form of the same physical regs).
+            if state.fp_idx < 8 {
+                let reg = state.fp_idx;
+                state.fp_idx += 1;
+                AbiArgLoc::V128(reg)
+            } else {
                 let (size, align) = abi_stack_layout(ty);
                 let offset = align_to(state.stack_offset, align);
                 state.stack_offset = offset + size;
@@ -3964,6 +3984,47 @@ mod tests {
             "expected StrQ in MIR, got {:?}",
             opcodes
         );
+    }
+
+    #[test]
+    fn vector_abi_arg_uses_v0_to_v7() {
+        // First 8 vector args should land in v0-v7. The 9th should
+        // overflow to the stack at the next 16-byte slot.
+        let mut state = AbiArgState::default();
+        let v_ty = IrType::Vector {
+            lanes: 4,
+            elem: Box::new(IrType::Float(FloatWidth::F32)),
+        };
+        for expected in 0u8..8 {
+            assert_eq!(
+                classify_abi_arg(&v_ty, &mut state),
+                AbiArgLoc::V128(expected),
+                "vector arg #{} should be v{}",
+                expected,
+                expected
+            );
+        }
+        // 9th vector arg overflows to stack.
+        match classify_abi_arg(&v_ty, &mut state) {
+            AbiArgLoc::Stack(_) => {}
+            other => panic!("expected Stack overflow, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn vector_args_share_idx_with_float_args() {
+        // AAPCS64: vector and float args draw from the same v0-v7
+        // pool. A float arg should bump fp_idx, then a vector arg
+        // should land at the next slot.
+        let mut state = AbiArgState::default();
+        let f_ty = IrType::Float(FloatWidth::F64);
+        let v_ty = IrType::Vector {
+            lanes: 2,
+            elem: Box::new(IrType::Int(IntWidth::I64)),
+        };
+        assert_eq!(classify_abi_arg(&f_ty, &mut state), AbiArgLoc::Fp(0));
+        assert_eq!(classify_abi_arg(&v_ty, &mut state), AbiArgLoc::V128(1));
+        assert_eq!(classify_abi_arg(&f_ty, &mut state), AbiArgLoc::Fp(2));
     }
 
     #[test]
