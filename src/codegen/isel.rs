@@ -1759,9 +1759,11 @@ fn select_inst(
             let vb = ctx.lookup_vreg(*b);
             let vc = ctx.lookup_vreg(*c);
             let dest = ctx.get_vreg(mf, inst.id, RegClass::V128);
-            // dest = c (init accumulator)
+            // dest = c (init accumulator). Must use Mov16B (mov.16b)
+            // for V128 — fmov d, d truncates to 64 bits and silently
+            // drops the upper lanes.
             mf.block_mut(mb).insts.push(MachineInst {
-                opcode: ArmOpcode::FmovReg,
+                opcode: ArmOpcode::Mov16B,
                 operands: vec![MachineOperand::VReg(dest), MachineOperand::VReg(vc)],
                 def: Some(dest),
             });
