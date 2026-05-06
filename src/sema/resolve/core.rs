@@ -5,18 +5,14 @@
 
 use crate::sema::symtab::*;
 use crate::ast::decl;
-use crate::ast::decl::{ArraySpec, Attribute, Decl, OnlyItem, SpannedDecl, TypeSpec};
+use crate::ast::decl::{Attribute, Decl, SpannedDecl, TypeSpec};
 use crate::ast::unit::*;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use super::statement_functions::detect_statement_functions;
-use super::type_resolution::{
-    derived_char_init_len, extract_char_len, extract_kind, type_spec_to_info,
-};
-use super::use_resolution::{
-    ensure_uses_loaded, load_external_module, preload_stmt_uses, process_uses,
-};
+use super::type_resolution::{derived_char_init_len, type_spec_to_info};
+use super::use_resolution::{load_external_module, preload_stmt_uses, process_uses};
 
 thread_local! {
     /// Track externally loaded module interfaces so resolve_file can

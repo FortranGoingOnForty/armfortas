@@ -26,10 +26,10 @@ use super::const_scalar::{
 };
 use super::ctx::{
     current_proc_scope, current_smp_extra_host, AmbiguousUseWarnings, CharKind,
-    HiddenResultAbi, LocalInfo, LowerCtx, ProcScopeGuard, SmpExtraHostGuard,
+    HiddenResultAbi, LocalInfo, LowerCtx,
 };
 use super::helpers::{
-    clamp_nonnegative_i64, coerce_to_type, const_range_for_ir_type, storage_size_bits_for_ir_type,
+    clamp_nonnegative_i64, coerce_to_type, const_range_for_ir_type,
     widen_to_i64,
 };
 

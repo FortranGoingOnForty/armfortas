@@ -385,7 +385,7 @@ fn flatten_assoc(
     replacements: &HashMap<ValueId, ValueId>,
 ) -> Vec<ValueId> {
     let mut out = Vec::new();
-    let mut push = |v: ValueId, out: &mut Vec<ValueId>, defs: &HashMap<ValueId, &Inst>| {
+    let push = |v: ValueId, out: &mut Vec<ValueId>, defs: &HashMap<ValueId, &Inst>| {
         let r = resolve_value(replacements, v);
         if let Some(inst) = defs.get(&r) {
             if assoc_tag(&inst.kind) == Some(tag) {

@@ -47,7 +47,7 @@ fn select_function_with_names(func: &Function, func_names: &[String]) -> Machine
     mf
 }
 
-use super::abi::{abi_stack_layout, align_to, classify_abi_arg, AbiArgLoc, AbiArgState};
+use super::abi::{classify_abi_arg, AbiArgLoc, AbiArgState};
 
 /// Select machine instructions for one IR function.
 pub fn select_function(func: &Function) -> MachineFunction {

@@ -7,17 +7,15 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 
-use crate::ast::expr::{Expr, SpannedExpr};
+use crate::ast::expr::Expr;
 use crate::ast::stmt::*;
 use crate::ir::builder::FuncBuilder;
 use crate::ir::inst::*;
 use crate::ir::types::*;
-use crate::sema::symtab::SymbolTable;
 
-use super::const_scalar::ConstScalar;
 use super::core::*;
 use super::ctx::{CharKind, HiddenResultAbi, LocalInfo, LowerCtx};
-use super::helpers::{coerce_to_type, storage_size_bits_for_ir_type};
+use super::helpers::coerce_to_type;
 
 pub(crate) fn lower_stmts(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmts: &[SpannedStmt]) {
     for stmt in stmts {

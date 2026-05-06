@@ -4,15 +4,12 @@
 //! Extracted from `core.rs` in Sprint 11 Stage B.2. Pure mechanical
 //! move — behavior unchanged. Helpers consulted via `core::*`.
 
-use std::collections::HashMap;
-
 use crate::ir::builder::FuncBuilder;
 use crate::ir::inst::*;
 use crate::ir::types::*;
-use crate::sema::symtab::SymbolTable;
 
 use super::core::*;
-use super::ctx::{CharKind, LocalInfo, LowerCtx};
+use super::ctx::{CharKind, LowerCtx};
 use super::helpers::coerce_to_type;
 use crate::ast::expr::Expr;
 

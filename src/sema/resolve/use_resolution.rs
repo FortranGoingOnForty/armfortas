@@ -6,12 +6,7 @@
 //! (the .amod loader that synthesises a module scope when a USE'd
 //! module wasn't seen in-file).
 
-use std::cell::RefCell;
-use std::collections::HashSet;
-
 use crate::ast::decl::{ArraySpec, Decl, OnlyItem, SpannedDecl};
-use crate::ast::stmt::SpannedStmt;
-use crate::ast::unit::*;
 use crate::sema::symtab::*;
 
 use super::core::{

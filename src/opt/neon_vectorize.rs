@@ -3132,7 +3132,7 @@ fn apply_reduction_scalar_tail(
 }
 
 fn substitute_in_inst(kind: &mut InstKind, from: ValueId, to: ValueId) {
-    let mut replace = |v: &mut ValueId| {
+    let replace = |v: &mut ValueId| {
         if *v == from {
             *v = to;
         }
@@ -3177,7 +3177,7 @@ fn substitute_in_inst(kind: &mut InstKind, from: ValueId, to: ValueId) {
 }
 
 fn substitute_in_terminator(term: &mut Terminator, from: ValueId, to: ValueId) {
-    let mut replace = |v: &mut ValueId| {
+    let replace = |v: &mut ValueId| {
         if *v == from {
             *v = to;
         }
