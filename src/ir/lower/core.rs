@@ -645,6 +645,17 @@ pub(super) fn function_hidden_result_abi(
             {
                 return HiddenResultAbi::DerivedAggregate;
             }
+            // Complex scalar result with explicit declaration: route through
+            // the hidden output buffer ABI. Without this, codegen returns
+            // the [Float x 2] aggregate value packed in x0 and the caller
+            // memcpys that pattern as a pointer, dereferencing the bytes
+            // of the complex literal as an address (SEGV).
+            if matches!(type_spec, TypeSpec::Complex(_) | TypeSpec::DoubleComplex)
+                && !decl_is_pointer(&result_key, decls)
+                && bind.is_none()
+            {
+                return HiddenResultAbi::ComplexBuffer;
+            }
             return HiddenResultAbi::None;
         }
     }
@@ -660,6 +671,16 @@ pub(super) fn function_hidden_result_abi(
         } else {
             HiddenResultAbi::StringDescriptor
         };
+    }
+    // Complex scalar result: route through the hidden-output-pointer ABI
+    // (caller alloca's 8 or 16 bytes, callee writes through the pointer).
+    // Without this, codegen emits `load %0; ret aggregate` and packs the
+    // 8 bytes into x0 — caller treats x0 as ptr and memcpy's from it,
+    // dereferencing the bit pattern of the complex value as an address.
+    if matches!(return_type, Some(TypeSpec::Complex(_)) | Some(TypeSpec::DoubleComplex))
+        && bind.is_none()
+    {
+        return HiddenResultAbi::ComplexBuffer;
     }
     HiddenResultAbi::None
 }
@@ -14814,6 +14835,10 @@ pub(super) fn callee_hidden_result_abi(st: &SymbolTable, callee_name: &str) -> O
         }
         _ if sym.attrs.allocatable => Some(HiddenResultAbi::ArrayDescriptor),
         TypeInfo::Derived(_) if !sym.attrs.pointer => Some(HiddenResultAbi::DerivedAggregate),
+        // Complex scalar return: hidden output pointer, caller-allocated buffer.
+        // Mirrors function_hidden_result_abi (definition side) so calls
+        // resolved via SymbolTable see the same ABI as direct lowering.
+        TypeInfo::Complex { .. } if !sym.attrs.pointer => Some(HiddenResultAbi::ComplexBuffer),
         _ => None,
     }
 }

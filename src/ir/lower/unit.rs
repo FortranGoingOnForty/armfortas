@@ -1080,6 +1080,54 @@ pub(crate) fn lower_unit(
                     );
                     ctx.result_addr = Some(ValueId(0));
                     ctx.result_type = Some(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                } else if hidden_result_abi == HiddenResultAbi::ComplexBuffer {
+                    // The hidden first param is the caller-allocated complex
+                    // buffer typed as `Ptr<[i8 x 8/16]>` so the call-site IR
+                    // type matches the caller's byte-buffer alloca. The body
+                    // needs a *typed* complex pointer (`Ptr<[Float x 2]>`)
+                    // for two reasons:
+                    //   1. The complex-assign path stores two Float lanes —
+                    //      a typed pointer keeps load/store types consistent
+                    //      with the IR verifier.
+                    //   2. Generic dispatch on the result variable consults
+                    //      `b.func().value_type(addr)` to match candidates;
+                    //      a `Ptr<[Float x 2]>` is recognised as complex,
+                    //      while `Ptr<[i8 x 8]>` matches no complex formal.
+                    // GEP at byte offset 0 with a Float-array result type
+                    // produces the typed view without changing the runtime
+                    // address.
+                    let kind = super::core::complex_result_kind(
+                        name,
+                        result,
+                        return_type.as_ref(),
+                        decls,
+                        st,
+                    );
+                    let fw = if kind == 8 { FloatWidth::F64 } else { FloatWidth::F32 };
+                    let cplx_ty = IrType::Array(Box::new(IrType::Float(fw)), 2);
+                    let zero_off = b.const_i64(0);
+                    let typed_addr = b.gep(ValueId(0), vec![zero_off], cplx_ty.clone());
+                    ctx.locals.insert(
+                        result_name.clone(),
+                        LocalInfo {
+                            addr: typed_addr,
+                            ty: cplx_ty.clone(),
+                            dims: vec![],
+                            allocatable: false,
+                            descriptor_arg: false,
+                            by_ref: false,
+                            char_kind: CharKind::None,
+                            derived_type: None,
+                            inline_const: None,
+                            is_pointer: false,
+                            runtime_dim_upper: vec![],
+                            is_class: false,
+                            logical_kind: None,
+                            last_dim_assumed_size: false,
+                        },
+                    );
+                    ctx.result_addr = Some(typed_addr);
+                    ctx.result_type = Some(IrType::Ptr(Box::new(cplx_ty)));
                 } else if hidden_result_abi == HiddenResultAbi::StringDescriptor {
                     // Scalar character results use the hidden StringDescriptor
                     // ABI, but the body still writes to a normal local result
