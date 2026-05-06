@@ -169,6 +169,10 @@ pub enum InstKind {
     VAbs(ValueId),
     VSqrt(ValueId),
     VFma(ValueId, ValueId, ValueId), // a*b + c
+    /// Vector bit-select: per lane, return `t` where mask bit is 1,
+    /// else `f`. Lowers to NEON `bsl.16b`. Produced by the WHERE-block
+    /// vectorizer to express conditional element-wise updates.
+    VSelect(ValueId, ValueId, ValueId), // (mask, t, f)
     VMin(ValueId, ValueId),
     VMax(ValueId, ValueId),
     VICmp(CmpOp, ValueId, ValueId),

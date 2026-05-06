@@ -612,6 +612,21 @@ fn check_type_consistency(func: &Function, inst: &Inst, errors: &mut Vec<VerifyE
                 }
             }
         }
+        InstKind::VSelect(_m, t, f) => {
+            // Mask is a vector of any element type (typically the
+            // bool/int result of vicmp/vfcmp); t and f must share
+            // type with each other and with the result.
+            if let (Some(tt), Some(tf)) = (func.value_type(*t), func.value_type(*f)) {
+                if tt != tf || tt != inst.ty {
+                    errors.push(VerifyError {
+                        msg: format!(
+                            "vselect t/f and result must share type: t {}, f {}, result {}",
+                            tt, tf, inst.ty
+                        ),
+                    });
+                }
+            }
+        }
         InstKind::VNeg(a) | InstKind::VAbs(a) | InstKind::VSqrt(a) => {
             if let Some(ta) = func.value_type(*a) {
                 if ta != inst.ty {

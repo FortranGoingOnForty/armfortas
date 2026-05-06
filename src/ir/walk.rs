@@ -108,6 +108,7 @@ pub fn inst_uses(kind: &InstKind) -> Vec<ValueId> {
         | InstKind::VReduceMin(a)
         | InstKind::VReduceMax(a) => vec![*a],
         InstKind::VFma(a, b, c) => vec![*a, *b, *c],
+        InstKind::VSelect(m, t, f) => vec![*m, *t, *f],
         InstKind::VICmp(_, a, b) | InstKind::VFCmp(_, a, b) => vec![*a, *b],
         InstKind::VStore(v, p) => vec![*v, *p],
         InstKind::VInsert(v, _, s) => vec![*v, *s],
@@ -282,6 +283,11 @@ pub fn for_each_operand_mut(kind: &mut InstKind, mut r: impl FnMut(&mut ValueId)
             r(a);
             r(b);
             r(c);
+        }
+        InstKind::VSelect(m, t, f) => {
+            r(m);
+            r(t);
+            r(f);
         }
         InstKind::VICmp(_, a, b) | InstKind::VFCmp(_, a, b) => {
             r(a);
