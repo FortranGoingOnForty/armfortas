@@ -546,8 +546,14 @@ pub(crate) fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId])
             })
         }
         "ishft" => {
-            // ishft(a, shift): positive shift = left, negative = right.
-            // For now, only handle positive (left shift). Full impl needs Select.
+            // F2018 §16.9.95: ISHFT does a *logical* shift on the bit
+            // representation of the integer. For int8/int16 values
+            // already sign-extended into the 32-bit AArch64 register
+            // (e.g. -32767_int16 = 0x8001 lives as 0xFFFF8001 in
+            // w-reg), `lshr` would shift the upper sign-fill bits in
+            // alongside, producing 0x00FFFF80 instead of 0x0080.
+            // Mask args[0] to the kind's width before the shift so
+            // the logical-right shift sees the unsigned bit pattern.
             if args.len() >= 2 {
                 let shift_cmp_width = int_width_of_value(b, args[1]).unwrap_or(IntWidth::I32);
                 let zero = int_const_for_width(b, shift_cmp_width, 0);
@@ -556,8 +562,19 @@ pub(crate) fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId])
                 let value_width = int_width_of_value(b, args[0]).unwrap_or(IntWidth::I32);
                 let shift = coerce_int_like_to_width(b, args[1], value_width);
                 let neg_shift = coerce_int_like_to_width(b, neg_shift, value_width);
+                let masked_value = match value_width {
+                    IntWidth::I8 => {
+                        let mask = int_const_for_width(b, value_width, 0xFF);
+                        b.bit_and(args[0], mask)
+                    }
+                    IntWidth::I16 => {
+                        let mask = int_const_for_width(b, value_width, 0xFFFF);
+                        b.bit_and(args[0], mask)
+                    }
+                    _ => args[0],
+                };
                 let left = b.shl(args[0], shift);
-                let right = b.lshr(args[0], neg_shift);
+                let right = b.lshr(masked_value, neg_shift);
                 Some(b.select(is_left, left, right))
             } else {
                 None
