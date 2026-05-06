@@ -1134,10 +1134,15 @@ fn apply_vector_plan(func: &mut Function, shape: &CountedLoop, plan: VectorPlan)
 struct ThenBinop {
     inst_id: ValueId,
     kind: BinaryKind,
-    /// The non-load operand (must be loop-invariant).
+    /// The non-load_a operand. When `other_is_load_b == false`, this is
+    /// a loop-invariant scalar to broadcast. When `other_is_load_b ==
+    /// true`, this is the second array's `then_load_b` value id (the
+    /// b-array load defined in the then_block).
     scalar_v: ValueId,
-    /// Whether the load is the LHS of the binop.
+    /// Whether load_a is the LHS of the binop.
     load_on_lhs: bool,
+    /// True iff the non-load_a operand is a second array load (`c = a + b`).
+    other_is_load_b: bool,
 }
 
 /// Vectorizable WHERE-block plan: one conditional store guarded by
@@ -1182,6 +1187,9 @@ struct WherePlan {
     /// (`where (cond) b = K`). When set, the true arm of the vselect
     /// is `VBroadcast(K)`; no load_a is consumed by the store.
     then_const: Option<ValueId>,
+    /// When `then_binop.other_is_load_b == true`, this holds the
+    /// b-array's GEP ptr (so the apply path can emit a VLoad on it).
+    b_ptr_id: Option<ValueId>,
     /// The dest pointer GEP (computed in body block).
     dest_ptr_id: ValueId,
     /// Source array's access shape (where load_a reads from).
@@ -1268,22 +1276,38 @@ fn build_where_plan(func: &Function, shape: &WhereLoop) -> Option<WherePlan> {
         return None;
     }
     // Walk then-block for the store. Expect optionally a redundant
-    // Load (same ptr as load_a), optionally a unary (FNeg/FAbs/FSqrt
-    // /INeg) OR a binop with an invariant scalar, and exactly one Store.
+    // Load (same ptr as load_a), optionally a second array Load (a
+    // different body-defined ptr — array+array body), optionally a
+    // unary (FNeg/FAbs/FSqrt/INeg) OR a binop with an invariant
+    // scalar OR a binop with the second array load, and exactly one
+    // Store.
+    let body_gep_ids: HashSet<ValueId> =
+        body_geps.iter().map(|i| i.id).collect();
     let mut store_id = None;
     let mut then_load_id = None;
+    let mut then_load_b: Option<(ValueId, ValueId)> = None;
     let mut then_unary: Option<(ValueId, UnaryKind)> = None;
     let mut then_binop: Option<ThenBinop> = None;
     let mut store_value = None;
     let mut store_ptr = None;
     for inst in &then_block.insts {
         let is_load_alias = |v: ValueId| v == load_a_id || Some(v) == then_load_id;
+        let is_load_b = |v: ValueId| then_load_b.map(|(id, _)| id) == Some(v);
         match inst.kind {
             InstKind::Load(p) if p == load_a_ptr => {
                 if then_load_id.is_some() {
                     return None;
                 }
                 then_load_id = Some(inst.id);
+            }
+            InstKind::Load(p) if body_gep_ids.contains(&p) => {
+                // Second array load — array+array body (`c = a + b`).
+                // Must be a different ptr than load_a's. We accept at
+                // most one such load.
+                if then_load_b.is_some() {
+                    return None;
+                }
+                then_load_b = Some((inst.id, p));
             }
             InstKind::FNeg(src) | InstKind::INeg(src) => {
                 if then_unary.is_some() || then_binop.is_some() {
@@ -1336,11 +1360,13 @@ fn build_where_plan(func: &Function, shape: &WhereLoop) -> Option<WherePlan> {
                 } else {
                     return None;
                 };
+                let other_is_load_b = is_load_b(scalar_v);
                 then_binop = Some(ThenBinop {
                     inst_id: inst.id,
                     kind,
                     scalar_v,
                     load_on_lhs,
+                    other_is_load_b,
                 });
             }
             InstKind::Store(v, p) => {
@@ -1382,12 +1408,13 @@ fn build_where_plan(func: &Function, shape: &WhereLoop) -> Option<WherePlan> {
         // (validated below alongside src/dest type match).
         then_const = Some(store_value);
     }
-    // For binop: scalar operand must be loop-invariant (not defined
-    // in body, then, or incr). FDiv is float-only.
+    // For binop: when not array+array, scalar operand must be loop-
+    // invariant (not defined in body, then, or incr). FDiv is float-only.
     if let Some(b) = then_binop {
-        if body_ids.contains(&b.scalar_v)
-            || then_ids.contains(&b.scalar_v)
-            || incr_ids.contains(&b.scalar_v)
+        if !b.other_is_load_b
+            && (body_ids.contains(&b.scalar_v)
+                || then_ids.contains(&b.scalar_v)
+                || incr_ids.contains(&b.scalar_v))
         {
             return None;
         }
@@ -1427,6 +1454,29 @@ fn build_where_plan(func: &Function, shape: &WhereLoop) -> Option<WherePlan> {
     if src_access.elem_ty != dest_access.elem_ty {
         return None;
     }
+    // If the binop's other operand is the b-array load, validate that
+    // b's access shape covers the same span and elem type.
+    let b_ptr_id = if let Some(b) = then_binop {
+        if b.other_is_load_b {
+            let (_b_load_id, b_ptr) = then_load_b?;
+            let b_access = classify_array_access(func, b_ptr, shape.iv_param)?;
+            let b_upper = b_access
+                .lower
+                .checked_add(b_access.len as i64)
+                .and_then(|v| v.checked_sub(1))?;
+            if shape.iv_init != b_access.lower
+                || shape.iv_bound != b_upper
+                || b_access.elem_ty != src_access.elem_ty
+            {
+                return None;
+            }
+            Some(b_ptr)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let elem_ty = src_access.elem_ty.clone();
     let lanes = lane_count_for(&elem_ty)?;
     // Skip tail for v0: require trip divisible by lanes.
@@ -1452,6 +1502,7 @@ fn build_where_plan(func: &Function, shape: &WhereLoop) -> Option<WherePlan> {
         then_unary,
         then_binop,
         then_const,
+        b_ptr_id,
         dest_ptr_id: store_ptr,
         src_access,
         dest_access,
@@ -1564,25 +1615,40 @@ fn apply_where_plan(func: &mut Function, shape: &WhereLoop, plan: WherePlan) {
         });
         vu_id
     } else if let Some(b) = plan.then_binop {
-        // Broadcast scalar into the preheader.
-        let vk_id = func.next_value_id();
-        func.register_type(vk_id, v_ty.clone());
-        let preheader = func.block_mut(shape.preheader);
-        let pos = preheader.insts.len();
-        preheader.insts.insert(
-            pos,
-            Inst {
-                id: vk_id,
-                kind: InstKind::VBroadcast(b.scalar_v),
+        // Other operand: either a vload on the b-array's ptr (array+
+        // array body) or a vbroadcast of a loop-invariant scalar.
+        let other_v = if b.other_is_load_b {
+            let b_ptr = plan.b_ptr_id.expect("load_b binop must have b_ptr_id");
+            let vload_b_id = func.next_value_id();
+            func.register_type(vload_b_id, v_ty.clone());
+            new_insts.push(Inst {
+                id: vload_b_id,
+                kind: InstKind::VLoad(b_ptr),
                 ty: v_ty.clone(),
                 span,
-            },
-        );
+            });
+            vload_b_id
+        } else {
+            let vk_id = func.next_value_id();
+            func.register_type(vk_id, v_ty.clone());
+            let preheader = func.block_mut(shape.preheader);
+            let pos = preheader.insts.len();
+            preheader.insts.insert(
+                pos,
+                Inst {
+                    id: vk_id,
+                    kind: InstKind::VBroadcast(b.scalar_v),
+                    ty: v_ty.clone(),
+                    span,
+                },
+            );
+            vk_id
+        };
         // Compute the binop in body block, in original operand order.
         let (l_id, r_id) = if b.load_on_lhs {
-            (plan.load_a_id, vk_id)
+            (plan.load_a_id, other_v)
         } else {
-            (vk_id, plan.load_a_id)
+            (other_v, plan.load_a_id)
         };
         let vbin_id = func.next_value_id();
         func.register_type(vbin_id, v_ty.clone());
