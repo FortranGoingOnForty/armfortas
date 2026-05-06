@@ -86,6 +86,11 @@ struct WhereLoop {
     body: BlockId,
     /// The "then" arm with the conditional store(s).
     then_block: BlockId,
+    /// The "else" arm, when WHERE/ELSEWHERE is used. The block
+    /// branches unconditionally to `incr_block`. When `None`, the
+    /// body's false branch goes directly to `incr_block` (single-arm
+    /// WHERE).
+    else_block: Option<BlockId>,
     /// The latch / incr block (iv + 1, br header).
     incr_block: BlockId,
     iv_param: ValueId,
@@ -317,7 +322,9 @@ fn detect_where_loop(
     lp: &NaturalLoop,
     preds: &HashMap<BlockId, Vec<BlockId>>,
 ) -> Option<WhereLoop> {
-    if lp.latches.len() != 1 || lp.body.len() != 4 {
+    // 4 blocks: header / body / then / incr (single-arm WHERE).
+    // 5 blocks: header / body / then / else / incr (WHERE/ELSEWHERE).
+    if lp.latches.len() != 1 || (lp.body.len() != 4 && lp.body.len() != 5) {
         return None;
     }
     let header = lp.header;
@@ -387,9 +394,22 @@ fn detect_where_loop(
     if then_block == header || then_block == incr_block || then_block == body {
         return None;
     }
-    if body_else != incr_block {
-        return None;
-    }
+    // body_else may be either incr_block (single-arm WHERE) or a
+    // distinct else_block that itself branches to incr_block
+    // (WHERE/ELSEWHERE two-arm).
+    let else_block = if body_else == incr_block {
+        None
+    } else {
+        if body_else == header || body_else == body || body_else == then_block {
+            return None;
+        }
+        let else_blk = func.block(body_else);
+        match &else_blk.terminator {
+            Some(Terminator::Branch(d, args)) if *d == incr_block && args.is_empty() => {}
+            _ => return None,
+        }
+        Some(body_else)
+    };
     // The then block must br unconditionally to incr.
     let then_blk = func.block(then_block);
     match &then_blk.terminator {
@@ -407,6 +427,7 @@ fn detect_where_loop(
         header,
         body,
         then_block,
+        else_block,
         incr_block,
         iv_param,
         iv_init,
@@ -1190,6 +1211,12 @@ struct WherePlan {
     /// When `then_binop.other_is_load_b == true`, this holds the
     /// b-array's GEP ptr (so the apply path can emit a VLoad on it).
     b_ptr_id: Option<ValueId>,
+    /// When the WHERE has an ELSEWHERE arm, the value to store in
+    /// the false-mask lanes. Currently supports a loop-invariant
+    /// scalar (`elsewhere; b = K; end where`) — broadcast in the
+    /// preheader and used as vselect's false arm in lieu of the
+    /// dest's prior value.
+    else_const: Option<ValueId>,
     /// The dest pointer GEP (computed in body block).
     dest_ptr_id: ValueId,
     /// Source array's access shape (where load_a reads from).
@@ -1454,6 +1481,49 @@ fn build_where_plan(func: &Function, shape: &WhereLoop) -> Option<WherePlan> {
     if src_access.elem_ty != dest_access.elem_ty {
         return None;
     }
+    // ELSEWHERE arm: walk the else_block (when present) for a single
+    // Store of a loop-invariant scalar to the same dest_ptr. More
+    // complex else expressions can be added later.
+    let else_const: Option<ValueId> = if let Some(else_blk_id) = shape.else_block {
+        let else_blk = func.block(else_blk_id);
+        // Reject calls in else.
+        if else_blk
+            .insts
+            .iter()
+            .any(|inst| matches!(inst.kind, InstKind::Call(..) | InstKind::RuntimeCall(..)))
+        {
+            return None;
+        }
+        let mut else_store: Option<(ValueId, ValueId)> = None;
+        for inst in &else_blk.insts {
+            match inst.kind {
+                InstKind::Store(v, p) => {
+                    if else_store.is_some() {
+                        return None;
+                    }
+                    else_store = Some((v, p));
+                }
+                _ => return None,
+            }
+        }
+        let (else_v, else_p) = else_store?;
+        if else_p != store_ptr {
+            return None;
+        }
+        // Else value must be loop-invariant (defined outside body /
+        // then / else / incr).
+        let else_ids: HashSet<ValueId> = else_blk.insts.iter().map(|i| i.id).collect();
+        if body_ids.contains(&else_v)
+            || then_ids.contains(&else_v)
+            || else_ids.contains(&else_v)
+            || incr_ids.contains(&else_v)
+        {
+            return None;
+        }
+        Some(else_v)
+    } else {
+        None
+    };
     // If the binop's other operand is the b-array load, validate that
     // b's access shape covers the same span and elem type.
     let b_ptr_id = if let Some(b) = then_binop {
@@ -1503,6 +1573,7 @@ fn build_where_plan(func: &Function, shape: &WhereLoop) -> Option<WherePlan> {
         then_binop,
         then_const,
         b_ptr_id,
+        else_const,
         dest_ptr_id: store_ptr,
         src_access,
         dest_access,
@@ -1561,10 +1632,10 @@ fn apply_where_plan(func: &mut Function, shape: &WhereLoop, plan: WherePlan) {
     let _ = load_a_ptr;
 
     // 3. In body block, after load_a, emit:
-    //    vload_b_old, v(f|i)cmp, optional v-unary, vselect, vstore.
-    //    The cmp+cond_br are dropped (we replace the terminator below).
-    let vload_b_id = func.next_value_id();
-    func.register_type(vload_b_id, v_ty.clone());
+    //    vload_b_old (only when no ELSEWHERE — we need the dest's
+    //    prior value for the masked-off lanes), v(f|i)cmp, optional
+    //    v-unary, vselect, vstore. The cmp+cond_br are dropped (we
+    //    replace the terminator below).
     let vcmp_id = func.next_value_id();
     func.register_type(vcmp_id, v_ty.clone());
     let vsel_id = func.next_value_id();
@@ -1573,12 +1644,35 @@ fn apply_where_plan(func: &mut Function, shape: &WhereLoop, plan: WherePlan) {
     func.register_type(vstore_id, IrType::Void);
 
     let mut new_insts: Vec<Inst> = Vec::new();
-    new_insts.push(Inst {
-        id: vload_b_id,
-        kind: InstKind::VLoad(plan.dest_ptr_id),
-        ty: v_ty.clone(),
-        span,
-    });
+    // The false-mask arm: when ELSEWHERE supplies a constant, broadcast
+    // it; otherwise reload the dest's prior value so masked-off lanes
+    // are preserved.
+    let false_arm_id = if let Some(else_v) = plan.else_const {
+        let vk_id = func.next_value_id();
+        func.register_type(vk_id, v_ty.clone());
+        let preheader = func.block_mut(shape.preheader);
+        let pos = preheader.insts.len();
+        preheader.insts.insert(
+            pos,
+            Inst {
+                id: vk_id,
+                kind: InstKind::VBroadcast(else_v),
+                ty: v_ty.clone(),
+                span,
+            },
+        );
+        vk_id
+    } else {
+        let vload_b_id = func.next_value_id();
+        func.register_type(vload_b_id, v_ty.clone());
+        new_insts.push(Inst {
+            id: vload_b_id,
+            kind: InstKind::VLoad(plan.dest_ptr_id),
+            ty: v_ty.clone(),
+            span,
+        });
+        vload_b_id
+    };
     new_insts.push(Inst {
         id: vcmp_id,
         kind: if plan.cmp_is_float {
@@ -1690,7 +1784,7 @@ fn apply_where_plan(func: &mut Function, shape: &WhereLoop, plan: WherePlan) {
     };
     new_insts.push(Inst {
         id: vsel_id,
-        kind: InstKind::VSelect(vcmp_id, true_arm_id, vload_b_id),
+        kind: InstKind::VSelect(vcmp_id, true_arm_id, false_arm_id),
         ty: v_ty.clone(),
         span,
     });
@@ -1720,6 +1814,12 @@ fn apply_where_plan(func: &mut Function, shape: &WhereLoop, plan: WherePlan) {
         let then = func.block_mut(shape.then_block);
         then.insts.clear();
         then.terminator = Some(Terminator::Branch(shape.incr_block, vec![]));
+    }
+    // Same for the else_block (when ELSEWHERE was present).
+    if let Some(else_id) = shape.else_block {
+        let else_blk = func.block_mut(else_id);
+        else_blk.insts.clear();
+        else_blk.terminator = Some(Terminator::Branch(shape.incr_block, vec![]));
     }
 
     // 5. Update the incr block's iadd to step by `lanes` instead of 1.
