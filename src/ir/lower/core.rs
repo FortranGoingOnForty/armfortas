@@ -20735,6 +20735,16 @@ pub(super) fn materialize_array_descriptor_for_info(b: &mut FuncBuilder, info: &
     let flags = b.const_i32(flags);
     store_byte_aggregate_field(b, desc, 20, IrType::Int(IntWidth::I32), flags);
 
+    // Per F2018 column-major layout: dim[k].stride is the memory step
+    // (in elements) between adjacent logical positions along dim k.
+    // For a contiguous rank-N stack array with extents e_0..e_{n-1},
+    // that means dim[0].stride = 1 and dim[k].stride = prod_{j<k} e_j.
+    // Setting all strides to 1 worked for the dim[0]-only flat-iteration
+    // path (load/store_rank1_array_desc_elem), but `lower_multi_d_section_assign`
+    // and other per-dim consumers compute byte_off = Σ coord_k * stride_k,
+    // so all-1 strides made distinct (i,j,k) tuples collide on the same
+    // byte offset — only `Σ extents - rank + 1` unique cells got written.
+    let mut running_stride: i64 = 1;
     for (i, (lower, extent)) in info.dims.iter().copied().enumerate() {
         let base_offset = 24 + (i as i64) * 24;
         let lower_val = b.const_i64(lower);
@@ -20747,7 +20757,7 @@ pub(super) fn materialize_array_descriptor_for_info(b: &mut FuncBuilder, info: &
             IrType::Int(IntWidth::I64),
             upper_val,
         );
-        let stride_val = b.const_i64(1);
+        let stride_val = b.const_i64(running_stride);
         store_byte_aggregate_field(
             b,
             desc,
@@ -20755,6 +20765,7 @@ pub(super) fn materialize_array_descriptor_for_info(b: &mut FuncBuilder, info: &
             IrType::Int(IntWidth::I64),
             stride_val,
         );
+        running_stride = running_stride.saturating_mul(extent.max(1));
     }
 
     desc
@@ -27044,7 +27055,10 @@ pub(super) fn lower_array_section(
                 b.store(stride_val, p16);
             }
             crate::ast::expr::SectionSubscript::Element(e) => {
-                // Single element subscript in a section context — treat as start=end=val, stride=1.
+                // Single element subscript in a section context is a *rank-reducing*
+                // scalar selection. We mark it with stride=0 (sentinel) so
+                // afs_create_section knows to drop this dim from the result and fold
+                // the source-extent multiplier into the surviving dims' memory stride.
                 let raw = super::expr::lower_expr_with_optional_layouts(b, locals, e, st, type_layouts);
                 let val = widen_idx_to_i64(b, raw);
                 let off0 = b.const_i64(base_offset);
@@ -27055,8 +27069,8 @@ pub(super) fn lower_array_section(
                 let p16 = b.gep(specs, vec![off16], IrType::Int(IntWidth::I8));
                 b.store(val, p0);
                 b.store(val, p8);
-                let one = b.const_i64(1);
-                b.store(one, p16);
+                let zero = b.const_i64(0);
+                b.store(zero, p16);
             }
         }
     }
