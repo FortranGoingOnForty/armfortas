@@ -1130,6 +1130,16 @@ fn apply_vector_plan(func: &mut Function, shape: &CountedLoop, plan: VectorPlan)
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ThenBinop {
+    inst_id: ValueId,
+    kind: BinaryKind,
+    /// The non-load operand (must be loop-invariant).
+    scalar_v: ValueId,
+    /// Whether the load is the LHS of the binop.
+    load_on_lhs: bool,
+}
+
 /// Vectorizable WHERE-block plan: one conditional store guarded by
 /// a scalar fcmp/icmp predicate. Only the simplest shape is handled
 /// for now: the store value is a load of the same pointer used in
@@ -1161,6 +1171,13 @@ struct WherePlan {
     /// `uid` is the inst id in then_block and `kind` is the unary
     /// kind to lift to a V-unary.
     then_unary: Option<(ValueId, UnaryKind)>,
+    /// Optional binop applied to the loaded value with a loop-invariant
+    /// scalar (`b = a + K`, `b = a * scale`, etc.). The `scalar_v` is
+    /// the invariant operand (will be broadcast in preheader);
+    /// `load_on_lhs` indicates whether the load is the LHS of the
+    /// binop (to preserve operand order for non-commutative ops like
+    /// Sub/Div).
+    then_binop: Option<ThenBinop>,
     /// The dest pointer GEP (computed in body block).
     dest_ptr_id: ValueId,
     /// Source array's access shape (where load_a reads from).
@@ -1248,13 +1265,15 @@ fn build_where_plan(func: &Function, shape: &WhereLoop) -> Option<WherePlan> {
     }
     // Walk then-block for the store. Expect optionally a redundant
     // Load (same ptr as load_a), optionally a unary (FNeg/FAbs/FSqrt
-    // /INeg) of the load, and exactly one Store.
+    // /INeg) OR a binop with an invariant scalar, and exactly one Store.
     let mut store_id = None;
     let mut then_load_id = None;
     let mut then_unary: Option<(ValueId, UnaryKind)> = None;
+    let mut then_binop: Option<ThenBinop> = None;
     let mut store_value = None;
     let mut store_ptr = None;
     for inst in &then_block.insts {
+        let is_load_alias = |v: ValueId| v == load_a_id || Some(v) == then_load_id;
         match inst.kind {
             InstKind::Load(p) if p == load_a_ptr => {
                 if then_load_id.is_some() {
@@ -1263,31 +1282,62 @@ fn build_where_plan(func: &Function, shape: &WhereLoop) -> Option<WherePlan> {
                 then_load_id = Some(inst.id);
             }
             InstKind::FNeg(src) | InstKind::INeg(src) => {
-                if then_unary.is_some() {
+                if then_unary.is_some() || then_binop.is_some() {
                     return None;
                 }
-                if src != load_a_id && Some(src) != then_load_id {
+                if !is_load_alias(src) {
                     return None;
                 }
                 then_unary = Some((inst.id, UnaryKind::Neg));
             }
             InstKind::FAbs(src) => {
-                if then_unary.is_some() {
+                if then_unary.is_some() || then_binop.is_some() {
                     return None;
                 }
-                if src != load_a_id && Some(src) != then_load_id {
+                if !is_load_alias(src) {
                     return None;
                 }
                 then_unary = Some((inst.id, UnaryKind::Abs));
             }
             InstKind::FSqrt(src) => {
-                if then_unary.is_some() {
+                if then_unary.is_some() || then_binop.is_some() {
                     return None;
                 }
-                if src != load_a_id && Some(src) != then_load_id {
+                if !is_load_alias(src) {
                     return None;
                 }
                 then_unary = Some((inst.id, UnaryKind::Sqrt));
+            }
+            InstKind::IAdd(l, r)
+            | InstKind::ISub(l, r)
+            | InstKind::IMul(l, r)
+            | InstKind::FAdd(l, r)
+            | InstKind::FSub(l, r)
+            | InstKind::FMul(l, r)
+            | InstKind::FDiv(l, r) => {
+                if then_unary.is_some() || then_binop.is_some() {
+                    return None;
+                }
+                let kind = match inst.kind {
+                    InstKind::IAdd(..) | InstKind::FAdd(..) => BinaryKind::Add,
+                    InstKind::ISub(..) | InstKind::FSub(..) => BinaryKind::Sub,
+                    InstKind::IMul(..) | InstKind::FMul(..) => BinaryKind::Mul,
+                    InstKind::FDiv(..) => BinaryKind::Div,
+                    _ => unreachable!(),
+                };
+                let (load_on_lhs, scalar_v) = if is_load_alias(l) {
+                    (true, r)
+                } else if is_load_alias(r) {
+                    (false, l)
+                } else {
+                    return None;
+                };
+                then_binop = Some(ThenBinop {
+                    inst_id: inst.id,
+                    kind,
+                    scalar_v,
+                    load_on_lhs,
+                });
             }
             InstKind::Store(v, p) => {
                 if store_id.is_some() {
@@ -1304,13 +1354,28 @@ fn build_where_plan(func: &Function, shape: &WhereLoop) -> Option<WherePlan> {
     let store_value = store_value?;
     let store_ptr = store_ptr?;
     // The store value must be either: load_a, the redundant then-load,
-    // or the then-block unary (whose source is one of those loads).
+    // the then-block unary, or the then-block binop.
     let unary_id = then_unary.map(|(id, _)| id);
+    let binop_id = then_binop.map(|b| b.inst_id);
     if store_value != load_a_id
         && Some(store_value) != then_load_id
         && Some(store_value) != unary_id
+        && Some(store_value) != binop_id
     {
         return None;
+    }
+    // For binop: scalar operand must be loop-invariant (not defined
+    // in body, then, or incr). FDiv is float-only.
+    if let Some(b) = then_binop {
+        if body_ids.contains(&b.scalar_v)
+            || then_ids.contains(&b.scalar_v)
+            || incr_ids.contains(&b.scalar_v)
+        {
+            return None;
+        }
+        if matches!(b.kind, BinaryKind::Div) && !matches!(src_access.elem_ty, IrType::Float(_)) {
+            return None;
+        }
     }
     // FSqrt is float-only; INeg is int-only. The dest elem type
     // must match.
@@ -1367,6 +1432,7 @@ fn build_where_plan(func: &Function, shape: &WhereLoop) -> Option<WherePlan> {
         store_id,
         then_load_id,
         then_unary,
+        then_binop,
         dest_ptr_id: store_ptr,
         src_access,
         dest_access,
@@ -1459,9 +1525,10 @@ fn apply_where_plan(func: &mut Function, shape: &WhereLoop, plan: WherePlan) {
         ty: v_ty.clone(),
         span,
     });
-    // If the WHERE body computes `b = unary(a)` (e.g., `b = -a`),
-    // emit the vector unary on the vload_a value and use that as
-    // the vselect's "true" arm.
+    // If the WHERE body computes `b = unary(a)` or `b = a op K`,
+    // emit the vector op on the vload_a value (broadcasting the
+    // scalar K for the binop case) and use that as the vselect's
+    // "true" arm.
     let true_arm_id = if let Some((_then_uid, kind)) = plan.then_unary {
         let vu_id = func.next_value_id();
         func.register_type(vu_id, v_ty.clone());
@@ -1477,6 +1544,45 @@ fn apply_where_plan(func: &mut Function, shape: &WhereLoop, plan: WherePlan) {
             span,
         });
         vu_id
+    } else if let Some(b) = plan.then_binop {
+        // Broadcast scalar into the preheader.
+        let vk_id = func.next_value_id();
+        func.register_type(vk_id, v_ty.clone());
+        let preheader = func.block_mut(shape.preheader);
+        let pos = preheader.insts.len();
+        preheader.insts.insert(
+            pos,
+            Inst {
+                id: vk_id,
+                kind: InstKind::VBroadcast(b.scalar_v),
+                ty: v_ty.clone(),
+                span,
+            },
+        );
+        // Compute the binop in body block, in original operand order.
+        let (l_id, r_id) = if b.load_on_lhs {
+            (plan.load_a_id, vk_id)
+        } else {
+            (vk_id, plan.load_a_id)
+        };
+        let vbin_id = func.next_value_id();
+        func.register_type(vbin_id, v_ty.clone());
+        let vbin_kind = match b.kind {
+            BinaryKind::Add => InstKind::VAdd(l_id, r_id),
+            BinaryKind::Sub => InstKind::VSub(l_id, r_id),
+            BinaryKind::Mul => InstKind::VMul(l_id, r_id),
+            BinaryKind::Div => InstKind::VDiv(l_id, r_id),
+            // Min/Max not produced by then-binop walker (those are
+            // recognized via Select, not directly).
+            BinaryKind::Min | BinaryKind::Max => InstKind::VAdd(l_id, r_id),
+        };
+        new_insts.push(Inst {
+            id: vbin_id,
+            kind: vbin_kind,
+            ty: v_ty.clone(),
+            span,
+        });
+        vbin_id
     } else {
         plan.load_a_id
     };
