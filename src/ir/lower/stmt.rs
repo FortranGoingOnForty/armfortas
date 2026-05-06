@@ -2076,11 +2076,22 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             ..
         } => {
             // WHERE(mask) body [ELSEWHERE body] END WHERE
-            // Collect ALL array names referenced in mask or body.
+            // Collect ALL array names referenced in mask, body, OR
+            // elsewhere body. Missing the elsewhere arm caused a
+            // silent miscompile: an array reference appearing only
+            // in elsewhere (e.g., `where (a > 0) c = a; elsewhere; c
+            // = d`) was not scalarized, so `c = d` lowered through
+            // the scalar path and silently produced 0.0 instead of
+            // d(i).
             let mut array_names: Vec<String> = Vec::new();
             collect_array_names(mask, &ctx.locals, &mut array_names);
             for s in body {
                 collect_array_names_stmt(s, &ctx.locals, &mut array_names);
+            }
+            if let Some((_emask, ebody)) = elsewhere.first() {
+                for s in ebody {
+                    collect_array_names_stmt(s, &ctx.locals, &mut array_names);
+                }
             }
 
             if array_names.is_empty() {
