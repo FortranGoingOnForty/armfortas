@@ -1368,11 +1368,21 @@ fn arg_uses_descriptor_from_decls(arg_name: &str, decls: &[crate::ast::decl::Spa
                     .any(|a| matches!(a, crate::ast::decl::Attribute::Allocatable));
                 let specs = entity.array_spec.as_ref().or(attr_dims);
                 if let Some(specs) = specs {
+                    // Assumed-SIZE dummies (`tau(*)`, `a(lda,*)`) are
+                    // passed as bare pointers per F2018 §15.5.2 — the
+                    // callee receives the first element's address, with
+                    // no descriptor metadata.  Lumping them in with
+                    // assumed-shape / deferred / assumed-rank made the
+                    // callee load through the slot a SECOND time as if
+                    // it held a descriptor pointer, so `tau(i)` for
+                    // `tau(*)` computed `*(*tau_slot) + (i-1)*elem` —
+                    // a garbage address.  stdlib_sgeqr2 → stdlib_slarfg
+                    // crashed with x4=null (= first element of the
+                    // intent(out) tau array, which was 0).
                     return specs.iter().any(|spec| {
                         matches!(
                             spec,
                             ArraySpec::AssumedShape { .. }
-                                | ArraySpec::AssumedSize { .. }
                                 | ArraySpec::Deferred
                                 | ArraySpec::AssumedRank
                         )
