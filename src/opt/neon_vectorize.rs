@@ -1217,6 +1217,10 @@ struct WherePlan {
     /// preheader and used as vselect's false arm in lieu of the
     /// dest's prior value.
     else_const: Option<ValueId>,
+    /// When ELSEWHERE loads from a different array
+    /// (`elsewhere; c = d; end where`), this is the body-defined
+    /// GEP ptr to load via VLoad for the false-mask lanes.
+    else_load_ptr: Option<ValueId>,
     /// The dest pointer GEP (computed in body block).
     dest_ptr_id: ValueId,
     /// Source array's access shape (where load_a reads from).
@@ -1481,49 +1485,78 @@ fn build_where_plan(func: &Function, shape: &WhereLoop) -> Option<WherePlan> {
     if src_access.elem_ty != dest_access.elem_ty {
         return None;
     }
-    // ELSEWHERE arm: walk the else_block (when present) for a single
-    // Store of a loop-invariant scalar to the same dest_ptr. More
-    // complex else expressions can be added later.
-    let else_const: Option<ValueId> = if let Some(else_blk_id) = shape.else_block {
-        let else_blk = func.block(else_blk_id);
-        // Reject calls in else.
-        if else_blk
-            .insts
-            .iter()
-            .any(|inst| matches!(inst.kind, InstKind::Call(..) | InstKind::RuntimeCall(..)))
-        {
-            return None;
-        }
-        let mut else_store: Option<(ValueId, ValueId)> = None;
-        for inst in &else_blk.insts {
-            match inst.kind {
-                InstKind::Store(v, p) => {
-                    if else_store.is_some() {
-                        return None;
-                    }
-                    else_store = Some((v, p));
-                }
-                _ => return None,
+    // ELSEWHERE arm: walk the else_block (when present). Two shapes
+    // are supported:
+    //   (a) `Store(invariant_const, dest_ptr)` — broadcast-in-preheader.
+    //   (b) `Load(body_gep_ptr); Store(load_val, dest_ptr)` — VLoad
+    //       on the body-defined ptr (e.g., `elsewhere; c = d`).
+    let (else_const, else_load_ptr): (Option<ValueId>, Option<ValueId>) =
+        if let Some(else_blk_id) = shape.else_block {
+            let else_blk = func.block(else_blk_id);
+            if else_blk
+                .insts
+                .iter()
+                .any(|inst| matches!(inst.kind, InstKind::Call(..) | InstKind::RuntimeCall(..)))
+            {
+                return None;
             }
-        }
-        let (else_v, else_p) = else_store?;
-        if else_p != store_ptr {
-            return None;
-        }
-        // Else value must be loop-invariant (defined outside body /
-        // then / else / incr).
-        let else_ids: HashSet<ValueId> = else_blk.insts.iter().map(|i| i.id).collect();
-        if body_ids.contains(&else_v)
-            || then_ids.contains(&else_v)
-            || else_ids.contains(&else_v)
-            || incr_ids.contains(&else_v)
-        {
-            return None;
-        }
-        Some(else_v)
-    } else {
-        None
-    };
+            let mut else_load: Option<(ValueId, ValueId)> = None;
+            let mut else_store: Option<(ValueId, ValueId)> = None;
+            for inst in &else_blk.insts {
+                match inst.kind {
+                    InstKind::Load(p) if body_gep_ids.contains(&p) => {
+                        if else_load.is_some() {
+                            return None;
+                        }
+                        else_load = Some((inst.id, p));
+                    }
+                    InstKind::Store(v, p) => {
+                        if else_store.is_some() {
+                            return None;
+                        }
+                        else_store = Some((v, p));
+                    }
+                    _ => return None,
+                }
+            }
+            let (else_v, else_p) = else_store?;
+            if else_p != store_ptr {
+                return None;
+            }
+            let else_ids: HashSet<ValueId> = else_blk.insts.iter().map(|i| i.id).collect();
+            // Case (b): store value is the else-block load.
+            if let Some((load_id, load_ptr)) = else_load {
+                if else_v != load_id {
+                    return None;
+                }
+                // Validate the load's access shape covers the full
+                // array span and matches dest's elem type.
+                let acc = classify_array_access(func, load_ptr, shape.iv_param)?;
+                let upper = acc
+                    .lower
+                    .checked_add(acc.len as i64)
+                    .and_then(|v| v.checked_sub(1))?;
+                if shape.iv_init != acc.lower
+                    || shape.iv_bound != upper
+                    || acc.elem_ty != src_access.elem_ty
+                {
+                    return None;
+                }
+                (None, Some(load_ptr))
+            } else {
+                // Case (a): store value must be loop-invariant.
+                if body_ids.contains(&else_v)
+                    || then_ids.contains(&else_v)
+                    || else_ids.contains(&else_v)
+                    || incr_ids.contains(&else_v)
+                {
+                    return None;
+                }
+                (Some(else_v), None)
+            }
+        } else {
+            (None, None)
+        };
     // If the binop's other operand is the b-array load, validate that
     // b's access shape covers the same span and elem type.
     let b_ptr_id = if let Some(b) = then_binop {
@@ -1574,6 +1607,7 @@ fn build_where_plan(func: &Function, shape: &WhereLoop) -> Option<WherePlan> {
         then_const,
         b_ptr_id,
         else_const,
+        else_load_ptr,
         dest_ptr_id: store_ptr,
         src_access,
         dest_access,
@@ -1644,9 +1678,12 @@ fn apply_where_plan(func: &mut Function, shape: &WhereLoop, plan: WherePlan) {
     func.register_type(vstore_id, IrType::Void);
 
     let mut new_insts: Vec<Inst> = Vec::new();
-    // The false-mask arm: when ELSEWHERE supplies a constant, broadcast
-    // it; otherwise reload the dest's prior value so masked-off lanes
+    // The false-mask arm: prefer ELSEWHERE-supplied values when
+    // present, else reload the dest's prior value so masked-off lanes
     // are preserved.
+    //   else_const     → VBroadcast(K) in preheader.
+    //   else_load_ptr  → VLoad on a body-defined GEP (e.g. `c = d`).
+    //   neither        → VLoad on dest_ptr_id (preserve old lanes).
     let false_arm_id = if let Some(else_v) = plan.else_const {
         let vk_id = func.next_value_id();
         func.register_type(vk_id, v_ty.clone());
@@ -1662,6 +1699,16 @@ fn apply_where_plan(func: &mut Function, shape: &WhereLoop, plan: WherePlan) {
             },
         );
         vk_id
+    } else if let Some(load_ptr) = plan.else_load_ptr {
+        let vload_else_id = func.next_value_id();
+        func.register_type(vload_else_id, v_ty.clone());
+        new_insts.push(Inst {
+            id: vload_else_id,
+            kind: InstKind::VLoad(load_ptr),
+            ty: v_ty.clone(),
+            span,
+        });
+        vload_else_id
     } else {
         let vload_b_id = func.next_value_id();
         func.register_type(vload_b_id, v_ty.clone());
