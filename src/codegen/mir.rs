@@ -129,6 +129,10 @@ pub enum ArmOpcode {
     FsqrtV2D,
     FmlaV4S, // FMLA Vd.4s, Vn.4s, Vm.4s   (Vd += Vn*Vm)
     FmlaV2D,
+    /// BSL Vd.16B, Vn.16B, Vm.16B — bit select. Per-bit:
+    /// `Vd[i] = Vd[i] ? Vn[i] : Vm[i]`. Vd is destructive
+    /// (input mask + output). Used to lower VSelect.
+    BslV16B,
     FminV4S,
     FminV2D,
     FmaxV4S,
