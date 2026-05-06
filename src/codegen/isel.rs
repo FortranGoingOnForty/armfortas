@@ -1778,6 +1778,29 @@ fn select_inst(
                 def: Some(dest),
             });
         }
+        InstKind::VSelect(mask, t, f) => {
+            // BSL is destructive: bsl Vd.16b, Vn.16b, Vm.16b → for
+            // each bit, if Vd then Vn else Vm. So we copy the mask
+            // into the dest first (mov.16b), then bsl with t/f.
+            let vmask = ctx.lookup_vreg(*mask);
+            let vt = ctx.lookup_vreg(*t);
+            let vf = ctx.lookup_vreg(*f);
+            let dest = ctx.get_vreg(mf, inst.id, RegClass::V128);
+            mf.block_mut(mb).insts.push(MachineInst {
+                opcode: ArmOpcode::Mov16B,
+                operands: vec![MachineOperand::VReg(dest), MachineOperand::VReg(vmask)],
+                def: Some(dest),
+            });
+            mf.block_mut(mb).insts.push(MachineInst {
+                opcode: ArmOpcode::BslV16B,
+                operands: vec![
+                    MachineOperand::VReg(dest),
+                    MachineOperand::VReg(vt),
+                    MachineOperand::VReg(vf),
+                ],
+                def: Some(dest),
+            });
+        }
         InstKind::VLoad(addr) => {
             let dest = ctx.get_vreg(mf, inst.id, RegClass::V128);
             let base = ctx.lookup_vreg(*addr);
