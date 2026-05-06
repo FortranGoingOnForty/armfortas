@@ -1593,8 +1593,249 @@ fn detect_partial_unroll_runtime_loop(
     })
 }
 
-fn do_partial_unroll_runtime(_func: &mut Function, _shape: PartialRuntimeShape) {
-    // Stub — apply path lands in a follow-up commit.
+fn do_partial_unroll_runtime(func: &mut Function, shape: PartialRuntimeShape) {
+    let span = dummy_span();
+    let int_ty = IrType::Int(shape.iv_width);
+    let bool_ty = IrType::Bool;
+
+    // ---- Snapshot the original body BEFORE we modify the latch ----
+    let body_snapshot: Vec<Inst> = func.block(shape.latch).insts.clone();
+    let body_no_iadd: Vec<Inst> = body_snapshot
+        .iter()
+        .filter(|i| i.id != shape.iadd_id)
+        .cloned()
+        .collect();
+
+    // ---- 1. Emit head_bound runtime arithmetic in the preheader ----
+    //
+    //   trip = (bound - init) + 1
+    //   head_count = trip - (trip mod U)
+    //   head_bound = init + (head_count - 1)
+    let init_const_id = func.next_value_id();
+    let one_id = func.next_value_id();
+    let u_const_id = func.next_value_id();
+    let trip_minus_init_id = func.next_value_id();
+    let trip_id = func.next_value_id();
+    let mod_id = func.next_value_id();
+    let head_count_id = func.next_value_id();
+    let head_count_minus_one_id = func.next_value_id();
+    let head_bound_id = func.next_value_id();
+    for v in [
+        init_const_id,
+        one_id,
+        u_const_id,
+        trip_minus_init_id,
+        trip_id,
+        mod_id,
+        head_count_id,
+        head_count_minus_one_id,
+        head_bound_id,
+    ] {
+        func.register_type(v, int_ty.clone());
+    }
+    let preheader_new_insts = vec![
+        Inst {
+            id: init_const_id,
+            kind: InstKind::ConstInt(shape.iv_init as i128, shape.iv_width),
+            ty: int_ty.clone(),
+            span,
+        },
+        Inst {
+            id: one_id,
+            kind: InstKind::ConstInt(1, shape.iv_width),
+            ty: int_ty.clone(),
+            span,
+        },
+        Inst {
+            id: u_const_id,
+            kind: InstKind::ConstInt(shape.u as i128, shape.iv_width),
+            ty: int_ty.clone(),
+            span,
+        },
+        Inst {
+            id: trip_minus_init_id,
+            kind: InstKind::ISub(shape.iv_bound_v, init_const_id),
+            ty: int_ty.clone(),
+            span,
+        },
+        Inst {
+            id: trip_id,
+            kind: InstKind::IAdd(trip_minus_init_id, one_id),
+            ty: int_ty.clone(),
+            span,
+        },
+        Inst {
+            id: mod_id,
+            kind: InstKind::IMod(trip_id, u_const_id),
+            ty: int_ty.clone(),
+            span,
+        },
+        Inst {
+            id: head_count_id,
+            kind: InstKind::ISub(trip_id, mod_id),
+            ty: int_ty.clone(),
+            span,
+        },
+        Inst {
+            id: head_count_minus_one_id,
+            kind: InstKind::ISub(head_count_id, one_id),
+            ty: int_ty.clone(),
+            span,
+        },
+        Inst {
+            id: head_bound_id,
+            kind: InstKind::IAdd(init_const_id, head_count_minus_one_id),
+            ty: int_ty.clone(),
+            span,
+        },
+    ];
+    {
+        let pre = func.block_mut(shape.preheader);
+        // Insert immediately before the terminator (after any existing insts).
+        let pos = pre.insts.len();
+        for (i, inst) in preheader_new_insts.into_iter().enumerate() {
+            pre.insts.insert(pos + i, inst);
+        }
+    }
+
+    // ---- 2. Rewire header's icmp RHS to head_bound ----
+    {
+        let hdr = func.block_mut(shape.header);
+        if let Some(inst) = hdr.insts.iter_mut().find(|i| i.id == shape.cond_id) {
+            if let InstKind::ICmp(_, _, ref mut rhs) = inst.kind {
+                *rhs = head_bound_id;
+            }
+        }
+    }
+
+    // ---- 3. Allocate remainder loop blocks ----
+    let header_remain = func.create_block("partial_remain_header");
+    let latch_remain = func.create_block("partial_remain_latch");
+    let remain_iv_id = func.next_value_id();
+    func.register_type(remain_iv_id, int_ty.clone());
+    func.block_mut(header_remain).params.push(BlockParam {
+        id: remain_iv_id,
+        ty: int_ty.clone(),
+    });
+
+    // ---- 4. Rewire header's cond_br false-target from exit to header_remain ----
+    let original_exit = shape.exit;
+    {
+        let hdr = func.block_mut(shape.header);
+        if let Some(Terminator::CondBranch {
+            false_dest,
+            false_args,
+            ..
+        }) = hdr.terminator.as_mut()
+        {
+            *false_dest = header_remain;
+            *false_args = vec![shape.iv_param];
+        }
+    }
+
+    // ---- 5. Build the U-way unrolled main-loop body in the latch ----
+    let mut new_main_insts: Vec<Inst> = body_no_iadd.clone();
+    for k in 1..shape.u {
+        let k_const_id = func.next_value_id();
+        func.register_type(k_const_id, int_ty.clone());
+        let iv_k_id = func.next_value_id();
+        func.register_type(iv_k_id, int_ty.clone());
+        new_main_insts.push(Inst {
+            id: k_const_id,
+            kind: InstKind::ConstInt(k as i128, shape.iv_width),
+            ty: int_ty.clone(),
+            span,
+        });
+        new_main_insts.push(Inst {
+            id: iv_k_id,
+            kind: InstKind::IAdd(shape.iv_param, k_const_id),
+            ty: int_ty.clone(),
+            span,
+        });
+        let mut subst: HashMap<ValueId, ValueId> = HashMap::new();
+        subst.insert(shape.iv_param, iv_k_id);
+        for orig in &body_no_iadd {
+            let new_id = func.next_value_id();
+            func.register_type(new_id, orig.ty.clone());
+            subst.insert(orig.id, new_id);
+            let new_kind = remap_kind(&orig.kind, &subst);
+            new_main_insts.push(Inst {
+                id: new_id,
+                kind: new_kind,
+                ty: orig.ty.clone(),
+                span: orig.span,
+            });
+        }
+    }
+    // New iadd: iv_next = iadd iv, U. Reuse the original iadd id.
+    let new_step_const = func.next_value_id();
+    func.register_type(new_step_const, int_ty.clone());
+    new_main_insts.push(Inst {
+        id: new_step_const,
+        kind: InstKind::ConstInt(shape.u as i128, shape.iv_width),
+        ty: int_ty.clone(),
+        span,
+    });
+    new_main_insts.push(Inst {
+        id: shape.iadd_id,
+        kind: InstKind::IAdd(shape.iv_param, new_step_const),
+        ty: int_ty.clone(),
+        span,
+    });
+    func.block_mut(shape.latch).insts = new_main_insts;
+
+    // ---- 6. Build header_remain ----
+    let remain_cmp_id = func.next_value_id();
+    func.register_type(remain_cmp_id, bool_ty.clone());
+    func.block_mut(header_remain).insts.push(Inst {
+        id: remain_cmp_id,
+        kind: InstKind::ICmp(CmpOp::Le, remain_iv_id, shape.iv_bound_v),
+        ty: bool_ty.clone(),
+        span,
+    });
+    func.block_mut(header_remain).terminator = Some(Terminator::CondBranch {
+        cond: remain_cmp_id,
+        true_dest: latch_remain,
+        true_args: vec![],
+        false_dest: original_exit,
+        false_args: vec![],
+    });
+
+    // ---- 7. Build latch_remain (scalar 1-iter copy of original body) ----
+    let mut subst: HashMap<ValueId, ValueId> = HashMap::new();
+    subst.insert(shape.iv_param, remain_iv_id);
+    let mut remain_insts: Vec<Inst> = Vec::new();
+    for orig in &body_no_iadd {
+        let new_id = func.next_value_id();
+        func.register_type(new_id, orig.ty.clone());
+        subst.insert(orig.id, new_id);
+        let new_kind = remap_kind(&orig.kind, &subst);
+        remain_insts.push(Inst {
+            id: new_id,
+            kind: new_kind,
+            ty: orig.ty.clone(),
+            span: orig.span,
+        });
+    }
+    let remain_step_const_id = func.next_value_id();
+    func.register_type(remain_step_const_id, int_ty.clone());
+    let remain_iv_next_id = func.next_value_id();
+    func.register_type(remain_iv_next_id, int_ty.clone());
+    remain_insts.push(Inst {
+        id: remain_step_const_id,
+        kind: InstKind::ConstInt(1, shape.iv_width),
+        ty: int_ty.clone(),
+        span,
+    });
+    remain_insts.push(Inst {
+        id: remain_iv_next_id,
+        kind: InstKind::IAdd(remain_iv_id, remain_step_const_id),
+        ty: int_ty.clone(),
+        span,
+    });
+    func.block_mut(latch_remain).insts = remain_insts;
+    func.block_mut(latch_remain).terminator =
+        Some(Terminator::Branch(header_remain, vec![remain_iv_next_id]));
 }
 
 // ---------------------------------------------------------------------------
@@ -1722,6 +1963,137 @@ mod tests {
 
     fn build_counted_loop(lo: i64, hi: i64) -> Module {
         build_counted_loop_with_prefix(lo, hi, "do")
+    }
+
+    /// Build a 2-block counted loop where the bound is a function
+    /// parameter (runtime). Uses an alloca + store as the body work
+    /// (1 store keeps the multi-store regalloc-pressure heuristic
+    /// happy) and increments by 1 in the latch.
+    fn build_runtime_counted_loop(lo: i64) -> Module {
+        let mut m = Module::new("test".into());
+        // Reserve %0 for the n_param so the function params line up.
+        let n_param = ValueId(0);
+        let params = vec![Param {
+            name: "n".into(),
+            ty: IrType::Int(IntWidth::I64),
+            id: n_param,
+            fortran_noalias: false,
+        }];
+        let mut f = Function::new("loop_runtime".into(), params, IrType::Void);
+
+        let header_id = f.create_block("do_check");
+        let latch_id = f.create_block("do_body");
+        let exit_id = f.create_block("exit");
+        let entry_id = f.entry;
+
+        // ---- preheader ----
+        let lo_val = f.next_value_id();
+        f.block_mut(entry_id).insts.push(Inst {
+            id: lo_val,
+            ty: IrType::Int(IntWidth::I64),
+            span: span(),
+            kind: InstKind::ConstInt(lo as i128, IntWidth::I64),
+        });
+        let alloca_val = f.next_value_id();
+        f.block_mut(entry_id).insts.push(Inst {
+            id: alloca_val,
+            ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I64))),
+            span: span(),
+            kind: InstKind::Alloca(IrType::Int(IntWidth::I64)),
+        });
+        f.block_mut(entry_id).terminator = Some(Terminator::Branch(header_id, vec![lo_val]));
+
+        // ---- header ----
+        let iv_param = f.next_value_id();
+        f.block_mut(header_id).params.push(BlockParam {
+            id: iv_param,
+            ty: IrType::Int(IntWidth::I64),
+        });
+        let cmp_val = f.next_value_id();
+        f.block_mut(header_id).insts.push(Inst {
+            id: cmp_val,
+            ty: IrType::Bool,
+            span: span(),
+            kind: InstKind::ICmp(CmpOp::Le, iv_param, n_param),
+        });
+        f.block_mut(header_id).terminator = Some(Terminator::CondBranch {
+            cond: cmp_val,
+            true_dest: latch_id,
+            true_args: vec![],
+            false_dest: exit_id,
+            false_args: vec![],
+        });
+
+        // ---- latch (one store as the body work; iadd iv,1; br) ----
+        let const_v = f.next_value_id();
+        f.block_mut(latch_id).insts.push(Inst {
+            id: const_v,
+            ty: IrType::Int(IntWidth::I64),
+            span: span(),
+            kind: InstKind::ConstInt(42, IntWidth::I64),
+        });
+        let store_id = f.next_value_id();
+        f.block_mut(latch_id).insts.push(Inst {
+            id: store_id,
+            ty: IrType::Void,
+            span: span(),
+            kind: InstKind::Store(const_v, alloca_val),
+        });
+        let one_val = f.next_value_id();
+        f.block_mut(latch_id).insts.push(Inst {
+            id: one_val,
+            ty: IrType::Int(IntWidth::I64),
+            span: span(),
+            kind: InstKind::ConstInt(1, IntWidth::I64),
+        });
+        let iv_next = f.next_value_id();
+        f.block_mut(latch_id).insts.push(Inst {
+            id: iv_next,
+            ty: IrType::Int(IntWidth::I64),
+            span: span(),
+            kind: InstKind::IAdd(iv_param, one_val),
+        });
+        f.block_mut(latch_id).terminator = Some(Terminator::Branch(header_id, vec![iv_next]));
+
+        // ---- exit ----
+        f.block_mut(exit_id).terminator = Some(Terminator::Return(None));
+
+        m.add_function(f);
+        m
+    }
+
+    #[test]
+    fn partial_unrolls_runtime_trip_2block_loop() {
+        // The bound is a function parameter (runtime), so the static
+        // partial-unroll detector won't fire — but the runtime detector
+        // should pick up the same shape and emit a head_bound
+        // computation in the preheader plus a remainder loop after
+        // the unrolled main loop.
+        let mut m = build_runtime_counted_loop(1);
+        let blocks_before = m.functions[0].blocks.len();
+        let pass = LoopUnroll;
+        let changed = pass.run(&mut m);
+        assert!(
+            changed,
+            "runtime-trip 2-block loop should partial-unroll"
+        );
+        let f = &m.functions[0];
+        // Two new blocks: header_remain + latch_remain.
+        assert_eq!(
+            f.blocks.len(),
+            blocks_before + 2,
+            "expected 2 new blocks (remainder header + latch); got {} → {}",
+            blocks_before,
+            f.blocks.len()
+        );
+        // Preheader should contain the runtime arithmetic for head_bound:
+        // ISub, IAdd, IMod feeding into the header's icmp via a fresh value.
+        let preheader = &f.blocks[0];
+        let kinds: Vec<&InstKind> = preheader.insts.iter().map(|i| &i.kind).collect();
+        let has_imod = kinds
+            .iter()
+            .any(|k| matches!(k, InstKind::IMod(..)));
+        assert!(has_imod, "preheader should compute head_bound via IMod");
     }
 
     #[test]
