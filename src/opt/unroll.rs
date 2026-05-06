@@ -1089,6 +1089,17 @@ struct PartialShape {
     iadd_id: ValueId,
     /// The const(1) value feeding the iadd.
     step_const_id: ValueId,
+    /// If the loop is a reduction (header has 2 params), this carries
+    /// the acc param id and the latch's terminator's new-acc value.
+    reduction: Option<PartialReductionInfo>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PartialReductionInfo {
+    acc_param: ValueId,
+    /// The value the latch passes back as the new accumulator
+    /// (terminator's args[1]).
+    new_acc: ValueId,
 }
 
 fn detect_partial_unroll_loop(
@@ -1105,7 +1116,7 @@ fn detect_partial_unroll_loop(
         return None;
     }
     let hdr = func.block(header);
-    if hdr.params.len() != 1 {
+    if hdr.params.is_empty() || hdr.params.len() > 2 {
         return None;
     }
     let iv_param = hdr.params[0].id;
@@ -1113,6 +1124,11 @@ fn detect_partial_unroll_loop(
     if !matches!(iv_ty, IrType::Int(_)) {
         return None;
     }
+    let acc_param: Option<ValueId> = if hdr.params.len() == 2 {
+        Some(hdr.params[1].id)
+    } else {
+        None
+    };
     // Header has the cmp + cond_br body/exit.
     let (iv_bound, exit, _exit_args) = detect_bound_and_exit(func, header, iv_param)?;
     if nl.body.contains(&exit) {
@@ -1132,19 +1148,31 @@ fn detect_partial_unroll_loop(
     }
     let preheader = outside[0];
     let ph = func.block(preheader);
+    let expected_args = if acc_param.is_some() { 2 } else { 1 };
     let iv_init = match &ph.terminator {
-        Some(Terminator::Branch(d, args)) if *d == header && args.len() == 1 => {
+        Some(Terminator::Branch(d, args))
+            if *d == header && args.len() == expected_args =>
+        {
             resolve_const_int(func, args[0])?
         }
         _ => return None,
     };
-    // Latch: `... insts ...; iadd iv, 1; br header(iv_next)`.
+    // Latch: `... insts ...; iadd iv, 1; br header(iv_next [, new_acc])`.
     let latch_blk = func.block(latch);
     let latch_term_args = match &latch_blk.terminator {
-        Some(Terminator::Branch(d, args)) if *d == header && args.len() == 1 => args.clone(),
+        Some(Terminator::Branch(d, args))
+            if *d == header && args.len() == expected_args =>
+        {
+            args.clone()
+        }
         _ => return None,
     };
     let iv_next = latch_term_args[0];
+    let new_acc = if acc_param.is_some() {
+        Some(latch_term_args[1])
+    } else {
+        None
+    };
     let iadd_inst = latch_blk.insts.iter().find(|i| i.id == iv_next)?;
     let (lhs, rhs) = match iadd_inst.kind {
         InstKind::IAdd(l, r) => (l, r),
@@ -1189,6 +1217,14 @@ fn detect_partial_unroll_loop(
         break;
     }
     let u = chosen_u?;
+    let reduction = match (acc_param, new_acc) {
+        (Some(p), Some(v)) => Some(PartialReductionInfo {
+            acc_param: p,
+            new_acc: v,
+        }),
+        (None, None) => None,
+        _ => return None,
+    };
     Some(PartialShape {
         header,
         latch,
@@ -1199,6 +1235,7 @@ fn detect_partial_unroll_loop(
         u,
         iadd_id: iv_next,
         step_const_id,
+        reduction,
     })
 }
 
@@ -1236,6 +1273,11 @@ fn do_partial_unroll(func: &mut Function, shape: PartialShape) {
         .filter(|i| i.id != shape.iadd_id)
         .cloned()
         .collect();
+    // For reduction loops, track the running accumulator. After the
+    // original (k=0) body, the running acc is the original new_acc.
+    // Each subsequent clone substitutes acc_param → prev_acc and
+    // produces a fresh new_acc (the cloned counterpart of orig new_acc).
+    let mut prev_acc: Option<ValueId> = shape.reduction.map(|r| r.new_acc);
     for k in 1..shape.u {
         // Allocate the const(k) and the iv_k = iadd iv, k.
         let k_const_id = func.next_value_id();
@@ -1255,9 +1297,13 @@ fn do_partial_unroll(func: &mut Function, shape: PartialShape) {
             span,
         });
         // Clone the body (sans iadd) substituting iv → iv_k and
-        // each inst id → fresh id.
+        // (for reductions) acc_param → prev_acc; each inst id →
+        // fresh id.
         let mut subst: HashMap<ValueId, ValueId> = HashMap::new();
         subst.insert(shape.iv_param, iv_k_id);
+        if let (Some(r), Some(prev)) = (shape.reduction, prev_acc) {
+            subst.insert(r.acc_param, prev);
+        }
         for orig in &body_inst_clone {
             let new_id = func.next_value_id();
             func.register_type(new_id, orig.ty.clone());
@@ -1269,6 +1315,11 @@ fn do_partial_unroll(func: &mut Function, shape: PartialShape) {
                 ty: orig.ty.clone(),
                 span: orig.span,
             });
+        }
+        // Walk forward the accumulator: prev_acc becomes the cloned
+        // counterpart of orig.new_acc.
+        if let Some(r) = shape.reduction {
+            prev_acc = subst.get(&r.new_acc).copied();
         }
     }
     // Finally, the new iadd: iv_next = iadd iv, U.
@@ -1292,6 +1343,17 @@ fn do_partial_unroll(func: &mut Function, shape: PartialShape) {
 
     // Swap the latch's instruction list.
     func.block_mut(shape.latch).insts = new_insts;
+
+    // For reduction loops, retarget the latch terminator's args[1]
+    // to the FINAL accumulator (after U-1 clones).
+    if let (Some(_r), Some(final_acc)) = (shape.reduction, prev_acc) {
+        let latch_blk = func.block_mut(shape.latch);
+        if let Some(Terminator::Branch(_, args)) = &mut latch_blk.terminator {
+            if args.len() == 2 {
+                args[1] = final_acc;
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
