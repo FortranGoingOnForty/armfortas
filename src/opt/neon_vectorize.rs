@@ -1155,15 +1155,26 @@ fn apply_vector_plan(func: &mut Function, shape: &CountedLoop, plan: VectorPlan)
 struct ThenBinop {
     inst_id: ValueId,
     kind: BinaryKind,
-    /// The non-load_a operand. When `other_is_load_b == false`, this is
-    /// a loop-invariant scalar to broadcast. When `other_is_load_b ==
-    /// true`, this is the second array's `then_load_b` value id (the
-    /// b-array load defined in the then_block).
+    /// When `binop_on_load_b == false`: the non-load_a operand. With
+    /// `other_is_load_b == false`, this is a loop-invariant scalar
+    /// to broadcast; with `other_is_load_b == true`, this is the
+    /// second array's `then_load_b` value id (the b-array load
+    /// defined in the then_block).
+    /// When `binop_on_load_b == true`: this is the loop-invariant
+    /// scalar paired with the b-array load (load_a is unused; e.g.
+    /// `c = K + d` where d is the second array).
     scalar_v: ValueId,
-    /// Whether load_a is the LHS of the binop.
+    /// Whether the "main" load is on the LHS of the binop. The main
+    /// load is load_a unless `binop_on_load_b == true`, in which
+    /// case it is load_b.
     load_on_lhs: bool,
     /// True iff the non-load_a operand is a second array load (`c = a + b`).
+    /// Always false when `binop_on_load_b == true`.
     other_is_load_b: bool,
+    /// True iff the binop's main load is load_b (`c = K + d` where d
+    /// is the second array). When false, the main load is load_a
+    /// (current default — `c = a + K` or `c = a + b`).
+    binop_on_load_b: bool,
 }
 
 /// Vectorizable WHERE-block plan: one conditional store guarded by
@@ -1408,20 +1419,34 @@ fn build_where_plan(func: &Function, shape: &WhereLoop) -> Option<WherePlan> {
                     InstKind::FDiv(..) => BinaryKind::Div,
                     _ => unreachable!(),
                 };
-                let (load_on_lhs, scalar_v) = if is_load_alias(l) {
-                    (true, r)
+                // Three accepted shapes:
+                //   (i)  binop(load_a, scalar)  — current default
+                //   (ii) binop(load_a, load_b)  — array+array body
+                //   (iii) binop(load_b, scalar) — `c = K + d` where d
+                //         is a second array (load_a only feeds cmp).
+                let (load_on_lhs, scalar_v, binop_on_load_b) = if is_load_alias(l) {
+                    (true, r, false)
                 } else if is_load_alias(r) {
-                    (false, l)
+                    (false, l, false)
+                } else if is_load_b(l) {
+                    (true, r, true)
+                } else if is_load_b(r) {
+                    (false, l, true)
                 } else {
                     return None;
                 };
-                let other_is_load_b = is_load_b(scalar_v);
+                let other_is_load_b = if binop_on_load_b {
+                    false
+                } else {
+                    is_load_b(scalar_v)
+                };
                 then_binop = Some(ThenBinop {
                     inst_id: inst.id,
                     kind,
                     scalar_v,
                     load_on_lhs,
                     other_is_load_b,
+                    binop_on_load_b,
                 });
             }
             InstKind::Store(v, p) => {
@@ -1463,8 +1488,10 @@ fn build_where_plan(func: &Function, shape: &WhereLoop) -> Option<WherePlan> {
         // (validated below alongside src/dest type match).
         then_const = Some(store_value);
     }
-    // For binop: when not array+array, scalar operand must be loop-
-    // invariant (not defined in body, then, or incr). FDiv is float-only.
+    // For binop: scalar operand must be loop-invariant (not defined
+    // in body, then, or incr). The `other_is_load_b == true` case
+    // (a + b) doesn't have a scalar; everything else does. FDiv is
+    // float-only.
     if let Some(b) = then_binop {
         if !b.other_is_load_b
             && (body_ids.contains(&b.scalar_v)
@@ -1664,12 +1691,15 @@ fn build_where_plan(func: &Function, shape: &WhereLoop) -> Option<WherePlan> {
     } else {
         (None, None, None, None)
     };
-    // If the binop's other operand is a b-array load, OR the unary
-    // is applied to a b-array load, validate that b's access shape
-    // covers the same span and elem type.
+    // If the binop's other operand is a b-array load, OR the binop's
+    // main load is on b, OR the unary is applied to a b-array load,
+    // validate that b's access shape covers the same span and elem
+    // type.
     let unary_on_b = then_unary.map(|(_, _, on_b)| on_b).unwrap_or(false);
-    let binop_on_b = then_binop.map(|b| b.other_is_load_b).unwrap_or(false);
-    let b_ptr_id = if unary_on_b || binop_on_b {
+    let binop_on_b_pair = then_binop
+        .map(|b| b.other_is_load_b || b.binop_on_load_b)
+        .unwrap_or(false);
+    let b_ptr_id = if unary_on_b || binop_on_b_pair {
         let (_b_load_id, b_ptr) = then_load_b?;
         let b_access = classify_array_access(func, b_ptr, shape.iv_param)?;
         let b_upper = b_access
@@ -1933,6 +1963,22 @@ fn apply_where_plan(func: &mut Function, shape: &WhereLoop, plan: WherePlan) {
         });
         vu_id
     } else if let Some(b) = plan.then_binop {
+        // The "main load" is load_a unless `binop_on_load_b == true`,
+        // in which case it's a fresh VLoad on b_ptr.
+        let main_load_id = if b.binop_on_load_b {
+            let b_ptr = plan.b_ptr_id.expect("binop_on_load_b must have b_ptr_id");
+            let vload_b_id = func.next_value_id();
+            func.register_type(vload_b_id, v_ty.clone());
+            new_insts.push(Inst {
+                id: vload_b_id,
+                kind: InstKind::VLoad(b_ptr),
+                ty: v_ty.clone(),
+                span,
+            });
+            vload_b_id
+        } else {
+            plan.load_a_id
+        };
         // Other operand: either a vload on the b-array's ptr (array+
         // array body) or a vbroadcast of a loop-invariant scalar.
         let other_v = if b.other_is_load_b {
@@ -1964,9 +2010,9 @@ fn apply_where_plan(func: &mut Function, shape: &WhereLoop, plan: WherePlan) {
         };
         // Compute the binop in body block, in original operand order.
         let (l_id, r_id) = if b.load_on_lhs {
-            (plan.load_a_id, other_v)
+            (main_load_id, other_v)
         } else {
-            (other_v, plan.load_a_id)
+            (other_v, main_load_id)
         };
         let vbin_id = func.next_value_id();
         func.register_type(vbin_id, v_ty.clone());
