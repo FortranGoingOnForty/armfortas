@@ -8721,8 +8721,20 @@ pub(super) fn resolve_bound_proc_actuals<'a>(
             _ => None,
         })
         .collect();
+    let actual_ranks: Vec<Option<usize>> = args
+        .iter()
+        .map(|arg| match &arg.value {
+            crate::ast::expr::SectionSubscript::Element(expr) => {
+                actual_expr_rank(expr, locals, st)
+            }
+            _ => None,
+        })
+        .collect();
 
-    for bp in candidates {
+    // Pass 1: collect every candidate whose type + IR-shape match —
+    // exactly the set the original first-match-wins loop would accept.
+    let mut matched: Vec<&'a crate::sema::type_layout::BoundProc> = Vec::new();
+    for bp in &candidates {
         let Some(scope) = bound_proc_scope(st, layout, bp) else {
             continue;
         };
@@ -8766,11 +8778,76 @@ pub(super) fn resolve_bound_proc_actuals<'a>(
             formal_skip,
         );
         if semantic_match && ir_match {
+            matched.push(bp);
+        }
+    }
+
+    if matched.is_empty() {
+        return None;
+    }
+    if matched.len() == 1 {
+        return Some(matched[0]);
+    }
+
+    // Pass 2: F2008 §12.4.4.1 disambiguation. Multiple candidates
+    // passed the type+IR-shape gate (the IR-shape check over-matches
+    // when a scalar character descriptor and a rank-1 character array
+    // descriptor both peel to the same `Array(I8, _)` slot). Pick the
+    // candidate whose formal rank for every constrained actual matches
+    // exactly. If no candidate satisfies the rank constraints we fall
+    // back to the first-match-wins behaviour so legitimate elemental /
+    // assumed-rank / scalar-broadcast dispatches keep working —
+    // strictly no worse than the prior logic.
+    //
+    // Motivating repro: stdlib_stringlist_type's `prepend_carray` body
+    // calls `self%insert_at(list_head, lhs)` where `lhs` is rank-1
+    // `character(*)`. Both `insert_at_char_idx_wrap` (scalar) and
+    // `insert_at_chararray_idx_wrap` (rank-1) passed the prior gate;
+    // the first-match loop returned the scalar specific and the
+    // callee dereferenced the rank-1 descriptor's first 8 bytes as a
+    // single character pointer. Step 5 of
+    // example_stringlist_type_concatenate_operator was the visible
+    // SEGV.
+    for bp in &matched {
+        let Some(scope) = bound_proc_scope(st, layout, bp) else {
+            continue;
+        };
+        let declared_args = declared_args_for_scope(scope);
+        let formal_skip = if bp.nopass { 0 } else { 1 };
+        let rank_slots = reorder_actual_ranks_by_formal_skip(
+            args,
+            &actual_ranks,
+            &scope.arg_order,
+            formal_skip,
+        );
+        let mut all_match = true;
+        let mut any_constraint = false;
+        for (idx, declared_arg) in declared_args.iter().enumerate() {
+            if idx < formal_skip {
+                continue;
+            }
+            let Some(actual) = rank_slots.get(idx).copied().flatten() else {
+                continue;
+            };
+            any_constraint = true;
+            let formal = formal_declared_rank(declared_arg);
+            let Some(formal_rank) = formal else {
+                // Assumed-rank / class(*) — neutral, doesn't help us
+                // pick this candidate over another.
+                all_match = false;
+                break;
+            };
+            if formal_rank != actual {
+                all_match = false;
+                break;
+            }
+        }
+        if any_constraint && all_match {
             return Some(bp);
         }
     }
 
-    None
+    Some(matched[0])
 }
 
 pub(super) fn resolved_bound_proc_for_call<'a>(
