@@ -2752,6 +2752,18 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             opts,
         } => {
             let stat_addr = allocate_status_target_addr(b, ctx, opts);
+            // F2018 §9.7.1.3: stat-variable is 0 on success. Pre-zero so
+            // any item path that doesn't update stat_addr (e.g. scalar
+            // simple allocates that don't go through a runtime helper)
+            // leaves the user's stat at SUCCESS rather than the
+            // uninitialized garbage that previously surfaced as the
+            // stdlib_bitsets "allocation fault for STRING" miscall.
+            // Failing item paths still overwrite stat_addr through their
+            // runtime helpers.
+            {
+                let zero_i32 = b.const_i32(0);
+                b.store(zero_i32, stat_addr);
+            }
             let errmsg_target = allocate_errmsg_target(b, ctx, opts);
             let typed_char_len = typed_allocate_char_len(
                 b,
