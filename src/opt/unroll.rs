@@ -146,6 +146,13 @@ fn unroll_in_function(func: &mut Function) -> bool {
             changed = true;
             break;
         }
+        // Multi-block partial unroll: 3-block (or longer) linear-chain
+        // body. Allocates fresh BlockIds for each cloned iteration.
+        if let Some(shape) = detect_partial_unroll_multiblock_loop(func, nl, &preds) {
+            do_partial_unroll_multiblock(func, shape);
+            changed = true;
+            break;
+        }
     }
     changed
 }
@@ -1830,6 +1837,347 @@ fn do_partial_unroll_runtime(func: &mut Function, shape: PartialRuntimeShape) {
 }
 
 // ---------------------------------------------------------------------------
+// Multi-block partial unroll
+// ---------------------------------------------------------------------------
+//
+// `detect_partial_unroll_loop` rejects loops whose natural body has
+// more than 2 blocks (i.e., header + extra blocks + latch). At -O3
+// such shapes are rare — SCCP, jump-threading, and simplify-cfg
+// merge most linear chains — but they do arise in less-aggressively-
+// optimized IR (debug builds, certain control-flow patterns the
+// optimizer can't simplify, or third-party IR consumers). For the
+// linear-chain case we can extend the partial-unroll transform by
+// allocating fresh BlockIds for each cloned body iteration and
+// rewiring branches; the latch's iadd still bumps iv by U.
+//
+// v0 limitations:
+//  * 3-block loop only (header + body + latch). Generalizing to
+//    longer chains is mechanical (clone N-1 blocks per copy) but
+//    not yet wired up.
+//  * Static trip count (constant header bound).
+//  * Non-reduction (iv-only header).
+//  * Body's intermediate block has at most 1 store (regalloc-
+//    pressure heuristic, mirrors the 2-block path).
+
+#[derive(Debug)]
+struct PartialMultiBlockShape {
+    header: BlockId,
+    /// The body block (between header and latch). Has unconditional
+    /// br to latch.
+    body_block: BlockId,
+    latch: BlockId,
+    iv_param: ValueId,
+    iv_ty: IrType,
+    iv_init: i64,
+    iv_bound: i64,
+    iv_width: IntWidth,
+    /// Latch's `iadd iv, 1` inst id.
+    iadd_id: ValueId,
+    /// Const(1) feeding the iadd.
+    step_const_id: ValueId,
+    u: usize,
+}
+
+fn detect_partial_unroll_multiblock_loop(
+    func: &Function,
+    nl: &NaturalLoop,
+    preds: &HashMap<BlockId, Vec<BlockId>>,
+) -> Option<PartialMultiBlockShape> {
+    if nl.latches.len() != 1 || nl.body.len() != 3 {
+        return None;
+    }
+    let header = nl.header;
+    let latch = nl.latches[0];
+    if header == latch {
+        return None;
+    }
+    let hdr = func.block(header);
+    if hdr.params.len() != 1 {
+        return None;
+    }
+    let iv_param = hdr.params[0].id;
+    let iv_ty = hdr.params[0].ty.clone();
+    let iv_width = match iv_ty {
+        IrType::Int(w) => w,
+        _ => return None,
+    };
+    // Header's cmp + cond_br true→body_block, false→exit.
+    let (cond_id, body_block, exit_dest) = match &hdr.terminator {
+        Some(Terminator::CondBranch {
+            cond,
+            true_dest,
+            true_args,
+            false_dest,
+            false_args,
+        }) if true_args.is_empty() && false_args.is_empty() => (*cond, *true_dest, *false_dest),
+        _ => return None,
+    };
+    if !nl.body.contains(&body_block) || nl.body.contains(&exit_dest) || body_block == latch {
+        return None;
+    }
+    // body_block must have no params and unconditional br latch.
+    let body_blk = func.block(body_block);
+    if !body_blk.params.is_empty() {
+        return None;
+    }
+    match &body_blk.terminator {
+        Some(Terminator::Branch(d, args)) if *d == latch && args.is_empty() => {}
+        _ => return None,
+    }
+    // Header's cmp must be `icmp.le iv, const(hi)` or `icmp.lt`.
+    let cmp_inst = hdr.insts.iter().find(|i| i.id == cond_id)?;
+    let iv_bound = match cmp_inst.kind {
+        InstKind::ICmp(CmpOp::Le, lhs, rhs) if lhs == iv_param => resolve_const_int(func, rhs)?,
+        InstKind::ICmp(CmpOp::Lt, lhs, rhs) if lhs == iv_param => {
+            resolve_const_int(func, rhs)?.checked_sub(1)?
+        }
+        _ => return None,
+    };
+    // Preheader supplies iv_init.
+    let preheader = {
+        let header_preds = preds.get(&header)?;
+        let mut outside: Vec<BlockId> = header_preds
+            .iter()
+            .copied()
+            .filter(|p| !nl.body.contains(p))
+            .collect();
+        outside.sort_by_key(|b| b.0);
+        outside.dedup();
+        if outside.len() != 1 {
+            return None;
+        }
+        outside[0]
+    };
+    let ph = func.block(preheader);
+    let iv_init = match &ph.terminator {
+        Some(Terminator::Branch(d, args)) if *d == header && args.len() == 1 => {
+            resolve_const_int(func, args[0])?
+        }
+        _ => return None,
+    };
+    // Latch's terminator: iadd iv, 1; br header(iv_next).
+    let latch_blk = func.block(latch);
+    let latch_term_args = match &latch_blk.terminator {
+        Some(Terminator::Branch(d, args)) if *d == header && args.len() == 1 => args.clone(),
+        _ => return None,
+    };
+    let iv_next = latch_term_args[0];
+    let iadd_inst = latch_blk.insts.iter().find(|i| i.id == iv_next)?;
+    let (lhs, rhs) = match iadd_inst.kind {
+        InstKind::IAdd(l, r) => (l, r),
+        _ => return None,
+    };
+    let step_const_id = if lhs == iv_param {
+        rhs
+    } else if rhs == iv_param {
+        lhs
+    } else {
+        return None;
+    };
+    if resolve_const_int(func, step_const_id) != Some(1) {
+        return None;
+    }
+    let body_set: HashSet<BlockId> = nl.body.iter().copied().collect();
+    if has_escaping_values(func, latch, &body_set, preds) {
+        return None;
+    }
+    if has_escaping_values(func, body_block, &body_set, preds) {
+        return None;
+    }
+    // Trip / size gates. Use total inst count across body+latch.
+    let trip = iv_bound - iv_init + 1;
+    if trip <= FULL_UNROLL_MAX {
+        return None;
+    }
+    let body_count = func.block(body_block).insts.len();
+    let latch_count = latch_blk.insts.len();
+    let total_inst = body_count + latch_count;
+    if total_inst == 0 {
+        return None;
+    }
+    // Multi-store gate (across both blocks).
+    let store_count = func
+        .block(body_block)
+        .insts
+        .iter()
+        .chain(latch_blk.insts.iter())
+        .filter(|i| matches!(i.kind, InstKind::Store(..)))
+        .count();
+    if store_count > 1 {
+        return None;
+    }
+    let mut chosen_u: Option<usize> = None;
+    for u in (2..=PARTIAL_UNROLL_MAX_FACTOR).rev() {
+        if trip % (u as i64) != 0 {
+            continue;
+        }
+        if total_inst * u > PARTIAL_UNROLL_BODY_BUDGET {
+            continue;
+        }
+        chosen_u = Some(u);
+        break;
+    }
+    let u = chosen_u?;
+    Some(PartialMultiBlockShape {
+        header,
+        body_block,
+        latch,
+        iv_param,
+        iv_ty,
+        iv_init,
+        iv_bound,
+        iv_width,
+        iadd_id: iv_next,
+        step_const_id,
+        u,
+    })
+}
+
+fn do_partial_unroll_multiblock(func: &mut Function, shape: PartialMultiBlockShape) {
+    let span = dummy_span();
+    let int_ty = IrType::Int(shape.iv_width);
+
+    // ---- Snapshot body and latch (sans iadd) BEFORE we modify them ----
+    let body_snapshot: Vec<Inst> = func.block(shape.body_block).insts.clone();
+    let latch_snapshot_no_iadd: Vec<Inst> = func
+        .block(shape.latch)
+        .insts
+        .iter()
+        .filter(|i| i.id != shape.iadd_id)
+        .cloned()
+        .collect();
+
+    // For each clone k=1..U, allocate two fresh BlockIds (body clone +
+    // latch-work clone). They form a chain wired between the original
+    // latch's body work and the iadd. The original chain runs first;
+    // each clone follows.
+    let mut clone_blocks: Vec<(BlockId, BlockId)> = Vec::new();
+    for k in 1..shape.u {
+        let body_c = func.create_block(&format!("partial_mb_body_c{}", k));
+        let latch_c = func.create_block(&format!("partial_mb_latch_c{}", k));
+        clone_blocks.push((body_c, latch_c));
+        // Pre-fill: each clone needs (k_const, iv_k, body insts subst, br latch_c)
+        // (body insts subst, br to next clone or to original iadd block)
+        let _ = k;
+        let _ = body_c;
+        let _ = latch_c;
+    }
+
+    // ---- 1. Original body_block: keep insts; rewire terminator from
+    //         `br latch` to `br latch (with body work)` — actually the
+    //         original body still flows into the original latch's body
+    //         work, then to the first clone.
+
+    // Strategy: keep the original chain (body_block → latch) intact for
+    // the work, but split the latch by removing the iadd. The latch's
+    // body-work insts run, then we br to the first clone; the iadd
+    // moves to the LAST clone's latch_c.
+    //
+    // After this:
+    //   header → body_block (orig) → latch (orig, no iadd) → clone1.body
+    //   → clone1.latch_c → clone2.body → clone2.latch_c → ... →
+    //   cloneU-1.latch_c (with new iadd*U) → header
+    //
+    // Each clone_k computes iv_k = iv + k at the top of body_c.
+
+    // Remove the iadd from the original latch's insts.
+    {
+        let lat = func.block_mut(shape.latch);
+        lat.insts.retain(|i| i.id != shape.iadd_id);
+    }
+
+    // ---- 2. Build each clone ----
+    for (k, &(body_c, latch_c)) in clone_blocks.iter().enumerate() {
+        let k_val = (k + 1) as i64; // k=0 in Vec → iv+1
+        // body_c: iv_k_const + iv_k_iadd + cloned body insts + br latch_c
+        let mut body_c_insts: Vec<Inst> = Vec::new();
+        let k_const_id = func.next_value_id();
+        func.register_type(k_const_id, int_ty.clone());
+        let iv_k_id = func.next_value_id();
+        func.register_type(iv_k_id, int_ty.clone());
+        body_c_insts.push(Inst {
+            id: k_const_id,
+            kind: InstKind::ConstInt(k_val as i128, shape.iv_width),
+            ty: int_ty.clone(),
+            span,
+        });
+        body_c_insts.push(Inst {
+            id: iv_k_id,
+            kind: InstKind::IAdd(shape.iv_param, k_const_id),
+            ty: int_ty.clone(),
+            span,
+        });
+        let mut subst: HashMap<ValueId, ValueId> = HashMap::new();
+        subst.insert(shape.iv_param, iv_k_id);
+        for orig in &body_snapshot {
+            let new_id = func.next_value_id();
+            func.register_type(new_id, orig.ty.clone());
+            subst.insert(orig.id, new_id);
+            let new_kind = remap_kind(&orig.kind, &subst);
+            body_c_insts.push(Inst {
+                id: new_id,
+                kind: new_kind,
+                ty: orig.ty.clone(),
+                span: orig.span,
+            });
+        }
+        func.block_mut(body_c).insts = body_c_insts;
+        func.block_mut(body_c).terminator = Some(Terminator::Branch(latch_c, vec![]));
+
+        // latch_c: cloned latch-body insts (sans iadd) with same subst.
+        let mut latch_c_insts: Vec<Inst> = Vec::new();
+        for orig in &latch_snapshot_no_iadd {
+            let new_id = func.next_value_id();
+            func.register_type(new_id, orig.ty.clone());
+            subst.insert(orig.id, new_id);
+            let new_kind = remap_kind(&orig.kind, &subst);
+            latch_c_insts.push(Inst {
+                id: new_id,
+                kind: new_kind,
+                ty: orig.ty.clone(),
+                span: orig.span,
+            });
+        }
+        func.block_mut(latch_c).insts = latch_c_insts;
+        // Terminator: chain to next clone, or for the LAST clone,
+        // emit the new iadd*U + br header.
+        if k + 1 < clone_blocks.len() {
+            let next_body = clone_blocks[k + 1].0;
+            func.block_mut(latch_c).terminator = Some(Terminator::Branch(next_body, vec![]));
+        } else {
+            // Last clone: append the new iadd and branch to header.
+            let new_step_const = func.next_value_id();
+            func.register_type(new_step_const, int_ty.clone());
+            func.block_mut(latch_c).insts.push(Inst {
+                id: new_step_const,
+                kind: InstKind::ConstInt(shape.u as i128, shape.iv_width),
+                ty: int_ty.clone(),
+                span,
+            });
+            // Reuse the original iadd id so anything referencing it
+            // (e.g., dominance maps) stays consistent.
+            func.block_mut(latch_c).insts.push(Inst {
+                id: shape.iadd_id,
+                kind: InstKind::IAdd(shape.iv_param, new_step_const),
+                ty: int_ty.clone(),
+                span,
+            });
+            func.block_mut(latch_c).terminator =
+                Some(Terminator::Branch(shape.header, vec![shape.iadd_id]));
+        }
+    }
+
+    // ---- 3. Rewire the original latch's terminator to flow into the
+    //         first clone (or directly to header if U == 2 and we
+    //         skipped clones — shouldn't happen since min U=2 means
+    //         exactly 1 clone).
+    if let Some(&(first_clone_body, _)) = clone_blocks.first() {
+        func.block_mut(shape.latch).terminator =
+            Some(Terminator::Branch(first_clone_body, vec![]));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
 
@@ -2051,6 +2399,149 @@ mod tests {
 
         m.add_function(f);
         m
+    }
+
+    /// Build a 3-block counted loop: header + body_block (unconditional
+    /// br to latch) + latch (with iadd + br header). Trip is statically
+    /// known (`hi`); body_block stores `42` to a local alloca.
+    fn build_3block_counted_loop(lo: i64, hi: i64) -> Module {
+        let mut m = Module::new("test".into());
+        let mut f = Function::new("loop_3block".into(), vec![], IrType::Void);
+
+        let header_id = f.create_block("do_check");
+        let body_id = f.create_block("do_body_inner");
+        let latch_id = f.create_block("do_body");
+        let exit_id = f.create_block("exit");
+        let entry_id = f.entry;
+
+        // ---- preheader ----
+        let lo_val = f.next_value_id();
+        f.block_mut(entry_id).insts.push(Inst {
+            id: lo_val,
+            ty: IrType::Int(IntWidth::I64),
+            span: span(),
+            kind: InstKind::ConstInt(lo as i128, IntWidth::I64),
+        });
+        let alloca_val = f.next_value_id();
+        f.block_mut(entry_id).insts.push(Inst {
+            id: alloca_val,
+            ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I64))),
+            span: span(),
+            kind: InstKind::Alloca(IrType::Int(IntWidth::I64)),
+        });
+        f.block_mut(entry_id).terminator = Some(Terminator::Branch(header_id, vec![lo_val]));
+
+        // ---- header(iv) ----
+        let iv_param = f.next_value_id();
+        f.block_mut(header_id).params.push(BlockParam {
+            id: iv_param,
+            ty: IrType::Int(IntWidth::I64),
+        });
+        let hi_val = f.next_value_id();
+        f.block_mut(header_id).insts.push(Inst {
+            id: hi_val,
+            ty: IrType::Int(IntWidth::I64),
+            span: span(),
+            kind: InstKind::ConstInt(hi as i128, IntWidth::I64),
+        });
+        let cmp_val = f.next_value_id();
+        f.block_mut(header_id).insts.push(Inst {
+            id: cmp_val,
+            ty: IrType::Bool,
+            span: span(),
+            kind: InstKind::ICmp(CmpOp::Le, iv_param, hi_val),
+        });
+        f.block_mut(header_id).terminator = Some(Terminator::CondBranch {
+            cond: cmp_val,
+            true_dest: body_id,
+            true_args: vec![],
+            false_dest: exit_id,
+            false_args: vec![],
+        });
+
+        // ---- body block (one store, br latch) ----
+        let const_v = f.next_value_id();
+        f.block_mut(body_id).insts.push(Inst {
+            id: const_v,
+            ty: IrType::Int(IntWidth::I64),
+            span: span(),
+            kind: InstKind::ConstInt(42, IntWidth::I64),
+        });
+        let store_id = f.next_value_id();
+        f.block_mut(body_id).insts.push(Inst {
+            id: store_id,
+            ty: IrType::Void,
+            span: span(),
+            kind: InstKind::Store(const_v, alloca_val),
+        });
+        f.block_mut(body_id).terminator = Some(Terminator::Branch(latch_id, vec![]));
+
+        // ---- latch (iadd iv,1; br header) ----
+        let one_val = f.next_value_id();
+        f.block_mut(latch_id).insts.push(Inst {
+            id: one_val,
+            ty: IrType::Int(IntWidth::I64),
+            span: span(),
+            kind: InstKind::ConstInt(1, IntWidth::I64),
+        });
+        let iv_next = f.next_value_id();
+        f.block_mut(latch_id).insts.push(Inst {
+            id: iv_next,
+            ty: IrType::Int(IntWidth::I64),
+            span: span(),
+            kind: InstKind::IAdd(iv_param, one_val),
+        });
+        f.block_mut(latch_id).terminator = Some(Terminator::Branch(header_id, vec![iv_next]));
+
+        // ---- exit ----
+        f.block_mut(exit_id).terminator = Some(Terminator::Return(None));
+
+        m.add_function(f);
+        m
+    }
+
+    #[test]
+    fn partial_unrolls_3block_loop_trip16() {
+        // Trip 16 > FULL_UNROLL_MAX=8. Multi-block detector should pick
+        // the largest U that divides 16 and fits the body budget; with
+        // a small body this is U=4. The transform allocates 3 fresh
+        // BlockIds per clone (body_c + latch_c) and wires them between
+        // the original latch and the header.
+        let mut m = build_3block_counted_loop(1, 16);
+        let blocks_before = m.functions[0].blocks.len();
+        let pass = LoopUnroll;
+        let changed = pass.run(&mut m);
+        assert!(
+            changed,
+            "3-block trip-16 loop should multi-block partial-unroll"
+        );
+        let f = &m.functions[0];
+        // For U=4, we add (U-1) * 2 = 6 new blocks (body_c + latch_c per clone).
+        assert_eq!(
+            f.blocks.len(),
+            blocks_before + 6,
+            "expected 6 new clone blocks; got {} → {}",
+            blocks_before,
+            f.blocks.len()
+        );
+        // The original latch lost its iadd; the new iadd lives in the
+        // last clone's latch_c. Count IAdd instances across the function:
+        // one in the last clone's latch_c. (The original iadd id was
+        // reused there.)
+        let total_iadd = f
+            .blocks
+            .iter()
+            .flat_map(|b| b.insts.iter())
+            .filter(|i| matches!(i.kind, InstKind::IAdd(..)))
+            .count();
+        // Each clone's body_c has one iadd (computing iv_k). The final
+        // clone's latch_c also has one iadd (the loop step). With U=4:
+        // 3 body_c iadds + 1 final-step iadd = 4 total.
+        assert_eq!(
+            total_iadd, 4,
+            "expected 4 IAdds total (3 iv_k + 1 step), got {}",
+            total_iadd
+        );
     }
 
     #[test]
