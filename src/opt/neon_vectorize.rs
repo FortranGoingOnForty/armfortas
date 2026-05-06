@@ -1221,6 +1221,13 @@ struct WherePlan {
     /// (`elsewhere; c = d; end where`), this is the body-defined
     /// GEP ptr to load via VLoad for the false-mask lanes.
     else_load_ptr: Option<ValueId>,
+    /// Unary lifted from `elsewhere; b = -d` / `abs(d)` / `sqrt(d)`.
+    /// When `Some`, the apply path applies a V-unary to the
+    /// else_load_ptr's vload before feeding vselect's false arm.
+    else_unary: Option<UnaryKind>,
+    /// Binop lifted from `elsewhere; b = d + K` / `d * scale`.
+    /// `(BinaryKind, scalar_v, load_on_lhs)`.
+    else_binop: Option<(BinaryKind, ValueId, bool)>,
     /// The dest pointer GEP (computed in body block).
     dest_ptr_id: ValueId,
     /// Source array's access shape (where load_a reads from).
@@ -1485,78 +1492,161 @@ fn build_where_plan(func: &Function, shape: &WhereLoop) -> Option<WherePlan> {
     if src_access.elem_ty != dest_access.elem_ty {
         return None;
     }
-    // ELSEWHERE arm: walk the else_block (when present). Two shapes
-    // are supported:
+    // ELSEWHERE arm: walk the else_block (when present). Shapes:
     //   (a) `Store(invariant_const, dest_ptr)` — broadcast-in-preheader.
     //   (b) `Load(body_gep_ptr); Store(load_val, dest_ptr)` — VLoad
     //       on the body-defined ptr (e.g., `elsewhere; c = d`).
-    let (else_const, else_load_ptr): (Option<ValueId>, Option<ValueId>) =
-        if let Some(else_blk_id) = shape.else_block {
-            let else_blk = func.block(else_blk_id);
-            if else_blk
-                .insts
-                .iter()
-                .any(|inst| matches!(inst.kind, InstKind::Call(..) | InstKind::RuntimeCall(..)))
+    //   (c) `Load(p); FNeg/FAbs/FSqrt/INeg(load); Store(unary, dest)`.
+    //   (d) `Load(p); binop(load, K); Store(binop, dest)` where K is
+    //       loop-invariant.
+    let (else_const, else_load_ptr, else_unary, else_binop): (
+        Option<ValueId>,
+        Option<ValueId>,
+        Option<UnaryKind>,
+        Option<(BinaryKind, ValueId, bool)>,
+    ) = if let Some(else_blk_id) = shape.else_block {
+        let else_blk = func.block(else_blk_id);
+        if else_blk
+            .insts
+            .iter()
+            .any(|inst| matches!(inst.kind, InstKind::Call(..) | InstKind::RuntimeCall(..)))
+        {
+            return None;
+        }
+        let mut else_load: Option<(ValueId, ValueId)> = None;
+        let mut e_unary: Option<(ValueId, UnaryKind)> = None;
+        let mut e_binop: Option<(ValueId, BinaryKind, ValueId, bool)> = None;
+        let mut else_store: Option<(ValueId, ValueId)> = None;
+        for inst in &else_blk.insts {
+            let is_else_load = |v: ValueId| else_load.map(|(id, _)| id) == Some(v);
+            match inst.kind {
+                InstKind::Load(p) if body_gep_ids.contains(&p) => {
+                    if else_load.is_some() {
+                        return None;
+                    }
+                    else_load = Some((inst.id, p));
+                }
+                InstKind::FNeg(src) | InstKind::INeg(src) => {
+                    if e_unary.is_some() || e_binop.is_some() || !is_else_load(src) {
+                        return None;
+                    }
+                    e_unary = Some((inst.id, UnaryKind::Neg));
+                }
+                InstKind::FAbs(src) => {
+                    if e_unary.is_some() || e_binop.is_some() || !is_else_load(src) {
+                        return None;
+                    }
+                    e_unary = Some((inst.id, UnaryKind::Abs));
+                }
+                InstKind::FSqrt(src) => {
+                    if e_unary.is_some() || e_binop.is_some() || !is_else_load(src) {
+                        return None;
+                    }
+                    e_unary = Some((inst.id, UnaryKind::Sqrt));
+                }
+                InstKind::IAdd(l, r)
+                | InstKind::ISub(l, r)
+                | InstKind::IMul(l, r)
+                | InstKind::FAdd(l, r)
+                | InstKind::FSub(l, r)
+                | InstKind::FMul(l, r)
+                | InstKind::FDiv(l, r) => {
+                    if e_unary.is_some() || e_binop.is_some() {
+                        return None;
+                    }
+                    let kind = match inst.kind {
+                        InstKind::IAdd(..) | InstKind::FAdd(..) => BinaryKind::Add,
+                        InstKind::ISub(..) | InstKind::FSub(..) => BinaryKind::Sub,
+                        InstKind::IMul(..) | InstKind::FMul(..) => BinaryKind::Mul,
+                        InstKind::FDiv(..) => BinaryKind::Div,
+                        _ => unreachable!(),
+                    };
+                    let (load_on_lhs, scalar_v) = if is_else_load(l) {
+                        (true, r)
+                    } else if is_else_load(r) {
+                        (false, l)
+                    } else {
+                        return None;
+                    };
+                    e_binop = Some((inst.id, kind, scalar_v, load_on_lhs));
+                }
+                InstKind::Store(v, p) => {
+                    if else_store.is_some() {
+                        return None;
+                    }
+                    else_store = Some((v, p));
+                }
+                _ => return None,
+            }
+        }
+        let (else_v, else_p) = else_store?;
+        if else_p != store_ptr {
+            return None;
+        }
+        let else_ids: HashSet<ValueId> = else_blk.insts.iter().map(|i| i.id).collect();
+        let unary_id = e_unary.map(|(id, _)| id);
+        let binop_id = e_binop.map(|(id, _, _, _)| id);
+        // Determine the case via the store_value.
+        if let Some((load_id, load_ptr)) = else_load {
+            // Validate the load's access shape covers the full span.
+            let acc = classify_array_access(func, load_ptr, shape.iv_param)?;
+            let upper = acc
+                .lower
+                .checked_add(acc.len as i64)
+                .and_then(|v| v.checked_sub(1))?;
+            if shape.iv_init != acc.lower
+                || shape.iv_bound != upper
+                || acc.elem_ty != src_access.elem_ty
             {
                 return None;
             }
-            let mut else_load: Option<(ValueId, ValueId)> = None;
-            let mut else_store: Option<(ValueId, ValueId)> = None;
-            for inst in &else_blk.insts {
-                match inst.kind {
-                    InstKind::Load(p) if body_gep_ids.contains(&p) => {
-                        if else_load.is_some() {
-                            return None;
-                        }
-                        else_load = Some((inst.id, p));
-                    }
-                    InstKind::Store(v, p) => {
-                        if else_store.is_some() {
-                            return None;
-                        }
-                        else_store = Some((v, p));
-                    }
+            if Some(else_v) == unary_id {
+                // Case (c): unary on load.
+                let (_, kind) = e_unary.unwrap();
+                match (&src_access.elem_ty, kind) {
+                    (IrType::Float(_), UnaryKind::Neg)
+                    | (IrType::Float(_), UnaryKind::Abs)
+                    | (IrType::Float(_), UnaryKind::Sqrt)
+                    | (IrType::Int(_), UnaryKind::Neg) => {}
                     _ => return None,
                 }
-            }
-            let (else_v, else_p) = else_store?;
-            if else_p != store_ptr {
+                (None, Some(load_ptr), Some(kind), None)
+            } else if Some(else_v) == binop_id {
+                // Case (d): binop on (load, invariant_scalar).
+                let (_, kind, scalar_v, load_on_lhs) = e_binop.unwrap();
+                if body_ids.contains(&scalar_v)
+                    || then_ids.contains(&scalar_v)
+                    || else_ids.contains(&scalar_v)
+                    || incr_ids.contains(&scalar_v)
+                {
+                    return None;
+                }
+                if matches!(kind, BinaryKind::Div)
+                    && !matches!(src_access.elem_ty, IrType::Float(_))
+                {
+                    return None;
+                }
+                (None, Some(load_ptr), None, Some((kind, scalar_v, load_on_lhs)))
+            } else if else_v == load_id {
+                // Case (b): identity load.
+                (None, Some(load_ptr), None, None)
+            } else {
                 return None;
             }
-            let else_ids: HashSet<ValueId> = else_blk.insts.iter().map(|i| i.id).collect();
-            // Case (b): store value is the else-block load.
-            if let Some((load_id, load_ptr)) = else_load {
-                if else_v != load_id {
-                    return None;
-                }
-                // Validate the load's access shape covers the full
-                // array span and matches dest's elem type.
-                let acc = classify_array_access(func, load_ptr, shape.iv_param)?;
-                let upper = acc
-                    .lower
-                    .checked_add(acc.len as i64)
-                    .and_then(|v| v.checked_sub(1))?;
-                if shape.iv_init != acc.lower
-                    || shape.iv_bound != upper
-                    || acc.elem_ty != src_access.elem_ty
-                {
-                    return None;
-                }
-                (None, Some(load_ptr))
-            } else {
-                // Case (a): store value must be loop-invariant.
-                if body_ids.contains(&else_v)
-                    || then_ids.contains(&else_v)
-                    || else_ids.contains(&else_v)
-                    || incr_ids.contains(&else_v)
-                {
-                    return None;
-                }
-                (Some(else_v), None)
-            }
         } else {
-            (None, None)
-        };
+            // No load in else_block — Case (a): invariant constant.
+            if body_ids.contains(&else_v)
+                || then_ids.contains(&else_v)
+                || else_ids.contains(&else_v)
+                || incr_ids.contains(&else_v)
+            {
+                return None;
+            }
+            (Some(else_v), None, None, None)
+        }
+    } else {
+        (None, None, None, None)
+    };
     // If the binop's other operand is the b-array load, validate that
     // b's access shape covers the same span and elem type.
     let b_ptr_id = if let Some(b) = then_binop {
@@ -1608,6 +1698,8 @@ fn build_where_plan(func: &Function, shape: &WhereLoop) -> Option<WherePlan> {
         b_ptr_id,
         else_const,
         else_load_ptr,
+        else_unary,
+        else_binop,
         dest_ptr_id: store_ptr,
         src_access,
         dest_access,
@@ -1708,7 +1800,60 @@ fn apply_where_plan(func: &mut Function, shape: &WhereLoop, plan: WherePlan) {
             ty: v_ty.clone(),
             span,
         });
-        vload_else_id
+        // Apply unary or binop on the else load when present.
+        if let Some(kind) = plan.else_unary {
+            let vu_id = func.next_value_id();
+            func.register_type(vu_id, v_ty.clone());
+            let vu_kind = match kind {
+                UnaryKind::Neg => InstKind::VNeg(vload_else_id),
+                UnaryKind::Abs => InstKind::VAbs(vload_else_id),
+                UnaryKind::Sqrt => InstKind::VSqrt(vload_else_id),
+            };
+            new_insts.push(Inst {
+                id: vu_id,
+                kind: vu_kind,
+                ty: v_ty.clone(),
+                span,
+            });
+            vu_id
+        } else if let Some((kind, scalar_v, load_on_lhs)) = plan.else_binop {
+            let vk_id = func.next_value_id();
+            func.register_type(vk_id, v_ty.clone());
+            let preheader = func.block_mut(shape.preheader);
+            let pos = preheader.insts.len();
+            preheader.insts.insert(
+                pos,
+                Inst {
+                    id: vk_id,
+                    kind: InstKind::VBroadcast(scalar_v),
+                    ty: v_ty.clone(),
+                    span,
+                },
+            );
+            let (l_id, r_id) = if load_on_lhs {
+                (vload_else_id, vk_id)
+            } else {
+                (vk_id, vload_else_id)
+            };
+            let vbin_id = func.next_value_id();
+            func.register_type(vbin_id, v_ty.clone());
+            let vbin_kind = match kind {
+                BinaryKind::Add => InstKind::VAdd(l_id, r_id),
+                BinaryKind::Sub => InstKind::VSub(l_id, r_id),
+                BinaryKind::Mul => InstKind::VMul(l_id, r_id),
+                BinaryKind::Div => InstKind::VDiv(l_id, r_id),
+                BinaryKind::Min | BinaryKind::Max => InstKind::VAdd(l_id, r_id),
+            };
+            new_insts.push(Inst {
+                id: vbin_id,
+                kind: vbin_kind,
+                ty: v_ty.clone(),
+                span,
+            });
+            vbin_id
+        } else {
+            vload_else_id
+        }
     } else {
         let vload_b_id = func.next_value_id();
         func.register_type(vload_b_id, v_ty.clone());
