@@ -1047,14 +1047,14 @@ fn function_hidden_result_abi(
     HiddenResultAbi::None
 }
 
-/// Resolve the complex kind (4 → sp, 8 → dp) for a function whose
+/// Resolve the complex kind (4 = sp, 8 = dp) for a function whose
 /// result is routed through `HiddenResultAbi::ComplexBuffer`. Reads the
 /// result variable's explicit declaration first (covers the `result(r)`
-/// + `complex(dp) :: r` shape that submodule procedures use), falling
+/// plus `complex(dp) :: r` shape that submodule procedures use), falling
 /// back to the function's return-type prefix when no explicit declaration
 /// is present. Without this, a body `complex(dp) :: p` declaration with
 /// no return-type prefix silently defaulted to kind=4, sizing the hidden
-/// buffer at 8 bytes and typing the IR pointer as `Ptr<[F32 x 2]>` —
+/// buffer at 8 bytes and typing the IR pointer as `Ptr<[F32 x 2]>`;
 /// generic dispatch then rejected every `complex(dp)` formal because
 /// the result variable was misclassified as complex(sp).
 fn complex_result_kind(
@@ -14587,10 +14587,7 @@ fn assignment_expr_type_info(
                 {
                     let mut common: Option<crate::sema::symtab::TypeInfo> = None;
                     for specific in &sym.arg_names {
-                        let scope = match procedure_scope_by_name(st, specific) {
-                            Some(s) => s,
-                            None => return None,
-                        };
+                        let scope = procedure_scope_by_name(st, specific)?;
                         let arg_set: std::collections::HashSet<String> =
                             scope.arg_order.iter().map(|n| n.to_lowercase()).collect();
                         let result_ti = scope.symbols.iter().find_map(|(key, s)| {
@@ -14607,9 +14604,7 @@ fn assignment_expr_type_info(
                                 None
                             }
                         });
-                        let Some(t) = result_ti else {
-                            return None;
-                        };
+                        let t = result_ti?;
                         match &common {
                             None => common = Some(t),
                             Some(c) => {
