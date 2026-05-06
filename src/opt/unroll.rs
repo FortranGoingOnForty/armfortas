@@ -138,6 +138,14 @@ fn unroll_in_function(func: &mut Function) -> bool {
             changed = true;
             break;
         }
+        // Same shape but with a runtime (non-constant) bound — emits
+        // a head_bound computation in the preheader and a scalar
+        // remainder loop after the unrolled main loop.
+        if let Some(shape) = detect_partial_unroll_runtime_loop(func, nl, &preds) {
+            do_partial_unroll_runtime(func, shape);
+            changed = true;
+            break;
+        }
     }
     changed
 }
@@ -1367,6 +1375,226 @@ fn do_partial_unroll(func: &mut Function, shape: PartialShape) {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Runtime-trip partial unroll
+// ---------------------------------------------------------------------------
+//
+// `detect_partial_unroll_loop` requires both `iv_init` and `iv_bound`
+// to be compile-time constants. Many real Fortran loops have runtime
+// trip counts (e.g., `do i = 1, n` where `n` is a subroutine arg).
+// For those we run a U-way unrolled main loop over a head range
+// `[init, init + head_count - 1]` and then a scalar remainder loop
+// over the leftover `[init + head_count, bound]`. The head_count is
+// computed at the top of the preheader as `((bound - init + 1) / U)
+// * U` using runtime arithmetic.
+//
+// v0 limitations:
+//  * `iv_init` is still a compile-time constant.
+//  * Non-reduction only (no acc threading across remainder).
+//  * 2-block loop (header + latch).
+//  * Body has at most one store (same regalloc-pressure heuristic
+//    as the static partial unroller — see commit 1b94a26).
+
+#[derive(Debug)]
+struct PartialRuntimeShape {
+    preheader: BlockId,
+    header: BlockId,
+    latch: BlockId,
+    /// Original loop exit (cond_br false-target on the header).
+    exit: BlockId,
+    iv_param: ValueId,
+    iv_ty: IrType,
+    iv_init: i64,
+    /// Runtime SSA value of the loop bound (the rhs of `icmp.le iv, ?`
+    /// or equivalent). Must be loop-invariant.
+    iv_bound_v: ValueId,
+    iv_width: IntWidth,
+    /// Header's icmp inst id.
+    cond_id: ValueId,
+    /// Latch's `iadd iv, 1` inst id.
+    iadd_id: ValueId,
+    /// Const(1) feeding the iadd.
+    step_const_id: ValueId,
+    u: usize,
+}
+
+fn detect_partial_unroll_runtime_loop(
+    func: &Function,
+    nl: &NaturalLoop,
+    preds: &HashMap<BlockId, Vec<BlockId>>,
+) -> Option<PartialRuntimeShape> {
+    if nl.latches.len() != 1 || nl.body.len() != 2 {
+        return None;
+    }
+    let header = nl.header;
+    let latch = nl.latches[0];
+    if header == latch {
+        return None;
+    }
+    let hdr = func.block(header);
+    // v0: iv-only header (no reduction acc).
+    if hdr.params.len() != 1 {
+        return None;
+    }
+    let iv_param = hdr.params[0].id;
+    let iv_ty = hdr.params[0].ty.clone();
+    let iv_width = match iv_ty {
+        IrType::Int(w) => w,
+        _ => return None,
+    };
+    // Header's icmp pattern. Accept icmp.le or icmp.lt with the IV on
+    // the LHS; capture the rhs ValueId regardless of whether it's a
+    // const.
+    let (cond_id, true_dest, false_dest, rhs_v) = {
+        let term = hdr.terminator.as_ref()?;
+        let (cond, td, fd) = match term {
+            Terminator::CondBranch {
+                cond,
+                true_dest,
+                true_args,
+                false_dest,
+                false_args,
+            } if true_args.is_empty() && false_args.is_empty() => (*cond, *true_dest, *false_dest),
+            _ => return None,
+        };
+        let cmp = hdr.insts.iter().find(|i| i.id == cond)?;
+        let rhs = match cmp.kind {
+            InstKind::ICmp(CmpOp::Le, lhs, rhs) if lhs == iv_param => rhs,
+            InstKind::ICmp(CmpOp::Lt, lhs, rhs) if lhs == iv_param => rhs,
+            _ => return None,
+        };
+        (cond, td, fd, rhs)
+    };
+    if !nl.body.contains(&true_dest) || nl.body.contains(&false_dest) {
+        return None;
+    }
+    let exit = false_dest;
+    // The exit must take no args from the header (v0).
+    let exit_args_from_header: Option<bool> = hdr.terminator.as_ref().map(|t| {
+        if let Terminator::CondBranch { false_args, .. } = t {
+            false_args.is_empty()
+        } else {
+            false
+        }
+    });
+    if exit_args_from_header != Some(true) {
+        return None;
+    }
+    // Bound must NOT be a compile-time constant — that case is handled
+    // by the static detector. We require the bound to be loop-invariant
+    // (defined outside the loop body).
+    if resolve_const_int(func, rhs_v).is_some() {
+        return None;
+    }
+    let body_set: HashSet<BlockId> = nl.body.iter().copied().collect();
+    let bound_in_body = body_set.iter().any(|b| {
+        let blk = func.block(*b);
+        blk.params.iter().any(|p| p.id == rhs_v) || blk.insts.iter().any(|i| i.id == rhs_v)
+    });
+    if bound_in_body {
+        return None;
+    }
+    // iv_init from preheader (still requires constant init for v0).
+    let preheader = {
+        let header_preds = preds.get(&header)?;
+        let mut outside: Vec<BlockId> = header_preds
+            .iter()
+            .copied()
+            .filter(|p| !nl.body.contains(p))
+            .collect();
+        outside.sort_by_key(|b| b.0);
+        outside.dedup();
+        if outside.len() != 1 {
+            return None;
+        }
+        outside[0]
+    };
+    let ph = func.block(preheader);
+    let iv_init = match &ph.terminator {
+        Some(Terminator::Branch(d, args)) if *d == header && args.len() == 1 => {
+            resolve_const_int(func, args[0])?
+        }
+        _ => return None,
+    };
+    // Latch must end with `iadd iv, 1; br header(iv_next)`.
+    let latch_blk = func.block(latch);
+    let latch_term_args = match &latch_blk.terminator {
+        Some(Terminator::Branch(d, args)) if *d == header && args.len() == 1 => args.clone(),
+        _ => return None,
+    };
+    let iv_next = latch_term_args[0];
+    let iadd_inst = latch_blk.insts.iter().find(|i| i.id == iv_next)?;
+    let (lhs, rhs) = match iadd_inst.kind {
+        InstKind::IAdd(l, r) => (l, r),
+        _ => return None,
+    };
+    let step_const_id = if lhs == iv_param {
+        rhs
+    } else if rhs == iv_param {
+        lhs
+    } else {
+        return None;
+    };
+    if resolve_const_int(func, step_const_id) != Some(1) {
+        return None;
+    }
+    if has_escaping_values(func, latch, &body_set, preds) {
+        return None;
+    }
+    let body_inst_count = latch_blk.insts.len();
+    if body_inst_count == 0 {
+        return None;
+    }
+    // Reject calls in the latch — partial unroll across calls can be
+    // unsafe (the call may have side effects observable per-iteration).
+    if latch_blk
+        .insts
+        .iter()
+        .any(|i| matches!(i.kind, InstKind::Call(..) | InstKind::RuntimeCall(..)))
+    {
+        return None;
+    }
+    // Multi-store regalloc-pressure heuristic (mirrors the static path).
+    let store_count = latch_blk
+        .insts
+        .iter()
+        .filter(|i| matches!(i.kind, InstKind::Store(..)))
+        .count();
+    if store_count > 1 {
+        return None;
+    }
+    // Pick the largest U ≤ MAX_FACTOR within body budget. Trip not
+    // required to be divisible — we'll generate a remainder loop.
+    let mut chosen_u: Option<usize> = None;
+    for u in (2..=PARTIAL_UNROLL_MAX_FACTOR).rev() {
+        if body_inst_count * u > PARTIAL_UNROLL_BODY_BUDGET {
+            continue;
+        }
+        chosen_u = Some(u);
+        break;
+    }
+    let u = chosen_u?;
+    Some(PartialRuntimeShape {
+        preheader,
+        header,
+        latch,
+        exit,
+        iv_param,
+        iv_ty,
+        iv_init,
+        iv_bound_v: rhs_v,
+        iv_width,
+        cond_id,
+        iadd_id: iv_next,
+        step_const_id,
+        u,
+    })
+}
+
+fn do_partial_unroll_runtime(_func: &mut Function, _shape: PartialRuntimeShape) {
+    // Stub — apply path lands in a follow-up commit.
 }
 
 // ---------------------------------------------------------------------------
