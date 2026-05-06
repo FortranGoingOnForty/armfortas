@@ -18713,31 +18713,52 @@ fn lower_intrinsic_subroutine(
         }
         "random_number" => {
             let harvest = nth_arg_ref(b, ctx, args, 0);
-            let runtime = nth_arg_expr(args, 0)
-                .and_then(|expr| {
-                    generic_actual_expr_type_info(
-                        expr,
-                        &ctx.locals,
-                        ctx.st,
-                        Some(ctx.type_layouts),
-                    )
-                })
-                .map(|ty| match ty {
-                    crate::sema::symtab::TypeInfo::Real { kind: Some(kind) } if kind <= 4 => {
-                        "afs_random_number_f32"
-                    }
-                    crate::sema::symtab::TypeInfo::Real { .. }
-                    | crate::sema::symtab::TypeInfo::DoublePrecision => {
-                        "afs_random_number_f64"
-                    }
-                    _ => "afs_random_number_f64",
-                })
-                .unwrap_or("afs_random_number_f64");
-            b.call(
-                FuncRef::External(runtime.into()),
-                vec![harvest],
-                IrType::Void,
+            let kind = nth_arg_expr(args, 0).and_then(|expr| {
+                generic_actual_expr_type_info(expr, &ctx.locals, ctx.st, Some(ctx.type_layouts))
+            });
+            let is_f32 = matches!(
+                kind,
+                Some(crate::sema::symtab::TypeInfo::Real { kind: Some(k) }) if k <= 4
             );
+            // Detect array harvest: if the actual is a Name bound to an
+            // array-like local, fill every element via the array
+            // runtime variant.  Without this `random_number(A)` for
+            // `real :: A(M, N)` only fills A(1,1) and the rest is stack
+            // garbage — LAPACK on the result then SEGV's nondeterministically.
+            let array_info = nth_arg_expr(args, 0).and_then(|expr| {
+                if let Expr::Name { name } = &expr.node {
+                    ctx.locals
+                        .get(&name.to_lowercase())
+                        .filter(|info| local_is_array_like(info))
+                        .cloned()
+                } else {
+                    None
+                }
+            });
+            if let Some(info) = array_info {
+                let n = array_total_elems_value(b, &info);
+                let runtime = if is_f32 {
+                    "afs_random_number_array_f32"
+                } else {
+                    "afs_random_number_array_f64"
+                };
+                b.call(
+                    FuncRef::External(runtime.into()),
+                    vec![harvest, n],
+                    IrType::Void,
+                );
+            } else {
+                let runtime = if is_f32 {
+                    "afs_random_number_f32"
+                } else {
+                    "afs_random_number_f64"
+                };
+                b.call(
+                    FuncRef::External(runtime.into()),
+                    vec![harvest],
+                    IrType::Void,
+                );
+            }
             true
         }
         "random_seed" => {

@@ -408,6 +408,39 @@ pub extern "C" fn afs_random_number_f64(harvest: *mut f64) {
     }
 }
 
+/// RANDOM_NUMBER on an N-element f32 array: every element gets an
+/// independent draw in [0, 1).  The scalar entry only fills one slot,
+/// so the IR dispatches to this when HARVEST is an array — without it,
+/// LAPACK / QR / EIG run on uninitialized stack data and segfault
+/// nondeterministically.
+#[no_mangle]
+pub extern "C" fn afs_random_number_array_f32(harvest: *mut f32, n: i64) {
+    if harvest.is_null() || n <= 0 {
+        return;
+    }
+    for i in 0..n {
+        let x = next_random_u64();
+        let v = ((x >> 40) as f32) / (1u32 << 24) as f32;
+        unsafe {
+            *harvest.offset(i as isize) = v;
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_random_number_array_f64(harvest: *mut f64, n: i64) {
+    if harvest.is_null() || n <= 0 {
+        return;
+    }
+    for i in 0..n {
+        let x = next_random_u64();
+        let v = (x >> 11) as f64 / (1u64 << 53) as f64;
+        unsafe {
+            *harvest.offset(i as isize) = v;
+        }
+    }
+}
+
 /// RANDOM_SEED: seed the random number generator.
 #[no_mangle]
 pub extern "C" fn afs_random_seed(seed_val: i64) {
