@@ -1203,6 +1203,19 @@ fn detect_partial_unroll_loop(
     if body_inst_count == 0 {
         return None;
     }
+    // Heuristic: only partial-unroll reductions OR non-reduction
+    // loops with at most one store. Multi-store init-style loops
+    // (e.g., `a(i) = ...; b(i) = ...; c(i) = ...;`) cloned U-way
+    // create too much register pressure across the function and
+    // expose latent regalloc fragility (Sprint 18 follow-up).
+    let store_count = latch_blk
+        .insts
+        .iter()
+        .filter(|i| matches!(i.kind, InstKind::Store(..)))
+        .count();
+    if acc_param.is_none() && store_count > 1 {
+        return None;
+    }
     // Pick the largest U ≤ MAX_FACTOR that divides trip and respects
     // the body-size budget.
     let mut chosen_u: Option<usize> = None;
