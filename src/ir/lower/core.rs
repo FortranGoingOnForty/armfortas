@@ -14352,7 +14352,7 @@ pub(super) fn callee_return_ir_type(st: &SymbolTable, callee_name: &str) -> Opti
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum CharacterReturnAbi {
+pub(in crate::ir::lower) enum CharacterReturnAbi {
     HiddenDescriptor,
     BindCScalarByte,
 }
@@ -18722,7 +18722,7 @@ pub(super) fn lower_internal_read_items(
 }
 
 #[derive(Clone, Copy)]
-enum ReadMode {
+pub(in crate::ir::lower) enum ReadMode {
     Unit {
         unit: ValueId,
         iostat: ValueId,
@@ -21133,7 +21133,7 @@ pub(super) fn whole_array_named_info(
 }
 
 #[derive(Clone)]
-enum BulkArrayPlan {
+pub(in crate::ir::lower) enum BulkArrayPlan {
     Fill {
         kernel: &'static str,
         scalar: crate::ast::expr::SpannedExpr,
@@ -21156,7 +21156,7 @@ enum BulkArrayPlan {
 }
 
 #[derive(Clone)]
-struct IndexedArrayRef {
+pub(in crate::ir::lower) struct IndexedArrayRef {
     name: String,
     info: LocalInfo,
 }
@@ -30889,7 +30889,7 @@ pub(super) fn resolve_component_base_for_method(
     }
 }
 
-enum MethodBaseKind {
+pub(in crate::ir::lower) enum MethodBaseKind {
     Derived(String),
     PolymorphicClass(String),
 }
