@@ -1193,10 +1193,12 @@ struct WherePlan {
     /// will be dropped during rewrite.
     then_load_id: Option<ValueId>,
     /// Optional unary applied to the loaded value before storing
-    /// (`b = -a`, `b = abs(a)`, `b = sqrt(a)`). When `Some(uid, kind)`,
-    /// `uid` is the inst id in then_block and `kind` is the unary
-    /// kind to lift to a V-unary.
-    then_unary: Option<(ValueId, UnaryKind)>,
+    /// (`b = -a`, `b = abs(a)`, `b = sqrt(a)`). When `Some(uid, kind,
+    /// on_load_b)`, `uid` is the inst id in then_block, `kind` is
+    /// the unary kind, and `on_load_b == true` means the unary is
+    /// applied to the second-array load (`c = -d`) rather than
+    /// load_a.
+    then_unary: Option<(ValueId, UnaryKind, bool)>,
     /// Optional binop applied to the loaded value with a loop-invariant
     /// scalar (`b = a + K`, `b = a * scale`, etc.). The `scalar_v` is
     /// the invariant operand (will be broadcast in preheader);
@@ -1324,7 +1326,10 @@ fn build_where_plan(func: &Function, shape: &WhereLoop) -> Option<WherePlan> {
     let mut store_id = None;
     let mut then_load_id = None;
     let mut then_load_b: Option<(ValueId, ValueId)> = None;
-    let mut then_unary: Option<(ValueId, UnaryKind)> = None;
+    // Unary tracking: (inst_id, kind, on_load_b). on_load_b == true
+    // means the unary is applied to the second-array load (`c = -d`)
+    // rather than load_a.
+    let mut then_unary: Option<(ValueId, UnaryKind, bool)> = None;
     let mut then_binop: Option<ThenBinop> = None;
     let mut store_value = None;
     let mut store_ptr = None;
@@ -1351,28 +1356,40 @@ fn build_where_plan(func: &Function, shape: &WhereLoop) -> Option<WherePlan> {
                 if then_unary.is_some() || then_binop.is_some() {
                     return None;
                 }
-                if !is_load_alias(src) {
+                let on_load_b = if is_load_alias(src) {
+                    false
+                } else if is_load_b(src) {
+                    true
+                } else {
                     return None;
-                }
-                then_unary = Some((inst.id, UnaryKind::Neg));
+                };
+                then_unary = Some((inst.id, UnaryKind::Neg, on_load_b));
             }
             InstKind::FAbs(src) => {
                 if then_unary.is_some() || then_binop.is_some() {
                     return None;
                 }
-                if !is_load_alias(src) {
+                let on_load_b = if is_load_alias(src) {
+                    false
+                } else if is_load_b(src) {
+                    true
+                } else {
                     return None;
-                }
-                then_unary = Some((inst.id, UnaryKind::Abs));
+                };
+                then_unary = Some((inst.id, UnaryKind::Abs, on_load_b));
             }
             InstKind::FSqrt(src) => {
                 if then_unary.is_some() || then_binop.is_some() {
                     return None;
                 }
-                if !is_load_alias(src) {
+                let on_load_b = if is_load_alias(src) {
+                    false
+                } else if is_load_b(src) {
+                    true
+                } else {
                     return None;
-                }
-                then_unary = Some((inst.id, UnaryKind::Sqrt));
+                };
+                then_unary = Some((inst.id, UnaryKind::Sqrt, on_load_b));
             }
             InstKind::IAdd(l, r)
             | InstKind::ISub(l, r)
@@ -1424,7 +1441,7 @@ fn build_where_plan(func: &Function, shape: &WhereLoop) -> Option<WherePlan> {
     // The store value must be either: load_a, the redundant then-load,
     // the then-block unary, the then-block binop, or a loop-invariant
     // scalar (typically a literal constant — `where (cond) b = K`).
-    let unary_id = then_unary.map(|(id, _)| id);
+    let unary_id = then_unary.map(|(id, _, _)| id);
     let binop_id = then_binop.map(|b| b.inst_id);
     let mut then_const: Option<ValueId> = None;
     if store_value != load_a_id
@@ -1462,7 +1479,7 @@ fn build_where_plan(func: &Function, shape: &WhereLoop) -> Option<WherePlan> {
     }
     // FSqrt is float-only; INeg is int-only. The dest elem type
     // must match.
-    if let Some((_, k)) = then_unary {
+    if let Some((_, k, _)) = then_unary {
         match (&src_access.elem_ty, k) {
             (IrType::Float(_), UnaryKind::Neg)
             | (IrType::Float(_), UnaryKind::Abs)
@@ -1647,26 +1664,25 @@ fn build_where_plan(func: &Function, shape: &WhereLoop) -> Option<WherePlan> {
     } else {
         (None, None, None, None)
     };
-    // If the binop's other operand is the b-array load, validate that
-    // b's access shape covers the same span and elem type.
-    let b_ptr_id = if let Some(b) = then_binop {
-        if b.other_is_load_b {
-            let (_b_load_id, b_ptr) = then_load_b?;
-            let b_access = classify_array_access(func, b_ptr, shape.iv_param)?;
-            let b_upper = b_access
-                .lower
-                .checked_add(b_access.len as i64)
-                .and_then(|v| v.checked_sub(1))?;
-            if shape.iv_init != b_access.lower
-                || shape.iv_bound != b_upper
-                || b_access.elem_ty != src_access.elem_ty
-            {
-                return None;
-            }
-            Some(b_ptr)
-        } else {
-            None
+    // If the binop's other operand is a b-array load, OR the unary
+    // is applied to a b-array load, validate that b's access shape
+    // covers the same span and elem type.
+    let unary_on_b = then_unary.map(|(_, _, on_b)| on_b).unwrap_or(false);
+    let binop_on_b = then_binop.map(|b| b.other_is_load_b).unwrap_or(false);
+    let b_ptr_id = if unary_on_b || binop_on_b {
+        let (_b_load_id, b_ptr) = then_load_b?;
+        let b_access = classify_array_access(func, b_ptr, shape.iv_param)?;
+        let b_upper = b_access
+            .lower
+            .checked_add(b_access.len as i64)
+            .and_then(|v| v.checked_sub(1))?;
+        if shape.iv_init != b_access.lower
+            || shape.iv_bound != b_upper
+            || b_access.elem_ty != src_access.elem_ty
+        {
+            return None;
         }
+        Some(b_ptr)
     } else {
         None
     };
@@ -1885,13 +1901,29 @@ fn apply_where_plan(func: &mut Function, shape: &WhereLoop, plan: WherePlan) {
     // emit the vector op on the vload_a value (broadcasting the
     // scalar K for the binop case) and use that as the vselect's
     // "true" arm.
-    let true_arm_id = if let Some((_then_uid, kind)) = plan.then_unary {
+    let true_arm_id = if let Some((_then_uid, kind, on_load_b)) = plan.then_unary {
+        // The source vector for the unary: load_a (default) or a
+        // VLoad on the b-array's ptr (`c = -d`).
+        let src_vec_id = if on_load_b {
+            let b_ptr = plan.b_ptr_id.expect("unary_on_load_b must have b_ptr_id");
+            let vload_b_id = func.next_value_id();
+            func.register_type(vload_b_id, v_ty.clone());
+            new_insts.push(Inst {
+                id: vload_b_id,
+                kind: InstKind::VLoad(b_ptr),
+                ty: v_ty.clone(),
+                span,
+            });
+            vload_b_id
+        } else {
+            plan.load_a_id
+        };
         let vu_id = func.next_value_id();
         func.register_type(vu_id, v_ty.clone());
         let vu_kind = match kind {
-            UnaryKind::Neg => InstKind::VNeg(plan.load_a_id),
-            UnaryKind::Abs => InstKind::VAbs(plan.load_a_id),
-            UnaryKind::Sqrt => InstKind::VSqrt(plan.load_a_id),
+            UnaryKind::Neg => InstKind::VNeg(src_vec_id),
+            UnaryKind::Abs => InstKind::VAbs(src_vec_id),
+            UnaryKind::Sqrt => InstKind::VSqrt(src_vec_id),
         };
         new_insts.push(Inst {
             id: vu_id,
