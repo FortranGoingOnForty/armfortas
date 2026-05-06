@@ -13158,6 +13158,23 @@ pub(super) fn install_assumed_shape_lower_overrides(
     type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
 ) {
     use crate::ast::decl::{ArraySpec, Attribute};
+    // Per F2018 §15.5.2.4(13), every assumed-shape dim has its own
+    // local lower bound: the declared one if specified, else 1 — the
+    // caller's bounds are NOT visible inside the procedure. We rebase
+    // the descriptor view by allocating a local 384-byte copy of the
+    // caller's descriptor and rewriting each AssumedShape dim's lower
+    // (and adjusting upper to preserve extent). base_addr / stride
+    // are preserved by the memcpy so element writes still propagate
+    // back to the caller. Skipping this rebase for `arr(:)` (because
+    // "the caller's 1 is already 1") was a longstanding bug that
+    // surfaced whenever a caller passed an array with non-1 lower
+    // (e.g. `array(-200:200)` into `pure subroutine f(x); real :: x(:)`):
+    // `lbound(x, 1)` inside f returned -200, breaking standard-conforming
+    // callees that rely on F2018's local-rebasing guarantee.
+    enum LowerTarget<'a> {
+        One,
+        Expr(&'a crate::ast::expr::SpannedExpr),
+    }
     for decl in decls {
         let Decl::TypeDecl {
             attrs, entities, ..
@@ -13172,6 +13189,26 @@ pub(super) fn install_assumed_shape_lower_overrides(
                 None
             }
         });
+        // Allocatable / pointer dummies are deferred-shape, not
+        // assumed-shape: their bounds come from the caller's
+        // ALLOCATE (or pointer assignment), and reallocations
+        // performed by the callee must propagate back. A local
+        // descriptor copy would prevent that propagation. F2018
+        // §15.5.2.5 / §15.5.2.6 are the relevant clauses.
+        let entity_is_allocatable_or_pointer = attrs
+            .iter()
+            .any(|a| matches!(a, Attribute::Allocatable | Attribute::Pointer));
+        // Optional dummies receive a null descriptor pointer when
+        // the actual is absent (F2018 §15.5.2.12). The unconditional
+        // load + memcpy from that pointer would fault — guard with a
+        // runtime null check so absent optionals fall through to the
+        // procedure body unchanged (`present()` still detects null
+        // because we only redirect `info.addr` to the local copy on
+        // the present path; the original null stays in the slot when
+        // absent).
+        let entity_is_optional = attrs
+            .iter()
+            .any(|a| matches!(a, Attribute::Optional));
         for entity in entities {
             let key = entity.name.to_lowercase();
             let Some(info) = locals.get(&key) else {
@@ -13180,32 +13217,40 @@ pub(super) fn install_assumed_shape_lower_overrides(
             if !info.by_ref || !info.descriptor_arg {
                 continue;
             }
+            if entity_is_allocatable_or_pointer || info.is_pointer {
+                continue;
+            }
             let Some(specs) = entity.array_spec.as_ref().or(attr_dims) else {
                 continue;
             };
 
-            // Per-dim: Some(expr) when this dim's declared lower bound is
-            // an explicit non-default (i.e. not literal 1) assumed-shape lower.
-            // Other shapes (Explicit, Deferred, AssumedSize, AssumedRank) take
-            // their lower from info.dims / static path and don't need patching.
-            let mut overrides: Vec<Option<&crate::ast::expr::SpannedExpr>> =
-                Vec::with_capacity(specs.len());
+            // Per-dim target lower:
+            //   - AssumedShape{lower: Some(e)} with e != 1 → rebase to expr
+            //   - AssumedShape{lower: None}                → rebase to 1
+            //   - AssumedShape{lower: Some(e)} with e == 1 → rebase to 1
+            //     (no-op for callers who already pass 1, but corrects
+            //      callers who pass `arr(-200:200)` through `arr(:)`)
+            //   - Other shapes (Explicit, Deferred, AssumedSize,
+            //     AssumedRank) take their lower from info.dims / static
+            //     path and don't need patching.
+            let mut overrides: Vec<Option<LowerTarget>> = Vec::with_capacity(specs.len());
             let mut any = false;
             for spec in specs.iter() {
-                let lower_expr = match spec {
-                    ArraySpec::AssumedShape { lower: Some(e) } => Some(e),
+                let target = match spec {
+                    ArraySpec::AssumedShape { lower: Some(e) } => {
+                        match eval_const_scalar(e, visible_param_consts) {
+                            Some(ConstScalar::Int(1)) => Some(LowerTarget::One),
+                            _ => Some(LowerTarget::Expr(e)),
+                        }
+                    }
+                    ArraySpec::AssumedShape { lower: None } => Some(LowerTarget::One),
+                    ArraySpec::Deferred => Some(LowerTarget::One),
                     _ => None,
                 };
-                let non_default = lower_expr.and_then(|e| {
-                    match eval_const_scalar(e, visible_param_consts) {
-                        Some(ConstScalar::Int(1)) => None,
-                        _ => Some(e),
-                    }
-                });
-                if non_default.is_some() {
+                if target.is_some() {
                     any = true;
                 }
-                overrides.push(non_default);
+                overrides.push(target);
             }
             if !any {
                 continue;
@@ -13217,26 +13262,50 @@ pub(super) fn install_assumed_shape_lower_overrides(
                 Box::new(IrType::Int(IntWidth::I8)),
                 384,
             ));
+
+            // For optional dummies, the actual may be absent — caller
+            // passes a null descriptor pointer in that case. Guard the
+            // memcpy + rewrite with a runtime null check; on the absent
+            // path we leave `slot` holding the original null so that
+            // `present()` and downstream null-checks behave unchanged.
+            let rebase_done_bb = if entity_is_optional {
+                let zero_i64 = b.const_i64(0);
+                let incoming_addr = b.ptr_to_int(original_desc_ptr);
+                let is_present = b.icmp(CmpOp::Ne, incoming_addr, zero_i64);
+                let bb_present = b.create_block("aslbr_present");
+                let bb_done = b.create_block("aslbr_done");
+                b.cond_branch(is_present, bb_present, vec![], bb_done, vec![]);
+                b.set_block(bb_present);
+                Some(bb_done)
+            } else {
+                None
+            };
+
             let bytes = b.const_i64(384);
             b.call(
                 FuncRef::External("memcpy".into()),
                 vec![local_desc, original_desc_ptr, bytes],
                 IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
             );
-            for (i, lower_expr) in overrides.iter().enumerate() {
-                let Some(lower_expr) = lower_expr else {
+            for (i, target) in overrides.iter().enumerate() {
+                let Some(target) = target else {
                     continue;
                 };
-                let new_lo_raw = super::expr::lower_expr_with_optional_layouts(
-                    b,
-                    locals,
-                    lower_expr,
-                    st,
-                    Some(type_layouts),
-                );
-                let new_lo_i64 = match b.func().value_type(new_lo_raw) {
-                    Some(IrType::Int(IntWidth::I64)) => new_lo_raw,
-                    _ => b.int_extend(new_lo_raw, IntWidth::I64, true),
+                let new_lo_i64 = match target {
+                    LowerTarget::One => b.const_i64(1),
+                    LowerTarget::Expr(lower_expr) => {
+                        let new_lo_raw = super::expr::lower_expr_with_optional_layouts(
+                            b,
+                            locals,
+                            lower_expr,
+                            st,
+                            Some(type_layouts),
+                        );
+                        match b.func().value_type(new_lo_raw) {
+                            Some(IrType::Int(IntWidth::I64)) => new_lo_raw,
+                            _ => b.int_extend(new_lo_raw, IntWidth::I64, true),
+                        }
+                    }
                 };
                 let dim_offset = 24i64 + (i as i64) * 24;
                 let off_lo = b.const_i64(dim_offset);
@@ -13251,6 +13320,11 @@ pub(super) fn install_assumed_shape_lower_overrides(
                 b.store(new_up, up_p);
             }
             b.store(local_desc, slot);
+
+            if let Some(done_bb) = rebase_done_bb {
+                b.branch(done_bb, vec![]);
+                b.set_block(done_bb);
+            }
         }
     }
 }
