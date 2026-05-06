@@ -393,7 +393,7 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
             u.filename.clone(),
             u.access,
             u.form.clone(),
-            u.action.clone(),
+            u.action,
             u.recl,
         )
     });
