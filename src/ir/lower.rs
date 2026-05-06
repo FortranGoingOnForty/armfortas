@@ -15559,29 +15559,17 @@ fn try_defined_assignment(
         lhs_info.addr
     };
 
-    // Only attempt overload resolution when the LHS and RHS types
-    // differ in a way the intrinsic assignment can't handle — e.g.
-    // derived-type vs scalar, derived-type with user-defined store.
-    // For strict type equality the built-in paths are correct and
-    // cheaper; defer to them.
-    let lhs_ty = lhs_info.ty.clone();
+    // The semantic_candidates filter above already proved that at
+    // least one specific in `interface assignment(=)` matches both
+    // operands by category and kind.  When semantic dispatch agrees
+    // with the user, dispatch unconditionally — the previous IR-level
+    // short-circuit accidentally fired both for `lv2 = s` (Bool LHS
+    // / Ptr(Array(I8, 16)) RHS peeled to I8 → (Bool, Int(_))) AND
+    // for stdlib_strings/path call sites where the intrinsic memcpy
+    // happened to be wrong but didn't crash.  Trust the semantic
+    // filter; drop the IR-peel gate entirely.
     let rhs_ty = b.func().value_type(rhs_val);
-    // Only short-circuit when LHS and RHS share a *semantic* type
-    // (kind-aware), not when their IR representations coincidentally
-    // peel to the same scalar.  Previously `ir_types_dispatch_equal`
-    // on `lv2 = s` (logical(int32) allocatable LHS, type(bitset_64)
-    // RHS) collapsed both to `Bool` because the descriptor's outer
-    // `Ptr(Array(I8, 16))` peeled to `I8` which `(Bool, Int(_))`
-    // accepted.  That bypassed the user-defined extract-assignment
-    // (`logint32_assign_64`) and fell into a scalar broadcast that
-    // crashed.  Defer to semantic equivalence: same TypeInfo category
-    // and (when present) matching kind.
-    if same_intrinsic_semantic_type(&lhs_semantic_ti, &rhs_semantic_ti)
-        && lhs_info.derived_type.is_none()
-    {
-        let _ = (&lhs_ty, &rhs_ty);
-        return false;
-    }
+    let _ = &lhs_info.ty;
 
     // For ASSIGNMENT(=) resolution, the conceptual argument list is
     // (lhs, rhs). The LHS is represented by its address (matching the
