@@ -8882,12 +8882,100 @@ pub(super) fn assignment_expr_type_info(
         Expr::Name { name } => lookup(name).and_then(|sym| sym.type_info.clone()),
         Expr::FunctionCall { callee, .. } => {
             if let Expr::Name { name } = &callee.node {
-                lookup(name).and_then(|sym| sym.type_info.clone())
+                let sym = lookup(name)?;
+                // F2008 §4.5.10: a structure constructor `T(...)` is a
+                // scalar of type T. The DerivedType symbol's
+                // `type_info` is None (it IS a type, not a typed
+                // entity), so use Derived(name) explicitly.
+                if matches!(sym.kind, crate::sema::symtab::SymbolKind::DerivedType) {
+                    return Some(crate::sema::symtab::TypeInfo::Derived(sym.name.clone()));
+                }
+                // F2008 §12.5.1: a generic function call resolves to
+                // one of its specifics by argument matching. The
+                // NamedInterface symbol itself has `type_info: None`,
+                // so a previous `lookup(...).type_info` returned None
+                // for any generic call (e.g. `adjustl(s)`). That made
+                // `defined_assignment_arg_semantic_match`'s
+                // permissive `None => true` branch kick in and let a
+                // wrong specific (`assign_string_char` instead of
+                // `assign_string_string`) win for `s = adjustl(s)`.
+                //
+                // Resolve generic by walking the union of all
+                // specifics' result-variable type_info. If every
+                // specific returns the same type, use that — that's
+                // sufficient for stdlib's elemental adjust/strip/trim
+                // family (one specific each) and for type-uniform
+                // generics (e.g. `len`, `len_trim`).  When specifics
+                // disagree we fall through to None so the dispatcher
+                // sees an unknown-actual and applies its existing
+                // permissive logic — strictly no worse than the prior
+                // behaviour.
+                if matches!(sym.kind, crate::sema::symtab::SymbolKind::NamedInterface)
+                    && !sym.arg_names.is_empty()
+                {
+                    let mut common: Option<crate::sema::symtab::TypeInfo> = None;
+                    for specific in &sym.arg_names {
+                        let scope = match procedure_scope_by_name(st, specific) {
+                            Some(s) => s,
+                            None => return None,
+                        };
+                        let arg_set: std::collections::HashSet<String> =
+                            scope.arg_order.iter().map(|n| n.to_lowercase()).collect();
+                        let result_ti = scope
+                            .symbols
+                            .iter()
+                            .find_map(|(key, s)| {
+                                if arg_set.contains(key) {
+                                    return None;
+                                }
+                                if matches!(
+                                    s.kind,
+                                    crate::sema::symtab::SymbolKind::Variable
+                                        | crate::sema::symtab::SymbolKind::Parameter
+                                ) {
+                                    s.type_info.clone()
+                                } else {
+                                    None
+                                }
+                            });
+                        let Some(t) = result_ti else { return None; };
+                        match &common {
+                            None => common = Some(t),
+                            Some(c) => {
+                                if !same_type_info(c, &t) {
+                                    return None;
+                                }
+                            }
+                        }
+                    }
+                    return common;
+                }
+                sym.type_info.clone()
             } else {
                 None
             }
         }
         _ => None,
+    }
+}
+
+pub(super) fn same_type_info(
+    a: &crate::sema::symtab::TypeInfo,
+    b: &crate::sema::symtab::TypeInfo,
+) -> bool {
+    use crate::sema::symtab::TypeInfo;
+    match (a, b) {
+        (TypeInfo::Derived(a), TypeInfo::Derived(b)) => a.eq_ignore_ascii_case(b),
+        (TypeInfo::Class(a), TypeInfo::Class(b)) => a.eq_ignore_ascii_case(b),
+        (TypeInfo::Character { .. }, TypeInfo::Character { .. }) => true,
+        (TypeInfo::Integer { kind: ka }, TypeInfo::Integer { kind: kb }) => ka == kb,
+        (TypeInfo::Real { kind: ka }, TypeInfo::Real { kind: kb }) => ka == kb,
+        (TypeInfo::Complex { kind: ka }, TypeInfo::Complex { kind: kb }) => ka == kb,
+        (TypeInfo::Logical { kind: ka }, TypeInfo::Logical { kind: kb }) => ka == kb,
+        (TypeInfo::DoublePrecision, TypeInfo::DoublePrecision) => true,
+        (TypeInfo::ClassStar, TypeInfo::ClassStar) => true,
+        (TypeInfo::TypeStar, TypeInfo::TypeStar) => true,
+        _ => false,
     }
 }
 
@@ -9991,7 +10079,69 @@ pub(super) fn try_defined_assignment(
     } else {
         rhs_val
     };
-    b.call(func_ref, vec![lhs_val, rhs_for_call], IrType::Void);
+    // F2018 §15.5.2.4: a `character(len=*)` dummy carries a hidden
+    // length argument the caller must supply. The general call path
+    // (search `char_len_star_params` in this file) appends one i64
+    // per flagged position. Defined-assignment lowering used to skip
+    // this step entirely, so a callee declared
+    // `subroutine assign_t(lhs, rhs)` with `rhs: character(*)`
+    // received a stack slot for the hidden length filled with garbage
+    // (or zero) — every `lhs%raw = rhs` inside the routine then
+    // allocated a 0-length deferred char and the visible result was
+    // an empty string with `len(lhs%raw) == 0`. The motivating repro
+    // was stdlib_string_type's `s = "Hello"`: defined assignment via
+    // `assign_string_char` saw `len(rhs) == 0`, leaving every
+    // string_type initialized empty regardless of the literal source.
+    //
+    // For the data pointer itself, char(*) actuals additionally need
+    // a fresh by-ref slot (the callee prologue does
+    // `b.store(pid, slot)` and reads through that slot), so we route
+    // the RHS through `lower_char_arg_by_ref` when the formal is
+    // character(len=*). Passing the const_string pointer directly
+    // bypasses the slot indirection and the callee's first load of
+    // the slot returns the literal byte pattern instead of the real
+    // data address.
+    let mask = cached_param_mask_for_lookup(ctx.st, ctx.char_len_star_params, &rk);
+    let rhs_is_char_star = mask.as_ref().and_then(|m| m.get(1).copied()).unwrap_or(false);
+    let rhs_for_call_final = if rhs_is_char_star {
+        lower_char_arg_by_ref(
+            b,
+            &ctx.locals,
+            rhs,
+            ctx.st,
+            Some(ctx.type_layouts),
+            Some(ctx.internal_funcs),
+            Some(ctx.contained_host_refs),
+            Some(ctx.descriptor_params),
+        )
+        .unwrap_or(rhs_for_call)
+    } else {
+        rhs_for_call
+    };
+    let mut call_args = vec![lhs_val, rhs_for_call_final];
+    if let Some(flags) = mask {
+        if flags.first().copied().unwrap_or(false) {
+            // LHS at position 0 is normally the derived-type formal,
+            // but defensively forward a length when it really is char(*).
+            call_args.push(b.const_i64(0));
+        }
+        if flags.get(1).copied().unwrap_or(false) {
+            let len = actual_char_arg_runtime_len(
+                b,
+                &ctx.locals,
+                Some(&ctx.optional_locals),
+                rhs,
+                ctx.st,
+                Some(ctx.type_layouts),
+                Some(ctx.internal_funcs),
+                Some(ctx.contained_host_refs),
+                Some(ctx.descriptor_params),
+            )
+            .unwrap_or_else(|| b.const_i64(0));
+            call_args.push(len);
+        }
+    }
+    b.call(func_ref, call_args, IrType::Void);
     true
 }
 
