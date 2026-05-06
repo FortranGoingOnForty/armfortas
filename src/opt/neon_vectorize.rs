@@ -1156,6 +1156,11 @@ struct WherePlan {
     /// The redundant Load in the then_block (same ptr as load_a) —
     /// will be dropped during rewrite.
     then_load_id: Option<ValueId>,
+    /// Optional unary applied to the loaded value before storing
+    /// (`b = -a`, `b = abs(a)`, `b = sqrt(a)`). When `Some(uid, kind)`,
+    /// `uid` is the inst id in then_block and `kind` is the unary
+    /// kind to lift to a V-unary.
+    then_unary: Option<(ValueId, UnaryKind)>,
     /// The dest pointer GEP (computed in body block).
     dest_ptr_id: ValueId,
     /// Source array's access shape (where load_a reads from).
@@ -1242,9 +1247,11 @@ fn build_where_plan(func: &Function, shape: &WhereLoop) -> Option<WherePlan> {
         return None;
     }
     // Walk then-block for the store. Expect optionally a redundant
-    // Load (same ptr as load_a) and exactly one Store.
+    // Load (same ptr as load_a), optionally a unary (FNeg/FAbs/FSqrt
+    // /INeg) of the load, and exactly one Store.
     let mut store_id = None;
     let mut then_load_id = None;
+    let mut then_unary: Option<(ValueId, UnaryKind)> = None;
     let mut store_value = None;
     let mut store_ptr = None;
     for inst in &then_block.insts {
@@ -1254,6 +1261,33 @@ fn build_where_plan(func: &Function, shape: &WhereLoop) -> Option<WherePlan> {
                     return None;
                 }
                 then_load_id = Some(inst.id);
+            }
+            InstKind::FNeg(src) | InstKind::INeg(src) => {
+                if then_unary.is_some() {
+                    return None;
+                }
+                if src != load_a_id && Some(src) != then_load_id {
+                    return None;
+                }
+                then_unary = Some((inst.id, UnaryKind::Neg));
+            }
+            InstKind::FAbs(src) => {
+                if then_unary.is_some() {
+                    return None;
+                }
+                if src != load_a_id && Some(src) != then_load_id {
+                    return None;
+                }
+                then_unary = Some((inst.id, UnaryKind::Abs));
+            }
+            InstKind::FSqrt(src) => {
+                if then_unary.is_some() {
+                    return None;
+                }
+                if src != load_a_id && Some(src) != then_load_id {
+                    return None;
+                }
+                then_unary = Some((inst.id, UnaryKind::Sqrt));
             }
             InstKind::Store(v, p) => {
                 if store_id.is_some() {
@@ -1269,10 +1303,25 @@ fn build_where_plan(func: &Function, shape: &WhereLoop) -> Option<WherePlan> {
     let store_id = store_id?;
     let store_value = store_value?;
     let store_ptr = store_ptr?;
-    // The store value must be either load_a or the redundant then-load
-    // (both alias the same pointer).
-    if store_value != load_a_id && Some(store_value) != then_load_id {
+    // The store value must be either: load_a, the redundant then-load,
+    // or the then-block unary (whose source is one of those loads).
+    let unary_id = then_unary.map(|(id, _)| id);
+    if store_value != load_a_id
+        && Some(store_value) != then_load_id
+        && Some(store_value) != unary_id
+    {
         return None;
+    }
+    // FSqrt is float-only; INeg is int-only. The dest elem type
+    // must match.
+    if let Some((_, k)) = then_unary {
+        match (&src_access.elem_ty, k) {
+            (IrType::Float(_), UnaryKind::Neg)
+            | (IrType::Float(_), UnaryKind::Abs)
+            | (IrType::Float(_), UnaryKind::Sqrt)
+            | (IrType::Int(_), UnaryKind::Neg) => {}
+            _ => return None,
+        }
     }
     let dest_access = classify_array_access(func, store_ptr, shape.iv_param)?;
     // Both src and dest must cover the full array.
@@ -1317,6 +1366,7 @@ fn build_where_plan(func: &Function, shape: &WhereLoop) -> Option<WherePlan> {
         load_on_lhs,
         store_id,
         then_load_id,
+        then_unary,
         dest_ptr_id: store_ptr,
         src_access,
         dest_access,
@@ -1375,9 +1425,8 @@ fn apply_where_plan(func: &mut Function, shape: &WhereLoop, plan: WherePlan) {
     let _ = load_a_ptr;
 
     // 3. In body block, after load_a, emit:
-    //    vload_b_old, v(f|i)cmp, vselect, vstore. Drop the cmp+cond_br
-    //    by rewriting cmp to vselect-result (won't be used; but
-    //    we'll replace terminator anyway).
+    //    vload_b_old, v(f|i)cmp, optional v-unary, vselect, vstore.
+    //    The cmp+cond_br are dropped (we replace the terminator below).
     let vload_b_id = func.next_value_id();
     func.register_type(vload_b_id, v_ty.clone());
     let vcmp_id = func.next_value_id();
@@ -1387,43 +1436,62 @@ fn apply_where_plan(func: &mut Function, shape: &WhereLoop, plan: WherePlan) {
     let vstore_id = func.next_value_id();
     func.register_type(vstore_id, IrType::Void);
 
-    // Build the new instructions in order.
-    let new_insts = vec![
-        Inst {
-            id: vload_b_id,
-            kind: InstKind::VLoad(plan.dest_ptr_id),
-            ty: v_ty.clone(),
-            span,
-        },
-        Inst {
-            id: vcmp_id,
-            kind: if plan.cmp_is_float {
-                if plan.load_on_lhs {
-                    InstKind::VFCmp(plan.cmp_op, plan.load_a_id, bcast_id)
-                } else {
-                    InstKind::VFCmp(plan.cmp_op, bcast_id, plan.load_a_id)
-                }
-            } else if plan.load_on_lhs {
-                InstKind::VICmp(plan.cmp_op, plan.load_a_id, bcast_id)
+    let mut new_insts: Vec<Inst> = Vec::new();
+    new_insts.push(Inst {
+        id: vload_b_id,
+        kind: InstKind::VLoad(plan.dest_ptr_id),
+        ty: v_ty.clone(),
+        span,
+    });
+    new_insts.push(Inst {
+        id: vcmp_id,
+        kind: if plan.cmp_is_float {
+            if plan.load_on_lhs {
+                InstKind::VFCmp(plan.cmp_op, plan.load_a_id, bcast_id)
             } else {
-                InstKind::VICmp(plan.cmp_op, bcast_id, plan.load_a_id)
-            },
+                InstKind::VFCmp(plan.cmp_op, bcast_id, plan.load_a_id)
+            }
+        } else if plan.load_on_lhs {
+            InstKind::VICmp(plan.cmp_op, plan.load_a_id, bcast_id)
+        } else {
+            InstKind::VICmp(plan.cmp_op, bcast_id, plan.load_a_id)
+        },
+        ty: v_ty.clone(),
+        span,
+    });
+    // If the WHERE body computes `b = unary(a)` (e.g., `b = -a`),
+    // emit the vector unary on the vload_a value and use that as
+    // the vselect's "true" arm.
+    let true_arm_id = if let Some((_then_uid, kind)) = plan.then_unary {
+        let vu_id = func.next_value_id();
+        func.register_type(vu_id, v_ty.clone());
+        let vu_kind = match kind {
+            UnaryKind::Neg => InstKind::VNeg(plan.load_a_id),
+            UnaryKind::Abs => InstKind::VAbs(plan.load_a_id),
+            UnaryKind::Sqrt => InstKind::VSqrt(plan.load_a_id),
+        };
+        new_insts.push(Inst {
+            id: vu_id,
+            kind: vu_kind,
             ty: v_ty.clone(),
             span,
-        },
-        Inst {
-            id: vsel_id,
-            kind: InstKind::VSelect(vcmp_id, plan.load_a_id, vload_b_id),
-            ty: v_ty.clone(),
-            span,
-        },
-        Inst {
-            id: vstore_id,
-            kind: InstKind::VStore(vsel_id, plan.dest_ptr_id),
-            ty: IrType::Void,
-            span,
-        },
-    ];
+        });
+        vu_id
+    } else {
+        plan.load_a_id
+    };
+    new_insts.push(Inst {
+        id: vsel_id,
+        kind: InstKind::VSelect(vcmp_id, true_arm_id, vload_b_id),
+        ty: v_ty.clone(),
+        span,
+    });
+    new_insts.push(Inst {
+        id: vstore_id,
+        kind: InstKind::VStore(vsel_id, plan.dest_ptr_id),
+        ty: IrType::Void,
+        span,
+    });
 
     // Drop the original cmp inst from the body (it's the cond_id) —
     // it'll be dead. Drop everything *after* load_a that we don't
