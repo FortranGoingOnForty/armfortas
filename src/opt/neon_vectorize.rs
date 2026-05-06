@@ -224,6 +224,13 @@ fn vectorize_one_loop(func: &mut Function) -> bool {
                 }
             }
         }
+        // WHERE-block diamond (4-block: header / body / then / incr).
+        if let Some(shape) = detect_where_loop(func, lp, &preds) {
+            if let Some(plan) = build_where_plan(func, &shape) {
+                apply_where_plan(func, &shape, plan);
+                return true;
+            }
+        }
         // Fall back: reduction loop (one escaping accumulator).
         if let Some(plan) = detect_reduction_plan(func, lp, &preds) {
             apply_reduction_plan(func, lp, plan);
@@ -795,13 +802,47 @@ fn classify_array_access(func: &Function, ptr: ValueId, iv_param: ValueId) -> Op
     let IrType::Array(elem, len) = inner.as_ref() else {
         return None;
     };
-    let lower = normalized_index_lower(func, indices[0], iv_param)?;
+    let lower = normalized_index_lower(func, indices[0], iv_param)
+        .or_else(|| byte_stride_lower(func, indices[0], iv_param, elem.as_ref()))?;
     Some(ArrayAccess {
         base,
         elem_ty: elem.as_ref().clone(),
         len: *len,
         lower,
     })
+}
+
+/// Recognize the byte-stride form `shl(iv, log2(elem_bytes))` (with
+/// an optional `IntExtend` between iv and shl). Returns the lower
+/// bound (currently only `0`, since the matcher requires the access
+/// to start at iv_init = the array's lower bound).
+fn byte_stride_lower(
+    func: &Function,
+    value: ValueId,
+    iv_param: ValueId,
+    elem_ty: &IrType,
+) -> Option<i64> {
+    let defs = inst_map(func);
+    let inst = defs.get(&value)?;
+    let (lhs, rhs) = match inst.kind {
+        InstKind::Shl(l, r) => (l, r),
+        _ => return None,
+    };
+    let shift = resolve_const_int(func, rhs)?;
+    let bytes = elem_size_bytes(elem_ty)?;
+    if bytes <= 0 || (1i64 << shift) != bytes {
+        return None;
+    }
+    if lhs == iv_param {
+        return Some(0);
+    }
+    let inner = defs.get(&lhs)?;
+    if let InstKind::IntExtend(src, _, _) = inner.kind {
+        if src == iv_param {
+            return Some(0);
+        }
+    }
+    None
 }
 
 fn normalized_index_lower(func: &Function, value: ValueId, iv_param: ValueId) -> Option<i64> {
@@ -868,6 +909,17 @@ fn lane_count_for(elem: &IrType) -> Option<u8> {
         IrType::Int(IntWidth::I64) => Some(2),
         IrType::Float(FloatWidth::F32) => Some(4),
         IrType::Float(FloatWidth::F64) => Some(2),
+        _ => None,
+    }
+}
+
+/// Size of a scalar IR type in bytes. Only used to recognize
+/// byte-stride GEP indexing in WHERE-block lowering, where a gep
+/// index of `shl(iv, log2(elem_size))` denotes the i-th element.
+fn elem_size_bytes(elem: &IrType) -> Option<i64> {
+    match elem {
+        IrType::Int(w) => Some(w.bytes() as i64),
+        IrType::Float(w) => Some((w.bits() / 8) as i64),
         _ => None,
     }
 }
@@ -1074,6 +1126,374 @@ fn apply_vector_plan(func: &mut Function, shape: &CountedLoop, plan: VectorPlan)
     if plan.tail_count > 0 {
         if let (Some(snapshot), Some(exit_block)) = (body_snapshot, exit_block_id) {
             apply_scalar_tail_peel(func, shape, &plan, &snapshot, exit_block);
+        }
+    }
+}
+
+/// Vectorizable WHERE-block plan: one conditional store guarded by
+/// a scalar fcmp/icmp predicate. Only the simplest shape is handled
+/// for now: the store value is a load of the same pointer used in
+/// the predicate (`b(i) = a(i)` under `where (a(i) op K)`).
+#[derive(Debug, Clone)]
+struct WherePlan {
+    lanes: u8,
+    elem_ty: IrType,
+    /// The load in the body block that feeds the predicate.
+    load_a_id: ValueId,
+    /// The cmp inst id (in body block).
+    cmp_id: ValueId,
+    /// Whether the cmp is fcmp (true) or icmp (false).
+    cmp_is_float: bool,
+    /// The cmp's CmpOp.
+    cmp_op: CmpOp,
+    /// The threshold operand of the cmp (the other side, not load_a).
+    /// Must be loop-invariant.
+    threshold_v: ValueId,
+    /// Whether `load_a` is on the LHS of the cmp.
+    load_on_lhs: bool,
+    /// The conditional Store in the then_block.
+    store_id: ValueId,
+    /// The redundant Load in the then_block (same ptr as load_a) —
+    /// will be dropped during rewrite.
+    then_load_id: Option<ValueId>,
+    /// The dest pointer GEP (computed in body block).
+    dest_ptr_id: ValueId,
+    /// Source array's access shape (where load_a reads from).
+    src_access: ArrayAccess,
+    /// Destination array's access shape (where the store writes to).
+    dest_access: ArrayAccess,
+    span: crate::lexer::Span,
+}
+
+fn build_where_plan(func: &Function, shape: &WhereLoop) -> Option<WherePlan> {
+    let body_block = func.block(shape.body);
+    let then_block = func.block(shape.then_block);
+    // Reject calls in body or then.
+    if body_block
+        .insts
+        .iter()
+        .chain(then_block.insts.iter())
+        .any(|inst| matches!(inst.kind, InstKind::Call(..) | InstKind::RuntimeCall(..)))
+    {
+        return None;
+    }
+    // Find the body's cmp (terminator's cond) and its associated load_a.
+    let cond_id = match &body_block.terminator {
+        Some(Terminator::CondBranch { cond, .. }) => *cond,
+        _ => return None,
+    };
+    let cmp_inst = body_block.insts.iter().find(|i| i.id == cond_id)?;
+    let (cmp_op, lhs_v, rhs_v, cmp_is_float) = match cmp_inst.kind {
+        InstKind::FCmp(op, l, r) => (op, l, r, true),
+        InstKind::ICmp(op, l, r) => (op, l, r, false),
+        _ => return None,
+    };
+    // One of {lhs_v, rhs_v} must be a Load in body block; the other
+    // must be loop-invariant (typically a ConstFloat / ConstInt).
+    let body_loads: Vec<&Inst> = body_block
+        .insts
+        .iter()
+        .filter(|i| matches!(i.kind, InstKind::Load(_)))
+        .collect();
+    if body_loads.len() != 1 {
+        return None;
+    }
+    let load_a = body_loads[0];
+    let load_a_id = load_a.id;
+    let load_a_ptr = match load_a.kind {
+        InstKind::Load(p) => p,
+        _ => return None,
+    };
+    let (threshold_v, load_on_lhs) = if lhs_v == load_a_id {
+        (rhs_v, true)
+    } else if rhs_v == load_a_id {
+        (lhs_v, false)
+    } else {
+        return None;
+    };
+    // Threshold must be defined OUTSIDE the loop body (loop-invariant).
+    // Conservative: require it to be a Const* in the function (any block),
+    // not defined in body, then, or incr.
+    let body_ids: HashSet<ValueId> = body_block.insts.iter().map(|i| i.id).collect();
+    let then_ids: HashSet<ValueId> = then_block.insts.iter().map(|i| i.id).collect();
+    let incr_ids: HashSet<ValueId> = func
+        .block(shape.incr_block)
+        .insts
+        .iter()
+        .map(|i| i.id)
+        .collect();
+    if body_ids.contains(&threshold_v)
+        || then_ids.contains(&threshold_v)
+        || incr_ids.contains(&threshold_v)
+    {
+        return None;
+    }
+    // Source array access.
+    let src_access = classify_array_access(func, load_a_ptr, shape.iv_param)?;
+    // Find the dest pointer GEP (computed in body block) and the store.
+    // The then block has the conditional store; dest_ptr must be a
+    // GEP defined in body.
+    let body_geps: Vec<&Inst> = body_block
+        .insts
+        .iter()
+        .filter(|i| matches!(i.kind, InstKind::GetElementPtr(..)))
+        .collect();
+    if body_geps.is_empty() {
+        return None;
+    }
+    // Walk then-block for the store. Expect optionally a redundant
+    // Load (same ptr as load_a) and exactly one Store.
+    let mut store_id = None;
+    let mut then_load_id = None;
+    let mut store_value = None;
+    let mut store_ptr = None;
+    for inst in &then_block.insts {
+        match inst.kind {
+            InstKind::Load(p) if p == load_a_ptr => {
+                if then_load_id.is_some() {
+                    return None;
+                }
+                then_load_id = Some(inst.id);
+            }
+            InstKind::Store(v, p) => {
+                if store_id.is_some() {
+                    return None;
+                }
+                store_id = Some(inst.id);
+                store_value = Some(v);
+                store_ptr = Some(p);
+            }
+            _ => return None,
+        }
+    }
+    let store_id = store_id?;
+    let store_value = store_value?;
+    let store_ptr = store_ptr?;
+    // The store value must be either load_a or the redundant then-load
+    // (both alias the same pointer).
+    if store_value != load_a_id && Some(store_value) != then_load_id {
+        return None;
+    }
+    let dest_access = classify_array_access(func, store_ptr, shape.iv_param)?;
+    // Both src and dest must cover the full array.
+    let trip = shape.iv_bound.checked_sub(shape.iv_init)?.checked_add(1)?;
+    let src_upper = src_access
+        .lower
+        .checked_add(src_access.len as i64)
+        .and_then(|v| v.checked_sub(1))?;
+    let dest_upper = dest_access
+        .lower
+        .checked_add(dest_access.len as i64)
+        .and_then(|v| v.checked_sub(1))?;
+    if shape.iv_init != src_access.lower
+        || shape.iv_init != dest_access.lower
+        || shape.iv_bound != src_upper
+        || shape.iv_bound != dest_upper
+    {
+        return None;
+    }
+    if src_access.elem_ty != dest_access.elem_ty {
+        return None;
+    }
+    let elem_ty = src_access.elem_ty.clone();
+    let lanes = lane_count_for(&elem_ty)?;
+    // Skip tail for v0: require trip divisible by lanes.
+    if trip % (lanes as i64) != 0 {
+        return None;
+    }
+    // FCmp requires float dest; ICmp requires int dest.
+    match (&elem_ty, cmp_is_float) {
+        (IrType::Float(_), true) | (IrType::Int(_), false) => {}
+        _ => return None,
+    }
+    Some(WherePlan {
+        lanes,
+        elem_ty,
+        load_a_id,
+        cmp_id: cond_id,
+        cmp_is_float,
+        cmp_op,
+        threshold_v,
+        load_on_lhs,
+        store_id,
+        then_load_id,
+        dest_ptr_id: store_ptr,
+        src_access,
+        dest_access,
+        span: cmp_inst.span,
+    })
+}
+
+/// Rewrite a WHERE diamond into a vectorized straight-line body:
+///   body: vload a; vload b_old; v(f|i)cmp pred; vselect mask, va, vb_old;
+///         vstore result, b_ptr; br incr_block
+/// The original `then` block becomes unreachable.
+fn apply_where_plan(func: &mut Function, shape: &WhereLoop, plan: WherePlan) {
+    let v_ty = IrType::Vector {
+        elem: Box::new(plan.elem_ty.clone()),
+        lanes: plan.lanes,
+    };
+    let span = plan.span;
+
+    // 1. Broadcast the threshold into the preheader (it's loop-invariant,
+    //    typically a const). Use VBroadcast so vfcmp/vicmp gets a
+    //    full vector lane.
+    let bcast_id = {
+        let preheader = func.block_mut(shape.preheader);
+        let id = preheader.params.first().map(|_| ()).map_or_else(|| 0, |_| 0);
+        let _ = id;
+        let new_id = func.next_value_id();
+        func.register_type(new_id, v_ty.clone());
+        let preheader = func.block_mut(shape.preheader);
+        // Insert just before the terminator branch.
+        let pos = preheader.insts.len();
+        preheader.insts.insert(
+            pos,
+            Inst {
+                id: new_id,
+                kind: InstKind::VBroadcast(plan.threshold_v),
+                ty: v_ty.clone(),
+                span,
+            },
+        );
+        new_id
+    };
+
+    // 2. Rewrite load_a (in body) to VLoad. Type changes from elem to vector.
+    let load_a_ptr = {
+        let body = func.block_mut(shape.body);
+        let inst = body.insts.iter_mut().find(|i| i.id == plan.load_a_id).unwrap();
+        let p = match inst.kind {
+            InstKind::Load(p) => p,
+            _ => unreachable!(),
+        };
+        inst.kind = InstKind::VLoad(p);
+        inst.ty = v_ty.clone();
+        p
+    };
+    func.register_type(plan.load_a_id, v_ty.clone());
+    let _ = load_a_ptr;
+
+    // 3. In body block, after load_a, emit:
+    //    vload_b_old, v(f|i)cmp, vselect, vstore. Drop the cmp+cond_br
+    //    by rewriting cmp to vselect-result (won't be used; but
+    //    we'll replace terminator anyway).
+    let vload_b_id = func.next_value_id();
+    func.register_type(vload_b_id, v_ty.clone());
+    let vcmp_id = func.next_value_id();
+    func.register_type(vcmp_id, v_ty.clone());
+    let vsel_id = func.next_value_id();
+    func.register_type(vsel_id, v_ty.clone());
+    let vstore_id = func.next_value_id();
+    func.register_type(vstore_id, IrType::Void);
+
+    // Build the new instructions in order.
+    let new_insts = vec![
+        Inst {
+            id: vload_b_id,
+            kind: InstKind::VLoad(plan.dest_ptr_id),
+            ty: v_ty.clone(),
+            span,
+        },
+        Inst {
+            id: vcmp_id,
+            kind: if plan.cmp_is_float {
+                if plan.load_on_lhs {
+                    InstKind::VFCmp(plan.cmp_op, plan.load_a_id, bcast_id)
+                } else {
+                    InstKind::VFCmp(plan.cmp_op, bcast_id, plan.load_a_id)
+                }
+            } else if plan.load_on_lhs {
+                InstKind::VICmp(plan.cmp_op, plan.load_a_id, bcast_id)
+            } else {
+                InstKind::VICmp(plan.cmp_op, bcast_id, plan.load_a_id)
+            },
+            ty: v_ty.clone(),
+            span,
+        },
+        Inst {
+            id: vsel_id,
+            kind: InstKind::VSelect(vcmp_id, plan.load_a_id, vload_b_id),
+            ty: v_ty.clone(),
+            span,
+        },
+        Inst {
+            id: vstore_id,
+            kind: InstKind::VStore(vsel_id, plan.dest_ptr_id),
+            ty: IrType::Void,
+            span,
+        },
+    ];
+
+    // Drop the original cmp inst from the body (it's the cond_id) —
+    // it'll be dead. Drop everything *after* load_a that we don't
+    // need (the original cmp). For simplicity, walk the body, keep
+    // load_a + its dependency chain (gep ptrs), drop the cmp.
+    {
+        let body = func.block_mut(shape.body);
+        body.insts.retain(|i| i.id != plan.cmp_id);
+        // Append the new vector ops at the end of the body.
+        body.insts.extend(new_insts);
+        // Replace cond_br terminator with unconditional br to incr.
+        body.terminator = Some(Terminator::Branch(shape.incr_block, vec![]));
+    }
+
+    // 4. Drop then-block: clear its insts and make it unreachable.
+    //    prune_unreachable will remove the block after the pass.
+    {
+        let then = func.block_mut(shape.then_block);
+        then.insts.clear();
+        then.terminator = Some(Terminator::Branch(shape.incr_block, vec![]));
+    }
+
+    // 5. Update the incr block's iadd to step by `lanes` instead of 1.
+    let incr = func.block_mut(shape.incr_block);
+    let step_id = match &incr.terminator {
+        Some(Terminator::Branch(_, args)) if args.len() == 1 => args[0],
+        _ => return,
+    };
+    let iadd_inst = incr.insts.iter().find(|i| i.id == step_id).cloned();
+    let (iv_param, old_step_const, iv_int_width) = match iadd_inst {
+        Some(inst) => match inst.kind {
+            InstKind::IAdd(l, r) => {
+                let (iv, k) = if l == shape.iv_param {
+                    (l, r)
+                } else if r == shape.iv_param {
+                    (r, l)
+                } else {
+                    return;
+                };
+                let width = match inst.ty {
+                    IrType::Int(w) => w,
+                    _ => return,
+                };
+                (iv, k, width)
+            }
+            _ => return,
+        },
+        _ => return,
+    };
+    let _ = iv_param;
+    // Allocate a fresh ConstInt for the new step.
+    let new_step = func.next_value_id();
+    func.register_type(new_step, IrType::Int(iv_int_width));
+    let incr = func.block_mut(shape.incr_block);
+    incr.insts.insert(
+        0,
+        Inst {
+            id: new_step,
+            kind: InstKind::ConstInt(plan.lanes as i128, iv_int_width),
+            ty: IrType::Int(iv_int_width),
+            span,
+        },
+    );
+    if let Some(inst) = incr.insts.iter_mut().find(|i| i.id == step_id) {
+        if let InstKind::IAdd(l, r) = inst.kind {
+            if l == old_step_const {
+                inst.kind = InstKind::IAdd(new_step, r);
+            } else if r == old_step_const {
+                inst.kind = InstKind::IAdd(l, new_step);
+            }
         }
     }
 }
