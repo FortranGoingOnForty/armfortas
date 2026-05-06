@@ -401,6 +401,7 @@ pub(super) fn resolve_unit(
                         original_name: sym_name.clone(),
                         source_scope: pid,
                         is_submodule_access: true,
+                        from_bare_use: true,
                     });
                 }
             }

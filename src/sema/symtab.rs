@@ -93,9 +93,9 @@ impl SymbolTable {
             // procedure (Subroutine/Function/Program). Stop walking
             // when we leave a procedure scope.
             match self.scopes[sid].kind {
-                ScopeKind::Subroutine(_)
-                | ScopeKind::Function(_)
-                | ScopeKind::Program(_) => return None,
+                ScopeKind::Subroutine(_) | ScopeKind::Function(_) | ScopeKind::Program(_) => {
+                    return None
+                }
                 _ => cur = self.scopes[sid].parent,
             }
         }
@@ -234,7 +234,12 @@ impl SymbolTable {
                 return Some(sym);
             }
 
-            // 2. Direct USE association.
+            // 2. Direct USE association — check the source module's own
+            // symbols first, then chase through that module's USE chain
+            // for the SAME name (handles re-exports like `use
+            // stdlib_kinds, only: int32` where int32 itself is a USE-
+            // associated re-export from iso_fortran_env). Only the UA's
+            // original_name is followed, so unrelated names cannot leak.
             for assoc in &scope.use_associations {
                 if assoc.local_name == key {
                     if let Some(sym) = self.scopes[assoc.source_scope]
@@ -245,15 +250,28 @@ impl SymbolTable {
                             return Some(sym);
                         }
                     }
+                    if let Some(sym) =
+                        self.lookup_in_guarded(assoc.source_scope, &assoc.original_name, visited)
+                    {
+                        if sym.attrs.access != Access::Private || assoc.is_submodule_access {
+                            return Some(sym);
+                        }
+                    }
                 }
             }
 
             // 2b. Transitive USE: look through each USE'd module's own
             // public symbols and its transitive USE chain. Only applies
-            // to bare `USE M` (local_name == original_name); renamed
-            // USE associations are intentional restrictions.
+            // to bare `USE M` — `use M, only: x` and `use M, only: x =>
+            // y` must NOT expose other names from M, including
+            // same-named generic interfaces whose specifics would
+            // otherwise be silently merged into a user-scope generic of
+            // the same name.
             let mut seen_use_scopes = Vec::new();
             for assoc in &scope.use_associations {
+                if !assoc.from_bare_use {
+                    continue;
+                }
                 if assoc.local_name != assoc.original_name {
                     continue;
                 }
@@ -380,9 +398,7 @@ impl SymbolTable {
                     {
                         return Some(sym);
                     }
-                    if let Some(sym) =
-                        self.lookup_in(assoc.source_scope, &assoc.original_name)
-                    {
+                    if let Some(sym) = self.lookup_in(assoc.source_scope, &assoc.original_name) {
                         return Some(sym);
                     }
                 }
@@ -452,6 +468,7 @@ impl SymbolTable {
             original_name: assoc.original_name.to_ascii_lowercase(),
             source_scope: assoc.source_scope,
             is_submodule_access: assoc.is_submodule_access,
+            from_bare_use: assoc.from_bare_use,
         };
         self.scopes[self.current].use_associations.push(assoc);
     }
@@ -673,12 +690,21 @@ pub enum Intent {
 }
 
 /// USE association — links a local name to a symbol in another scope.
+///
+/// `from_bare_use` distinguishes `use M` (true — full re-export visibility,
+/// transitive lookup walks the source module's USE chain) from `use M, only:
+/// x` (false — only the explicitly named symbols are visible). Without this
+/// flag the transitive walk in `lookup_in_guarded` happily resolves any
+/// generic interface in `M` even when only an unrelated name was imported,
+/// silently merging foreign specifics into a same-named generic in the user
+/// scope.
 #[derive(Debug, Clone)]
 pub struct UseAssociation {
     pub local_name: String,
     pub original_name: String,
     pub source_scope: ScopeId,
     pub is_submodule_access: bool,
+    pub from_bare_use: bool,
 }
 
 /// Implicit typing rules for a scope.
@@ -843,6 +869,7 @@ mod tests {
             original_name: "dep_item".into(),
             source_scope: imported_scope,
             is_submodule_access: false,
+            from_bare_use: true,
         });
 
         assert!(
@@ -887,6 +914,7 @@ mod tests {
             original_name: "foo".into(),
             source_scope: mod_scope,
             is_submodule_access: false,
+            from_bare_use: true,
         });
 
         assert!(st.lookup("foo").is_some());
@@ -922,6 +950,7 @@ mod tests {
             original_name: "original_name".into(),
             source_scope: mod_scope,
             is_submodule_access: false,
+            from_bare_use: true,
         });
 
         assert!(st.lookup("local_name").is_some());
@@ -944,6 +973,7 @@ mod tests {
             original_name: "hidden".into(),
             source_scope: mod_scope,
             is_submodule_access: false,
+            from_bare_use: true,
         });
 
         assert!(st.lookup("hidden").is_none()); // private, not accessible
@@ -965,6 +995,7 @@ mod tests {
             original_name: "x".into(),
             source_scope: mod_scope,
             is_submodule_access: false,
+            from_bare_use: true,
         });
         let mut local_sym = make_symbol("x", SymbolKind::Variable);
         local_sym.type_info = Some(TypeInfo::Real { kind: None });

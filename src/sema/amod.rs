@@ -702,20 +702,14 @@ fn emit_procedure(
                             && st.scope(parent_id).parent == Some(mod_scope_id)
                 })
                 .and_then(|pscope| {
-                    let arg_set: std::collections::HashSet<String> = pscope
-                        .arg_order
-                        .iter()
-                        .map(|n| n.to_lowercase())
-                        .collect();
+                    let arg_set: std::collections::HashSet<String> =
+                        pscope.arg_order.iter().map(|n| n.to_lowercase()).collect();
                     pscope
                         .symbols
                         .iter()
                         .find(|(key, sym)| {
                             !arg_set.contains(*key)
-                                && matches!(
-                                    sym.kind,
-                                    SymbolKind::Variable | SymbolKind::Parameter
-                                )
+                                && matches!(sym.kind, SymbolKind::Variable | SymbolKind::Parameter)
                         })
                         .map(|(_, sym)| sym.attrs.array_spec.clone())
                 })
@@ -860,7 +854,10 @@ fn emit_procedure(
                         .and_then(|flags| flags.get(arg_idx))
                         .copied()
                         .unwrap_or(false)
-                    || matches!(arg_sym.type_info, Some(TypeInfo::Class(_)) | Some(TypeInfo::ClassStar));
+                    || matches!(
+                        arg_sym.type_info,
+                        Some(TypeInfo::Class(_)) | Some(TypeInfo::ClassStar)
+                    );
                 if is_descriptor_arg {
                     arg_attrs.push("descriptor");
                 }
@@ -1059,8 +1056,12 @@ fn emit_type(out: &mut String, name: &str, type_layouts: &TypeLayoutRegistry) {
                     )
                     .unwrap();
                 } else {
-                    writeln!(out, "  @binds {} => {}{}", bp.method_name, bp.target_name, abi_suffix)
-                        .unwrap();
+                    writeln!(
+                        out,
+                        "  @binds {} => {}{}",
+                        bp.method_name, bp.target_name, abi_suffix
+                    )
+                    .unwrap();
                 }
             }
         }
@@ -1681,10 +1682,7 @@ fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
             i += 1;
         }
         match split_at {
-            Some(idx) => (
-                rest[..idx].trim_end(),
-                rest[idx + 1..].trim_start(),
-            ),
+            Some(idx) => (rest[..idx].trim_end(), rest[idx + 1..].trim_start()),
             None => (rest.trim(), ""),
         }
     };
@@ -2196,11 +2194,7 @@ pub fn extract_optional_params(iface: &ModuleInterface) -> HashMap<String, Vec<b
             let key = proc.name.to_lowercase();
             out.insert(key.clone(), flags.clone());
             out.insert(
-                format!(
-                    "afs_modproc_{}_{}",
-                    iface.module_name.to_lowercase(),
-                    key
-                ),
+                format!("afs_modproc_{}_{}", iface.module_name.to_lowercase(), key),
                 flags,
             );
         }
@@ -2228,11 +2222,7 @@ pub fn extract_char_len_star_params(iface: &ModuleInterface) -> HashMap<String, 
             let key = proc.name.to_lowercase();
             out.insert(key.clone(), flags.clone());
             out.insert(
-                format!(
-                    "afs_modproc_{}_{}",
-                    iface.module_name.to_lowercase(),
-                    key
-                ),
+                format!("afs_modproc_{}_{}", iface.module_name.to_lowercase(), key),
                 flags,
             );
         }
@@ -2252,11 +2242,7 @@ pub fn extract_descriptor_params(iface: &ModuleInterface) -> HashMap<String, Vec
             let key = proc.name.to_lowercase();
             out.insert(key.clone(), flags.clone());
             out.insert(
-                format!(
-                    "afs_modproc_{}_{}",
-                    iface.module_name.to_lowercase(),
-                    key
-                ),
+                format!("afs_modproc_{}_{}", iface.module_name.to_lowercase(), key),
                 flags,
             );
         }

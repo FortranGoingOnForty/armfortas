@@ -1498,7 +1498,10 @@ fn rewrite_call_arg_copies(pending_moves: Vec<MachineInst>) -> Vec<MachineInst> 
         let scratch = scratch_phys_for(src);
         rewritten.push(MachineInst {
             opcode: move_opcode_for_phys(src),
-            operands: vec![MachineOperand::PhysReg(scratch), MachineOperand::PhysReg(src)],
+            operands: vec![
+                MachineOperand::PhysReg(scratch),
+                MachineOperand::PhysReg(src),
+            ],
             def: None,
         });
         pending[0].2 = scratch;

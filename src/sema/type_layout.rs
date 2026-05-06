@@ -136,7 +136,11 @@ fn stable_type_tag(layout: &TypeLayout) -> u64 {
         hash ^= byte as u64;
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    if hash == 0 { 1 } else { hash }
+    if hash == 0 {
+        1
+    } else {
+        hash
+    }
 }
 
 impl TypeLayoutRegistry {
@@ -334,7 +338,8 @@ fn eval_const_field_int_expr(
             eval_const_field_int_expr(inner, const_params, const_derived_field_inits)
         }
         Expr::UnaryOp { op, operand } => {
-            let value = eval_const_field_int_expr(operand, const_params, const_derived_field_inits)?;
+            let value =
+                eval_const_field_int_expr(operand, const_params, const_derived_field_inits)?;
             match op {
                 crate::ast::expr::UnaryOp::Minus => Some(-value),
                 crate::ast::expr::UnaryOp::Plus => Some(value),
@@ -371,7 +376,9 @@ fn eval_const_field_logical_expr(
                 _ => None,
             }
         }
-        Expr::ParenExpr { inner } => eval_const_field_logical_expr(inner, const_derived_field_inits),
+        Expr::ParenExpr { inner } => {
+            eval_const_field_logical_expr(inner, const_derived_field_inits)
+        }
         Expr::UnaryOp {
             op: crate::ast::expr::UnaryOp::Not,
             operand,
@@ -406,7 +413,8 @@ fn eval_const_field_char_expr(
             left,
             right,
         } => {
-            let mut out = eval_const_field_char_expr(left, const_params, const_derived_field_inits)?;
+            let mut out =
+                eval_const_field_char_expr(left, const_params, const_derived_field_inits)?;
             out.push_str(&eval_const_field_char_expr(
                 right,
                 const_params,
@@ -427,8 +435,11 @@ fn eval_const_field_char_expr(
                             None
                         }
                     })?;
-                    let code =
-                        eval_const_field_int_expr(first_arg, const_params, const_derived_field_inits)?;
+                    let code = eval_const_field_int_expr(
+                        first_arg,
+                        const_params,
+                        const_derived_field_inits,
+                    )?;
                     if !(0..=255).contains(&code) {
                         return None;
                     }
@@ -438,13 +449,21 @@ fn eval_const_field_char_expr(
                 "repeat" if args.len() == 2 => {
                     let pattern = match &args[0].value {
                         crate::ast::expr::SectionSubscript::Element(expr) => {
-                            eval_const_field_char_expr(expr, const_params, const_derived_field_inits)?
+                            eval_const_field_char_expr(
+                                expr,
+                                const_params,
+                                const_derived_field_inits,
+                            )?
                         }
                         _ => return None,
                     };
                     let copies = match &args[1].value {
                         crate::ast::expr::SectionSubscript::Element(expr) => {
-                            eval_const_field_int_expr(expr, const_params, const_derived_field_inits)?
+                            eval_const_field_int_expr(
+                                expr,
+                                const_params,
+                                const_derived_field_inits,
+                            )?
                         }
                         _ => return None,
                     };
@@ -468,17 +487,16 @@ pub fn eval_const_field_default_init_for_layout(
     const_derived_field_inits: &HashMap<String, FieldDefaultInit>,
 ) -> Option<FieldDefaultInit> {
     match type_info {
-        TypeInfo::Character { .. } => eval_const_field_char_expr(
-            expr,
-            const_params,
-            const_derived_field_inits,
-        )
-        .map(FieldDefaultInit::Character),
-        TypeInfo::Integer { .. } => eval_const_field_int_expr(expr, const_params, const_derived_field_inits)
-            .map(|value| FieldDefaultInit::Integer(value as i128)),
-        TypeInfo::Logical { .. } => {
-            eval_const_field_logical_expr(expr, const_derived_field_inits).map(FieldDefaultInit::Logical)
+        TypeInfo::Character { .. } => {
+            eval_const_field_char_expr(expr, const_params, const_derived_field_inits)
+                .map(FieldDefaultInit::Character)
         }
+        TypeInfo::Integer { .. } => {
+            eval_const_field_int_expr(expr, const_params, const_derived_field_inits)
+                .map(|value| FieldDefaultInit::Integer(value as i128))
+        }
+        TypeInfo::Logical { .. } => eval_const_field_logical_expr(expr, const_derived_field_inits)
+            .map(FieldDefaultInit::Logical),
         TypeInfo::Derived(type_name) | TypeInfo::Class(type_name) => {
             eval_const_derived_default_init(
                 type_name,
@@ -714,13 +732,10 @@ pub fn compute_layout_with_attrs(
                         && !declared_array
                     {
                         (32, 8) // StringDescriptor for deferred-length scalar char components
-                } else if is_pointer
-                    && !declared_array
-                    && !matches!(ti, TypeInfo::Class(_))
-                {
-                    (8, 8) // Scalar POINTER components are pointer slots, not descriptors
-                } else if is_allocatable || is_pointer {
-                    (384, 8) // ArrayDescriptor size for allocatable/pointer array components
+                    } else if is_pointer && !declared_array && !matches!(ti, TypeInfo::Class(_)) {
+                        (8, 8) // Scalar POINTER components are pointer slots, not descriptors
+                    } else if is_allocatable || is_pointer {
+                        (384, 8) // ArrayDescriptor size for allocatable/pointer array components
                     } else if let TypeInfo::Derived(ref dname) = ti {
                         registry
                             .get(dname)
@@ -819,11 +834,7 @@ pub fn compute_layout_with_attrs(
         // looked up `_afs_modproc_<mod>_process_get_id` — caught at
         // stdlib `example_process_5` link.
         if let Some(module_name) = host_module {
-            format!(
-                "afs_modproc_{}_{}",
-                module_name.to_lowercase(),
-                target
-            )
+            format!("afs_modproc_{}_{}", module_name.to_lowercase(), target)
         } else {
             target.to_string()
         }

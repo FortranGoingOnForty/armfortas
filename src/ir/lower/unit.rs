@@ -682,6 +682,21 @@ pub(crate) fn lower_unit(
                             .and_then(|dt_name| type_layouts.get(&dt_name).map(|layout| layout.size.max(1) as u64))
                             .unwrap_or(8)
                     }
+                    HiddenResultAbi::ComplexBuffer => {
+                        // 8 bytes for complex(sp), 16 for complex(dp).
+                        let kind = super::core::complex_result_kind(
+                            name,
+                            result,
+                            return_type.as_ref(),
+                            decls,
+                            st,
+                        );
+                        if kind == 8 {
+                            16
+                        } else {
+                            8
+                        }
+                    }
                     HiddenResultAbi::None => 0,
                 };
                 let desc_ptr_ty = IrType::Ptr(Box::new(IrType::Array(

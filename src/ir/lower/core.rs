@@ -664,6 +664,51 @@ pub(super) fn function_hidden_result_abi(
     HiddenResultAbi::None
 }
 
+/// Recover the complex kind (4 = sp, 8 = dp) declared for a function's
+/// result variable. Used by ComplexBuffer ABI to size the caller's
+/// result buffer (8 bytes for sp, 16 for dp). Falls back to sp (4) if
+/// the result variable was misclassified as complex(sp).
+pub(super) fn complex_result_kind(
+    function_name: &str,
+    result: &Option<String>,
+    return_type: Option<&TypeSpec>,
+    decls: &[crate::ast::decl::SpannedDecl],
+    st: &SymbolTable,
+) -> u8 {
+    let result_key = result
+        .as_deref()
+        .unwrap_or(function_name)
+        .to_ascii_lowercase();
+    for decl in decls {
+        let Decl::TypeDecl {
+            type_spec,
+            entities,
+            ..
+        } = &decl.node
+        else {
+            continue;
+        };
+        let matches_result = entities
+            .iter()
+            .any(|e| e.name.to_ascii_lowercase() == result_key);
+        if !matches_result {
+            continue;
+        }
+        match type_spec {
+            TypeSpec::Complex(sel) => {
+                return extract_kind_with_context(sel, 4, None, Some(st));
+            }
+            TypeSpec::DoubleComplex => return 8,
+            _ => {}
+        }
+    }
+    match return_type {
+        Some(TypeSpec::Complex(sel)) => extract_kind_with_context(sel, 4, None, Some(st)),
+        Some(TypeSpec::DoubleComplex) => 8,
+        _ => 4,
+    }
+}
+
 /// Walk a program unit and any nested `contains` to collect the
 /// names of functions whose result variable is lowered through the
 /// 384-byte array descriptor hidden-result ABI. Scalar character
@@ -29353,6 +29398,24 @@ pub(super) fn hidden_result_temp_bytes_for_callee(
                 first_procedure_lookup(abi_lookup_keys, |k| callee_return_derived_type_name(st, k))?;
             let layout = type_layouts?.get(&type_name)?;
             Some(layout.size.max(1) as u64)
+        }
+        HiddenResultAbi::ComplexBuffer => {
+            // Look up the callee's symbol to determine the complex kind
+            // (sp → 8 bytes, dp → 16 bytes). Defaults to sp (8) if the
+            // symbol can't be resolved — same fallback DerivedAggregate
+            // uses for missing layouts.
+            use crate::sema::symtab::TypeInfo;
+            let kind_bytes = abi_lookup_keys
+                .iter()
+                .find_map(|k| {
+                    let sym = st.find_symbol_any_scope(&k.to_lowercase())?;
+                    match sym.type_info.as_ref()? {
+                        TypeInfo::Complex { kind } => Some(kind.unwrap_or(4) as u64 * 2),
+                        _ => None,
+                    }
+                })
+                .unwrap_or(8);
+            Some(kind_bytes)
         }
     }
 }

@@ -50,6 +50,7 @@ pub(super) fn process_uses(
                                     original_name: name.clone(),
                                     source_scope: mod_scope,
                                     is_submodule_access: false,
+                                    from_bare_use: false,
                                 });
                             }
                             OnlyItem::Generic(name) => {
@@ -58,6 +59,7 @@ pub(super) fn process_uses(
                                     original_name: name.clone(),
                                     source_scope: mod_scope,
                                     is_submodule_access: false,
+                                    from_bare_use: false,
                                 });
                             }
                             OnlyItem::Rename(rename) => {
@@ -66,6 +68,7 @@ pub(super) fn process_uses(
                                     original_name: rename.remote.clone(),
                                     source_scope: mod_scope,
                                     is_submodule_access: false,
+                                    from_bare_use: false,
                                 });
                             }
                         }
@@ -85,15 +88,19 @@ pub(super) fn process_uses(
                             original_name: name.clone(),
                             source_scope: mod_scope,
                             is_submodule_access: false,
+                            from_bare_use: true,
                         });
                     }
-                    // Apply renames.
+                    // Apply renames. Renames inside a bare USE rebind a
+                    // single name; the name itself is no longer bare so
+                    // it doesn't extend transitive lookup.
                     for rename in renames {
                         st.add_use_association(UseAssociation {
                             local_name: rename.local.clone(),
                             original_name: rename.remote.clone(),
                             source_scope: mod_scope,
                             is_submodule_access: false,
+                            from_bare_use: false,
                         });
                     }
                 }
@@ -275,6 +282,7 @@ pub(super) fn load_external_module(
                     original_name: name,
                     source_scope: dep_scope,
                     is_submodule_access: false,
+                    from_bare_use: true,
                 });
             }
         }
@@ -299,6 +307,7 @@ pub(super) fn load_external_module(
             original_name: rename.original.clone(),
             source_scope: src_scope,
             is_submodule_access: false,
+            from_bare_use: false,
         });
     }
 

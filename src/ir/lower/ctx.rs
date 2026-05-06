@@ -120,6 +120,15 @@ pub(super) enum HiddenResultAbi {
     ArrayDescriptor,
     StringDescriptor,
     DerivedAggregate,
+    /// Complex scalar function result. Caller allocates an 8-byte
+    /// (real(sp)) or 16-byte (real(dp)) buffer, passes its address as
+    /// the hidden first param; callee writes the two float lanes
+    /// through that pointer and returns void. Without this, the
+    /// IR-level return type was `[Float x 2]` aggregate which codegen
+    /// packed into x0 as 8 bytes — the caller then memcpy'd from x0
+    /// treating the value AS a pointer (SEGV on first complex-returning
+    /// call to e.g. stdlib's `gamma_dist_pdf_csp`).
+    ComplexBuffer,
 }
 
 /// Info about a local variable.
