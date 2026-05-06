@@ -213,9 +213,43 @@ fn o2_removes_dead_seed_store_across_noalias_call() {
         "raw loop body should still contain the seed store and the real fill store:\n{}",
         raw_body
     );
+    // Detect "seed-zero" pattern: a store whose value is a `const_int 0`.
+    // This invariant is robust to loop transformations like partial
+    // unrolling that multiply store counts — DSE removing the dead
+    // seed eliminates the const-zero feeding any store.
+    fn count_store_of_zero(func_section: &str) -> usize {
+        use std::collections::HashSet;
+        // Collect every value id defined as `const_int 0`.
+        let zeros: HashSet<&str> = func_section
+            .lines()
+            .filter_map(|l| {
+                let t = l.trim();
+                let after_eq = t.strip_prefix("%")?;
+                let (id, rest) = after_eq.split_once(" = const_int 0 ")?;
+                let _ = rest;
+                Some(id)
+            })
+            .collect();
+        // Count `store %ID, ...` where %ID is one of those.
+        func_section
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("store %"))
+            .filter(|rest| {
+                let id = rest.split(',').next().unwrap_or("").trim();
+                zeros.contains(id)
+            })
+            .count()
+    }
+    let raw_zeros = count_store_of_zero(raw_fill);
+    let opt_zeros = count_store_of_zero(opt_fill);
     assert!(
-        opt_body.matches("store ").count() < raw_body.matches("store ").count(),
-        "O2 should remove the dead seed store while keeping the real fill:\n{}",
-        opt_body
+        raw_zeros >= 1,
+        "raw seed_and_fill should have at least one store-of-zero (the dead seed):\n{}",
+        raw_fill
+    );
+    assert_eq!(
+        opt_zeros, 0,
+        "O2 DSE should remove the dead store-of-zero (raw had {}):\n{}",
+        raw_zeros, opt_fill
     );
 }
