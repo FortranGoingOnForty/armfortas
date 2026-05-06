@@ -133,6 +133,16 @@ pub enum ArmOpcode {
     /// `Vd[i] = Vd[i] ? Vn[i] : Vm[i]`. Vd is destructive
     /// (input mask + output). Used to lower VSelect.
     BslV16B,
+    /// Vector compare (per-lane all-ones / all-zeros result).
+    FcmgtV4S,
+    FcmgtV2D,
+    FcmgeV4S,
+    FcmgeV2D,
+    FcmeqV4S,
+    FcmeqV2D,
+    CmgtV4S,
+    CmgeV4S,
+    CmeqV4S,
     FminV4S,
     FminV2D,
     FmaxV4S,
