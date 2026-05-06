@@ -1425,6 +1425,35 @@ struct PartialRuntimeShape {
     /// Const(1) feeding the iadd.
     step_const_id: ValueId,
     u: usize,
+    /// Optional reduction. When `Some`, the header has 2 params
+    /// (iv + acc); the latch passes (iv_next, new_acc) to header.
+    /// Acc must be threaded through the unrolled body and the
+    /// remainder loop.
+    reduction: Option<RuntimeReduction>,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeReduction {
+    /// Header's accumulator block-param value id.
+    acc_param: ValueId,
+    /// Type of the accumulator.
+    acc_ty: IrType,
+    /// Initial accumulator value (preheader branch args[acc_idx]).
+    acc_init: ValueId,
+    /// New accumulator value computed in the latch (latch terminator
+    /// args[acc_idx]) — typically a fadd / iadd / select chain.
+    new_acc: ValueId,
+    /// Position of the accumulator in header.params and the latch /
+    /// preheader terminator args. mem2reg's ordering of phi nodes is
+    /// not stable across loops — sometimes acc is at idx 0, iv at
+    /// idx 1.
+    acc_idx: usize,
+    /// True when the original header's cond_br false_args carries
+    /// the acc as a block-arg to exit. False when the exit references
+    /// acc_param via dominance only (no block-arg passing). Affects
+    /// how the apply path forwards the final acc to the original
+    /// exit after rewiring the CFG through the remainder loop.
+    exit_takes_acc: bool,
 }
 
 fn detect_partial_unroll_runtime_loop(
@@ -1441,16 +1470,41 @@ fn detect_partial_unroll_runtime_loop(
         return None;
     }
     let hdr = func.block(header);
-    // v0: iv-only header (no reduction acc).
-    if hdr.params.len() != 1 {
+    // Header may be iv-only (no reduction) or iv + acc (reduction).
+    if hdr.params.len() != 1 && hdr.params.len() != 2 {
         return None;
     }
-    let iv_param = hdr.params[0].id;
-    let iv_ty = hdr.params[0].ty.clone();
+    // Find the IV by inspecting the header's icmp — the param that
+    // appears as the LHS of `icmp.le|.lt _, bound` is the IV. The
+    // other param (when 2 params) is the accumulator.
+    let icmp_lhs: Option<ValueId> = hdr.terminator.as_ref().and_then(|t| {
+        if let Terminator::CondBranch { cond, .. } = t {
+            hdr.insts.iter().find(|i| i.id == *cond).and_then(|c| match c.kind {
+                InstKind::ICmp(CmpOp::Le, lhs, _) | InstKind::ICmp(CmpOp::Lt, lhs, _) => {
+                    Some(lhs)
+                }
+                _ => None,
+            })
+        } else {
+            None
+        }
+    });
+    let icmp_lhs = icmp_lhs?;
+    let iv_idx = hdr.params.iter().position(|p| p.id == icmp_lhs)?;
+    let iv_param = hdr.params[iv_idx].id;
+    let iv_ty = hdr.params[iv_idx].ty.clone();
     let iv_width = match iv_ty {
         IrType::Int(w) => w,
         _ => return None,
     };
+    let acc_param_info: Option<(ValueId, IrType)> = if hdr.params.len() == 2 {
+        let other_idx = 1 - iv_idx;
+        let p = &hdr.params[other_idx];
+        Some((p.id, p.ty.clone()))
+    } else {
+        None
+    };
+    let acc_idx: Option<usize> = if hdr.params.len() == 2 { Some(1 - iv_idx) } else { None };
     // Header's icmp pattern. Accept icmp.le or icmp.lt with the IV on
     // the LHS; capture the rhs ValueId regardless of whether it's a
     // const.
@@ -1478,15 +1532,32 @@ fn detect_partial_unroll_runtime_loop(
         return None;
     }
     let exit = false_dest;
-    // The exit must take no args from the header (v0).
-    let exit_args_from_header: Option<bool> = hdr.terminator.as_ref().map(|t| {
-        if let Terminator::CondBranch { false_args, .. } = t {
-            false_args.is_empty()
-        } else {
-            false
-        }
-    });
-    if exit_args_from_header != Some(true) {
+    // The exit's args from header: must be empty for the iv-only
+    // form. For the reduction form, accept either []  (acc_param is
+    // referenced by the exit via dominance — common Fortran lowering)
+    // OR [acc_param] (canonical mem2reg shape).
+    let (exit_args_ok, exit_takes_acc): (bool, bool) = hdr
+        .terminator
+        .as_ref()
+        .map(|t| {
+            if let Terminator::CondBranch { false_args, .. } = t {
+                if let Some((acc_p, _)) = &acc_param_info {
+                    if false_args.is_empty() {
+                        (true, false)
+                    } else if false_args.len() == 1 && false_args[0] == *acc_p {
+                        (true, true)
+                    } else {
+                        (false, false)
+                    }
+                } else {
+                    (false_args.is_empty(), false)
+                }
+            } else {
+                (false, false)
+            }
+        })
+        .unwrap_or((false, false));
+    if !exit_args_ok {
         return None;
     }
     // Bound must NOT be a compile-time constant — that case is handled
@@ -1519,19 +1590,31 @@ fn detect_partial_unroll_runtime_loop(
         outside[0]
     };
     let ph = func.block(preheader);
-    let iv_init = match &ph.terminator {
-        Some(Terminator::Branch(d, args)) if *d == header && args.len() == 1 => {
-            resolve_const_int(func, args[0])?
+    let want_arity = if acc_param_info.is_some() { 2 } else { 1 };
+    let (iv_init, acc_init_v) = match &ph.terminator {
+        Some(Terminator::Branch(d, args))
+            if *d == header && args.len() == want_arity =>
+        {
+            let init = resolve_const_int(func, args[iv_idx])?;
+            let acc_init = acc_idx.map(|i| args[i]);
+            (init, acc_init)
         }
         _ => return None,
     };
-    // Latch must end with `iadd iv, 1; br header(iv_next)`.
+    // Latch must end with `br header(iv_next)` (iv-only) or
+    // `br header(iv_next, new_acc)` (reduction) — args ordering
+    // matches header.params ordering.
     let latch_blk = func.block(latch);
     let latch_term_args = match &latch_blk.terminator {
-        Some(Terminator::Branch(d, args)) if *d == header && args.len() == 1 => args.clone(),
+        Some(Terminator::Branch(d, args))
+            if *d == header && args.len() == want_arity =>
+        {
+            args.clone()
+        }
         _ => return None,
     };
-    let iv_next = latch_term_args[0];
+    let iv_next = latch_term_args[iv_idx];
+    let new_acc_v = acc_idx.map(|i| latch_term_args[i]);
     let iadd_inst = latch_blk.insts.iter().find(|i| i.id == iv_next)?;
     let (lhs, rhs) = match iadd_inst.kind {
         InstKind::IAdd(l, r) => (l, r),
@@ -1574,6 +1657,19 @@ fn detect_partial_unroll_runtime_loop(
         break;
     }
     let u = chosen_u?;
+    let reduction = match (acc_param_info, acc_init_v, new_acc_v, acc_idx) {
+        (Some((acc_param, acc_ty)), Some(acc_init), Some(new_acc), Some(idx)) => {
+            Some(RuntimeReduction {
+                acc_param,
+                acc_ty,
+                acc_init,
+                new_acc,
+                acc_idx: idx,
+                exit_takes_acc,
+            })
+        }
+        _ => None,
+    };
     Some(PartialRuntimeShape {
         preheader,
         header,
@@ -1588,6 +1684,7 @@ fn detect_partial_unroll_runtime_loop(
         iadd_id: iv_next,
         step_const_id,
         u,
+        reduction,
     })
 }
 
@@ -1715,8 +1812,22 @@ fn do_partial_unroll_runtime(func: &mut Function, shape: PartialRuntimeShape) {
         id: remain_iv_id,
         ty: int_ty.clone(),
     });
+    // Reduction: header_remain also takes an acc param.
+    let remain_acc_id: Option<ValueId> = if let Some(r) = &shape.reduction {
+        let id = func.next_value_id();
+        func.register_type(id, r.acc_ty.clone());
+        func.block_mut(header_remain).params.push(BlockParam {
+            id,
+            ty: r.acc_ty.clone(),
+        });
+        Some(id)
+    } else {
+        None
+    };
 
     // ---- 4. Rewire header's cond_br false-target from exit to header_remain ----
+    //         When reducing, also forward the acc value into header_remain.
+    //         header_remain's params are [iv, acc] in that order.
     let original_exit = shape.exit;
     {
         let hdr = func.block_mut(shape.header);
@@ -1727,12 +1838,19 @@ fn do_partial_unroll_runtime(func: &mut Function, shape: PartialRuntimeShape) {
         }) = hdr.terminator.as_mut()
         {
             *false_dest = header_remain;
-            *false_args = vec![shape.iv_param];
+            *false_args = if let Some(r) = &shape.reduction {
+                vec![shape.iv_param, r.acc_param]
+            } else {
+                vec![shape.iv_param]
+            };
         }
     }
 
     // ---- 5. Build the U-way unrolled main-loop body in the latch ----
+    //         When reducing, thread the acc through clones (each clone's
+    //         acc_param substitution is the previous clone's new_acc).
     let mut new_main_insts: Vec<Inst> = body_no_iadd.clone();
+    let mut prev_acc: Option<ValueId> = shape.reduction.as_ref().map(|r| r.new_acc);
     for k in 1..shape.u {
         let k_const_id = func.next_value_id();
         func.register_type(k_const_id, int_ty.clone());
@@ -1752,6 +1870,12 @@ fn do_partial_unroll_runtime(func: &mut Function, shape: PartialRuntimeShape) {
         });
         let mut subst: HashMap<ValueId, ValueId> = HashMap::new();
         subst.insert(shape.iv_param, iv_k_id);
+        // Reduction: substitute acc_param with the running prev_acc so
+        // this clone consumes the previous iteration's accumulator.
+        if let (Some(r), Some(prev)) = (shape.reduction.as_ref(), prev_acc) {
+            subst.insert(r.acc_param, prev);
+        }
+        let mut clone_new_acc: Option<ValueId> = None;
         for orig in &body_no_iadd {
             let new_id = func.next_value_id();
             func.register_type(new_id, orig.ty.clone());
@@ -1763,6 +1887,16 @@ fn do_partial_unroll_runtime(func: &mut Function, shape: PartialRuntimeShape) {
                 ty: orig.ty.clone(),
                 span: orig.span,
             });
+            // Track this clone's new_acc id for the next iteration's
+            // substitution.
+            if let Some(r) = shape.reduction.as_ref() {
+                if orig.id == r.new_acc {
+                    clone_new_acc = Some(new_id);
+                }
+            }
+        }
+        if shape.reduction.is_some() {
+            prev_acc = clone_new_acc;
         }
     }
     // New iadd: iv_next = iadd iv, U. Reuse the original iadd id.
@@ -1781,6 +1915,18 @@ fn do_partial_unroll_runtime(func: &mut Function, shape: PartialRuntimeShape) {
         span,
     });
     func.block_mut(shape.latch).insts = new_main_insts;
+    // When reducing, rewrite the latch terminator's args[acc_idx] to
+    // the FINAL clone's new_acc (so each main-loop iteration commits
+    // the accumulated U-way result instead of the original first-
+    // iteration new_acc).
+    if let (Some(r), Some(final_acc)) = (shape.reduction.as_ref(), prev_acc) {
+        let latch_blk = func.block_mut(shape.latch);
+        if let Some(Terminator::Branch(_, args)) = latch_blk.terminator.as_mut() {
+            if args.len() == 2 {
+                args[r.acc_idx] = final_acc;
+            }
+        }
+    }
 
     // ---- 6. Build header_remain ----
     let remain_cmp_id = func.next_value_id();
@@ -1791,18 +1937,35 @@ fn do_partial_unroll_runtime(func: &mut Function, shape: PartialRuntimeShape) {
         ty: bool_ty.clone(),
         span,
     });
+    // When the original exit takes acc as a false_arg, header_remain
+    // must forward the final acc that way. Otherwise (acc-via-
+    // dominance lowering), the exit takes no args and the final acc
+    // is forwarded by rewriting acc_param uses in step 8 below.
+    let exit_args_remain: Vec<ValueId> = match (
+        remain_acc_id,
+        shape.reduction.as_ref().map(|r| r.exit_takes_acc),
+    ) {
+        (Some(acc), Some(true)) => vec![acc],
+        _ => vec![],
+    };
     func.block_mut(header_remain).terminator = Some(Terminator::CondBranch {
         cond: remain_cmp_id,
         true_dest: latch_remain,
         true_args: vec![],
         false_dest: original_exit,
-        false_args: vec![],
+        false_args: exit_args_remain,
     });
 
     // ---- 7. Build latch_remain (scalar 1-iter copy of original body) ----
+    //         Reduction: substitute acc_param → remain_acc_id so the
+    //         body computes new_acc on the running accumulator.
     let mut subst: HashMap<ValueId, ValueId> = HashMap::new();
     subst.insert(shape.iv_param, remain_iv_id);
+    if let (Some(r), Some(remain_acc)) = (shape.reduction.as_ref(), remain_acc_id) {
+        subst.insert(r.acc_param, remain_acc);
+    }
     let mut remain_insts: Vec<Inst> = Vec::new();
+    let mut remain_new_acc: Option<ValueId> = None;
     for orig in &body_no_iadd {
         let new_id = func.next_value_id();
         func.register_type(new_id, orig.ty.clone());
@@ -1814,6 +1977,11 @@ fn do_partial_unroll_runtime(func: &mut Function, shape: PartialRuntimeShape) {
             ty: orig.ty.clone(),
             span: orig.span,
         });
+        if let Some(r) = shape.reduction.as_ref() {
+            if orig.id == r.new_acc {
+                remain_new_acc = Some(new_id);
+            }
+        }
     }
     let remain_step_const_id = func.next_value_id();
     func.register_type(remain_step_const_id, int_ty.clone());
@@ -1832,8 +2000,86 @@ fn do_partial_unroll_runtime(func: &mut Function, shape: PartialRuntimeShape) {
         span,
     });
     func.block_mut(latch_remain).insts = remain_insts;
+    let latch_remain_args: Vec<ValueId> = if let Some(acc) = remain_new_acc {
+        vec![remain_iv_next_id, acc]
+    } else {
+        vec![remain_iv_next_id]
+    };
     func.block_mut(latch_remain).terminator =
-        Some(Terminator::Branch(header_remain, vec![remain_iv_next_id]));
+        Some(Terminator::Branch(header_remain, latch_remain_args));
+
+    // ---- 8. When the original exit references acc_param via dominance
+    //         (rather than via false_args), the head loop's acc value
+    //         that flows out of `header` is now the U-way unrolled head
+    //         result — but the remainder loop continues the
+    //         accumulation. Rewrite uses of acc_param outside the loop
+    //         body to use `remain_acc_id` (the final acc from
+    //         header_remain). header_remain dominates everything that
+    //         used to be dominated by header (along the false branch).
+    if let (Some(r), Some(remain_acc)) = (shape.reduction.as_ref(), remain_acc_id) {
+        if !r.exit_takes_acc {
+            let body_set: HashSet<BlockId> =
+                [shape.header, shape.latch].iter().copied().collect();
+            for block in func.blocks.iter_mut() {
+                if body_set.contains(&block.id) || block.id == shape.preheader {
+                    continue;
+                }
+                if block.id == header_remain || block.id == latch_remain {
+                    continue;
+                }
+                for inst in block.insts.iter_mut() {
+                    inst.kind = remap_kind_single(&inst.kind, r.acc_param, remain_acc);
+                }
+                if let Some(term) = block.terminator.as_mut() {
+                    remap_term_single(term, r.acc_param, remain_acc);
+                }
+            }
+        }
+    }
+}
+
+/// Replace every occurrence of `from` in an `InstKind`'s value
+/// operands with `to`. Forwards through `remap_kind` by building a
+/// 1-entry HashMap.
+fn remap_kind_single(kind: &InstKind, from: ValueId, to: ValueId) -> InstKind {
+    let mut subst: HashMap<ValueId, ValueId> = HashMap::new();
+    subst.insert(from, to);
+    remap_kind(kind, &subst)
+}
+
+/// Like `remap_kind_single` but for a `Terminator`. Walks both
+/// args lists for `Branch` / `CondBranch`, plus the `cond` operand
+/// for `CondBranch` and the value operand for `Return`.
+fn remap_term_single(term: &mut Terminator, from: ValueId, to: ValueId) {
+    let sub = |v: &mut ValueId| {
+        if *v == from {
+            *v = to;
+        }
+    };
+    match term {
+        Terminator::Branch(_, args) => {
+            for v in args.iter_mut() {
+                sub(v);
+            }
+        }
+        Terminator::CondBranch {
+            cond,
+            true_args,
+            false_args,
+            ..
+        } => {
+            sub(cond);
+            for v in true_args.iter_mut() {
+                sub(v);
+            }
+            for v in false_args.iter_mut() {
+                sub(v);
+            }
+        }
+        Terminator::Return(Some(v)) => sub(v),
+        Terminator::Return(None) | Terminator::Unreachable => {}
+        Terminator::Switch { selector, .. } => sub(selector),
+    }
 }
 
 // ---------------------------------------------------------------------------
