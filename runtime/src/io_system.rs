@@ -23,6 +23,20 @@ fn io_state() -> &'static Mutex<IoState> {
     STATE.get_or_init(|| Mutex::new(IoState::new()))
 }
 
+fn scratch_filename(unit: i32) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let dir = std::env::temp_dir();
+    dir.join(format!(
+        "afs_scratch_{pid}_{}_{seq}.tmp",
+        unit.unsigned_abs()
+    ))
+    .to_string_lossy()
+    .into_owned()
+}
+
 #[inline]
 fn read_i128_ptr(src: *const i128) -> Option<i128> {
     if src.is_null() {
@@ -59,7 +73,7 @@ enum Form {
     Unformatted,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum Action {
     Read,
     Write,
@@ -94,6 +108,8 @@ struct Unit {
     formatted_read_record: Option<String>,
     /// Cursor within a cached formatted input record for ADVANCE='NO' reads.
     formatted_read_cursor: usize,
+    /// True for STATUS='SCRATCH' units: backing file is deleted on close or exit.
+    scratch: bool,
 }
 
 impl Unit {
@@ -226,6 +242,7 @@ impl IoState {
                 read_tokens: Vec::new(),
                 formatted_read_record: None,
                 formatted_read_cursor: 0,
+                scratch: false,
             },
         );
         units.insert(
@@ -242,6 +259,7 @@ impl IoState {
                 read_tokens: Vec::new(),
                 formatted_read_record: None,
                 formatted_read_cursor: 0,
+                scratch: false,
             },
         );
         units.insert(
@@ -258,6 +276,7 @@ impl IoState {
                 read_tokens: Vec::new(),
                 formatted_read_record: None,
                 formatted_read_cursor: 0,
+                scratch: false,
             },
         );
 
@@ -346,6 +365,7 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
     let unit = cb.unit;
     let fname = unsafe_str(cb.filename, cb.filename_len);
     let status_str = unsafe_str(cb.status, cb.status_len).to_lowercase();
+    let is_scratch = status_str.trim() == "scratch";
     let action_str = unsafe_str(cb.action, cb.action_len).to_lowercase();
     let access_str = unsafe_str(cb.access, cb.access_len).to_lowercase();
     let form_str = unsafe_str(cb.form, cb.form_len).to_lowercase();
@@ -373,15 +393,21 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
             u.filename.clone(),
             u.access,
             u.form.clone(),
-            u.action.clone(),
+            u.action,
             u.recl,
         )
     });
     let fname = if missing_filename {
-        existing_unit
-            .as_ref()
-            .map(|(filename, _, _, _, _)| filename.clone())
-            .unwrap_or(fname)
+        if is_scratch {
+            // STATUS='SCRATCH': F2018 §12.5.6.13 — implementation chooses the
+            // backing path; file must not be FILE=, must be deleted on close.
+            scratch_filename(actual_unit)
+        } else {
+            existing_unit
+                .as_ref()
+                .map(|(filename, _, _, _, _)| filename.clone())
+                .unwrap_or(fname)
+        }
     } else {
         fname
     };
@@ -546,6 +572,7 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
                     read_tokens: Vec::new(),
                     formatted_read_record: None,
                     formatted_read_cursor: 0,
+                    scratch: is_scratch,
                 },
             );
 
@@ -590,6 +617,13 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
                     *iostat = e.raw_os_error().unwrap_or(1);
                 }
             } else {
+                // Release the io_state mutex before exit. process::exit invokes
+                // libc atexit handlers — including afs_io_finalize, which locks
+                // io_state to flush units. Holding the lock here while exiting
+                // deadlocked on macOS where the atexit thread re-entered the
+                // same mutex (sample-trace: pthread_mutex_firstfit_lock_wait
+                // → __psynch_mutexwait, hangs forever).
+                drop(state);
                 eprintln!("OPEN: {}: {}", fname, e);
                 std::process::exit(1);
             }
@@ -619,10 +653,12 @@ pub extern "C" fn afs_close_ex(unit: i32, status: *const u8, status_len: i64, io
     if let Some(mut u) = state.units.remove(&unit) {
         let _ = u.flush();
         let filename = u.filename.clone();
+        // STATUS='SCRATCH' units always delete on close (F2018 §12.5.6.13).
+        let delete = delete_on_close || u.scratch;
         drop(u);
 
         let mut close_status = 0;
-        if delete_on_close
+        if delete
             && !matches!(filename.as_str(), "stdin" | "stdout" | "stderr")
             && !filename.is_empty()
         {
@@ -634,7 +670,13 @@ pub extern "C" fn afs_close_ex(unit: i32, status: *const u8, status_len: i64, io
         if !iostat.is_null() {
             unsafe { *iostat = close_status };
         } else if close_status != 0 {
-            eprintln!("CLOSE: {}: {}", filename, io::Error::from_raw_os_error(close_status));
+            // Release lock before exit (afs_io_finalize atexit re-locks). See afs_open.
+            drop(state);
+            eprintln!(
+                "CLOSE: {}: {}",
+                filename,
+                io::Error::from_raw_os_error(close_status)
+            );
             std::process::exit(1);
         }
     } else {
@@ -2178,6 +2220,12 @@ pub extern "C" fn afs_inquire_file(
     action_buf_len: i64,
     recl_out: *mut i64,
     size_out: *mut i64,
+    read_buf: *mut u8,
+    read_buf_len: i64,
+    write_buf: *mut u8,
+    write_buf_len: i64,
+    readwrite_buf: *mut u8,
+    readwrite_buf_len: i64,
 ) {
     let fname = unsafe_str(filename, filename_len);
 
@@ -2211,10 +2259,28 @@ pub extern "C" fn afs_inquire_file(
             action_buf_len,
             recl_out,
         );
+        write_action_capabilities(
+            Some(u.action),
+            read_buf,
+            read_buf_len,
+            write_buf,
+            write_buf_len,
+            readwrite_buf,
+            readwrite_buf_len,
+        );
     } else {
         write_inquire_string(access_buf, access_buf_len, "UNDEFINED");
         write_inquire_string(form_buf, form_buf_len, "UNDEFINED");
         write_inquire_string(action_buf, action_buf_len, "UNDEFINED");
+        write_action_capabilities(
+            None,
+            read_buf,
+            read_buf_len,
+            write_buf,
+            write_buf_len,
+            readwrite_buf,
+            readwrite_buf_len,
+        );
     }
 
     // File size via metadata.
@@ -2252,6 +2318,12 @@ pub extern "C" fn afs_inquire_unit(
     action_buf_len: i64,
     recl_out: *mut i64,
     size_out: *mut i64,
+    read_buf: *mut u8,
+    read_buf_len: i64,
+    write_buf: *mut u8,
+    write_buf_len: i64,
+    readwrite_buf: *mut u8,
+    readwrite_buf_len: i64,
 ) {
     let state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     let unit_entry = state.units.get(&unit);
@@ -2279,6 +2351,15 @@ pub extern "C" fn afs_inquire_unit(
             action_buf_len,
             recl_out,
         );
+        write_action_capabilities(
+            Some(u.action),
+            read_buf,
+            read_buf_len,
+            write_buf,
+            write_buf_len,
+            readwrite_buf,
+            readwrite_buf_len,
+        );
 
         if !size_out.is_null() {
             let sz = if !u.filename.is_empty() {
@@ -2297,6 +2378,15 @@ pub extern "C" fn afs_inquire_unit(
         write_inquire_string(access_buf, access_buf_len, "UNDEFINED");
         write_inquire_string(form_buf, form_buf_len, "UNDEFINED");
         write_inquire_string(action_buf, action_buf_len, "UNDEFINED");
+        write_action_capabilities(
+            None,
+            read_buf,
+            read_buf_len,
+            write_buf,
+            write_buf_len,
+            readwrite_buf,
+            readwrite_buf_len,
+        );
         if !size_out.is_null() {
             unsafe {
                 *size_out = -1;
@@ -2309,6 +2399,30 @@ pub extern "C" fn afs_inquire_unit(
             *iostat = 0;
         }
     }
+}
+
+/// Fill READ=, WRITE=, READWRITE= INQUIRE specifiers based on a unit's
+/// declared `Action`.  Per F2018 §12.10.2, READ returns YES if the unit
+/// can be read, NO otherwise, and similarly for WRITE.  Disconnected
+/// units (`action = None`) report UNKNOWN for all three.
+fn write_action_capabilities(
+    action: Option<Action>,
+    read_buf: *mut u8,
+    read_buf_len: i64,
+    write_buf: *mut u8,
+    write_buf_len: i64,
+    readwrite_buf: *mut u8,
+    readwrite_buf_len: i64,
+) {
+    let (read_cap, write_cap, rw_cap) = match action {
+        Some(Action::Read) => ("YES", "NO", "NO"),
+        Some(Action::Write) => ("NO", "YES", "NO"),
+        Some(Action::ReadWrite) => ("YES", "YES", "YES"),
+        None => ("UNKNOWN", "UNKNOWN", "UNKNOWN"),
+    };
+    write_inquire_string(read_buf, read_buf_len, read_cap);
+    write_inquire_string(write_buf, write_buf_len, write_cap);
+    write_inquire_string(readwrite_buf, readwrite_buf_len, rw_cap);
 }
 
 /// Write ACCESS, FORM, ACTION, RECL for a connected unit.
@@ -2417,9 +2531,25 @@ pub extern "C" fn afs_io_init() {
 /// Finalize the I/O subsystem. Flush and close all open units.
 #[no_mangle]
 pub extern "C" fn afs_io_finalize() {
-    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    for (_, unit) in state.units.iter_mut() {
-        let _ = unit.flush();
+    // Use try_lock instead of lock: process::exit invokes libc atexit handlers,
+    // and any I/O routine that exited while holding io_state would deadlock here.
+    // If the caller is already holding the lock during exit, their drop has already
+    // unwound or process::exit released their mutex first; in the rare case where
+    // the lock is genuinely contested, skip flush rather than hang the program.
+    if let Ok(mut state) = io_state().try_lock() {
+        for (_, unit) in state.units.iter_mut() {
+            let _ = unit.flush();
+        }
+        // Delete any STATUS='SCRATCH' backing files left open at exit.
+        let scratch_paths: Vec<String> = state
+            .units
+            .values()
+            .filter(|u| u.scratch && !u.filename.is_empty())
+            .map(|u| u.filename.clone())
+            .collect();
+        for path in scratch_paths {
+            let _ = std::fs::remove_file(&path);
+        }
     }
 }
 

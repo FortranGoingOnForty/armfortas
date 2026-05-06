@@ -549,7 +549,10 @@ mod tests {
             "tail-call optimization must not erase the call when an arg reloads a spilled frame pointer"
         );
         assert!(
-            mf.blocks[0].insts.iter().any(|i| i.opcode == ArmOpcode::Ret),
+            mf.blocks[0]
+                .insts
+                .iter()
+                .any(|i| i.opcode == ArmOpcode::Ret),
             "tail-call optimization must leave the normal return path intact"
         );
     }

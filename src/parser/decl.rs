@@ -647,7 +647,11 @@ impl<'a> Parser<'a> {
                 self.advance();
                 let kind = self.advance().clone().text;
                 self.expect(&TokenKind::RParen)?;
-                name = format!("{}({})", name.to_ascii_lowercase(), kind.to_ascii_lowercase());
+                name = format!(
+                    "{}({})",
+                    name.to_ascii_lowercase(),
+                    kind.to_ascii_lowercase()
+                );
                 is_generic_spec = true;
             }
             if self.eat(&TokenKind::Arrow) {
@@ -927,10 +931,8 @@ impl<'a> Parser<'a> {
                                 // the field is zero-initialised).
                             } else if self.peek() == &TokenKind::Identifier {
                                 let target_name = self.advance().clone().text;
-                                let span = crate::parser::expr::span_from_to(
-                                    init_start,
-                                    self.prev_span(),
-                                );
+                                let span =
+                                    crate::parser::expr::span_from_to(init_start, self.prev_span());
                                 ptr_init = Some(crate::ast::Spanned::new(
                                     crate::ast::expr::Expr::Name { name: target_name },
                                     span,
@@ -1395,8 +1397,7 @@ mod tests {
     #[test]
     fn generic_type_bound_proc_preserves_all_specific_bindings() {
         let tokens =
-            Lexer::tokenize("generic :: set => set_float, set_integer, set_datetime", 0)
-                .unwrap();
+            Lexer::tokenize("generic :: set => set_float, set_integer, set_datetime", 0).unwrap();
         let mut parser = Parser::new(&tokens);
         parser.advance();
         let tbp = parser.parse_type_bound_proc_generic().unwrap();

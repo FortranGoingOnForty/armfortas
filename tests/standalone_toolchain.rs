@@ -104,11 +104,38 @@ fn compile_with_driver(
     extra_envs: &[(&str, &Path)],
     context: &str,
 ) -> Output {
+    compile_with_driver_args(driver, source, output, extra_envs, &[], context)
+}
+
+fn compile_with_driver_args(
+    driver: &Path,
+    source: &Path,
+    output: &Path,
+    extra_envs: &[(&str, &Path)],
+    extra_args: &[&str],
+    context: &str,
+) -> Output {
+    compile_with_driver_args_and_vars(driver, source, output, extra_envs, &[], extra_args, context)
+}
+
+fn compile_with_driver_args_and_vars(
+    driver: &Path,
+    source: &Path,
+    output: &Path,
+    extra_envs: &[(&str, &Path)],
+    extra_vars: &[(&str, &str)],
+    extra_args: &[&str],
+    context: &str,
+) -> Output {
     let mut cmd = Command::new(driver);
     for (name, value) in extra_envs {
         cmd.env(name, value);
     }
-    run_command(cmd.arg(source).arg("-o").arg(output), context)
+    for (name, value) in extra_vars {
+        cmd.env(name, value);
+    }
+    cmd.arg(source).arg("-o").arg(output).args(extra_args);
+    run_command(&mut cmd, context)
 }
 
 #[test]
@@ -275,6 +302,54 @@ fn hello_world_runs_through_driver_with_standalone_tool_overrides() {
         standalone_stderr, default_stderr,
         "driver override stderr diverged from default driver"
     );
+    assert_eq!(standalone_stdout, " Hello, World!\n");
+}
+
+#[test]
+fn hello_world_runs_through_driver_with_afs_ld_enable_flag() {
+    let Some(armfortas) = binary("armfortas") else {
+        eprintln!("skipping: armfortas binary not built");
+        return;
+    };
+    let Some(afs_as) = binary("afs-as") else {
+        eprintln!("skipping: afs-as binary not built");
+        return;
+    };
+    let Some(_afs_ld) = binary("afs-ld") else {
+        eprintln!("skipping: afs-ld binary not built");
+        return;
+    };
+    let Some(runtime) = runtime_archive() else {
+        eprintln!("skipping: libarmfortas_rt.a not built");
+        return;
+    };
+    let Some(libsystem) = libsystem_tbd() else {
+        eprintln!("skipping: libSystem.tbd not found");
+        return;
+    };
+
+    let source = workspace_root().join("test_programs/hello.f90");
+    assert!(source.exists(), "hello.f90 missing at {}", source.display());
+
+    let dir = unique_dir("driver_afs_ld_flag_hello");
+    let standalone_bin = dir.join("hello-driver-afs-ld-flag");
+
+    let standalone_compile = compile_with_driver_args_and_vars(
+        &armfortas,
+        &source,
+        &standalone_bin,
+        &[
+            ("AFS_AS_PATH", &afs_as),
+            ("AFS_RUNTIME_PATH", &runtime),
+            ("AFS_LIBSYSTEM_TBD", &libsystem),
+        ],
+        &[("AFS_LD", "1")],
+        &["-L", "/tmp", "-rpath", "/tmp"],
+        "AFS_LD=1 armfortas compile",
+    );
+    assert_success(&standalone_compile, "AFS_LD=1 armfortas compile");
+    let standalone_run = run_binary(&standalone_bin, "AFS_LD=1 armfortas run");
+    let standalone_stdout = String::from_utf8_lossy(&standalone_run.stdout);
     assert_eq!(standalone_stdout, " Hello, World!\n");
 }
 

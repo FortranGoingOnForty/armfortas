@@ -628,7 +628,10 @@ impl<'a> Parser<'a> {
                     let rank_expr = self.parse_expr()?;
                     let rank_val = match &rank_expr.node {
                         Expr::IntegerLiteral { text, .. } => text.parse::<i64>().unwrap_or(0),
-                        Expr::UnaryOp { op: crate::ast::expr::UnaryOp::Minus, operand } => {
+                        Expr::UnaryOp {
+                            op: crate::ast::expr::UnaryOp::Minus,
+                            operand,
+                        } => {
                             if let Expr::IntegerLiteral { text, .. } = &operand.node {
                                 -text.parse::<i64>().unwrap_or(0)
                             } else {
@@ -639,7 +642,10 @@ impl<'a> Parser<'a> {
                     };
                     self.expect(&TokenKind::RParen)?;
                     let body = self.parse_select_rank_body()?;
-                    guards.push(RankGuard::Rank { rank: rank_val, body });
+                    guards.push(RankGuard::Rank {
+                        rank: rank_val,
+                        body,
+                    });
                 }
             }
         }

@@ -25,3 +25,13 @@ AGENTS.md
 /*.mod
 /*.amod
 /scratch/
+
+# Runtime artifacts left in the repo root by stdlib example runs
+# (savetxt / savenpy / io examples).
+/.claude/
+/error_log.txt
+/example*.dat
+/example*.csv
+/example*.npy
+/test.bin
+/test.txt

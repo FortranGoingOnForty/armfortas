@@ -9215,7 +9215,11 @@ fn generic_subroutine_accepts_imported_derived_array_element_actual() {
     let main_obj = dir.join("main.o");
     let out = dir.join("generic_imported_derived_array_elem");
 
-    for (src, obj) in [(&types_src, &types_obj), (&impl_src, &impl_obj), (&main_src, &main_obj)] {
+    for (src, obj) in [
+        (&types_src, &types_obj),
+        (&impl_src, &impl_obj),
+        (&main_src, &main_obj),
+    ] {
         let compile = Command::new(compiler("armfortas"))
             .current_dir(&dir)
             .args([
@@ -10757,9 +10761,7 @@ fn matmul_over_integer_matrices_uses_column_major_indexing() {
         "matmul int should compile: {}",
         String::from_utf8_lossy(&compile.stderr)
     );
-    let run = Command::new(&out)
-        .output()
-        .expect("matmul int run failed");
+    let run = Command::new(&out).output().expect("matmul int run failed");
     assert!(
         run.status.success(),
         "matmul int should pass: status={:?} stdout={} stderr={}",
@@ -10838,7 +10840,9 @@ fn matmul_over_complex_kind4_matrices_produces_correct_results() {
         "matmul complex4 should compile: {}",
         String::from_utf8_lossy(&compile.stderr)
     );
-    let run = Command::new(&out).output().expect("matmul complex4 run failed");
+    let run = Command::new(&out)
+        .output()
+        .expect("matmul complex4 run failed");
     assert!(
         run.status.success(),
         "matmul complex4 should pass: status={:?} stdout={} stderr={}",
@@ -10873,7 +10877,9 @@ fn matmul_over_complex_kind8_matrices_produces_correct_imag_part() {
         "matmul complex8 should compile: {}",
         String::from_utf8_lossy(&compile.stderr)
     );
-    let run = Command::new(&out).output().expect("matmul complex8 run failed");
+    let run = Command::new(&out)
+        .output()
+        .expect("matmul complex8 run failed");
     assert!(
         run.status.success(),
         "matmul complex8 should pass: status={:?} stdout={} stderr={}",
@@ -10931,7 +10937,9 @@ fn inline_array_intrinsic_in_print_handles_complex_elements() {
         stdout
     );
     assert!(
-        stdout.contains(",   0.0000000E0)") || stdout.contains(",0.0000000E+0)") || stdout.contains(",   0.0000000E+0)"),
+        stdout.contains(",   0.0000000E0)")
+            || stdout.contains(",0.0000000E+0)")
+            || stdout.contains(",   0.0000000E+0)"),
         "complex closing paren missing: {}",
         stdout
     );
@@ -11714,8 +11722,16 @@ fn class_star_optional_argument_forwards_through_intermediate_subroutine() {
         String::from_utf8_lossy(&run.stderr)
     );
     let stdout = String::from_utf8_lossy(&run.stdout);
-    assert!(stdout.contains("A"), "expected absent path to print A: {}", stdout);
-    assert!(stdout.contains("P"), "expected present path to print P: {}", stdout);
+    assert!(
+        stdout.contains("A"),
+        "expected absent path to print A: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("P"),
+        "expected present path to print P: {}",
+        stdout
+    );
 
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
@@ -11868,7 +11884,10 @@ fn assumed_shape_lower_bound_override_rebases_dummy_descriptor() {
     );
     let stdout = String::from_utf8_lossy(&run.stdout);
     assert!(
-        stdout.contains("sorted=") && stdout.contains("1") && stdout.contains("2") && stdout.contains("3"),
+        stdout.contains("sorted=")
+            && stdout.contains("1")
+            && stdout.contains("2")
+            && stdout.contains("3"),
         "expected sorted output: {}",
         stdout
     );
@@ -11916,6 +11935,256 @@ fn assumed_shape_lower_override_propagates_through_nested_calls() {
         "expected 100, 20, 300 (inner writes propagated): {}",
         stdout
     );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn default_assumed_shape_dummy_rebases_lower_to_one_per_f2018() {
+    // F2018 §15.5.2.4(13): a dummy declared `arr(:)` (no explicit
+    // lower bound) must see lbound=1 inside the procedure regardless
+    // of the caller's actual lower bound.  Pre-fix `install_assumed_
+    // shape_lower_overrides` skipped default `(:)` dummies, so a
+    // caller's `array(-200:200)` flowed through and `lbound(arr,1)`
+    // returned -200 — non-conforming, and the source of cascading
+    // bounds-check failures whenever stdlib code did `do i=1,size(arr)`
+    // expecting 1-based indexing.
+    let src = write_program(
+        "program p\n  implicit none\n  real, allocatable :: array(:)\n  allocate(array(-5:5))\n  array = 0.0\n  array(0) = 42.0\n  call probe(array)\ncontains\n  subroutine probe(arr)\n    real, intent(in) :: arr(:)\n    if (lbound(arr, 1) /= 1) error stop 1\n    if (ubound(arr, 1) /= 11) error stop 2\n    if (size(arr) /= 11) error stop 3\n    ! caller's array(0) was element index 6 in 1-based view\n    if (arr(6) /= 42.0) error stop 4\n    print *, 'ok'\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("default_assumed_shape_rebase", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "run failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected 'ok': {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn optional_assumed_shape_dummy_rebases_lower_to_one_when_present() {
+    // F2018 §15.5.2.4(13) applies to optional assumed-shape dummies
+    // too: when the actual is present, the callee's view must rebase
+    // to lbound=1 (or the declared lower) regardless of caller bounds.
+    // Pre-fix `install_assumed_shape_lower_overrides` had to skip
+    // optional dummies entirely to avoid SEGV on the absence path
+    // (callers pass a null descriptor pointer); the runtime null
+    // check now guards the load+memcpy so absent calls fall through
+    // and present calls get the correct rebase.
+    let src = write_program(
+        "program p\n  implicit none\n  real, allocatable :: array(:)\n  allocate(array(-3:3))\n  array = 0.0\n  array(0) = 7.0\n  call probe(array)\n  call probe()\ncontains\n  subroutine probe(arr)\n    real, intent(in), optional :: arr(:)\n    if (present(arr)) then\n      if (lbound(arr, 1) /= 1) error stop 1\n      if (ubound(arr, 1) /= 7) error stop 2\n      if (size(arr) /= 7) error stop 3\n      if (arr(4) /= 7.0) error stop 4\n      print *, 'present-ok'\n    else\n      print *, 'absent-ok'\n    end if\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("optional_assumed_shape_rebase", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "run failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("present-ok") && stdout.contains("absent-ok"),
+        "expected both 'present-ok' and 'absent-ok': {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn rank_n_array_compare_yields_same_shape_logical_descriptor_per_f2018() {
+    // F2018 §10.1.5: a relational op over an array operand yields a
+    // logical array of the SAME SHAPE — same rank, same extents — as
+    // the operand. F2018 §6.5.3.5(2): every fresh array expression
+    // is 1-based regardless of operand bounds.  Pre-fix
+    // `lower_rank1_array_compare_descriptor` hardcoded the result
+    // descriptor to rank=1 with `lower=1, upper=total_flat_size`,
+    // so for `m = (y > 3.)` over a rank-2 `y(2,3)` the mask had
+    // `(rank=1, lower=1, upper=6)` — fine for serial element walks
+    // but corrupting downstream code that reads the mask through a
+    // rank-2 dummy `mask(:,:)` (e.g. stdlib's `var(y, dim, mask)`).
+    let src = write_program(
+        "program p\n  implicit none\n  real :: y(2,3) = reshape([1.,2.,3.,4.,5.,6.], [2,3])\n  logical :: m(2,3)\n  m = y > 3.\n  if (.not. (size(shape(m)) == 2)) error stop 1\n  if (size(m,1) /= 2) error stop 2\n  if (size(m,2) /= 3) error stop 3\n  if (m(1,1) .or. m(2,1) .or. m(1,2)) error stop 4\n  if (.not. (m(2,2) .and. m(1,3) .and. m(2,3))) error stop 5\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("rank_n_compare_shape", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "run failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected 'ok': {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn ieee_is_nan_over_rank_n_array_dispatches_elementally() {
+    // F2018 §17.11: ieee_is_nan is elemental — applied to a rank-N
+    // numeric array it must yield a same-shape logical array. Without
+    // dispatch the scalar `lower_intrinsic` arm emits `fcmp ne desc,
+    // desc` over the array's descriptor pointer (garbage / IR verifier
+    // failure / wrong code), and the catch-all `any(..)` fallback
+    // walks the source as if rank-1, tripping a bounds check at
+    // index > size(arr,1) for rank-2+ inputs.  stdlib's median /
+    // cov / sort_* hit this in the `if any(ieee_is_nan(x))` guard
+    // when the matrix has more than `size(x,1)` total elements.
+    let src = write_program(
+        "program p\n  use, intrinsic :: ieee_arithmetic, only: ieee_is_nan\n  implicit none\n  real :: y(2,3) = reshape([1.,2.,3.,4.,5.,6.], [2,3])\n  real :: nan_val\n  nan_val = 0.0\n  nan_val = nan_val / nan_val\n  y(2,2) = nan_val\n  if (any(ieee_is_nan(y))) then\n    print *, 'has-nan-ok'\n  else\n    error stop 1\n  end if\n  y(2,2) = 4.0\n  if (.not. any(ieee_is_nan(y))) then\n    print *, 'no-nan-ok'\n  else\n    error stop 2\n  end if\nend program\n",
+        "f90",
+    );
+    let out = unique_path("ieee_is_nan_rank_n", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "run failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("has-nan-ok") && stdout.contains("no-nan-ok"),
+        "expected both 'has-nan-ok' and 'no-nan-ok': {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn rank_n_section_scalar_broadcast_writes_every_element() {
+    // F2018 §7.5.1.2: `a(:,:,:) = scalar` must assign the scalar to
+    // EVERY element of the rank-N section.  `lower_multi_d_section_assign`
+    // walks per-dim coords and accumulates `byte_off = Σ coord_k *
+    // dim[k].stride * elem_size`.  Pre-fix `materialize_array_descriptor_for_info`
+    // hardcoded every dim's stride to 1, so for `a(2,3,4)` distinct
+    // (i,j,k) tuples collided on identical byte offsets and only
+    // `Σ extents - rank + 1` cells got written — 7 of 24 for [2,3,4],
+    // 9 of 24 for [4,6], 5 of 9 for [3,3].  stdlib's gamma_pdf example
+    // failed visibly because `shape(:,:,:) = 2.0` and `rate(:,:,:) = 1.0`
+    // only touched the first few elements; the rank-3 elemental call
+    // then read garbage (NaN, denormals) for the bulk of x.
+    let src = write_program(
+        "program p\n  implicit none\n  real :: a(2,3,4), b(4,6), c(3,3)\n  integer :: i\n  a(:,:,:) = 7.0\n  do i = 1, 24\n    if (a(mod(i-1,2)+1, mod((i-1)/2,3)+1, (i-1)/6+1) /= 7.0) error stop 1\n  end do\n  b(:,:) = 9.0\n  if (any(b /= 9.0)) error stop 2\n  c(:,:) = 11.0\n  if (any(c /= 11.0)) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("rank_n_section_broadcast", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "run failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected 'ok': {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn complex_module_function_result_routes_through_hidden_buffer() {
+    // F2018 §15.6: a complex(k) function result is a value of category
+    // Complex(kind=k). Pre-fix, the IR-level return type was the
+    // [Float x 2] aggregate value; codegen packed the 8 (sp) or 16 (dp)
+    // bytes into x0 as if returning an integer. The caller's
+    // post-call memcpy then read x0 *as a pointer*, dereferencing the
+    // raw bit pattern of (3.0, 4.0) — usually SEGV, sometimes garbage.
+    // Fix routes complex scalar results through ComplexBuffer ABI:
+    // caller alloca's the 8/16-byte buffer, passes its address as a
+    // hidden first param; callee writes the two float lanes through
+    // that pointer and returns void.
+    //
+    // Simultaneously the hidden first param's IR type must be the
+    // typed complex pointer (`Ptr<[Float x 2]>`) rather than a generic
+    // byte buffer — otherwise generic dispatch on the result variable
+    // (e.g. `kahan_kernel(p, ...)` inside a complex-returning function)
+    // sees `Ptr<[I8 x 8]>` and rejects every complex-formal candidate.
+    let src = write_program(
+        "module m\n  implicit none\ncontains\n  pure elemental subroutine kk_csp(a, s, c)\n    complex, intent(in) :: a\n    complex, intent(inout) :: s, c\n    complex :: t, y\n    y = a - c\n    t = s + y\n    c = (t - s) - y\n    s = t\n  end subroutine\n  pure elemental subroutine kk_sp(a, s, c)\n    real, intent(in) :: a\n    real, intent(inout) :: s, c\n    real :: t, y\n    y = a - c\n    t = s + y\n    c = (t - s) - y\n    s = t\n  end subroutine\n  interface kahan_kernel\n    module procedure kk_sp\n    module procedure kk_csp\n  end interface\n  pure module function dot_kahan(a, b) result(p)\n    complex, intent(in) :: a(:), b(:)\n    complex :: p\n    integer :: i\n    complex :: c\n    c = (0.0, 0.0)\n    p = (0.0, 0.0)\n    do i = 1, size(a)\n      call kahan_kernel(a(i)*b(i), p, c)\n    end do\n  end function\n  function get_c() result(r)\n    complex :: r\n    r = (3.0, 4.0)\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  complex :: r, a(3), b(3)\n  r = get_c()\n  if (r%re /= 3.0) error stop 1\n  if (r%im /= 4.0) error stop 2\n  a = [(1.0,0.0), (2.0,0.0), (3.0,0.0)]\n  b = [(1.0,0.0), (2.0,0.0), (3.0,0.0)]\n  r = dot_kahan(a, b)\n  if (abs(r%re - 14.0) > 1.0e-5) error stop 3\n  if (abs(r%im) > 1.0e-5) error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("complex_module_function_hidden_buffer", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected 'ok': {}", stdout);
 
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
@@ -12468,14 +12737,23 @@ fn inline_array_intrinsic_in_print_walks_descriptor_elements() {
     );
     let stdout = String::from_utf8_lossy(&run.stdout);
     // transpose([1..9, [3,3]]) = [1,4,7,2,5,8,3,6,9] in column-major
-    assert!(stdout.contains("1") && stdout.contains("4") && stdout.contains("7"),
-        "transpose row missing: {}", stdout);
+    assert!(
+        stdout.contains("1") && stdout.contains("4") && stdout.contains("7"),
+        "transpose row missing: {}",
+        stdout
+    );
     // matmul self-product diagonal: B(1,1)=30
-    assert!(stdout.contains("30") && stdout.contains("81") && stdout.contains("150"),
-        "matmul values missing: {}", stdout);
+    assert!(
+        stdout.contains("30") && stdout.contains("81") && stdout.contains("150"),
+        "matmul values missing: {}",
+        stdout
+    );
     // shape: "3 3"
-    assert!(stdout.lines().any(|l| l.split_whitespace().eq(["3", "3"])),
-        "shape line missing: {}", stdout);
+    assert!(
+        stdout.lines().any(|l| l.split_whitespace().eq(["3", "3"])),
+        "shape line missing: {}",
+        stdout
+    );
 
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
@@ -12852,7 +13130,9 @@ fn module_parameter_array_scalar_broadcast_init_keeps_array_global() {
         "scalar broadcast should compile + link: {}",
         String::from_utf8_lossy(&compile.stderr)
     );
-    let run = Command::new(&out).output().expect("scalar broadcast run failed");
+    let run = Command::new(&out)
+        .output()
+        .expect("scalar broadcast run failed");
     assert!(
         run.status.success(),
         "scalar broadcast should pass: status={:?} stdout={} stderr={}",
@@ -12899,7 +13179,9 @@ fn internal_subprogram_call_under_intrinsic_under_user_call_keeps_mangled_name()
         "should compile + link cleanly: {}",
         String::from_utf8_lossy(&compile.stderr)
     );
-    let run = Command::new(&out).output().expect("internal mangle run failed");
+    let run = Command::new(&out)
+        .output()
+        .expect("internal mangle run failed");
     assert!(
         run.status.success(),
         "should pass: status={:?} stdout={} stderr={}",
@@ -13207,6 +13489,132 @@ fn runtime_shape_array_function_result_auto_allocates_on_entry() {
         "expected diag sum 10, got: {}",
         stdout
     );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fixed_shape_array_function_result_auto_allocates_on_entry() {
+    // F2018 §15.5.2.4: a function whose result is an explicit-shape
+    // array with constant bounds (e.g. `real :: res(3)`) flows through
+    // the same `HiddenResultAbi::ArrayDescriptor` ABI as runtime-shape
+    // results — the caller passes a 384-byte descriptor, the body
+    // expects `afs_array_lbound` / `afs_array_ubound` to return the
+    // declared bounds. Pre-fix `allocate_runtime_shape_array_result`
+    // early-returned when every spec was a compile-time integer, so
+    // the descriptor stayed zeroed and the body's first write
+    // (`res(1) = ...`) tripped `index 1 outside [1, 0]`. Reproduces
+    // stdlib's `cross_product_rsp`, every `merge_*` helper with a
+    // fixed-shape result, etc.
+    let src = write_program(
+        "module mm\ncontains\n  pure function cross(a, b) result(res)\n    real, intent(in) :: a(3), b(3)\n    real :: res(3)\n    res(1) = a(2)*b(3) - a(3)*b(2)\n    res(2) = a(3)*b(1) - a(1)*b(3)\n    res(3) = a(1)*b(2) - a(2)*b(1)\n  end function\nend module\n\nprogram t\n  use mm\n  implicit none\n  real :: a(3) = [1., 0., 0.]\n  real :: b(3) = [0., 1., 0.]\n  real :: c(3)\n  c = cross(a, b)\n  if (abs(c(1)) > 1.0e-6) error stop 1\n  if (abs(c(2)) > 1.0e-6) error stop 2\n  if (abs(c(3) - 1.0) > 1.0e-6) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("fixed_shape_array_result", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("fixed-shape array result compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "fixed-shape array result should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("fixed-shape array result run failed");
+    assert!(
+        run.status.success(),
+        "fixed-shape array result should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn sum_along_dim_returns_reduced_array() {
+    // F2018 §16.9.231: SUM(arr, dim=k) reduces along dim k and
+    // returns a rank-(N-1) array. For a 2x3 matrix [[1,3,5],[2,4,6]]
+    // sum(y, 1) = [3, 7, 11], sum(y, 2) = [9, 12]. Pre-fix,
+    // sum-with-dim broadcast the whole-array sum (21) to every
+    // element of the result, which propagated to var/cov in
+    // stdlib_stats and silently produced wrong moments.
+    let src = write_program(
+        "program t\n  implicit none\n  real :: y(2,3) = reshape([1.,2.,3.,4.,5.,6.], [2,3])\n  real :: r1(3), r2(2)\n  r1 = sum(y, 1)\n  r2 = sum(y, 2)\n  if (any(abs(r1 - [3., 7., 11.]) > 1.0e-6)) error stop 1\n  if (any(abs(r2 - [9., 12.]) > 1.0e-6)) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("sum_along_dim", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("sum-with-dim compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "sum-with-dim should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("sum-with-dim run failed");
+    assert!(
+        run.status.success(),
+        "sum-with-dim should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn rank_reducing_section_arithmetic_uses_strided_descriptor() {
+    // F2018 §9.5.3.4: a subscript like `y(1,:)` is a *rank-reducing*
+    // selection — the leading scalar index drops the first dim and
+    // the result is rank-1 with column-major memory stride
+    // (= extent of the dropped dim). Pre-fix, `afs_create_section`
+    // preserved the source rank, leaving a rank-2 descriptor with
+    // both extents intact and dim[0].stride=1; the binop loop in
+    // `lower_array_expr_descriptor` then iterated flat over the
+    // total element count using only dim[0].stride and read garbage
+    // from the wrong memory positions. Confirmed shape: y(1,:)-m
+    // returned [-0.5,-1.5,-2.5] instead of [-0.5,-0.5,-0.5].
+    let src = write_program(
+        "program t\n  implicit none\n  real :: y(2,3) = reshape([1.,2.,3.,4.,5.,6.], [2,3])\n  real :: m(3) = [1.5, 3.5, 5.5]\n  real :: m2(2) = [10., 20.]\n  real :: r1(3), r2(2)\n  r1 = y(1,:) - m\n  r2 = y(:,2) - m2\n  if (any(abs(r1 - [-0.5, -0.5, -0.5]) > 1.0e-6)) error stop 1\n  if (any(abs(r2 - [-7., -16.]) > 1.0e-6)) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("rank_reducing_section_arith", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("rank-reducing section arith compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "rank-reducing section arith should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("rank-reducing section arith run failed");
+    assert!(
+        run.status.success(),
+        "rank-reducing section arith should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok: {}", stdout);
 
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
@@ -17867,7 +18275,10 @@ fn sibling_extensions_keep_distinct_runtime_tags_across_tus() {
         (&main_src, &main_obj, "main program", true),
     ] {
         let mut cmd = Command::new(compiler("armfortas"));
-        cmd.current_dir(&dir).arg("-c").arg("-J").arg(dir.to_str().unwrap());
+        cmd.current_dir(&dir)
+            .arg("-c")
+            .arg("-J")
+            .arg(dir.to_str().unwrap());
         if needs_imports {
             cmd.arg("-I").arg(dir.to_str().unwrap());
         }
@@ -20664,7 +21075,8 @@ fn logical_reduction_intrinsics_on_component_char_constructor_actuals_compile_an
 }
 
 #[test]
-fn logical_reduction_intrinsics_on_nonmatching_component_char_constructor_actuals_compile_and_run() {
+fn logical_reduction_intrinsics_on_nonmatching_component_char_constructor_actuals_compile_and_run()
+{
     let src = write_program(
         "program p\n  implicit none\n  type :: chars_t\n    character(len=1) :: equal\n    character(len=1) :: space\n    character(len=1) :: tab\n  end type\n  type(chars_t), parameter :: char_kind = chars_t('=', ' ', achar(9))\n\n  if (any(match(char_kind%equal, 1, [char_kind%space, char_kind%tab]))) error stop 1\n\n  print *, 'ok'\ncontains\n  elemental logical function match(src, idx, want) result(ok)\n    character(len=*), intent(in) :: src\n    integer, intent(in) :: idx\n    character(len=1), intent(in) :: want\n    ok = src(idx:idx) == want\n  end function\nend program\n",
         "f90",
@@ -24171,7 +24583,10 @@ fn module_global_component_overloaded_concat_preserves_nested_character_actual_l
         "module m\n  implicit none\n  integer, parameter :: i1 = selected_int_kind(2)\n  type :: color_code\n    integer(i1) :: style = -1_i1\n    integer(i1) :: bg = -1_i1\n    integer(i1) :: fg = -1_i1\n  end type\n  type :: color_output\n    type(color_code) :: dim = color_code(style=2_i1)\n    type(color_code) :: reset = color_code()\n    type(color_code) :: blue = color_code(fg=4_i1)\n  end type\n  type(color_output), protected :: color\n  interface operator(//)\n    module procedure :: concat_color_left\n    module procedure :: concat_color_right\n  end interface\ncontains\n  pure function concat_color_left(lval, code) result(str)\n    character(len=*), intent(in) :: lval\n    type(color_code), intent(in) :: code\n    character(len=:), allocatable :: str\n    if (anycolor(code)) then\n      str = lval // 'X'\n    else\n      str = lval // 'Y'\n    end if\n  end function\n  pure function concat_color_right(code, rval) result(str)\n    type(color_code), intent(in) :: code\n    character(len=*), intent(in) :: rval\n    character(len=:), allocatable :: str\n    if (anycolor(code)) then\n      str = 'Z' // rval\n    else\n      str = 'W' // rval\n    end if\n  end function\n  pure function anycolor(code) result(flag)\n    type(color_code), intent(in) :: code\n    logical :: flag\n    flag = code%fg >= 0 .or. code%bg >= 0 .or. code%style >= 0\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  character(len=:), allocatable :: s\n  s = 'A' // color%dim // 'B' // color%reset // 'C' // color%blue\n  if (s /= 'AXBYCX') error stop 1\n  print *, 'ok'\nend program\n",
         "f90",
     );
-    let out = unique_path("module_global_component_overloaded_concat_nested_len", "bin");
+    let out = unique_path(
+        "module_global_component_overloaded_concat_nested_len",
+        "bin",
+    );
     let compile = Command::new(compiler("armfortas"))
         .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
         .output()
@@ -25156,7 +25571,9 @@ fn complex_re_im_designators_lower_to_correct_lane_and_dispatch_real_kind() {
         "complex %re dispatch compile failed: {}",
         String::from_utf8_lossy(&compile.stderr)
     );
-    let run = Command::new(&out).output().expect("complex %re dispatch run failed");
+    let run = Command::new(&out)
+        .output()
+        .expect("complex %re dispatch run failed");
     assert!(
         run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
         "complex %re dispatch run failed: status={:?} stdout={} stderr={}",
@@ -25242,7 +25659,15 @@ fn f2008_submodule_explicit_iface_smp_body_split_file_runtime_shape_result() {
         String::from_utf8_lossy(&run.stderr)
     );
 
-    for p in [&parent_src, &sub_src, &main_src, &parent_o, &sub_o, &main_o, &out] {
+    for p in [
+        &parent_src,
+        &sub_src,
+        &main_src,
+        &parent_o,
+        &sub_o,
+        &main_o,
+        &out,
+    ] {
         let _ = std::fs::remove_file(p);
     }
     let _ = std::fs::remove_dir_all(&mod_dir);
@@ -25297,6 +25722,856 @@ fn f2008_submodule_explicit_iface_smp_body_with_runtime_shape_result() {
 }
 
 #[test]
+fn user_op_dispatch_rank_filters_scalar_actual_to_scalar_specific() {
+    // F2018 §12.4.4 / §15.5.2: when a user-defined operator has both a
+    // scalar specific and a rank-1 array specific differing only in
+    // the operand rank, dispatch must select the scalar specific for a
+    // scalar actual and the rank-1 specific for an array actual. Both
+    // forms share the same `TypeInfo::Character`, so a TypeInfo-only
+    // semantic match is ambiguous; without a rank filter the dispatch
+    // picks alphabetically — `append_carray` before `append_char` —
+    // and the callee dereferences the scalar's character bytes as an
+    // array descriptor. stdlib_stringlist_type's `operator(//)` was
+    // the motivating repro: `a // "Hello"` segfaulted in
+    // `afs_string_allocated` reading garbage as a descriptor pointer.
+    //
+    // Two-module multi-file build matches the stdlib shape: the user
+    // module declares both specifics, the program imports the
+    // operator generic, and dispatch must land on the scalar one for
+    // a scalar character actual.
+    let dir = unique_dir("user_op_rank_filter");
+    let m = write_program_in(
+        &dir,
+        "m.f90",
+        "module m\n  implicit none\n  private\n  public :: bag, operator(//)\n  type :: bag\n     integer :: n = 0\n  end type\n  interface operator(//)\n     module procedure append_char\n     module procedure append_carray\n  end interface\ncontains\n  pure function append_char(lhs, rhs) result(c)\n     type(bag), intent(in) :: lhs\n     character(len=*), intent(in) :: rhs\n     character(len=:), allocatable :: c\n     c = 'scalar'\n  end function\n  pure function append_carray(lhs, rhs) result(c)\n     type(bag), intent(in) :: lhs\n     character(len=*), intent(in) :: rhs(:)\n     character(len=:), allocatable :: c\n     c = 'array'\n  end function\nend module\n",
+    );
+    let p = write_program_in(
+        &dir,
+        "p.f90",
+        "program p\n  use m, only : bag, operator(//)\n  implicit none\n  type(bag) :: b\n  character(len=:), allocatable :: r\n  r = b // 'Hello'\n  if (r /= 'scalar') error stop 1\n  r = b // ['#1', '#2']\n  if (r /= 'array') error stop 2\n  print *, 'ok'\nend program\n",
+    );
+    let mo = dir.join("m.o");
+    let po = dir.join("p.o");
+    let bin = dir.join("p");
+    for (src, obj) in [(&m, &mo), (&p, &po)] {
+        let r = Command::new(compiler("armfortas"))
+            .args([
+                "-c",
+                src.to_str().unwrap(),
+                "-I",
+                dir.to_str().unwrap(),
+                "-J",
+                dir.to_str().unwrap(),
+                "-o",
+                obj.to_str().unwrap(),
+            ])
+            .output()
+            .expect("compile failed");
+        assert!(
+            r.status.success(),
+            "compile {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&r.stderr)
+        );
+    }
+    let link = Command::new(compiler("armfortas"))
+        .args([
+            mo.to_str().unwrap(),
+            po.to_str().unwrap(),
+            "-o",
+            bin.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link failed");
+    assert!(
+        link.status.success(),
+        "link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+    let run = Command::new(&bin).output().expect("run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "rank-filter run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+#[test]
+fn user_op_dispatch_recognises_derived_type_constructor_as_scalar() {
+    // F2008 §4.5.10: a structure constructor `T(args)` always yields a
+    // scalar of type T. The rank-aware specific dispatcher inspects the
+    // actual argument's rank to discriminate between scalar and array
+    // formals; pre-fix `actual_expr_rank` returned `None` for any
+    // FunctionCall whose callee was not a known local array. That made
+    // the rank filter say "actual rank unknown — accept any formal",
+    // and dispatch picked an array specific (`prepend_sarray`,
+    // `string_type, dimension(:)`) for a scalar derived-type
+    // constructor actual (`string_type("...")`). The callee then
+    // dereferenced the scalar's first 8 bytes as `dims[0].lower`,
+    // segfaulting in `_platform_memmove`.
+    //
+    // The motivating repro was stdlib_stringlist_type's
+    // `string_type("Element No. two") // first_stringlist`, which
+    // crashed step 2 of example_stringlist_type_concatenate_operator.
+    // Two-module multi-file build mirrors the stdlib shape: the user
+    // module declares two specifics differing only by LHS rank, and
+    // the program invokes the operator with a derived-type
+    // constructor on the LHS.
+    let dir = unique_dir("user_op_constructor_rank");
+    let m = write_program_in(
+        &dir,
+        "m.f90",
+        "module m\n  implicit none\n  private\n  public :: t, sink, operator(//)\n  type :: t\n     integer :: n = 0\n  end type\n  type :: sink\n     integer :: tag = 0\n  end type\n  interface operator(//)\n     module procedure prepend_scalar\n     module procedure prepend_array\n  end interface\ncontains\n  pure function prepend_scalar(lhs, rhs) result(c)\n     type(t), intent(in) :: lhs\n     type(sink), intent(in) :: rhs\n     character(len=:), allocatable :: c\n     c = 'scalar'\n  end function\n  pure function prepend_array(lhs, rhs) result(c)\n     type(t), intent(in) :: lhs(:)\n     type(sink), intent(in) :: rhs\n     character(len=:), allocatable :: c\n     c = 'array'\n  end function\nend module\n",
+    );
+    let p = write_program_in(
+        &dir,
+        "p.f90",
+        "program p\n  use m, only : t, sink, operator(//)\n  implicit none\n  type(sink) :: s\n  character(len=:), allocatable :: r\n  r = t(7) // s\n  if (r /= 'scalar') error stop 1\n  r = [t(1), t(2)] // s\n  if (r /= 'array') error stop 2\n  print *, 'ok'\nend program\n",
+    );
+    let mo = dir.join("m.o");
+    let po = dir.join("p.o");
+    let bin = dir.join("p");
+    for (src, obj) in [(&m, &mo), (&p, &po)] {
+        let r = Command::new(compiler("armfortas"))
+            .args([
+                "-c",
+                src.to_str().unwrap(),
+                "-I",
+                dir.to_str().unwrap(),
+                "-J",
+                dir.to_str().unwrap(),
+                "-o",
+                obj.to_str().unwrap(),
+            ])
+            .output()
+            .expect("compile failed");
+        assert!(
+            r.status.success(),
+            "compile {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&r.stderr)
+        );
+    }
+    let link = Command::new(compiler("armfortas"))
+        .args([
+            mo.to_str().unwrap(),
+            po.to_str().unwrap(),
+            "-o",
+            bin.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link failed");
+    assert!(
+        link.status.success(),
+        "link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+    let run = Command::new(&bin).output().expect("run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "constructor-rank dispatch: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+#[test]
+fn defined_assignment_routes_constructor_and_literal_to_correct_specific() {
+    // F2018 §10.2.1.4: defined-assignment dispatch is by declared TYPE
+    // (and kind) of the dummies. Pre-fix the type-information used to
+    // pick a specific had two holes:
+    //   1. `assignment_expr_type_info` returned None for a derived-type
+    //      constructor `T(...)` (the callee symbol is the type
+    //      definition, whose `type_info` is None). Fixed in the
+    //      `Expr::FunctionCall` arm by recognising the
+    //      `SymbolKind::DerivedType` case and returning
+    //      `Some(TypeInfo::Derived(name))`.
+    //   2. `try_defined_assignment` never appended the hidden i64
+    //      length argument required by F2018 §15.5.2.4 for a
+    //      `character(len=*)` formal, and never wrapped a literal RHS
+    //      in the by-ref slot the callee's prologue expects. Fixed by
+    //      consulting `char_len_star_params[resolved_specific]`,
+    //      routing char-star RHS through `lower_char_arg_by_ref`, and
+    //      appending the runtime length per flagged position.
+    //
+    // The motivating repros were stdlib_string_type's
+    // `s = string_type("hello")` (constructor RHS — was dispatching to
+    // `assign_string_char` with `len(rhs) == 0`) and `s = "Hello"`
+    // (literal RHS — was dispatching to `assign_string_char` with the
+    // hidden len uninitialised). Both must land on the right specific
+    // and propagate the full character length through to the body's
+    // `lhs%raw = rhs` assignment.
+    let src = write_program(
+        "module strtype\n  implicit none\n  type :: my_str\n    character(len=:), allocatable :: raw\n  end type\n  interface assignment(=)\n    module procedure assign_str_char\n    module procedure assign_str_str\n  end interface\n  interface my_str\n    module procedure new_my_str\n  end interface\ncontains\n  pure function new_my_str(c) result(new)\n    character(len=*), intent(in) :: c\n    type(my_str) :: new\n    new%raw = c\n  end function\n  subroutine assign_str_char(lhs, rhs)\n    type(my_str), intent(inout) :: lhs\n    character(len=*), intent(in) :: rhs\n    lhs%raw = rhs\n  end subroutine\n  subroutine assign_str_str(lhs, rhs)\n    type(my_str), intent(inout) :: lhs\n    type(my_str), intent(in) :: rhs\n    if (allocated(rhs%raw)) lhs%raw = rhs%raw\n  end subroutine\nend module\n\nprogram p\n  use strtype\n  implicit none\n  type(my_str) :: s\n  s = \"Hello\"\n  if (.not. allocated(s%raw)) error stop 1\n  if (len(s%raw) /= 5) error stop 2\n  if (s%raw /= \"Hello\") error stop 3\n  s = my_str(\"World!\")\n  if (.not. allocated(s%raw)) error stop 4\n  if (len(s%raw) /= 6) error stop 5\n  if (s%raw /= \"World!\") error stop 6\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("def_assign_ctor_and_literal", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("def-assign-ctor-literal compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "def-assign-ctor-literal compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("def-assign-ctor-literal run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "def-assign-ctor-literal: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn defined_assignment_routes_generic_function_result_to_typed_specific() {
+    // F2008 §12.5.1: a generic function call resolves to a specific
+    // by argument matching, and its return type is that specific's
+    // result type. `assignment_expr_type_info` previously returned
+    // None for any `FunctionCall` whose callee resolved to a
+    // `NamedInterface` (the interface symbol has no type_info), so
+    // `defined_assignment_arg_semantic_match`'s permissive
+    // `None => true` branch let a `character(*)` formal match a
+    // generic-function-result actual whose true return type was a
+    // derived type. The motivating repro: stdlib_string_type's
+    // `string = adjustl(string)` (adjustl returns string_type)
+    // dispatched to `assign_string_char` instead of
+    // `assign_string_string`, then the wrong-typed dispatch crashed
+    // inside the callee's `lhs%raw = rhs`.
+    //
+    // Fix: in the `FunctionCall` arm of `assignment_expr_type_info`,
+    // when the callee is a `NamedInterface`, walk the union of the
+    // specifics' result-variable type_info; return the common type
+    // when all specifics agree (sufficient for stdlib's elemental
+    // adjust/strip/trim family) and None otherwise so the dispatcher
+    // continues to use its existing permissive logic for genuinely
+    // ambiguous cases.
+    //
+    // This test models the stdlib shape: a single-specific generic
+    // returning a derived type, plus two assignment specifics that
+    // differ by RHS type. With the resolver in place, dispatch picks
+    // `assign_str_str`; without it, `assign_str_char` wins silently.
+    // The two specifics print sentinel markers so we can assert on
+    // which one was bound — checking the data round-trip end-to-end
+    // exercises a separate downstream bug in derived-type allocatable
+    // function-return semantics that the dispatch fix only exposes.
+    let src = write_program(
+        "module strtype\n  implicit none\n  type :: my_str\n    character(len=:), allocatable :: raw\n  end type\n  interface assignment(=)\n    module procedure assign_str_char\n    module procedure assign_str_str\n  end interface\n  interface upper_str\n    module procedure upper_my_str\n  end interface\ncontains\n  pure function upper_my_str(s) result(out)\n    type(my_str), intent(in) :: s\n    type(my_str) :: out\n    out%raw = \"OUT\"\n  end function\n  subroutine assign_str_char(lhs, rhs)\n    type(my_str), intent(inout) :: lhs\n    character(len=*), intent(in) :: rhs\n    print *, 'WRONG_SPECIFIC_CHAR'\n    lhs%raw = rhs\n  end subroutine\n  subroutine assign_str_str(lhs, rhs)\n    type(my_str), intent(inout) :: lhs\n    type(my_str), intent(in) :: rhs\n    print *, 'RIGHT_SPECIFIC_STR'\n    if (allocated(rhs%raw)) lhs%raw = rhs%raw\n  end subroutine\nend module\n\nprogram p\n  use strtype\n  implicit none\n  type(my_str) :: s, t\n  t%raw = \"hi\"\n  s = upper_str(t)\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("def_assign_generic_result", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("def-assign-generic-result compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "def-assign-generic-result compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("def-assign-generic-result run failed");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        run.status.success() && stdout.contains("ok"),
+        "def-assign-generic-result: status={:?} stdout={} stderr={}",
+        run.status,
+        stdout,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        stdout.contains("RIGHT_SPECIFIC_STR"),
+        "def-assign-generic-result dispatched wrong specific (expected assign_str_str): stdout={}",
+        stdout
+    );
+    assert!(
+        !stdout.contains("WRONG_SPECIFIC_CHAR"),
+        "def-assign-generic-result mis-dispatched to char specific: stdout={}",
+        stdout
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn type_bound_generic_dispatch_disambiguates_by_rank() {
+    // F2008 §12.4.4.1: distinguishable specifics in a generic must
+    // differ by rank or type of at least one passed-object argument.
+    // `resolve_bound_proc_actuals` checks TypeInfo + IR-shape but
+    // not rank; the IR-shape comparison over-matches because a
+    // scalar character descriptor and a rank-1 character array
+    // descriptor both peel to the same `Array(I8, _)` slot. The
+    // first-match-wins loop then bound the scalar specific for a
+    // rank-1 char actual and the callee dereferenced the rank-1
+    // descriptor's `data` field as a single character pointer —
+    // SEGV. The motivating repro was stdlib_stringlist_type's
+    // `prepend_carray` body calling
+    // `self%insert_at(list_head, lhs)` with a rank-1 `lhs`; the
+    // visible failure was step 5 of
+    // example_stringlist_type_concatenate_operator.
+    //
+    // Fix lives in `resolve_bound_proc_actuals`: a second pass over
+    // the candidates that already passed type+IR-shape, preferring
+    // the one whose formal rank matches the actual rank exactly.
+    // When no candidate satisfies the rank constraint we fall back
+    // to first-match-wins so legitimate elemental / assumed-rank /
+    // scalar-broadcast dispatches keep working — strictly no worse
+    // than the prior logic.
+    let src = write_program(
+        "module bagm\n  implicit none\n  type :: bag\n    integer :: tag = 0\n  contains\n    procedure :: insert_scalar\n    procedure :: insert_array\n    generic :: insert => insert_scalar, insert_array\n  end type\ncontains\n  subroutine insert_scalar(self, s)\n    class(bag), intent(inout) :: self\n    character(len=*), intent(in) :: s\n    if (s /= 'hi') error stop 1\n  end subroutine\n  subroutine insert_array(self, s)\n    class(bag), intent(inout) :: self\n    character(len=*), intent(in) :: s(:)\n    if (size(s) /= 2) error stop 2\n    if (s(1) /= '#1') error stop 3\n    if (s(2) /= '#2') error stop 4\n  end subroutine\nend module\n\nprogram p\n  use bagm\n  implicit none\n  type(bag) :: b\n  call b%insert(\"hi\")\n  call b%insert([\"#1\", \"#2\"])\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("tbp_rank_disambig", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("tbp-rank compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "tbp-rank compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("tbp-rank run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "tbp-rank: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn substring_write_with_inline_ichar_of_same_component_substring() {
+    // Regression: `a%raw(i:i) = char(ichar(a%raw(i:i)) - 32)` for
+    // `a%raw : character(:), allocatable` produced 5 garbage bytes
+    // instead of "HELLO". `lower_string_expr_ctx`'s `char` arm called
+    // the slim `lower_expr` shim (which hardcodes `type_layouts=None`,
+    // etc.) to lower its integer argument. Inside that, the recursive
+    // `ichar(a%raw(i:i))` reached `lower_string_expr_full` for the
+    // FunctionCall `a%raw(i:i)` with `type_layouts=None`;
+    // `expr_is_character_expr`'s ComponentAccess arm requires
+    // `type_layouts` to resolve the component's TypeInfo, so it
+    // returned false. The substring fast path at the top of the
+    // FunctionCall arm was bypassed, the fallback `lower_expr_full`
+    // produced a const-zero pointer, and `afs_ichar_ptr(0)` returned
+    // 0 → `char(0 - 32)` was written into each slot. Fix forwards the
+    // full lowering context (type_layouts/internal_funcs/host_refs/
+    // descriptor_params) so the inner ComponentAccess substring still
+    // resolves through the same fast path the outside-of-assignment
+    // case already used.
+    let src = write_program(
+        "program p\n  implicit none\n  type :: holder\n    character(:), allocatable :: raw\n  end type\n  type(holder) :: a\n  integer :: i\n  a%raw = \"hello\"\n  do i = 1, len(a%raw)\n    a%raw(i:i) = char(ichar(a%raw(i:i)) - 32)\n  end do\n  if (a%raw /= 'HELLO') error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("comp_substr_inline_ichar", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("comp-substr-inline-ichar compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "comp-substr-inline-ichar compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("comp-substr-inline-ichar run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "comp-substr-inline-ichar: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn ishft_negative_shift_on_negative_int16_returns_logical_shift() {
+    // F2018 §16.9.95: ISHFT does a *logical* shift on the bit
+    // representation of the integer. For a negative int8/int16 value
+    // sign-extended into the AArch64 32-bit register
+    // (e.g. -32767_int16 = 0x8001 lives as 0xFFFF8001 in w-reg),
+    // a naive `lshr` over the register shifted the upper sign-fill
+    // bits in alongside, producing 0x00FFFF80 (16777088) instead of
+    // 0x0080 (128).
+    //
+    // Surfaced via stdlib's `radix_sort_u16_helper`, which does
+    // `b1 = ishft(arr(i), -radix_bits_i16)` with `arr(i)` in
+    // `[-32767, ...]`. The helper then indexes
+    // `c1(b1)` against a 0:255 counts array — the bogus -128 result
+    // tripped a bounds check on the radix bucket lookup.
+    //
+    // Fix: mask args[0] to its kind's width before the lshr so the
+    // shift sees the unsigned bit pattern of the int16, not the
+    // sign-extended w-reg representation.
+    let src = write_program(
+        "program p\n  use iso_fortran_env, only: int16\n  implicit none\n  integer(int16) :: a16\n  integer :: r\n  a16 = -32767_int16\n  r = ishft(a16, -8_int16)\n  if (r /= 128) error stop 1\n  ! Also exercise positive shift and zero shift on negative int16.\n  if (ishft(a16, 0_int16) /= -32767_int16) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("ishft_neg_i16", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("ishft-neg-i16 compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "ishft-neg-i16 compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("ishft-neg-i16 run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "ishft-neg-i16: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn int64_array_scalar_broadcast_init_clears_upper_half() {
+    // Regression: `integer(int64) :: counts(-128:127); counts(:) = 0`
+    // emitted a broadcast loop that stored an i32 zero at every
+    // 8-byte stride, leaving the upper 4 bytes of each i64 slot with
+    // stack garbage. A later `counts(b) = counts(b) + 1` round-tripped
+    // those 4 garbage bytes through a 64-bit load/add/store, so the
+    // counter accumulated bogus high-bit values.
+    //
+    // Surfaced via stdlib's `radix_sort_u8_helper` (counting-sort path
+    // for int8 arrays): for input `[-128, 127, 0, -1, 1]` the helper's
+    // counts grew to `sum(counts) = 272088089462046725` instead of 5,
+    // and the write-back loop overshot N=5 with "Bounds check failed:
+    // index 6 outside [1, 5]" on `arr(i) = …`.
+    //
+    // Fix coerces the broadcast scalar to the destination element
+    // type before the inner store so the store width matches the
+    // slot stride; the broadcast loop now writes 0_i64 each iteration.
+    let src = write_program(
+        "module m\n  use iso_fortran_env, only: int64\n  implicit none\ncontains\n  subroutine helper(arr)\n    integer(int64), intent(out) :: arr(-128:127)\n    arr(:) = 0\n  end subroutine\nend module\n\nprogram p\n  use m\n  use iso_fortran_env, only: int64\n  implicit none\n  integer(int64) :: counts(-128:127)\n  integer :: i, b\n  call helper(counts)\n  do i = -128, 127\n    if (counts(i) /= 0_int64) error stop 1\n  end do\n  ! Mirror the radix_sort counting pattern.\n  do b = 1, 5\n    counts(merge(-128, merge(127, merge(0, merge(-1, 1, b == 4), b == 3), b == 2), b == 1)) = &\n      counts(merge(-128, merge(127, merge(0, merge(-1, 1, b == 4), b == 3), b == 2), b == 1)) + 1\n  end do\n  if (sum(counts) /= 5) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("int64_broadcast_init", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("int64-broadcast-init compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "int64-broadcast-init compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("int64-broadcast-init run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "int64-broadcast-init: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn nested_call_chain_with_array_section_args_keeps_frame_bounded() {
+    // Regression: `array_function_result_elem_type` called
+    // `generic_dispatch_probe_value` on every argument before
+    // checking whether the callee even returns an array.  Each
+    // probe re-lowered the argument expression — including any
+    // `arr(i:)` section actuals, which materialise a fresh
+    // ArrayDescriptor (384 bytes) + DimDescriptor (24 bytes) on
+    // the stack via `afs_create_section`.  When the same
+    // expression is wrapped through a chain of scalar-returning
+    // calls (e.g. stdlib_hash_32bit_water's
+    // `watermum(ieor(waterr32(key(i:)), h), …)`) the probe recurses
+    // and emits the section materialisation N times per
+    // source-level slice — for `int8_water_hash` the prologue ended
+    // up at 958 × 16K = ~15.6MB of stack alloca, which crashed past
+    // the macOS guard page.  The fix bails out in
+    // `array_function_result_elem_type` before any probing when no
+    // candidate of the callee has the ArrayDescriptor hidden-result
+    // ABI (i.e. the call cannot return an array — `ieor`, `+`,
+    // user-defined scalar functions etc.), so the recursive probe
+    // chain collapses.
+    //
+    // Asserts: the `int8_water_hash`-shaped repro now runs to
+    // completion (rather than EXC_BAD_ACCESS in the prologue), and
+    // the emitted assembly's outer-function 16K stack-probe count
+    // is bounded — confirms the prologue alloca didn't reappear at
+    // pathological scale.  The exact probe count depends on the
+    // surrounding optimization passes; we assert "well under the
+    // pre-fix worst case" rather than a single number.
+    let src = write_program(
+        "module wmin\n  use iso_fortran_env, only: int8, int32, int64\n  implicit none\ncontains\n  pure function water_simple(key, seed) result(hash_code)\n    integer(int32) :: hash_code\n    integer(int8), intent(in) :: key(0:)\n    integer(int64), intent(in) :: seed\n    integer(int64) :: h, i\n    integer(int64), parameter :: waterp2 = int(z'8ebc6af1', int64), waterp3 = int(z'589965cd', int64)\n    h = seed; i = 0_int64\n    h = ieor(watermum(ieor(waterr32(key(i:)), h), &\n                      ieor(waterr32(key(i+4:)), waterp2)),   &\n             watermum(h, ieor(waterr16(key(i+8:)), waterp3)))\n    hash_code = int(h, int32)\n  contains\n    pure function watermum(a, b) result(r)\n      integer(int64) :: r\n      integer(int64), intent(in) :: a, b\n      r = a * b\n    end function\n    pure function waterr16(p) result(v)\n      integer(int64) :: v\n      integer(int8), intent(in) :: p(:)\n      v = transfer( [ p(1), p(2), 0_int8, 0_int8, 0_int8, 0_int8, 0_int8, 0_int8 ], v )\n    end function\n    pure function waterr32(p) result(v)\n      integer(int64) :: v\n      integer(int8), intent(in) :: p(:)\n      v = transfer( [ p(1), p(2), p(3), p(4), 0_int8, 0_int8, 0_int8, 0_int8 ], v )\n    end function\n  end function\nend module\n\nprogram p\n  use wmin\n  use iso_fortran_env, only: int8, int64\n  implicit none\n  integer(int8) :: arr(0:14) = [(int(j, int8), j=1,15)]\n  integer(int64) :: s = 0\n  integer :: j\n  print '(z16)', water_simple(arr, s)\nend program\n",
+        "f90",
+    );
+    let out = unique_path("water_hash_frame", "bin");
+    let asm = unique_path("water_hash_frame", "s");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("water-hash-frame compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "water-hash-frame compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let asm_compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-S", "-o", asm.to_str().unwrap()])
+        .output()
+        .expect("water-hash-frame -S failed to spawn");
+    assert!(
+        asm_compile.status.success(),
+        "water-hash-frame -S compile failed: {}",
+        String::from_utf8_lossy(&asm_compile.stderr)
+    );
+    let asm_text = std::fs::read_to_string(&asm).expect("read asm");
+    let outer_fn_marker = "_afs_modproc_wmin_water_simple:";
+    let outer_start = asm_text
+        .find(outer_fn_marker)
+        .expect("outer function symbol present in asm");
+    // Count the 16K stack-probe pattern within the outer function's
+    // prologue. The probe is `movz x16, #16384 ; sub sp, sp, x16`.
+    // Pre-fix: ~958. Post-fix: well under 50 for this shape.
+    let probes_to_next_label = asm_text[outer_start..]
+        .lines()
+        .take_while(|line| {
+            !line.trim_start().starts_with("_afs_modproc_") || line.contains("water_simple:")
+        })
+        .filter(|line| line.contains("movz x16, #16384"))
+        .count();
+    assert!(
+        probes_to_next_label < 60,
+        "water_simple prologue still emits {} 16K stack probes (pre-fix was 380+, post-fix should be well under 60). \
+         The fix in array_function_result_elem_type may have regressed.",
+        probes_to_next_label
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("water-hash-frame run failed");
+    assert!(
+        run.status.success(),
+        "water-hash-frame run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&asm);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn allocate_deferred_char_writes_zero_to_stat() {
+    // F2018 §9.7.1.3: after a successful ALLOCATE the stat-variable
+    // must equal zero. The deferred-length character paths in
+    // lower_allocate (both the bare-name and the
+    // ComponentAccess-component variants) called
+    // `init_allocated_string_descriptor` and `continue`d without ever
+    // touching `stat_addr` — so when the user passed `stat=stat`, the
+    // user's `integer :: stat` retained its uninitialized stack
+    // contents.
+    //
+    // Surfaced via stdlib_bitsets_64's `write_bitset_string_64`
+    // (`allocate(character(len=count_digits+bit_count+2)::string,
+    // stat=stat)` followed by `if (stat > 0) call error_handler(...)`):
+    // stat was 0x01000001 (16777217) so the success path emitted
+    // "There was an allocation fault for STRING." and ERROR STOP'd —
+    // this knocked out the four bitset I/O examples
+    // (write_bitset / read_bitset / input / output) at the macro
+    // sweep level even though the underlying allocation was fine.
+    //
+    // Fix writes a literal zero to stat_addr after
+    // init_allocated_string_descriptor in both deferred-char ALLOCATE
+    // arms.
+    let src = write_program(
+        "program p\n  implicit none\n  character(:), allocatable :: s\n  integer :: stat\n  integer :: n\n  ! Pre-stamp stat with garbage so the test catches \"never written\".\n  stat = 16777217\n  n = 37\n  allocate(character(len=n) :: s, stat=stat)\n  if (stat /= 0) error stop 1\n  if (len(s) /= 37) error stop 2\n  ! Same shape, but the LHS lives inside a derived component.\n  call inner()\n  print *, 'ok'\ncontains\n  subroutine inner()\n    type :: box_t\n      character(:), allocatable :: raw\n    end type\n    type(box_t) :: b\n    integer :: stat2\n    stat2 = 16777217\n    allocate(character(len=5) :: b%raw, stat=stat2)\n    if (stat2 /= 0) error stop 3\n    if (len(b%raw) /= 5) error stop 4\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("alloc_deferred_char_stat", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("alloc-deferred-char-stat compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "alloc-deferred-char-stat compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("alloc-deferred-char-stat run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "alloc-deferred-char-stat: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn user_generic_named_char_shadows_intrinsic_in_string_context() {
+    // F2008 §13.7: a user-defined function or generic interface with
+    // the same name as an intrinsic shadows the intrinsic. The
+    // integer-context dispatch already gated `lower_char_intrinsic`
+    // on `find_named_interface_symbol`, but the string-context
+    // intrinsic match in `lower_string_expr_full` had no such gate.
+    //
+    // Surfaced via stdlib's `to_c_char_from_string`: it does
+    // `use stdlib_string_type, only: char` and inside the body
+    // calls `char(value, pos=i)` against a `type(string_type)`.
+    // Without this gate we emitted intrinsic `afs_char(integer)`
+    // reading the first 8 bytes of the descriptor as an i64,
+    // producing the low byte of the descriptor's data pointer
+    // (a constant value like 0x50 → "PPPPPPPPPPPPP" in the
+    // example_to_c_char output). The PASS direction (size matched
+    // since both came from `len(value)+1`) hid the silent corruption
+    // until the byte-by-byte equality check fired error stop.
+    let src = write_program(
+        "module shadow_mod\n  implicit none\n  type :: box_t\n    integer :: tag = 99\n  end type\n  interface char\n    module procedure char_box\n  end interface\ncontains\n  pure function char_box(b) result(c)\n    type(box_t), intent(in) :: b\n    character(1) :: c\n    c = '!'\n  end function\nend module\n\nprogram p\n  use shadow_mod, only: box_t, char\n  implicit none\n  type(box_t) :: b\n  character(1) :: u, n\n  u = char(b)\n  n = char(72)\n  if (u /= '!') error stop 1\n  if (n /= 'H') error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("user_char_shadow", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("user-char-shadow compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "user-char-shadow compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("user-char-shadow run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "user-char-shadow: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn strided_section_scalar_broadcast_writes_every_strided_slot() {
+    // Regression: `arr(1::7) = SCALAR` for a fixed-shape integer
+    // array only wrote arr(1), leaving arr(8), arr(15) untouched.
+    // Same family across allocatable real/integer/logical arrays.
+    //
+    // Root cause was in the runtime's `DimDescriptor::extent()`. The
+    // formula was `(upper - lower) / stride + 1` — designed for
+    // dim descriptors that encoded original-array-coordinate bounds
+    // with a logical stride. But every other DimDescriptor site in
+    // the codebase uses the convention `(lower=1, upper=count,
+    // stride=memory_step_in_elements)`, and the IR-side extent at
+    // lower.rs:28443 already computes `upper - lower + 1` with no
+    // stride division. `afs_create_section` produced
+    // `(1, count, memory_stride)`; for a stride-7 section over an
+    // arr(20) yielding count=3, `extent()` returned `(3-1)/7+1 = 1`,
+    // so `afs_array_size` reported 1 and the lowering's
+    // section-assign loop ran exactly once — only the first slot was
+    // written. Aligning the runtime formula with the IR convention
+    // (drop the stride division) makes both views agree and a
+    // strided whole-section assign covers every position.
+    //
+    // Visible at runtime via `count(logi)` returning 21 (the
+    // count of slots that did get touched at later stride boundaries
+    // due to compounding) instead of 143 in
+    // `example_bitsets_bit_count`'s setup `logi(1::7) = .true.`
+    // pattern.
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: arr(20) = 0\n  real :: r(20) = 0.0\n  logical :: l(20) = .false.\n  arr(1::7) = 99\n  r(1::7) = 9.5\n  l(1::7) = .true.\n  if (arr(1) /= 99 .or. arr(8) /= 99 .or. arr(15) /= 99) error stop 1\n  if (arr(2) /= 0 .or. arr(7) /= 0) error stop 2\n  if (count(arr == 99) /= 3) error stop 3\n  if (r(1) /= 9.5 .or. r(8) /= 9.5 .or. r(15) /= 9.5) error stop 4\n  if (count(r == 9.5) /= 3) error stop 5\n  if (.not. (l(1) .and. l(8) .and. l(15))) error stop 6\n  if (l(2) .or. l(7)) error stop 7\n  if (count(l) /= 3) error stop 8\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("strided_section_broadcast", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("strided-section compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "strided-section compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("strided-section run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "strided-section: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn declared_init_reshape_populates_fixed_shape_stack_array() {
+    // F2018 §16.9.169 RESHAPE used as a declared initializer for a
+    // fixed-shape rank-2+ stack array. Pre-fix `init_decls` only
+    // handled `Expr::ArrayConstructor` and bare scalar literal
+    // initializers; everything else (including
+    // `reshape([...], [...])`) silently fell through with no stores
+    // emitted, leaving the stack array with garbage stack bytes.
+    // example_var, example_savetxt, and many stdlib examples that
+    // initialize a 2-D test matrix via `real :: y(2,3) =
+    // reshape([1.,2.,3.,4.,5.,6.], [2,3])` saw `y(1,1)` come back as
+    // a junk float (e.g. -3.29e30), `sum(y)` returning NaN/inf, and
+    // var(y) crashing downstream when the resulting NaN-filled
+    // descriptor was passed into stdlib_stats. New `init_decls` arm
+    // recognises `reshape(SOURCE, SHAPE)` where SOURCE is an array
+    // constructor and feeds the values straight into the existing
+    // AC writer (column-major, contiguous source — pure layout
+    // reinterpretation).
+    let src = write_program(
+        "program p\n  implicit none\n  real :: y(2, 3) = reshape([1., 2., 3., 4., 5., 6.], [2, 3])\n  if (y(1, 1) /= 1.0) error stop 1\n  if (y(2, 1) /= 2.0) error stop 2\n  if (y(1, 2) /= 3.0) error stop 3\n  if (y(2, 3) /= 6.0) error stop 4\n  if (sum(y) /= 21.0) error stop 5\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("decl_init_reshape", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("decl-init-reshape compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "decl-init-reshape compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("decl-init-reshape run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "decl-init-reshape run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn use_only_does_not_leak_unrelated_generic_specifics_into_user_scope() {
+    // F2008 §11.2.3: `use M, only: x` brings only `x` into scope. It
+    // must NOT make M's same-named generic interfaces visible — even
+    // implicitly via transitive USE-chain walks. Pre-fix
+    // `lookup_in_guarded` chased the source_scope of every UA whose
+    // local_name == original_name (which is also true for plain only-
+    // form imports), so `use stdlib_string_type, only: string_type`
+    // exposed `operator(//)` from stdlib_string_type. When the user
+    // module's own `interface operator(//)` was being processed,
+    // `merged_visible_generic_specifics` looked up `operator(//)` in
+    // the user scope, hit the leaked symbol, and merged
+    // stdlib_string_type's specifics (concat_char_string,
+    // concat_string_char, concat_string_string) into the user's
+    // generic. The runtime symptom in stdlib_ansi was
+    // `fg_color_red // "x" // style_reset` dispatching to
+    // concat_char_string (expecting char // string_type), feeding it
+    // an ansi_code where it expected a string_type, and crashing in
+    // afs_string_allocated with a misaligned pointer dereference.
+    //
+    // Multi-file build (each module compiled to its own .amod and .o)
+    // — matches the stdlib_ansi/stdlib_string_type shape exactly. A
+    // single-file repro hits a separate, pre-existing intra-TU
+    // dispatch bug that's orthogonal to the leak.
+    let dir = unique_dir("use_only_no_leak");
+    let mod_a = write_program_in(
+        &dir,
+        "other_ops.f90",
+        "module other_ops\n  implicit none\n  private\n  public :: t_other, operator(//)\n  type :: t_other\n     integer :: x = 1\n  end type\n  interface operator(//)\n     module procedure other_concat_other\n     module procedure other_concat_char\n     module procedure char_concat_other\n  end interface\ncontains\n  pure function other_concat_other(a, b) result(c)\n     type(t_other), intent(in) :: a, b\n     character(len=:), allocatable :: c\n     c = 'oo'\n  end function\n  pure function other_concat_char(a, b) result(c)\n     type(t_other), intent(in) :: a\n     character(len=*), intent(in) :: b\n     character(len=:), allocatable :: c\n     c = 'oc'\n  end function\n  pure function char_concat_other(a, b) result(c)\n     character(len=*), intent(in) :: a\n     type(t_other), intent(in) :: b\n     character(len=:), allocatable :: c\n     c = 'co'\n  end function\nend module\n",
+    );
+    let mod_b = write_program_in(
+        &dir,
+        "user_ops.f90",
+        "module user_ops\n  use other_ops, only : t_other\n  implicit none\n  private\n  public :: t_user, operator(//)\n  type :: t_user\n     integer :: y = 2\n  end type\n  interface operator(//)\n     module procedure user_concat_char\n     module procedure char_concat_user\n  end interface\ncontains\n  pure function user_concat_char(a, b) result(c)\n     type(t_user), intent(in) :: a\n     character(len=*), intent(in) :: b\n     character(len=:), allocatable :: c\n     c = 'uc'\n  end function\n  pure function char_concat_user(a, b) result(c)\n     character(len=*), intent(in) :: a\n     type(t_user), intent(in) :: b\n     character(len=:), allocatable :: c\n     c = 'cu'\n  end function\nend module\n",
+    );
+    let prog = write_program_in(
+        &dir,
+        "p.f90",
+        "program p\n  use user_ops, only : t_user, operator(//)\n  implicit none\n  type(t_user) :: u\n  character(len=:), allocatable :: r\n  r = ('a' // 'b') // u\n  if (r /= 'cu') error stop 1\n  print *, 'ok'\nend program\n",
+    );
+    let obj_a = dir.join("other_ops.o");
+    let obj_b = dir.join("user_ops.o");
+    let obj_p = dir.join("p.o");
+    let bin = dir.join("p");
+
+    for (src, obj) in [(&mod_a, &obj_a), (&mod_b, &obj_b), (&prog, &obj_p)] {
+        let r = Command::new(compiler("armfortas"))
+            .args([
+                "-c",
+                src.to_str().unwrap(),
+                "-I",
+                dir.to_str().unwrap(),
+                "-J",
+                dir.to_str().unwrap(),
+                "-o",
+                obj.to_str().unwrap(),
+            ])
+            .output()
+            .expect("compile failed");
+        assert!(
+            r.status.success(),
+            "compile {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&r.stderr)
+        );
+    }
+    let link = Command::new(compiler("armfortas"))
+        .args([
+            obj_a.to_str().unwrap(),
+            obj_b.to_str().unwrap(),
+            obj_p.to_str().unwrap(),
+            "-o",
+            bin.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link failed");
+    assert!(
+        link.status.success(),
+        "link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+    let run = Command::new(&bin).output().expect("run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "use-only-no-leak run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+#[test]
 fn defined_assignment_class_lhs_loads_descriptor_pointer_through_slot() {
     // F2008 §7.2.1 / §15.5.2: a defined-assignment specific receiving
     // `class(T), intent(inout) :: to` expects the caller to pass the
@@ -25327,7 +26602,9 @@ fn defined_assignment_class_lhs_loads_descriptor_pointer_through_slot() {
         "class assign compile failed: {}",
         String::from_utf8_lossy(&compile.stderr)
     );
-    let run = Command::new(&out).output().expect("class assign run failed");
+    let run = Command::new(&out)
+        .output()
+        .expect("class assign run failed");
     assert!(
         run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
         "class assign run failed: status={:?} stdout={} stderr={}",
@@ -25460,7 +26737,15 @@ fn amod_proc_attrs_split_preserves_result_array_bounds_with_inner_comma() {
         String::from_utf8_lossy(&run.stderr)
     );
 
-    for p in [&parent_src, &sub_src, &main_src, &parent_o, &sub_o, &main_o, &out] {
+    for p in [
+        &parent_src,
+        &sub_src,
+        &main_src,
+        &parent_o,
+        &sub_o,
+        &main_o,
+        &out,
+    ] {
         let _ = std::fs::remove_file(p);
     }
     let _ = std::fs::remove_dir_all(&mod_dir);
@@ -25493,7 +26778,9 @@ fn cmplx_whole_array_with_kind_keyword_returns_correct_kind_descriptor() {
         "cmplx whole-array compile failed: {}",
         String::from_utf8_lossy(&compile.stderr)
     );
-    let run = Command::new(&out).output().expect("cmplx whole-array run failed");
+    let run = Command::new(&out)
+        .output()
+        .expect("cmplx whole-array run failed");
     assert!(
         run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
         "cmplx whole-array run failed: status={:?} stdout={} stderr={}",

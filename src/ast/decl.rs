@@ -206,9 +206,9 @@ pub enum TypeAttr {
 pub struct TypeBoundProc {
     pub name: String,
     pub interface: Option<String>, // procedure(iface) :: name
-    pub binding: Option<String>, // procedure :: name => binding
-    pub bindings: Vec<String>, // generic :: name => specific_a, specific_b
-    pub attrs: Vec<String>,      // pass, nopass, deferred, etc.
+    pub binding: Option<String>,   // procedure :: name => binding
+    pub bindings: Vec<String>,     // generic :: name => specific_a, specific_b
+    pub attrs: Vec<String>,        // pass, nopass, deferred, etc.
     pub is_generic: bool,
 }
 

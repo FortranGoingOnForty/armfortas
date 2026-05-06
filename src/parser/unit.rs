@@ -75,17 +75,11 @@ impl<'a> Parser<'a> {
                     } else {
                         String::new()
                     };
-                    let is_simple_prefix = matches!(
-                        next.as_str(),
-                        "subroutine" | "function" | "procedure"
-                    );
+                    let is_simple_prefix =
+                        matches!(next.as_str(), "subroutine" | "function" | "procedure");
                     let is_followed_by_decl_prefix = matches!(
                         next.as_str(),
-                        "pure"
-                            | "impure"
-                            | "elemental"
-                            | "recursive"
-                            | "non_recursive"
+                        "pure" | "impure" | "elemental" | "recursive" | "non_recursive"
                     );
                     let is_type_then_function = matches!(
                         next.as_str(),
@@ -98,10 +92,7 @@ impl<'a> Parser<'a> {
                             | "type"
                             | "class"
                     );
-                    if is_simple_prefix
-                        || is_followed_by_decl_prefix
-                        || is_type_then_function
-                    {
+                    if is_simple_prefix || is_followed_by_decl_prefix || is_type_then_function {
                         self.advance();
                         prefixes.push(Prefix::Module);
                     } else {
@@ -133,11 +124,7 @@ impl<'a> Parser<'a> {
             // parent module's interface block, so args/return type
             // are not repeated here.  Only valid when the `module`
             // prefix was consumed above.
-            "procedure"
-                if prefixes
-                    .iter()
-                    .any(|p| matches!(p, Prefix::Module)) =>
-            {
+            "procedure" if prefixes.iter().any(|p| matches!(p, Prefix::Module)) => {
                 self.parse_separate_module_procedure(start, prefixes)
             }
             "blockdata" | "block" => {
@@ -483,11 +470,10 @@ impl<'a> Parser<'a> {
         // Optional name or generic spec.
         // Check generic specs BEFORE generic identifier — they lex as identifiers.
         let kw_lc = self.peek_text().to_lowercase();
-        let is_generic_spec = matches!(
-            kw_lc.as_str(),
-            "operator" | "assignment" | "read" | "write"
-        ) && self.pos + 1 < self.tokens.len()
-            && self.tokens[self.pos + 1].kind == TokenKind::LParen;
+        let is_generic_spec =
+            matches!(kw_lc.as_str(), "operator" | "assignment" | "read" | "write")
+                && self.pos + 1 < self.tokens.len()
+                && self.tokens[self.pos + 1].kind == TokenKind::LParen;
         let name = if is_generic_spec {
             let op_kw = self.advance().clone().text;
             self.expect(&TokenKind::LParen)?;
@@ -1004,10 +990,8 @@ impl<'a> Parser<'a> {
         }
 
         let kw = self.peek_text().to_lowercase();
-        let is_generic_spec = matches!(
-            kw.as_str(),
-            "operator" | "assignment" | "read" | "write"
-        ) && self.pos + 1 < self.tokens.len()
+        let is_generic_spec = matches!(kw.as_str(), "operator" | "assignment" | "read" | "write")
+            && self.pos + 1 < self.tokens.len()
             && self.tokens[self.pos + 1].kind == TokenKind::LParen;
 
         if !is_generic_spec {
