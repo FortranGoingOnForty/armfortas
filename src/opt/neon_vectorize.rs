@@ -131,6 +131,17 @@ enum BodyOp {
         binop_id: ValueId,
         kind: BinaryKind,
     },
+    /// `dest(i) = a*b + c` — element-wise FMA. Float-only (NEON has
+    /// `fmla.4s` / `fmla.2d` for floats; integer `mla.4s` exists but
+    /// VFma in our IR is float). At least one of {a,b,c} must be
+    /// an array load; the others can be invariant scalars (broadcast).
+    Fma {
+        a: BinopOperand,
+        b: BinopOperand,
+        c: BinopOperand,
+        fmul_id: ValueId,
+        fadd_id: ValueId,
+    },
 }
 
 /// One element-wise statement (one store) inside a multi-statement
@@ -421,6 +432,17 @@ fn classify_body_op(
             binop_body(stored_value, BinaryKind::Mul, *l, *r, func, shape, dest, loop_defs)
         }
         InstKind::FAdd(l, r) => {
+            // Detect element-wise FMA: `c(i) = a(i)*b(i) + d(i)`.
+            // The store value is FAdd whose one operand is an FMul of
+            // two operands (each load or invariant scalar). NEON
+            // FMLA is float-only, so gate on a Float dest.
+            if matches!(dest.elem_ty, IrType::Float(_)) {
+                if let Some(fma) =
+                    fma_body(stored_value, *l, *r, func, shape, dest, loop_defs)
+                {
+                    return Some(fma);
+                }
+            }
             binop_body(stored_value, BinaryKind::Add, *l, *r, func, shape, dest, loop_defs)
         }
         InstKind::FSub(l, r) => {
@@ -523,6 +545,51 @@ fn binop_body(
         binop_id,
         kind,
     })
+}
+
+/// Classify a body that's `dest(i) = (a*b) + c` (or `c + (a*b)`).
+/// `fadd_id` is the FAdd's value id; `lhs_v` and `rhs_v` are its
+/// operands. One of them must itself be an `FMul` whose two operands
+/// are each load-or-invariant-scalar; the other operand is `c`.
+fn fma_body(
+    fadd_id: ValueId,
+    lhs_v: ValueId,
+    rhs_v: ValueId,
+    func: &Function,
+    shape: &CountedLoop,
+    dest: &ArrayAccess,
+    loop_defs: &HashSet<ValueId>,
+) -> Option<BodyOp> {
+    let defs = inst_map(func);
+    let try_fmul = |fmul_v: ValueId, other_v: ValueId| -> Option<BodyOp> {
+        let fmul_inst = defs.get(&fmul_v)?;
+        let (a_v, b_v) = match fmul_inst.kind {
+            InstKind::FMul(a, b) => (a, b),
+            _ => return None,
+        };
+        let a = classify_binop_operand(func, a_v, shape.iv_param, dest, loop_defs)?;
+        let b = classify_binop_operand(func, b_v, shape.iv_param, dest, loop_defs)?;
+        let c = classify_binop_operand(func, other_v, shape.iv_param, dest, loop_defs)?;
+        // At least one operand must be an array load — otherwise
+        // there's no per-iteration data to vectorize.
+        if matches!(a, BinopOperand::InvariantScalar(_))
+            && matches!(b, BinopOperand::InvariantScalar(_))
+            && matches!(c, BinopOperand::InvariantScalar(_))
+        {
+            return None;
+        }
+        Some(BodyOp::Fma {
+            a,
+            b,
+            c,
+            fmul_id: fmul_v,
+            fadd_id,
+        })
+    };
+    if let Some(op) = try_fmul(lhs_v, rhs_v) {
+        return Some(op);
+    }
+    try_fmul(rhs_v, lhs_v)
 }
 
 /// Classify one operand of the body's binop as either a load from
@@ -746,6 +813,16 @@ fn apply_vector_plan(func: &mut Function, shape: &CountedLoop, plan: VectorPlan)
                 broadcast_if_invariant(func, shape.preheader, lhs, &v_ty, plan.span),
                 broadcast_if_invariant(func, shape.preheader, rhs, &v_ty, plan.span),
             ),
+            BodyOp::Fma { .. } => (None, None),
+        };
+        let fma_subst = if let BodyOp::Fma { a, b, c, .. } = &stmt.op {
+            Some((
+                broadcast_if_invariant(func, shape.preheader, a, &v_ty, plan.span),
+                broadcast_if_invariant(func, shape.preheader, b, &v_ty, plan.span),
+                broadcast_if_invariant(func, shape.preheader, c, &v_ty, plan.span),
+            ))
+        } else {
+            None
         };
 
         if let BodyOp::Unary {
@@ -805,6 +882,46 @@ fn apply_vector_plan(func: &mut Function, shape: &CountedLoop, plan: VectorPlan)
                 inst.ty = v_ty.clone();
             }
             func.register_type(*binop_id, v_ty.clone());
+        }
+
+        if let BodyOp::Fma {
+            fmul_id, fadd_id, ..
+        } = &stmt.op
+        {
+            let (a_subst, b_subst, c_subst) = fma_subst.unwrap();
+            let body_block = func.block_mut(shape.body);
+            // Rewrite fmul to VMul (becomes dead — DCE will clean up;
+            // we still rewrite to avoid leaving a scalar fmul whose
+            // operands have been retyped to vectors).
+            if let Some(inst) = body_block.insts.iter_mut().find(|i| i.id == *fmul_id) {
+                if let InstKind::FMul(l, r) = inst.kind {
+                    inst.kind = InstKind::VMul(a_subst.unwrap_or(l), b_subst.unwrap_or(r));
+                    inst.ty = v_ty.clone();
+                }
+            }
+            func.register_type(*fmul_id, v_ty.clone());
+            // Rewrite fadd to VFma(a, b, c). Lookup fmul to recover
+            // its (possibly subst'd) operands so VFma reads the
+            // original / broadcast values rather than the dead VMul.
+            let (a_v, b_v) = {
+                let body_ro = func.block(shape.body);
+                let fmul_inst = body_ro.insts.iter().find(|i| i.id == *fmul_id).unwrap();
+                if let InstKind::VMul(l, r) = fmul_inst.kind {
+                    (l, r)
+                } else {
+                    unreachable!()
+                }
+            };
+            let body_block = func.block_mut(shape.body);
+            if let Some(inst) = body_block.insts.iter_mut().find(|i| i.id == *fadd_id) {
+                if let InstKind::FAdd(l, r) = inst.kind {
+                    let c = if l == *fmul_id { r } else { l };
+                    let c_final = c_subst.unwrap_or(c);
+                    inst.kind = InstKind::VFma(a_v, b_v, c_final);
+                    inst.ty = v_ty.clone();
+                }
+            }
+            func.register_type(*fadd_id, v_ty.clone());
         }
 
         let body_block = func.block_mut(shape.body);
@@ -926,6 +1043,7 @@ fn op_operands(op: &BodyOp) -> Vec<&BinopOperand> {
     match op {
         BodyOp::Copy { source } | BodyOp::Unary { source, .. } => vec![source],
         BodyOp::Binop { lhs, rhs, .. } => vec![lhs, rhs],
+        BodyOp::Fma { a, b, c, .. } => vec![a, b, c],
     }
 }
 
