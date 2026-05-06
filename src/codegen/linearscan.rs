@@ -345,10 +345,8 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
         } else {
             None
         };
-        if reg_opt.is_none()
-            && interval.crosses_call
-            && real_crosses
-            && safe_pre_phys.is_some()
+        if let (None, true, true, Some(safe_idx)) =
+            (reg_opt, interval.crosses_call, real_crosses, safe_pre_phys)
         {
             let call_pos = interval.call_crossings[0];
             let bridge_slot = mf.alloc_local(spill_slot_size(interval.class));
@@ -359,7 +357,7 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
             // assignment path could pick a different register that
             // *isn't* phys-write-safe (free_caller.pop() doesn't
             // filter), which would defeat the whole point.
-            let safe_reg = free_caller.remove(safe_pre_phys.unwrap());
+            let safe_reg = free_caller.remove(safe_idx);
             let pre_phys = if is_fp {
                 match interval.class {
                     RegClass::Fp32 => PhysReg::Fp32(safe_reg),
@@ -681,15 +679,15 @@ pub fn apply_allocation(
             }
             for (_, phys) in &sorted_assignments {
                 match phys {
-                    PhysReg::Gp(n) | PhysReg::Gp32(n) => {
-                        if !used_gp.contains(n) && !gp_temps.contains(n) {
-                            gp_temps.push(*n);
-                        }
+                    PhysReg::Gp(n) | PhysReg::Gp32(n)
+                        if !used_gp.contains(n) && !gp_temps.contains(n) =>
+                    {
+                        gp_temps.push(*n);
                     }
-                    PhysReg::Fp(n) | PhysReg::Fp32(n) => {
-                        if !used_fp.contains(n) && !fp_temps.contains(n) {
-                            fp_temps.push(*n);
-                        }
+                    PhysReg::Fp(n) | PhysReg::Fp32(n)
+                        if !used_fp.contains(n) && !fp_temps.contains(n) =>
+                    {
+                        fp_temps.push(*n);
                     }
                     _ => {}
                 }
@@ -705,15 +703,11 @@ pub fn apply_allocation(
                     };
                     if !in_use {
                         match p {
-                            PhysReg::Gp(n) | PhysReg::Gp32(n) => {
-                                if !gp_temps.contains(&n) {
-                                    gp_temps.push(n);
-                                }
+                            PhysReg::Gp(n) | PhysReg::Gp32(n) if !gp_temps.contains(&n) => {
+                                gp_temps.push(n);
                             }
-                            PhysReg::Fp(n) | PhysReg::Fp32(n) => {
-                                if !fp_temps.contains(&n) {
-                                    fp_temps.push(n);
-                                }
+                            PhysReg::Fp(n) | PhysReg::Fp32(n) if !fp_temps.contains(&n) => {
+                                fp_temps.push(n);
                             }
                             _ => {}
                         }

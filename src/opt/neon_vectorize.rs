@@ -1543,12 +1543,14 @@ fn build_where_plan(func: &Function, shape: &WhereLoop) -> Option<WherePlan> {
     //   (c) `Load(p); FNeg/FAbs/FSqrt/INeg(load); Store(unary, dest)`.
     //   (d) `Load(p); binop(load, K); Store(binop, dest)` where K is
     //       loop-invariant.
-    let (else_const, else_load_ptr, else_unary, else_binop): (
+    type ElseArmInfo = (
         Option<ValueId>,
         Option<ValueId>,
         Option<UnaryKind>,
         Option<(BinaryKind, ValueId, bool)>,
-    ) = if let Some(else_blk_id) = shape.else_block {
+    );
+    let (else_const, else_load_ptr, else_unary, else_binop): ElseArmInfo
+        = if let Some(else_blk_id) = shape.else_block {
         let else_blk = func.block(else_blk_id);
         if else_blk
             .insts
@@ -2144,11 +2146,11 @@ fn apply_where_plan(func: &mut Function, shape: &WhereLoop, plan: WherePlan) {
     }
 }
 
-/// Insert a fresh ConstInt for the head bound (`iv_init + head_count
-/// - 1`) into the preheader and rewire the original icmp's RHS to
-/// reference it; then peel `tail_count` scalar copies of the body
-/// into the top of the exit block, with the IV substituted by a
-/// constant per iteration.
+/// Insert a fresh ConstInt for the head bound
+/// (`iv_init + head_count - 1`) into the preheader and rewire the
+/// original icmp's RHS to reference it; then peel `tail_count` scalar
+/// copies of the body into the top of the exit block, with the IV
+/// substituted by a constant per iteration.
 fn apply_scalar_tail_peel(
     func: &mut Function,
     shape: &CountedLoop,
@@ -2181,13 +2183,10 @@ fn apply_scalar_tail_peel(
         .iter_mut()
         .find(|i| i.id == shape.cond_id)
     {
-        match &mut inst.kind {
-            InstKind::ICmp(_, _, rhs) => {
-                if *rhs == shape.bound_const_id {
-                    *rhs = new_bound_id;
-                }
+        if let InstKind::ICmp(_, _, rhs) = &mut inst.kind {
+            if *rhs == shape.bound_const_id {
+                *rhs = new_bound_id;
             }
-            _ => {}
         }
     }
 

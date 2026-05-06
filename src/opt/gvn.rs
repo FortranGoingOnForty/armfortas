@@ -130,7 +130,7 @@ const PURE_EXTERNAL_INTRINSICS: &[&str] = &[
 ];
 
 fn is_pure_external_intrinsic(name: &str) -> bool {
-    PURE_EXTERNAL_INTRINSICS.iter().any(|n| *n == name)
+    PURE_EXTERNAL_INTRINSICS.contains(&name)
 }
 
 fn reads_non_argument_memory(func: &Function) -> bool {

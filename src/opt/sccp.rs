@@ -527,7 +527,7 @@ fn apply(func: &mut Function, analysis: &SccpResult) -> bool {
     if !const_param_rewrites.is_empty() {
         // Sort by (block, descending param index) so predecessor
         // arg removal is index-stable as we mutate.
-        const_param_rewrites.sort_by(|a, b| b.1.cmp(&a.1));
+        const_param_rewrites.sort_by_key(|x| std::cmp::Reverse(x.1));
         for (block_id, pi, param_id, cval, ty) in const_param_rewrites {
             // Allocate a new value for the constant.
             let new_id = func.next_value_id();
@@ -570,10 +570,8 @@ fn apply(func: &mut Function, analysis: &SccpResult) -> bool {
                     continue;
                 };
                 match term {
-                    Terminator::Branch(dest, args) if *dest == block_id => {
-                        if pi < args.len() {
-                            args.remove(pi);
-                        }
+                    Terminator::Branch(dest, args) if *dest == block_id && pi < args.len() => {
+                        args.remove(pi);
                     }
                     Terminator::CondBranch {
                         true_dest,

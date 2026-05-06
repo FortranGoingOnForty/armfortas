@@ -235,7 +235,7 @@ fn plan_threads(
             // args don't include the cond param itself; otherwise
             // we'd need to rewrite via a fresh per-pred constant.
             let arm_args = if chosen_arm { &true_args } else { &false_args };
-            if arm_args.iter().any(|v| *v == cond) {
+            if arm_args.contains(&cond) {
                 continue;
             }
             // Also: arm args may reference the join's *other* block

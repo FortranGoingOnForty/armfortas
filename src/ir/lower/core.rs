@@ -9013,13 +9013,10 @@ pub(super) fn assignment_expr_type_info(
                 {
                     let mut common: Option<crate::sema::symtab::TypeInfo> = None;
                     for specific in &sym.arg_names {
-                        let scope = match procedure_scope_by_name(st, specific) {
-                            Some(s) => s,
-                            None => return None,
-                        };
+                        let scope = procedure_scope_by_name(st, specific)?;
                         let arg_set: std::collections::HashSet<String> =
                             scope.arg_order.iter().map(|n| n.to_lowercase()).collect();
-                        let result_ti = scope
+                        let t = scope
                             .symbols
                             .iter()
                             .find_map(|(key, s)| {
@@ -9035,8 +9032,7 @@ pub(super) fn assignment_expr_type_info(
                                 } else {
                                     None
                                 }
-                            });
-                        let Some(t) = result_ti else { return None; };
+                            })?;
                         match &common {
                             None => common = Some(t),
                             Some(c) => {
