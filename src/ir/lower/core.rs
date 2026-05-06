@@ -8616,7 +8616,8 @@ pub(super) fn actual_expr_rank(
         Expr::FunctionCall { callee, args } => {
             // Section result: rank = number of Range subscripts in args.
             if let Expr::Name { name } = &callee.node {
-                if let Some(info) = locals.get(&name.to_lowercase()) {
+                let key = name.to_lowercase();
+                if let Some(info) = locals.get(&key) {
                     if local_is_array_like(info) {
                         let n_ranges = args
                             .iter()
@@ -8629,6 +8630,15 @@ pub(super) fn actual_expr_rank(
                             return Some(n_ranges);
                         }
                         return Some(local_declared_rank(info));
+                    }
+                }
+                // F2008 §4.5.10: a structure constructor invocation
+                // `T(...)` is always a scalar of type T. Recognising this
+                // lets the rank-aware specific dispatcher reject array
+                // formals when the actual is a derived-type constructor.
+                if let Some(sym) = st.find_symbol_any_scope(&key) {
+                    if matches!(sym.kind, crate::sema::symtab::SymbolKind::DerivedType) {
+                        return Some(0);
                     }
                 }
             }
@@ -10070,7 +10080,58 @@ pub(super) fn resolve_operator_overload(
             Some(specific.clone())
         })
         .collect();
-    let specifics = if semantic_candidates.is_empty() {
+    // Rank-aware filter, applied ONLY to the typed-disambiguation
+    // path (`semantic_candidates`). A `character(len=*)` scalar actual
+    // must not bind to a `character(len=*), dimension(:)` rank-1
+    // formal even though both share the same TypeInfo and look the
+    // same at the IR level (both arrive as `Ptr(Array(I8, _))`).
+    // stdlib_stringlist's `operator(//)` exposes both
+    // `append_char(scalar)` and `append_carray(rank-1)`; without this
+    // filter the alphabetical first match (append_carray) was picked
+    // for `a // "Hello"` and the callee dereferenced the ASCII bytes
+    // of the literal as an `ArrayDescriptor` — segfault on the
+    // descriptor's base_addr load.
+    //
+    // Don't apply to `char_position_candidates` or the all-arg_names
+    // fallback paths — those exist because some legitimate users
+    // (e.g. stdlib_sparse with `*` overloads on derived sparse types)
+    // hit the fallback path even though they want intrinsic
+    // arithmetic; tightening the fallback would turn previously-found
+    // matches into None and expose a separate intrinsic-lowering bug
+    // (float op on descriptor pointer in the sparse_spmv build path).
+    let semantic_filtered_by_rank: Vec<String> = if !semantic_candidates.is_empty() {
+        let left_actual_rank = actual_expr_rank(left_expr, locals, st);
+        let right_actual_rank = actual_expr_rank(right_expr, locals, st);
+        semantic_candidates
+            .iter()
+            .filter(|specific| {
+                let Some(scope) = procedure_scope_by_name(st, specific) else {
+                    return false;
+                };
+                let declared_args = declared_args_for_scope(scope);
+                if declared_args.len() != 2 {
+                    return true;
+                }
+                let lf = formal_declared_rank(declared_args[0]);
+                let rf = formal_declared_rank(declared_args[1]);
+                formal_rank_matches_actual(lf, left_actual_rank)
+                    && formal_rank_matches_actual(rf, right_actual_rank)
+            })
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let specifics = if !semantic_filtered_by_rank.is_empty() {
+        semantic_filtered_by_rank
+    } else if !semantic_candidates.is_empty() {
+        // Same-type generics existed but rank disqualified them all.
+        // Don't fall through to the fully-permissive arg_names path
+        // here — sema's narrower set is the right universe; the
+        // caller will fall back to intrinsic arithmetic.
+        return None;
+    } else {
         let left_is_char = expr_is_character_expr(b, locals, left_expr, st, type_layouts);
         let right_is_char = expr_is_character_expr(b, locals, right_expr, st, type_layouts);
         let char_position_candidates: Vec<String> = if left_is_char != right_is_char {
@@ -10103,8 +10164,6 @@ pub(super) fn resolve_operator_overload(
         } else {
             char_position_candidates
         }
-    } else {
-        semantic_candidates
     };
 
     let lhs_probe = if expr_is_character_expr(b, locals, left_expr, st, type_layouts) {
