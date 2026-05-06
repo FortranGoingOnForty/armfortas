@@ -324,6 +324,7 @@ pub fn remap_inst_kind(kind: &InstKind, map: &HashMap<ValueId, ValueId>) -> Inst
         InstKind::VAbs(a) => InstKind::VAbs(r(a)),
         InstKind::VSqrt(a) => InstKind::VSqrt(r(a)),
         InstKind::VFma(a, b, c) => InstKind::VFma(r(a), r(b), r(c)),
+        InstKind::VSelect(m, t, f) => InstKind::VSelect(r(m), r(t), r(f)),
         InstKind::VMin(a, b) => InstKind::VMin(r(a), r(b)),
         InstKind::VMax(a, b) => InstKind::VMax(r(a), r(b)),
         InstKind::VICmp(op, a, b) => InstKind::VICmp(*op, r(a), r(b)),

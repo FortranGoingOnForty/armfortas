@@ -217,6 +217,7 @@ fn key_of(inst: &Inst) -> Option<Key> {
         | InstKind::VAbs(..)
         | InstKind::VSqrt(..)
         | InstKind::VFma(..)
+        | InstKind::VSelect(..)
         | InstKind::VMin(..)
         | InstKind::VMax(..)
         | InstKind::VICmp(..)
