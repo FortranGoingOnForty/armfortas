@@ -1178,6 +1178,10 @@ struct WherePlan {
     /// binop (to preserve operand order for non-commutative ops like
     /// Sub/Div).
     then_binop: Option<ThenBinop>,
+    /// Optional loop-invariant scalar that is stored directly
+    /// (`where (cond) b = K`). When set, the true arm of the vselect
+    /// is `VBroadcast(K)`; no load_a is consumed by the store.
+    then_const: Option<ValueId>,
     /// The dest pointer GEP (computed in body block).
     dest_ptr_id: ValueId,
     /// Source array's access shape (where load_a reads from).
@@ -1354,15 +1358,29 @@ fn build_where_plan(func: &Function, shape: &WhereLoop) -> Option<WherePlan> {
     let store_value = store_value?;
     let store_ptr = store_ptr?;
     // The store value must be either: load_a, the redundant then-load,
-    // the then-block unary, or the then-block binop.
+    // the then-block unary, the then-block binop, or a loop-invariant
+    // scalar (typically a literal constant — `where (cond) b = K`).
     let unary_id = then_unary.map(|(id, _)| id);
     let binop_id = then_binop.map(|b| b.inst_id);
+    let mut then_const: Option<ValueId> = None;
     if store_value != load_a_id
         && Some(store_value) != then_load_id
         && Some(store_value) != unary_id
         && Some(store_value) != binop_id
     {
-        return None;
+        // Accept iff the store value is loop-invariant (defined
+        // outside body / then / incr). The scalar will be broadcast
+        // in the preheader and routed through vselect's true arm.
+        if body_ids.contains(&store_value)
+            || then_ids.contains(&store_value)
+            || incr_ids.contains(&store_value)
+        {
+            return None;
+        }
+        // Element type of the store value must match the dest array
+        // element type — defer the check until dest_access is known
+        // (validated below alongside src/dest type match).
+        then_const = Some(store_value);
     }
     // For binop: scalar operand must be loop-invariant (not defined
     // in body, then, or incr). FDiv is float-only.
@@ -1433,6 +1451,7 @@ fn build_where_plan(func: &Function, shape: &WhereLoop) -> Option<WherePlan> {
         then_load_id,
         then_unary,
         then_binop,
+        then_const,
         dest_ptr_id: store_ptr,
         src_access,
         dest_access,
@@ -1583,6 +1602,23 @@ fn apply_where_plan(func: &mut Function, shape: &WhereLoop, plan: WherePlan) {
             span,
         });
         vbin_id
+    } else if let Some(k_scalar) = plan.then_const {
+        // Broadcast the loop-invariant scalar in the preheader so the
+        // vselect sees a full lane-vector of K's in its true arm.
+        let vk_id = func.next_value_id();
+        func.register_type(vk_id, v_ty.clone());
+        let preheader = func.block_mut(shape.preheader);
+        let pos = preheader.insts.len();
+        preheader.insts.insert(
+            pos,
+            Inst {
+                id: vk_id,
+                kind: InstKind::VBroadcast(k_scalar),
+                ty: v_ty.clone(),
+                span,
+            },
+        );
+        vk_id
     } else {
         plan.load_a_id
     };
