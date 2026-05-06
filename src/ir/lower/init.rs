@@ -97,6 +97,33 @@ pub(crate) fn init_decls(
                                 None,
                                 None,
                             );
+                        } else if let Some(values) = super::core::extract_reshape_source_ac(&init_expr.node) {
+                            // F2018 §16.9.169 RESHAPE used as a declared
+                            // initializer for a fixed-shape stack array.
+                            // The source AC is laid out column-major into
+                            // the destination; for a contiguous source the
+                            // reshape is a pure reinterpretation, so we
+                            // can store the flat element list straight
+                            // into the slot via the existing AC writer.
+                            // Pre-fix `reshape([...], [...])` initializers
+                            // were silently dropped here, leaving every
+                            // rank-2+ stack array with garbage data — every
+                            // example that did `real :: y(2,3) =
+                            // reshape([1.,2.,3.,4.,5.,6.], [2,3])` saw
+                            // y(1,1) come back as a junk float.
+                            store_ac_values_into(
+                                b,
+                                locals,
+                                info.addr,
+                                &info.ty,
+                                info.derived_type.as_deref(),
+                                values,
+                                st,
+                                type_layouts,
+                                None,
+                                None,
+                                None,
+                            );
                         } else if matches!(
                             &init_expr.node,
                             Expr::IntegerLiteral { .. }

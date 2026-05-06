@@ -17873,6 +17873,61 @@ pub(super) fn lower_runtime_array_constructor_descriptor(
 /// Audit BLOCKING-1: previously the implied-do branch silently
 /// skipped all stores and advanced a compile-time counter,
 /// leaving the destination buffer with whatever stack bytes
+/// Recognise `reshape(SOURCE, SHAPE [, ...])` where SOURCE is an
+/// array constructor and return its values. Used by `init_decls`
+/// to populate fixed-shape stack arrays declared with
+/// `real :: y(2,3) = reshape([1.,2.,...], [2,3])`. The reshape's
+/// SOURCE list is laid out column-major into the destination, which
+/// for a contiguous source matches a flat element-by-element store
+/// (the existing AC writer's behavior). PAD/ORDER variants aren't
+/// folded here — they fall back to silently skipping init the same
+/// way they used to (visible if the user mixes them in declared
+/// initializers, which is rare).
+pub(super) fn extract_reshape_source_ac(
+    expr: &crate::ast::expr::Expr,
+) -> Option<&[crate::ast::expr::AcValue]> {
+    use crate::ast::expr::{Expr, SectionSubscript};
+    let Expr::FunctionCall { callee, args } = expr else {
+        return None;
+    };
+    let Expr::Name { name } = &callee.node else {
+        return None;
+    };
+    if !name.eq_ignore_ascii_case("reshape") {
+        return None;
+    }
+    if args.len() < 2 {
+        return None;
+    }
+    // Source is positional arg 0 OR keyword `source`. Don't accept if
+    // PAD/ORDER are present — that needs a real reshape evaluator.
+    for a in args.iter().skip(2) {
+        if let Some(k) = &a.keyword {
+            let k = k.to_ascii_lowercase();
+            if k != "shape" {
+                return None;
+            }
+        }
+    }
+    let src_arg = if let Some(named) = args
+        .iter()
+        .find(|a| a.keyword.as_deref().map(str::to_ascii_lowercase) == Some("source".into()))
+    {
+        named
+    } else if args[0].keyword.is_none() {
+        &args[0]
+    } else {
+        return None;
+    };
+    let SectionSubscript::Element(src_expr) = &src_arg.value else {
+        return None;
+    };
+    let Expr::ArrayConstructor { values, .. } = &src_expr.node else {
+        return None;
+    };
+    Some(values.as_slice())
+}
+
 /// happened to be there (the comment lied about allocas being
 /// zeroed). Programs that used `[(expr, i=1,n)]` got garbage.
 pub(super) fn store_ac_values_into(
@@ -24361,7 +24416,18 @@ pub(super) fn lower_rank1_array_compare_descriptor(
         IrType::Int(IntWidth::I64),
     );
 
-    // Allocate the result descriptor with elem_size matching Bool (i32 = 4).
+    // F2018 §10.1.5: relational ops over array operands yield a
+    // logical array of the same SHAPE (rank + extents) as the
+    // operands.  The function name says "rank1" but the loop below
+    // walks the underlying buffer flat and works for any rank — we
+    // just need to allocate the mask with the correct rank-N
+    // descriptor.  afs_allocate_like_with_elem_size copies source's
+    // rank+extents and forces lbound=1 per F2018 §6.5.3.5(2)
+    // (every fresh array expression is 1-based, irrespective of
+    // operand bounds; install_assumed_shape_lower_overrides then
+    // gives callees a consistent 1-based view through `mask(:,:)`
+    // dummies).  Element size differs from the source (Bool=4 vs.
+    // potentially Real(8) source), so we cannot reuse afs_allocate_like.
     let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
     let zero32 = b.const_i32(0);
     let sz384 = b.const_i64(384);
@@ -24370,27 +24436,17 @@ pub(super) fn lower_rank1_array_compare_descriptor(
         vec![result_desc, zero32, sz384],
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
     );
-    let bounds = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 24));
-    let zero64 = b.const_i64(0);
-    let one64 = b.const_i64(1);
-    let lower_ptr = b.gep(bounds, vec![zero64], IrType::Int(IntWidth::I8));
-    let eight = b.const_i64(8);
-    let upper_ptr = b.gep(bounds, vec![eight], IrType::Int(IntWidth::I8));
-    let sixteen = b.const_i64(16);
-    let stride_ptr = b.gep(bounds, vec![sixteen], IrType::Int(IntWidth::I8));
-    b.store(one64, lower_ptr);
-    b.store(n, upper_ptr);
-    b.store(one64, stride_ptr);
-
     let stat = b.alloca(IrType::Int(IntWidth::I32));
     b.store(zero32, stat);
-    let elem_size = b.const_i64(ir_scalar_byte_size(&IrType::Bool));
-    let rank = b.const_i32(1);
+    let bool_elem_size = b.const_i64(ir_scalar_byte_size(&IrType::Bool));
     b.call(
-        FuncRef::External("afs_allocate_array".into()),
-        vec![result_desc, elem_size, rank, bounds, stat],
+        FuncRef::External("afs_allocate_like_with_elem_size".into()),
+        vec![result_desc, source_desc, bool_elem_size, stat],
         IrType::Void,
     );
+
+    let zero64 = b.const_i64(0);
+    let one64 = b.const_i64(1);
 
     let i_addr = b.alloca(IrType::Int(IntWidth::I64));
     b.store(zero64, i_addr);
