@@ -1827,6 +1827,64 @@ fn select_inst(
                 def: None,
             });
         }
+        InstKind::VFCmp(op, a, b) => {
+            // NEON fcmp produces an all-ones / all-zeros mask per lane.
+            // Eq/Ge/Gt are direct; Ne/Le/Lt swap operands or invert.
+            // For Lt: fcmgt swapped operands. For Le: fcmge swapped.
+            // Ne is not a single-instruction in NEON; we don't handle
+            // it yet (vectorizer doesn't emit Ne).
+            let dest = ctx.get_vreg(mf, inst.id, RegClass::V128);
+            let va = ctx.lookup_vreg(*a);
+            let vb = ctx.lookup_vreg(*b);
+            let shape = VShape::from_ir(&inst.ty);
+            let (opcode, swap) = match (shape, op) {
+                (Some(VShape::F4S), CmpOp::Gt) => (ArmOpcode::FcmgtV4S, false),
+                (Some(VShape::F2D), CmpOp::Gt) => (ArmOpcode::FcmgtV2D, false),
+                (Some(VShape::F4S), CmpOp::Ge) => (ArmOpcode::FcmgeV4S, false),
+                (Some(VShape::F2D), CmpOp::Ge) => (ArmOpcode::FcmgeV2D, false),
+                (Some(VShape::F4S), CmpOp::Eq) => (ArmOpcode::FcmeqV4S, false),
+                (Some(VShape::F2D), CmpOp::Eq) => (ArmOpcode::FcmeqV2D, false),
+                (Some(VShape::F4S), CmpOp::Lt) => (ArmOpcode::FcmgtV4S, true),
+                (Some(VShape::F2D), CmpOp::Lt) => (ArmOpcode::FcmgtV2D, true),
+                (Some(VShape::F4S), CmpOp::Le) => (ArmOpcode::FcmgeV4S, true),
+                (Some(VShape::F2D), CmpOp::Le) => (ArmOpcode::FcmgeV2D, true),
+                _ => (ArmOpcode::Nop, false),
+            };
+            let (lhs, rhs) = if swap { (vb, va) } else { (va, vb) };
+            mf.block_mut(mb).insts.push(MachineInst {
+                opcode,
+                operands: vec![
+                    MachineOperand::VReg(dest),
+                    MachineOperand::VReg(lhs),
+                    MachineOperand::VReg(rhs),
+                ],
+                def: Some(dest),
+            });
+        }
+        InstKind::VICmp(op, a, b) => {
+            let dest = ctx.get_vreg(mf, inst.id, RegClass::V128);
+            let va = ctx.lookup_vreg(*a);
+            let vb = ctx.lookup_vreg(*b);
+            let shape = VShape::from_ir(&inst.ty);
+            let (opcode, swap) = match (shape, op) {
+                (Some(VShape::V4S), CmpOp::Gt) => (ArmOpcode::CmgtV4S, false),
+                (Some(VShape::V4S), CmpOp::Ge) => (ArmOpcode::CmgeV4S, false),
+                (Some(VShape::V4S), CmpOp::Eq) => (ArmOpcode::CmeqV4S, false),
+                (Some(VShape::V4S), CmpOp::Lt) => (ArmOpcode::CmgtV4S, true),
+                (Some(VShape::V4S), CmpOp::Le) => (ArmOpcode::CmgeV4S, true),
+                _ => (ArmOpcode::Nop, false),
+            };
+            let (lhs, rhs) = if swap { (vb, va) } else { (va, vb) };
+            mf.block_mut(mb).insts.push(MachineInst {
+                opcode,
+                operands: vec![
+                    MachineOperand::VReg(dest),
+                    MachineOperand::VReg(lhs),
+                    MachineOperand::VReg(rhs),
+                ],
+                def: Some(dest),
+            });
+        }
         InstKind::VBroadcast(scalar) => {
             let s = ctx.lookup_vreg(*scalar);
             let dest = ctx.get_vreg(mf, inst.id, RegClass::V128);
