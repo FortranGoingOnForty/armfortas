@@ -1577,7 +1577,7 @@ fn link(obj: &Path, output: &Path, opts: &Options) -> Result<(), String> {
 /// Link prebuilt objects and archives with the runtime to produce a
 /// binary or shared library, preserving the user-supplied input order.
 fn link_inputs(inputs: &[PathBuf], output: &Path, opts: &Options) -> Result<(), String> {
-    if let Some(linker) = env_override("AFS_LD_PATH") {
+    if let Some(linker) = afs_ld_override() {
         return link_inputs_with_afs_ld(&linker, inputs, output, opts);
     }
 
@@ -1622,19 +1622,10 @@ fn link_inputs_with_afs_ld(
     opts: &Options,
 ) -> Result<(), String> {
     if opts.shared {
-        return Err("AFS_LD_PATH override does not yet support shared-library links".into());
-    }
-    if !opts.library_search_paths.is_empty() {
-        return Err("AFS_LD_PATH override does not yet support -L search paths".into());
-    }
-    if !opts.link_libs.is_empty() {
-        return Err("AFS_LD_PATH override does not yet support -l linker inputs".into());
-    }
-    if !opts.rpath.is_empty() {
-        return Err("AFS_LD_PATH override does not yet support -rpath".into());
+        return Err("AFS_LD override does not yet support shared-library links".into());
     }
     if opts.static_link {
-        return Err("AFS_LD_PATH override does not yet support static-link mode".into());
+        return Err("AFS_LD override does not yet support static-link mode".into());
     }
 
     let rt_path = find_runtime_lib()?;
@@ -1652,6 +1643,7 @@ fn link_inputs_with_afs_ld(
     }
     args.push(rt_path);
     args.push(libsystem_tbd);
+    push_afs_ld_link_flags(&mut args, opts);
 
     let output = Command::new(linker)
         .args(&args)
@@ -1692,6 +1684,47 @@ fn push_link_flags(args: &mut Vec<String>, opts: &Options) {
         // intent visible without breaking link.
         args.push("-search_paths_first".into());
     }
+}
+
+fn push_afs_ld_link_flags(args: &mut Vec<String>, opts: &Options) {
+    for dir in &opts.library_search_paths {
+        args.push("-L".into());
+        args.push(dir.to_string_lossy().into_owned());
+    }
+    for lib in &opts.link_libs {
+        args.push("-l".into());
+        args.push(lib.clone());
+    }
+    for path in &opts.rpath {
+        args.push("-rpath".into());
+        args.push(path.to_string_lossy().into_owned());
+    }
+}
+
+fn afs_ld_override() -> Option<String> {
+    if let Some(linker) = env_override("AFS_LD_PATH") {
+        return Some(linker);
+    }
+    let enabled = env_override("AFS_LD")?;
+    if matches!(
+        enabled.as_str(),
+        "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF"
+    ) {
+        return None;
+    }
+    Some(resolve_sibling_tool("afs-ld"))
+}
+
+fn resolve_sibling_tool(name: &str) -> String {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+    }
+    name.into()
 }
 
 fn env_override(name: &str) -> Option<String> {
