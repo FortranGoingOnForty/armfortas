@@ -1547,15 +1547,6 @@ fn detect_partial_unroll_runtime_loop(
     if body_inst_count == 0 {
         return None;
     }
-    // Reject calls in the latch — partial unroll across calls can be
-    // unsafe (the call may have side effects observable per-iteration).
-    if latch_blk
-        .insts
-        .iter()
-        .any(|i| matches!(i.kind, InstKind::Call(..) | InstKind::RuntimeCall(..)))
-    {
-        return None;
-    }
     // Multi-store regalloc-pressure heuristic (mirrors the static path).
     let store_count = latch_blk
         .insts
