@@ -3305,7 +3305,11 @@ mod tests {
 
             b.set_block(def_block);
             let slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
-            b.call(FuncRef::External("_callee".into()), vec![slot], IrType::Void);
+            b.call(
+                FuncRef::External("_callee".into()),
+                vec![slot],
+                IrType::Void,
+            );
             b.branch(use_block, vec![]);
         }
 

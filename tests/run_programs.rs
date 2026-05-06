@@ -1541,8 +1541,13 @@ fn compile_stage_bytes(
     opt_flag: &str,
     stage: ReproStage,
 ) -> Result<Vec<u8>, String> {
-    let source_path = fs::canonicalize(source)
-        .map_err(|e| format!("{}: cannot canonicalize source path: {}", source.display(), e))?;
+    let source_path = fs::canonicalize(source).map_err(|e| {
+        format!(
+            "{}: cannot canonicalize source path: {}",
+            source.display(),
+            e
+        )
+    })?;
     let stem = source.file_stem().unwrap().to_str().unwrap();
     let level = opt_flag.trim_start_matches('-');
     let (kind, ext, extra_args): (&str, &str, &[&str]) = match stage {
@@ -1554,7 +1559,8 @@ fn compile_stage_bytes(
         }
     };
     let out = unique_temp_path(kind, stem, level, ext);
-    let compile_sandbox = unique_temp_path("compile_sandbox", stem, &format!("{}_{}", level, kind), "");
+    let compile_sandbox =
+        unique_temp_path("compile_sandbox", stem, &format!("{}_{}", level, kind), "");
     fs::create_dir_all(&compile_sandbox).map_err(|e| {
         format!(
             "{}: cannot create {} compile sandbox {}: {}",

@@ -29,9 +29,12 @@ fn scratch_filename(unit: i32) -> String {
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
     let dir = std::env::temp_dir();
-    dir.join(format!("afs_scratch_{pid}_{}_{seq}.tmp", unit.unsigned_abs()))
-        .to_string_lossy()
-        .into_owned()
+    dir.join(format!(
+        "afs_scratch_{pid}_{}_{seq}.tmp",
+        unit.unsigned_abs()
+    ))
+    .to_string_lossy()
+    .into_owned()
 }
 
 #[inline]
@@ -669,7 +672,11 @@ pub extern "C" fn afs_close_ex(unit: i32, status: *const u8, status_len: i64, io
         } else if close_status != 0 {
             // Release lock before exit (afs_io_finalize atexit re-locks). See afs_open.
             drop(state);
-            eprintln!("CLOSE: {}: {}", filename, io::Error::from_raw_os_error(close_status));
+            eprintln!(
+                "CLOSE: {}: {}",
+                filename,
+                io::Error::from_raw_os_error(close_status)
+            );
             std::process::exit(1);
         }
     } else {

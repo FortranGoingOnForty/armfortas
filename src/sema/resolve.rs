@@ -134,7 +134,11 @@ fn backfill_function_result_type(
     let result_key = result_name.to_ascii_lowercase();
     let (type_info, pointer, allocatable) = match st.scope(function_scope).symbols.get(&result_key)
     {
-        Some(sym) => (sym.type_info.clone(), sym.attrs.pointer, sym.attrs.allocatable),
+        Some(sym) => (
+            sym.type_info.clone(),
+            sym.attrs.pointer,
+            sym.attrs.allocatable,
+        ),
         None => return,
     };
     let Some(type_info) = type_info else {
@@ -554,16 +558,8 @@ fn resolve_unit(
             // Surface each declared procedure to the enclosing scope
             // so callers under IMPLICIT NONE can resolve the name,
             // and so BIND(C) external prototypes are callable.
-            for (
-                fn_name,
-                kind,
-                ti,
-                arg_names,
-                binding_label,
-                pure,
-                elemental,
-                result_rank,
-            ) in outer_refs
+            for (fn_name, kind, ti, arg_names, binding_label, pure, elemental, result_rank) in
+                outer_refs
             {
                 let span = unit.span;
                 let _ = st.define(Symbol {
@@ -1053,9 +1049,9 @@ fn load_external_module(
     // :: dummy` falls back to default kind=4 and silently truncates a
     // 64-bit local to 32 bits.
     for rename in &iface.renames {
-        let src_scope = st
-            .find_module_scope(&rename.source_module)
-            .or_else(|| load_external_module(st, &rename.source_module, search_paths, type_layouts));
+        let src_scope = st.find_module_scope(&rename.source_module).or_else(|| {
+            load_external_module(st, &rename.source_module, search_paths, type_layouts)
+        });
         let Some(src_scope) = src_scope else {
             continue;
         };
@@ -1224,9 +1220,7 @@ fn load_external_module(
         // and reject `allocate(result(...))`. Use a doubly-underscored
         // synth name so SMP-body synthesis can find it (via the body
         // scope after sema injection) but no user code can collide.
-        if matches!(proc.kind, crate::sema::symtab::SymbolKind::Function)
-            && proc.result_rank > 0
-        {
+        if matches!(proc.kind, crate::sema::symtab::SymbolKind::Function) && proc.result_rank > 0 {
             let synth_name = format!(
                 "__amod_result_{}",
                 proc.result_name.as_deref().unwrap_or(&proc.name)
@@ -1432,10 +1426,13 @@ fn inject_separate_module_procedure_args(
     let proc_lc = proc_name.to_lowercase();
     let iface_scope = st.all_scopes().iter().find_map(|scope| {
         let direct_parent_matches = scope.parent == Some(parent_module_scope);
-        let via_interface = scope.parent.map(|pid| {
-            matches!(st.scope(pid).kind, ScopeKind::Interface)
-                && st.scope(pid).parent == Some(parent_module_scope)
-        }).unwrap_or(false);
+        let via_interface = scope
+            .parent
+            .map(|pid| {
+                matches!(st.scope(pid).kind, ScopeKind::Interface)
+                    && st.scope(pid).parent == Some(parent_module_scope)
+            })
+            .unwrap_or(false);
         if !direct_parent_matches && !via_interface {
             return None;
         }
@@ -1458,17 +1455,13 @@ fn inject_separate_module_procedure_args(
     let arg_symbols: Vec<Symbol> = arg_order
         .iter()
         .filter_map(|n| {
-            st.scope(iface_scope)
-                .symbols
-                .get(n)
-                .cloned()
-                .or_else(|| {
-                    st.scope(iface_scope)
-                        .symbols
-                        .iter()
-                        .find(|(_, s)| s.name.eq_ignore_ascii_case(n))
-                        .map(|(_, s)| s.clone())
-                })
+            st.scope(iface_scope).symbols.get(n).cloned().or_else(|| {
+                st.scope(iface_scope)
+                    .symbols
+                    .iter()
+                    .find(|(_, s)| s.name.eq_ignore_ascii_case(n))
+                    .map(|(_, s)| s.clone())
+            })
         })
         .collect();
 
@@ -1964,10 +1957,7 @@ fn collect_const_derived_field_inits(
                     }
                 }
                 for (field_name, field_init) in overrides {
-                    combined.insert(
-                        field_name.to_ascii_lowercase(),
-                        (field_name, field_init),
-                    );
+                    combined.insert(field_name.to_ascii_lowercase(), (field_name, field_init));
                 }
 
                 for (_field_key, (field_name, field_init)) in combined {
@@ -2088,11 +2078,7 @@ fn resolve_proc_pointer_default_targets(
 /// unmodified.  USE associations are followed transitively so renames
 /// like `default_hasher => fnv_1_hasher` resolve to the underlying
 /// procedure's origin module.
-fn resolve_proc_pointer_link_symbol(
-    st: &SymbolTable,
-    from_scope: ScopeId,
-    target: &str,
-) -> String {
+fn resolve_proc_pointer_link_symbol(st: &SymbolTable, from_scope: ScopeId, target: &str) -> String {
     let key = target.to_lowercase();
     let mut seen = std::collections::HashSet::new();
     let mut current_scope = from_scope;
@@ -2372,7 +2358,8 @@ fn process_contains(
 ) -> Result<(), SemaError> {
     for unit in contains {
         // Register the subprogram name in the current scope before descending.
-        let host_is_submodule = matches!(st.scope(st.current_scope()).kind, ScopeKind::Submodule(_));
+        let host_is_submodule =
+            matches!(st.scope(st.current_scope()).kind, ScopeKind::Submodule(_));
         match &unit.node {
             ProgramUnit::Subroutine {
                 name, prefix, bind, ..
@@ -2616,23 +2603,23 @@ fn eval_const_int_expr(expr: &crate::ast::expr::SpannedExpr, st: &SymbolTable) -
                             _ => None,
                         }?;
                         match ty {
-                            TypeInfo::Integer { kind } => Some(match kind
-                                .unwrap_or(crate::driver::defaults::default_int_kind())
-                            {
-                                1 => 2,
-                                2 => 4,
-                                4 => 9,
-                                8 => 18,
-                                16 => 38,
-                                _ => return None,
-                            }),
-                            TypeInfo::Real { kind } => Some(match kind
-                                .unwrap_or(crate::driver::defaults::default_real_kind())
-                            {
-                                4 => 37,
-                                8 => 307,
-                                _ => return None,
-                            }),
+                            TypeInfo::Integer { kind } => Some(
+                                match kind.unwrap_or(crate::driver::defaults::default_int_kind()) {
+                                    1 => 2,
+                                    2 => 4,
+                                    4 => 9,
+                                    8 => 18,
+                                    16 => 38,
+                                    _ => return None,
+                                },
+                            ),
+                            TypeInfo::Real { kind } => Some(
+                                match kind.unwrap_or(crate::driver::defaults::default_real_kind()) {
+                                    4 => 37,
+                                    8 => 307,
+                                    _ => return None,
+                                },
+                            ),
                             TypeInfo::DoublePrecision => Some(307),
                             _ => None,
                         }
@@ -2672,10 +2659,7 @@ fn extract_kind(sel: &Option<decl::KindSelector>, st: &SymbolTable) -> Option<u8
 /// string literals, references to other character parameters whose
 /// length is already known, and `lit // lit` / `lit // name` concat
 /// chains.  Returns None when we can't classify the init.
-fn derived_char_init_len(
-    e: &crate::ast::expr::Expr,
-    st: &SymbolTable,
-) -> Option<usize> {
+fn derived_char_init_len(e: &crate::ast::expr::Expr, st: &SymbolTable) -> Option<usize> {
     use crate::ast::expr::Expr;
     match e {
         Expr::StringLiteral { value, .. } => Some(value.len()),
@@ -2692,8 +2676,7 @@ fn derived_char_init_len(
             op: crate::ast::expr::BinaryOp::Concat,
             left,
             right,
-        } => Some(derived_char_init_len(&left.node, st)?
-            + derived_char_init_len(&right.node, st)?),
+        } => Some(derived_char_init_len(&left.node, st)? + derived_char_init_len(&right.node, st)?),
         _ => None,
     }
 }

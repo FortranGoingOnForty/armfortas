@@ -9215,7 +9215,11 @@ fn generic_subroutine_accepts_imported_derived_array_element_actual() {
     let main_obj = dir.join("main.o");
     let out = dir.join("generic_imported_derived_array_elem");
 
-    for (src, obj) in [(&types_src, &types_obj), (&impl_src, &impl_obj), (&main_src, &main_obj)] {
+    for (src, obj) in [
+        (&types_src, &types_obj),
+        (&impl_src, &impl_obj),
+        (&main_src, &main_obj),
+    ] {
         let compile = Command::new(compiler("armfortas"))
             .current_dir(&dir)
             .args([
@@ -10757,9 +10761,7 @@ fn matmul_over_integer_matrices_uses_column_major_indexing() {
         "matmul int should compile: {}",
         String::from_utf8_lossy(&compile.stderr)
     );
-    let run = Command::new(&out)
-        .output()
-        .expect("matmul int run failed");
+    let run = Command::new(&out).output().expect("matmul int run failed");
     assert!(
         run.status.success(),
         "matmul int should pass: status={:?} stdout={} stderr={}",
@@ -10838,7 +10840,9 @@ fn matmul_over_complex_kind4_matrices_produces_correct_results() {
         "matmul complex4 should compile: {}",
         String::from_utf8_lossy(&compile.stderr)
     );
-    let run = Command::new(&out).output().expect("matmul complex4 run failed");
+    let run = Command::new(&out)
+        .output()
+        .expect("matmul complex4 run failed");
     assert!(
         run.status.success(),
         "matmul complex4 should pass: status={:?} stdout={} stderr={}",
@@ -10873,7 +10877,9 @@ fn matmul_over_complex_kind8_matrices_produces_correct_imag_part() {
         "matmul complex8 should compile: {}",
         String::from_utf8_lossy(&compile.stderr)
     );
-    let run = Command::new(&out).output().expect("matmul complex8 run failed");
+    let run = Command::new(&out)
+        .output()
+        .expect("matmul complex8 run failed");
     assert!(
         run.status.success(),
         "matmul complex8 should pass: status={:?} stdout={} stderr={}",
@@ -10931,7 +10937,9 @@ fn inline_array_intrinsic_in_print_handles_complex_elements() {
         stdout
     );
     assert!(
-        stdout.contains(",   0.0000000E0)") || stdout.contains(",0.0000000E+0)") || stdout.contains(",   0.0000000E+0)"),
+        stdout.contains(",   0.0000000E0)")
+            || stdout.contains(",0.0000000E+0)")
+            || stdout.contains(",   0.0000000E+0)"),
         "complex closing paren missing: {}",
         stdout
     );
@@ -11714,8 +11722,16 @@ fn class_star_optional_argument_forwards_through_intermediate_subroutine() {
         String::from_utf8_lossy(&run.stderr)
     );
     let stdout = String::from_utf8_lossy(&run.stdout);
-    assert!(stdout.contains("A"), "expected absent path to print A: {}", stdout);
-    assert!(stdout.contains("P"), "expected present path to print P: {}", stdout);
+    assert!(
+        stdout.contains("A"),
+        "expected absent path to print A: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("P"),
+        "expected present path to print P: {}",
+        stdout
+    );
 
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
@@ -11868,7 +11884,10 @@ fn assumed_shape_lower_bound_override_rebases_dummy_descriptor() {
     );
     let stdout = String::from_utf8_lossy(&run.stdout);
     assert!(
-        stdout.contains("sorted=") && stdout.contains("1") && stdout.contains("2") && stdout.contains("3"),
+        stdout.contains("sorted=")
+            && stdout.contains("1")
+            && stdout.contains("2")
+            && stdout.contains("3"),
         "expected sorted output: {}",
         stdout
     );
@@ -12718,14 +12737,23 @@ fn inline_array_intrinsic_in_print_walks_descriptor_elements() {
     );
     let stdout = String::from_utf8_lossy(&run.stdout);
     // transpose([1..9, [3,3]]) = [1,4,7,2,5,8,3,6,9] in column-major
-    assert!(stdout.contains("1") && stdout.contains("4") && stdout.contains("7"),
-        "transpose row missing: {}", stdout);
+    assert!(
+        stdout.contains("1") && stdout.contains("4") && stdout.contains("7"),
+        "transpose row missing: {}",
+        stdout
+    );
     // matmul self-product diagonal: B(1,1)=30
-    assert!(stdout.contains("30") && stdout.contains("81") && stdout.contains("150"),
-        "matmul values missing: {}", stdout);
+    assert!(
+        stdout.contains("30") && stdout.contains("81") && stdout.contains("150"),
+        "matmul values missing: {}",
+        stdout
+    );
     // shape: "3 3"
-    assert!(stdout.lines().any(|l| l.split_whitespace().eq(["3", "3"])),
-        "shape line missing: {}", stdout);
+    assert!(
+        stdout.lines().any(|l| l.split_whitespace().eq(["3", "3"])),
+        "shape line missing: {}",
+        stdout
+    );
 
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
@@ -13102,7 +13130,9 @@ fn module_parameter_array_scalar_broadcast_init_keeps_array_global() {
         "scalar broadcast should compile + link: {}",
         String::from_utf8_lossy(&compile.stderr)
     );
-    let run = Command::new(&out).output().expect("scalar broadcast run failed");
+    let run = Command::new(&out)
+        .output()
+        .expect("scalar broadcast run failed");
     assert!(
         run.status.success(),
         "scalar broadcast should pass: status={:?} stdout={} stderr={}",
@@ -13149,7 +13179,9 @@ fn internal_subprogram_call_under_intrinsic_under_user_call_keeps_mangled_name()
         "should compile + link cleanly: {}",
         String::from_utf8_lossy(&compile.stderr)
     );
-    let run = Command::new(&out).output().expect("internal mangle run failed");
+    let run = Command::new(&out)
+        .output()
+        .expect("internal mangle run failed");
     assert!(
         run.status.success(),
         "should pass: status={:?} stdout={} stderr={}",
@@ -18243,7 +18275,10 @@ fn sibling_extensions_keep_distinct_runtime_tags_across_tus() {
         (&main_src, &main_obj, "main program", true),
     ] {
         let mut cmd = Command::new(compiler("armfortas"));
-        cmd.current_dir(&dir).arg("-c").arg("-J").arg(dir.to_str().unwrap());
+        cmd.current_dir(&dir)
+            .arg("-c")
+            .arg("-J")
+            .arg(dir.to_str().unwrap());
         if needs_imports {
             cmd.arg("-I").arg(dir.to_str().unwrap());
         }
@@ -21040,7 +21075,8 @@ fn logical_reduction_intrinsics_on_component_char_constructor_actuals_compile_an
 }
 
 #[test]
-fn logical_reduction_intrinsics_on_nonmatching_component_char_constructor_actuals_compile_and_run() {
+fn logical_reduction_intrinsics_on_nonmatching_component_char_constructor_actuals_compile_and_run()
+{
     let src = write_program(
         "program p\n  implicit none\n  type :: chars_t\n    character(len=1) :: equal\n    character(len=1) :: space\n    character(len=1) :: tab\n  end type\n  type(chars_t), parameter :: char_kind = chars_t('=', ' ', achar(9))\n\n  if (any(match(char_kind%equal, 1, [char_kind%space, char_kind%tab]))) error stop 1\n\n  print *, 'ok'\ncontains\n  elemental logical function match(src, idx, want) result(ok)\n    character(len=*), intent(in) :: src\n    integer, intent(in) :: idx\n    character(len=1), intent(in) :: want\n    ok = src(idx:idx) == want\n  end function\nend program\n",
         "f90",
@@ -24547,7 +24583,10 @@ fn module_global_component_overloaded_concat_preserves_nested_character_actual_l
         "module m\n  implicit none\n  integer, parameter :: i1 = selected_int_kind(2)\n  type :: color_code\n    integer(i1) :: style = -1_i1\n    integer(i1) :: bg = -1_i1\n    integer(i1) :: fg = -1_i1\n  end type\n  type :: color_output\n    type(color_code) :: dim = color_code(style=2_i1)\n    type(color_code) :: reset = color_code()\n    type(color_code) :: blue = color_code(fg=4_i1)\n  end type\n  type(color_output), protected :: color\n  interface operator(//)\n    module procedure :: concat_color_left\n    module procedure :: concat_color_right\n  end interface\ncontains\n  pure function concat_color_left(lval, code) result(str)\n    character(len=*), intent(in) :: lval\n    type(color_code), intent(in) :: code\n    character(len=:), allocatable :: str\n    if (anycolor(code)) then\n      str = lval // 'X'\n    else\n      str = lval // 'Y'\n    end if\n  end function\n  pure function concat_color_right(code, rval) result(str)\n    type(color_code), intent(in) :: code\n    character(len=*), intent(in) :: rval\n    character(len=:), allocatable :: str\n    if (anycolor(code)) then\n      str = 'Z' // rval\n    else\n      str = 'W' // rval\n    end if\n  end function\n  pure function anycolor(code) result(flag)\n    type(color_code), intent(in) :: code\n    logical :: flag\n    flag = code%fg >= 0 .or. code%bg >= 0 .or. code%style >= 0\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  character(len=:), allocatable :: s\n  s = 'A' // color%dim // 'B' // color%reset // 'C' // color%blue\n  if (s /= 'AXBYCX') error stop 1\n  print *, 'ok'\nend program\n",
         "f90",
     );
-    let out = unique_path("module_global_component_overloaded_concat_nested_len", "bin");
+    let out = unique_path(
+        "module_global_component_overloaded_concat_nested_len",
+        "bin",
+    );
     let compile = Command::new(compiler("armfortas"))
         .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
         .output()
@@ -25532,7 +25571,9 @@ fn complex_re_im_designators_lower_to_correct_lane_and_dispatch_real_kind() {
         "complex %re dispatch compile failed: {}",
         String::from_utf8_lossy(&compile.stderr)
     );
-    let run = Command::new(&out).output().expect("complex %re dispatch run failed");
+    let run = Command::new(&out)
+        .output()
+        .expect("complex %re dispatch run failed");
     assert!(
         run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
         "complex %re dispatch run failed: status={:?} stdout={} stderr={}",
@@ -25618,7 +25659,15 @@ fn f2008_submodule_explicit_iface_smp_body_split_file_runtime_shape_result() {
         String::from_utf8_lossy(&run.stderr)
     );
 
-    for p in [&parent_src, &sub_src, &main_src, &parent_o, &sub_o, &main_o, &out] {
+    for p in [
+        &parent_src,
+        &sub_src,
+        &main_src,
+        &parent_o,
+        &sub_o,
+        &main_o,
+        &out,
+    ] {
         let _ = std::fs::remove_file(p);
     }
     let _ = std::fs::remove_dir_all(&mod_dir);
@@ -26207,7 +26256,9 @@ fn nested_call_chain_with_array_section_args_keeps_frame_bounded() {
     // Pre-fix: ~958. Post-fix: well under 50 for this shape.
     let probes_to_next_label = asm_text[outer_start..]
         .lines()
-        .take_while(|line| !line.trim_start().starts_with("_afs_modproc_") || line.contains("water_simple:"))
+        .take_while(|line| {
+            !line.trim_start().starts_with("_afs_modproc_") || line.contains("water_simple:")
+        })
         .filter(|line| line.contains("movz x16, #16384"))
         .count();
     assert!(
@@ -26216,7 +26267,9 @@ fn nested_call_chain_with_array_section_args_keeps_frame_bounded() {
          The fix in array_function_result_elem_type may have regressed.",
         probes_to_next_label
     );
-    let run = Command::new(&out).output().expect("water-hash-frame run failed");
+    let run = Command::new(&out)
+        .output()
+        .expect("water-hash-frame run failed");
     assert!(
         run.status.success(),
         "water-hash-frame run failed: status={:?} stdout={} stderr={}",
@@ -26549,7 +26602,9 @@ fn defined_assignment_class_lhs_loads_descriptor_pointer_through_slot() {
         "class assign compile failed: {}",
         String::from_utf8_lossy(&compile.stderr)
     );
-    let run = Command::new(&out).output().expect("class assign run failed");
+    let run = Command::new(&out)
+        .output()
+        .expect("class assign run failed");
     assert!(
         run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
         "class assign run failed: status={:?} stdout={} stderr={}",
@@ -26682,7 +26737,15 @@ fn amod_proc_attrs_split_preserves_result_array_bounds_with_inner_comma() {
         String::from_utf8_lossy(&run.stderr)
     );
 
-    for p in [&parent_src, &sub_src, &main_src, &parent_o, &sub_o, &main_o, &out] {
+    for p in [
+        &parent_src,
+        &sub_src,
+        &main_src,
+        &parent_o,
+        &sub_o,
+        &main_o,
+        &out,
+    ] {
         let _ = std::fs::remove_file(p);
     }
     let _ = std::fs::remove_dir_all(&mod_dir);
@@ -26715,7 +26778,9 @@ fn cmplx_whole_array_with_kind_keyword_returns_correct_kind_descriptor() {
         "cmplx whole-array compile failed: {}",
         String::from_utf8_lossy(&compile.stderr)
     );
-    let run = Command::new(&out).output().expect("cmplx whole-array run failed");
+    let run = Command::new(&out)
+        .output()
+        .expect("cmplx whole-array run failed");
     assert!(
         run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
         "cmplx whole-array run failed: status={:?} stdout={} stderr={}",

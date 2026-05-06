@@ -2054,10 +2054,7 @@ pub extern "C" fn afs_array_size_dim(desc: *const ArrayDescriptor, dim: i32) -> 
 /// `rank`, holding each dimension's extent. Allocates the destination
 /// via `afs_allocate_array`. F2018 §16.9.207.
 #[no_mangle]
-pub extern "C" fn afs_array_shape_int4(
-    dst: *mut ArrayDescriptor,
-    src: *const ArrayDescriptor,
-) {
+pub extern "C" fn afs_array_shape_int4(dst: *mut ArrayDescriptor, src: *const ArrayDescriptor) {
     if dst.is_null() || src.is_null() {
         return;
     }
@@ -2080,10 +2077,7 @@ pub extern "C" fn afs_array_shape_int4(
 
 /// SHAPE(array, kind=int64) → rank-1 i64 array of extents.
 #[no_mangle]
-pub extern "C" fn afs_array_shape_int8(
-    dst: *mut ArrayDescriptor,
-    src: *const ArrayDescriptor,
-) {
+pub extern "C" fn afs_array_shape_int8(dst: *mut ArrayDescriptor, src: *const ArrayDescriptor) {
     if dst.is_null() || src.is_null() {
         return;
     }
@@ -2400,22 +2394,30 @@ pub extern "C" fn afs_array_sum_real8_dim(
     if s.elem_size == 4 {
         let buf = d.base_addr as *mut f32;
         for i in 0..dst_total {
-            unsafe { *buf.add(i) = 0.0; }
+            unsafe {
+                *buf.add(i) = 0.0;
+            }
         }
         let src_ptr = s.base_addr as *const u8;
         for_each_reduce_along_dim(s, dim, |byte_off, dst_flat| {
             let v = unsafe { *(src_ptr.add(byte_off) as *const f32) };
-            unsafe { *buf.add(dst_flat) += v; }
+            unsafe {
+                *buf.add(dst_flat) += v;
+            }
         });
     } else {
         let buf = d.base_addr as *mut f64;
         for i in 0..dst_total {
-            unsafe { *buf.add(i) = 0.0; }
+            unsafe {
+                *buf.add(i) = 0.0;
+            }
         }
         let src_ptr = s.base_addr as *const u8;
         for_each_reduce_along_dim(s, dim, |byte_off, dst_flat| {
             let v = unsafe { *(src_ptr.add(byte_off) as *const f64) };
-            unsafe { *buf.add(dst_flat) += v; }
+            unsafe {
+                *buf.add(dst_flat) += v;
+            }
         });
     }
 }
@@ -2474,41 +2476,57 @@ pub extern "C" fn afs_array_sum_int_dim(
         1 => {
             let buf = d.base_addr as *mut i8;
             for i in 0..dst_total {
-                unsafe { *buf.add(i) = 0; }
+                unsafe {
+                    *buf.add(i) = 0;
+                }
             }
             for_each_reduce_along_dim(s, dim, |byte_off, dst_flat| {
                 let v = unsafe { *(src_ptr.add(byte_off) as *const i8) };
-                unsafe { *buf.add(dst_flat) = (*buf.add(dst_flat)).wrapping_add(v); }
+                unsafe {
+                    *buf.add(dst_flat) = (*buf.add(dst_flat)).wrapping_add(v);
+                }
             });
         }
         2 => {
             let buf = d.base_addr as *mut i16;
             for i in 0..dst_total {
-                unsafe { *buf.add(i) = 0; }
+                unsafe {
+                    *buf.add(i) = 0;
+                }
             }
             for_each_reduce_along_dim(s, dim, |byte_off, dst_flat| {
                 let v = unsafe { *(src_ptr.add(byte_off) as *const i16) };
-                unsafe { *buf.add(dst_flat) = (*buf.add(dst_flat)).wrapping_add(v); }
+                unsafe {
+                    *buf.add(dst_flat) = (*buf.add(dst_flat)).wrapping_add(v);
+                }
             });
         }
         4 => {
             let buf = d.base_addr as *mut i32;
             for i in 0..dst_total {
-                unsafe { *buf.add(i) = 0; }
+                unsafe {
+                    *buf.add(i) = 0;
+                }
             }
             for_each_reduce_along_dim(s, dim, |byte_off, dst_flat| {
                 let v = unsafe { *(src_ptr.add(byte_off) as *const i32) };
-                unsafe { *buf.add(dst_flat) = (*buf.add(dst_flat)).wrapping_add(v); }
+                unsafe {
+                    *buf.add(dst_flat) = (*buf.add(dst_flat)).wrapping_add(v);
+                }
             });
         }
         _ => {
             let buf = d.base_addr as *mut i64;
             for i in 0..dst_total {
-                unsafe { *buf.add(i) = 0; }
+                unsafe {
+                    *buf.add(i) = 0;
+                }
             }
             for_each_reduce_along_dim(s, dim, |byte_off, dst_flat| {
                 let v = unsafe { *(src_ptr.add(byte_off) as *const i64) };
-                unsafe { *buf.add(dst_flat) = (*buf.add(dst_flat)).wrapping_add(v); }
+                unsafe {
+                    *buf.add(dst_flat) = (*buf.add(dst_flat)).wrapping_add(v);
+                }
             });
         }
     }
@@ -3707,13 +3725,7 @@ pub extern "C" fn afs_transpose_int(source: *const ArrayDescriptor, result: *mut
         stride: 1,
     };
     let dims = [dim0, dim1];
-    afs_allocate_array(
-        result,
-        elem_size as i64,
-        2,
-        dims.as_ptr(),
-        ptr::null_mut(),
-    );
+    afs_allocate_array(result, elem_size as i64, 2, dims.as_ptr(), ptr::null_mut());
     let res = unsafe { &mut *result };
     let rp = res.base_addr;
 
@@ -3733,10 +3745,7 @@ pub extern "C" fn afs_transpose_int(source: *const ArrayDescriptor, result: *mut
 /// Handles complex(sp) (8-byte) and complex(dp) (16-byte) by reading the
 /// per-element width from the descriptor.
 #[no_mangle]
-pub extern "C" fn afs_array_conjg(
-    source: *const ArrayDescriptor,
-    result: *mut ArrayDescriptor,
-) {
+pub extern "C" fn afs_array_conjg(source: *const ArrayDescriptor, result: *mut ArrayDescriptor) {
     if source.is_null() || result.is_null() {
         return;
     }
@@ -3790,10 +3799,7 @@ pub extern "C" fn afs_array_conjg(
 /// 16B → real(dp) 8B), so we allocate fresh dims rather than using
 /// `afs_allocate_like`.
 #[no_mangle]
-pub extern "C" fn afs_array_aimag(
-    source: *const ArrayDescriptor,
-    result: *mut ArrayDescriptor,
-) {
+pub extern "C" fn afs_array_aimag(source: *const ArrayDescriptor, result: *mut ArrayDescriptor) {
     if source.is_null() || result.is_null() {
         return;
     }
@@ -3811,7 +3817,11 @@ pub extern "C" fn afs_array_aimag(
             stride: 1,
         };
     }
-    let dims_ptr = if src.rank > 0 { dims.as_ptr() } else { ptr::null() };
+    let dims_ptr = if src.rank > 0 {
+        dims.as_ptr()
+    } else {
+        ptr::null()
+    };
     afs_allocate_array(result, lane as i64, src.rank, dims_ptr, ptr::null_mut());
 
     let res = unsafe { &mut *result };
@@ -3860,7 +3870,11 @@ pub extern "C" fn afs_array_abs_complex(
             stride: 1,
         };
     }
-    let dims_ptr = if src.rank > 0 { dims.as_ptr() } else { ptr::null() };
+    let dims_ptr = if src.rank > 0 {
+        dims.as_ptr()
+    } else {
+        ptr::null()
+    };
     afs_allocate_array(result, lane as i64, src.rank, dims_ptr, ptr::null_mut());
 
     let res = unsafe { &mut *result };
@@ -3913,7 +3927,11 @@ pub extern "C" fn afs_array_cmplx(
         None
     } else {
         let im = unsafe { &*im_source };
-        if im.base_addr.is_null() { None } else { Some(im) }
+        if im.base_addr.is_null() {
+            None
+        } else {
+            Some(im)
+        }
     };
     let lane = out_lane_bytes.max(4) as usize;
     let elem_size = 2 * lane;
@@ -3925,7 +3943,11 @@ pub extern "C" fn afs_array_cmplx(
             stride: 1,
         };
     }
-    let dims_ptr = if re.rank > 0 { dims.as_ptr() } else { ptr::null() };
+    let dims_ptr = if re.rank > 0 {
+        dims.as_ptr()
+    } else {
+        ptr::null()
+    };
     afs_allocate_array(result, elem_size as i64, re.rank, dims_ptr, ptr::null_mut());
 
     let res = unsafe { &mut *result };

@@ -78,9 +78,9 @@ impl SymbolTable {
             // procedure (Subroutine/Function/Program). Stop walking
             // when we leave a procedure scope.
             match self.scopes[sid].kind {
-                ScopeKind::Subroutine(_)
-                | ScopeKind::Function(_)
-                | ScopeKind::Program(_) => return None,
+                ScopeKind::Subroutine(_) | ScopeKind::Function(_) | ScopeKind::Program(_) => {
+                    return None
+                }
                 _ => cur = self.scopes[sid].parent,
             }
         }
@@ -350,9 +350,7 @@ impl SymbolTable {
                     {
                         return Some(sym);
                     }
-                    if let Some(sym) =
-                        self.lookup_in(assoc.source_scope, &assoc.original_name)
-                    {
+                    if let Some(sym) = self.lookup_in(assoc.source_scope, &assoc.original_name) {
                         return Some(sym);
                     }
                 }

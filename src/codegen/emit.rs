@@ -754,17 +754,33 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
             if dest_is_gp && src_is_fp {
                 // GPR ← FPR: pick GPR width to match FPR (s→w, d→x).
                 let gp = if src.starts_with('d') {
-                    if dest_is_x { dest.clone() } else { format!("x{}", &dest[1..]) }
+                    if dest_is_x {
+                        dest.clone()
+                    } else {
+                        format!("x{}", &dest[1..])
+                    }
                 } else {
-                    if dest_is_w { dest.clone() } else { format!("w{}", &dest[1..]) }
+                    if dest_is_w {
+                        dest.clone()
+                    } else {
+                        format!("w{}", &dest[1..])
+                    }
                 };
                 return format!("fmov {}, {}", gp, src);
             }
             if dest_is_fp && src_is_gp {
                 let gp = if dest.starts_with('d') {
-                    if src_is_x { src.clone() } else { format!("x{}", &src[1..]) }
+                    if src_is_x {
+                        src.clone()
+                    } else {
+                        format!("x{}", &src[1..])
+                    }
                 } else {
-                    if src_is_w { src.clone() } else { format!("w{}", &src[1..]) }
+                    if src_is_w {
+                        src.clone()
+                    } else {
+                        format!("w{}", &src[1..])
+                    }
                 };
                 return format!("fmov {}, {}", dest, gp);
             }

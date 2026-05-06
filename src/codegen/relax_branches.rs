@@ -32,7 +32,9 @@
 //! function body larger than 128MB.
 
 use super::emit::emit_inst_text;
-use super::mir::{ArmCond, ArmOpcode, MBlockId, MachineBlock, MachineFunction, MachineInst, MachineOperand};
+use super::mir::{
+    ArmCond, ArmOpcode, MBlockId, MachineBlock, MachineFunction, MachineInst, MachineOperand,
+};
 
 /// Maximum signed offset (in bytes) reachable by a `B.cond`. The
 /// 19-bit signed immediate is scaled by 4, giving ±(2^20) bytes.

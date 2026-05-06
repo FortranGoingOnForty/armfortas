@@ -657,9 +657,7 @@ pub fn expr_type(
             let base_ty = expr_type(base, symtab);
             let lc = component.to_lowercase();
             match (lc.as_str(), &base_ty) {
-                ("re" | "im", FortranType::Complex { kind }) => {
-                    FortranType::Real { kind: *kind }
-                }
+                ("re" | "im", FortranType::Complex { kind }) => FortranType::Real { kind: *kind },
                 _ => FortranType::Unknown,
             }
         }
@@ -1069,10 +1067,7 @@ pub fn intrinsic_result_type(name: &str, args: &[FortranType]) -> Option<Fortran
         // `lower_rank1_elemental_call_descriptor` can't compute the mask
         // result element type and bails to the rank-1-only scalarization
         // path (which corrupts rank-N callers).
-        "ieee_is_nan"
-        | "ieee_is_finite"
-        | "ieee_is_negative"
-        | "ieee_is_normal"
+        "ieee_is_nan" | "ieee_is_finite" | "ieee_is_negative" | "ieee_is_normal"
         | "ieee_signbit" => Some(FortranType::default_logical()),
         "ieee_value" => args.first().cloned(),
 
