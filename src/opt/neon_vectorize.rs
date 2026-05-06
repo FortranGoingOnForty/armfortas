@@ -70,6 +70,32 @@ struct ArrayAccess {
     lower: i64,
 }
 
+/// A counted WHERE-block loop. The natural-loop body is a 4-block
+/// diamond: header (cmp + cond_br exit/body) → body (load + cmp +
+/// cond_br then/incr) → then (conditional store + br incr) → incr
+/// (iv += 1 + br header). The vectorizer rewrites this into:
+///
+///   body': vload a; vload b_old; v(f|i)cmp predicate; vselect mask, va, vb_old; vstore;
+///          drop the `then` block, branch body' → incr unconditionally.
+#[derive(Debug, Clone, Copy)]
+struct WhereLoop {
+    preheader: BlockId,
+    header: BlockId,
+    /// The body block holding the per-iteration cmp and cond_br
+    /// to `then` / `incr`.
+    body: BlockId,
+    /// The "then" arm with the conditional store(s).
+    then_block: BlockId,
+    /// The latch / incr block (iv + 1, br header).
+    incr_block: BlockId,
+    iv_param: ValueId,
+    iv_init: i64,
+    iv_bound: i64,
+    /// Header `icmp ge|gt iv, hi` (body on FALSE branch).
+    cond_id: ValueId,
+    bound_const_id: ValueId,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BinaryKind {
     Add,
@@ -266,6 +292,115 @@ fn detect_counted_loop(
         preheader,
         header,
         body,
+        iv_param,
+        iv_init,
+        iv_bound,
+        cond_id,
+        bound_const_id,
+    })
+}
+
+/// Detect a counted WHERE-block diamond:
+///   header(iv): icmp ge iv, hi; cond_br c, exit, body
+///   body: load + cmp + cond_br mask, then, incr
+///   then: store(s) + br incr
+///   incr: iv+1 + br header(iv+1)
+fn detect_where_loop(
+    func: &Function,
+    lp: &NaturalLoop,
+    preds: &HashMap<BlockId, Vec<BlockId>>,
+) -> Option<WhereLoop> {
+    if lp.latches.len() != 1 || lp.body.len() != 4 {
+        return None;
+    }
+    let header = lp.header;
+    let incr_block = lp.latches[0];
+    if incr_block == header {
+        return None;
+    }
+    let header_block = func.block(header);
+    if header_block.params.len() != 1 {
+        return None;
+    }
+    let iv_param = header_block.params[0].id;
+    if !matches!(header_block.params[0].ty, IrType::Int(_)) {
+        return None;
+    }
+    let preheader = find_preheader(func, lp, preds)?;
+    let iv_init = match &func.block(preheader).terminator {
+        Some(Terminator::Branch(dest, args)) if *dest == header && args.len() == 1 => {
+            resolve_const_int(func, args[0])?
+        }
+        _ => return None,
+    };
+    // Header terminator: cond_br with body on FALSE (exit on TRUE).
+    let (cond_id, true_dest, false_dest) = match &header_block.terminator {
+        Some(Terminator::CondBranch {
+            cond,
+            true_dest,
+            true_args,
+            false_dest,
+            false_args,
+        }) if true_args.is_empty() && false_args.is_empty() => {
+            (*cond, *true_dest, *false_dest)
+        }
+        _ => return None,
+    };
+    if lp.body.contains(&true_dest) || !lp.body.contains(&false_dest) {
+        return None;
+    }
+    let body = false_dest;
+    // Header cmp: `icmp ge iv, hi` (or `gt`, in which case bound is hi-1).
+    let cond_inst = header_block.insts.iter().find(|inst| inst.id == cond_id)?;
+    let (iv_bound, bound_const_id) = match cond_inst.kind {
+        InstKind::ICmp(CmpOp::Ge, lhs, rhs) if lhs == iv_param => {
+            (resolve_const_int(func, rhs)?.checked_sub(1)?, rhs)
+        }
+        InstKind::ICmp(CmpOp::Gt, lhs, rhs) if lhs == iv_param => {
+            (resolve_const_int(func, rhs)?, rhs)
+        }
+        _ => return None,
+    };
+    // Body terminator: cond_br to {then, incr}, with incr being the
+    // latch and `then` being a 4th body block.
+    let body_block = func.block(body);
+    let (then_block, body_else) = match &body_block.terminator {
+        Some(Terminator::CondBranch {
+            cond: _,
+            true_dest,
+            true_args,
+            false_dest,
+            false_args,
+        }) if true_args.is_empty() && false_args.is_empty() => (*true_dest, *false_dest),
+        _ => return None,
+    };
+    if !lp.body.contains(&then_block) || !lp.body.contains(&body_else) {
+        return None;
+    }
+    if then_block == header || then_block == incr_block || then_block == body {
+        return None;
+    }
+    if body_else != incr_block {
+        return None;
+    }
+    // The then block must br unconditionally to incr.
+    let then_blk = func.block(then_block);
+    match &then_blk.terminator {
+        Some(Terminator::Branch(d, args)) if *d == incr_block && args.is_empty() => {}
+        _ => return None,
+    }
+    // The incr block must be `iadd iv, 1; br header(iv+1)`.
+    let incr_blk = func.block(incr_block);
+    match &incr_blk.terminator {
+        Some(Terminator::Branch(d, args)) if *d == header && args.len() == 1 => {}
+        _ => return None,
+    }
+    Some(WhereLoop {
+        preheader,
+        header,
+        body,
+        then_block,
+        incr_block,
         iv_param,
         iv_init,
         iv_bound,
