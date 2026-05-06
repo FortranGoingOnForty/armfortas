@@ -131,6 +131,13 @@ fn unroll_in_function(func: &mut Function) -> bool {
             // fix-point loop drive re-runs.
             break;
         }
+        // Try partial unrolling for trip > FULL_UNROLL_MAX. Keeps the
+        // loop intact but clones body U times and bumps step by U.
+        if let Some(shape) = detect_partial_unroll_loop(func, nl, &preds) {
+            do_partial_unroll(func, shape);
+            changed = true;
+            break;
+        }
     }
     changed
 }
@@ -1046,6 +1053,248 @@ fn remap_kind(kind: &InstKind, subst: &HashMap<ValueId, ValueId>) -> InstKind {
 }
 
 // ---------------------------------------------------------------------------
+// Partial unrolling
+// ---------------------------------------------------------------------------
+//
+// Loops with statically known trip counts above FULL_UNROLL_MAX don't
+// benefit from full unrolling (code bloat), but a U-way partial unroll
+// (clone body U-1 additional times, step IV by U) can still expose ILP
+// and reduce loop overhead. v0 handles the simplest shape:
+//
+//   * 2-block loop (header + latch).
+//   * Single block param (no reduction).
+//   * Static trip count > FULL_UNROLL_MAX, divisible by `U`.
+//   * Body instruction count × U ≤ PARTIAL_UNROLL_BODY_BUDGET.
+//
+// The transform clones the latch's body insts U-1 more times with
+// `iv` substituted by a freshly-computed `iv + k` (1 ≤ k < U), then
+// rewrites the latch's `iadd iv, 1` to `iadd iv, U`.
+
+/// Largest unrolled-body size in instructions for partial unrolling.
+const PARTIAL_UNROLL_BODY_BUDGET: usize = 60;
+/// Largest unroll factor we'll apply.
+const PARTIAL_UNROLL_MAX_FACTOR: usize = 4;
+
+#[derive(Debug)]
+struct PartialShape {
+    header: BlockId,
+    latch: BlockId,
+    iv_param: ValueId,
+    iv_ty: IrType,
+    iv_init: i64,
+    iv_bound: i64,
+    /// Unroll factor.
+    u: usize,
+    /// The latch's `iadd iv, 1` instruction id.
+    iadd_id: ValueId,
+    /// The const(1) value feeding the iadd.
+    step_const_id: ValueId,
+}
+
+fn detect_partial_unroll_loop(
+    func: &Function,
+    nl: &NaturalLoop,
+    preds: &HashMap<BlockId, Vec<BlockId>>,
+) -> Option<PartialShape> {
+    if nl.latches.len() != 1 || nl.body.len() != 2 {
+        return None;
+    }
+    let header = nl.header;
+    let latch = nl.latches[0];
+    if header == latch {
+        return None;
+    }
+    let hdr = func.block(header);
+    if hdr.params.len() != 1 {
+        return None;
+    }
+    let iv_param = hdr.params[0].id;
+    let iv_ty = hdr.params[0].ty.clone();
+    if !matches!(iv_ty, IrType::Int(_)) {
+        return None;
+    }
+    // Header has the cmp + cond_br body/exit.
+    let (iv_bound, exit, _exit_args) = detect_bound_and_exit(func, header, iv_param)?;
+    if nl.body.contains(&exit) {
+        return None;
+    }
+    // Preheader supplies iv_init.
+    let header_preds = preds.get(&header)?;
+    let mut outside: Vec<BlockId> = header_preds
+        .iter()
+        .copied()
+        .filter(|p| !nl.body.contains(p))
+        .collect();
+    outside.sort_by_key(|b| b.0);
+    outside.dedup();
+    if outside.len() != 1 {
+        return None;
+    }
+    let preheader = outside[0];
+    let ph = func.block(preheader);
+    let iv_init = match &ph.terminator {
+        Some(Terminator::Branch(d, args)) if *d == header && args.len() == 1 => {
+            resolve_const_int(func, args[0])?
+        }
+        _ => return None,
+    };
+    // Latch: `... insts ...; iadd iv, 1; br header(iv_next)`.
+    let latch_blk = func.block(latch);
+    let latch_term_args = match &latch_blk.terminator {
+        Some(Terminator::Branch(d, args)) if *d == header && args.len() == 1 => args.clone(),
+        _ => return None,
+    };
+    let iv_next = latch_term_args[0];
+    let iadd_inst = latch_blk.insts.iter().find(|i| i.id == iv_next)?;
+    let (lhs, rhs) = match iadd_inst.kind {
+        InstKind::IAdd(l, r) => (l, r),
+        _ => return None,
+    };
+    let step_const_id = if lhs == iv_param {
+        rhs
+    } else if rhs == iv_param {
+        lhs
+    } else {
+        return None;
+    };
+    if resolve_const_int(func, step_const_id) != Some(1) {
+        return None;
+    }
+    // No latch-defined value escapes the loop.
+    let body_set: HashSet<BlockId> = nl.body.iter().copied().collect();
+    if has_escaping_values(func, latch, &body_set, preds) {
+        return None;
+    }
+    // Trip count gate: > FULL_UNROLL_MAX (full unroller would have
+    // taken it otherwise) and divisible by some U in [2, MAX_FACTOR].
+    let trip = iv_bound - iv_init + 1;
+    if trip <= FULL_UNROLL_MAX {
+        return None;
+    }
+    let body_inst_count = latch_blk.insts.len();
+    if body_inst_count == 0 {
+        return None;
+    }
+    // Pick the largest U ≤ MAX_FACTOR that divides trip and respects
+    // the body-size budget.
+    let mut chosen_u: Option<usize> = None;
+    for u in (2..=PARTIAL_UNROLL_MAX_FACTOR).rev() {
+        if trip % (u as i64) != 0 {
+            continue;
+        }
+        if body_inst_count * u > PARTIAL_UNROLL_BODY_BUDGET {
+            continue;
+        }
+        chosen_u = Some(u);
+        break;
+    }
+    let u = chosen_u?;
+    Some(PartialShape {
+        header,
+        latch,
+        iv_param,
+        iv_ty,
+        iv_init,
+        iv_bound,
+        u,
+        iadd_id: iv_next,
+        step_const_id,
+    })
+}
+
+fn do_partial_unroll(func: &mut Function, shape: PartialShape) {
+    // Snapshot of latch body BEFORE the iadd. We'll clone these
+    // instructions U-1 more times with iv substituted.
+    let latch_snapshot: Vec<Inst> = func.block(shape.latch).insts.clone();
+    // Precompute body-without-iadd for cloning.
+    let body_inst_clone: Vec<Inst> = latch_snapshot
+        .iter()
+        .filter(|i| i.id != shape.iadd_id)
+        .cloned()
+        .collect();
+    let iv_width = match shape.iv_ty {
+        IrType::Int(w) => w,
+        _ => return,
+    };
+    let span = dummy_span();
+    // For each k in 1..U: emit `iv_k = iadd iv, k_const`, then clone
+    // every body inst (except iadd) with iv → iv_k. Append all of
+    // these BEFORE the existing iadd, so the sequence is:
+    //   <orig body insts>          ; uses iv
+    //   iv_1 = iadd iv, 1
+    //   <body cloned, iv → iv_1>
+    //   iv_2 = iadd iv, 2
+    //   <body cloned, iv → iv_2>
+    //   ...
+    //   iv_next = iadd iv, U
+    //   br header(iv_next)
+    //
+    // We construct the new instruction list off-band, then swap
+    // it in.
+    let mut new_insts: Vec<Inst> = latch_snapshot
+        .iter()
+        .filter(|i| i.id != shape.iadd_id)
+        .cloned()
+        .collect();
+    for k in 1..shape.u {
+        // Allocate the const(k) and the iv_k = iadd iv, k.
+        let k_const_id = func.next_value_id();
+        func.register_type(k_const_id, shape.iv_ty.clone());
+        let iv_k_id = func.next_value_id();
+        func.register_type(iv_k_id, shape.iv_ty.clone());
+        new_insts.push(Inst {
+            id: k_const_id,
+            kind: InstKind::ConstInt(k as i128, iv_width),
+            ty: shape.iv_ty.clone(),
+            span,
+        });
+        new_insts.push(Inst {
+            id: iv_k_id,
+            kind: InstKind::IAdd(shape.iv_param, k_const_id),
+            ty: shape.iv_ty.clone(),
+            span,
+        });
+        // Clone the body (sans iadd) substituting iv → iv_k and
+        // each inst id → fresh id.
+        let mut subst: HashMap<ValueId, ValueId> = HashMap::new();
+        subst.insert(shape.iv_param, iv_k_id);
+        for orig in &body_inst_clone {
+            let new_id = func.next_value_id();
+            func.register_type(new_id, orig.ty.clone());
+            subst.insert(orig.id, new_id);
+            let new_kind = remap_kind(&orig.kind, &subst);
+            new_insts.push(Inst {
+                id: new_id,
+                kind: new_kind,
+                ty: orig.ty.clone(),
+                span: orig.span,
+            });
+        }
+    }
+    // Finally, the new iadd: iv_next = iadd iv, U.
+    let new_step_const = func.next_value_id();
+    func.register_type(new_step_const, shape.iv_ty.clone());
+    new_insts.push(Inst {
+        id: new_step_const,
+        kind: InstKind::ConstInt(shape.u as i128, iv_width),
+        ty: shape.iv_ty.clone(),
+        span,
+    });
+    // Replace iadd's step constant. Reuse the existing iadd id so
+    // the latch terminator (which references it) stays valid.
+    let new_iadd = Inst {
+        id: shape.iadd_id,
+        kind: InstKind::IAdd(shape.iv_param, new_step_const),
+        ty: shape.iv_ty.clone(),
+        span,
+    };
+    new_insts.push(new_iadd);
+
+    // Swap the latch's instruction list.
+    func.block_mut(shape.latch).insts = new_insts;
+}
+
+// ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
 
@@ -1204,11 +1453,33 @@ mod tests {
     }
 
     #[test]
-    fn does_not_unroll_trip10() {
-        let mut m = build_counted_loop(1, 10); // 10 > FULL_UNROLL_MAX=8
+    fn partial_unrolls_trip10() {
+        // Trip 10 > FULL_UNROLL_MAX=8 — full unroll skips it, but
+        // partial unroll picks U=2 (largest factor of 10 that fits
+        // the body budget) and doubles the body in place.
+        let mut m = build_counted_loop(1, 10);
         let pass = LoopUnroll;
         let changed = pass.run(&mut m);
-        assert!(!changed, "should not unroll trip-count-10 loop");
+        assert!(changed, "trip-10 loop should partial-unroll");
+        // Same number of blocks (loop is preserved); body inst count
+        // grew because we cloned the body once with iv → iv+1.
+        let f = &m.functions[0];
+        let block_count = f.blocks.len();
+        assert!(
+            block_count >= 3,
+            "expected loop structure preserved, got {} blocks",
+            block_count
+        );
+    }
+
+    #[test]
+    fn does_not_partial_unroll_trip_above_threshold_with_no_factor() {
+        // Trip 11 is prime and > FULL_UNROLL_MAX — neither full nor
+        // partial unroll fires.
+        let mut m = build_counted_loop(1, 11);
+        let pass = LoopUnroll;
+        let changed = pass.run(&mut m);
+        assert!(!changed, "trip-11 (prime) loop should not unroll");
     }
 
     #[test]
