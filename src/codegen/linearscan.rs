@@ -336,7 +336,19 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
         // P — by the time the bridge str fires (right above the
         // arg-setup block), P would no longer hold the pre-half's
         // value and the bridge would capture garbage.
-        let safe_pre_phys = if !free_caller.is_empty() && interval.call_crossings.len() == 1 {
+        // Live-range splitting is gated behind an opt-in env var
+        // until the regalloc phi-resolution interaction is hardened.
+        // Without the gate, loops where mem2reg leaves the
+        // accumulator in memory but the body has duplicate loads of
+        // an invariant scalar can pick up split intervals that alias
+        // the loop's iv block param register on the preheader edge,
+        // miscompiling `realworld_affine_shift.f90` at -O2+ (iv ends
+        // up holding the invariant scalar, not the iv init).
+        let splitting_enabled = std::env::var_os("ARMFORTAS_SPLIT_INTERVALS").is_some();
+        let safe_pre_phys = if splitting_enabled
+            && !free_caller.is_empty()
+            && interval.call_crossings.len() == 1
+        {
             let cp = interval.call_crossings[0];
             let pre_end = cp.saturating_sub(1);
             free_caller.iter().rposition(|&r| {
@@ -1970,6 +1982,14 @@ mod tests {
 
     #[test]
     fn linear_scan_splits_call_crossing_when_callee_saved_exhausted() {
+        // Splitting is gated behind an env var in production until
+        // the regalloc phi-resolution interaction is hardened. Set
+        // the gate here so the unit test can exercise the splitting
+        // path. (Unsetting it after the test would race with parallel
+        // tests; instead, only this one test reads the var, and any
+        // other tests that don't expect splitting use shapes that
+        // wouldn't trigger it anyway.)
+        std::env::set_var("ARMFORTAS_SPLIT_INTERVALS", "1");
         // 12 vregs all live across a single BL forces the
         // allocator past the 10-deep callee-saved pool. Without
         // splitting the overflow vregs full-spill; with splitting
