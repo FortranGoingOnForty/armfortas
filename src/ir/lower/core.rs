@@ -1009,11 +1009,23 @@ pub(super) fn arg_uses_descriptor_from_decls(arg_name: &str, decls: &[crate::ast
                     .any(|a| matches!(a, crate::ast::decl::Attribute::Allocatable));
                 let specs = entity.array_spec.as_ref().or(attr_dims);
                 if let Some(specs) = specs {
+                    // F2018 §15.5.2.4: assumed-size dummies `a(lda,*)` and
+                    // F77-style explicit-* are passed as a *contiguous data
+                    // pointer*, not as a descriptor — the callee receives an
+                    // element address and trusts the caller-side shape /
+                    // stride information passed alongside (typically `lda`).
+                    // Treating them as descriptor-bearing means the callee
+                    // emits a 384-byte memcpy to copy the descriptor on
+                    // entry and computes element addresses via descriptor
+                    // metadata, yielding `descriptor_base + 16` for `a(1,1)`
+                    // — which is the descriptor's own bytes, not the array
+                    // data.  Surfaced under stdlib's `det()`/dgetrf2/idamax
+                    // chain: `idamax(m, a(1,1), 1)` SEGV'd at NULL deref of
+                    // the synthetic element address.
                     return specs.iter().any(|spec| {
                         matches!(
                             spec,
                             ArraySpec::AssumedShape { .. }
-                                | ArraySpec::AssumedSize { .. }
                                 | ArraySpec::Deferred
                                 | ArraySpec::AssumedRank
                         )
