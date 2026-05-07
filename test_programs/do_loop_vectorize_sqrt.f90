@@ -27,6 +27,10 @@ program test_do_loop_vectorize_sqrt
   end do
 
   ! Print a couple of representative results.
-  print *, c32(1), c32(4), c32(16)
-  print *, c64(1), c64(4), c64(16)
+  print *, c32(1)
+  print *, c32(4)
+  print *, c32(16)
+  print *, c64(1)
+  print *, c64(4)
+  print *, c64(16)
 end program test_do_loop_vectorize_sqrt

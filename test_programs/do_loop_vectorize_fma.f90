@@ -45,7 +45,11 @@ program test_do_loop_vectorize_fma
     e32(i) = a32(i) * 2.5 + 10.0
   end do
 
-  print *, c32(1), c32(16), c32(32)
-  print *, c64(1), c64(16), c64(32)
+  print *, c32(1)
+  print *, c32(16)
+  print *, c32(32)
+  print *, c64(1)
+  print *, c64(16)
+  print *, c64(32)
   print *, e32(4)
 end program test_do_loop_vectorize_fma
