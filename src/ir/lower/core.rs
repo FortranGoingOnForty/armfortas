@@ -28178,6 +28178,28 @@ pub(super) fn lower_array_intrinsic(
     contained_host_refs: Option<&HashMap<String, Vec<String>>>,
     descriptor_params: Option<&HashMap<String, Vec<bool>>>,
 ) -> Option<ValueId> {
+    // Bail before any IR emission if `name` isn't one of the array
+    // intrinsics this dispatcher handles.  The function originally fell
+    // through to the unconditional `lower_array_expr_descriptor` below
+    // (which materialises a 384-byte descriptor + memset +
+    // afs_create_section for the first arg) and only THEN matched on
+    // `name`, returning None for unknown intrinsics — at which point
+    // the descriptor was already emitted.  expr.rs's FunctionCall
+    // handler calls this twice for every user-procedure call (once
+    // gated on `!has_named_interface`, once in the post-generic-resolve
+    // fallback), so a `pick(key(0:))` user call ended up emitting two
+    // throwaway sections per use site on top of the legitimate one in
+    // ref_arg_vals.
+    if !matches!(
+        name,
+        "size" | "lbound" | "ubound" | "shape" | "allocated"
+            | "sum" | "product" | "maxval" | "minval"
+            | "maxloc" | "minloc" | "matmul" | "dot_product"
+            | "transpose" | "huge" | "tiny" | "epsilon"
+            | "precision" | "range" | "digits" | "norm2"
+    ) {
+        return None;
+    }
     let first_expr = args.first().and_then(|a| {
         if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
             Some(e)

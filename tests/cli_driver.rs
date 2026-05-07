@@ -13220,18 +13220,22 @@ fn user_function_call_with_section_arg_emits_one_section_descriptor_per_callsite
     );
     let asm = std::fs::read_to_string(&out).expect("read asm");
     let n = asm.matches("bl _afs_create_section").count();
-    // 8 source-level sections.  Each `pick(key(I:))` call emits a
-    // descriptor for the actual call (1) plus a fixed amount of
-    // bounds-check materialization (~2 more); so observed-good is
-    // ~5.25x source.  Pre-fix the resolution_arg_vals +
-    // intrinsic_arg_vals probes also each lowered the same section,
-    // pushing the ratio to ~25x or worse.  Threshold at 60 catches a
-    // return to the multiplicative-probe regime while leaving
-    // headroom for the remaining per-callsite work.
+    // 8 source-level sections.  Observed-good: 14 emissions
+    // (~1.75x) — one descriptor per call plus a small per-callsite
+    // overhead.  History:
+    //   * pre-fix:                                  ~24x source
+    //     (resolution_arg_vals + intrinsic_arg_vals duplication)
+    //   * after probe-vec gating (0592c14):         ~5.25x source
+    //     (lower_array_intrinsic still emitted descriptor for
+    //     non-array-intrinsic names before its dispatch matched)
+    //   * after lower_array_intrinsic name gate:    ~1.75x source
+    // Threshold at 24 (3x) catches a return to either earlier
+    // regime while leaving headroom for incidental per-callsite
+    // work.
     assert!(
-        n <= 60,
-        "expected ≤60 afs_create_section emissions for 8 source sections, \
-         got {n} — probe-duplication may have regressed"
+        n <= 24,
+        "expected ≤24 afs_create_section emissions for 8 source sections, \
+         got {n} — probe duplication may have regressed"
     );
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
