@@ -15,7 +15,7 @@ use crate::ir::types::*;
 use crate::sema::symtab::SymbolTable;
 
 use super::core::*;
-use super::ctx::{current_proc_scope, CharKind, LocalInfo, LowerCtx};
+use super::ctx::{current_proc_scope, CharKind, HiddenResultAbi, LocalInfo, LowerCtx};
 use super::const_scalar::{clamp_const_to_type, materialize_const_scalar, ConstScalar};
 use super::helpers::coerce_to_type;
 use crate::ast::expr::{BinaryOp, UnaryOp};
@@ -1372,25 +1372,49 @@ pub(crate) fn lower_expr_full(
                 // Keyword-argument reordering for function calls
                 // (symmetric with the Stmt::Call path). Binds by name
                 // when the callee's arg_order is resolvable.
+                //
+                // resolution_arg_vals is ONLY consumed when we need to
+                // pick a specific procedure out of a NamedInterface or
+                // route a procedure-pointer call by signature.  For an
+                // ordinary user-procedure call (`waterr32(key(0:))`)
+                // resolve_generic_call_actuals returns None on its
+                // first line (no NamedInterface candidates) and never
+                // touches the actual_vals slice — so the work spent
+                // lowering each arg into a typed null / real value is
+                // discarded.  For a section-shaped arg that lowering
+                // emits a 384-byte descriptor + memset + afs_create_section
+                // every time, which compounds badly inside nested
+                // intrinsic chains (stdlib_hash_32bit_water:
+                // `ieor(waterr32(key(i:)), waterp1)` lowers `key(i:)`
+                // a second time once it pops out of the resolution
+                // probe, then a third time when the eventual user-
+                // call reference lowering fills ref_arg_vals).  Skip
+                // the resolution probe when no caller can use it.
                 let original_args = args;
-                let resolution_arg_vals: Vec<ValueId> = original_args
-                    .iter()
-                    .map(|arg| match &arg.value {
-                        crate::ast::expr::SectionSubscript::Element(e) => {
-                            generic_dispatch_probe_value(
-                                b,
-                                locals,
-                                e,
-                                st,
-                                type_layouts,
-                                internal_funcs,
-                                contained_host_refs,
-                                descriptor_params,
-                            )
-                        }
-                        _ => b.const_i32(0),
-                    })
-                    .collect();
+                let needs_generic_resolution =
+                    has_named_interface || procptr_target.is_some();
+                let resolution_arg_vals: Vec<ValueId> = if needs_generic_resolution {
+                    original_args
+                        .iter()
+                        .map(|arg| match &arg.value {
+                            crate::ast::expr::SectionSubscript::Element(e) => {
+                                generic_dispatch_probe_value(
+                                    b,
+                                    locals,
+                                    e,
+                                    st,
+                                    type_layouts,
+                                    internal_funcs,
+                                    contained_host_refs,
+                                    descriptor_params,
+                                )
+                            }
+                            _ => b.const_i32(0),
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
 
                 let fallback_to_structure_ctor = has_named_interface
                     && type_layouts.is_some_and(|tl| tl.get(&key).is_some())
@@ -1455,29 +1479,47 @@ pub(crate) fn lower_expr_full(
                 }
 
                 // Try intrinsic lowering first (intrinsics use values, not references).
-                let intrinsic_arg_slots = reorder_args_by_keyword_slots(original_args, &key, st);
-                let intrinsic_args: Vec<crate::ast::expr::Argument> =
-                    intrinsic_arg_slots.iter().flatten().cloned().collect();
-                let intrinsic_arg_vals: Vec<ValueId> = intrinsic_args
-                    .iter()
-                    .map(|a| match &a.value {
-                        crate::ast::expr::SectionSubscript::Element(e) => {
-                            generic_dispatch_probe_value(
-                                b,
-                                locals,
-                                e,
-                                st,
-                                type_layouts,
-                                internal_funcs,
-                                contained_host_refs,
-                                descriptor_params,
-                            )
-                        }
-                        _ => b.const_i32(0),
-                    })
-                    .collect();
-
-                let intrinsic_result = super::intrinsic::lower_intrinsic(b, &key, &intrinsic_arg_vals);
+                //
+                // lower_intrinsic only matches a fixed set of names — for
+                // anything else it returns None and intrinsic_arg_vals is
+                // discarded.  Lowering each arg unconditionally costs a
+                // section-descriptor materialization per array section
+                // arg, which compounded into a 26 GB compile peak on
+                // stdlib_hash_32bit_water (each `ieor(waterr32(key(i:)),
+                // waterp1)` lowered `waterr32(key(i:))` once for the
+                // intrinsic probe, then again for ref_arg_vals).  Gate
+                // the work behind the intrinsic-name check so user-call
+                // sites pay no probe cost.  For a name shadowed by a
+                // user generic the explicit check earlier already routes
+                // to the structure ctor / generic-resolve path before
+                // we get here.
+                let intrinsic_result = if crate::sema::validate::is_intrinsic_name(&key) {
+                    let intrinsic_arg_slots =
+                        reorder_args_by_keyword_slots(original_args, &key, st);
+                    let intrinsic_args: Vec<crate::ast::expr::Argument> =
+                        intrinsic_arg_slots.iter().flatten().cloned().collect();
+                    let intrinsic_arg_vals: Vec<ValueId> = intrinsic_args
+                        .iter()
+                        .map(|a| match &a.value {
+                            crate::ast::expr::SectionSubscript::Element(e) => {
+                                generic_dispatch_probe_value(
+                                    b,
+                                    locals,
+                                    e,
+                                    st,
+                                    type_layouts,
+                                    internal_funcs,
+                                    contained_host_refs,
+                                    descriptor_params,
+                                )
+                            }
+                            _ => b.const_i32(0),
+                        })
+                        .collect();
+                    super::intrinsic::lower_intrinsic(b, &key, &intrinsic_arg_vals)
+                } else {
+                    None
+                };
                 if !has_named_interface {
                     if let Some(result) = intrinsic_result {
                         let coerced = operator_expr_type_info(expr, Some(locals), st, type_layouts)
@@ -1644,8 +1686,31 @@ pub(crate) fn lower_expr_full(
                             &abi_lookup_keys,
                             hidden_abi,
                         ) {
-                            let desc =
-                                b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), bytes));
+                            // For ComplexBuffer ABI returns, type the temp
+                            // as `[f32 x 2]` / `[f64 x 2]` so the call's
+                            // result is `Ptr<[fN x 2]>` and `is_complex_ty`
+                            // sees it as a complex value.  Without this,
+                            // the buffer is `Ptr<[i8 x 8/16]>`, the binop
+                            // path's `is_complex_ty(&lty) || is_complex_ty(&rty)`
+                            // check fails for `complex_local - complex_call(...)`,
+                            // and the int/float promotion path then
+                            // emits `fsub %ptr<[i8 x 8]>` against the buffer
+                            // pointer — IR-verify rejects with `float op
+                            // has non-float operand : ptr<[i8 x 8]>`.
+                            // Surfaced in stdlib_lapack_solve_chol_comp's
+                            // CPOTF2/ZPOTF2 routines:
+                            //   `ajj = real( real(a(j,j),sp) - cdotc(...), sp)`.
+                            let alloca_ty = if hidden_abi == HiddenResultAbi::ComplexBuffer {
+                                let fw = if bytes == 16 {
+                                    FloatWidth::F64
+                                } else {
+                                    FloatWidth::F32
+                                };
+                                IrType::Array(Box::new(IrType::Float(fw)), 2)
+                            } else {
+                                IrType::Array(Box::new(IrType::Int(IntWidth::I8)), bytes)
+                            };
+                            let desc = b.alloca(alloca_ty);
                             let zero_i32 = b.const_i32(0);
                             let size = b.const_i64(bytes as i64);
                             b.call(
@@ -2016,10 +2081,26 @@ pub(crate) fn lower_expr_full(
                                         &abi_lookup_keys,
                                         hidden_abi,
                                     ) {
-                                        let desc = b.alloca(IrType::Array(
-                                            Box::new(IrType::Int(IntWidth::I8)),
-                                            bytes,
-                                        ));
+                                        // Type ComplexBuffer ABI temps as
+                                        // [fN x 2] so downstream `is_complex_ty`
+                                        // checks recognize the result; same
+                                        // motivation as the Name-callee path.
+                                        let alloca_ty = if hidden_abi
+                                            == HiddenResultAbi::ComplexBuffer
+                                        {
+                                            let fw = if bytes == 16 {
+                                                FloatWidth::F64
+                                            } else {
+                                                FloatWidth::F32
+                                            };
+                                            IrType::Array(Box::new(IrType::Float(fw)), 2)
+                                        } else {
+                                            IrType::Array(
+                                                Box::new(IrType::Int(IntWidth::I8)),
+                                                bytes,
+                                            )
+                                        };
+                                        let desc = b.alloca(alloca_ty);
                                         let zero_i32 = b.const_i32(0);
                                         let size = b.const_i64(bytes as i64);
                                         b.call(

@@ -1505,13 +1505,13 @@ fn select_inst(
             };
 
             // Determine element size from the GEP result type (Ptr<elem_ty>).
-            // Scalar IR bool values are lowered as byte-sized SSA values, but
-            // Fortran LOGICAL storage still uses the default 4-byte kind in
-            // stack slots and arrays.
+            // Bool occupies 1 byte both in SSA and in `alloca [Bool x N]`
+            // storage; the prior 4-byte override here desynced GEP byte
+            // strides from `alloca` byte strides, so `arr(i) = .true.` for
+            // a stack `logical :: arr(N)` wrote 3 bytes past the slot.
             let elem_size = match &inst.ty {
                 IrType::Ptr(inner) => match inner.as_ref() {
                     IrType::Struct(_) => alloca_size(inner) as i64,
-                    IrType::Bool => 4,
                     _ => inner.size_bytes() as i64,
                 },
                 _ => 4, // fallback

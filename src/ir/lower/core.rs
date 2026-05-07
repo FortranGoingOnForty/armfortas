@@ -9778,18 +9778,55 @@ pub(super) fn generic_dispatch_probe_value(
         let zero = b.const_i64(0);
         return b.int_to_ptr(zero, elem_ty);
     }
-    if let Some((_desc, elem_ty)) = lower_array_expr_descriptor(
-        b,
-        locals,
-        expr,
-        st,
-        type_layouts,
-        internal_funcs,
-        contained_host_refs,
-        descriptor_params,
-    ) {
-        let zero = b.const_i64(0);
-        return b.int_to_ptr(zero, elem_ty);
+    // For a `Name(callee)` FunctionCall whose ABI is *not* an array
+    // descriptor (the early `array_function_result_elem_type` check
+    // above already returned None) and whose callee is neither a
+    // local array nor one of the transformational intrinsics that
+    // `lower_array_expr_descriptor` knows how to materialize, calling
+    // `lower_array_expr_descriptor` here is wasted work: it walks the
+    // FunctionCall arm, fails every named-intrinsic match, and ends
+    // up re-running `array_function_result_elem_type` (via
+    // `lower_array_function_result_descriptor`) only to return None.
+    // The recursive arg-probing inside that second invocation is
+    // O(2^depth) for nested calls — stdlib_hash_32bit_water.f90's
+    // water_hash inner loop nested four-deep across 16 SELECT CASE
+    // arms compounded into a ~123 GB compile peak.  Skip the redundant
+    // call and go straight to `lower_expr_full`, which does the real
+    // evaluation correctly (the test
+    // `internal_subprogram_call_under_intrinsic_under_user_call_keeps_mangled_name`
+    // depends on threaded `internal_funcs` reaching the actual call).
+    let skip_array_descriptor_path = if let Expr::FunctionCall { callee, .. } = &expr.node {
+        if let Expr::Name { name } = &callee.node {
+            let lname = name.to_ascii_lowercase();
+            const NAMED_ARRAY_INTRINSICS: &[&str] = &[
+                "pack", "reshape", "transfer", "sum", "merge", "matmul",
+                "transpose", "conjg", "aimag", "dimag", "abs", "cmplx", "shape",
+            ];
+            let is_named_intrinsic = NAMED_ARRAY_INTRINSICS.contains(&lname.as_str());
+            let local_array = locals
+                .get(&lname)
+                .is_some_and(local_is_array_like);
+            !is_named_intrinsic && !local_array
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    if !skip_array_descriptor_path {
+        if let Some((_desc, elem_ty)) = lower_array_expr_descriptor(
+            b,
+            locals,
+            expr,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        ) {
+            let zero = b.const_i64(0);
+            return b.int_to_ptr(zero, elem_ty);
+        }
     }
     if expr_is_character_expr(b, locals, expr, st, type_layouts) {
         b.const_int(0, IntWidth::I8)
@@ -17593,9 +17630,18 @@ pub(super) fn ir_scalar_byte_size(ty: &IrType) -> i64 {
         IrType::Int(IntWidth::I32) | IrType::Float(FloatWidth::F32) => 4,
         IrType::Int(IntWidth::I64) | IrType::Float(FloatWidth::F64) => 8,
         IrType::Int(IntWidth::I128) => 16,
-        // Fortran default LOGICAL arrays/components occupy 4-byte storage
-        // slots even though Bool values stay compact in SSA form.
-        IrType::Bool => 4,
+        // `IrType::Bool` is 1 byte both in SSA (size_bytes()) and in
+        // `alloca [Bool x N]` array storage. Reporting 4 here while
+        // storage stayed 1 byte/element broke every consumer of the
+        // descriptor's elem_size for logical arrays — `mask_at`,
+        // `afs_array_sum_real8_mask`, and the new `_dim_mask` helpers
+        // all stepped 4× past the actual data, so `sum(y, mask=m)`
+        // and `sum(y, dim, mask)` quietly returned the unmasked sum.
+        // Match storage; allocatable logical arrays now also see
+        // elem_size=1 in their `afs_allocate_array` call, which is
+        // consistent because the runtime sizes the buffer from the
+        // same value.
+        IrType::Bool => 1,
         _ => 8,
     }
 }
@@ -17608,7 +17654,10 @@ pub(super) fn descriptor_element_size_bytes(info: &LocalInfo) -> i64 {
         IrType::Int(IntWidth::I32) | IrType::Float(FloatWidth::F32) => 4,
         IrType::Int(IntWidth::I64) | IrType::Float(FloatWidth::F64) => 8,
         IrType::Int(IntWidth::I128) => 16,
-        IrType::Bool => 4,
+        // See `ir_scalar_byte_size` — Bool is a single-byte storage
+        // slot. Keeping these two paired prevents descriptor/storage
+        // disagreement on logical arrays.
+        IrType::Bool => 1,
         _ => 8,
     }
 }
@@ -23270,7 +23319,7 @@ pub(super) fn lower_array_sum_dim_descriptor(
         return None;
     };
     let mut dim_expr: Option<&crate::ast::expr::SpannedExpr> = None;
-    let mut has_mask = false;
+    let mut mask_expr: Option<&crate::ast::expr::SpannedExpr> = None;
     for (i, arg) in args.iter().enumerate() {
         let kw = arg.keyword.as_deref().map(|s| s.to_lowercase());
         match (i, kw.as_deref()) {
@@ -23280,15 +23329,14 @@ pub(super) fn lower_array_sum_dim_descriptor(
                 }
             }
             (_, Some("mask")) | (2, None) => {
-                has_mask = true;
+                if let SectionSubscript::Element(e) = &arg.value {
+                    mask_expr = Some(e);
+                }
             }
             _ => {}
         }
     }
     let dim_expr = dim_expr?;
-    if has_mask {
-        return None;
-    }
 
     let (src_desc, elem_ty) = lower_array_expr_descriptor(
         b,
@@ -23300,6 +23348,28 @@ pub(super) fn lower_array_sum_dim_descriptor(
         contained_host_refs,
         descriptor_params,
     )?;
+
+    // The mask actual must lower into a descriptor too (rank matches
+    // the source); without it we fall back to scalar broadcast which
+    // crashed example_var by passing a small int as a descriptor
+    // pointer to afs_assign_allocatable.
+    let mask_desc = if let Some(me) = mask_expr {
+        Some(
+            lower_array_expr_descriptor(
+                b,
+                locals,
+                me,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            )?
+            .0,
+        )
+    } else {
+        None
+    };
 
     let dim_raw = super::expr::lower_expr_with_optional_layouts(b, locals, dim_expr, st, type_layouts);
     let dim_val = match b.func().value_type(dim_raw) {
@@ -23317,16 +23387,17 @@ pub(super) fn lower_array_sum_dim_descriptor(
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
     );
 
-    let helper = if elem_ty.is_float() {
-        "afs_array_sum_real8_dim"
-    } else {
-        "afs_array_sum_int_dim"
+    let helper = match (mask_desc.is_some(), elem_ty.is_float()) {
+        (true, true) => "afs_array_sum_real8_dim_mask",
+        (true, false) => "afs_array_sum_int_dim_mask",
+        (false, true) => "afs_array_sum_real8_dim",
+        (false, false) => "afs_array_sum_int_dim",
     };
-    b.call(
-        FuncRef::External(helper.into()),
-        vec![src_desc, dim_val, result_desc],
-        IrType::Void,
-    );
+    let mut call_args = vec![src_desc, dim_val, result_desc];
+    if let Some(md) = mask_desc {
+        call_args.push(md);
+    }
+    b.call(FuncRef::External(helper.into()), call_args, IrType::Void);
     Some((result_desc, elem_ty))
 }
 
@@ -27280,13 +27351,11 @@ pub(super) fn lower_array_assign(
         b.set_block(bb_body);
         let i_val = b.load(i_addr);
         // Compute byte offset: i * elem_size. Use byte-level GEP to avoid double multiplication.
-        let elem_bytes = match &dest_info.ty {
-            IrType::Int(IntWidth::I128) => b.const_i64(16),
-            IrType::Int(IntWidth::I64) | IrType::Float(FloatWidth::F64) => b.const_i64(8),
-            IrType::Int(IntWidth::I16) => b.const_i64(2),
-            IrType::Int(IntWidth::I8) => b.const_i64(1),
-            _ => b.const_i64(4),
-        };
+        // The catch-all used to assume 4 bytes per slot, which broke `logical :: a(N)`
+        // broadcasts after `ir_scalar_byte_size(Bool) = 1` started matching the
+        // storage layout — every iteration jumped 3 bytes past its slot, leaving
+        // src(2..N) full of stack garbage.
+        let elem_bytes = b.const_i64(ir_scalar_byte_size(&dest_info.ty));
         let byte_offset = b.imul(i_val, elem_bytes);
         let elem_ptr = b.gep(dest_base, vec![byte_offset], IrType::Int(IntWidth::I8));
         b.store(scalar, elem_ptr);
@@ -28109,6 +28178,28 @@ pub(super) fn lower_array_intrinsic(
     contained_host_refs: Option<&HashMap<String, Vec<String>>>,
     descriptor_params: Option<&HashMap<String, Vec<bool>>>,
 ) -> Option<ValueId> {
+    // Bail before any IR emission if `name` isn't one of the array
+    // intrinsics this dispatcher handles.  The function originally fell
+    // through to the unconditional `lower_array_expr_descriptor` below
+    // (which materialises a 384-byte descriptor + memset +
+    // afs_create_section for the first arg) and only THEN matched on
+    // `name`, returning None for unknown intrinsics — at which point
+    // the descriptor was already emitted.  expr.rs's FunctionCall
+    // handler calls this twice for every user-procedure call (once
+    // gated on `!has_named_interface`, once in the post-generic-resolve
+    // fallback), so a `pick(key(0:))` user call ended up emitting two
+    // throwaway sections per use site on top of the legitimate one in
+    // ref_arg_vals.
+    if !matches!(
+        name,
+        "size" | "lbound" | "ubound" | "shape" | "allocated"
+            | "sum" | "product" | "maxval" | "minval"
+            | "maxloc" | "minloc" | "matmul" | "dot_product"
+            | "transpose" | "huge" | "tiny" | "epsilon"
+            | "precision" | "range" | "digits" | "norm2"
+    ) {
+        return None;
+    }
     let first_expr = args.first().and_then(|a| {
         if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
             Some(e)
@@ -31465,6 +31556,43 @@ pub(super) fn emit_scalar_allocate_source_init_on_success(
         emit_derived_value_copy(b, ctx.type_layouts, type_name, dest_base, src);
     } else {
         let raw = super::expr::lower_expr_ctx_tl(b, ctx, source_expr);
+        // Complex(sp/dp) results returned via the ComplexBuffer ABI
+        // come back as a pointer to a fresh 8/16-byte buffer holding
+        // the lane pair.  Depending on the call site that pointer is
+        // typed `Ptr([f32/f64 x 2])`, `Ptr([i8 x 8/16])`, or just
+        // `Ptr<i8>` — none of which `coerce_to_type` knows how to
+        // turn into the `[f32/f64 x 2]` value `b.store` expects, so
+        // we'd silently fall through and emit a pointer-into-pair
+        // store that IR-verify rejects.  Memcpy the lane pair from
+        // the buffer to the freshly allocated destination slot
+        // instead — same shape as the assignment-from-complex-call
+        // path elsewhere.  Surfaced in stdlib_stats_moment_mask:
+        // `allocate(mean_, source = mean(x, 1, mask))` where mean
+        // returns scalar complex(sp).
+        if is_complex_ty(dest_ty) {
+            let raw_ty = b.func().value_type(raw);
+            let raw_is_complex_buffer = matches!(
+                raw_ty,
+                Some(IrType::Ptr(ref inner)) if matches!(
+                    inner.as_ref(),
+                    IrType::Array(ref e, n)
+                        if (*n == 2 && matches!(e.as_ref(), IrType::Float(_)))
+                            || (matches!(e.as_ref(), IrType::Int(IntWidth::I8))
+                                && (*n == 8 || *n == 16))
+                ) || matches!(inner.as_ref(), IrType::Int(IntWidth::I8))
+            );
+            if raw_is_complex_buffer {
+                let bytes = b.const_i64(complex_byte_size(dest_ty));
+                b.call(
+                    FuncRef::External("memcpy".into()),
+                    vec![dest_base, raw, bytes],
+                    IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                );
+                b.branch(done_bb, vec![]);
+                b.set_block(done_bb);
+                return;
+            }
+        }
         let coerced = coerce_to_type(b, raw, dest_ty);
         b.store(coerced, dest_base);
     }

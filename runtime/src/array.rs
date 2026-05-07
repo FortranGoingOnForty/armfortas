@@ -1078,13 +1078,23 @@ pub extern "C" fn afs_allocate_like_with_elem_size(
 
     let source = unsafe { &*source };
     let mut dims = [DimDescriptor::default(); MAX_RANK];
+    // Column-major running strides: dim[0]=1, dim[k]=Π_{j<k} extent_j.
+    // The previous flat-1 stride caused per-dim consumers
+    // (`for_each_reduce_along_dim`, `for_each_reduce_along_dim_with_mask`,
+    // `lower_multi_d_section_assign`) to compute colliding byte offsets,
+    // so for `m = (y > 3.)` over `real :: y(2,3)` only 4 of the 6 mask
+    // bytes were read by the masked sum-along-dim helper — the
+    // remaining two ran over the same byte twice and dropped the
+    // column-2 hit entirely.
+    let mut running: i64 = 1;
     for (i, dim) in dims.iter_mut().enumerate().take(source.rank as usize) {
         let extent = source.dims[i].extent();
         *dim = DimDescriptor {
             lower_bound: 1,
             upper_bound: extent,
-            stride: 1,
+            stride: running,
         };
+        running = running.saturating_mul(extent.max(1));
     }
 
     let dims_ptr = if source.rank > 0 {
@@ -2529,6 +2539,251 @@ pub extern "C" fn afs_array_sum_int_dim(
                 }
             });
         }
+    }
+}
+
+/// Walk every source element along all dims (column-major), invoking
+/// `accum(src_byte_off, mask_byte_off, dst_flat)` so the caller can
+/// honor both the source's and the mask's per-dim strides without
+/// reimplementing the index machinery. `dst_flat` indexes the
+/// rank-(N-1) output that excludes `reduce_dim`.
+fn for_each_reduce_along_dim_with_mask<F: FnMut(usize, usize, usize)>(
+    src: &ArrayDescriptor,
+    mask: &ArrayDescriptor,
+    reduce_dim: i32,
+    mut accum: F,
+) {
+    let rank = src.rank as usize;
+    if rank == 0 {
+        return;
+    }
+    let reduce_dim_idx = reduce_dim as usize - 1;
+    if reduce_dim_idx >= rank {
+        return;
+    }
+    let mut extents: [i64; 15] = [0; 15];
+    let mut s_strides: [i64; 15] = [0; 15];
+    let mut m_strides: [i64; 15] = [0; 15];
+    let mut dst_running_stride: [i64; 15] = [0; 15];
+    let mut k = 0usize;
+    let mut acc = 1i64;
+    for i in 0..rank {
+        extents[i] = src.dims[i].extent();
+        s_strides[i] = src.dims[i].stride.max(1);
+        m_strides[i] = if (i as i32) < mask.rank {
+            mask.dims[i].stride.max(1)
+        } else {
+            1
+        };
+        if i == reduce_dim_idx {
+            continue;
+        }
+        dst_running_stride[k] = acc;
+        acc *= extents[i];
+        k += 1;
+    }
+    let mut idx: [i64; 15] = [0; 15];
+    let total = (0..rank).map(|i| extents[i]).product::<i64>();
+    if total <= 0 {
+        return;
+    }
+    let m_elem = mask.elem_size.max(1);
+    for _ in 0..total {
+        let mut s_byte_off: i64 = 0;
+        let mut m_byte_off: i64 = 0;
+        let mut dst_flat: i64 = 0;
+        let mut dk = 0usize;
+        for d in 0..rank {
+            s_byte_off += idx[d] * s_strides[d] * src.elem_size;
+            m_byte_off += idx[d] * m_strides[d] * m_elem;
+            if d != reduce_dim_idx {
+                dst_flat += idx[d] * dst_running_stride[dk];
+                dk += 1;
+            }
+        }
+        accum(s_byte_off as usize, m_byte_off as usize, dst_flat as usize);
+        for d in 0..rank {
+            idx[d] += 1;
+            if idx[d] < extents[d] {
+                break;
+            }
+            idx[d] = 0;
+        }
+    }
+}
+
+unsafe fn mask_byte_is_true(mask: &ArrayDescriptor, byte_off: usize) -> bool {
+    let p = mask.base_addr.add(byte_off);
+    match mask.elem_size {
+        1 => *p != 0,
+        2 => *(p as *const u16) != 0,
+        4 => *(p as *const u32) != 0,
+        8 => *(p as *const u64) != 0,
+        _ => *p != 0,
+    }
+}
+
+/// SUM(array, DIM=k, MASK=mask) — real version. Auto-allocates `dst`
+/// to rank-(N-1) on first call. Walks both array and mask using each
+/// descriptor's own per-dim strides; treats any non-zero mask byte as
+/// `.true.` (matches `mask_at`).
+#[no_mangle]
+pub extern "C" fn afs_array_sum_real8_dim_mask(
+    src: *const ArrayDescriptor,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+) {
+    if src.is_null() || dst.is_null() || mask.is_null() {
+        return;
+    }
+    let s = unsafe { &*src };
+    let d = unsafe { &mut *dst };
+    let m = unsafe { &*mask };
+    if s.base_addr.is_null() || m.base_addr.is_null() {
+        return;
+    }
+    if !d.is_allocated() {
+        let new_rank = (s.rank - 1).max(0);
+        let mut dim_buf: [DimDescriptor; 15] = [DimDescriptor {
+            lower_bound: 0,
+            upper_bound: 0,
+            stride: 0,
+        }; 15];
+        let mut k = 0usize;
+        let mut acc: i64 = 1;
+        for i in 0..s.rank as usize {
+            if i + 1 == dim as usize {
+                continue;
+            }
+            let extent = s.dims[i].extent();
+            dim_buf[k].lower_bound = 1;
+            dim_buf[k].upper_bound = extent;
+            dim_buf[k].stride = acc;
+            acc *= extent;
+            k += 1;
+        }
+        let dim_ptr = if new_rank > 0 {
+            dim_buf.as_ptr()
+        } else {
+            ptr::null()
+        };
+        let mut stat: i32 = 0;
+        afs_allocate_array(dst, s.elem_size, new_rank, dim_ptr, &mut stat);
+        if stat != 0 || d.base_addr.is_null() {
+            return;
+        }
+    }
+    let dst_total = d.total_elements() as usize;
+    let src_ptr = s.base_addr as *const u8;
+    if s.elem_size == 4 {
+        let buf = d.base_addr as *mut f32;
+        for i in 0..dst_total {
+            unsafe {
+                *buf.add(i) = 0.0;
+            }
+        }
+        for_each_reduce_along_dim_with_mask(s, m, dim, |sb, mb, df| {
+            if unsafe { mask_byte_is_true(m, mb) } {
+                let v = unsafe { *(src_ptr.add(sb) as *const f32) };
+                unsafe {
+                    *buf.add(df) += v;
+                }
+            }
+        });
+    } else {
+        let buf = d.base_addr as *mut f64;
+        for i in 0..dst_total {
+            unsafe {
+                *buf.add(i) = 0.0;
+            }
+        }
+        for_each_reduce_along_dim_with_mask(s, m, dim, |sb, mb, df| {
+            if unsafe { mask_byte_is_true(m, mb) } {
+                let v = unsafe { *(src_ptr.add(sb) as *const f64) };
+                unsafe {
+                    *buf.add(df) += v;
+                }
+            }
+        });
+    }
+}
+
+/// SUM(array, DIM=k, MASK=mask) — integer version. Dispatches on
+/// `src.elem_size` (1/2/4/8); auto-allocates `dst` and walks both
+/// descriptors with their own per-dim strides.
+#[no_mangle]
+pub extern "C" fn afs_array_sum_int_dim_mask(
+    src: *const ArrayDescriptor,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+) {
+    if src.is_null() || dst.is_null() || mask.is_null() {
+        return;
+    }
+    let s = unsafe { &*src };
+    let d = unsafe { &mut *dst };
+    let m = unsafe { &*mask };
+    if s.base_addr.is_null() || m.base_addr.is_null() {
+        return;
+    }
+    if !d.is_allocated() {
+        let new_rank = (s.rank - 1).max(0);
+        let mut dim_buf: [DimDescriptor; 15] = [DimDescriptor {
+            lower_bound: 0,
+            upper_bound: 0,
+            stride: 0,
+        }; 15];
+        let mut k = 0usize;
+        let mut acc: i64 = 1;
+        for i in 0..s.rank as usize {
+            if i + 1 == dim as usize {
+                continue;
+            }
+            let extent = s.dims[i].extent();
+            dim_buf[k].lower_bound = 1;
+            dim_buf[k].upper_bound = extent;
+            dim_buf[k].stride = acc;
+            acc *= extent;
+            k += 1;
+        }
+        let dim_ptr = if new_rank > 0 {
+            dim_buf.as_ptr()
+        } else {
+            ptr::null()
+        };
+        let mut stat: i32 = 0;
+        afs_allocate_array(dst, s.elem_size, new_rank, dim_ptr, &mut stat);
+        if stat != 0 || d.base_addr.is_null() {
+            return;
+        }
+    }
+    let dst_total = d.total_elements() as usize;
+    let src_ptr = s.base_addr as *const u8;
+    macro_rules! sum_dim_mask_kind {
+        ($t:ty) => {{
+            let buf = d.base_addr as *mut $t;
+            for i in 0..dst_total {
+                unsafe {
+                    *buf.add(i) = 0;
+                }
+            }
+            for_each_reduce_along_dim_with_mask(s, m, dim, |sb, mb, df| {
+                if unsafe { mask_byte_is_true(m, mb) } {
+                    let v = unsafe { *(src_ptr.add(sb) as *const $t) };
+                    unsafe {
+                        *buf.add(df) = (*buf.add(df)).wrapping_add(v);
+                    }
+                }
+            });
+        }};
+    }
+    match s.elem_size {
+        1 => sum_dim_mask_kind!(i8),
+        2 => sum_dim_mask_kind!(i16),
+        8 => sum_dim_mask_kind!(i64),
+        _ => sum_dim_mask_kind!(i32),
     }
 }
 
@@ -4033,13 +4288,13 @@ pub extern "C" fn afs_array_pack(
     let pairs = total.min(mask_total);
     let mask_elem = msk.elem_size.max(1) as usize;
 
-    // First pass: count true values in the mask.
+    // First pass: count true values in the mask. Dispatch on the
+    // mask's elem_size — a `logical :: m(:)` now reaches us with
+    // elem_size=1 (matches storage), and the prior fixed i32 read
+    // misaligned every iteration.
     let mut true_count: i64 = 0;
-    let msk_buf = msk.base_addr as *const u8;
     for i in 0..pairs {
-        let off = i * mask_elem;
-        let v = unsafe { *(msk_buf.add(off) as *const i32) };
-        if v != 0 {
+        if unsafe { mask_byte_is_true(msk, i * mask_elem) } {
             true_count += 1;
         }
     }
@@ -4068,8 +4323,7 @@ pub extern "C" fn afs_array_pack(
     // Second pass: emit masked-true source elements into result.
     let mut out_idx: usize = 0;
     for i in 0..pairs {
-        let m = unsafe { *(msk_buf.add(i * mask_elem) as *const i32) };
-        if m != 0 {
+        if unsafe { mask_byte_is_true(msk, i * mask_elem) } {
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     sp.add(i * elem_size),

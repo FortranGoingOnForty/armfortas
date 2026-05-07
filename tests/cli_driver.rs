@@ -12061,6 +12061,45 @@ fn rank_n_array_compare_yields_same_shape_logical_descriptor_per_f2018() {
 }
 
 #[test]
+fn sum_with_dim_and_mask_filters_per_column_using_descriptor_strides() {
+    // F2018 §16.9.193: SUM(ARRAY, DIM, MASK) sums elements of ARRAY
+    // along DIM where MASK is .true. — element-wise gather, not
+    // unmasked-then-broadcast. Pre-fix `lower_array_sum_dim_descriptor`
+    // bailed on `has_mask` and the assignment fell through to a scalar
+    // broadcast that crashed `afs_assign_allocatable` with a misaligned
+    // 0x3 source pointer in `example_var`'s `var(y, 1, y > 3.)`. Now
+    // the lowering routes through `afs_array_sum_real8_dim_mask` /
+    // `afs_array_sum_int_dim_mask`, which walk source + mask using
+    // each descriptor's own per-dim strides.
+    let src = write_program(
+        "program p\n  implicit none\n  real :: y(2,3)\n  real, allocatable :: r(:)\n  y = reshape([1.,2.,3.,4.,5.,6.], [2,3])\n  r = sum(y, 1, y > 3.)\n  if (size(r) /= 3) error stop 1\n  if (abs(r(1) - 0.0) > 1e-6) error stop 2\n  if (abs(r(2) - 4.0) > 1e-6) error stop 3\n  if (abs(r(3) - 11.0) > 1e-6) error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("sum_dim_mask", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "run failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected 'ok': {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn ieee_is_nan_over_rank_n_array_dispatches_elementally() {
     // F2018 §17.11: ieee_is_nan is elemental — applied to a rank-N
     // numeric array it must yield a same-shape logical array. Without
@@ -13148,6 +13187,61 @@ fn module_parameter_array_scalar_broadcast_init_keeps_array_global() {
 }
 
 #[test]
+fn user_function_call_with_section_arg_emits_one_section_descriptor_per_callsite() {
+    // Asm-level guard against re-introducing the resolution_arg_vals /
+    // intrinsic_arg_vals probe duplication that compiled
+    // stdlib_hash_32bit_water at a 26 GB peak: every
+    // `user_func(arr(i:))` site used to lower the section descriptor
+    // three times — once for resolve_generic_call_actuals, once for
+    // lower_intrinsic, once for ref_arg_vals — even though the first
+    // two are no-ops for a non-generic non-intrinsic callee.  Now we
+    // gate the resolution probe behind has_named_interface /
+    // procptr_target and the intrinsic probe behind is_intrinsic_name;
+    // only ref_arg_vals materialises the descriptor.
+    //
+    // Counts a fixed-shape stdlib_hash-style snippet's
+    // `afs_create_section` call sites in `-S` output: source has 8
+    // section accesses across 8 user-call sites, so emitted descriptor
+    // count must stay ≤ 16 (one per access plus a generous slack for
+    // the final-call ref-arg lowering).  Pre-fix this number was 24+.
+    let src = write_program(
+        "module m\n  use iso_fortran_env, only: int8, int64\n  implicit none\ncontains\n  pure function pick(buf) result(r)\n    integer(int8), intent(in) :: buf(0:)\n    integer(int64) :: r\n    r = transfer([buf(0), buf(1), buf(2), buf(3), 0_int8, 0_int8, 0_int8, 0_int8], r)\n  end function\n  pure function combine(key) result(h)\n    integer(int8), intent(in) :: key(0:)\n    integer(int64) :: h\n    h = ieor(pick(key(0:)),  pick(key(4:)))\n    h = ieor(h, ieor(pick(key(8:)),  pick(key(12:))))\n    h = ieor(h, ieor(pick(key(0:)),  pick(key(4:))))\n    h = ieor(h, ieor(pick(key(8:)),  pick(key(12:))))\n  end function\nend module\n",
+        "f90",
+    );
+    let out = unique_path("section_emit_count", "s");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-S", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("section emit count compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "should compile cleanly: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let asm = std::fs::read_to_string(&out).expect("read asm");
+    let n = asm.matches("bl _afs_create_section").count();
+    // 8 source-level sections.  Observed-good: 14 emissions
+    // (~1.75x) — one descriptor per call plus a small per-callsite
+    // overhead.  History:
+    //   * pre-fix:                                  ~24x source
+    //     (resolution_arg_vals + intrinsic_arg_vals duplication)
+    //   * after probe-vec gating (0592c14):         ~5.25x source
+    //     (lower_array_intrinsic still emitted descriptor for
+    //     non-array-intrinsic names before its dispatch matched)
+    //   * after lower_array_intrinsic name gate:    ~1.75x source
+    // Threshold at 24 (3x) catches a return to either earlier
+    // regime while leaving headroom for incidental per-callsite
+    // work.
+    assert!(
+        n <= 24,
+        "expected ≤24 afs_create_section emissions for 8 source sections, \
+         got {n} — probe duplication may have regressed"
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn internal_subprogram_call_under_intrinsic_under_user_call_keeps_mangled_name() {
     // F2018 §15.6.2.2: internal subprograms (CONTAINS-block functions
     // inside another procedure) link under a host-prefixed mangled
@@ -13191,6 +13285,84 @@ fn internal_subprogram_call_under_intrinsic_under_user_call_keeps_mangled_name()
     );
     let stdout = String::from_utf8_lossy(&run.stdout);
     assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn complex_local_minus_complex_function_call_compiles_through_complex_arith() {
+    // F2018 §7.1.5: complex - complex is a complex-shape binary op.
+    // The binop lowering's complex-arithmetic branch fires when at
+    // least one operand satisfies `is_complex_ty` (`[fN x 2]` or
+    // `Ptr<[fN x 2]>`).  ComplexBuffer-ABI returns are passed back to
+    // the caller as a pointer to a typed temp buffer; the temp used to
+    // be allocated as `Ptr<[i8 x 8/16]>`, which `is_complex_ty` does
+    // not recognise.  For `complex_local - complex_call(...)` the
+    // binop check then fell through to the int/float promotion path
+    // and emitted `fsub %ptr<[i8 x 8]>` — IR-verify rejected with
+    // `float op has non-float operand : ptr<[i8 x 8]>`.
+    //
+    // Surfaced in stdlib_lapack_solve_chol_comp's CPOTF2/ZPOTF2:
+    //   ajj = real( real(a(j,j),sp) - cdotc(...), sp )
+    // Fix types the ComplexBuffer temp as `[fN x 2]` so the call's
+    // result is `Ptr<[fN x 2]>` and downstream paths recognize it as
+    // a complex value.
+    let src = write_program(
+        "module m\n  implicit none\n  integer, parameter :: sp = kind(1.0)\ncontains\n  pure function dot_csp(n, x, y) result(res)\n    integer, intent(in) :: n\n    complex(sp), intent(in) :: x(*), y(*)\n    complex(sp) :: res\n    integer :: i\n    res = (0.0_sp, 0.0_sp)\n    do i = 1, n\n      res = res + conjg(x(i)) * y(i)\n    end do\n  end function\n  pure subroutine cpotf2_min(n, a)\n    integer, intent(in) :: n\n    complex(sp), intent(inout) :: a(n,n)\n    real(sp) :: ajj\n    integer :: j\n    do j = 1, n\n      ajj = real( real(a(j,j), KIND=sp) - dot_csp(j-1, a(1,j), a(1,j)), KIND=sp)\n      a(j,j) = ajj\n    end do\n  end subroutine\nend module\n",
+        "f90",
+    );
+    let out = unique_path("complex_minus_call", "o");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("complex minus call compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "should compile cleanly (no IR-verify failure): {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn allocate_scalar_with_source_from_complex_returning_call_compiles_cleanly() {
+    // F2018 §9.7.1.2: ALLOCATE(target, SOURCE = expr) initializes the
+    // freshly allocated target with the value of expr.  When expr is
+    // a scalar complex(sp/dp) function call, the callee returns its
+    // result through the ComplexBuffer hidden-output-parameter ABI:
+    // the value comes back as a *pointer* to a fresh 8/16-byte lane
+    // pair, not as a `[f32/f64 x 2]` aggregate.  The previous
+    // emit_scalar_allocate_source_init_on_success piped that pointer
+    // through `coerce_to_type(Ptr → Array)`, which has no path,
+    // silently fell through to `b.store(ptr, complex_slot)`, and
+    // tripped IR-verify with `value type ptr<[i8 x 8]> doesn't match
+    // pointee type [f32 x 2]`.  The fix memcpys the lane pair from
+    // the buffer into the destination slot.  Surfaced in
+    // stdlib_stats_moment_mask:
+    // `allocate(mean_, source = mean(x, 1, mask))` where mean
+    // returns scalar complex(sp).
+    //
+    // Compile-level only: the runtime path through allocatable
+    // complex scalars hits a separate pre-existing bug in
+    // afs_assign_allocatable / `real(m_)` reads on allocated complex
+    // scalars (descriptor index out of bounds), tracked separately.
+    let src = write_program(
+        "module m\n  implicit none\n  integer, parameter :: sp = kind(1.0)\ncontains\n  pure function pick_csp(x) result(res)\n    complex(sp), intent(in) :: x(:)\n    complex(sp) :: res\n    res = x(1)\n  end function\nend module\n\nprogram t\n  use m\n  implicit none\n  complex(kind=kind(1.0)) :: x(1)\n  complex(kind=kind(1.0)), allocatable :: m_\n  x(1) = (3.0, 4.0)\n  allocate(m_, source = pick_csp(x))\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("alloc_complex_source", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("alloc complex source compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "should compile + link cleanly (no IR-verify failure): {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
 
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
