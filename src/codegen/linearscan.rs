@@ -223,13 +223,30 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
     // ways that surface latent bugs in arg-setup emission — but we
     // do consult this tighter map before committing to a split.
     let mut vreg_actual_range: HashMap<VRegId, (u32, u32)> = HashMap::new();
+    // Vregs defined in more than one MIR block — these are
+    // phi-like (block params receiving values via the parallel-copy
+    // sequence emit_branch_arg_copies inserts at the end of every
+    // predecessor). Linear-position liveness can't represent the
+    // true CFG-aware live set for these, so the splitter must not
+    // act on them: a call block lexically wedged between the def
+    // edge and the use block fakes a crossing point that no actual
+    // control-flow path traverses, and the resulting split assigns
+    // the post-half a different physreg than the pre-half — every
+    // predecessor's parallel-copy lands in pre_phys but every use
+    // inside the loop reads post_phys. (`realworld_affine_shift.f90`
+    // at -O2+ exhibits this: V_iv defined in `if_end_1`, used in
+    // `do_check_3`/`do_body_4`, but `if_then_2` carrying the
+    // recursive call is lexically between if_end_1 and do_check_3.)
+    let mut vreg_def_blocks: HashMap<VRegId, std::collections::HashSet<usize>> =
+        HashMap::new();
     {
         let mut p: u32 = 0;
-        for block in &mf.blocks {
+        for (block_idx, block) in mf.blocks.iter().enumerate() {
             for inst in &block.insts {
                 let mut touched: Vec<VRegId> = Vec::new();
                 if let Some(d) = inst.def {
                     touched.push(d);
+                    vreg_def_blocks.entry(d).or_default().insert(block_idx);
                 }
                 for op in &inst.operands {
                     if let MachineOperand::VReg(v) = op {
@@ -249,6 +266,11 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
             }
         }
     }
+    let multi_def_vregs: std::collections::HashSet<VRegId> = vreg_def_blocks
+        .iter()
+        .filter(|(_, blocks)| blocks.len() > 1)
+        .map(|(v, _)| *v)
+        .collect();
 
     // Worklist of intervals to allocate. Starts as a clone of the
     // pre-sorted liveness intervals; splitting inserts post-half
@@ -321,7 +343,14 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
         // range from the MIR walk: a vreg whose real range doesn't
         // straddle the supposed crossing point is a false positive
         // from inflated liveness, and must NOT be split.
-        let real_crosses = if let Some(&(real_start, real_end)) =
+        let real_crosses = if multi_def_vregs.contains(&interval.vreg) {
+            // Phi-like vreg: positions can't represent the true
+            // live set (see comment above where multi_def_vregs is
+            // built). Refuse to split — the parallel-copy at every
+            // predecessor must land in the same physreg as every
+            // use, and splitting fundamentally breaks that.
+            false
+        } else if let Some(&(real_start, real_end)) =
             vreg_actual_range.get(&interval.vreg)
         {
             interval.call_crossings.len() == 1
@@ -336,19 +365,7 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
         // P — by the time the bridge str fires (right above the
         // arg-setup block), P would no longer hold the pre-half's
         // value and the bridge would capture garbage.
-        // Live-range splitting is gated behind an opt-in env var
-        // until the regalloc phi-resolution interaction is hardened.
-        // Without the gate, loops where mem2reg leaves the
-        // accumulator in memory but the body has duplicate loads of
-        // an invariant scalar can pick up split intervals that alias
-        // the loop's iv block param register on the preheader edge,
-        // miscompiling `realworld_affine_shift.f90` at -O2+ (iv ends
-        // up holding the invariant scalar, not the iv init).
-        let splitting_enabled = std::env::var_os("ARMFORTAS_SPLIT_INTERVALS").is_some();
-        let safe_pre_phys = if splitting_enabled
-            && !free_caller.is_empty()
-            && interval.call_crossings.len() == 1
-        {
+        let safe_pre_phys = if !free_caller.is_empty() && interval.call_crossings.len() == 1 {
             let cp = interval.call_crossings[0];
             let pre_end = cp.saturating_sub(1);
             free_caller.iter().rposition(|&r| {
@@ -1982,14 +1999,6 @@ mod tests {
 
     #[test]
     fn linear_scan_splits_call_crossing_when_callee_saved_exhausted() {
-        // Splitting is gated behind an env var in production until
-        // the regalloc phi-resolution interaction is hardened. Set
-        // the gate here so the unit test can exercise the splitting
-        // path. (Unsetting it after the test would race with parallel
-        // tests; instead, only this one test reads the var, and any
-        // other tests that don't expect splitting use shapes that
-        // wouldn't trigger it anyway.)
-        std::env::set_var("ARMFORTAS_SPLIT_INTERVALS", "1");
         // 12 vregs all live across a single BL forces the
         // allocator past the 10-deep callee-saved pool. Without
         // splitting the overflow vregs full-spill; with splitting
