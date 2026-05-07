@@ -13236,6 +13236,43 @@ fn internal_subprogram_call_under_intrinsic_under_user_call_keeps_mangled_name()
 }
 
 #[test]
+fn complex_local_minus_complex_function_call_compiles_through_complex_arith() {
+    // F2018 §7.1.5: complex - complex is a complex-shape binary op.
+    // The binop lowering's complex-arithmetic branch fires when at
+    // least one operand satisfies `is_complex_ty` (`[fN x 2]` or
+    // `Ptr<[fN x 2]>`).  ComplexBuffer-ABI returns are passed back to
+    // the caller as a pointer to a typed temp buffer; the temp used to
+    // be allocated as `Ptr<[i8 x 8/16]>`, which `is_complex_ty` does
+    // not recognise.  For `complex_local - complex_call(...)` the
+    // binop check then fell through to the int/float promotion path
+    // and emitted `fsub %ptr<[i8 x 8]>` — IR-verify rejected with
+    // `float op has non-float operand : ptr<[i8 x 8]>`.
+    //
+    // Surfaced in stdlib_lapack_solve_chol_comp's CPOTF2/ZPOTF2:
+    //   ajj = real( real(a(j,j),sp) - cdotc(...), sp )
+    // Fix types the ComplexBuffer temp as `[fN x 2]` so the call's
+    // result is `Ptr<[fN x 2]>` and downstream paths recognize it as
+    // a complex value.
+    let src = write_program(
+        "module m\n  implicit none\n  integer, parameter :: sp = kind(1.0)\ncontains\n  pure function dot_csp(n, x, y) result(res)\n    integer, intent(in) :: n\n    complex(sp), intent(in) :: x(*), y(*)\n    complex(sp) :: res\n    integer :: i\n    res = (0.0_sp, 0.0_sp)\n    do i = 1, n\n      res = res + conjg(x(i)) * y(i)\n    end do\n  end function\n  pure subroutine cpotf2_min(n, a)\n    integer, intent(in) :: n\n    complex(sp), intent(inout) :: a(n,n)\n    real(sp) :: ajj\n    integer :: j\n    do j = 1, n\n      ajj = real( real(a(j,j), KIND=sp) - dot_csp(j-1, a(1,j), a(1,j)), KIND=sp)\n      a(j,j) = ajj\n    end do\n  end subroutine\nend module\n",
+        "f90",
+    );
+    let out = unique_path("complex_minus_call", "o");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("complex minus call compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "should compile cleanly (no IR-verify failure): {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn allocate_scalar_with_source_from_complex_returning_call_compiles_cleanly() {
     // F2018 §9.7.1.2: ALLOCATE(target, SOURCE = expr) initializes the
     // freshly allocated target with the value of expr.  When expr is

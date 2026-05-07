@@ -15,7 +15,7 @@ use crate::ir::types::*;
 use crate::sema::symtab::SymbolTable;
 
 use super::core::*;
-use super::ctx::{current_proc_scope, CharKind, LocalInfo, LowerCtx};
+use super::ctx::{current_proc_scope, CharKind, HiddenResultAbi, LocalInfo, LowerCtx};
 use super::const_scalar::{clamp_const_to_type, materialize_const_scalar, ConstScalar};
 use super::helpers::coerce_to_type;
 use crate::ast::expr::{BinaryOp, UnaryOp};
@@ -1644,8 +1644,31 @@ pub(crate) fn lower_expr_full(
                             &abi_lookup_keys,
                             hidden_abi,
                         ) {
-                            let desc =
-                                b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), bytes));
+                            // For ComplexBuffer ABI returns, type the temp
+                            // as `[f32 x 2]` / `[f64 x 2]` so the call's
+                            // result is `Ptr<[fN x 2]>` and `is_complex_ty`
+                            // sees it as a complex value.  Without this,
+                            // the buffer is `Ptr<[i8 x 8/16]>`, the binop
+                            // path's `is_complex_ty(&lty) || is_complex_ty(&rty)`
+                            // check fails for `complex_local - complex_call(...)`,
+                            // and the int/float promotion path then
+                            // emits `fsub %ptr<[i8 x 8]>` against the buffer
+                            // pointer — IR-verify rejects with `float op
+                            // has non-float operand : ptr<[i8 x 8]>`.
+                            // Surfaced in stdlib_lapack_solve_chol_comp's
+                            // CPOTF2/ZPOTF2 routines:
+                            //   `ajj = real( real(a(j,j),sp) - cdotc(...), sp)`.
+                            let alloca_ty = if hidden_abi == HiddenResultAbi::ComplexBuffer {
+                                let fw = if bytes == 16 {
+                                    FloatWidth::F64
+                                } else {
+                                    FloatWidth::F32
+                                };
+                                IrType::Array(Box::new(IrType::Float(fw)), 2)
+                            } else {
+                                IrType::Array(Box::new(IrType::Int(IntWidth::I8)), bytes)
+                            };
+                            let desc = b.alloca(alloca_ty);
                             let zero_i32 = b.const_i32(0);
                             let size = b.const_i64(bytes as i64);
                             b.call(
@@ -2016,10 +2039,26 @@ pub(crate) fn lower_expr_full(
                                         &abi_lookup_keys,
                                         hidden_abi,
                                     ) {
-                                        let desc = b.alloca(IrType::Array(
-                                            Box::new(IrType::Int(IntWidth::I8)),
-                                            bytes,
-                                        ));
+                                        // Type ComplexBuffer ABI temps as
+                                        // [fN x 2] so downstream `is_complex_ty`
+                                        // checks recognize the result; same
+                                        // motivation as the Name-callee path.
+                                        let alloca_ty = if hidden_abi
+                                            == HiddenResultAbi::ComplexBuffer
+                                        {
+                                            let fw = if bytes == 16 {
+                                                FloatWidth::F64
+                                            } else {
+                                                FloatWidth::F32
+                                            };
+                                            IrType::Array(Box::new(IrType::Float(fw)), 2)
+                                        } else {
+                                            IrType::Array(
+                                                Box::new(IrType::Int(IntWidth::I8)),
+                                                bytes,
+                                            )
+                                        };
+                                        let desc = b.alloca(alloca_ty);
                                         let zero_i32 = b.const_i32(0);
                                         let size = b.const_i64(bytes as i64);
                                         b.call(
