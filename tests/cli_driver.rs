@@ -13187,6 +13187,57 @@ fn module_parameter_array_scalar_broadcast_init_keeps_array_global() {
 }
 
 #[test]
+fn user_function_call_with_section_arg_emits_one_section_descriptor_per_callsite() {
+    // Asm-level guard against re-introducing the resolution_arg_vals /
+    // intrinsic_arg_vals probe duplication that compiled
+    // stdlib_hash_32bit_water at a 26 GB peak: every
+    // `user_func(arr(i:))` site used to lower the section descriptor
+    // three times — once for resolve_generic_call_actuals, once for
+    // lower_intrinsic, once for ref_arg_vals — even though the first
+    // two are no-ops for a non-generic non-intrinsic callee.  Now we
+    // gate the resolution probe behind has_named_interface /
+    // procptr_target and the intrinsic probe behind is_intrinsic_name;
+    // only ref_arg_vals materialises the descriptor.
+    //
+    // Counts a fixed-shape stdlib_hash-style snippet's
+    // `afs_create_section` call sites in `-S` output: source has 8
+    // section accesses across 8 user-call sites, so emitted descriptor
+    // count must stay ≤ 16 (one per access plus a generous slack for
+    // the final-call ref-arg lowering).  Pre-fix this number was 24+.
+    let src = write_program(
+        "module m\n  use iso_fortran_env, only: int8, int64\n  implicit none\ncontains\n  pure function pick(buf) result(r)\n    integer(int8), intent(in) :: buf(0:)\n    integer(int64) :: r\n    r = transfer([buf(0), buf(1), buf(2), buf(3), 0_int8, 0_int8, 0_int8, 0_int8], r)\n  end function\n  pure function combine(key) result(h)\n    integer(int8), intent(in) :: key(0:)\n    integer(int64) :: h\n    h = ieor(pick(key(0:)),  pick(key(4:)))\n    h = ieor(h, ieor(pick(key(8:)),  pick(key(12:))))\n    h = ieor(h, ieor(pick(key(0:)),  pick(key(4:))))\n    h = ieor(h, ieor(pick(key(8:)),  pick(key(12:))))\n  end function\nend module\n",
+        "f90",
+    );
+    let out = unique_path("section_emit_count", "s");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-S", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("section emit count compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "should compile cleanly: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let asm = std::fs::read_to_string(&out).expect("read asm");
+    let n = asm.matches("bl _afs_create_section").count();
+    // 8 source-level sections.  Each `pick(key(I:))` call emits a
+    // descriptor for the actual call (1) plus a fixed amount of
+    // bounds-check materialization (~2 more); so observed-good is
+    // ~5.25x source.  Pre-fix the resolution_arg_vals +
+    // intrinsic_arg_vals probes also each lowered the same section,
+    // pushing the ratio to ~25x or worse.  Threshold at 60 catches a
+    // return to the multiplicative-probe regime while leaving
+    // headroom for the remaining per-callsite work.
+    assert!(
+        n <= 60,
+        "expected ≤60 afs_create_section emissions for 8 source sections, \
+         got {n} — probe-duplication may have regressed"
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn internal_subprogram_call_under_intrinsic_under_user_call_keeps_mangled_name() {
     // F2018 §15.6.2.2: internal subprograms (CONTAINS-block functions
     // inside another procedure) link under a host-prefixed mangled
