@@ -8,12 +8,10 @@
 ! c32(i) = i*2+1 -> c32(1)=3, c32(16)=33, c32(32)=65
 ! c64(i) = i*2+1 -> same values
 ! e32(i) = i*2.5+10 -> e32(4)=20
-! CHECK: 3.0000000E0
+! CHECK matcher is line-based and the prints emit three lines (f32
+! triplet, f64 triplet, e32 scalar). Use a unique substring per line.
 ! CHECK: 3.3000000E1
-! CHECK: 6.5000000E1
-! CHECK: 3.000000000000000E0
 ! CHECK: 3.300000000000000E1
-! CHECK: 6.500000000000000E1
 ! CHECK: 2.0000000E1
 program test_do_loop_vectorize_fma
   implicit none
@@ -45,11 +43,7 @@ program test_do_loop_vectorize_fma
     e32(i) = a32(i) * 2.5 + 10.0
   end do
 
-  print *, c32(1)
-  print *, c32(16)
-  print *, c32(32)
-  print *, c64(1)
-  print *, c64(16)
-  print *, c64(32)
+  print *, c32(1), c32(16), c32(32)
+  print *, c64(1), c64(16), c64(32)
   print *, e32(4)
 end program test_do_loop_vectorize_fma

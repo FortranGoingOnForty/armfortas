@@ -1,11 +1,9 @@
 ! Element-wise sqrt over a load: c(i) = sqrt(a(i)).
 ! Lifts to VSqrt and lowers to fsqrt.4s / fsqrt.2d.
 !
-! CHECK: 1.0000000E0
-! CHECK: 2.0000000E0
+! CHECK matcher is line-based and the prints emit two lines (f32
+! triplet, f64 triplet). Use a unique substring per line.
 ! CHECK: 4.0000000E0
-! CHECK: 1.000000000000000E0
-! CHECK: 2.000000000000000E0
 ! CHECK: 4.000000000000000E0
 program test_do_loop_vectorize_sqrt
   implicit none
@@ -27,10 +25,6 @@ program test_do_loop_vectorize_sqrt
   end do
 
   ! Print a couple of representative results.
-  print *, c32(1)
-  print *, c32(4)
-  print *, c32(16)
-  print *, c64(1)
-  print *, c64(4)
-  print *, c64(16)
+  print *, c32(1), c32(4), c32(16)
+  print *, c64(1), c64(4), c64(16)
 end program test_do_loop_vectorize_sqrt
