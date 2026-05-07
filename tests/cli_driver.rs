@@ -12061,6 +12061,45 @@ fn rank_n_array_compare_yields_same_shape_logical_descriptor_per_f2018() {
 }
 
 #[test]
+fn sum_with_dim_and_mask_filters_per_column_using_descriptor_strides() {
+    // F2018 §16.9.193: SUM(ARRAY, DIM, MASK) sums elements of ARRAY
+    // along DIM where MASK is .true. — element-wise gather, not
+    // unmasked-then-broadcast. Pre-fix `lower_array_sum_dim_descriptor`
+    // bailed on `has_mask` and the assignment fell through to a scalar
+    // broadcast that crashed `afs_assign_allocatable` with a misaligned
+    // 0x3 source pointer in `example_var`'s `var(y, 1, y > 3.)`. Now
+    // the lowering routes through `afs_array_sum_real8_dim_mask` /
+    // `afs_array_sum_int_dim_mask`, which walk source + mask using
+    // each descriptor's own per-dim strides.
+    let src = write_program(
+        "program p\n  implicit none\n  real :: y(2,3)\n  real, allocatable :: r(:)\n  y = reshape([1.,2.,3.,4.,5.,6.], [2,3])\n  r = sum(y, 1, y > 3.)\n  if (size(r) /= 3) error stop 1\n  if (abs(r(1) - 0.0) > 1e-6) error stop 2\n  if (abs(r(2) - 4.0) > 1e-6) error stop 3\n  if (abs(r(3) - 11.0) > 1e-6) error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("sum_dim_mask", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "run failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected 'ok': {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn ieee_is_nan_over_rank_n_array_dispatches_elementally() {
     // F2018 §17.11: ieee_is_nan is elemental — applied to a rank-N
     // numeric array it must yield a same-shape logical array. Without
