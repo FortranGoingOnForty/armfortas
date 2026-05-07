@@ -13242,6 +13242,79 @@ fn user_function_call_with_section_arg_emits_one_section_descriptor_per_callsite
 }
 
 #[test]
+fn descriptor_actual_passed_to_assumed_size_dummy_extracts_base_addr() {
+    // F2018 §15.5.2.4: assumed-size dummies receive a bare element
+    // pointer.  When the actual is an array section (`arr(:)`) — a
+    // non-Name, non-all-Element shape — `lower_arg_by_ref_full`'s tail
+    // path lowers it to a 384-byte descriptor.  Without explicit base
+    // extraction at the tail, the callee receives the descriptor pointer
+    // and reads its first 8 bytes (= base_addr field) as if it were the
+    // first element.  This surfaces in stdlib's solve / lapack chains
+    // (e.g. `call gesv(n, nrhs, amat, ...)` where amat is a pointer
+    // local feeding `a(lda,*)`) as bounds-check failures of the form
+    // "index <huge> outside [1, n]".
+    //
+    // This test exercises the section→assumed-size path end-to-end:
+    // wrong-base would either crash, fault, or produce a wildly wrong
+    // sum.  6.0 means base was correctly extracted from the section
+    // descriptor before the call.
+    let src = write_program(
+        r#"
+module m
+  implicit none
+  integer, parameter :: dp = kind(1.0d0)
+contains
+  pure function sum_first(n, x) result(s)
+    integer, intent(in) :: n
+    real(dp), intent(in) :: x(*)
+    real(dp) :: s
+    integer :: i
+    s = 0.0_dp
+    do i = 1, n
+      s = s + x(i)
+    end do
+  end function
+end module
+program t
+  use m
+  implicit none
+  real(dp) :: arr(5)
+  real(dp) :: s
+  arr = [1.0_dp, 2.0_dp, 3.0_dp, 4.0_dp, 5.0_dp]
+  s = sum_first(3, arr(:))
+  if (abs(s - 6.0_dp) > 1.0e-12_dp) error stop 1
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("descriptor_actual_to_assumed_size", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("descriptor-actual to assumed-size compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "should compile cleanly: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "section→assumed-size runtime failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected 'ok' from section→assumed-size sum: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn internal_subprogram_call_under_intrinsic_under_user_call_keeps_mangled_name() {
     // F2018 §15.6.2.2: internal subprograms (CONTAINS-block functions
     // inside another procedure) link under a host-prefixed mangled

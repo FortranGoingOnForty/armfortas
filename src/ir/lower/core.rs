@@ -32142,6 +32142,24 @@ pub(super) fn lower_arg_by_ref_full(
         .value_type(val)
         .unwrap_or(IrType::Int(IntWidth::I32));
     if ty.is_ptr() {
+        // F2018 §15.5.2.4: assumed-size and explicit-shape dummies receive
+        // a *bare element pointer*, not a descriptor.  When the actual is
+        // a section, an array binop, an array-result function, or any
+        // other expression whose lowering produces a 384-byte descriptor
+        // pointer (Ptr<[i8; 384]>), extract the base_addr field before
+        // passing it on.  Without this, the callee reads the descriptor's
+        // first 8 bytes (= base_addr) as if they were the array's first
+        // element — surfaced post-db04b9d as bounds-check failures of the
+        // form "index <huge> outside [1, n]" in stdlib's solve/getrf path
+        // (e.g. `call gesv(n, nrhs, amat, ...)` where amat is a pointer
+        // local feeding `a(lda,*)`).
+        if let IrType::Ptr(inner) = &ty {
+            if let IrType::Array(elem, 384) = inner.as_ref() {
+                if matches!(elem.as_ref(), IrType::Int(IntWidth::I8)) {
+                    return b.load_typed(val, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                }
+            }
+        }
         return val;
     }
     let tmp = b.alloca(ty);
