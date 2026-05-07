@@ -9778,18 +9778,55 @@ pub(super) fn generic_dispatch_probe_value(
         let zero = b.const_i64(0);
         return b.int_to_ptr(zero, elem_ty);
     }
-    if let Some((_desc, elem_ty)) = lower_array_expr_descriptor(
-        b,
-        locals,
-        expr,
-        st,
-        type_layouts,
-        internal_funcs,
-        contained_host_refs,
-        descriptor_params,
-    ) {
-        let zero = b.const_i64(0);
-        return b.int_to_ptr(zero, elem_ty);
+    // For a `Name(callee)` FunctionCall whose ABI is *not* an array
+    // descriptor (the early `array_function_result_elem_type` check
+    // above already returned None) and whose callee is neither a
+    // local array nor one of the transformational intrinsics that
+    // `lower_array_expr_descriptor` knows how to materialize, calling
+    // `lower_array_expr_descriptor` here is wasted work: it walks the
+    // FunctionCall arm, fails every named-intrinsic match, and ends
+    // up re-running `array_function_result_elem_type` (via
+    // `lower_array_function_result_descriptor`) only to return None.
+    // The recursive arg-probing inside that second invocation is
+    // O(2^depth) for nested calls — stdlib_hash_32bit_water.f90's
+    // water_hash inner loop nested four-deep across 16 SELECT CASE
+    // arms compounded into a ~123 GB compile peak.  Skip the redundant
+    // call and go straight to `lower_expr_full`, which does the real
+    // evaluation correctly (the test
+    // `internal_subprogram_call_under_intrinsic_under_user_call_keeps_mangled_name`
+    // depends on threaded `internal_funcs` reaching the actual call).
+    let skip_array_descriptor_path = if let Expr::FunctionCall { callee, .. } = &expr.node {
+        if let Expr::Name { name } = &callee.node {
+            let lname = name.to_ascii_lowercase();
+            const NAMED_ARRAY_INTRINSICS: &[&str] = &[
+                "pack", "reshape", "transfer", "sum", "merge", "matmul",
+                "transpose", "conjg", "aimag", "dimag", "abs", "cmplx", "shape",
+            ];
+            let is_named_intrinsic = NAMED_ARRAY_INTRINSICS.contains(&lname.as_str());
+            let local_array = locals
+                .get(&lname)
+                .is_some_and(local_is_array_like);
+            !is_named_intrinsic && !local_array
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    if !skip_array_descriptor_path {
+        if let Some((_desc, elem_ty)) = lower_array_expr_descriptor(
+            b,
+            locals,
+            expr,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        ) {
+            let zero = b.const_i64(0);
+            return b.int_to_ptr(zero, elem_ty);
+        }
     }
     if expr_is_character_expr(b, locals, expr, st, type_layouts) {
         b.const_int(0, IntWidth::I8)
