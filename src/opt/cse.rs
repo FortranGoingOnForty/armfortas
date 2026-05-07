@@ -205,6 +205,32 @@ fn key_of(inst: &Inst) -> Option<Key> {
         | InstKind::RuntimeCall(..)
         | InstKind::ConstString(..)
         | InstKind::Undef(..) => None,
+
+        // Vector ops not yet CSE-eligible — Stage 1 lands the
+        // type/instruction system; CSE keying for SIMD lands when the
+        // vectorizer starts producing them.
+        InstKind::VAdd(..)
+        | InstKind::VSub(..)
+        | InstKind::VMul(..)
+        | InstKind::VDiv(..)
+        | InstKind::VNeg(..)
+        | InstKind::VAbs(..)
+        | InstKind::VSqrt(..)
+        | InstKind::VFma(..)
+        | InstKind::VSelect(..)
+        | InstKind::VMin(..)
+        | InstKind::VMax(..)
+        | InstKind::VICmp(..)
+        | InstKind::VFCmp(..)
+        | InstKind::VLoad(..)
+        | InstKind::VStore(..)
+        | InstKind::VBitcast(..)
+        | InstKind::VExtract(..)
+        | InstKind::VInsert(..)
+        | InstKind::VBroadcast(..)
+        | InstKind::VReduceSum(..)
+        | InstKind::VReduceMin(..)
+        | InstKind::VReduceMax(..) => None,
     }
 }
 

@@ -25,6 +25,12 @@ pub enum RegClass {
     Fp64,
     /// FP/SIMD single (S0-S31).
     Fp32,
+    /// 128-bit NEON vector (Q0-Q31). Covers 4×f32, 2×f64, 4×i32,
+    /// 2×i64, etc. — every shape in `IrType::Vector`. Codegen
+    /// shares the same physical bank as Fp32/Fp64 (the V registers
+    /// are the 128-bit form of D/S), so the regalloc assigns them
+    /// from the same pool but at 128-bit width.
+    V128,
 }
 
 /// ARM64 opcodes that we emit.
@@ -41,7 +47,8 @@ pub enum ArmOpcode {
     SubImm,  // SUB Xd, Xn, #imm
     Mul,     // MUL Xd, Xn, Xm
     Sdiv,    // SDIV Xd, Xn, Xm
-    Msub,    // MSUB Xd, Xn, Xm, Xa  (for imod: a - (a/b)*b)
+    Madd,    // MADD Xd, Xn, Xm, Xa   (Xa + Xn*Xm; produced by mul-add peephole)
+    Msub,    // MSUB Xd, Xn, Xm, Xa   (Xa - Xn*Xm; for imod and the mul-sub peephole)
     Neg,     // NEG Xd, Xm  (alias: SUB Xd, XZR, Xm)
 
     // ---- Logic ----
@@ -88,6 +95,112 @@ pub enum ArmOpcode {
     // 3-source: dest = Sa ± Sn*Sm.
     FmaddS,
     FmaddD, // FMADD:  dest = Sa + Sn*Sm
+
+    // ---- NEON SIMD vector arithmetic (Sprint 12 Stage 2) ----
+    //
+    // Each opcode encodes the lane shape so emit/encoding stays
+    // table-driven. Naming convention: `<Op><LaneCount><LaneType>`.
+    // Examples: `FaddV4S` is "fadd Vd.4s, Vn.4s, Vm.4s", `FmlaV2D`
+    // is "fmla Vd.2d, Vn.2d, Vm.2d".
+    //
+    // Operands across this family: dest VReg of class V128 plus the
+    // expected source operands for that op. Lane shape is implicit
+    // in the opcode; emit just dispatches.
+    AddV4S,  // ADD Vd.4s, Vn.4s, Vm.4s    (integer)
+    AddV2D,  // ADD Vd.2d, Vn.2d, Vm.2d
+    SubV4S,
+    SubV2D,
+    MulV4S,  // MUL Vd.4s, Vn.4s, Vm.4s    (integer; 2D not in NEON)
+    NegV4S,
+    NegV2D,
+    FaddV4S, // FADD Vd.4s, Vn.4s, Vm.4s
+    FaddV2D, // FADD Vd.2d, Vn.2d, Vm.2d
+    FsubV4S,
+    FsubV2D,
+    FmulV4S,
+    FmulV2D,
+    FdivV4S,
+    FdivV2D,
+    FnegV4S,
+    FnegV2D,
+    FabsV4S,
+    FabsV2D,
+    FsqrtV4S,
+    FsqrtV2D,
+    FmlaV4S, // FMLA Vd.4s, Vn.4s, Vm.4s   (Vd += Vn*Vm)
+    FmlaV2D,
+    /// BSL Vd.16B, Vn.16B, Vm.16B — bit select. Per-bit:
+    /// `Vd[i] = Vd[i] ? Vn[i] : Vm[i]`. Vd is destructive
+    /// (input mask + output). Used to lower VSelect.
+    BslV16B,
+    /// Vector compare (per-lane all-ones / all-zeros result).
+    FcmgtV4S,
+    FcmgtV2D,
+    FcmgeV4S,
+    FcmgeV2D,
+    FcmeqV4S,
+    FcmeqV2D,
+    CmgtV4S,
+    CmgeV4S,
+    CmeqV4S,
+    FminV4S,
+    FminV2D,
+    FmaxV4S,
+    FmaxV2D,
+    SminV4S, // SMIN (signed integer)
+    SmaxV4S,
+    UminV4S,
+    UmaxV4S,
+
+    // Cross-lane reductions
+    FaddpV2S, // FADDP Sd, Vn.2s     (pair-add → scalar; 2-lane f32)
+    /// `FADDP.4S Vd, Vn, Vm` — 3-operand pairwise add over four
+    /// f32 lanes. For cross-lane f32 sum reduction we use this with
+    /// `Vn = Vm = v_src` then follow with FaddpV2S to fold the
+    /// remaining two lanes (NEON has no `faddv.4s`).
+    FaddpV4S,
+    FaddpV2D, // FADDP Dd, Vn.2d     (pair-add → scalar; 2-lane f64)
+    Faddv4S,  // FADDV Sd, Vn.4s     (across 4 f32 lanes → scalar)
+    Sminv4S,  // SMINV Sd, Vn.4s
+    Smaxv4S,
+    /// `FMAXV.4S Sd, Vn` — across-lane f32 max reduction → scalar.
+    FmaxvV4S,
+    /// `FMINV.4S Sd, Vn` — across-lane f32 min reduction → scalar.
+    FminvV4S,
+    /// `FMAXP.2D Dd, Vn` — pairwise f64 max reduction (2 lanes → scalar).
+    /// NEON has no `fmaxv.2d`; for two f64 lanes the pairwise form is
+    /// the across-lane reduction.
+    FmaxpV2DScalar,
+    /// `FMINP.2D Dd, Vn` — pairwise f64 min reduction (2 lanes → scalar).
+    FminpV2DScalar,
+    /// `ADDP.2D Vd, Vn, Vm` — pairwise integer add over two i64 lanes.
+    /// Used for i64 cross-lane reduction: `addp.2d v_dst, v_src, v_src`
+    /// puts the sum of the two lanes in v_dst[0].
+    AddpV2D,
+    Uminv4S,
+    Umaxv4S,
+    Addv4S,   // integer cross-lane add over 4×i32
+
+    // Lane move / broadcast
+    DupGen4S, // DUP Vd.4s, Wn       (broadcast scalar to 4 lanes)
+    DupGen2D, // DUP Vd.2d, Xn
+    DupEl4S,  // DUP Vd.4s, Vn.s[0]  (broadcast lane 0 to 4 lanes)
+    DupEl2D,
+    Ins4S,    // INS Vd.s[lane], Wn  (insert scalar into one lane)
+    Ins2D,
+    Umov4S,   // UMOV Wd, Vn.s[lane] (extract lane to scalar)
+    Umov2D,
+    FmovEl4S, // FMOV Sd, Vn.s[lane] (extract f32 lane)
+    FmovEl2D,
+
+    // Vector load/store (128-bit Q register)
+    LdrQ,     // LDR Qt, [Xn, #imm]
+    StrQ,     // STR Qt, [Xn, #imm]
+    /// `mov.16b vN, vM` — 128-bit register-to-register copy.
+    /// Used by regalloc when moving a V128 vreg between physical
+    /// regs; FmovReg only handles the low 64 bits and would corrupt
+    /// the upper lanes of a V128.
+    Mov16B,
     FmsubS,
     FmsubD, // FMSUB:  dest = Sa - Sn*Sm
     FnmsubS,
@@ -121,6 +234,14 @@ pub enum ArmOpcode {
     LdrsbImm,  // LDRSB Wt, [Xn, #imm] (load 8-bit byte, sign-extended)
     StrFpImm,  // STR Dt, [Xn, #imm]  (float store)
     LdrFpImm,  // LDR Dt, [Xn, #imm]  (float load)
+    // Register-offset loads/stores: address = base + index << shift.
+    // Operands: [dest, base, idx, Imm(shift)]. Shift ∈ {0,1,2,3}.
+    // Sprint 05: emitted by `scaled_addressing_fusion` from a
+    // Movz+Mul+AddReg+Ldr/Str sequence when elem_size ∈ {1,2,4,8}.
+    LdrReg,    // LDR Xt|Wt, [Xn, Xm, lsl #shift]
+    StrReg,    // STR Xt|Wt, [Xn, Xm, lsl #shift]
+    LdrFpReg,  // LDR Dt|St, [Xn, Xm, lsl #shift]
+    StrFpReg,  // STR Dt|St, [Xn, Xm, lsl #shift]
     StpPre,    // STP Xt1, Xt2, [Xn, #imm]!  (pre-index)
     LdpPost,   // LDP Xt1, Xt2, [Xn], #imm   (post-index)
     StpOffset, // STP Xt1, Xt2, [Xn, #imm]   (signed offset, no writeback)
@@ -131,6 +252,17 @@ pub enum ArmOpcode {
     // ---- Branch ----
     B,     // B label
     BCond, // B.cond label
+    // Compare-and-branch (single-instruction zero check). Operands:
+    //   [VReg|PhysReg of register to test, BlockRef target]
+    // Width inferred from the test register's class (Gp32 → cbz w; Gp64 → cbz x).
+    // ±1MB range (19-bit signed × 4), same as BCond — relaxed identically.
+    Cbz,
+    Cbnz,
+    // Test-bit-and-branch. Operands:
+    //   [VReg|PhysReg of test reg, Imm(bit_index 0..63), BlockRef target]
+    // ±32KB range (14-bit signed × 4), tighter than BCond — needs its own relax bound.
+    Tbz,
+    Tbnz,
     Bl,    // BL label  (call)
     Blr,   // BLR reg   (indirect call)
     Ret,   // RET
@@ -335,10 +467,20 @@ impl Default for StackFrame {
 impl StackFrame {
     /// Allocate a local variable slot. Returns a negative offset from FP.
     /// Locals grow downward from FP: first local at [FP-8], etc.
+    ///
+    /// Alignment ladders 4 → 8 → 16 by size. The 16 case matters for
+    /// 128-bit NEON vector spills — Apple Silicon's `LDR Q` / `STR Q`
+    /// require 16-byte alignment; an 8-byte cap silently produces
+    /// addresses that may fault on slow paths.
     pub fn alloc_local(&mut self, size: u32) -> i32 {
-        let align = if size >= 8 { 8i32 } else { 4 };
+        let align = if size >= 16 {
+            16i32
+        } else if size >= 8 {
+            8
+        } else {
+            4
+        };
         self.next_offset += size as i32;
-        // Align the running offset.
         self.next_offset = (self.next_offset + align - 1) & !(align - 1);
         let offset = -self.next_offset; // negative from FP
         self.locals.push(FrameSlot { offset, size });

@@ -355,8 +355,45 @@ fn check_branch_args(
     }
 }
 
+/// Vector type shape check: 128-bit total, lanes ∈ {2,4,8,16}, elem
+/// scalar of matching width. Returns an error string if invalid.
+fn vector_shape_error(ty: &IrType) -> Option<String> {
+    let IrType::Vector { lanes, elem } = ty else {
+        return None;
+    };
+    let lanes = *lanes;
+    let elem_bits = match elem.as_ref() {
+        IrType::Int(w) => w.bits(),
+        IrType::Float(w) => w.bits(),
+        other => {
+            return Some(format!(
+                "vector element type must be scalar int/float, got {}",
+                other
+            ));
+        }
+    };
+    if !matches!(lanes, 2 | 4 | 8 | 16) {
+        return Some(format!(
+            "vector lane count {} unsupported (NEON: 2/4/8/16)",
+            lanes
+        ));
+    }
+    if (lanes as u32) * elem_bits != 128 {
+        return Some(format!(
+            "vector total width {}b must be 128 ({}× {}b)",
+            (lanes as u32) * elem_bits,
+            lanes,
+            elem_bits
+        ));
+    }
+    None
+}
+
 /// Check type consistency for instructions.
 fn check_type_consistency(func: &Function, inst: &Inst, errors: &mut Vec<VerifyError>) {
+    if let Some(msg) = vector_shape_error(&inst.ty) {
+        errors.push(VerifyError { msg });
+    }
     match &inst.kind {
         InstKind::IAdd(a, b)
         | InstKind::ISub(a, b)
@@ -535,6 +572,87 @@ fn check_type_consistency(func: &Function, inst: &Inst, errors: &mut Vec<VerifyE
                             "logical op %{}: operands must be Bool ({} / {})",
                             inst.id.0, ta, tb,
                         ),
+                    });
+                }
+            }
+        }
+
+        // ---- SIMD vector ops ----
+        //
+        // Element-wise binary / unary / fma ops require all vector
+        // operands and the result to share the same lane shape.
+        InstKind::VAdd(a, b)
+        | InstKind::VSub(a, b)
+        | InstKind::VMul(a, b)
+        | InstKind::VDiv(a, b)
+        | InstKind::VMin(a, b)
+        | InstKind::VMax(a, b) => {
+            if let (Some(ta), Some(tb)) = (func.value_type(*a), func.value_type(*b)) {
+                if ta != tb || ta != inst.ty {
+                    errors.push(VerifyError {
+                        msg: format!(
+                            "vector binop operands and result must share type: lhs {}, rhs {}, result {}",
+                            ta, tb, inst.ty
+                        ),
+                    });
+                }
+            }
+        }
+        InstKind::VFma(a, b, c) => {
+            if let (Some(ta), Some(tb), Some(tc)) =
+                (func.value_type(*a), func.value_type(*b), func.value_type(*c))
+            {
+                if ta != tb || tb != tc || ta != inst.ty {
+                    errors.push(VerifyError {
+                        msg: format!(
+                            "vfma operands and result must share type: a {}, b {}, c {}, result {}",
+                            ta, tb, tc, inst.ty
+                        ),
+                    });
+                }
+            }
+        }
+        InstKind::VSelect(_m, t, f) => {
+            // Mask is a vector of any element type (typically the
+            // bool/int result of vicmp/vfcmp); t and f must share
+            // type with each other and with the result.
+            if let (Some(tt), Some(tf)) = (func.value_type(*t), func.value_type(*f)) {
+                if tt != tf || tt != inst.ty {
+                    errors.push(VerifyError {
+                        msg: format!(
+                            "vselect t/f and result must share type: t {}, f {}, result {}",
+                            tt, tf, inst.ty
+                        ),
+                    });
+                }
+            }
+        }
+        InstKind::VNeg(a) | InstKind::VAbs(a) | InstKind::VSqrt(a) => {
+            if let Some(ta) = func.value_type(*a) {
+                if ta != inst.ty {
+                    errors.push(VerifyError {
+                        msg: format!(
+                            "vector unop operand and result must share type: {} vs {}",
+                            ta, inst.ty
+                        ),
+                    });
+                }
+            }
+        }
+        InstKind::VExtract(v, lane) => {
+            if let Some(IrType::Vector { lanes, .. }) = func.value_type(*v) {
+                if *lane >= lanes {
+                    errors.push(VerifyError {
+                        msg: format!("vextract lane {} out of range (vector has {} lanes)", lane, lanes),
+                    });
+                }
+            }
+        }
+        InstKind::VInsert(v, lane, _s) => {
+            if let Some(IrType::Vector { lanes, .. }) = func.value_type(*v) {
+                if *lane >= lanes {
+                    errors.push(VerifyError {
+                        msg: format!("vinsert lane {} out of range (vector has {} lanes)", lane, lanes),
                     });
                 }
             }
@@ -924,5 +1042,63 @@ mod tests {
         func.blocks[0].terminator = Some(Terminator::Return(None));
         let errs = verify_function(&func);
         assert!(errs.iter().any(|e| e.msg.contains("duplicate value ID")));
+    }
+
+    // ---- SIMD vector type / verify tests ----
+
+    #[test]
+    fn vector_shape_4xi32_ok() {
+        assert!(vector_shape_error(&IrType::Vector {
+            lanes: 4,
+            elem: Box::new(IrType::Int(IntWidth::I32)),
+        })
+        .is_none());
+    }
+
+    #[test]
+    fn vector_shape_2xf64_ok() {
+        assert!(vector_shape_error(&IrType::Vector {
+            lanes: 2,
+            elem: Box::new(IrType::Float(FloatWidth::F64)),
+        })
+        .is_none());
+    }
+
+    #[test]
+    fn vector_shape_3xi32_rejected() {
+        // 3 lanes is not a NEON shape.
+        assert!(vector_shape_error(&IrType::Vector {
+            lanes: 3,
+            elem: Box::new(IrType::Int(IntWidth::I32)),
+        })
+        .is_some());
+    }
+
+    #[test]
+    fn vector_shape_8xi32_rejected_for_total_width() {
+        // 8 × 32 = 256 bits, > NEON 128b.
+        assert!(vector_shape_error(&IrType::Vector {
+            lanes: 8,
+            elem: Box::new(IrType::Int(IntWidth::I32)),
+        })
+        .is_some());
+    }
+
+    #[test]
+    fn vector_type_displays_with_angle_bracket_form() {
+        let ty = IrType::Vector {
+            lanes: 4,
+            elem: Box::new(IrType::Int(IntWidth::I32)),
+        };
+        assert_eq!(format!("{}", ty), "<4 x i32>");
+    }
+
+    #[test]
+    fn vector_type_size_bytes_is_16() {
+        let ty = IrType::Vector {
+            lanes: 2,
+            elem: Box::new(IrType::Float(FloatWidth::F64)),
+        };
+        assert_eq!(ty.size_bytes(), 16);
     }
 }

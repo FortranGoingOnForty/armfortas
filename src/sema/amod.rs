@@ -1327,11 +1327,66 @@ pub struct ModuleInterface {
     pub checksum: Option<String>,
 }
 
-/// Read a `.amod` file and return the parsed module interface.
+use std::cell::RefCell;
+use std::path::PathBuf;
+use std::time::SystemTime;
+
+thread_local! {
+    /// In-memory cache of parsed `.amod` files for the current build.
+    /// A second `USE foo` in the same compilation skips the parse step
+    /// when the file's mtime hasn't moved since the first access.
+    /// Keyed by canonicalized path so two different relative paths
+    /// pointing at the same file share the entry. mtime is checked
+    /// per access so on-disk edits during a build are picked up.
+    static AMOD_CACHE: RefCell<HashMap<PathBuf, (SystemTime, ModuleInterface)>> =
+        RefCell::new(HashMap::new());
+
+    /// Counter for cache hits — useful for tests verifying the cache
+    /// fires on a second USE of the same module.
+    pub static AMOD_CACHE_HITS: RefCell<u64> = const { RefCell::new(0) };
+}
+
+/// Read a `.amod` file and return the parsed module interface. The
+/// result is cached per-thread, keyed by canonical path + mtime.
 pub fn read_amod(path: &Path) -> Result<ModuleInterface, String> {
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mtime = std::fs::metadata(&canonical).and_then(|m| m.modified()).ok();
+
+    if let Some(now) = mtime {
+        let cached = AMOD_CACHE.with(|c| {
+            c.borrow().get(&canonical).and_then(|(stored, iface)| {
+                if *stored == now {
+                    Some(iface.clone())
+                } else {
+                    None
+                }
+            })
+        });
+        if let Some(iface) = cached {
+            AMOD_CACHE_HITS.with(|h| *h.borrow_mut() += 1);
+            return Ok(iface);
+        }
+    }
+
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
-    parse_amod(&content, path)
+    let iface = parse_amod(&content, path)?;
+
+    if let Some(stored) = mtime {
+        AMOD_CACHE.with(|c| {
+            c.borrow_mut()
+                .insert(canonical.clone(), (stored, iface.clone()));
+        });
+    }
+
+    Ok(iface)
+}
+
+/// Clear the per-thread amod cache. Tests use this to start fresh
+/// between cases.
+pub fn clear_amod_cache() {
+    AMOD_CACHE.with(|c| c.borrow_mut().clear());
+    AMOD_CACHE_HITS.with(|h| *h.borrow_mut() = 0);
 }
 
 fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
@@ -2399,5 +2454,37 @@ mod tests {
             .unwrap();
         assert_eq!(alloc.args[0].rank, 1);
         assert!(alloc.args[0].allocatable);
+    }
+
+    #[test]
+    fn amod_cache_skips_reparse_on_second_read() {
+        // Write a small valid .amod, read it twice, and verify the
+        // hit counter advanced exactly once.
+        clear_amod_cache();
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("amod_cache_test_{}.amod", std::process::id()));
+        std::fs::write(
+            &path,
+            r#"#!amod 2
+# module: cache_test
+# source: cache_test.f90
+
+@param k : integer = 7
+"#,
+        )
+        .unwrap();
+
+        let _ = read_amod(&path).expect("first read");
+        let hits_after_first = AMOD_CACHE_HITS.with(|h| *h.borrow());
+
+        let _ = read_amod(&path).expect("second read");
+        let hits_after_second = AMOD_CACHE_HITS.with(|h| *h.borrow());
+
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(hits_after_first, 0, "first read must miss the cache");
+        assert_eq!(
+            hits_after_second, 1,
+            "second read must hit the cache (no reparse)"
+        );
     }
 }

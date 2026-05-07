@@ -459,6 +459,13 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
             op_str(&inst.operands[1]),
             op_str(&inst.operands[2])
         ),
+        ArmOpcode::Madd => format!(
+            "madd {}, {}, {}, {}",
+            op_str(&inst.operands[0]),
+            op_str(&inst.operands[1]),
+            op_str(&inst.operands[2]),
+            op_str(&inst.operands[3])
+        ),
         ArmOpcode::Msub => format!(
             "msub {}, {}, {}, {}",
             op_str(&inst.operands[0]),
@@ -800,6 +807,23 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
             op_str(&inst.operands[0]),
             op_str(&inst.operands[1])
         ),
+        ArmOpcode::Mov16B => format!(
+            "mov.16b {}, {}",
+            v_reg_bare(&inst.operands[0]),
+            v_reg_bare(&inst.operands[1]),
+        ),
+        ArmOpcode::AddpV2D => format!(
+            "addp.2d {}, {}, {}",
+            v_reg_bare(&inst.operands[0]),
+            v_reg_bare(&inst.operands[1]),
+            v_reg_bare(&inst.operands[2]),
+        ),
+        ArmOpcode::FaddpV4S => format!(
+            "faddp.4s {}, {}, {}",
+            v_reg_bare(&inst.operands[0]),
+            v_reg_bare(&inst.operands[1]),
+            v_reg_bare(&inst.operands[2]),
+        ),
 
         ArmOpcode::LdrImm | ArmOpcode::LdrFpImm | ArmOpcode::LdrsbImm | ArmOpcode::LdrshImm => {
             let dest = op_str(&inst.operands[0]);
@@ -853,6 +877,28 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
                     mnemonic,
                     src
                 )
+            }
+        }
+        // Sprint 05: scaled-register-offset addressing. Operands are
+        // [dest, base, idx, Imm(shift)]. Shift 0 elides the `, lsl
+        // #0` suffix per the assembler convention.
+        ArmOpcode::LdrReg | ArmOpcode::LdrFpReg | ArmOpcode::StrReg | ArmOpcode::StrFpReg => {
+            let dest = op_str(&inst.operands[0]);
+            let base = op_str(&inst.operands[1]);
+            let idx = op_str(&inst.operands[2]);
+            let shift = match &inst.operands[3] {
+                MachineOperand::Imm(v) => *v,
+                _ => 0,
+            };
+            let mnemonic = match inst.opcode {
+                ArmOpcode::LdrReg | ArmOpcode::LdrFpReg => "ldr",
+                ArmOpcode::StrReg | ArmOpcode::StrFpReg => "str",
+                _ => unreachable!(),
+            };
+            if shift == 0 {
+                format!("{} {}, [{}, {}]", mnemonic, dest, base, idx)
+            } else {
+                format!("{} {}, [{}, {}, lsl #{}]", mnemonic, dest, base, idx, shift)
             }
         }
 
@@ -1036,6 +1082,41 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
             };
             format!("b.{} {}", cond, target)
         }
+        ArmOpcode::Cbz | ArmOpcode::Cbnz => {
+            let mnemonic = match inst.opcode {
+                ArmOpcode::Cbz => "cbz",
+                _ => "cbnz",
+            };
+            let target = if let MachineOperand::BlockRef(id) = &inst.operands[1] {
+                mf.block(*id).label.clone()
+            } else {
+                "???".into()
+            };
+            format!("{} {}, {}", mnemonic, op_str(&inst.operands[0]), target)
+        }
+        ArmOpcode::Tbz | ArmOpcode::Tbnz => {
+            let mnemonic = match inst.opcode {
+                ArmOpcode::Tbz => "tbz",
+                _ => "tbnz",
+            };
+            let bit = if let MachineOperand::Imm(v) = &inst.operands[1] {
+                *v
+            } else {
+                0
+            };
+            let target = if let MachineOperand::BlockRef(id) = &inst.operands[2] {
+                mf.block(*id).label.clone()
+            } else {
+                "???".into()
+            };
+            format!(
+                "{} {}, #{}, {}",
+                mnemonic,
+                op_str(&inst.operands[0]),
+                bit,
+                target
+            )
+        }
         ArmOpcode::Bl => {
             if let MachineOperand::Extern(name) = &inst.operands[0] {
                 // Mach-O convention: C symbols get a _ prefix.
@@ -1074,6 +1155,305 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
             };
             format!("brk #{}", imm)
         }
+
+        // ---- NEON SIMD vector ops (Sprint 12 Stage 2) ----
+        //
+        // Each op forwards to a small helper so the lane-shape suffix
+        // (.4s / .2d / .s[n] / .d[n]) lives in one place.
+        ArmOpcode::AddV4S => fmt_vbinop(inst, "add", "4s"),
+        ArmOpcode::AddV2D => fmt_vbinop(inst, "add", "2d"),
+        ArmOpcode::SubV4S => fmt_vbinop(inst, "sub", "4s"),
+        ArmOpcode::SubV2D => fmt_vbinop(inst, "sub", "2d"),
+        ArmOpcode::MulV4S => fmt_vbinop(inst, "mul", "4s"),
+        ArmOpcode::NegV4S => fmt_vunop(inst, "neg", "4s"),
+        ArmOpcode::NegV2D => fmt_vunop(inst, "neg", "2d"),
+        ArmOpcode::FaddV4S => fmt_vbinop(inst, "fadd", "4s"),
+        ArmOpcode::FaddV2D => fmt_vbinop(inst, "fadd", "2d"),
+        ArmOpcode::FsubV4S => fmt_vbinop(inst, "fsub", "4s"),
+        ArmOpcode::FsubV2D => fmt_vbinop(inst, "fsub", "2d"),
+        ArmOpcode::FmulV4S => fmt_vbinop(inst, "fmul", "4s"),
+        ArmOpcode::FmulV2D => fmt_vbinop(inst, "fmul", "2d"),
+        ArmOpcode::FdivV4S => fmt_vbinop(inst, "fdiv", "4s"),
+        ArmOpcode::FdivV2D => fmt_vbinop(inst, "fdiv", "2d"),
+        ArmOpcode::FnegV4S => fmt_vunop(inst, "fneg", "4s"),
+        ArmOpcode::FnegV2D => fmt_vunop(inst, "fneg", "2d"),
+        ArmOpcode::FabsV4S => fmt_vunop(inst, "fabs", "4s"),
+        ArmOpcode::FabsV2D => fmt_vunop(inst, "fabs", "2d"),
+        ArmOpcode::FsqrtV4S => fmt_vunop(inst, "fsqrt", "4s"),
+        ArmOpcode::FsqrtV2D => fmt_vunop(inst, "fsqrt", "2d"),
+        ArmOpcode::BslV16B => fmt_vbinop(inst, "bsl", "16b"),
+        ArmOpcode::FcmgtV4S => fmt_vbinop(inst, "fcmgt", "4s"),
+        ArmOpcode::FcmgtV2D => fmt_vbinop(inst, "fcmgt", "2d"),
+        ArmOpcode::FcmgeV4S => fmt_vbinop(inst, "fcmge", "4s"),
+        ArmOpcode::FcmgeV2D => fmt_vbinop(inst, "fcmge", "2d"),
+        ArmOpcode::FcmeqV4S => fmt_vbinop(inst, "fcmeq", "4s"),
+        ArmOpcode::FcmeqV2D => fmt_vbinop(inst, "fcmeq", "2d"),
+        ArmOpcode::CmgtV4S => fmt_vbinop(inst, "cmgt", "4s"),
+        ArmOpcode::CmgeV4S => fmt_vbinop(inst, "cmge", "4s"),
+        ArmOpcode::CmeqV4S => fmt_vbinop(inst, "cmeq", "4s"),
+        ArmOpcode::FmlaV4S => fmt_vbinop(inst, "fmla", "4s"),
+        ArmOpcode::FmlaV2D => fmt_vbinop(inst, "fmla", "2d"),
+        ArmOpcode::FminV4S => fmt_vbinop(inst, "fmin", "4s"),
+        ArmOpcode::FminV2D => fmt_vbinop(inst, "fmin", "2d"),
+        ArmOpcode::FmaxV4S => fmt_vbinop(inst, "fmax", "4s"),
+        ArmOpcode::FmaxV2D => fmt_vbinop(inst, "fmax", "2d"),
+        ArmOpcode::SminV4S => fmt_vbinop(inst, "smin", "4s"),
+        ArmOpcode::SmaxV4S => fmt_vbinop(inst, "smax", "4s"),
+        ArmOpcode::UminV4S => fmt_vbinop(inst, "umin", "4s"),
+        ArmOpcode::UmaxV4S => fmt_vbinop(inst, "umax", "4s"),
+
+        // afs-as dialect: cross-lane reductions encode the shape in
+        // the mnemonic suffix; the destination is a scalar `s/d` and
+        // the source is the bare vector register.
+        ArmOpcode::FaddpV2S => format!(
+            "faddp.2s {}, {}",
+            fp32_scalar(&inst.operands[0]),
+            v_reg_bare(&inst.operands[1]),
+        ),
+        ArmOpcode::FaddpV2D => format!(
+            "faddp.2d {}, {}",
+            fp64_scalar(&inst.operands[0]),
+            v_reg_bare(&inst.operands[1]),
+        ),
+        ArmOpcode::Faddv4S => format!(
+            "faddv.4s {}, {}",
+            fp32_scalar(&inst.operands[0]),
+            v_reg_bare(&inst.operands[1]),
+        ),
+        ArmOpcode::Sminv4S => format!(
+            "sminv.4s {}, {}",
+            fp32_scalar(&inst.operands[0]),
+            v_reg_bare(&inst.operands[1]),
+        ),
+        ArmOpcode::Smaxv4S => format!(
+            "smaxv.4s {}, {}",
+            fp32_scalar(&inst.operands[0]),
+            v_reg_bare(&inst.operands[1]),
+        ),
+        ArmOpcode::FmaxvV4S => format!(
+            "fmaxv.4s {}, {}",
+            fp32_scalar(&inst.operands[0]),
+            v_reg_bare(&inst.operands[1]),
+        ),
+        ArmOpcode::FminvV4S => format!(
+            "fminv.4s {}, {}",
+            fp32_scalar(&inst.operands[0]),
+            v_reg_bare(&inst.operands[1]),
+        ),
+        ArmOpcode::FmaxpV2DScalar => format!(
+            "fmaxp.2d {}, {}",
+            fp64_scalar(&inst.operands[0]),
+            v_reg_bare(&inst.operands[1]),
+        ),
+        ArmOpcode::FminpV2DScalar => format!(
+            "fminp.2d {}, {}",
+            fp64_scalar(&inst.operands[0]),
+            v_reg_bare(&inst.operands[1]),
+        ),
+        ArmOpcode::Uminv4S => format!(
+            "uminv.4s {}, {}",
+            fp32_scalar(&inst.operands[0]),
+            v_reg_bare(&inst.operands[1]),
+        ),
+        ArmOpcode::Umaxv4S => format!(
+            "umaxv.4s {}, {}",
+            fp32_scalar(&inst.operands[0]),
+            v_reg_bare(&inst.operands[1]),
+        ),
+        ArmOpcode::Addv4S => format!(
+            "addv.4s {}, {}",
+            fp32_scalar(&inst.operands[0]),
+            v_reg_bare(&inst.operands[1]),
+        ),
+
+        ArmOpcode::DupGen4S => format!(
+            "dup.4s {}, {}",
+            v_reg_bare(&inst.operands[0]),
+            op_str(&inst.operands[1]),
+        ),
+        ArmOpcode::DupGen2D => format!(
+            "dup.2d {}, {}",
+            v_reg_bare(&inst.operands[0]),
+            op_str(&inst.operands[1]),
+        ),
+        ArmOpcode::DupEl4S => format!(
+            "dup.4s {}, {}",
+            v_reg_bare(&inst.operands[0]),
+            v_lane_bare(&inst.operands[1], "s", 0),
+        ),
+        ArmOpcode::DupEl2D => format!(
+            "dup.2d {}, {}",
+            v_reg_bare(&inst.operands[0]),
+            v_lane_bare(&inst.operands[1], "d", 0),
+        ),
+        ArmOpcode::Ins4S => {
+            let lane = imm_u8(&inst.operands[1]);
+            format!(
+                "ins.s {}, {}",
+                v_lane_bare(&inst.operands[0], "s", lane),
+                op_str(&inst.operands[2]),
+            )
+        }
+        ArmOpcode::Ins2D => {
+            let lane = imm_u8(&inst.operands[1]);
+            format!(
+                "ins.d {}, {}",
+                v_lane_bare(&inst.operands[0], "d", lane),
+                op_str(&inst.operands[2]),
+            )
+        }
+        ArmOpcode::Umov4S => {
+            let lane = imm_u8(&inst.operands[2]);
+            format!(
+                "umov.s {}, {}",
+                op_str(&inst.operands[0]),
+                v_lane_bare(&inst.operands[1], "s", lane),
+            )
+        }
+        ArmOpcode::Umov2D => {
+            let lane = imm_u8(&inst.operands[2]);
+            format!(
+                "umov.d {}, {}",
+                op_str(&inst.operands[0]),
+                v_lane_bare(&inst.operands[1], "d", lane),
+            )
+        }
+        ArmOpcode::FmovEl4S => {
+            let lane = imm_u8(&inst.operands[2]);
+            format!(
+                "mov.s {}, {}",
+                fp32_scalar(&inst.operands[0]),
+                v_lane_bare(&inst.operands[1], "s", lane),
+            )
+        }
+        ArmOpcode::FmovEl2D => {
+            let lane = imm_u8(&inst.operands[2]);
+            format!(
+                "mov.d {}, {}",
+                fp64_scalar(&inst.operands[0]),
+                v_lane_bare(&inst.operands[1], "d", lane),
+            )
+        }
+
+        ArmOpcode::LdrQ => format!(
+            "ldr {}, [{}, {}]",
+            q_reg(&inst.operands[0]),
+            op_str(&inst.operands[1]),
+            op_str(&inst.operands[2]),
+        ),
+        ArmOpcode::StrQ => format!(
+            "str {}, [{}, {}]",
+            q_reg(&inst.operands[0]),
+            op_str(&inst.operands[1]),
+            op_str(&inst.operands[2]),
+        ),
+    }
+}
+
+// ---- NEON formatting helpers ----
+
+fn v_reg(op: &MachineOperand, shape: &str) -> String {
+    match op {
+        MachineOperand::VReg(id) => format!("v{}.{}", id.0, shape),
+        MachineOperand::PhysReg(PhysReg::Fp(n)) | MachineOperand::PhysReg(PhysReg::Fp32(n)) => {
+            format!("v{}.{}", n, shape)
+        }
+        _ => format!("{}.{}", op_str(op), shape),
+    }
+}
+
+fn q_reg(op: &MachineOperand) -> String {
+    match op {
+        MachineOperand::VReg(id) => format!("q{}", id.0),
+        MachineOperand::PhysReg(PhysReg::Fp(n)) | MachineOperand::PhysReg(PhysReg::Fp32(n)) => {
+            format!("q{}", n)
+        }
+        _ => format!("q{}", op_str(op)),
+    }
+}
+
+fn v_lane(op: &MachineOperand, lane_ty: &str, lane: u8) -> String {
+    match op {
+        MachineOperand::VReg(id) => format!("v{}.{}[{}]", id.0, lane_ty, lane),
+        MachineOperand::PhysReg(PhysReg::Fp(n)) | MachineOperand::PhysReg(PhysReg::Fp32(n)) => {
+            format!("v{}.{}[{}]", n, lane_ty, lane)
+        }
+        _ => format!("v{}.{}[{}]", op_str(op), lane_ty, lane),
+    }
+}
+
+fn fp32_scalar(op: &MachineOperand) -> String {
+    match op {
+        MachineOperand::VReg(id) => format!("s{}", id.0),
+        MachineOperand::PhysReg(PhysReg::Fp(n)) | MachineOperand::PhysReg(PhysReg::Fp32(n)) => {
+            format!("s{}", n)
+        }
+        _ => op_str(op),
+    }
+}
+
+fn fp64_scalar(op: &MachineOperand) -> String {
+    match op {
+        MachineOperand::VReg(id) => format!("d{}", id.0),
+        MachineOperand::PhysReg(PhysReg::Fp(n)) | MachineOperand::PhysReg(PhysReg::Fp32(n)) => {
+            format!("d{}", n)
+        }
+        _ => op_str(op),
+    }
+}
+
+fn imm_u8(op: &MachineOperand) -> u8 {
+    if let MachineOperand::Imm(v) = op {
+        *v as u8
+    } else {
+        0
+    }
+}
+
+fn fmt_vbinop(inst: &MachineInst, mnemonic: &str, shape: &str) -> String {
+    // afs-as dialect: shape suffix is part of the mnemonic, operand
+    // registers are bare (`fadd.4s v0, v1, v2`). Encodes to the same
+    // bytes as the Apple/GNU `fadd v0.4s, v1.4s, v2.4s` form.
+    format!(
+        "{}.{} {}, {}, {}",
+        mnemonic,
+        shape,
+        v_reg_bare(&inst.operands[0]),
+        v_reg_bare(&inst.operands[1]),
+        v_reg_bare(&inst.operands[2]),
+    )
+}
+
+fn fmt_vunop(inst: &MachineInst, mnemonic: &str, shape: &str) -> String {
+    format!(
+        "{}.{} {}, {}",
+        mnemonic,
+        shape,
+        v_reg_bare(&inst.operands[0]),
+        v_reg_bare(&inst.operands[1]),
+    )
+}
+
+fn v_reg_bare(op: &MachineOperand) -> String {
+    match op {
+        MachineOperand::VReg(id) => format!("v{}", id.0),
+        MachineOperand::PhysReg(PhysReg::Fp(n)) | MachineOperand::PhysReg(PhysReg::Fp32(n)) => {
+            format!("v{}", n)
+        }
+        _ => op_str(op),
+    }
+}
+
+fn v_lane_bare(op: &MachineOperand, _lane_ty: &str, lane: u8) -> String {
+    // afs-as dialect for `umov.s w3, v0[2]` — bare reg with `[lane]`
+    // suffix; the element-size width is encoded into the mnemonic
+    // (`umov.s` / `umov.d`).
+    match op {
+        MachineOperand::VReg(id) => format!("v{}[{}]", id.0, lane),
+        MachineOperand::PhysReg(PhysReg::Fp(n)) | MachineOperand::PhysReg(PhysReg::Fp32(n)) => {
+            format!("v{}[{}]", n, lane)
+        }
+        _ => format!("{}[{}]", op_str(op), lane),
     }
 }
 
@@ -1470,5 +1850,163 @@ mod tests {
             "internal-only functions should not keep external linkage:\n{}",
             asm
         );
+    }
+
+    // ---- NEON SIMD emit smoke tests (Sprint 12 Stage 2) ----
+    //
+    // The vectorizer doesn't generate any of these yet, but the emit
+    // formatters can be exercised directly by hand-building a
+    // MachineInst and feeding it through `emit_inst`. These tests
+    // pin the assembly text form so future codegen wiring has a
+    // golden reference.
+
+    use crate::codegen::mir::{ArmOpcode, MachineFunction, MachineInst, MachineOperand, RegClass};
+
+    fn emit_one(opcode: ArmOpcode, operands: Vec<MachineOperand>) -> String {
+        let mut mf = MachineFunction::new("t".into());
+        mf.new_block("entry");
+        let inst = MachineInst {
+            opcode,
+            operands,
+            def: None,
+        };
+        emit_inst(&inst, &mf)
+    }
+
+    #[test]
+    fn emit_fadd_v_4s_form() {
+        let mut mf = MachineFunction::new("t".into());
+        let v0 = mf.new_vreg(RegClass::V128);
+        let v1 = mf.new_vreg(RegClass::V128);
+        let v2 = mf.new_vreg(RegClass::V128);
+        let asm = emit_one(
+            ArmOpcode::FaddV4S,
+            vec![
+                MachineOperand::VReg(v0),
+                MachineOperand::VReg(v1),
+                MachineOperand::VReg(v2),
+            ],
+        );
+        let _ = mf;
+        // afs-as dialect: shape suffix on mnemonic, bare regs.
+        assert_eq!(asm, "fadd.4s v0, v1, v2");
+    }
+
+    #[test]
+    fn emit_fadd_v_2d_form() {
+        let asm = emit_one(
+            ArmOpcode::FaddV2D,
+            vec![
+                MachineOperand::VReg(crate::codegen::mir::VRegId(0)),
+                MachineOperand::VReg(crate::codegen::mir::VRegId(1)),
+                MachineOperand::VReg(crate::codegen::mir::VRegId(2)),
+            ],
+        );
+        assert_eq!(asm, "fadd.2d v0, v1, v2");
+    }
+
+    #[test]
+    fn emit_fmla_v_4s_form() {
+        let asm = emit_one(
+            ArmOpcode::FmlaV4S,
+            vec![
+                MachineOperand::VReg(crate::codegen::mir::VRegId(0)),
+                MachineOperand::VReg(crate::codegen::mir::VRegId(1)),
+                MachineOperand::VReg(crate::codegen::mir::VRegId(2)),
+            ],
+        );
+        assert_eq!(asm, "fmla.4s v0, v1, v2");
+    }
+
+    #[test]
+    fn emit_addv_4s_reduction_form() {
+        let asm = emit_one(
+            ArmOpcode::Addv4S,
+            vec![
+                MachineOperand::VReg(crate::codegen::mir::VRegId(0)),
+                MachineOperand::VReg(crate::codegen::mir::VRegId(1)),
+            ],
+        );
+        assert_eq!(asm, "addv.4s s0, v1");
+    }
+
+    #[test]
+    fn emit_dup_gen_4s_broadcasts_w_register() {
+        let asm = emit_one(
+            ArmOpcode::DupGen4S,
+            vec![
+                MachineOperand::VReg(crate::codegen::mir::VRegId(0)),
+                MachineOperand::PhysReg(crate::codegen::mir::PhysReg::Gp32(2)),
+            ],
+        );
+        assert_eq!(asm, "dup.4s v0, w2");
+    }
+
+    #[test]
+    fn emit_dup_el_4s_broadcasts_fp_lane_zero() {
+        // Splatting an Fp32 scalar (which lives in v2's lane 0) into
+        // a 4×f32 vector uses the lane-dup form. The gp form
+        // `dup.4s v0, s2` is rejected by the assembler. afs-as
+        // dialect: bare `vN[L]` (no `.s` suffix), with the lane
+        // element width encoded into the `dup.4s` mnemonic.
+        let asm = emit_one(
+            ArmOpcode::DupEl4S,
+            vec![
+                MachineOperand::VReg(crate::codegen::mir::VRegId(0)),
+                MachineOperand::VReg(crate::codegen::mir::VRegId(2)),
+            ],
+        );
+        assert_eq!(asm, "dup.4s v0, v2[0]");
+    }
+
+    #[test]
+    fn emit_dup_el_2d_broadcasts_fp_lane_zero() {
+        let asm = emit_one(
+            ArmOpcode::DupEl2D,
+            vec![
+                MachineOperand::VReg(crate::codegen::mir::VRegId(0)),
+                MachineOperand::VReg(crate::codegen::mir::VRegId(2)),
+            ],
+        );
+        assert_eq!(asm, "dup.2d v0, v2[0]");
+    }
+
+    #[test]
+    fn emit_ldr_q_form() {
+        let asm = emit_one(
+            ArmOpcode::LdrQ,
+            vec![
+                MachineOperand::VReg(crate::codegen::mir::VRegId(0)),
+                MachineOperand::PhysReg(crate::codegen::mir::PhysReg::Gp(1)),
+                MachineOperand::Imm(16),
+            ],
+        );
+        assert_eq!(asm, "ldr q0, [x1, #16]");
+    }
+
+    #[test]
+    fn emit_str_q_form() {
+        let asm = emit_one(
+            ArmOpcode::StrQ,
+            vec![
+                MachineOperand::VReg(crate::codegen::mir::VRegId(0)),
+                MachineOperand::PhysReg(crate::codegen::mir::PhysReg::Gp(1)),
+                MachineOperand::Imm(0),
+            ],
+        );
+        assert_eq!(asm, "str q0, [x1, #0]");
+    }
+
+    #[test]
+    fn emit_umov_extracts_lane() {
+        let asm = emit_one(
+            ArmOpcode::Umov4S,
+            vec![
+                MachineOperand::PhysReg(crate::codegen::mir::PhysReg::Gp32(3)),
+                MachineOperand::VReg(crate::codegen::mir::VRegId(0)),
+                MachineOperand::Imm(2),
+            ],
+        );
+        assert_eq!(asm, "umov.s w3, v0[2]");
     }
 }

@@ -3,20 +3,24 @@
 //! First pass: collect declarations, create scopes, process USE/IMPLICIT.
 //! This establishes the symbol table that type checking (Sprint 13) will use.
 
-use super::symtab::*;
+use crate::sema::symtab::*;
 use crate::ast::decl;
-use crate::ast::decl::{ArraySpec, Attribute, Decl, OnlyItem, SpannedDecl, TypeSpec};
+use crate::ast::decl::{Attribute, Decl, SpannedDecl, TypeSpec};
 use crate::ast::unit::*;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
+use super::statement_functions::detect_statement_functions;
+use super::type_resolution::{derived_char_init_len, type_spec_to_info};
+use super::use_resolution::{load_external_module, preload_stmt_uses, process_uses};
+
 thread_local! {
     /// Track externally loaded module interfaces so resolve_file can
     /// return them to the driver for globals extraction.
-    static LOADED_EXTERNAL_MODULES: RefCell<Vec<super::amod::ModuleInterface>> = const { RefCell::new(Vec::new()) };
+    pub(super) static LOADED_EXTERNAL_MODULES: RefCell<Vec<crate::sema::amod::ModuleInterface>> = const { RefCell::new(Vec::new()) };
 }
 
-fn merge_specific_names(into: &mut Vec<String>, additional: &[String]) {
+pub(super) fn merge_specific_names(into: &mut Vec<String>, additional: &[String]) {
     let mut seen: HashSet<String> = into.iter().map(|name| name.to_ascii_lowercase()).collect();
     for name in additional {
         let key = name.to_ascii_lowercase();
@@ -50,8 +54,8 @@ fn merged_visible_generic_specifics(
 /// resolution.
 pub struct ResolveResult {
     pub st: SymbolTable,
-    pub type_layouts: super::type_layout::TypeLayoutRegistry,
-    pub external_modules: Vec<super::amod::ModuleInterface>,
+    pub type_layouts: crate::sema::type_layout::TypeLayoutRegistry,
+    pub external_modules: Vec<crate::sema::amod::ModuleInterface>,
 }
 
 pub fn resolve_file(
@@ -59,10 +63,10 @@ pub fn resolve_file(
     module_search_paths: &[std::path::PathBuf],
 ) -> Result<ResolveResult, SemaError> {
     let mut st = SymbolTable::new();
-    let mut layouts = super::type_layout::TypeLayoutRegistry::new();
+    let mut layouts = crate::sema::type_layout::TypeLayoutRegistry::new();
 
     // Register intrinsic modules (iso_c_binding, iso_fortran_env) so USE can find them.
-    super::intrinsic_modules::register_intrinsic_modules(&mut st);
+    crate::sema::intrinsic_modules::register_intrinsic_modules(&mut st);
 
     // First pass: create module scopes so USE can find them.
     for unit in units {
@@ -93,7 +97,7 @@ pub fn resolve_file(
     })
 }
 
-fn backfill_procedure_pointer_interfaces(st: &mut SymbolTable, scope_id: ScopeId) {
+pub(super) fn backfill_procedure_pointer_interfaces(st: &mut SymbolTable, scope_id: ScopeId) {
     let updates: Vec<(String, Option<TypeInfo>, Vec<String>)> = st
         .scope(scope_id)
         .symbols
@@ -134,11 +138,7 @@ fn backfill_function_result_type(
     let result_key = result_name.to_ascii_lowercase();
     let (type_info, pointer, allocatable) = match st.scope(function_scope).symbols.get(&result_key)
     {
-        Some(sym) => (
-            sym.type_info.clone(),
-            sym.attrs.pointer,
-            sym.attrs.allocatable,
-        ),
+        Some(sym) => (sym.type_info.clone(), sym.attrs.pointer, sym.attrs.allocatable),
         None => return,
     };
     let Some(type_info) = type_info else {
@@ -181,11 +181,11 @@ type InterfaceOuterRef = (
     u8,   // result_rank
 );
 
-fn resolve_unit(
+pub(super) fn resolve_unit(
     st: &mut SymbolTable,
     unit: &SpannedUnit,
     module_search_paths: &[std::path::PathBuf],
-    layouts: &mut super::type_layout::TypeLayoutRegistry,
+    layouts: &mut crate::sema::type_layout::TypeLayoutRegistry,
 ) -> Result<(), SemaError> {
     match &unit.node {
         ProgramUnit::Program {
@@ -558,8 +558,16 @@ fn resolve_unit(
             // Surface each declared procedure to the enclosing scope
             // so callers under IMPLICIT NONE can resolve the name,
             // and so BIND(C) external prototypes are callable.
-            for (fn_name, kind, ti, arg_names, binding_label, pure, elemental, result_rank) in
-                outer_refs
+            for (
+                fn_name,
+                kind,
+                ti,
+                arg_names,
+                binding_label,
+                pure,
+                elemental,
+                result_rank,
+            ) in outer_refs
             {
                 let span = unit.span;
                 let _ = st.define(Symbol {
@@ -622,728 +630,12 @@ fn resolve_unit(
     Ok(())
 }
 
-fn process_uses(
-    st: &mut SymbolTable,
-    uses: &[SpannedDecl],
-    module_search_paths: &[std::path::PathBuf],
-    type_layouts: &mut super::type_layout::TypeLayoutRegistry,
-) -> Result<(), SemaError> {
-    for use_decl in uses {
-        if let Decl::UseStmt {
-            module,
-            nature: _,
-            renames,
-            only,
-        } = &use_decl.node
-        {
-            // If the module isn't defined in-file, try loading from .amod.
-            let mod_scope = st
-                .find_module_scope(module)
-                .or_else(|| load_external_module(st, module, module_search_paths, type_layouts));
-            if let Some(mod_scope) = mod_scope {
-                // Reject self-USE: a module cannot USE itself.
-                if mod_scope == st.current_scope() {
-                    return Err(SemaError {
-                        msg: format!("module '{}' cannot USE itself", module),
-                        span: use_decl.span,
-                    });
-                }
-                if let Some(only_items) = only {
-                    // USE ... ONLY: import specific names.
-                    for item in only_items {
-                        match item {
-                            OnlyItem::Name(name) => {
-                                st.add_use_association(UseAssociation {
-                                    local_name: name.clone(),
-                                    original_name: name.clone(),
-                                    source_scope: mod_scope,
-                                    is_submodule_access: false,
-                                    from_bare_use: false,
-                                });
-                            }
-                            OnlyItem::Generic(name) => {
-                                st.add_use_association(UseAssociation {
-                                    local_name: name.clone(),
-                                    original_name: name.clone(),
-                                    source_scope: mod_scope,
-                                    is_submodule_access: false,
-                                    from_bare_use: false,
-                                });
-                            }
-                            OnlyItem::Rename(rename) => {
-                                st.add_use_association(UseAssociation {
-                                    local_name: rename.local.clone(),
-                                    original_name: rename.remote.clone(),
-                                    source_scope: mod_scope,
-                                    is_submodule_access: false,
-                                    from_bare_use: false,
-                                });
-                            }
-                        }
-                    }
-                } else {
-                    // USE without ONLY: import all public symbols.
-                    let mod_symbols: Vec<(String, String)> = st
-                        .scope(mod_scope)
-                        .symbols
-                        .iter()
-                        .filter(|(_, sym)| sym.attrs.access != Access::Private)
-                        .map(|(key, sym)| (sym.name.clone(), key.clone()))
-                        .collect();
-                    for (name, _key) in &mod_symbols {
-                        st.add_use_association(UseAssociation {
-                            local_name: name.clone(),
-                            original_name: name.clone(),
-                            source_scope: mod_scope,
-                            is_submodule_access: false,
-                            from_bare_use: true,
-                        });
-                    }
-                    // Apply renames. Renames inside a bare USE rebind a
-                    // single name; the name itself is no longer bare so
-                    // it doesn't extend transitive lookup.
-                    for rename in renames {
-                        st.add_use_association(UseAssociation {
-                            local_name: rename.local.clone(),
-                            original_name: rename.remote.clone(),
-                            source_scope: mod_scope,
-                            is_submodule_access: false,
-                            from_bare_use: false,
-                        });
-                    }
-                }
-            } else {
-                return Err(SemaError {
-                    msg: format!("module '{}' not found (searched -I paths and current directory for {}.amod)", module, module.to_lowercase()),
-                    span: use_decl.span,
-                });
-            }
-        }
-    }
-    Ok(())
-}
-
-/// BLOCK constructs can carry their own USE statements inside a statement body.
-/// We do not model block-local use associations in the symbol table yet, but we
-/// still need the referenced modules loaded so later validation and lowering can
-/// resolve imported procedures, derived types, and module globals.
-fn ensure_uses_loaded(
-    st: &mut SymbolTable,
-    uses: &[SpannedDecl],
-    module_search_paths: &[std::path::PathBuf],
-    type_layouts: &mut super::type_layout::TypeLayoutRegistry,
-) {
-    for use_decl in uses {
-        if let Decl::UseStmt { module, .. } = &use_decl.node {
-            if st.find_module_scope(module).is_none() {
-                let _ = load_external_module(st, module, module_search_paths, type_layouts);
-            }
-        }
-    }
-}
-
-fn preload_stmt_uses(
-    st: &mut SymbolTable,
-    stmts: &[crate::ast::stmt::SpannedStmt],
-    module_search_paths: &[std::path::PathBuf],
-    type_layouts: &mut super::type_layout::TypeLayoutRegistry,
-) {
-    use crate::ast::stmt::Stmt;
-
-    for stmt in stmts {
-        match &stmt.node {
-            Stmt::IfConstruct {
-                then_body,
-                else_ifs,
-                else_body,
-                ..
-            } => {
-                preload_stmt_uses(st, then_body, module_search_paths, type_layouts);
-                for (_, body) in else_ifs {
-                    preload_stmt_uses(st, body, module_search_paths, type_layouts);
-                }
-                if let Some(body) = else_body {
-                    preload_stmt_uses(st, body, module_search_paths, type_layouts);
-                }
-            }
-            Stmt::IfStmt { action, .. } => {
-                preload_stmt_uses(
-                    st,
-                    std::slice::from_ref(action.as_ref()),
-                    module_search_paths,
-                    type_layouts,
-                );
-            }
-            Stmt::DoLoop { body, .. }
-            | Stmt::DoWhile { body, .. }
-            | Stmt::DoConcurrent { body, .. }
-            | Stmt::Associate { body, .. }
-            | Stmt::ForallConstruct { body, .. }
-            | Stmt::WhereConstruct { body, .. } => {
-                preload_stmt_uses(st, body, module_search_paths, type_layouts);
-            }
-            Stmt::ForallStmt { stmt: inner, .. }
-            | Stmt::WhereStmt { stmt: inner, .. }
-            | Stmt::Labeled { stmt: inner, .. } => {
-                preload_stmt_uses(
-                    st,
-                    std::slice::from_ref(inner.as_ref()),
-                    module_search_paths,
-                    type_layouts,
-                );
-            }
-            Stmt::Block {
-                uses, ifaces, body, ..
-            } => {
-                ensure_uses_loaded(st, uses, module_search_paths, type_layouts);
-                for iface in ifaces {
-                    let _ = resolve_unit(st, iface, module_search_paths, type_layouts);
-                }
-                preload_stmt_uses(st, body, module_search_paths, type_layouts);
-            }
-            Stmt::SelectCase { cases, .. } => {
-                for case in cases {
-                    preload_stmt_uses(st, &case.body, module_search_paths, type_layouts);
-                }
-            }
-            Stmt::SelectType { guards, .. } => {
-                for guard in guards {
-                    match guard {
-                        crate::ast::stmt::TypeGuard::TypeIs { body, .. }
-                        | crate::ast::stmt::TypeGuard::ClassIs { body, .. }
-                        | crate::ast::stmt::TypeGuard::ClassDefault { body } => {
-                            preload_stmt_uses(st, body, module_search_paths, type_layouts);
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-/// F77 §15.4 statement-function detection.
-///
-/// Walks the leading prologue of a procedure body looking for definitions
-/// of the form `Name(p1, p2, ...) = expr` where `Name` is a previously
-/// declared scalar variable in the current scope. When found, the symbol
-/// is converted from `Variable` to `Function`, its dummy parameter names
-/// are recorded, and the body expression is parked in
-/// `SymbolTable::statement_functions` keyed by `(scope_id, name)`.
-///
-/// Detection stops at the first statement that does not match the
-/// statement-function shape, so true executable code following the
-/// definitions is not misclassified.
-fn detect_statement_functions(
-    st: &mut SymbolTable,
-    scope_id: ScopeId,
-    body: &[crate::ast::stmt::SpannedStmt],
-) {
-    use crate::ast::expr::{Expr, SectionSubscript};
-    use crate::ast::stmt::Stmt;
-
-    for stmt in body {
-        let (target, value) = match &stmt.node {
-            Stmt::Assignment { target, value } => (target, value),
-            // Skip blank/comment-only labelled wrappers if they ever
-            // appear; otherwise the prologue ended.
-            _ => break,
-        };
-
-        // Target must be `Name(args...)` — i.e. the LHS looks like a
-        // function call or array element reference.
-        let (fname, args) = match &target.node {
-            Expr::FunctionCall { callee, args } => match &callee.node {
-                Expr::Name { name } => (name.clone(), args),
-                _ => break,
-            },
-            _ => break,
-        };
-
-        // Resolve fname in the current scope. Statement-function
-        // declarations declare the result type as if it were a scalar
-        // variable, so the symbol must already exist as a Variable
-        // with a known scalar TypeInfo and no array_spec.
-        let key = fname.to_ascii_lowercase();
-        let result_type = {
-            let scope = st.scope(scope_id);
-            let Some(sym) = scope.symbols.get(&key) else {
-                break;
-            };
-            if !matches!(sym.kind, SymbolKind::Variable) {
-                break;
-            }
-            if !sym.attrs.array_spec.is_empty() {
-                break;
-            }
-            // Must have a concrete scalar numeric / character / logical
-            // type. Derived/Class targets are not statement functions.
-            let Some(ti) = sym.type_info.clone() else {
-                break;
-            };
-            match ti {
-                TypeInfo::Integer { .. }
-                | TypeInfo::Real { .. }
-                | TypeInfo::DoublePrecision
-                | TypeInfo::Complex { .. }
-                | TypeInfo::Logical { .. }
-                | TypeInfo::Character { .. } => ti,
-                _ => break,
-            }
-        };
-
-        // Each argument must be a positional `Element(Name(p))` where
-        // `p` is a scalar variable in the current scope. Keyword args
-        // and ranges are not allowed in a statement-function header.
-        let mut params: Vec<String> = Vec::with_capacity(args.len());
-        let mut all_params_ok = true;
-        for a in args {
-            if a.keyword.is_some() {
-                all_params_ok = false;
-                break;
-            }
-            let pname = match &a.value {
-                SectionSubscript::Element(e) => match &e.node {
-                    Expr::Name { name } => name.clone(),
-                    _ => {
-                        all_params_ok = false;
-                        break;
-                    }
-                },
-                _ => {
-                    all_params_ok = false;
-                    break;
-                }
-            };
-            // The dummy parameter must already be a scalar Variable.
-            // F77 §15.4: the dummy arguments of a statement function
-            // are local to it and must agree in type with names of the
-            // same spelling in the host's declaration scope. armfortas
-            // already requires the names to be declared (no implicit
-            // typing leaks here under IMPLICIT NONE), so insist on a
-            // proper Variable.
-            let pkey = pname.to_ascii_lowercase();
-            let scope = st.scope(scope_id);
-            let Some(psym) = scope.symbols.get(&pkey) else {
-                all_params_ok = false;
-                break;
-            };
-            if !matches!(psym.kind, SymbolKind::Variable | SymbolKind::Parameter) {
-                all_params_ok = false;
-                break;
-            }
-            if !psym.attrs.array_spec.is_empty() {
-                all_params_ok = false;
-                break;
-            }
-            params.push(pkey);
-        }
-        if !all_params_ok {
-            break;
-        }
-
-        // All checks passed: convert the symbol kind, record the body.
-        // F77 §15.4 statement functions evaluate a single expression
-        // with no side effects, so they're pure by construction. Mark
-        // `pure` (and `elemental` — statement functions broadcast
-        // naturally over array actuals though stdlib only uses scalar
-        // calls) so PURE-procedure callers like the BLAS rotation
-        // routines validate cleanly.
-        {
-            let scope = st.scope_mut(scope_id);
-            if let Some(sym) = scope.symbols.get_mut(&key) {
-                sym.kind = SymbolKind::Function;
-                sym.arg_names = params.clone();
-                sym.attrs.pure = true;
-                sym.attrs.elemental = true;
-            }
-        }
-        st.statement_functions.insert(
-            (scope_id, key),
-            StatementFunctionDef {
-                params,
-                body: value.clone(),
-                result_type,
-            },
-        );
-    }
-}
-
-/// Try to load a module interface from an .amod file on the search path.
-/// Creates a synthetic module scope in the symbol table and returns its ID.
-fn load_external_module(
-    st: &mut SymbolTable,
-    module_name: &str,
-    search_paths: &[std::path::PathBuf],
-    type_layouts: &mut super::type_layout::TypeLayoutRegistry,
-) -> Option<ScopeId> {
-    use crate::lexer::{Position, Span};
-    use crate::sema::amod;
-
-    let filename = format!("{}.amod", module_name.to_lowercase());
-
-    // Search -I paths then CWD.
-    let mut candidates: Vec<std::path::PathBuf> =
-        search_paths.iter().map(|p| p.join(&filename)).collect();
-    candidates.push(std::path::PathBuf::from(&filename));
-
-    let amod_path = candidates.iter().find(|p| p.exists())?;
-
-    let iface = match amod::read_amod(amod_path) {
-        Ok(iface) => iface,
-        Err(e) => {
-            eprintln!("warning: {}", e);
-            return None;
-        }
-    };
-
-    let dummy_span = Span {
-        file_id: 0,
-        start: Position { line: 0, col: 0 },
-        end: Position { line: 0, col: 0 },
-    };
-
-    // Create a synthetic module scope.
-    let scope_id = st.push_scope(ScopeKind::Module(iface.module_name.clone()));
-
-    // Recursively resolve `@uses` dependencies so transitive USE
-    // chains see re-exported symbols. Each dep becomes a
-    // UseAssociation on this scope, exactly like `use foo` inside a
-    // real source module, which makes lookup_in_guarded walk into
-    // the dep's symbols. Without this, `USE amod_middle` where
-    // middle does `use amod_base` never sees amod_base's symbols.
-    for dep in &iface.dependencies {
-        let dep_scope = st
-            .find_module_scope(dep)
-            .or_else(|| load_external_module(st, dep, search_paths, type_layouts));
-        if let Some(dep_scope) = dep_scope {
-            st.enter_scope(scope_id);
-            // Re-export every public symbol of the dep by name, like
-            // a bare `use <dep>` in source. The transitive lookup in
-            // SymbolTable::lookup_in_guarded handles onward chaining.
-            for (name, sym) in st
-                .scope(dep_scope)
-                .symbols
-                .iter()
-                .map(|(n, s)| (n.clone(), s.clone()))
-                .collect::<Vec<_>>()
-            {
-                if matches!(sym.attrs.access, Access::Private) {
-                    continue;
-                }
-                st.add_use_association(crate::sema::symtab::UseAssociation {
-                    local_name: name.clone(),
-                    original_name: name,
-                    source_scope: dep_scope,
-                    is_submodule_access: false,
-                    from_bare_use: true,
-                });
-            }
-        }
-    }
-
-    // Replay use renames recorded by the writer (`@use_rename a = b from m`).
-    // Without this, `use stdlib_kinds, only: block_kind => int64` is lost
-    // when stdlib_bitsets is serialized, and submodule bodies can no
-    // longer resolve `block_kind` for kind selectors — `integer(block_kind)
-    // :: dummy` falls back to default kind=4 and silently truncates a
-    // 64-bit local to 32 bits.
-    for rename in &iface.renames {
-        let src_scope = st.find_module_scope(&rename.source_module).or_else(|| {
-            load_external_module(st, &rename.source_module, search_paths, type_layouts)
-        });
-        let Some(src_scope) = src_scope else {
-            continue;
-        };
-        st.enter_scope(scope_id);
-        st.add_use_association(crate::sema::symtab::UseAssociation {
-            local_name: rename.local.clone(),
-            original_name: rename.original.clone(),
-            source_scope: src_scope,
-            is_submodule_access: false,
-            from_bare_use: false,
-        });
-    }
-
-    // Populate variables and parameters.
-    for var in &iface.variables {
-        let kind = if var.is_parameter {
-            SymbolKind::Parameter
-        } else if var.proc_pointer {
-            SymbolKind::ProcedurePointer
-        } else {
-            SymbolKind::Variable
-        };
-        let attrs = SymbolAttrs {
-            access: var.access,
-            allocatable: var.allocatable,
-            save: var.save,
-            pointer: var.pointer,
-            target: var.target,
-            parameter: var.is_parameter,
-            external: var.proc_pointer,
-            procedure_iface: if var.proc_pointer {
-                match &var.type_info {
-                    Some(TypeInfo::Derived(name)) => Some(name.clone()),
-                    _ => None,
-                }
-            } else {
-                None
-            },
-            ..Default::default()
-        };
-        let _ = st.define(Symbol {
-            name: var.name.clone(),
-            kind,
-            type_info: var.type_info.clone(),
-            attrs,
-            defined_at: dummy_span,
-            scope: scope_id,
-            arg_names: vec![],
-            const_value: var.const_value,
-        });
-    }
-
-    // Populate procedures. Each proc is defined as a symbol in the
-    // module scope AND given its own Function/Subroutine scope whose
-    // symbols carry the argument type_info. The dedicated scope is
-    // what `resolve_generic_call` walks to match argument types at
-    // call sites — without it, cross-TU generic dispatch sees no
-    // candidates and fails.
-    for proc in &iface.procedures {
-        // Sprint35-SMP Phase 2: rebuild the function result's array_spec
-        // from result_rank + result_allocatable/pointer flags so the
-        // SMP-body synthesizer can recover the result's shape from a
-        // pure .amod load (where the result variable isn't otherwise
-        // present as a separate symbol).
-        let result_array_spec: Vec<ArraySpec> = if proc.result_rank == 0 {
-            Vec::new()
-        } else {
-            let template = if proc.result_allocatable || proc.result_pointer {
-                ArraySpec::Deferred
-            } else {
-                ArraySpec::AssumedShape { lower: None }
-            };
-            vec![template; proc.result_rank as usize]
-        };
-        let attrs = SymbolAttrs {
-            access: proc.access,
-            allocatable: proc.result_allocatable,
-            pointer: proc.result_pointer,
-            pure: proc.pure,
-            elemental: proc.elemental,
-            binding_label: proc.binding_label.clone(),
-            result_rank: proc.result_rank,
-            array_spec: result_array_spec,
-            ..Default::default()
-        };
-        let arg_names: Vec<String> = proc
-            .args
-            .iter()
-            .filter(|a| !a.hidden)
-            .map(|a| a.name.clone())
-            .collect();
-        let _ = st.define(Symbol {
-            name: proc.name.clone(),
-            kind: proc.kind.clone(),
-            type_info: proc.return_type.clone(),
-            attrs,
-            defined_at: dummy_span,
-            scope: scope_id,
-            arg_names: arg_names.clone(),
-            const_value: None,
-        });
-        // Synthesise a Function/Subroutine scope for this procedure
-        // so arg types survive to generic dispatch.
-        let proc_scope_kind = match &proc.kind {
-            crate::sema::symtab::SymbolKind::Function => ScopeKind::Function(proc.name.clone()),
-            crate::sema::symtab::SymbolKind::Subroutine => ScopeKind::Subroutine(proc.name.clone()),
-            _ => continue,
-        };
-        let proc_scope = st.push_scope(proc_scope_kind);
-        st.scope_mut(proc_scope).arg_order = arg_names.clone();
-        for arg in &proc.args {
-            if arg.hidden {
-                continue;
-            }
-            // Sprint35-SMP Phase 1: rebuild a same-rank array_spec from
-            // the encoded rank + descriptor/allocatable/pointer flags.
-            // Bound expressions are not preserved across .amod boundaries;
-            // assumed-shape / deferred-shape kinds are sufficient for the
-            // synthesizer's uses in Phase 2 (the bound expressions are
-            // unused for descriptor-passed dummies anyway — extents come
-            // from the caller's runtime descriptor).
-            let array_spec: Vec<ArraySpec> = if arg.rank == 0 {
-                Vec::new()
-            } else {
-                let template = if arg.allocatable || arg.pointer {
-                    ArraySpec::Deferred
-                } else if arg.descriptor {
-                    ArraySpec::AssumedShape { lower: None }
-                } else {
-                    // Non-descriptor array dummy: explicit-shape with
-                    // unknown bounds. The Phase-2 synthesizer treats
-                    // this as a placeholder and the lowering helpers
-                    // pull actual bounds from the caller's array.
-                    ArraySpec::AssumedShape { lower: None }
-                };
-                vec![template; arg.rank as usize]
-            };
-            let arg_attrs = SymbolAttrs {
-                intent: arg.intent,
-                optional: arg.optional,
-                value: arg.value,
-                allocatable: arg.allocatable,
-                pointer: arg.pointer,
-                external: arg.external,
-                procedure_iface: arg.procedure_iface.clone(),
-                array_spec,
-                ..Default::default()
-            };
-            let _ = st.define(Symbol {
-                name: arg.name.clone(),
-                kind: crate::sema::symtab::SymbolKind::Variable,
-                type_info: arg.type_info.clone(),
-                attrs: arg_attrs,
-                defined_at: dummy_span,
-                scope: proc_scope,
-                arg_names: vec![],
-                const_value: None,
-            });
-        }
-        // Sprint35-SMP Phase 2: also define the function's result
-        // variable in the proc scope under a name that won't collide
-        // with the user's own local declarations. Same-name SMP-body
-        // procedures push their own Function scope on top, so the
-        // duplicate name `result` would otherwise shadow the local
-        // and the validator's lookup would walk to this stale symbol
-        // and reject `allocate(result(...))`. Use a doubly-underscored
-        // synth name so SMP-body synthesis can find it (via the body
-        // scope after sema injection) but no user code can collide.
-        if matches!(proc.kind, crate::sema::symtab::SymbolKind::Function) && proc.result_rank > 0 {
-            let synth_name = format!(
-                "__amod_result_{}",
-                proc.result_name.as_deref().unwrap_or(&proc.name)
-            );
-            // Sprint35-SMP Phase 3: prefer the .amod-preserved
-            // explicit-shape bounds when available so split-file
-            // submodule lowering of `res = …` allocates a runtime-shape
-            // result in the function prologue. Falls through to the
-            // legacy AssumedShape template when bounds aren't in .amod
-            // (rank-only, allocatable, or pointer results).
-            let parsed_bounds = proc
-                .result_array_bounds
-                .as_deref()
-                .and_then(amod::parse_array_bounds);
-            let result_array_spec: Vec<ArraySpec> = if proc.result_rank == 0 {
-                Vec::new()
-            } else if let Some(specs) = parsed_bounds {
-                if specs.len() == proc.result_rank as usize {
-                    specs
-                } else {
-                    let template = if proc.result_allocatable || proc.result_pointer {
-                        ArraySpec::Deferred
-                    } else {
-                        ArraySpec::AssumedShape { lower: None }
-                    };
-                    vec![template; proc.result_rank as usize]
-                }
-            } else {
-                let template = if proc.result_allocatable || proc.result_pointer {
-                    ArraySpec::Deferred
-                } else {
-                    ArraySpec::AssumedShape { lower: None }
-                };
-                vec![template; proc.result_rank as usize]
-            };
-            let result_attrs = SymbolAttrs {
-                allocatable: proc.result_allocatable,
-                pointer: proc.result_pointer,
-                array_spec: result_array_spec,
-                ..Default::default()
-            };
-            let _ = st.define(Symbol {
-                name: synth_name,
-                kind: crate::sema::symtab::SymbolKind::Variable,
-                type_info: proc.return_type.clone(),
-                attrs: result_attrs,
-                defined_at: dummy_span,
-                scope: proc_scope,
-                arg_names: vec![],
-                const_value: None,
-            });
-        }
-        st.pop_scope();
-    }
-    backfill_procedure_pointer_interfaces(st, scope_id);
-
-    // Register type layouts.
-    for layout in &iface.types {
-        type_layouts.insert(layout.clone());
-        // Also add a DerivedType symbol.
-        let attrs = SymbolAttrs {
-            access: Access::Public,
-            ..Default::default()
-        };
-        let _ = st.define(Symbol {
-            name: layout.name.clone(),
-            kind: SymbolKind::DerivedType,
-            type_info: None,
-            attrs,
-            defined_at: dummy_span,
-            scope: scope_id,
-            arg_names: vec![],
-            const_value: None,
-        });
-    }
-
-    // Register named generic interfaces. The specifics list rides
-    // in `arg_names` to match how intra-file INTERFACE blocks are
-    // stored by process_decls — `resolve_generic_call` reads it
-    // when dispatching a call through the generic name. The access
-    // attribute is preserved from the .amod so that submodules can
-    // dispatch private parent interfaces via host association while
-    // ordinary `USE` consumers filter them out (F2018 §11.2.3).
-    for iface_def in &iface.interfaces {
-        let attrs = SymbolAttrs {
-            access: iface_def.access,
-            ..Default::default()
-        };
-        let define_result = st.define(Symbol {
-            name: iface_def.name.clone(),
-            kind: SymbolKind::NamedInterface,
-            type_info: None,
-            attrs,
-            defined_at: dummy_span,
-            scope: scope_id,
-            arg_names: iface_def.specifics.clone(),
-            const_value: None,
-        });
-        if define_result.is_err() {
-            let key = iface_def.name.to_ascii_lowercase();
-            if let Some(existing) = st.scope_mut(scope_id).symbols.get_mut(&key) {
-                if existing.kind == SymbolKind::NamedInterface
-                    || existing.kind == SymbolKind::DerivedType
-                {
-                    merge_specific_names(&mut existing.arg_names, &iface_def.specifics);
-                }
-            }
-        }
-    }
-
-    st.pop_scope();
-
-    // Track the loaded interface so resolve_file can return it.
-    LOADED_EXTERNAL_MODULES.with(|cell| cell.borrow_mut().push(iface));
-
-    Some(scope_id)
-}
 
 /// Walk all program units and compute layouts for derived types.
 fn compute_all_layouts(
     units: &[SpannedUnit],
     st: &SymbolTable,
-    layouts: &mut super::type_layout::TypeLayoutRegistry,
+    layouts: &mut crate::sema::type_layout::TypeLayoutRegistry,
 ) {
     let inherited_params = HashMap::new();
     let mut visible_param_cache: HashMap<ScopeId, HashMap<String, i64>> = HashMap::new();
@@ -1426,13 +718,10 @@ fn inject_separate_module_procedure_args(
     let proc_lc = proc_name.to_lowercase();
     let iface_scope = st.all_scopes().iter().find_map(|scope| {
         let direct_parent_matches = scope.parent == Some(parent_module_scope);
-        let via_interface = scope
-            .parent
-            .map(|pid| {
-                matches!(st.scope(pid).kind, ScopeKind::Interface)
-                    && st.scope(pid).parent == Some(parent_module_scope)
-            })
-            .unwrap_or(false);
+        let via_interface = scope.parent.map(|pid| {
+            matches!(st.scope(pid).kind, ScopeKind::Interface)
+                && st.scope(pid).parent == Some(parent_module_scope)
+        }).unwrap_or(false);
         if !direct_parent_matches && !via_interface {
             return None;
         }
@@ -1455,13 +744,17 @@ fn inject_separate_module_procedure_args(
     let arg_symbols: Vec<Symbol> = arg_order
         .iter()
         .filter_map(|n| {
-            st.scope(iface_scope).symbols.get(n).cloned().or_else(|| {
-                st.scope(iface_scope)
-                    .symbols
-                    .iter()
-                    .find(|(_, s)| s.name.eq_ignore_ascii_case(n))
-                    .map(|(_, s)| s.clone())
-            })
+            st.scope(iface_scope)
+                .symbols
+                .get(n)
+                .cloned()
+                .or_else(|| {
+                    st.scope(iface_scope)
+                        .symbols
+                        .iter()
+                        .find(|(_, s)| s.name.eq_ignore_ascii_case(n))
+                        .map(|(_, s)| s.clone())
+                })
         })
         .collect();
 
@@ -1649,7 +942,7 @@ fn collect_derived_type_layouts(
     unit: &ProgramUnit,
     scope_id: ScopeId,
     st: &SymbolTable,
-    layouts: &mut super::type_layout::TypeLayoutRegistry,
+    layouts: &mut crate::sema::type_layout::TypeLayoutRegistry,
     inherited_params: &HashMap<String, i64>,
     visible_param_cache: &mut HashMap<ScopeId, HashMap<String, i64>>,
     exported_param_cache: &mut HashMap<ScopeId, HashMap<String, i64>>,
@@ -1898,10 +1191,10 @@ fn collect_const_int_params(
 
 fn collect_const_derived_field_inits(
     decls: &[SpannedDecl],
-    layouts: &super::type_layout::TypeLayoutRegistry,
+    layouts: &crate::sema::type_layout::TypeLayoutRegistry,
     const_params: &HashMap<String, i64>,
-) -> HashMap<String, super::type_layout::FieldDefaultInit> {
-    use super::type_layout::{
+) -> HashMap<String, crate::sema::type_layout::FieldDefaultInit> {
+    use crate::sema::type_layout::{
         derived_param_field_lookup_key, eval_const_field_default_init_for_layout, FieldDefaultInit,
     };
 
@@ -1957,7 +1250,10 @@ fn collect_const_derived_field_inits(
                     }
                 }
                 for (field_name, field_init) in overrides {
-                    combined.insert(field_name.to_ascii_lowercase(), (field_name, field_init));
+                    combined.insert(
+                        field_name.to_ascii_lowercase(),
+                        (field_name, field_init),
+                    );
                 }
 
                 for (_field_key, (field_name, field_init)) in combined {
@@ -1981,9 +1277,9 @@ fn collect_const_derived_field_inits(
 fn register_local_type_layouts(
     decls: &[SpannedDecl],
     host_module: Option<&str>,
-    layouts: &mut super::type_layout::TypeLayoutRegistry,
+    layouts: &mut crate::sema::type_layout::TypeLayoutRegistry,
     const_params: &HashMap<String, i64>,
-    const_derived_field_inits: &HashMap<String, super::type_layout::FieldDefaultInit>,
+    const_derived_field_inits: &HashMap<String, crate::sema::type_layout::FieldDefaultInit>,
 ) {
     for decl in decls {
         if let Decl::DerivedTypeDef {
@@ -2000,7 +1296,7 @@ fn register_local_type_layouts(
             let is_abstract = attrs
                 .iter()
                 .any(|attr| matches!(attr, crate::ast::decl::TypeAttr::Abstract));
-            let layout = super::type_layout::compute_layout_with_attrs(
+            let layout = crate::sema::type_layout::compute_layout_with_attrs(
                 name,
                 host_module,
                 type_bound_procs,
@@ -2047,9 +1343,9 @@ fn register_local_type_layouts(
 fn resolve_proc_pointer_default_targets(
     st: &SymbolTable,
     scope_id: ScopeId,
-    layouts: &mut super::type_layout::TypeLayoutRegistry,
+    layouts: &mut crate::sema::type_layout::TypeLayoutRegistry,
 ) {
-    use super::type_layout::FieldDefaultInit;
+    use crate::sema::type_layout::FieldDefaultInit;
 
     for layout in layouts.layouts.values_mut() {
         let owner = match layout.owner_module.as_deref() {
@@ -2078,7 +1374,11 @@ fn resolve_proc_pointer_default_targets(
 /// unmodified.  USE associations are followed transitively so renames
 /// like `default_hasher => fnv_1_hasher` resolve to the underlying
 /// procedure's origin module.
-fn resolve_proc_pointer_link_symbol(st: &SymbolTable, from_scope: ScopeId, target: &str) -> String {
+fn resolve_proc_pointer_link_symbol(
+    st: &SymbolTable,
+    from_scope: ScopeId,
+    target: &str,
+) -> String {
     let key = target.to_lowercase();
     let mut seen = std::collections::HashSet::new();
     let mut current_scope = from_scope;
@@ -2111,11 +1411,11 @@ fn resolve_proc_pointer_link_symbol(st: &SymbolTable, from_scope: ScopeId, targe
 }
 
 fn mangle_link_symbol_for(
-    sym: &super::symtab::Symbol,
-    scope: &super::symtab::Scope,
+    sym: &crate::sema::symtab::Symbol,
+    scope: &crate::sema::symtab::Scope,
     name_in_scope: &str,
 ) -> String {
-    use super::symtab::{ScopeKind, SymbolKind};
+    use crate::sema::symtab::{ScopeKind, SymbolKind};
     match sym.kind {
         SymbolKind::Function | SymbolKind::Subroutine => match &scope.kind {
             ScopeKind::Module(module_name) | ScopeKind::Submodule(module_name) => format!(
@@ -2354,12 +1654,11 @@ fn process_contains(
     st: &mut SymbolTable,
     contains: &[SpannedUnit],
     module_search_paths: &[std::path::PathBuf],
-    layouts: &mut super::type_layout::TypeLayoutRegistry,
+    layouts: &mut crate::sema::type_layout::TypeLayoutRegistry,
 ) -> Result<(), SemaError> {
     for unit in contains {
         // Register the subprogram name in the current scope before descending.
-        let host_is_submodule =
-            matches!(st.scope(st.current_scope()).kind, ScopeKind::Submodule(_));
+        let host_is_submodule = matches!(st.scope(st.current_scope()).kind, ScopeKind::Submodule(_));
         match &unit.node {
             ProgramUnit::Subroutine {
                 name, prefix, bind, ..
@@ -2472,7 +1771,10 @@ fn process_contains(
 /// Handles integer literals, negation, binary ops, parenthesized
 /// expressions, and Name references that resolve to PARAMETERs
 /// with known const_value in the current scope chain.
-fn eval_const_int_expr(expr: &crate::ast::expr::SpannedExpr, st: &SymbolTable) -> Option<i64> {
+pub(super) fn eval_const_int_expr(
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+) -> Option<i64> {
     use crate::ast::expr::Expr;
     match &expr.node {
         Expr::IntegerLiteral { text, .. } => {
@@ -2603,23 +1905,23 @@ fn eval_const_int_expr(expr: &crate::ast::expr::SpannedExpr, st: &SymbolTable) -
                             _ => None,
                         }?;
                         match ty {
-                            TypeInfo::Integer { kind } => Some(
-                                match kind.unwrap_or(crate::driver::defaults::default_int_kind()) {
-                                    1 => 2,
-                                    2 => 4,
-                                    4 => 9,
-                                    8 => 18,
-                                    16 => 38,
-                                    _ => return None,
-                                },
-                            ),
-                            TypeInfo::Real { kind } => Some(
-                                match kind.unwrap_or(crate::driver::defaults::default_real_kind()) {
-                                    4 => 37,
-                                    8 => 307,
-                                    _ => return None,
-                                },
-                            ),
+                            TypeInfo::Integer { kind } => Some(match kind
+                                .unwrap_or(crate::driver::defaults::default_int_kind())
+                            {
+                                1 => 2,
+                                2 => 4,
+                                4 => 9,
+                                8 => 18,
+                                16 => 38,
+                                _ => return None,
+                            }),
+                            TypeInfo::Real { kind } => Some(match kind
+                                .unwrap_or(crate::driver::defaults::default_real_kind())
+                            {
+                                4 => 37,
+                                8 => 307,
+                                _ => return None,
+                            }),
                             TypeInfo::DoublePrecision => Some(307),
                             _ => None,
                         }
@@ -2634,91 +1936,6 @@ fn eval_const_int_expr(expr: &crate::ast::expr::SpannedExpr, st: &SymbolTable) -
     }
 }
 
-fn extract_kind(sel: &Option<decl::KindSelector>, st: &SymbolTable) -> Option<u8> {
-    use crate::ast::expr::Expr;
-    match sel {
-        Some(decl::KindSelector::Expr(e)) | Some(decl::KindSelector::Star(e)) => {
-            match &e.node {
-                Expr::IntegerLiteral { text, .. } => text.parse().ok(),
-                Expr::Name { name } => {
-                    // Resolve named constant (e.g., c_double, real64, int64).
-                    let key = name.to_lowercase();
-                    st.lookup_in(st.current_scope(), &key)
-                        .and_then(|sym| sym.const_value.map(|v| v as u8))
-                }
-                _ => None,
-            }
-        }
-        None => None,
-    }
-}
-
-/// Extract character length from a CharSelector.
-/// Compute the byte length of a string-valued PARAMETER initializer
-/// for `character(*)` length inference (F2008 §5.3.2).  Handles
-/// string literals, references to other character parameters whose
-/// length is already known, and `lit // lit` / `lit // name` concat
-/// chains.  Returns None when we can't classify the init.
-fn derived_char_init_len(e: &crate::ast::expr::Expr, st: &SymbolTable) -> Option<usize> {
-    use crate::ast::expr::Expr;
-    match e {
-        Expr::StringLiteral { value, .. } => Some(value.len()),
-        Expr::Name { name } => {
-            let sym = st.find_symbol_any_scope(&name.to_lowercase())?;
-            if let Some(TypeInfo::Character { len: Some(n), .. }) = &sym.type_info {
-                usize::try_from(*n).ok()
-            } else {
-                None
-            }
-        }
-        Expr::ParenExpr { inner } => derived_char_init_len(&inner.node, st),
-        Expr::BinaryOp {
-            op: crate::ast::expr::BinaryOp::Concat,
-            left,
-            right,
-        } => Some(derived_char_init_len(&left.node, st)? + derived_char_init_len(&right.node, st)?),
-        _ => None,
-    }
-}
-
-fn extract_char_len(sel: &Option<decl::CharSelector>, st: &SymbolTable) -> Option<i64> {
-    match sel {
-        Some(cs) => match &cs.len {
-            Some(decl::LenSpec::Expr(e)) => eval_const_int_expr(e, st),
-            Some(decl::LenSpec::Star) => None,  // assumed length
-            Some(decl::LenSpec::Colon) => None, // deferred length
-            None => None,
-        },
-        None => None,
-    }
-}
-
-fn type_spec_to_info(ts: &TypeSpec, st: &SymbolTable) -> TypeInfo {
-    match ts {
-        TypeSpec::Integer(sel) => TypeInfo::Integer {
-            kind: extract_kind(sel, st),
-        },
-        TypeSpec::Real(sel) => TypeInfo::Real {
-            kind: extract_kind(sel, st),
-        },
-        TypeSpec::DoublePrecision => TypeInfo::DoublePrecision,
-        TypeSpec::Complex(sel) => TypeInfo::Complex {
-            kind: extract_kind(sel, st),
-        },
-        TypeSpec::DoubleComplex => TypeInfo::Complex { kind: Some(8) },
-        TypeSpec::Logical(sel) => TypeInfo::Logical {
-            kind: extract_kind(sel, st),
-        },
-        TypeSpec::Character(sel) => TypeInfo::Character {
-            len: extract_char_len(sel, st),
-            kind: None,
-        },
-        TypeSpec::Type(name) => TypeInfo::Derived(name.clone()),
-        TypeSpec::Class(name) => TypeInfo::Class(name.clone()),
-        TypeSpec::ClassStar => TypeInfo::ClassStar,
-        TypeSpec::TypeStar => TypeInfo::TypeStar,
-    }
-}
 
 fn attrs_to_symbol_attrs(attrs: &[Attribute], default_access: Access) -> SymbolAttrs {
     let mut sa = SymbolAttrs {

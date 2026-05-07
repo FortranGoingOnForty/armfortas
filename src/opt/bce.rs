@@ -116,7 +116,7 @@ fn loop_index_range(
     preds: &std::collections::HashMap<BlockId, Vec<BlockId>>,
     index: ValueId,
 ) -> Option<(i64, i64)> {
-    let (index, offset) = loop_index_base_and_offset(func, index)?;
+    let (index, scale, offset) = loop_index_base_and_offset(func, index)?;
     let header = func.block(lp.header);
     let param_idx = header.params.iter().position(|param| param.id == index)?;
     let init = loop_init_const(func, lp, preds, param_idx)?;
@@ -143,40 +143,75 @@ fn loop_index_range(
         }
         _ => return None,
     };
-    let adj_lo = range_lo.checked_add(offset)?;
-    let adj_hi = range_hi.checked_add(offset)?;
-    Some((adj_lo.min(adj_hi), adj_lo.max(adj_hi)))
+    // Apply scale and offset: idx == scale * base + offset, with
+    // `base` ranging over [range_lo, range_hi]. Negative scale flips
+    // the interval, so take min/max after multiplying both endpoints.
+    let lo_scaled = scale.checked_mul(range_lo)?;
+    let hi_scaled = scale.checked_mul(range_hi)?;
+    let adj_lo = lo_scaled.min(hi_scaled).checked_add(offset)?;
+    let adj_hi = lo_scaled.max(hi_scaled).checked_add(offset)?;
+    Some((adj_lo, adj_hi))
 }
 
-fn loop_index_base_and_offset(func: &Function, value: ValueId) -> Option<(ValueId, i64)> {
+/// Decompose `value` into a linear function of an inner SSA value:
+/// `value == scale * base + offset`. The "base" returned is whatever
+/// definition is left after we've stripped IAdd / ISub / IMul of
+/// constant operands; if `base` is the loop induction variable, the
+/// caller can then map a known IV range into a known range for
+/// `value` itself.
+///
+/// Default decomposition is `(value, 1, 0)` (i.e. base==value, no
+/// scale, no offset). Recurses through:
+///  * `iadd lhs, const` / `isub lhs, const` → bumps offset.
+///  * `imul lhs, const` / `imul const, rhs` → multiplies both scale
+///    and offset, capturing `(2*i) + 3 = 2*i + 3` and `2*(i+1) = 2*i + 2`.
+fn loop_index_base_and_offset(func: &Function, value: ValueId) -> Option<(ValueId, i64, i64)> {
     let value = strip_int_casts(func, value);
     let Some(kind) = find_inst_kind(func, value) else {
-        return Some((value, 0));
+        return Some((value, 1, 0));
     };
 
     match kind {
         InstKind::IAdd(lhs, rhs) => {
-            if let Some((base, offset)) = loop_index_base_and_offset(func, *lhs) {
+            if let Some((base, scale, offset)) = loop_index_base_and_offset(func, *lhs) {
                 if let Some(delta) = resolve_int_scalar(func, *rhs) {
-                    return offset.checked_add(delta).map(|next| (base, next));
+                    return offset.checked_add(delta).map(|next| (base, scale, next));
                 }
             }
-            if let Some((base, offset)) = loop_index_base_and_offset(func, *rhs) {
+            if let Some((base, scale, offset)) = loop_index_base_and_offset(func, *rhs) {
                 if let Some(delta) = resolve_int_scalar(func, *lhs) {
-                    return offset.checked_add(delta).map(|next| (base, next));
+                    return offset.checked_add(delta).map(|next| (base, scale, next));
                 }
             }
-            Some((value, 0))
+            Some((value, 1, 0))
         }
         InstKind::ISub(lhs, rhs) => {
-            if let Some((base, offset)) = loop_index_base_and_offset(func, *lhs) {
+            if let Some((base, scale, offset)) = loop_index_base_and_offset(func, *lhs) {
                 if let Some(delta) = resolve_int_scalar(func, *rhs) {
-                    return offset.checked_sub(delta).map(|next| (base, next));
+                    return offset.checked_sub(delta).map(|next| (base, scale, next));
                 }
             }
-            Some((value, 0))
+            Some((value, 1, 0))
         }
-        _ => Some((value, 0)),
+        InstKind::IMul(lhs, rhs) => {
+            // k * (s * base + o) = (k*s) * base + k*o
+            if let Some((base, scale, offset)) = loop_index_base_and_offset(func, *lhs) {
+                if let Some(k) = resolve_int_scalar(func, *rhs) {
+                    let new_scale = scale.checked_mul(k)?;
+                    let new_offset = offset.checked_mul(k)?;
+                    return Some((base, new_scale, new_offset));
+                }
+            }
+            if let Some((base, scale, offset)) = loop_index_base_and_offset(func, *rhs) {
+                if let Some(k) = resolve_int_scalar(func, *lhs) {
+                    let new_scale = scale.checked_mul(k)?;
+                    let new_offset = offset.checked_mul(k)?;
+                    return Some((base, new_scale, new_offset));
+                }
+            }
+            Some((value, 1, 0))
+        }
+        _ => Some((value, 1, 0)),
     }
 }
 
@@ -1209,5 +1244,59 @@ mod tests {
             )
         });
         assert!(!has_check, "loop body should no longer contain CheckBounds");
+    }
+
+    #[test]
+    fn loop_index_decomposes_constant_multiplied_iv() {
+        let mut f = Function::new("test".into(), vec![], IrType::Void);
+        let span = crate::lexer::Span {
+            file_id: 0,
+            start: crate::lexer::Position { line: 0, col: 0 },
+            end: crate::lexer::Position { line: 0, col: 0 },
+        };
+
+        // Synthesise: i = next_value(); 2*i; (2*i) + 3 — verify the
+        // decomposition (base, scale, offset) recovers (i, 2, 3).
+        let entry = f.entry;
+        let i = f.next_value_id();
+        f.register_type(i, IrType::Int(IntWidth::I32));
+        let two = f.next_value_id();
+        f.register_type(two, IrType::Int(IntWidth::I32));
+        f.block_mut(entry).insts.push(Inst {
+            id: two,
+            ty: IrType::Int(IntWidth::I32),
+            span,
+            kind: InstKind::ConstInt(2, IntWidth::I32),
+        });
+        let two_i = f.next_value_id();
+        f.register_type(two_i, IrType::Int(IntWidth::I32));
+        f.block_mut(entry).insts.push(Inst {
+            id: two_i,
+            ty: IrType::Int(IntWidth::I32),
+            span,
+            kind: InstKind::IMul(two, i),
+        });
+        let three = f.next_value_id();
+        f.register_type(three, IrType::Int(IntWidth::I32));
+        f.block_mut(entry).insts.push(Inst {
+            id: three,
+            ty: IrType::Int(IntWidth::I32),
+            span,
+            kind: InstKind::ConstInt(3, IntWidth::I32),
+        });
+        let two_i_plus_three = f.next_value_id();
+        f.register_type(two_i_plus_three, IrType::Int(IntWidth::I32));
+        f.block_mut(entry).insts.push(Inst {
+            id: two_i_plus_three,
+            ty: IrType::Int(IntWidth::I32),
+            span,
+            kind: InstKind::IAdd(two_i, three),
+        });
+
+        let (base, scale, offset) =
+            loop_index_base_and_offset(&f, two_i_plus_three).expect("should decompose");
+        assert_eq!(base, i, "base should be the unanalysable inner value");
+        assert_eq!(scale, 2, "scale captures the IMul by 2");
+        assert_eq!(offset, 3, "offset captures the +3");
     }
 }

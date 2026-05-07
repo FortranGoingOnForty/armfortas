@@ -21,13 +21,16 @@ use super::global_lsf::GlobalLsf;
 use super::gvn::Gvn;
 use super::inline::Inline;
 use super::interchange::LoopInterchange;
+use super::jump_thread::JumpThread;
 use super::licm::Licm;
 use super::lsf::LocalLsf;
 use super::mem2reg::Mem2Reg;
+use super::neon_vectorize::NeonVectorize;
 use super::pass::PassManager;
 use super::peel::LoopPeel;
 use super::preheader::PreheaderInsert;
 use super::return_prop::ReturnPropagate;
+use super::sccp::Sccp_;
 use super::simplify_cfg::SimplifyCfg;
 use super::sroa::Sroa;
 use super::strength_reduce::StrengthReduce;
@@ -140,6 +143,8 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(DeadFuncElim));
             pm.add(Box::new(LocalLsf));
             pm.add(Box::new(LocalCse));
+            pm.add(Box::new(Sccp_));
+            pm.add(Box::new(JumpThread));
             pm.add(Box::new(ConstProp));
             pm.add(Box::new(Dce));
         }
@@ -165,6 +170,8 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(LoopPeel));
             pm.add(Box::new(LoopUnswitch));
             pm.add(Box::new(Licm));
+            pm.add(Box::new(Sccp_));
+            pm.add(Box::new(JumpThread));
             pm.add(Box::new(ConstProp));
             pm.add(Box::new(Dse));
             pm.add(Box::new(LoopInterchange));
@@ -196,6 +203,8 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(LoopPeel));
             pm.add(Box::new(LoopUnswitch));
             pm.add(Box::new(Licm));
+            pm.add(Box::new(Sccp_));
+            pm.add(Box::new(JumpThread));
             pm.add(Box::new(ConstProp));
             pm.add(Box::new(Dse));
             pm.add(Box::new(LoopInterchange));
@@ -224,11 +233,14 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(LoopPeel));
             pm.add(Box::new(LoopUnswitch));
             pm.add(Box::new(Licm));
+            pm.add(Box::new(Sccp_));
+            pm.add(Box::new(JumpThread));
             pm.add(Box::new(ConstProp));
             pm.add(Box::new(Dse));
             pm.add(Box::new(LoopInterchange));
             pm.add(Box::new(LoopFission));
             pm.add(Box::new(LoopFusion));
+            pm.add(Box::new(NeonVectorize));
             pm.add(Box::new(Vectorize));
             pm.add(Box::new(LoopUnroll));
             pm.add(Box::new(Gvn)); // keep O3/Ofast aligned with O2/Os value numbering
@@ -256,11 +268,14 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(LoopPeel));
             pm.add(Box::new(LoopUnswitch));
             pm.add(Box::new(Licm));
+            pm.add(Box::new(Sccp_));
+            pm.add(Box::new(JumpThread));
             pm.add(Box::new(ConstProp));
             pm.add(Box::new(Dse));
             pm.add(Box::new(LoopInterchange));
             pm.add(Box::new(LoopFission));
             pm.add(Box::new(LoopFusion));
+            pm.add(Box::new(NeonVectorize));
             pm.add(Box::new(Vectorize));
             pm.add(Box::new(LoopUnroll));
             pm.add(Box::new(FastMathReassoc));

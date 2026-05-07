@@ -18,6 +18,11 @@ pub enum IrType {
     Struct(StructId),
     /// Function pointer.
     FuncPtr(Box<FuncSig>),
+    /// SIMD vector: `lanes` elements of `elem`. Only the lane counts
+    /// the NEON ISA supports are accepted by the verifier — 4×i32,
+    /// 2×i64, 4×f32, 2×f64, plus narrow integer packings (16×i8,
+    /// 8×i16). All vectors are 128 bits wide.
+    Vector { lanes: u8, elem: Box<IrType> },
 }
 
 /// Integer bit widths.
@@ -97,6 +102,23 @@ impl IrType {
                 panic!("Struct size requires struct_defs; use Module::struct_size()")
             }
             Self::FuncPtr(_) => 8,
+            // 128-bit NEON: every supported lane combo lands at 16
+            // bytes. The verifier rejects shapes that don't.
+            Self::Vector { .. } => 16,
+        }
+    }
+
+    /// Is this a vector type?
+    pub fn is_vector(&self) -> bool {
+        matches!(self, Self::Vector { .. })
+    }
+
+    /// If this is a vector, return (lanes, element type).
+    pub fn vector_shape(&self) -> Option<(u8, &IrType)> {
+        if let Self::Vector { lanes, elem } = self {
+            Some((*lanes, elem))
+        } else {
+            None
         }
     }
 
@@ -171,6 +193,7 @@ impl std::fmt::Display for IrType {
                 }
                 write!(f, ") -> {}", sig.ret)
             }
+            Self::Vector { lanes, elem } => write!(f, "<{} x {}>", lanes, elem),
         }
     }
 }

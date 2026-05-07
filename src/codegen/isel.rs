@@ -47,114 +47,7 @@ fn select_function_with_names(func: &Function, func_names: &[String]) -> Machine
     mf
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AbiArgLoc {
-    Gp(u8),
-    Gp32(u8),
-    Fp(u8),
-    Fp32(u8),
-    GpPair(u8),
-    Stack(i64),
-}
-
-#[derive(Debug, Default, Clone, Copy)]
-struct AbiArgState {
-    gp_idx: u8,
-    fp_idx: u8,
-    stack_offset: i64,
-}
-
-fn align_to(value: i64, align: i64) -> i64 {
-    debug_assert!(align > 0 && (align & (align - 1)) == 0);
-    (value + align - 1) & !(align - 1)
-}
-
-fn abi_stack_layout(ty: &IrType) -> (i64, i64) {
-    match ty {
-        IrType::Int(IntWidth::I128) => (16, 16),
-        IrType::Int(IntWidth::I64) | IrType::Ptr(_) | IrType::FuncPtr(_) => (8, 8),
-        IrType::Float(FloatWidth::F64) => (8, 8),
-        // TODO: integer(c_short), value actuals still appear widened before
-        // reaching call lowering, so end-to-end 16-bit VALUE ABI parity needs
-        // a follow-up beyond this stack-packing fix.
-        IrType::Float(FloatWidth::F32) => (4, 4),
-        IrType::Int(IntWidth::I32) => (4, 4),
-        IrType::Int(IntWidth::I16) => (2, 2),
-        IrType::Int(IntWidth::I8) | IrType::Bool => (1, 1),
-        _ => (8, 8),
-    }
-}
-
-fn classify_abi_arg(ty: &IrType, state: &mut AbiArgState) -> AbiArgLoc {
-    match ty {
-        IrType::Int(IntWidth::I128) => {
-            if state.gp_idx + 2 <= 8 {
-                let reg = state.gp_idx;
-                state.gp_idx += 2;
-                AbiArgLoc::GpPair(reg)
-            } else {
-                state.gp_idx = 8;
-                let (size, align) = abi_stack_layout(ty);
-                let offset = align_to(state.stack_offset, align);
-                state.stack_offset = offset + size;
-                AbiArgLoc::Stack(offset)
-            }
-        }
-        IrType::Float(FloatWidth::F64) => {
-            if state.fp_idx < 8 {
-                let reg = state.fp_idx;
-                state.fp_idx += 1;
-                AbiArgLoc::Fp(reg)
-            } else {
-                let (size, align) = abi_stack_layout(ty);
-                let offset = align_to(state.stack_offset, align);
-                state.stack_offset = offset + size;
-                AbiArgLoc::Stack(offset)
-            }
-        }
-        IrType::Float(FloatWidth::F32) => {
-            if state.fp_idx < 8 {
-                let reg = state.fp_idx;
-                state.fp_idx += 1;
-                AbiArgLoc::Fp32(reg)
-            } else {
-                let (size, align) = abi_stack_layout(ty);
-                let offset = align_to(state.stack_offset, align);
-                state.stack_offset = offset + size;
-                AbiArgLoc::Stack(offset)
-            }
-        }
-        IrType::Int(IntWidth::I8)
-        | IrType::Int(IntWidth::I16)
-        | IrType::Int(IntWidth::I32)
-        | IrType::Bool => {
-            if state.gp_idx < 8 {
-                let reg = state.gp_idx;
-                state.gp_idx += 1;
-                AbiArgLoc::Gp32(reg)
-            } else {
-                state.gp_idx = 8;
-                let (size, align) = abi_stack_layout(ty);
-                let offset = align_to(state.stack_offset, align);
-                state.stack_offset = offset + size;
-                AbiArgLoc::Stack(offset)
-            }
-        }
-        _ => {
-            if state.gp_idx < 8 {
-                let reg = state.gp_idx;
-                state.gp_idx += 1;
-                AbiArgLoc::Gp(reg)
-            } else {
-                state.gp_idx = 8;
-                let (size, align) = abi_stack_layout(ty);
-                let offset = align_to(state.stack_offset, align);
-                state.stack_offset = offset + size;
-                AbiArgLoc::Stack(offset)
-            }
-        }
-    }
-}
+use super::abi::{classify_abi_arg, AbiArgLoc, AbiArgState};
 
 /// Select machine instructions for one IR function.
 pub fn select_function(func: &Function) -> MachineFunction {
@@ -546,6 +439,7 @@ fn select_call_inst(
         let (src_reg, opcode) = match class {
             RegClass::Fp64 => (PhysReg::Fp(0), ArmOpcode::FmovReg),
             RegClass::Fp32 => (PhysReg::Fp32(0), ArmOpcode::FmovReg),
+            RegClass::V128 => (PhysReg::Fp(0), ArmOpcode::FmovReg),
             RegClass::Gp32 => (PhysReg::Gp32(0), ArmOpcode::MovReg),
             RegClass::Gp64 => (PhysReg::Gp(0), ArmOpcode::MovReg),
         };
@@ -689,65 +583,11 @@ fn select_inst(
                 return;
             }
             InstKind::IAdd(a, b) => {
-                let dest_slot = ctx.lookup_wide_slot(inst.id);
-                let lhs_slot = ctx.lookup_wide_slot(*a);
-                let rhs_slot = ctx.lookup_wide_slot(*b);
-                emit_load_phys_i128_pair(
-                    mf,
-                    mb,
-                    MachineOperand::PhysReg(PhysReg::FP),
-                    lhs_slot as i64,
-                    PhysReg::Gp(16),
-                    PhysReg::Gp(17),
-                );
-                emit_i128_add_from_slot(
-                    mf,
-                    mb,
-                    MachineOperand::PhysReg(PhysReg::FP),
-                    rhs_slot as i64,
-                    PhysReg::Gp(16),
-                    PhysReg::Gp(17),
-                    PhysReg::Gp(8),
-                );
-                emit_store_phys_i128_pair(
-                    mf,
-                    mb,
-                    MachineOperand::PhysReg(PhysReg::FP),
-                    dest_slot as i64,
-                    PhysReg::Gp(16),
-                    PhysReg::Gp(17),
-                );
+                emit_i128_binop_via_slots(mf, ctx, mb, I128BinOp::Add, inst.id, *a, *b);
                 return;
             }
             InstKind::ISub(a, b) => {
-                let dest_slot = ctx.lookup_wide_slot(inst.id);
-                let lhs_slot = ctx.lookup_wide_slot(*a);
-                let rhs_slot = ctx.lookup_wide_slot(*b);
-                emit_load_phys_i128_pair(
-                    mf,
-                    mb,
-                    MachineOperand::PhysReg(PhysReg::FP),
-                    lhs_slot as i64,
-                    PhysReg::Gp(16),
-                    PhysReg::Gp(17),
-                );
-                emit_i128_sub_from_slot(
-                    mf,
-                    mb,
-                    MachineOperand::PhysReg(PhysReg::FP),
-                    rhs_slot as i64,
-                    PhysReg::Gp(16),
-                    PhysReg::Gp(17),
-                    PhysReg::Gp(8),
-                );
-                emit_store_phys_i128_pair(
-                    mf,
-                    mb,
-                    MachineOperand::PhysReg(PhysReg::FP),
-                    dest_slot as i64,
-                    PhysReg::Gp(16),
-                    PhysReg::Gp(17),
-                );
+                emit_i128_binop_via_slots(mf, ctx, mb, I128BinOp::Sub, inst.id, *a, *b);
                 return;
             }
             InstKind::INeg(a) => {
@@ -981,6 +821,14 @@ fn select_inst(
                         ],
                         def: Some(dest),
                     });
+                }
+                RegClass::V128 => {
+                    // Sprint 12 Stage 1 reserves the type/instr; no
+                    // path produces a V128 Undef yet. Bail rather
+                    // than emit a half-baked NEON zero — when the
+                    // vectorizer arrives it will have its own
+                    // VBroadcast(const 0) lowering.
+                    unreachable!("V128 Undef emission not implemented (Sprint 12 Stage 4 work)");
                 }
             }
         }
@@ -1565,45 +1413,19 @@ fn select_inst(
         }
 
         InstKind::Load(addr) => {
+            // Audit CRITICAL-2: dispatch on the IR result type so the
+            // load opcode width matches the value, not the pointer.
+            // Previously every integer load used `ldr w_, [_]` regardless
+            // of width, silently reading 4 bytes for an i8 load.
             let class = type_to_reg_class(&inst.ty);
             let dest = ctx.get_vreg(mf, inst.id, class);
-            // Pick the load opcode by element width. i8 → LDRSB
-            // (sign-extended into Wt), i16 → LDRSH, i32/Bool → LDR
-            // Wt, i64/ptr → LDR Xt, FP → LDR Dt/St. Audit
-            // CRITICAL-2: previously every integer load used the
-            // 32-bit `ldr w_, [_]` regardless of width, so an i8
-            // load read 4 bytes and the result depended on what
-            // happened to follow the byte in memory.
-            let opcode = match &inst.ty {
-                IrType::Int(IntWidth::I8) | IrType::Bool => ArmOpcode::LdrsbImm,
-                IrType::Int(IntWidth::I16) => ArmOpcode::LdrshImm,
-                IrType::Float(_) => ArmOpcode::LdrFpImm,
-                _ => ArmOpcode::LdrImm,
-            };
-
-            // If addr is an alloca, load directly from the frame slot.
-            if let Some(&offset) = ctx.alloca_offsets.get(addr) {
-                mf.block_mut(mb).insts.push(MachineInst {
-                    opcode,
-                    operands: vec![
-                        MachineOperand::VReg(dest),
-                        MachineOperand::PhysReg(PhysReg::FP),
-                        MachineOperand::FrameSlot(offset),
-                    ],
-                    def: Some(dest),
-                });
-            } else {
-                let base = ctx.lookup_vreg(*addr);
-                mf.block_mut(mb).insts.push(MachineInst {
-                    opcode,
-                    operands: vec![
-                        MachineOperand::VReg(dest),
-                        MachineOperand::VReg(base),
-                        MachineOperand::Imm(0),
-                    ],
-                    def: Some(dest),
-                });
-            }
+            let opcode = load_opcode_for(&inst.ty, class);
+            let (base_op, offset_op) = narrow_load_store_addr(ctx, *addr);
+            mf.block_mut(mb).insts.push(MachineInst {
+                opcode,
+                operands: vec![MachineOperand::VReg(dest), base_op, offset_op],
+                def: Some(dest),
+            });
         }
 
         InstKind::Store(val, addr) => {
@@ -1641,57 +1463,24 @@ fn select_inst(
             }
 
             let val_vreg = ctx.lookup_vreg(*val);
-            // Audit CRITICAL-2: pick the store opcode by the IR
-            // VALUE's declared type, not the pointer's pointee.
-            // Byte-level GEPs into derived types and array
-            // constructors use Ptr<i8> as a generic offset cursor
-            // even when the actual element being stored is i32 —
-            // checking the pointee in those cases would
-            // incorrectly emit STRB and write only 1 byte.
-            //
-            // The value's IR type is the source of truth for
-            // store width. STRB / STRH are only used when the
-            // value itself is i8/i16/Bool.
+            // Audit CRITICAL-2: dispatch on the *value*'s declared IR
+            // type, not the pointer's pointee — byte-level GEPs into
+            // derived types and array constructors reuse `Ptr<i8>` as a
+            // generic offset cursor, so dispatching by the pointee
+            // would silently truncate non-byte stores.
             let val_ty = func.value_type(*val);
-            let opcode = match &val_ty {
-                Some(IrType::Int(IntWidth::I8)) | Some(IrType::Bool) => ArmOpcode::StrbImm,
-                Some(IrType::Int(IntWidth::I16)) => ArmOpcode::StrhImm,
-                Some(IrType::Float(_)) => ArmOpcode::StrFpImm,
-                _ => {
-                    // Default to the value's reg class for any
-                    // other case (i32, i64, ptr).
-                    let val_class = mf.vregs.iter().find(|v| v.id == val_vreg).map(|v| v.class);
-                    let is_fp = matches!(val_class, Some(RegClass::Fp32) | Some(RegClass::Fp64));
-                    if is_fp {
-                        ArmOpcode::StrFpImm
-                    } else {
-                        ArmOpcode::StrImm
-                    }
-                }
-            };
-
-            if let Some(&offset) = ctx.alloca_offsets.get(addr) {
-                mf.block_mut(mb).insts.push(MachineInst {
-                    opcode,
-                    operands: vec![
-                        MachineOperand::VReg(val_vreg),
-                        MachineOperand::PhysReg(PhysReg::FP),
-                        MachineOperand::FrameSlot(offset),
-                    ],
-                    def: None,
-                });
-            } else {
-                let base = ctx.lookup_vreg(*addr);
-                mf.block_mut(mb).insts.push(MachineInst {
-                    opcode,
-                    operands: vec![
-                        MachineOperand::VReg(val_vreg),
-                        MachineOperand::VReg(base),
-                        MachineOperand::Imm(0),
-                    ],
-                    def: None,
-                });
-            }
+            let val_class = mf.vregs
+                .iter()
+                .find(|v| v.id == val_vreg)
+                .map(|v| v.class)
+                .unwrap_or(RegClass::Gp64);
+            let opcode = store_opcode_for(val_ty.as_ref(), val_class);
+            let (base_op, offset_op) = narrow_load_store_addr(ctx, *addr);
+            mf.block_mut(mb).insts.push(MachineInst {
+                opcode,
+                operands: vec![MachineOperand::VReg(val_vreg), base_op, offset_op],
+                def: None,
+            });
         }
 
         InstKind::GetElementPtr(base, indices) => {
@@ -1889,7 +1678,472 @@ fn select_inst(
             });
         }
 
-        // Remaining: ExtractField, InsertField — placeholder.
+        // ---- SIMD vector ops (Sprint 12 Stage 2 isel hookup) ----
+        //
+        // The vectorizer (Stage 4) is what will start producing
+        // these. Each arm picks a NEON ArmOpcode based on the result
+        // vector's lane shape. Mixed-shape ops (e.g. integer 8×i16
+        // narrow lanes) aren't selected here — Stage 4 will only
+        // emit the four shapes covered by `VShape`.
+        InstKind::VAdd(a, b) => emit_vbinop(mf, ctx, mb, inst, *a, *b, |s| match s {
+            VShape::V4S => ArmOpcode::AddV4S,
+            VShape::V2D => ArmOpcode::AddV2D,
+            VShape::F4S => ArmOpcode::FaddV4S,
+            VShape::F2D => ArmOpcode::FaddV2D,
+        }),
+        InstKind::VSub(a, b) => emit_vbinop(mf, ctx, mb, inst, *a, *b, |s| match s {
+            VShape::V4S => ArmOpcode::SubV4S,
+            VShape::V2D => ArmOpcode::SubV2D,
+            VShape::F4S => ArmOpcode::FsubV4S,
+            VShape::F2D => ArmOpcode::FsubV2D,
+        }),
+        InstKind::VMul(a, b) => emit_vbinop(mf, ctx, mb, inst, *a, *b, |s| match s {
+            VShape::V4S => ArmOpcode::MulV4S,
+            // NEON has no integer 2D mul — Stage 4 should not request
+            // it; if it does we fall through to a placeholder.
+            VShape::V2D => ArmOpcode::Nop,
+            VShape::F4S => ArmOpcode::FmulV4S,
+            VShape::F2D => ArmOpcode::FmulV2D,
+        }),
+        InstKind::VDiv(a, b) => emit_vbinop(mf, ctx, mb, inst, *a, *b, |s| match s {
+            // No integer NEON divide — emit a placeholder; the
+            // vectorizer should refuse to pick V128 lanes for VDiv
+            // on integer types. Float forms exist.
+            VShape::V4S | VShape::V2D => ArmOpcode::Nop,
+            VShape::F4S => ArmOpcode::FdivV4S,
+            VShape::F2D => ArmOpcode::FdivV2D,
+        }),
+        InstKind::VNeg(a) => emit_vunop(mf, ctx, mb, inst, *a, |s| match s {
+            VShape::V4S => ArmOpcode::NegV4S,
+            VShape::V2D => ArmOpcode::NegV2D,
+            VShape::F4S => ArmOpcode::FnegV4S,
+            VShape::F2D => ArmOpcode::FnegV2D,
+        }),
+        InstKind::VAbs(a) => emit_vunop(mf, ctx, mb, inst, *a, |s| match s {
+            VShape::F4S => ArmOpcode::FabsV4S,
+            VShape::F2D => ArmOpcode::FabsV2D,
+            // NEON `abs` exists for integer too but the four-shape
+            // alias isn't generated yet; placeholder.
+            VShape::V4S | VShape::V2D => ArmOpcode::Nop,
+        }),
+        InstKind::VSqrt(a) => emit_vunop(mf, ctx, mb, inst, *a, |s| match s {
+            VShape::F4S => ArmOpcode::FsqrtV4S,
+            VShape::F2D => ArmOpcode::FsqrtV2D,
+            // sqrt is float-only.
+            VShape::V4S | VShape::V2D => ArmOpcode::Nop,
+        }),
+        InstKind::VFma(a, b, c) => {
+            // FMLA is dest += a*b. Conventional 3-operand call
+            // assumes dest is a fresh vreg — emit a copy-from-c
+            // followed by FMLA. Stage 4 should fold the copy when it
+            // tracks SSA destinations more carefully.
+            let shape = match VShape::from_ir(&inst.ty) {
+                Some(s) if s.is_float() => s,
+                _ => {
+                    // unsupported shape — placeholder
+                    let dest = ctx.get_vreg(mf, inst.id, RegClass::V128);
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode: ArmOpcode::Nop,
+                        operands: vec![],
+                        def: Some(dest),
+                    });
+                    return;
+                }
+            };
+            let opcode = match shape {
+                VShape::F4S => ArmOpcode::FmlaV4S,
+                VShape::F2D => ArmOpcode::FmlaV2D,
+                _ => unreachable!(),
+            };
+            let va = ctx.lookup_vreg(*a);
+            let vb = ctx.lookup_vreg(*b);
+            let vc = ctx.lookup_vreg(*c);
+            let dest = ctx.get_vreg(mf, inst.id, RegClass::V128);
+            // dest = c (init accumulator). Must use Mov16B (mov.16b)
+            // for V128 — fmov d, d truncates to 64 bits and silently
+            // drops the upper lanes.
+            mf.block_mut(mb).insts.push(MachineInst {
+                opcode: ArmOpcode::Mov16B,
+                operands: vec![MachineOperand::VReg(dest), MachineOperand::VReg(vc)],
+                def: Some(dest),
+            });
+            // dest += a * b
+            mf.block_mut(mb).insts.push(MachineInst {
+                opcode,
+                operands: vec![
+                    MachineOperand::VReg(dest),
+                    MachineOperand::VReg(va),
+                    MachineOperand::VReg(vb),
+                ],
+                def: Some(dest),
+            });
+        }
+        InstKind::VSelect(mask, t, f) => {
+            // BSL is destructive: bsl Vd.16b, Vn.16b, Vm.16b → for
+            // each bit, if Vd then Vn else Vm. So we copy the mask
+            // into the dest first (mov.16b), then bsl with t/f.
+            let vmask = ctx.lookup_vreg(*mask);
+            let vt = ctx.lookup_vreg(*t);
+            let vf = ctx.lookup_vreg(*f);
+            let dest = ctx.get_vreg(mf, inst.id, RegClass::V128);
+            mf.block_mut(mb).insts.push(MachineInst {
+                opcode: ArmOpcode::Mov16B,
+                operands: vec![MachineOperand::VReg(dest), MachineOperand::VReg(vmask)],
+                def: Some(dest),
+            });
+            mf.block_mut(mb).insts.push(MachineInst {
+                opcode: ArmOpcode::BslV16B,
+                operands: vec![
+                    MachineOperand::VReg(dest),
+                    MachineOperand::VReg(vt),
+                    MachineOperand::VReg(vf),
+                ],
+                def: Some(dest),
+            });
+        }
+        InstKind::VLoad(addr) => {
+            let dest = ctx.get_vreg(mf, inst.id, RegClass::V128);
+            let base = ctx.lookup_vreg(*addr);
+            mf.block_mut(mb).insts.push(MachineInst {
+                opcode: ArmOpcode::LdrQ,
+                operands: vec![
+                    MachineOperand::VReg(dest),
+                    MachineOperand::VReg(base),
+                    MachineOperand::Imm(0),
+                ],
+                def: Some(dest),
+            });
+        }
+        InstKind::VStore(val, addr) => {
+            let v = ctx.lookup_vreg(*val);
+            let base = ctx.lookup_vreg(*addr);
+            mf.block_mut(mb).insts.push(MachineInst {
+                opcode: ArmOpcode::StrQ,
+                operands: vec![
+                    MachineOperand::VReg(v),
+                    MachineOperand::VReg(base),
+                    MachineOperand::Imm(0),
+                ],
+                def: None,
+            });
+        }
+        InstKind::VFCmp(op, a, b) => {
+            // NEON fcmp produces an all-ones / all-zeros mask per lane.
+            // Eq/Ge/Gt are direct; Ne/Le/Lt swap operands or invert.
+            // For Lt: fcmgt swapped operands. For Le: fcmge swapped.
+            // Ne is not a single-instruction in NEON; we don't handle
+            // it yet (vectorizer doesn't emit Ne).
+            let dest = ctx.get_vreg(mf, inst.id, RegClass::V128);
+            let va = ctx.lookup_vreg(*a);
+            let vb = ctx.lookup_vreg(*b);
+            let shape = VShape::from_ir(&inst.ty);
+            let (opcode, swap) = match (shape, op) {
+                (Some(VShape::F4S), CmpOp::Gt) => (ArmOpcode::FcmgtV4S, false),
+                (Some(VShape::F2D), CmpOp::Gt) => (ArmOpcode::FcmgtV2D, false),
+                (Some(VShape::F4S), CmpOp::Ge) => (ArmOpcode::FcmgeV4S, false),
+                (Some(VShape::F2D), CmpOp::Ge) => (ArmOpcode::FcmgeV2D, false),
+                (Some(VShape::F4S), CmpOp::Eq) => (ArmOpcode::FcmeqV4S, false),
+                (Some(VShape::F2D), CmpOp::Eq) => (ArmOpcode::FcmeqV2D, false),
+                (Some(VShape::F4S), CmpOp::Lt) => (ArmOpcode::FcmgtV4S, true),
+                (Some(VShape::F2D), CmpOp::Lt) => (ArmOpcode::FcmgtV2D, true),
+                (Some(VShape::F4S), CmpOp::Le) => (ArmOpcode::FcmgeV4S, true),
+                (Some(VShape::F2D), CmpOp::Le) => (ArmOpcode::FcmgeV2D, true),
+                _ => (ArmOpcode::Nop, false),
+            };
+            let (lhs, rhs) = if swap { (vb, va) } else { (va, vb) };
+            mf.block_mut(mb).insts.push(MachineInst {
+                opcode,
+                operands: vec![
+                    MachineOperand::VReg(dest),
+                    MachineOperand::VReg(lhs),
+                    MachineOperand::VReg(rhs),
+                ],
+                def: Some(dest),
+            });
+        }
+        InstKind::VICmp(op, a, b) => {
+            let dest = ctx.get_vreg(mf, inst.id, RegClass::V128);
+            let va = ctx.lookup_vreg(*a);
+            let vb = ctx.lookup_vreg(*b);
+            let shape = VShape::from_ir(&inst.ty);
+            let (opcode, swap) = match (shape, op) {
+                (Some(VShape::V4S), CmpOp::Gt) => (ArmOpcode::CmgtV4S, false),
+                (Some(VShape::V4S), CmpOp::Ge) => (ArmOpcode::CmgeV4S, false),
+                (Some(VShape::V4S), CmpOp::Eq) => (ArmOpcode::CmeqV4S, false),
+                (Some(VShape::V4S), CmpOp::Lt) => (ArmOpcode::CmgtV4S, true),
+                (Some(VShape::V4S), CmpOp::Le) => (ArmOpcode::CmgeV4S, true),
+                _ => (ArmOpcode::Nop, false),
+            };
+            let (lhs, rhs) = if swap { (vb, va) } else { (va, vb) };
+            mf.block_mut(mb).insts.push(MachineInst {
+                opcode,
+                operands: vec![
+                    MachineOperand::VReg(dest),
+                    MachineOperand::VReg(lhs),
+                    MachineOperand::VReg(rhs),
+                ],
+                def: Some(dest),
+            });
+        }
+        InstKind::VBroadcast(scalar) => {
+            let s = ctx.lookup_vreg(*scalar);
+            let dest = ctx.get_vreg(mf, inst.id, RegClass::V128);
+            // Float scalars live in S/D registers — splatting from
+            // those uses the lane-dup form (`dup.4s vN, vM.s[0]`).
+            // Integer scalars live in W/X registers — splatting from
+            // those uses the gp-dup form (`dup.4s vN, wM`).
+            let opcode = match VShape::from_ir(&inst.ty) {
+                Some(VShape::V4S) => ArmOpcode::DupGen4S,
+                Some(VShape::V2D) => ArmOpcode::DupGen2D,
+                Some(VShape::F4S) => ArmOpcode::DupEl4S,
+                Some(VShape::F2D) => ArmOpcode::DupEl2D,
+                None => ArmOpcode::Nop,
+            };
+            mf.block_mut(mb).insts.push(MachineInst {
+                opcode,
+                operands: vec![MachineOperand::VReg(dest), MachineOperand::VReg(s)],
+                def: Some(dest),
+            });
+        }
+        InstKind::VReduceSum(v) => {
+            // Cross-lane sum. The reduction instruction writes its
+            // 32/64-bit result into the FP register file (sN/dN view
+            // of vN). For float results that's already what we want;
+            // for int results we follow up with a `umov.s/.d` move
+            // from the FP lane back into a GP register.
+            //
+            //   F4S → faddv s_dest, v_src.4s
+            //   F2D → faddp d_dest, v_src.2d
+            //   int(I32) → addv s_tmp, v_src.4s; umov.s w_dest, v_tmp[0]
+            //   int(I64) → addv s_tmp, v_src.4s; umov.s w_dest, v_tmp[0]
+            //              (4-lane i32 sum widens into a single i32; the
+            //              caller is expected to sign-extend if it
+            //              wanted i64 semantics — matches scalar IAdd)
+            let src = ctx.lookup_vreg(*v);
+            match &inst.ty {
+                IrType::Float(FloatWidth::F32) => {
+                    // NEON has no `faddv.4s`. Reduce 4 f32 lanes
+                    // with two pairwise adds:
+                    //   1) `faddp.4s v_tmp, v_src, v_src`
+                    //         → [a+b, c+d, a+b, c+d]
+                    //   2) `faddp.2s s_dest, v_tmp`
+                    //         → (a+b)+(c+d) — the full sum
+                    let tmp = mf.new_vreg(RegClass::V128);
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode: ArmOpcode::FaddpV4S,
+                        operands: vec![
+                            MachineOperand::VReg(tmp),
+                            MachineOperand::VReg(src),
+                            MachineOperand::VReg(src),
+                        ],
+                        def: Some(tmp),
+                    });
+                    let class = type_to_reg_class(&inst.ty);
+                    let dest = ctx.get_vreg(mf, inst.id, class);
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode: ArmOpcode::FaddpV2S,
+                        operands: vec![MachineOperand::VReg(dest), MachineOperand::VReg(tmp)],
+                        def: Some(dest),
+                    });
+                }
+                IrType::Float(FloatWidth::F64) => {
+                    let class = type_to_reg_class(&inst.ty);
+                    let dest = ctx.get_vreg(mf, inst.id, class);
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode: ArmOpcode::FaddpV2D,
+                        operands: vec![MachineOperand::VReg(dest), MachineOperand::VReg(src)],
+                        def: Some(dest),
+                    });
+                }
+                IrType::Int(IntWidth::I32) => {
+                    // 4×i32 → scalar via `addv.4s s_tmp, v_src` then
+                    // `umov.s w_dest, v_tmp[0]`.
+                    let tmp = mf.new_vreg(RegClass::V128);
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode: ArmOpcode::Addv4S,
+                        operands: vec![MachineOperand::VReg(tmp), MachineOperand::VReg(src)],
+                        def: Some(tmp),
+                    });
+                    let class = type_to_reg_class(&inst.ty);
+                    let dest = ctx.get_vreg(mf, inst.id, class);
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode: ArmOpcode::Umov4S,
+                        operands: vec![
+                            MachineOperand::VReg(dest),
+                            MachineOperand::VReg(tmp),
+                            MachineOperand::Imm(0),
+                        ],
+                        def: Some(dest),
+                    });
+                }
+                IrType::Int(IntWidth::I64) => {
+                    // 2×i64 → scalar via pairwise add (`addp.2d
+                    // v_tmp, v_src, v_src`) then `umov.d x_dest,
+                    // v_tmp[0]`. NEON has no `addv.2d`, so the
+                    // pairwise form is the canonical i64 reduce.
+                    let tmp = mf.new_vreg(RegClass::V128);
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode: ArmOpcode::AddpV2D,
+                        operands: vec![
+                            MachineOperand::VReg(tmp),
+                            MachineOperand::VReg(src),
+                            MachineOperand::VReg(src),
+                        ],
+                        def: Some(tmp),
+                    });
+                    let class = type_to_reg_class(&inst.ty);
+                    let dest = ctx.get_vreg(mf, inst.id, class);
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode: ArmOpcode::Umov2D,
+                        operands: vec![
+                            MachineOperand::VReg(dest),
+                            MachineOperand::VReg(tmp),
+                            MachineOperand::Imm(0),
+                        ],
+                        def: Some(dest),
+                    });
+                }
+                IrType::Int(_) => {
+                    let class = type_to_reg_class(&inst.ty);
+                    let dest = ctx.get_vreg(mf, inst.id, class);
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode: ArmOpcode::Nop,
+                        operands: vec![MachineOperand::VReg(dest), MachineOperand::VReg(src)],
+                        def: Some(dest),
+                    });
+                }
+                _ => {
+                    let class = type_to_reg_class(&inst.ty);
+                    let dest = ctx.get_vreg(mf, inst.id, class);
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode: ArmOpcode::Nop,
+                        operands: vec![MachineOperand::VReg(dest), MachineOperand::VReg(src)],
+                        def: Some(dest),
+                    });
+                }
+            }
+        }
+        InstKind::VExtract(v, lane) => {
+            let src = ctx.lookup_vreg(*v);
+            let class = type_to_reg_class(&inst.ty);
+            let dest = ctx.get_vreg(mf, inst.id, class);
+            let opcode = match &inst.ty {
+                IrType::Int(IntWidth::I32) => ArmOpcode::Umov4S,
+                IrType::Int(IntWidth::I64) => ArmOpcode::Umov2D,
+                IrType::Float(FloatWidth::F32) => ArmOpcode::FmovEl4S,
+                IrType::Float(FloatWidth::F64) => ArmOpcode::FmovEl2D,
+                _ => ArmOpcode::Nop,
+            };
+            mf.block_mut(mb).insts.push(MachineInst {
+                opcode,
+                operands: vec![
+                    MachineOperand::VReg(dest),
+                    MachineOperand::VReg(src),
+                    MachineOperand::Imm(*lane as i64),
+                ],
+                def: Some(dest),
+            });
+        }
+
+        InstKind::VMin(a, b) | InstKind::VMax(a, b) => {
+            let va = ctx.lookup_vreg(*a);
+            let vb = ctx.lookup_vreg(*b);
+            let dest = ctx.get_vreg(mf, inst.id, RegClass::V128);
+            let is_max = matches!(inst.kind, InstKind::VMax(..));
+            let opcode = match (VShape::from_ir(&inst.ty), is_max) {
+                (Some(VShape::V4S), true) => ArmOpcode::SmaxV4S,
+                (Some(VShape::V4S), false) => ArmOpcode::SminV4S,
+                (Some(VShape::F4S), true) => ArmOpcode::FmaxV4S,
+                (Some(VShape::F4S), false) => ArmOpcode::FminV4S,
+                (Some(VShape::F2D), true) => ArmOpcode::FmaxV2D,
+                (Some(VShape::F2D), false) => ArmOpcode::FminV2D,
+                _ => ArmOpcode::Nop,
+            };
+            mf.block_mut(mb).insts.push(MachineInst {
+                opcode,
+                operands: vec![
+                    MachineOperand::VReg(dest),
+                    MachineOperand::VReg(va),
+                    MachineOperand::VReg(vb),
+                ],
+                def: Some(dest),
+            });
+        }
+        InstKind::VReduceMin(v) | InstKind::VReduceMax(v) => {
+            let src = ctx.lookup_vreg(*v);
+            let is_max = matches!(inst.kind, InstKind::VReduceMax(..));
+            match &inst.ty {
+                IrType::Int(IntWidth::I32) => {
+                    let tmp = mf.new_vreg(RegClass::V128);
+                    let opcode = if is_max {
+                        ArmOpcode::Smaxv4S
+                    } else {
+                        ArmOpcode::Sminv4S
+                    };
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode,
+                        operands: vec![MachineOperand::VReg(tmp), MachineOperand::VReg(src)],
+                        def: Some(tmp),
+                    });
+                    let class = type_to_reg_class(&inst.ty);
+                    let dest = ctx.get_vreg(mf, inst.id, class);
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode: ArmOpcode::Umov4S,
+                        operands: vec![
+                            MachineOperand::VReg(dest),
+                            MachineOperand::VReg(tmp),
+                            MachineOperand::Imm(0),
+                        ],
+                        def: Some(dest),
+                    });
+                }
+                IrType::Float(FloatWidth::F32) => {
+                    // fmaxv.4s / fminv.4s s_dest, v_src
+                    let class = type_to_reg_class(&inst.ty);
+                    let dest = ctx.get_vreg(mf, inst.id, class);
+                    let opcode = if is_max {
+                        ArmOpcode::FmaxvV4S
+                    } else {
+                        ArmOpcode::FminvV4S
+                    };
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode,
+                        operands: vec![MachineOperand::VReg(dest), MachineOperand::VReg(src)],
+                        def: Some(dest),
+                    });
+                }
+                IrType::Float(FloatWidth::F64) => {
+                    // NEON has no fmaxv.2d; the pairwise scalar form
+                    // (fmaxp.2d d_dest, v_src) is the across-lane
+                    // reduction for two f64 lanes.
+                    let class = type_to_reg_class(&inst.ty);
+                    let dest = ctx.get_vreg(mf, inst.id, class);
+                    let opcode = if is_max {
+                        ArmOpcode::FmaxpV2DScalar
+                    } else {
+                        ArmOpcode::FminpV2DScalar
+                    };
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode,
+                        operands: vec![MachineOperand::VReg(dest), MachineOperand::VReg(src)],
+                        def: Some(dest),
+                    });
+                }
+                _ => {
+                    let class = type_to_reg_class(&inst.ty);
+                    let dest = ctx.get_vreg(mf, inst.id, class);
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode: ArmOpcode::Nop,
+                        operands: vec![MachineOperand::VReg(dest), MachineOperand::VReg(src)],
+                        def: Some(dest),
+                    });
+                }
+            }
+        }
+
+        // Remaining: ExtractField, InsertField, and other vector ops
+        // (VInsert, VICmp, VFCmp, VBitcast) — placeholder. Land
+        // per-op as the vectorizer grows in Stage 4.
         _ => {
             let class = type_to_reg_class(&inst.ty);
             let _dest = ctx.get_vreg(mf, inst.id, class);
@@ -2172,6 +2426,10 @@ fn emit_branch_arg_copies(
     // Helper to choose the right move opcode for a vreg's class.
     fn move_opcode_for(class: RegClass) -> ArmOpcode {
         match class {
+            // V128 needs `mov.16b` to copy all 128 bits — `fmov d, d`
+            // would corrupt the upper lanes. Fp64/Fp32 still use
+            // `fmov` which is the canonical narrow form.
+            RegClass::V128 => ArmOpcode::Mov16B,
             RegClass::Fp64 | RegClass::Fp32 => ArmOpcode::FmovReg,
             RegClass::Gp64 | RegClass::Gp32 => ArmOpcode::MovReg,
         }
@@ -2433,21 +2691,12 @@ fn emit_load_stack_arg_into_vreg(
     ty: &IrType,
     offset: i64,
 ) {
-    let opcode = match ty {
-        IrType::Int(IntWidth::I8) | IrType::Bool => ArmOpcode::LdrsbImm,
-        IrType::Int(IntWidth::I16) => ArmOpcode::LdrshImm,
-        IrType::Float(_) => ArmOpcode::LdrFpImm,
-        _ => match class {
-            RegClass::Fp64 | RegClass::Fp32 => ArmOpcode::LdrFpImm,
-            RegClass::Gp32 | RegClass::Gp64 => ArmOpcode::LdrImm,
-        },
-    };
-    let reg_base = MachineOperand::PhysReg(PhysReg::FP);
+    let opcode = load_opcode_for(ty, class);
     mf.block_mut(mb).insts.push(MachineInst {
         opcode,
         operands: vec![
             MachineOperand::VReg(dest),
-            reg_base,
+            MachineOperand::PhysReg(PhysReg::FP),
             MachineOperand::Imm(offset),
         ],
         def: Some(dest),
@@ -2462,15 +2711,7 @@ fn emit_store_stack_arg_from_vreg(
     ty: &IrType,
     offset: i64,
 ) {
-    let opcode = match ty {
-        IrType::Int(IntWidth::I8) | IrType::Bool => ArmOpcode::StrbImm,
-        IrType::Int(IntWidth::I16) => ArmOpcode::StrhImm,
-        IrType::Float(_) => ArmOpcode::StrFpImm,
-        _ => match class {
-            RegClass::Fp64 | RegClass::Fp32 => ArmOpcode::StrFpImm,
-            RegClass::Gp32 | RegClass::Gp64 => ArmOpcode::StrImm,
-        },
-    };
+    let opcode = store_opcode_for(Some(ty), class);
     mf.block_mut(mb).insts.push(MachineInst {
         opcode,
         operands: vec![
@@ -2656,6 +2897,58 @@ fn emit_binop(
     });
 }
 
+/// Emit a NEON vector binary op. The `pick` closure resolves the
+/// concrete `ArmOpcode` from the result vector's lane shape — that
+/// keeps the per-op InstKind arms one-line.
+fn emit_vbinop(
+    mf: &mut MachineFunction,
+    ctx: &mut ISelCtx,
+    mb: MBlockId,
+    inst: &Inst,
+    a: ValueId,
+    b: ValueId,
+    pick: impl FnOnce(VShape) -> ArmOpcode,
+) {
+    let dest = ctx.get_vreg(mf, inst.id, RegClass::V128);
+    let va = ctx.lookup_vreg(a);
+    let vb = ctx.lookup_vreg(b);
+    let opcode = match VShape::from_ir(&inst.ty) {
+        Some(s) => pick(s),
+        None => ArmOpcode::Nop,
+    };
+    mf.block_mut(mb).insts.push(MachineInst {
+        opcode,
+        operands: vec![
+            MachineOperand::VReg(dest),
+            MachineOperand::VReg(va),
+            MachineOperand::VReg(vb),
+        ],
+        def: Some(dest),
+    });
+}
+
+/// Emit a NEON vector unary op (one source, one result, both V128).
+fn emit_vunop(
+    mf: &mut MachineFunction,
+    ctx: &mut ISelCtx,
+    mb: MBlockId,
+    inst: &Inst,
+    a: ValueId,
+    pick: impl FnOnce(VShape) -> ArmOpcode,
+) {
+    let dest = ctx.get_vreg(mf, inst.id, RegClass::V128);
+    let va = ctx.lookup_vreg(a);
+    let opcode = match VShape::from_ir(&inst.ty) {
+        Some(s) => pick(s),
+        None => ArmOpcode::Nop,
+    };
+    mf.block_mut(mb).insts.push(MachineInst {
+        opcode,
+        operands: vec![MachineOperand::VReg(dest), MachineOperand::VReg(va)],
+        def: Some(dest),
+    });
+}
+
 /// Emit a float binary op, selecting single or double precision.
 #[allow(clippy::too_many_arguments)]
 fn emit_float_binop(
@@ -2688,15 +2981,158 @@ fn emit_float_binop(
 }
 
 /// Map IR type to register class.
+/// Pick the load opcode for a value of the given IR type and reg class.
+/// Narrow integer types use the sign-extending byte/half loads; floats
+/// route to the FP-imm load; everything else falls through to `LdrImm`
+/// or `LdrFpImm` per reg class. The reg-class fallback matters when
+/// `ty` is a generic pointer or aggregate (e.g., a stack-arg copy that
+/// only knows the destination's register kind).
+fn load_opcode_for(ty: &IrType, class: RegClass) -> ArmOpcode {
+    match ty {
+        IrType::Int(IntWidth::I8) | IrType::Bool => ArmOpcode::LdrsbImm,
+        IrType::Int(IntWidth::I16) => ArmOpcode::LdrshImm,
+        IrType::Float(_) => ArmOpcode::LdrFpImm,
+        _ => match class {
+            RegClass::Fp64 | RegClass::Fp32 => ArmOpcode::LdrFpImm,
+            RegClass::V128 => ArmOpcode::LdrQ,
+            RegClass::Gp32 | RegClass::Gp64 => ArmOpcode::LdrImm,
+        },
+    }
+}
+
+/// Mirror of `load_opcode_for` for stores. Audit CRITICAL-2: the
+/// `ty` here must be the *value's* declared IR type, not the pointer
+/// or pointee — byte-level GEPs reuse `ptr<i8>` as a generic offset
+/// cursor, so dispatching by pointee width would silently truncate
+/// non-byte stores. Pass `None` for `ty` when only the reg class is
+/// available; in that case the helper falls through to the class-only
+/// branch.
+fn store_opcode_for(ty: Option<&IrType>, class: RegClass) -> ArmOpcode {
+    match ty {
+        Some(IrType::Int(IntWidth::I8)) | Some(IrType::Bool) => ArmOpcode::StrbImm,
+        Some(IrType::Int(IntWidth::I16)) => ArmOpcode::StrhImm,
+        Some(IrType::Float(_)) => ArmOpcode::StrFpImm,
+        _ => match class {
+            RegClass::Fp64 | RegClass::Fp32 => ArmOpcode::StrFpImm,
+            RegClass::V128 => ArmOpcode::StrQ,
+            RegClass::Gp32 | RegClass::Gp64 => ArmOpcode::StrImm,
+        },
+    }
+}
+
+/// Resolve an IR address value to the (base, offset) operand pair
+/// expected by `LdrImm`/`StrImm`-family instructions. Alloca addresses
+/// fold to `(FP, FrameSlot(offset))` so the assembler can pick the
+/// final stack-relative form; everything else becomes
+/// `(VReg(addr_vreg), Imm(0))`. Used by both narrow-width Load/Store
+/// arms in `select_inst`. The wide-i128 paths build their own operand
+/// pairs directly because they target the `emit_*_phys_i128_pair`
+/// helpers, which take `i64` offsets and only need a base operand.
+fn narrow_load_store_addr(
+    ctx: &ISelCtx,
+    addr: ValueId,
+) -> (MachineOperand, MachineOperand) {
+    if let Some(&offset) = ctx.alloca_offsets.get(&addr) {
+        (
+            MachineOperand::PhysReg(PhysReg::FP),
+            MachineOperand::FrameSlot(offset),
+        )
+    } else {
+        let base = ctx.lookup_vreg(addr);
+        (MachineOperand::VReg(base), MachineOperand::Imm(0))
+    }
+}
+
+/// Operation tag for `emit_i128_binop_via_slots`. Add and Sub share a
+/// load-binop-store skeleton that differs only in which intermediate
+/// helper does the arithmetic.
+#[derive(Clone, Copy)]
+enum I128BinOp {
+    Add,
+    Sub,
+}
+
+/// Lower an i128 IAdd/ISub: load `lhs_id`'s slot into x16/x17, run the
+/// matching `emit_i128_<op>_from_slot` against `rhs_id`, then store
+/// the result to `dest_id`'s slot. Replaces three near-identical 30-LOC
+/// blocks in the i128 dispatch (IAdd / ISub).
+fn emit_i128_binop_via_slots(
+    mf: &mut MachineFunction,
+    ctx: &ISelCtx,
+    mb: MBlockId,
+    op: I128BinOp,
+    dest_id: ValueId,
+    lhs_id: ValueId,
+    rhs_id: ValueId,
+) {
+    let dest_slot = ctx.lookup_wide_slot(dest_id);
+    let lhs_slot = ctx.lookup_wide_slot(lhs_id);
+    let rhs_slot = ctx.lookup_wide_slot(rhs_id);
+    let fp = || MachineOperand::PhysReg(PhysReg::FP);
+    emit_load_phys_i128_pair(mf, mb, fp(), lhs_slot as i64, PhysReg::Gp(16), PhysReg::Gp(17));
+    match op {
+        I128BinOp::Add => emit_i128_add_from_slot(
+            mf,
+            mb,
+            fp(),
+            rhs_slot as i64,
+            PhysReg::Gp(16),
+            PhysReg::Gp(17),
+            PhysReg::Gp(8),
+        ),
+        I128BinOp::Sub => emit_i128_sub_from_slot(
+            mf,
+            mb,
+            fp(),
+            rhs_slot as i64,
+            PhysReg::Gp(16),
+            PhysReg::Gp(17),
+            PhysReg::Gp(8),
+        ),
+    }
+    emit_store_phys_i128_pair(mf, mb, fp(), dest_slot as i64, PhysReg::Gp(16), PhysReg::Gp(17));
+}
+
 fn type_to_reg_class(ty: &IrType) -> RegClass {
     match ty {
         IrType::Float(FloatWidth::F32) => RegClass::Fp32,
         IrType::Float(FloatWidth::F64) => RegClass::Fp64,
+        IrType::Vector { .. } => RegClass::V128,
         IrType::Int(IntWidth::I8)
         | IrType::Int(IntWidth::I16)
         | IrType::Int(IntWidth::I32)
         | IrType::Bool => RegClass::Gp32,
         _ => RegClass::Gp64,
+    }
+}
+
+/// Vector lane shape for NEON opcode dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VShape {
+    /// 4 × i32
+    V4S,
+    /// 2 × i64
+    V2D,
+    /// 4 × f32
+    F4S,
+    /// 2 × f64
+    F2D,
+}
+
+impl VShape {
+    fn from_ir(ty: &IrType) -> Option<Self> {
+        let (lanes, elem) = ty.vector_shape()?;
+        match (lanes, elem) {
+            (4, IrType::Int(IntWidth::I32)) => Some(Self::V4S),
+            (2, IrType::Int(IntWidth::I64)) => Some(Self::V2D),
+            (4, IrType::Float(FloatWidth::F32)) => Some(Self::F4S),
+            (2, IrType::Float(FloatWidth::F64)) => Some(Self::F2D),
+            _ => None,
+        }
+    }
+
+    fn is_float(self) -> bool {
+        matches!(self, Self::F4S | Self::F2D)
     }
 }
 
@@ -2984,6 +3420,7 @@ fn alloca_size(ty: &IrType) -> u32 {
         }
         IrType::FuncPtr(_) => 8,
         IrType::Struct(_) => 8, // placeholder
+        IrType::Vector { .. } => 16, // 128-bit NEON
     }
 }
 
@@ -3614,6 +4051,168 @@ mod tests {
         assert_eq!(
             alloca_size(&IrType::Array(Box::new(IrType::Int(IntWidth::I32)), 3)),
             12
+        );
+    }
+
+    // ---- VShape mapping tests (Sprint 12 Stage 2 isel hookup) ----
+
+    #[test]
+    fn vshape_recognizes_4xi32() {
+        let ty = IrType::Vector {
+            lanes: 4,
+            elem: Box::new(IrType::Int(IntWidth::I32)),
+        };
+        assert_eq!(VShape::from_ir(&ty), Some(VShape::V4S));
+        assert!(!VShape::V4S.is_float());
+    }
+
+    #[test]
+    fn vshape_recognizes_2xf64() {
+        let ty = IrType::Vector {
+            lanes: 2,
+            elem: Box::new(IrType::Float(FloatWidth::F64)),
+        };
+        assert_eq!(VShape::from_ir(&ty), Some(VShape::F2D));
+        assert!(VShape::F2D.is_float());
+    }
+
+    #[test]
+    fn vshape_rejects_unsupported_shape() {
+        // 3 lanes is not a NEON shape; we already verified that
+        // verify.rs rejects it. VShape::from_ir simply returns None
+        // and the isel arm falls back to Nop.
+        let ty = IrType::Vector {
+            lanes: 3,
+            elem: Box::new(IrType::Int(IntWidth::I32)),
+        };
+        assert_eq!(VShape::from_ir(&ty), None);
+    }
+
+    #[test]
+    fn vector_type_to_reg_class_returns_v128() {
+        let ty = IrType::Vector {
+            lanes: 4,
+            elem: Box::new(IrType::Float(FloatWidth::F32)),
+        };
+        assert_eq!(type_to_reg_class(&ty), RegClass::V128);
+    }
+
+    /// End-to-end: build a tiny IR function that adds two 4×f32
+    /// vectors and walk through isel. The result MachineFunction
+    /// must contain at least one `FaddV4S` opcode.
+    #[test]
+    fn isel_lowers_vadd_4xf32_to_faddv4s() {
+        use crate::codegen::mir::ArmOpcode;
+
+        let v_ty = IrType::Vector {
+            lanes: 4,
+            elem: Box::new(IrType::Float(FloatWidth::F32)),
+        };
+        let mut func = Function::new("vadd_test".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func);
+            // Two pointer params synthesized via alloca for the
+            // smoke test — keeps the body small but exercises the
+            // VLoad / VAdd / VStore chain.
+            let p_a = b.alloca(v_ty.clone());
+            let p_b = b.alloca(v_ty.clone());
+            let p_dst = b.alloca(v_ty.clone());
+            let va = b.vload(p_a, v_ty.clone());
+            let vb = b.vload(p_b, v_ty.clone());
+            let vc = b.vadd(va, vb);
+            b.vstore(vc, p_dst);
+            b.ret_void();
+        }
+
+        let mf = select_function(&func);
+        let opcodes: Vec<ArmOpcode> =
+            mf.blocks.iter().flat_map(|b| b.insts.iter()).map(|i| i.opcode).collect();
+        assert!(
+            opcodes.contains(&ArmOpcode::FaddV4S),
+            "expected FaddV4S in MIR, got {:?}",
+            opcodes
+        );
+        assert!(
+            opcodes.contains(&ArmOpcode::LdrQ),
+            "expected LdrQ in MIR, got {:?}",
+            opcodes
+        );
+        assert!(
+            opcodes.contains(&ArmOpcode::StrQ),
+            "expected StrQ in MIR, got {:?}",
+            opcodes
+        );
+    }
+
+    #[test]
+    fn vector_abi_arg_uses_v0_to_v7() {
+        // First 8 vector args should land in v0-v7. The 9th should
+        // overflow to the stack at the next 16-byte slot.
+        let mut state = AbiArgState::default();
+        let v_ty = IrType::Vector {
+            lanes: 4,
+            elem: Box::new(IrType::Float(FloatWidth::F32)),
+        };
+        for expected in 0u8..8 {
+            assert_eq!(
+                classify_abi_arg(&v_ty, &mut state),
+                AbiArgLoc::V128(expected),
+                "vector arg #{} should be v{}",
+                expected,
+                expected
+            );
+        }
+        // 9th vector arg overflows to stack.
+        match classify_abi_arg(&v_ty, &mut state) {
+            AbiArgLoc::Stack(_) => {}
+            other => panic!("expected Stack overflow, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn vector_args_share_idx_with_float_args() {
+        // AAPCS64: vector and float args draw from the same v0-v7
+        // pool. A float arg should bump fp_idx, then a vector arg
+        // should land at the next slot.
+        let mut state = AbiArgState::default();
+        let f_ty = IrType::Float(FloatWidth::F64);
+        let v_ty = IrType::Vector {
+            lanes: 2,
+            elem: Box::new(IrType::Int(IntWidth::I64)),
+        };
+        assert_eq!(classify_abi_arg(&f_ty, &mut state), AbiArgLoc::Fp(0));
+        assert_eq!(classify_abi_arg(&v_ty, &mut state), AbiArgLoc::V128(1));
+        assert_eq!(classify_abi_arg(&f_ty, &mut state), AbiArgLoc::Fp(2));
+    }
+
+    #[test]
+    fn isel_lowers_vfma_2xf64_to_fmlav2d() {
+        use crate::codegen::mir::ArmOpcode;
+
+        let v_ty = IrType::Vector {
+            lanes: 2,
+            elem: Box::new(IrType::Float(FloatWidth::F64)),
+        };
+        let mut func = Function::new("vfma_test".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func);
+            let p_a = b.alloca(v_ty.clone());
+            let p_b = b.alloca(v_ty.clone());
+            let p_c = b.alloca(v_ty.clone());
+            let va = b.vload(p_a, v_ty.clone());
+            let vb = b.vload(p_b, v_ty.clone());
+            let vc = b.vload(p_c, v_ty.clone());
+            let _ = b.vfma(va, vb, vc);
+            b.ret_void();
+        }
+
+        let mf = select_function(&func);
+        let opcodes: Vec<ArmOpcode> =
+            mf.blocks.iter().flat_map(|b| b.insts.iter()).map(|i| i.opcode).collect();
+        assert!(
+            opcodes.contains(&ArmOpcode::FmlaV2D),
+            "expected FmlaV2D, got {:?}",
+            opcodes
         );
     }
 }

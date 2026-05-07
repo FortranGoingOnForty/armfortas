@@ -29,7 +29,23 @@ impl Pass for Gvn {
             .collect();
         let mut changed = false;
         for func in &mut module.functions {
-            if gvn_function(func, &pure_calls) {
+            // Sprint 15 Stage 2: congruence closure via fixpoint.
+            // After the first pass merges some values, downstream
+            // instructions may now have equivalent operands; their
+            // keys must be recomputed with the new `replacements`
+            // table. Iterating gvn_function until it stops mutating
+            // achieves the fixpoint without rewriting the per-block
+            // dominator-tree walk. Cap at 8 rounds to bound the worst
+            // case (in practice 1-2 rounds covers it).
+            let mut local_changed = false;
+            for _ in 0..8 {
+                if gvn_function(func, &pure_calls) {
+                    local_changed = true;
+                } else {
+                    break;
+                }
+            }
+            if local_changed {
                 changed = true;
             }
         }
@@ -96,12 +112,37 @@ impl PureCallPolicy {
 /// or a non-Internal `Call` / `RuntimeCall`.  The existing
 /// argument-policy machinery already handles the "reads through
 /// argument pointer" case via `ReadOnlyWrapperPtr`.
+/// External math intrinsics whose `Call` sites are pure functions of
+/// their by-value arguments — emitting one is identical to emitting
+/// any other equivalent one, so they don't disqualify their hosting
+/// function from GVN's pure-call CSE policy. Names match the libm /
+/// armfortas runtime symbols emitted by lower.
+const PURE_EXTERNAL_INTRINSICS: &[&str] = &[
+    // libm scalar math (single + double).
+    "sinf", "cosf", "tanf", "asinf", "acosf", "atanf", "atan2f",
+    "sinhf", "coshf", "tanhf", "expf", "expm1f", "logf", "log2f",
+    "log10f", "log1pf", "sqrtf", "cbrtf", "fabsf", "ceilf", "floorf",
+    "roundf", "truncf", "powf", "fmodf", "hypotf", "copysignf",
+    "sin", "cos", "tan", "asin", "acos", "atan", "atan2",
+    "sinh", "cosh", "tanh", "exp", "expm1", "log", "log2",
+    "log10", "log1p", "sqrt", "cbrt", "fabs", "ceil", "floor",
+    "round", "trunc", "pow", "fmod", "hypot", "copysign",
+];
+
+fn is_pure_external_intrinsic(name: &str) -> bool {
+    PURE_EXTERNAL_INTRINSICS.contains(&name)
+}
+
 fn reads_non_argument_memory(func: &Function) -> bool {
     for block in &func.blocks {
         for inst in &block.insts {
             match &inst.kind {
                 InstKind::GlobalAddr(_) => return true,
-                InstKind::Call(FuncRef::External(_), _) => return true,
+                InstKind::Call(FuncRef::External(name), _)
+                    if !is_pure_external_intrinsic(name) =>
+                {
+                    return true;
+                }
                 InstKind::RuntimeCall(_, _) => return true,
                 _ => {}
             }
@@ -300,11 +341,74 @@ fn resolve_value(map: &HashMap<ValueId, ValueId>, mut value: ValueId) -> ValueId
     value
 }
 
+/// Tag identifying an associative+commutative integer/bitwise op.
+/// Used to detect when an operand of an outer op of the same kind can
+/// be flattened into a multi-operand list. FP ops are intentionally
+/// excluded — under default rounding mode `(a+b)+c` is not equivalent
+/// to `a+(b+c)`, so reordering would change results.
+fn assoc_tag(kind: &InstKind) -> Option<u32> {
+    match kind {
+        InstKind::IAdd(..) => Some(1),
+        InstKind::IMul(..) => Some(3),
+        InstKind::And(..) => Some(30),
+        InstKind::Or(..) => Some(31),
+        InstKind::BitAnd(..) => Some(40),
+        InstKind::BitOr(..) => Some(41),
+        InstKind::BitXor(..) => Some(42),
+        _ => None,
+    }
+}
+
+fn assoc_inputs(kind: &InstKind) -> Option<(ValueId, ValueId)> {
+    match kind {
+        InstKind::IAdd(a, b)
+        | InstKind::IMul(a, b)
+        | InstKind::And(a, b)
+        | InstKind::Or(a, b)
+        | InstKind::BitAnd(a, b)
+        | InstKind::BitOr(a, b)
+        | InstKind::BitXor(a, b) => Some((*a, *b)),
+        _ => None,
+    }
+}
+
+/// Walk `a` and `b`, expanding any operand whose defining instruction
+/// is the same associative-commutative op (after replacements). The
+/// returned vector is sorted by ValueId so reorderings of the same
+/// chain hash identically. `(a+b)+c` and `a+(b+c)` both flatten to
+/// the sorted multiset `{a, b, c}`.
+fn flatten_assoc(
+    tag: u32,
+    a: ValueId,
+    b: ValueId,
+    defs: &HashMap<ValueId, &Inst>,
+    replacements: &HashMap<ValueId, ValueId>,
+) -> Vec<ValueId> {
+    let mut out = Vec::new();
+    let push = |v: ValueId, out: &mut Vec<ValueId>, defs: &HashMap<ValueId, &Inst>| {
+        let r = resolve_value(replacements, v);
+        if let Some(inst) = defs.get(&r) {
+            if assoc_tag(&inst.kind) == Some(tag) {
+                if let Some((aa, bb)) = assoc_inputs(&inst.kind) {
+                    out.extend(flatten_assoc(tag, aa, bb, defs, replacements));
+                    return;
+                }
+            }
+        }
+        out.push(r);
+    };
+    push(a, &mut out, defs);
+    push(b, &mut out, defs);
+    out.sort_by_key(|v| v.0);
+    out
+}
+
 fn key_of(
     inst: &Inst,
     replacements: &HashMap<ValueId, ValueId>,
     pure_calls: &[PureCallPolicy],
     wrapper_values: &HashMap<ValueId, ValueId>,
+    defs: &HashMap<ValueId, &Inst>,
 ) -> Option<Key> {
     let mk = |tag: u32, ops: Vec<ValueId>, aux: i128| -> Option<Key> {
         Some(Key {
@@ -334,10 +438,11 @@ fn key_of(
     }
 
     match &inst.kind {
-        // Pure arithmetic — commutative ops get canonicalized operand order.
-        InstKind::IAdd(a, b) => mk(1, canon(remap(*a), remap(*b)), 0),
+        // Pure arithmetic — associative+commutative ops are flattened
+        // and sorted so `(a+b)+c` ≡ `a+(b+c)` ≡ `b+(a+c)` etc.
+        InstKind::IAdd(a, b) => mk(1, flatten_assoc(1, *a, *b, defs, replacements), 0),
         InstKind::ISub(a, b) => mk(2, vec![remap(*a), remap(*b)], 0),
-        InstKind::IMul(a, b) => mk(3, canon(remap(*a), remap(*b)), 0),
+        InstKind::IMul(a, b) => mk(3, flatten_assoc(3, *a, *b, defs, replacements), 0),
         InstKind::IDiv(a, b) => mk(4, vec![remap(*a), remap(*b)], 0),
         InstKind::IMod(a, b) => mk(5, vec![remap(*a), remap(*b)], 0),
         InstKind::INeg(a) => mk(6, vec![remap(*a)], 0),
@@ -357,13 +462,13 @@ fn key_of(
             }
         }
         InstKind::FCmp(op, a, b) => mk(21, vec![remap(*a), remap(*b)], *op as i128),
-        InstKind::And(a, b) => mk(30, canon(remap(*a), remap(*b)), 0),
-        InstKind::Or(a, b) => mk(31, canon(remap(*a), remap(*b)), 0),
+        InstKind::And(a, b) => mk(30, flatten_assoc(30, *a, *b, defs, replacements), 0),
+        InstKind::Or(a, b) => mk(31, flatten_assoc(31, *a, *b, defs, replacements), 0),
         InstKind::Not(a) => mk(32, vec![remap(*a)], 0),
         InstKind::Select(c, t, f) => mk(33, vec![remap(*c), remap(*t), remap(*f)], 0),
-        InstKind::BitAnd(a, b) => mk(40, canon(remap(*a), remap(*b)), 0),
-        InstKind::BitOr(a, b) => mk(41, canon(remap(*a), remap(*b)), 0),
-        InstKind::BitXor(a, b) => mk(42, canon(remap(*a), remap(*b)), 0),
+        InstKind::BitAnd(a, b) => mk(40, flatten_assoc(40, *a, *b, defs, replacements), 0),
+        InstKind::BitOr(a, b) => mk(41, flatten_assoc(41, *a, *b, defs, replacements), 0),
+        InstKind::BitXor(a, b) => mk(42, flatten_assoc(42, *a, *b, defs, replacements), 0),
         InstKind::BitNot(a) => mk(43, vec![remap(*a)], 0),
         InstKind::Shl(a, b) => mk(44, vec![remap(*a), remap(*b)], 0),
         InstKind::LShr(a, b) => mk(45, vec![remap(*a), remap(*b)], 0),
@@ -439,6 +544,32 @@ fn key_of(
         | InstKind::Undef(..)
         | InstKind::ExtractField(..)
         | InstKind::InsertField(..) => None,
+
+        // Vector ops opt out of GVN until the vectorizer lands and we
+        // can characterize aliasing / commutativity properly. Same
+        // policy as CSE keying.
+        InstKind::VAdd(..)
+        | InstKind::VSub(..)
+        | InstKind::VMul(..)
+        | InstKind::VDiv(..)
+        | InstKind::VNeg(..)
+        | InstKind::VAbs(..)
+        | InstKind::VSqrt(..)
+        | InstKind::VFma(..)
+        | InstKind::VSelect(..)
+        | InstKind::VMin(..)
+        | InstKind::VMax(..)
+        | InstKind::VICmp(..)
+        | InstKind::VFCmp(..)
+        | InstKind::VLoad(..)
+        | InstKind::VStore(..)
+        | InstKind::VBitcast(..)
+        | InstKind::VExtract(..)
+        | InstKind::VInsert(..)
+        | InstKind::VBroadcast(..)
+        | InstKind::VReduceSum(..)
+        | InstKind::VReduceMin(..)
+        | InstKind::VReduceMax(..) => None,
     }
 }
 
@@ -446,6 +577,7 @@ fn gvn_function(func: &mut Function, pure_calls: &[PureCallPolicy]) -> bool {
     let idoms = compute_immediate_dominators(func);
     let children = dominator_tree_children(&idoms);
     let wrapper_values = wrapper_alloca_values(func, pure_calls);
+    let defs = inst_map(func);
 
     // Scoped value number table: Key → dominating ValueId.
     let mut vn_table: HashMap<Key, ValueId> = HashMap::new();
@@ -470,7 +602,7 @@ fn gvn_function(func: &mut Function, pure_calls: &[PureCallPolicy]) -> bool {
         let mut new_keys = Vec::new();
         let block = func.block(block_id);
         for inst in &block.insts {
-            if let Some(key) = key_of(inst, &replacements, pure_calls, &wrapper_values) {
+            if let Some(key) = key_of(inst, &replacements, pure_calls, &wrapper_values, &defs) {
                 if let Some(&existing) = vn_table.get(&key) {
                     // This expression is already available from a dominating block.
                     replacements.insert(inst.id, existing);
@@ -661,6 +793,38 @@ mod tests {
         pm.add(Box::new(LoopFusion));
         pm.add(Box::new(LoopUnroll));
         pm
+    }
+
+    #[test]
+    fn gvn_associativity_folds_left_and_right_regroups() {
+        // r1 = (a + b) + c
+        // r2 = a + (b + c)
+        // After GVN, r2 should be replaced by r1 (or vice versa) — the
+        // pass should detect at least one redundancy.
+        let mut m = Module::new("test".into());
+        let mut f = Function::new("test".into(), vec![], IrType::Int(IntWidth::I32));
+        let entry = f.entry;
+        let i32t = IrType::Int(IntWidth::I32);
+        let a = push_inst(&mut f, entry, InstKind::ConstInt(7, IntWidth::I32), i32t.clone());
+        let b = push_inst(&mut f, entry, InstKind::ConstInt(11, IntWidth::I32), i32t.clone());
+        let c = push_inst(&mut f, entry, InstKind::ConstInt(13, IntWidth::I32), i32t.clone());
+        // (a + b) + c
+        let ab = push_inst(&mut f, entry, InstKind::IAdd(a, b), i32t.clone());
+        let r1 = push_inst(&mut f, entry, InstKind::IAdd(ab, c), i32t.clone());
+        // a + (b + c)
+        let bc = push_inst(&mut f, entry, InstKind::IAdd(b, c), i32t.clone());
+        let r2 = push_inst(&mut f, entry, InstKind::IAdd(a, bc), i32t.clone());
+        // Use both so DCE doesn't strip them: sum = r1 + r2
+        let sum = push_inst(&mut f, entry, InstKind::IAdd(r1, r2), i32t.clone());
+        f.block_mut(entry).terminator = Some(Terminator::Return(Some(sum)));
+        m.add_function(f);
+
+        let pass = Gvn;
+        let changed = pass.run(&mut m);
+        assert!(
+            changed,
+            "GVN should detect that (a+b)+c and a+(b+c) are the same value"
+        );
     }
 
     #[test]
@@ -1129,10 +1293,11 @@ mod tests {
             .iter()
             .find(|inst| inst.id == call2)
             .expect("call2 inst");
-        let key1 =
-            key_of(call1_inst, &replacements, &pure_calls, &wrappers).expect("call1 should key");
-        let key2 =
-            key_of(call2_inst, &replacements, &pure_calls, &wrappers).expect("call2 should key");
+        let test_defs = inst_map(caller_before);
+        let key1 = key_of(call1_inst, &replacements, &pure_calls, &wrappers, &test_defs)
+            .expect("call1 should key");
+        let key2 = key_of(call2_inst, &replacements, &pure_calls, &wrappers, &test_defs)
+            .expect("call2 should key");
         assert_eq!(
             key1, key2,
             "wrapper-based call keys should line up before the pass runs"

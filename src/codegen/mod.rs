@@ -3,6 +3,7 @@
 //! Instruction selection, register allocation, stack frame layout,
 //! and emission of machine instructions for the afs-as assembler.
 
+pub mod abi;
 pub mod emit;
 pub mod isel;
 pub mod linearscan;

@@ -30,6 +30,7 @@ pub fn regalloc_naive(mf: &mut MachineFunction) {
             RegClass::Gp32 => 4,
             RegClass::Fp64 => 8,
             RegClass::Fp32 => 4,
+            RegClass::V128 => 16,
         };
         let offset = mf.frame.alloc_local(size);
         vreg_slots.insert(vreg.id, offset);
@@ -82,6 +83,15 @@ pub fn regalloc_naive(mf: &mut MachineFunction) {
                             fp_scratch_idx += 1;
                             (PhysReg::Fp32(s), ArmOpcode::LdrFpImm)
                         }
+                        RegClass::V128 => {
+                            // 128-bit vector spill/fill uses LdrQ / StrQ
+                            // off the FP-scratch pool — same physical
+                            // register bank as Fp{32,64}, just at 128b
+                            // width.
+                            let s = FP_SCRATCH[fp_scratch_idx % FP_SCRATCH.len()];
+                            fp_scratch_idx += 1;
+                            (PhysReg::Fp(s), ArmOpcode::LdrQ)
+                        }
                         RegClass::Gp32 => {
                             let s = GP_SCRATCH[gp_scratch_idx % GP_SCRATCH.len()];
                             gp_scratch_idx += 1;
@@ -120,6 +130,7 @@ pub fn regalloc_naive(mf: &mut MachineFunction) {
                     let scratch = match class {
                         RegClass::Fp64 => PhysReg::Fp(FP_SCRATCH[0]),
                         RegClass::Fp32 => PhysReg::Fp32(FP_SCRATCH[0]),
+                        RegClass::V128 => PhysReg::Fp(FP_SCRATCH[0]),
                         RegClass::Gp32 => PhysReg::Gp32(GP_SCRATCH[0]),
                         RegClass::Gp64 => PhysReg::Gp(GP_SCRATCH[0]),
                     };
@@ -147,6 +158,7 @@ pub fn regalloc_naive(mf: &mut MachineFunction) {
             if let Some((scratch, offset, class)) = def_scratch {
                 let store_op = match class {
                     RegClass::Fp32 | RegClass::Fp64 => ArmOpcode::StrFpImm,
+                    RegClass::V128 => ArmOpcode::StrQ,
                     RegClass::Gp32 | RegClass::Gp64 => ArmOpcode::StrImm,
                 };
                 new_insts.push(MachineInst {

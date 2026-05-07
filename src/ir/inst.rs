@@ -150,6 +150,42 @@ pub enum InstKind {
     // ---- Aggregates ----
     ExtractField(ValueId, u32),
     InsertField(ValueId, u32, ValueId),
+
+    // ---- SIMD vector ops (Sprint 12 Stage 1) ----
+    //
+    // All vector ops operate on `IrType::Vector` values (128-bit NEON).
+    // Element-wise binary / unary arithmetic and bitwise ops follow the
+    // same lane shape as their operands. `VLoad`/`VStore` move 128 bits
+    // to / from a `Ptr<elem>`. `VBroadcast` splats a scalar across every
+    // lane. `VExtract` / `VInsert` access a single lane by constant
+    // index (lane index is `u8`, not a `ValueId`, so SCCP and
+    // const-fold can reason about it). Reductions take a vector and
+    // return a scalar.
+    VAdd(ValueId, ValueId),
+    VSub(ValueId, ValueId),
+    VMul(ValueId, ValueId),
+    VDiv(ValueId, ValueId),
+    VNeg(ValueId),
+    VAbs(ValueId),
+    VSqrt(ValueId),
+    VFma(ValueId, ValueId, ValueId), // a*b + c
+    /// Vector bit-select: per lane, return `t` where mask bit is 1,
+    /// else `f`. Lowers to NEON `bsl.16b`. Produced by the WHERE-block
+    /// vectorizer to express conditional element-wise updates.
+    VSelect(ValueId, ValueId, ValueId), // (mask, t, f)
+    VMin(ValueId, ValueId),
+    VMax(ValueId, ValueId),
+    VICmp(CmpOp, ValueId, ValueId),
+    VFCmp(CmpOp, ValueId, ValueId),
+    VLoad(ValueId),                 // ptr → vector
+    VStore(ValueId, ValueId),       // (vector, ptr)
+    VBitcast(ValueId, IrType),      // reinterpret element layout
+    VExtract(ValueId, u8),          // extract lane `n`
+    VInsert(ValueId, u8, ValueId),  // (vector, lane, scalar) → vector
+    VBroadcast(ValueId),            // scalar → vector (every lane)
+    VReduceSum(ValueId),            // vector → scalar (cross-lane sum)
+    VReduceMin(ValueId),            // vector → scalar (cross-lane min)
+    VReduceMax(ValueId),            // vector → scalar (cross-lane max)
 }
 
 /// Block terminator — exactly one per basic block.

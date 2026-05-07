@@ -46,6 +46,13 @@ fn has_side_effect(kind: &InstKind, pure_internal_calls: &[bool]) -> bool {
     matches!(
         kind,
         InstKind::Store(..)
+            // VStore writes 128 bits to memory just like Store; it
+            // must not be DCE'd. NeonVectorize emits VStore as the
+            // sink of every vectorized loop body — without this,
+            // DCE strips the whole body once it's been vectorized
+            // (the VAdd/VLoad chain has no other uses) and the
+            // function silently becomes a no-op.
+            | InstKind::VStore(..)
             | InstKind::RuntimeCall(..)
             // Alloca produces a stack slot whose identity matters even
             // if no one reads from it (the address may escape via a

@@ -48,6 +48,11 @@ fn sdk_path() -> String {
 }
 
 fn compile_file(compiler: &Path, source: &Path, output: &Path, search_dir: &Path, opt: &str) {
+    // -J{dir} writes generated .amod files into the test's unique
+    // temp dir. Without it, armfortas writes .amod to the process's
+    // current working directory (the repo root), where parallel
+    // multifile tests race on the same `.amod` filename and one
+    // test reads another's (or a mid-write empty) artifact.
     let result = Command::new(compiler)
         .args([
             source.to_str().unwrap(),
@@ -56,6 +61,7 @@ fn compile_file(compiler: &Path, source: &Path, output: &Path, search_dir: &Path
             "-o",
             output.to_str().unwrap(),
             &format!("-I{}", search_dir.display()),
+            &format!("-J{}", search_dir.display()),
         ])
         .output()
         .expect("compiler launch failed");
