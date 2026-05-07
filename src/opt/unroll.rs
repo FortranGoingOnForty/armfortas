@@ -1223,27 +1223,12 @@ fn detect_partial_unroll_loop(
     // (e.g., `a(i) = ...; b(i) = ...; c(i) = ...;`) cloned U-way
     // create too much register pressure across the function and
     // expose latent regalloc fragility (Sprint 18 follow-up).
-    //
-    // Additional gate for 2-block-param loops with stores: when the
-    // second block param is a counter mutated by an inlined
-    // `intent(inout)` arg (e.g., `do i = 1, n; y(i) = ...;
-    // call touch(token); end do`), the unroller treats the counter
-    // as a reduction accumulator and chains it across iterations.
-    // The IR is correct, but linearscan splits the chained register
-    // across the latch back-edge inconsistently with the preheader
-    // edge — phi resolution misses the move and the chained iadd
-    // in the body uses a constant-holding register, producing an
-    // infinite loop where iv never increments. Skip this combo
-    // until regalloc phi-resolution is hardened.
     let store_count = latch_blk
         .insts
         .iter()
         .filter(|i| matches!(i.kind, InstKind::Store(..)))
         .count();
     if acc_param.is_none() && store_count > 1 {
-        return None;
-    }
-    if acc_param.is_some() && store_count > 0 {
         return None;
     }
     // Pick the largest U ≤ MAX_FACTOR that divides trip and respects
