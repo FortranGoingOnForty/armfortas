@@ -13236,6 +13236,47 @@ fn internal_subprogram_call_under_intrinsic_under_user_call_keeps_mangled_name()
 }
 
 #[test]
+fn allocate_scalar_with_source_from_complex_returning_call_compiles_cleanly() {
+    // F2018 §9.7.1.2: ALLOCATE(target, SOURCE = expr) initializes the
+    // freshly allocated target with the value of expr.  When expr is
+    // a scalar complex(sp/dp) function call, the callee returns its
+    // result through the ComplexBuffer hidden-output-parameter ABI:
+    // the value comes back as a *pointer* to a fresh 8/16-byte lane
+    // pair, not as a `[f32/f64 x 2]` aggregate.  The previous
+    // emit_scalar_allocate_source_init_on_success piped that pointer
+    // through `coerce_to_type(Ptr → Array)`, which has no path,
+    // silently fell through to `b.store(ptr, complex_slot)`, and
+    // tripped IR-verify with `value type ptr<[i8 x 8]> doesn't match
+    // pointee type [f32 x 2]`.  The fix memcpys the lane pair from
+    // the buffer into the destination slot.  Surfaced in
+    // stdlib_stats_moment_mask:
+    // `allocate(mean_, source = mean(x, 1, mask))` where mean
+    // returns scalar complex(sp).
+    //
+    // Compile-level only: the runtime path through allocatable
+    // complex scalars hits a separate pre-existing bug in
+    // afs_assign_allocatable / `real(m_)` reads on allocated complex
+    // scalars (descriptor index out of bounds), tracked separately.
+    let src = write_program(
+        "module m\n  implicit none\n  integer, parameter :: sp = kind(1.0)\ncontains\n  pure function pick_csp(x) result(res)\n    complex(sp), intent(in) :: x(:)\n    complex(sp) :: res\n    res = x(1)\n  end function\nend module\n\nprogram t\n  use m\n  implicit none\n  complex(kind=kind(1.0)) :: x(1)\n  complex(kind=kind(1.0)), allocatable :: m_\n  x(1) = (3.0, 4.0)\n  allocate(m_, source = pick_csp(x))\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("alloc_complex_source", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("alloc complex source compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "should compile + link cleanly (no IR-verify failure): {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn transfer_with_constant_size_into_array_dest_byte_copies_source() {
     // F2018 §16.9.193: TRANSFER(SRC, MOLD, SIZE) returns a rank-1
     // array of SIZE mold-typed elements, byte-equal to the SRC bytes.

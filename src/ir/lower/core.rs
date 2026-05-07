@@ -31534,6 +31534,43 @@ pub(super) fn emit_scalar_allocate_source_init_on_success(
         emit_derived_value_copy(b, ctx.type_layouts, type_name, dest_base, src);
     } else {
         let raw = super::expr::lower_expr_ctx_tl(b, ctx, source_expr);
+        // Complex(sp/dp) results returned via the ComplexBuffer ABI
+        // come back as a pointer to a fresh 8/16-byte buffer holding
+        // the lane pair.  Depending on the call site that pointer is
+        // typed `Ptr([f32/f64 x 2])`, `Ptr([i8 x 8/16])`, or just
+        // `Ptr<i8>` — none of which `coerce_to_type` knows how to
+        // turn into the `[f32/f64 x 2]` value `b.store` expects, so
+        // we'd silently fall through and emit a pointer-into-pair
+        // store that IR-verify rejects.  Memcpy the lane pair from
+        // the buffer to the freshly allocated destination slot
+        // instead — same shape as the assignment-from-complex-call
+        // path elsewhere.  Surfaced in stdlib_stats_moment_mask:
+        // `allocate(mean_, source = mean(x, 1, mask))` where mean
+        // returns scalar complex(sp).
+        if is_complex_ty(dest_ty) {
+            let raw_ty = b.func().value_type(raw);
+            let raw_is_complex_buffer = matches!(
+                raw_ty,
+                Some(IrType::Ptr(ref inner)) if matches!(
+                    inner.as_ref(),
+                    IrType::Array(ref e, n)
+                        if (*n == 2 && matches!(e.as_ref(), IrType::Float(_)))
+                            || (matches!(e.as_ref(), IrType::Int(IntWidth::I8))
+                                && (*n == 8 || *n == 16))
+                ) || matches!(inner.as_ref(), IrType::Int(IntWidth::I8))
+            );
+            if raw_is_complex_buffer {
+                let bytes = b.const_i64(complex_byte_size(dest_ty));
+                b.call(
+                    FuncRef::External("memcpy".into()),
+                    vec![dest_base, raw, bytes],
+                    IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                );
+                b.branch(done_bb, vec![]);
+                b.set_block(done_bb);
+                return;
+            }
+        }
         let coerced = coerce_to_type(b, raw, dest_ty);
         b.store(coerced, dest_base);
     }
