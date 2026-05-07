@@ -1078,13 +1078,23 @@ pub extern "C" fn afs_allocate_like_with_elem_size(
 
     let source = unsafe { &*source };
     let mut dims = [DimDescriptor::default(); MAX_RANK];
+    // Column-major running strides: dim[0]=1, dim[k]=Π_{j<k} extent_j.
+    // The previous flat-1 stride caused per-dim consumers
+    // (`for_each_reduce_along_dim`, `for_each_reduce_along_dim_with_mask`,
+    // `lower_multi_d_section_assign`) to compute colliding byte offsets,
+    // so for `m = (y > 3.)` over `real :: y(2,3)` only 4 of the 6 mask
+    // bytes were read by the masked sum-along-dim helper — the
+    // remaining two ran over the same byte twice and dropped the
+    // column-2 hit entirely.
+    let mut running: i64 = 1;
     for (i, dim) in dims.iter_mut().enumerate().take(source.rank as usize) {
         let extent = source.dims[i].extent();
         *dim = DimDescriptor {
             lower_bound: 1,
             upper_bound: extent,
-            stride: 1,
+            stride: running,
         };
+        running = running.saturating_mul(extent.max(1));
     }
 
     let dims_ptr = if source.rank > 0 {
