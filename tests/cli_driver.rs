@@ -3848,6 +3848,58 @@ end program
 }
 
 #[test]
+fn real_of_count_with_dim_does_not_emit_scalar_count_probe() {
+    // F2018 §16.9.46: COUNT(MASK, DIM) returns a rank N-1 integer array.
+    // The elemental-call dispatcher probes argument types via
+    // generic_dispatch_probe_value, which falls through to lower_expr_full
+    // when the probe helper does not recognize the inner intrinsic. Without
+    // recognizing COUNT(MASK, DIM) as array-shaped, the probe materialized
+    // a scalar `_count` external on every elemental wrap (`real(count(...))`,
+    // `int(count(...))`, etc.), surfaced as link-time `Undefined symbol _count`
+    // when the broader stdlib stats sources (mean / corr / cov / moment / pca)
+    // were rebuilt. Verify the assignment compiles and runs without
+    // emitting the scalar external.
+    let src = write_program(
+        r#"
+program test
+  implicit none
+  logical :: m(2, 3)
+  real :: r(3)
+  m = reshape([.false., .false., .false., .true., .true., .true.], [2, 3])
+  r = real(count(m, 1))
+  if (any(abs(r - [0.0, 1.0, 2.0]) > 1.0e-6)) error stop 1
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("real_of_count_with_dim", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("real(count(...)) compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "real(count(mask, dim)) must link without `_count` external: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "real(count(mask, dim)) runtime failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected 'ok' from real(count(...)): {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn reshape_typed_array_constructor_preserves_elem_size_through_assumed_shape() {
     // F2018 §7.8: a typed array constructor `[T :: ...]` has element
     // type T regardless of the element expressions' types.  The reshape
