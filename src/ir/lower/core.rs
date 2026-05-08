@@ -22232,6 +22232,19 @@ pub(super) fn expr_contains_array_refs_in_subscripts(
         Expr::ParenExpr { inner } => expr_contains_array_refs_in_subscripts(inner, locals),
         Expr::ComponentAccess { base, .. } => expr_contains_array_refs_in_subscripts(base, locals),
         Expr::FunctionCall { callee, args } => {
+            // Array-reducing intrinsics (size, lbound, sum, count, …) take a
+            // whole array as their primary operand; that array reference is
+            // NOT a subscript expression. Without this guard,
+            // `res = res / (size(arr, dim) - 1)` flagged as "contains array
+            // refs in subscripts" because `arr` shows up as a size() arg,
+            // and the assignment was scalarized to `res(i) = res(i) / …`
+            // for a rank-2 res — which then bounds-checked the rank-1
+            // subscript against dim 1's extent and aborted at i=4 of 9.
+            if let Expr::Name { name } = &callee.node {
+                if is_array_reducing_intrinsic(name) {
+                    return expr_contains_array_refs_in_subscripts(callee, locals);
+                }
+            }
             expr_contains_array_refs_in_subscripts(callee, locals)
                 || args.iter().any(|arg| match &arg.value {
                     crate::ast::expr::SectionSubscript::Element(e) => {
