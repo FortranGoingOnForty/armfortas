@@ -3900,6 +3900,71 @@ end program
 }
 
 #[test]
+fn runtime_shape_local_uses_column_major_stride_for_row_section_assign() {
+    // F2018 §6.5.3.2: Fortran arrays are stored in column-major order.
+    // The runtime-shape allocate path in alloc.rs hardcoded
+    // dim[k].stride = 1 for every dim, so a rank-2 local
+    // `center(size(x,1), size(x,2))` got both row stride and column
+    // stride set to 1. Section assigns `center(i, :) = ...` walked
+    // the row axis with stride=1 (touching only the first column entry
+    // per row) instead of the column axis with stride=m. Surfaced in
+    // stdlib_stats cov_2_rsp_rsp's `center(i, :) = x(i, :) - mean_`
+    // loop and any other runtime-shape rank>=2 local participating in
+    // multi-d section assignment.
+    let src = write_program(
+        r#"
+program test
+  implicit none
+  real :: y(2, 3) = reshape([1., 2., 3., 4., 5., 6.], [2, 3])
+  call run(y)
+contains
+  subroutine run(x)
+    real, intent(in) :: x(:, :)
+    real :: center(size(x, 1), size(x, 2))
+    integer :: i
+    center = 0.0
+    do i = 1, size(x, 1)
+      center(i, :) = x(i, :)
+    end do
+    if (abs(center(1, 1) - 1.0) > 1.0e-6) error stop 1
+    if (abs(center(1, 2) - 3.0) > 1.0e-6) error stop 2
+    if (abs(center(1, 3) - 5.0) > 1.0e-6) error stop 3
+    if (abs(center(2, 1) - 2.0) > 1.0e-6) error stop 4
+    if (abs(center(2, 2) - 4.0) > 1.0e-6) error stop 5
+    if (abs(center(2, 3) - 6.0) > 1.0e-6) error stop 6
+    print *, 'ok'
+  end subroutine
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("runtime_shape_stride", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("runtime-shape stride compile failed");
+    assert!(
+        compile.status.success(),
+        "should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "runtime-shape stride row-section assign produced wrong values: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected 'ok': {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn reshape_typed_array_constructor_preserves_elem_size_through_assumed_shape() {
     // F2018 §7.8: a typed array constructor `[T :: ...]` has element
     // type T regardless of the element expressions' types.  The reshape
