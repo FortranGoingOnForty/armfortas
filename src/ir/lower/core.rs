@@ -18740,7 +18740,7 @@ pub(super) fn lower_write_items_adv(
             if let Expr::Name { name } = &item.node {
                 let key = name.to_lowercase();
                 if let Some(info) = ctx.locals.get(&key).cloned() {
-                    if is_complex_ty(&info.ty) {
+                    if is_complex_ty(&info.ty) && !local_is_array_like(&info) {
                         // Complex variable: pass pointer to [f32/f64 x 2] buffer.
                         // For a POINTER complex, the slot holds the
                         // target buffer address — load it first.
@@ -20117,7 +20117,21 @@ pub(super) fn lower_1d_slice_write(
 
     let base = array_base_addr(b, info);
     let elem_bytes = ir_scalar_byte_size(&info.ty);
+    // F2018 §13.10.2: list-directed output of complex slice prints
+    // each element as `(re, im)`. Without the complex check below,
+    // `print *, c(1:3)` for a complex array fell through to the
+    // integer-fallback writer and printed bit patterns.
+    let is_complex_elem = matches!(
+        &info.ty,
+        IrType::Array(inner, 2) if matches!(inner.as_ref(), IrType::Float(_))
+    );
+    let complex_lane_f64 = matches!(
+        &info.ty,
+        IrType::Array(inner, 2) if matches!(inner.as_ref(), IrType::Float(FloatWidth::F64))
+    );
     let writer = match &info.ty {
+        _ if is_complex_elem && complex_lane_f64 => "afs_write_complex_f64",
+        _ if is_complex_elem => "afs_write_complex_f32",
         IrType::Int(IntWidth::I128) => "afs_write_int128",
         IrType::Int(IntWidth::I64) => "afs_write_int64",
         IrType::Int(_) => "afs_write_int",
@@ -20175,12 +20189,20 @@ pub(super) fn lower_1d_slice_write(
     let step = b.const_i64(elem_bytes);
     let byte_off = b.imul(zero_based64, step);
     let p = b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
-    let elem = b.load_typed(p, info.ty.clone());
-    b.call(
-        FuncRef::External(writer.into()),
-        vec![unit, elem],
-        IrType::Void,
-    );
+    if is_complex_elem {
+        b.call(
+            FuncRef::External(writer.into()),
+            vec![unit, p],
+            IrType::Void,
+        );
+    } else {
+        let elem = b.load_typed(p, info.ty.clone());
+        b.call(
+            FuncRef::External(writer.into()),
+            vec![unit, elem],
+            IrType::Void,
+        );
+    }
     let next = b.iadd(i_val, stride_val);
     b.store(next, i_addr);
     b.branch(bb_check, vec![]);
@@ -20719,7 +20741,22 @@ pub(super) fn lower_section_write_nd(
 
     let base = array_base_addr(b, info);
     let elem_bytes = ir_scalar_byte_size(&info.ty);
+    // F2018 §13.10.2: complex section write — emit per-element
+    // (re, im) via afs_write_complex_*, mirroring 1-D and
+    // whole-array paths above. Without the complex branch, a
+    // multi-dim complex section like `out_mat(:, j)` fell
+    // through to afs_write_int and printed bit patterns.
+    let is_complex_elem = matches!(
+        &info.ty,
+        IrType::Array(inner, 2) if matches!(inner.as_ref(), IrType::Float(_))
+    );
+    let complex_lane_f64 = matches!(
+        &info.ty,
+        IrType::Array(inner, 2) if matches!(inner.as_ref(), IrType::Float(FloatWidth::F64))
+    );
     let writer = match &info.ty {
+        _ if is_complex_elem && complex_lane_f64 => "afs_write_complex_f64",
+        _ if is_complex_elem => "afs_write_complex_f32",
         IrType::Int(IntWidth::I128) => "afs_write_int128",
         IrType::Int(IntWidth::I64) => "afs_write_int64",
         IrType::Int(_) => "afs_write_int",
@@ -20872,12 +20909,20 @@ pub(super) fn lower_section_write_nd(
             }
             let off = byte_offset.unwrap_or_else(|| b.const_i64(0));
             let p = b.gep(base, vec![off], IrType::Int(IntWidth::I8));
-            let elem = b.load_typed(p, info.ty.clone());
-            b.call(
-                FuncRef::External(writer.into()),
-                vec![unit, elem],
-                IrType::Void,
-            );
+            if is_complex_elem {
+                b.call(
+                    FuncRef::External(writer.into()),
+                    vec![unit, p],
+                    IrType::Void,
+                );
+            } else {
+                let elem = b.load_typed(p, info.ty.clone());
+                b.call(
+                    FuncRef::External(writer.into()),
+                    vec![unit, elem],
+                    IrType::Void,
+                );
+            }
             b.branch(incrs[0], vec![]);
         } else {
             // Not innermost: re-init the next-inner dim's counter
@@ -20932,8 +20977,27 @@ pub(super) fn lower_whole_array_write(
         CharKind::Fixed(n) => Some(n),
         _ => None,
     };
+    // F2018 §13.10.2: list-directed output of a complex array prints
+    // each element as `(re, im)`.  The per-item dispatch above (`Expr::
+    // Name` branch in `lower_write_items_adv`) checks `is_complex_ty`
+    // before `local_is_array_like` and treats a complex *array* as a
+    // single complex scalar — only `c(1)` was emitted for `print *, c`,
+    // breaking stdlib_linalg's eig/eigvals/schur examples that invoke
+    // `print *, lambda` over an N-element complex eigenvalue array.
+    // Detect the complex-array case here and dispatch to the per-element
+    // complex writer instead of the integer-fallback default.
+    let is_complex_elem = matches!(
+        &info.ty,
+        IrType::Array(inner, 2) if matches!(inner.as_ref(), IrType::Float(_))
+    );
+    let complex_lane_f64 = matches!(
+        &info.ty,
+        IrType::Array(inner, 2) if matches!(inner.as_ref(), IrType::Float(FloatWidth::F64))
+    );
     let writer = match &info.ty {
         _ if char_fixed_len.is_some() => "afs_write_string",
+        _ if is_complex_elem && complex_lane_f64 => "afs_write_complex_f64",
+        _ if is_complex_elem => "afs_write_complex_f32",
         IrType::Int(IntWidth::I128) => "afs_write_int128",
         IrType::Int(IntWidth::I64) => "afs_write_int64",
         IrType::Int(_) => "afs_write_int",
@@ -20972,6 +21036,14 @@ pub(super) fn lower_whole_array_write(
         b.call(
             FuncRef::External(writer.into()),
             vec![unit, ptr, len_v],
+            IrType::Void,
+        );
+    } else if is_complex_elem {
+        // afs_write_complex_f32/f64 takes (unit, *const [f32/f64; 2]) —
+        // pass the per-element pointer directly, no load.
+        b.call(
+            FuncRef::External(writer.into()),
+            vec![unit, ptr],
             IrType::Void,
         );
     } else {
