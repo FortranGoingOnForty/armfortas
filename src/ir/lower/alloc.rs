@@ -348,6 +348,15 @@ pub(crate) fn alloc_decls(
                                 Box::new(IrType::Int(IntWidth::I8)),
                                 dim_buf_bytes,
                             ));
+                            // Column-major stride accumulator: dim[k].stride =
+                            // product(extents[0..k]). Without this, every dim
+                            // got stride=1 — `center(i, :) = ...` walked the
+                            // row axis in element-stride-1 (touching only the
+                            // first column entry per row) instead of the
+                            // column axis in stride=m, so multi-dim section
+                            // assigns to a runtime-shape local silently
+                            // wrote bogus values.
+                            let mut running_stride = one_i64;
                             for (i, spec) in specs.iter().enumerate() {
                                 let (lo64, up64) = match spec {
                                     ArraySpec::Explicit { lower, upper } => {
@@ -401,7 +410,12 @@ pub(crate) fn alloc_decls(
                                 let p_st = b.gep(dim_buf, vec![off_st], IrType::Int(IntWidth::I8));
                                 b.store(lo64, p_lo);
                                 b.store(up64, p_up);
-                                b.store(one_i64, p_st);
+                                b.store(running_stride, p_st);
+                                if i + 1 < rank {
+                                    let span = b.isub(up64, lo64);
+                                    let extent = b.iadd(span, one_i64);
+                                    running_stride = b.imul(running_stride, extent);
+                                }
                             }
                             dim_buf
                         };
