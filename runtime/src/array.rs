@@ -3802,13 +3802,22 @@ pub extern "C" fn afs_transpose_real8(
         stride: 1,
     };
 
+    // Fortran arrays are column-major: source A(i,j) at offset j*m+i for
+    // an m-row source; result B = transpose(A) has n rows, so B(j,i) at
+    // offset i*n+j. The previous formulas were swapped (rp[j*m+i] =
+    // sp[i*n+j]) which used row-major indexing on both sides; for any
+    // non-square source this produced a scrambled output that's neither
+    // the transpose nor the original. Surfaced in stdlib_stats cov_2_*
+    // where `matmul(transpose(center), center)` returned all zeros — the
+    // mis-strided transpose left the matrix multiply consuming the wrong
+    // lanes, and the elements summed to 0 by accident on the toy input.
     if elem_size == 4 {
         let sp = src.base_addr as *const f32;
         let rp = res.base_addr as *mut f32;
         for i in 0..m {
             for j in 0..n {
                 unsafe {
-                    *rp.add(j * m + i) = *sp.add(i * n + j);
+                    *rp.add(i * n + j) = *sp.add(j * m + i);
                 }
             }
         }
@@ -3818,7 +3827,7 @@ pub extern "C" fn afs_transpose_real8(
         for i in 0..m {
             for j in 0..n {
                 unsafe {
-                    *rp.add(j * m + i) = *sp.add(i * n + j);
+                    *rp.add(i * n + j) = *sp.add(j * m + i);
                 }
             }
         }
@@ -3831,8 +3840,8 @@ pub extern "C" fn afs_transpose_real8(
         for i in 0..m {
             for j in 0..n {
                 unsafe {
-                    let src_off = (i * n + j) * sb;
-                    let dst_off = (j * m + i) * sb;
+                    let src_off = (j * m + i) * sb;
+                    let dst_off = (i * n + j) * sb;
                     core::ptr::copy_nonoverlapping(sp.add(src_off), rp.add(dst_off), sb);
                 }
             }
@@ -4116,10 +4125,12 @@ pub extern "C" fn afs_transpose_int(source: *const ArrayDescriptor, result: *mut
     let res = unsafe { &mut *result };
     let rp = res.base_addr;
 
+    // Column-major: source A(i,j) at offset j*m+i; dest B(j,i) at i*n+j.
+    // See afs_transpose_real8 for the full root-cause note.
     for i in 0..m {
         for j in 0..n {
-            let src_off = (i * n + j) * elem_size;
-            let dst_off = (j * m + i) * elem_size;
+            let src_off = (j * m + i) * elem_size;
+            let dst_off = (i * n + j) * elem_size;
             unsafe {
                 core::ptr::copy_nonoverlapping(sp.add(src_off), rp.add(dst_off), elem_size);
             }
