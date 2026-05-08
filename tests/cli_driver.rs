@@ -3592,6 +3592,83 @@ end program
 }
 
 #[test]
+fn print_complex_array_emits_each_element_as_complex() {
+    // F2018 §13.10.2: list-directed output of a complex array
+    // prints each element as `(re, im)`. The per-PRINT-item
+    // dispatch in lower_write_items_adv used to check
+    // `is_complex_ty(&info.ty)` before `local_is_array_like(&info)`,
+    // so a complex *array* matched the complex-scalar branch and
+    // only the first element got written.
+    //
+    // Whole-array (`print *, c`), 1-D slice (`print *, c(1:n)`),
+    // and N-D section (`print *, m(:, j)`) all needed parallel
+    // fixes — without them stdlib's eig / eigvals / schur examples
+    // could only show the first eigenvalue. Surfaced in
+    // example_eig, example_eigvals, example_schur*, example_lstsq*.
+    let src = write_program(
+        r#"
+program t
+  implicit none
+  integer, parameter :: sp = kind(1.0)
+  complex(sp) :: c(3)
+  complex(sp) :: m(3, 3)
+  integer :: j
+  c(1) = (1.0_sp, 4.0_sp)
+  c(2) = (2.0_sp, 5.0_sp)
+  c(3) = (3.0_sp, 6.0_sp)
+  m = (0.0_sp, 0.0_sp)
+  m(:, 2) = c
+  ! whole-array
+  print *, c
+  ! 1-D slice
+  print *, c(1:3)
+  ! N-D section
+  j = 2
+  print *, m(:, j)
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("print_complex_array", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("complex-array print compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "should compile cleanly: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(run.status.success(), "complex-array print runtime failed");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    // Each of the three lines must contain all three (re, im) pairs.
+    let lines: Vec<&str> = stdout.lines().filter(|l| l.contains('(')).collect();
+    assert_eq!(
+        lines.len(),
+        3,
+        "expected 3 lines with complex output, got {}: {}",
+        lines.len(),
+        stdout
+    );
+    for line in &lines {
+        for (re, im) in &[("1.0", "4.0"), ("2.0", "5.0"), ("3.0", "6.0")] {
+            assert!(
+                line.contains(re) && line.contains(im),
+                "expected ({}, {}) in line {:?}: {}",
+                re,
+                im,
+                line,
+                stdout
+            );
+        }
+    }
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn reshape_typed_array_constructor_preserves_elem_size_through_assumed_shape() {
     // F2018 §7.8: a typed array constructor `[T :: ...]` has element
     // type T regardless of the element expressions' types.  The reshape
