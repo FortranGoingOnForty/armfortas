@@ -10037,6 +10037,71 @@ pub(super) fn array_expr_elem_type_only(
                             }
                         }
                     }
+                    "count" => {
+                        // F2018 §16.9.46: COUNT(MASK, DIM, KIND) with a DIM
+                        // returns a rank N-1 integer array. Without recognizing
+                        // it here, generic_dispatch_probe_value falls through
+                        // to lower_expr_full and emits `_count` external on
+                        // every probe. KIND defaults to default integer (i32);
+                        // honor an explicit `kind = int64` argument.
+                        let has_dim = args.iter().enumerate().any(|(i, a)| {
+                            let kw = a.keyword.as_deref().map(|s| s.to_lowercase());
+                            matches!(kw.as_deref(), Some("dim")) || (i == 1 && kw.is_none())
+                        });
+                        if has_dim {
+                            let kind_is_i64 = args.iter().any(|a| {
+                                if a.keyword.as_deref().map(|s| s.to_lowercase())
+                                    == Some("kind".to_string())
+                                {
+                                    if let crate::ast::expr::SectionSubscript::Element(e) =
+                                        &a.value
+                                    {
+                                        if let Expr::IntegerLiteral { text, .. } = &e.node {
+                                            return text
+                                                .split('_')
+                                                .next()
+                                                .and_then(|s| s.parse::<i64>().ok())
+                                                == Some(8);
+                                        }
+                                    }
+                                }
+                                false
+                            });
+                            return Some(IrType::Int(if kind_is_i64 {
+                                IntWidth::I64
+                            } else {
+                                IntWidth::I32
+                            }));
+                        }
+                    }
+                    "sum" | "product" | "maxval" | "minval" => {
+                        // sum(arr, dim) / similar dim-reductions return rank N-1
+                        // arrays of the source element type. Without dim they're
+                        // scalar — bail and let lower_expr_full handle.
+                        let has_dim = args.iter().enumerate().any(|(i, a)| {
+                            let kw = a.keyword.as_deref().map(|s| s.to_lowercase());
+                            matches!(kw.as_deref(), Some("dim")) || (i == 1 && kw.is_none())
+                        });
+                        if has_dim {
+                            if let Some(arg) = args.first() {
+                                if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
+                                    return array_expr_elem_type_only(
+                                        locals,
+                                        e,
+                                        st,
+                                        type_layouts,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    "pack" | "spread" => {
+                        if let Some(arg) = args.first() {
+                            if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
+                                return array_expr_elem_type_only(locals, e, st, type_layouts);
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
