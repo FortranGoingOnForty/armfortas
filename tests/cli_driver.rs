@@ -3669,6 +3669,63 @@ end program
 }
 
 #[test]
+fn count_with_dim_returns_per_slice_integer_array() {
+    // F2018 §16.9.46: COUNT(MASK, DIM=k) returns an integer ARRAY of
+    // rank N-1 with per-slice true-element counts. The scalar logical-
+    // reduction lowering returned a single i32 total — when assigned
+    // into a rank-1 destination (e.g. `n = count(mask, 1)` in
+    // stdlib_stats var_mask_2_*), the integer count was then passed
+    // as the source descriptor pointer to afs_assign_allocatable,
+    // dereferencing a tiny address (e.g. 0x3 for count=3) and
+    // aborting with `misaligned pointer dereference: address must be
+    // a multiple of 0x8 but is 0x3`. Surfaced in stdlib's var / cov /
+    // pseudoinverse examples (the entire `var_mask_*` family).
+    let src = write_program(
+        r#"
+program test
+  implicit none
+  logical :: m(2, 3)
+  integer :: c_fixed(3)
+  integer, allocatable :: c_alloc(:)
+  m = reshape([.false., .false., .false., .true., .true., .true.], [2, 3])
+  ! mask(:,1) = [F,F] count=0; mask(:,2) = [F,T] count=1; mask(:,3) = [T,T] count=2
+  c_fixed = count(m, 1)
+  c_alloc = count(m, 1)
+  if (any(c_fixed /= [0, 1, 2])) error stop 1
+  if (size(c_alloc) /= 3) error stop 2
+  if (any(c_alloc /= [0, 1, 2])) error stop 3
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("count_with_dim", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("count-with-dim compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "should compile cleanly: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "count-with-dim runtime failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected 'ok' from count-with-dim: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn reshape_typed_array_constructor_preserves_elem_size_through_assumed_shape() {
     // F2018 §7.8: a typed array constructor `[T :: ...]` has element
     // type T regardless of the element expressions' types.  The reshape
