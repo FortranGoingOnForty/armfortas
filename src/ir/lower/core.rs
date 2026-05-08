@@ -27913,6 +27913,51 @@ pub(super) fn find_array_in_expr(
 }
 
 /// Check if the first argument refers to a REAL array (for type dispatch).
+/// Walk an expression looking for the underlying array's element type.
+/// Pierces transformational intrinsics that pass their array argument
+/// through unchanged (`transpose`, `reshape`, `pack`, `spread`,
+/// `merge`, `conjg`, parens) plus arithmetic on arrays. Without this,
+/// `matmul(transpose(A), A)` for `real :: A(...)` saw the first arg as
+/// FunctionCall and `first_arg_is_real` returned false, dispatching the
+/// real(4) matmul to `afs_matmul_int` and reading garbage as int32 from
+/// the f32 buffer. The result was structurally an array of zeros (because
+/// non-finite f32 patterns interpreted as int and summed on contrived
+/// inputs collapsed to 0).
+fn array_arg_elem_ty<'a>(
+    expr: &crate::ast::expr::SpannedExpr,
+    locals: &'a HashMap<String, LocalInfo>,
+) -> Option<&'a IrType> {
+    match &expr.node {
+        Expr::Name { name } => locals.get(&name.to_lowercase()).map(|i| &i.ty),
+        Expr::ParenExpr { inner } => array_arg_elem_ty(inner, locals),
+        Expr::UnaryOp { operand, .. } => array_arg_elem_ty(operand, locals),
+        Expr::BinaryOp { left, right, .. } => {
+            array_arg_elem_ty(left, locals).or_else(|| array_arg_elem_ty(right, locals))
+        }
+        Expr::FunctionCall { callee, args: inner } => {
+            if let Expr::Name { name } = &callee.node {
+                let lname = name.to_ascii_lowercase();
+                // Transformational intrinsics that preserve element type.
+                if matches!(
+                    lname.as_str(),
+                    "transpose" | "reshape" | "pack" | "spread" | "merge"
+                        | "conjg" | "matmul" | "sum" | "product" | "maxval" | "minval"
+                ) {
+                    return inner.first().and_then(|a| {
+                        if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+                            array_arg_elem_ty(e, locals)
+                        } else {
+                            None
+                        }
+                    });
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 pub(super) fn first_arg_is_real(
     args: &[crate::ast::expr::Argument],
     locals: &HashMap<String, LocalInfo>,
@@ -27920,11 +27965,7 @@ pub(super) fn first_arg_is_real(
     args.first()
         .and_then(|a| {
             if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
-                if let Expr::Name { name } = &e.node {
-                    locals.get(&name.to_lowercase()).map(|i| i.ty.is_float())
-                } else {
-                    None
-                }
+                array_arg_elem_ty(e, locals).map(|ty| ty.is_float())
             } else {
                 None
             }
@@ -27964,11 +28005,7 @@ pub(super) fn first_arg_is_complex(
     args.first()
         .and_then(|a| {
             if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
-                if let Expr::Name { name } = &e.node {
-                    locals.get(&name.to_lowercase()).map(|i| is_complex_ty(&i.ty))
-                } else {
-                    None
-                }
+                array_arg_elem_ty(e, locals).map(is_complex_ty)
             } else {
                 None
             }
