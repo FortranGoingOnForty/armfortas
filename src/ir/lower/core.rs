@@ -7314,23 +7314,68 @@ pub(super) fn lower_logical_reduction_intrinsic_ast(
         return None;
     }
 
+    // stdlib's `var_all_1_*` calls `count(mask, kind=int64)` where
+    // `mask` is a SCALAR logical optional dummy (not an array). The
+    // standard requires an array MASK, but gfortran/flang accept the
+    // scalar form as a degenerate rank-0 reduction (1 if true, 0
+    // otherwise). Without this, the call fell through to an external
+    // `_count` symbol the linker can't resolve. ANY/ALL of a scalar
+    // are similarly trivial — return the scalar's truth value.
+    if let Some(arg0) = args.first() {
+        if let SectionSubscript::Element(e) = &arg0.value {
+            if let Expr::Name { name: arg_name } = &e.node {
+                let key = arg_name.to_lowercase();
+                if let Some(info) = locals.get(&key) {
+                    if !local_is_array_like(info) && info.ty == IrType::Bool {
+                        let raw = if info.by_ref {
+                            let p = b.load(info.addr);
+                            b.load(p)
+                        } else {
+                            b.load(info.addr)
+                        };
+                        let bool_val = coerce_to_type(b, raw, &IrType::Bool);
+                        return Some(match name {
+                            "count" => {
+                                let one = b.const_i32(1);
+                                let zero = b.const_i32(0);
+                                b.select(bool_val, one, zero)
+                            }
+                            _ => bool_val, // any / all of a scalar = the scalar
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     // F2018 §16.9.46: COUNT(MASK, DIM=k) returns an integer ARRAY of
-    // rank N-1, not a scalar. The scalar runtime helper below would
-    // collapse the entire mask into one i32 — when assigned into a
-    // rank-1 destination (e.g. `n = count(mask, 1)` in stdlib_stats
-    // var_mask_2), the integer count would then be passed as the
-    // source descriptor pointer to afs_assign_allocatable, dereferencing
-    // a tiny address (e.g. 0x3 for count=3) and aborting. Bail only
-    // when an actual dim= argument is present; `count(mask, kind=int64)`
-    // is still a scalar reduction (kind is just the result kind) and
-    // must keep using the scalar path.
+    // rank N-1 (where N = rank(MASK)). For rank-1 MASK with DIM=1 the
+    // result IS scalar — the scalar runtime helper handles that case
+    // correctly. Only bail when MASK has rank > 1 AND DIM is present,
+    // i.e. the result is a true array; the array-side descriptor path
+    // picks those up via `lower_array_count_dim_descriptor`. Otherwise
+    // count(mask, kind=int64) (no dim, scalar) and count(rank1_mask, 1)
+    // (rank-1 with dim, scalar) keep the scalar path. Without this
+    // distinction, var_mask_1_* (rank-1 mask + dim=1) emitted an
+    // unresolved external `_count` symbol.
     if name == "count" {
         let has_dim = args.iter().enumerate().any(|(i, a)| {
             let kw = a.keyword.as_deref().map(|s| s.to_lowercase());
             matches!(kw.as_deref(), Some("dim")) || (i == 1 && kw.is_none())
         });
         if has_dim {
-            return None;
+            let mask_rank = args.first().and_then(|a| {
+                if let SectionSubscript::Element(e) = &a.value {
+                    if let Expr::Name { name: arg_name } = &e.node {
+                        let key = arg_name.to_lowercase();
+                        return locals.get(&key).map(|info| info.dims.len());
+                    }
+                }
+                None
+            }).unwrap_or(0);
+            if mask_rank > 1 {
+                return None;
+            }
         }
     }
 
@@ -25610,7 +25655,16 @@ pub(super) fn lower_array_expr_descriptor(
                         let kw = a.keyword.as_deref().map(|s| s.to_lowercase());
                         matches!(kw.as_deref(), Some("dim")) || (i == 1 && kw.is_none())
                     });
-                    if has_dim {
+                    let mask_rank = args.first().and_then(|a| {
+                        if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+                            if let Expr::Name { name: arg_name } = &e.node {
+                                let key = arg_name.to_lowercase();
+                                return locals.get(&key).map(|info| info.dims.len());
+                            }
+                        }
+                        None
+                    }).unwrap_or(0);
+                    if has_dim && mask_rank > 1 {
                         if let Some(result) = lower_array_count_dim_descriptor(
                             b,
                             locals,
