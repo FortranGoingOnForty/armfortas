@@ -22963,8 +22963,22 @@ pub(super) fn lower_reshape_array_expr_descriptor(
     // assignment plans handle them, but RESHAPE consumes the descriptor
     // directly. Try materialization first; fall back to the regular
     // descriptor path for Names, intrinsic calls, etc.
-    let (source_desc, elem_ty) = if let Expr::ArrayConstructor { values, .. } = &source_expr.node {
-        let elem_ty = first_array_constructor_type_info(values, Some(locals), st, type_layouts)
+    let (source_desc, elem_ty) = if let Expr::ArrayConstructor { values, type_spec } = &source_expr.node {
+        // F2018 §7.8: a typed array constructor `[T :: ...]` has element
+        // type T regardless of the element expressions' types.  For
+        // `reshape([real(dp) :: 1, 2, 3, 4], [2, 2])` the values are
+        // integer literals, but the constructor's type is real(dp) — so
+        // its descriptor must carry elem_size=8.  Without consulting
+        // type_spec first the materialised descriptor was elem_size=4
+        // (integer), and downstream `allocate(amat(...), source=…)` then
+        // saw an elem_size mismatch in afs_prepare_array_copy and
+        // freed the freshly-allocated dest, producing a SEGV on the
+        // next read of `amat(1,1)`.
+        let elem_ty = type_spec
+            .as_ref()
+            .and_then(|s| crate::sema::types::type_spec_to_fortran_type(s, st))
+            .and_then(|fty| fortran_type_to_type_info(&fty))
+            .or_else(|| first_array_constructor_type_info(values, Some(locals), st, type_layouts))
             .map(|ti| type_info_to_ir_type(&ti))
             .unwrap_or(IrType::Float(FloatWidth::F32));
         let desc = lower_runtime_array_constructor_descriptor(

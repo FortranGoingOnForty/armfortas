@@ -3521,6 +3521,72 @@ fn allocate_bounds_size_intrinsic_lowers_without_raw_symbol() {
 }
 
 #[test]
+fn reshape_typed_array_constructor_preserves_elem_size_through_assumed_shape() {
+    // F2018 §7.8: a typed array constructor `[T :: ...]` has element
+    // type T regardless of the element expressions' types.  The reshape
+    // lowering used to ignore type_spec and infer elem_ty from the
+    // first value — `[real(dp) :: 1, 2, 3, 4]` would resolve as integer
+    // (4 bytes) instead of real(dp) (8 bytes).  The malformed elem_size
+    // then propagated through the reshape result descriptor; when
+    // passed to an assumed-shape dummy and used as the SOURCE= of an
+    // ALLOCATE, afs_prepare_array_copy saw `dest.elem_size != source.elem_size`,
+    // freed the freshly-allocated dest buffer, zeroed base_addr, and
+    // SEGV'd on the next read.  Surfaced in stdlib's det / determinant /
+    // eig / qr clusters where examples invoke
+    // `det(reshape([real(dp)::1,2,3,4], [2,2]))`.
+    let src = write_program(
+        r#"
+module m
+  implicit none
+  integer, parameter :: dp = kind(1.0d0)
+contains
+  function probe(a) result(s)
+    real(dp), intent(in) :: a(:, :)
+    real(dp) :: s
+    real(dp), allocatable :: amat(:, :)
+    allocate(amat(size(a,1), size(a,2)), source=a)
+    s = amat(1, 1) + amat(2, 2)
+    deallocate(amat)
+  end function
+end module
+program t
+  use m
+  implicit none
+  real(dp) :: r
+  r = probe(reshape([real(dp) :: 1, 2, 3, 4], [2, 2]))
+  if (abs(r - 5.0_dp) > 1.0e-12_dp) error stop 1
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("reshape_typed_ac_elem_size", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("reshape-typed-ac compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "should compile cleanly: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "reshape→source= runtime failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected 'ok' from reshape→source=: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn allocate_with_source_from_assumed_shape_dummy_populates_base_addr() {
     // F2018 §9.7.1.2: ALLOCATE(..., SOURCE=expr) requires only that
     // SOURCE-expr have a defined value of the right shape — it doesn't
