@@ -390,6 +390,23 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                             || (i == 1 && kw.is_none())
                                                     })
                                                 )
+                                                || (
+                                                    // count(mask, dim) is rank-N-1 integer
+                                                    // array: same routing as sum(arr, dim).
+                                                    // Without this, the scalar logical-
+                                                    // reduction path returns a single i32
+                                                    // total and the array-assign treats it
+                                                    // as a source descriptor, dereferencing
+                                                    // a tiny address (e.g. 0x3) and aborting
+                                                    // in afs_assign_allocatable. Surfaced
+                                                    // in stdlib_stats var_mask_2_*.
+                                                    lname == "count"
+                                                    && call_args.iter().enumerate().any(|(i, a)| {
+                                                        let kw = a.keyword.as_deref().map(|s| s.to_lowercase());
+                                                        matches!(kw.as_deref(), Some("dim"))
+                                                            || (i == 1 && kw.is_none())
+                                                    })
+                                                )
                                             } else {
                                                 false
                                             };

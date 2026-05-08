@@ -7314,6 +7314,26 @@ pub(super) fn lower_logical_reduction_intrinsic_ast(
         return None;
     }
 
+    // F2018 §16.9.46: COUNT(MASK, DIM=k) returns an integer ARRAY of
+    // rank N-1, not a scalar. The scalar runtime helper below would
+    // collapse the entire mask into one i32 — when assigned into a
+    // rank-1 destination (e.g. `n = count(mask, 1)` in stdlib_stats
+    // var_mask_2), the integer count would then be passed as the
+    // source descriptor pointer to afs_assign_allocatable, dereferencing
+    // a tiny address (e.g. 0x3 for count=3) and aborting. Bail only
+    // when an actual dim= argument is present; `count(mask, kind=int64)`
+    // is still a scalar reduction (kind is just the result kind) and
+    // must keep using the scalar path.
+    if name == "count" {
+        let has_dim = args.iter().enumerate().any(|(i, a)| {
+            let kw = a.keyword.as_deref().map(|s| s.to_lowercase());
+            matches!(kw.as_deref(), Some("dim")) || (i == 1 && kw.is_none())
+        });
+        if has_dim {
+            return None;
+        }
+    }
+
     let arg0 = args.first().and_then(|arg| {
         if let SectionSubscript::Element(expr) = &arg.value {
             Some(expr)
@@ -23455,6 +23475,81 @@ pub(super) fn lower_transfer_array_expr_descriptor(
 /// rank-(N-1) descriptor. Returns None when DIM is absent (scalar
 /// SUM(ARRAY) lives in the standard intrinsic path) or when the
 /// optional MASK is supplied (no mask runtime support yet).
+/// F2018 §16.9.46 COUNT(MASK, DIM=k) returns an integer array of rank
+/// N-1 with per-slice true-element counts along dimension k. The
+/// scalar logical-reduction path lowers `count` to `afs_array_count_logical`,
+/// which returns a single i32 — with DIM= present that's incorrect: the
+/// stdlib_stats `var_mask_2_*` body assigns the result into a real
+/// rank-1 array `n`, and the compiler then passed the scalar count as
+/// the source descriptor pointer to afs_assign_allocatable, crashing
+/// with a misaligned-pointer dereference at address 0x3 (the count
+/// value masquerading as a pointer).
+pub(super) fn lower_array_count_dim_descriptor(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    args: &[crate::ast::expr::Argument],
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) -> Option<(ValueId, IrType)> {
+    use crate::ast::expr::SectionSubscript;
+    if args.is_empty() {
+        return None;
+    }
+    let SectionSubscript::Element(mask_expr) = &args[0].value else {
+        return None;
+    };
+    let mut dim_expr: Option<&crate::ast::expr::SpannedExpr> = None;
+    for (i, arg) in args.iter().enumerate() {
+        let kw = arg.keyword.as_deref().map(|s| s.to_lowercase());
+        match (i, kw.as_deref()) {
+            (1, None) | (_, Some("dim")) => {
+                if let SectionSubscript::Element(e) = &arg.value {
+                    dim_expr = Some(e);
+                }
+            }
+            _ => {}
+        }
+    }
+    let dim_expr = dim_expr?;
+
+    let (mask_desc, _) = lower_array_expr_descriptor(
+        b,
+        locals,
+        mask_expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    )?;
+
+    let dim_raw = super::expr::lower_expr_with_optional_layouts(b, locals, dim_expr, st, type_layouts);
+    let dim_val = match b.func().value_type(dim_raw) {
+        Some(IrType::Int(IntWidth::I32)) => dim_raw,
+        Some(IrType::Int(_)) => b.int_trunc(dim_raw, IntWidth::I32),
+        _ => dim_raw,
+    };
+
+    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let zero_i32 = b.const_i32(0);
+    let sz384 = b.const_i64(384);
+    b.call(
+        FuncRef::External("memset".into()),
+        vec![result_desc, zero_i32, sz384],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+
+    b.call(
+        FuncRef::External("afs_array_count_logical_dim".into()),
+        vec![mask_desc, dim_val, result_desc],
+        IrType::Void,
+    );
+    Some((result_desc, IrType::Int(IntWidth::I32)))
+}
+
 pub(super) fn lower_array_sum_dim_descriptor(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -25502,6 +25597,32 @@ pub(super) fn lower_array_expr_descriptor(
                         descriptor_params,
                     ) {
                         return Some(result);
+                    }
+                }
+                // F2018 §16.9.46: COUNT(MASK, DIM=k) returns an integer
+                // array of rank N-1. Without this dim-aware path the
+                // scalar logical-reduction lowering returns a single i32
+                // and the caller copies that into the destination array
+                // descriptor's source slot — afs_assign_allocatable then
+                // dereferences the count value as a pointer and aborts.
+                if name.eq_ignore_ascii_case("count") {
+                    let has_dim = args.iter().enumerate().any(|(i, a)| {
+                        let kw = a.keyword.as_deref().map(|s| s.to_lowercase());
+                        matches!(kw.as_deref(), Some("dim")) || (i == 1 && kw.is_none())
+                    });
+                    if has_dim {
+                        if let Some(result) = lower_array_count_dim_descriptor(
+                            b,
+                            locals,
+                            args,
+                            st,
+                            type_layouts,
+                            internal_funcs,
+                            contained_host_refs,
+                            descriptor_params,
+                        ) {
+                            return Some(result);
+                        }
                     }
                 }
                 // F2018 §16.9.135: MERGE is elemental. When at least one of the
