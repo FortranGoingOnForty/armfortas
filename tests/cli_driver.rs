@@ -3965,6 +3965,62 @@ end program
 }
 
 #[test]
+fn rank_2_runtime_shape_assign_with_size_in_scalar_does_not_scalarize() {
+    // F2018 §16.9.171: SIZE(arr, dim) is a whole-array inquiry intrinsic.
+    // The scalarized-subscript-array-assign path detected `arr` as an
+    // "array ref in subscripts" because arr appears as a positional
+    // SIZE() arg, then synthesized `res(loop_var) = res(loop_var) / k`
+    // — which for a rank-2 res emitted a 1-D bounds check against dim 1
+    // and aborted at i=4 of total 9. Surfaced in stdlib_stats
+    // cov_2_rsp_rsp's `res = res / (size(x, dim) - merge(1, 0, …))`.
+    let src = write_program(
+        r#"
+program test
+  implicit none
+  real :: x(2, 3) = reshape([1., 2., 3., 4., 5., 6.], [2, 3])
+  call run(x, 1)
+contains
+  subroutine run(arr, dim)
+    real, intent(in) :: arr(:, :)
+    integer, intent(in) :: dim
+    real :: res(merge(size(arr, 1), size(arr, 2), mask = 1<dim), &
+                merge(size(arr, 1), size(arr, 2), mask = 1<dim))
+    res = 0.0
+    res = res / (size(arr, dim) - 1)
+    if (any(res /= 0.0)) error stop 1
+    print *, 'ok'
+  end subroutine
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("rank2_runtime_size_in_scalar", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "rank-2 runtime-shape assign with size() in scalar must not bounds-fail: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected 'ok': {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn reshape_typed_array_constructor_preserves_elem_size_through_assumed_shape() {
     // F2018 §7.8: a typed array constructor `[T :: ...]` has element
     // type T regardless of the element expressions' types.  The reshape
