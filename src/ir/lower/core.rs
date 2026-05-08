@@ -23229,14 +23229,25 @@ pub(super) fn lower_reshape_array_expr_descriptor(
                 store_byte_aggregate_field(b, desc, 16, IrType::Int(IntWidth::I32), rank);
                 let flags = b.const_i32(2);
                 store_byte_aggregate_field(b, desc, 20, IrType::Int(IntWidth::I32), flags);
+                // Column-major running stride: dims[k].stride is the
+                // running product of extents[0..k]. Prior to this, all
+                // strides were hardcoded to 1, which made reduce/section
+                // helpers walk consecutive bytes for every dim — so
+                // `sum(reshape(...,[2,3]), 1)` summed [x[0]+x[1], x[1]+x[2],
+                // x[2]+x[3]] instead of per-column [x[0]+x[1], x[2]+x[3],
+                // x[4]+x[5]]. Surfaced via stdlib_stats `mean(x, dim)` →
+                // `sum(x, dim)` for any caller passing a reshape result
+                // through an assumed-shape dummy (cov_2_*, var_2_*).
+                let mut running: i64 = 1;
                 for (i, extent) in extents.iter().copied().enumerate() {
                     let base_offset = 24 + (i as i64) * 24;
                     let lower = b.const_i64(1);
                     let upper = b.const_i64(extent);
-                    let stride = b.const_i64(1);
+                    let stride = b.const_i64(running);
                     store_byte_aggregate_field(b, desc, base_offset, IrType::Int(IntWidth::I64), lower);
                     store_byte_aggregate_field(b, desc, base_offset + 8, IrType::Int(IntWidth::I64), upper);
                     store_byte_aggregate_field(b, desc, base_offset + 16, IrType::Int(IntWidth::I64), stride);
+                    running = running.saturating_mul(extent.max(0));
                 }
                 return Some((desc, elem_ty));
             }
