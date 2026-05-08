@@ -3669,6 +3669,61 @@ end program
 }
 
 #[test]
+fn reshape_descriptor_stride_walks_columns_under_dim_reduction() {
+    // F2018 §15.5.2.4: an actual argument that's an intrinsic-call
+    // expression (e.g. `reshape(...)`) passed to an assumed-shape dummy
+    // gets a fresh descriptor.  The reshape descriptor builder used to
+    // hardcode `stride = 1` for every dimension; for column-major dim
+    // k > 0 the stride should be the running product of preceding
+    // extents (so dim[1].stride == extent[0], etc.).  The wrong stride
+    // made `sum(x, 1)` walk consecutive bytes per result column instead
+    // of jumping by `m` rows, returning [x[0]+x[1], x[1]+x[2], …]
+    // instead of the per-column sums.  Surfaced via stdlib_stats `mean`
+    // (= sum/n) → cov_2 / var_2 → example_var / example_cov.
+    let src = write_program(
+        r#"
+program t
+  implicit none
+  call run(reshape([1., 2., 3., 4., 5., 6.], [2, 3]))
+contains
+  subroutine run(x)
+    real, intent(in) :: x(:, :)
+    real :: s(3)
+    s = sum(x, 1)
+    if (any(abs(s - [3.0, 7.0, 11.0]) > 1.0e-6)) error stop 1
+    print *, 'ok'
+  end subroutine
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("reshape_stride_dim_reduce", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "should compile cleanly: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "reshape stride runtime failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected 'ok': {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn matmul_transpose_real_dispatches_to_real_matmul_runtime() {
     // F2018 §16.9.114 + §16.9.198: `matmul(transpose(A), A)` for real A
     // should produce a real-valued m×m matrix.  Two latent bugs collided:
