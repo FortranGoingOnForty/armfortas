@@ -26578,7 +26578,18 @@ pub(super) fn lower_multi_d_section_assign(
         return false;
     }
 
-    let n_dims = dest_args.len();
+    // The section descriptor's rank is the number of Range subscripts —
+    // Element subscripts collapse a dim. Without this, `center(i, :)` on a
+    // rank-2 array would walk dest_desc as rank-2, reading garbage past the
+    // first 24-byte dim entry; only column 1 (offset 0) ever got the
+    // RHS values, the rest stayed zero.
+    let n_dims = dest_args
+        .iter()
+        .filter(|a| matches!(a.value, crate::ast::expr::SectionSubscript::Range { .. }))
+        .count();
+    if n_dims == 0 {
+        return false;
+    }
     let dest_desc = lower_array_section(
         b,
         &ctx.locals,
