@@ -21106,20 +21106,79 @@ pub(super) fn lower_rank_remap_pointer_assignment(
         None => return false,
     };
 
-    // Source must be a Name resolvable to a local with array storage,
-    // so we can read its base_addr and element size. Defer fancier RHS
-    // shapes (sections, function calls) to future work.
-    let src_name = match &value.node {
-        Expr::Name { name } => name.clone(),
+    // Source can be either a bare Name (whole-array pointer assignment)
+    // or a section/element designator (`q(1:k, 1)`) for "remap pointer
+    // to view of fixed-shape array column / row".  The latter is the
+    // pattern used by stdlib_linalg_qr's
+    //   real(sp), pointer :: tau(:)
+    //   tau(1:k) => q(1:k, 1)
+    // — without this branch the rank-remap path returned false, the
+    // pointer descriptor never got populated, and `geqrf(..., tau, ...)`
+    // received a NULL base, SEGV'ing inside slarfg's `*tau = ...` write.
+    // Surfaced across stdlib's QR/EIG cluster: example_qr, qr_space,
+    // pivoting_qr*, eig*, schur*.
+    let (src_base, elem_bytes) = match &value.node {
+        Expr::Name { name } => {
+            let src_info = match ctx.locals.get(&name.to_lowercase()).cloned() {
+                Some(i) => i,
+                None => return false,
+            };
+            if src_info.dims.is_empty() && !src_info.allocatable && !src_info.descriptor_arg {
+                return false;
+            }
+            (
+                array_data_ptr_for_call(b, &src_info),
+                ir_scalar_byte_size(&src_info.ty),
+            )
+        }
+        Expr::FunctionCall { callee, args: src_args } => {
+            // RHS is a designator like `q(1:k, 1)`.  Compute the base
+            // address as the address of the FIRST included element —
+            // for each Range, take the lower bound; for each Element,
+            // take that index.  Then the resulting pointer plus the
+            // target's bounds form the remapped view.
+            let Expr::Name { name: src_name } = &callee.node else {
+                return false;
+            };
+            let src_info = match ctx.locals.get(&src_name.to_lowercase()).cloned() {
+                Some(i) => i,
+                None => return false,
+            };
+            if src_info.dims.is_empty() && !src_info.allocatable && !src_info.descriptor_arg {
+                return false;
+            }
+            // Build first-element subscripts: turn each Range(lower:..)
+            // into Element(lower).  We use lower_array_element_addr
+            // which expects all-Element args.  Defer Range with no
+            // explicit `start` (`q(:, 1)`) — synthesizing a literal `1`
+            // here would need a span and the AST IntegerLiteral takes
+            // a `text` field; the explicit-start form covers stdlib's
+            // qr/eig usage `q(1:k, 1)` end-to-end.
+            use crate::ast::expr::{Argument, SectionSubscript};
+            let mut first_elem_args: Vec<Argument> = Vec::with_capacity(src_args.len());
+            for a in src_args {
+                let elem_expr = match &a.value {
+                    SectionSubscript::Element(e) => e.clone(),
+                    SectionSubscript::Range { start: Some(s), .. } => s.clone(),
+                    _ => return false,
+                };
+                first_elem_args.push(Argument {
+                    keyword: None,
+                    value: SectionSubscript::Element(elem_expr),
+                });
+            }
+            let base = lower_array_element_addr(
+                b,
+                &ctx.locals,
+                &src_info,
+                &first_elem_args,
+                ctx.st,
+                Some(ctx.type_layouts),
+            );
+            (base, ir_scalar_byte_size(&src_info.ty))
+        }
         _ => return false,
     };
-    let src_info = match ctx.locals.get(&src_name.to_lowercase()).cloned() {
-        Some(i) => i,
-        None => return false,
-    };
-    if src_info.dims.is_empty() && !src_info.allocatable && !src_info.descriptor_arg {
-        return false;
-    }
 
     // Compute (lower, upper, stride=1) from each Range subscript.
     let mut bounds: Vec<(ValueId, ValueId)> = Vec::with_capacity(target_args.len());
@@ -21152,9 +21211,6 @@ pub(super) fn lower_rank_remap_pointer_assignment(
         };
         bounds.push((lo, hi));
     }
-
-    let src_base = array_data_ptr_for_call(b, &src_info);
-    let elem_bytes = ir_scalar_byte_size(&src_info.ty);
 
     let desc = array_descriptor_addr(b, &tgt_info);
     let zero32 = b.const_i32(0);
