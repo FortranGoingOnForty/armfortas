@@ -2215,6 +2215,130 @@ pub extern "C" fn afs_array_count_logical(desc: *const ArrayDescriptor) -> i32 {
     count
 }
 
+/// COUNT(mask, DIM=k) — reduce along dimension k, allocate `dst` with
+/// rank `mask.rank - 1` and extents = mask extents minus the reduction
+/// dim, fill with per-slice counts of true elements (i32). Caller passes
+/// a zeroed 384-byte descriptor; this helper populates it. Surfaced in
+/// stdlib_stats var_mask_2_*: `n = count(mask, dim)` where n is rank-1
+/// (and a real array — caller does the int→real conversion after).
+/// Without this helper count(mask, dim) lowered to the rank-0 helper
+/// and returned a single int, which the compiler then passed as the
+/// source descriptor pointer to afs_assign_allocatable, crashing with
+/// a misaligned-pointer dereference (address 0x3 = the count value).
+#[no_mangle]
+pub extern "C" fn afs_array_count_logical_dim(
+    src: *const ArrayDescriptor,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+) {
+    if src.is_null() || dst.is_null() {
+        return;
+    }
+    let s = unsafe { &*src };
+    let d = unsafe { &mut *dst };
+    if s.base_addr.is_null() {
+        return;
+    }
+    if !d.is_allocated() {
+        let new_rank = (s.rank - 1).max(0);
+        let mut dim_buf: [DimDescriptor; 15] = [DimDescriptor {
+            lower_bound: 0,
+            upper_bound: 0,
+            stride: 0,
+        }; 15];
+        let mut k = 0usize;
+        let mut acc: i64 = 1;
+        for i in 0..s.rank as usize {
+            if i + 1 == dim as usize {
+                continue;
+            }
+            let extent = s.dims[i].extent();
+            dim_buf[k].lower_bound = 1;
+            dim_buf[k].upper_bound = extent;
+            dim_buf[k].stride = acc;
+            acc *= extent;
+            k += 1;
+        }
+        let dim_ptr = if new_rank > 0 {
+            dim_buf.as_ptr()
+        } else {
+            ptr::null()
+        };
+        let mut stat: i32 = 0;
+        // Result is integer(int32) per F2018 §16.9.46 default kind.
+        afs_allocate_array(dst, 4, new_rank, dim_ptr, &mut stat);
+        if stat != 0 || d.base_addr.is_null() {
+            return;
+        }
+    }
+    let dst_total = d.total_elements() as usize;
+    let buf = d.base_addr as *mut i32;
+    for i in 0..dst_total {
+        unsafe {
+            *buf.add(i) = 0;
+        }
+    }
+    // Walk the mask in column-major order. logical_desc_value uses a
+    // flat index which itself does column-major stride math, so we
+    // mirror that here rather than use for_each_reduce_along_dim
+    // (which gives byte offsets — not what logical_desc_value wants).
+    let rank = s.rank as usize;
+    if rank == 0 {
+        return;
+    }
+    let reduce_dim_idx = dim as usize - 1;
+    if reduce_dim_idx >= rank {
+        return;
+    }
+    let mut extents: [i64; 15] = [0; 15];
+    let mut dst_running_stride: [i64; 15] = [0; 15];
+    let mut k = 0usize;
+    let mut acc = 1i64;
+    for i in 0..rank {
+        extents[i] = s.dims[i].extent();
+        if i == reduce_dim_idx {
+            continue;
+        }
+        dst_running_stride[k] = acc;
+        acc *= extents[i];
+        k += 1;
+    }
+    let mut idx: [i64; 15] = [0; 15];
+    let total = (0..rank).map(|i| extents[i]).product::<i64>();
+    if total <= 0 {
+        return;
+    }
+    for _ in 0..total {
+        // Flat (column-major) index into the source mask.
+        let mut src_flat: i64 = 0;
+        let mut src_stride: i64 = 1;
+        for d_i in 0..rank {
+            src_flat += idx[d_i] * src_stride;
+            src_stride *= extents[d_i];
+        }
+        let mut dst_flat: i64 = 0;
+        let mut dk = 0usize;
+        for d_i in 0..rank {
+            if d_i != reduce_dim_idx {
+                dst_flat += idx[d_i] * dst_running_stride[dk];
+                dk += 1;
+            }
+        }
+        if logical_desc_value(s, src_flat as usize) {
+            unsafe {
+                *buf.add(dst_flat as usize) += 1;
+            }
+        }
+        for d_i in 0..rank {
+            idx[d_i] += 1;
+            if idx[d_i] < extents[d_i] {
+                break;
+            }
+            idx[d_i] = 0;
+        }
+    }
+}
+
 /// NORM2(array) — Euclidean norm `sqrt(sum(x**2))` (real(8)).
 /// F2018 §16.9.158. Respects strides for non-contiguous sections.
 #[no_mangle]
