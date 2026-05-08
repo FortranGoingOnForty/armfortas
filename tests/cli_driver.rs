@@ -3521,6 +3521,76 @@ fn allocate_bounds_size_intrinsic_lowers_without_raw_symbol() {
 }
 
 #[test]
+fn allocate_with_source_from_assumed_shape_dummy_populates_base_addr() {
+    // F2018 §9.7.1.2: ALLOCATE(..., SOURCE=expr) requires only that
+    // SOURCE-expr have a defined value of the right shape — it doesn't
+    // have to be itself an ALLOCATABLE.  The common stdlib pattern is:
+    //
+    //     pure module function det(a) result(d)
+    //       real(dp), intent(in) :: a(:,:)        ! assumed-shape dummy
+    //       real(dp), allocatable :: amat(:,:)
+    //       allocate(amat(size(a,1), size(a,2)), source=a)
+    //
+    // afs_prepare_array_copy used to require both `dest.is_allocated()`
+    // AND `source.is_allocated()`.  But assumed-shape dummies carry
+    // flags=DESC_CONTIGUOUS only — they're bound to the caller's data,
+    // not owned/allocated.  The check failed, the runtime freed the
+    // freshly-allocated dest buffer, zeroed dest.base_addr, and the
+    // next read of `amat(1,1)` faulted.  Surfaced as SEGV in stdlib's
+    // det / determinant / eig / qr / lstsq / solve_chol clusters.
+    let src = write_program(
+        r#"
+module m
+  implicit none
+  integer, parameter :: dp = kind(1.0d0)
+contains
+  function copy_via_source(a) result(s)
+    real(dp), intent(in) :: a(:, :)
+    real(dp) :: s
+    real(dp), allocatable :: amat(:, :)
+    allocate(amat(size(a,1), size(a,2)), source=a)
+    s = amat(1, 1) + amat(2, 1)
+    deallocate(amat)
+  end function
+end module
+program t
+  use m
+  implicit none
+  real(dp) :: r
+  r = copy_via_source(reshape([1.0_dp, 2.0_dp, 3.0_dp, 4.0_dp], [2, 2]))
+  if (abs(r - 3.0_dp) > 1.0e-12_dp) error stop 1
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("alloc_source_assumed_shape", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("alloc-source compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "should compile cleanly: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "alloc(source=assumed_shape) runtime failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected 'ok' from alloc-source: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn automatic_component_array_bound_size_lowers_without_raw_symbol() {
     let src = write_program(
         "module m\n  implicit none\n  type :: state_set_t\n    integer(8) :: bits(4) = 0_8\n  contains\n    procedure :: f\n  end type\ncontains\n  subroutine f(state_set)\n    type(state_set_t), intent(inout) :: state_set\n    integer(8) :: original_bits(size(state_set%bits))\n    original_bits = state_set%bits\n    print *, size(original_bits)\n  end subroutine\nend module\n",

@@ -1209,8 +1209,16 @@ pub extern "C" fn afs_prepare_array_copy(
     let dest = unsafe { &mut *dest };
     let source = unsafe { &*source };
 
+    // F2018 §9.7.1.2: SOURCE-expr need only have a defined value of the
+    // right type/kind/shape — it doesn't have to be an ALLOCATABLE.
+    // Common case: `allocate(amat(...), source=a)` where `a` is an
+    // assumed-shape dummy `a(:,:)`.  Such dummies have flags=CONTIGUOUS
+    // (no DESC_ALLOCATED) since they're bound to the caller's data, not
+    // owned.  Treat the source as valid as long as it has a non-null
+    // base_addr; require DESC_ALLOCATED only on the freshly-allocated
+    // destination.
     let ok = dest.is_allocated()
-        && source.is_allocated()
+        && !source.base_addr.is_null()
         && dest.elem_size == source.elem_size
         && dest.rank == source.rank
         && (0..dest.rank as usize).all(|i| dest.dims[i].extent() == source.dims[i].extent());
