@@ -3669,6 +3669,73 @@ end program
 }
 
 #[test]
+fn matmul_transpose_real_dispatches_to_real_matmul_runtime() {
+    // F2018 §16.9.114 + §16.9.198: `matmul(transpose(A), A)` for real A
+    // should produce a real-valued m×m matrix.  Two latent bugs collided:
+    //   (a) `afs_transpose_real8/_int` used row-major index formulas
+    //       (`rp[j*m+i] = sp[i*n+j]`) on Fortran's column-major data —
+    //       for any non-square A the dest got a permuted-but-not-
+    //       transposed layout that read as zeros once consumed by matmul.
+    //   (b) `first_arg_is_real` only matched `Expr::Name`, so the real
+    //       matmul saw `transpose(A)` (a FunctionCall) as "not real" and
+    //       dispatched to `afs_matmul_int`, which interpreted f32 bytes
+    //       as i32, summed garbage, and dropped the result on store.
+    // Both surfaced in stdlib_stats `cov_2_*` whose body computes
+    // `res = matmul(transpose(center), center)` — example_cov produced
+    // an all-zero covariance matrix instead of the diagonal it should.
+    let src = write_program(
+        r#"
+program t
+  implicit none
+  real :: A(2, 3)
+  real :: R(3, 3)
+  integer :: i, j
+  A(1, :) = -0.5
+  A(2, :) =  0.5
+  R = matmul(transpose(A), A)
+  ! Each (i,j) should be 0.5: sum_k transpose(A)(i,k) * A(k,j)
+  ! = (-0.5)(-0.5) + (0.5)(0.5) = 0.5
+  do j = 1, 3
+    do i = 1, 3
+      if (abs(R(i,j) - 0.5) > 1.0e-6) then
+        print *, 'fail at (', i, ',', j, ') = ', R(i,j)
+        error stop 1
+      end if
+    end do
+  end do
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("matmul_transpose_real", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "should compile cleanly: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "matmul(transpose(A), A) runtime failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected 'ok': {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn count_with_dim_returns_per_slice_integer_array() {
     // F2018 §16.9.46: COUNT(MASK, DIM=k) returns an integer ARRAY of
     // rank N-1 with per-slice true-element counts. The scalar logical-
