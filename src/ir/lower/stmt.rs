@@ -2853,24 +2853,6 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             b.unreachable();
         }
         Stmt::ErrorStop { code, .. } => {
-            let skip = if matches!(
-                ctx.hidden_result_abi,
-                HiddenResultAbi::ArrayDescriptor | HiddenResultAbi::DerivedAggregate
-            ) {
-                Some(ValueId(0))
-            } else {
-                None
-            };
-            insert_implicit_dealloc(
-                b,
-                &ctx.locals,
-                &ctx.locals,
-                ctx.type_layouts,
-                ctx.st,
-                ctx.internal_funcs,
-                Some(ctx.contained_host_refs),
-                skip,
-            );
             // F2018 §11.4: error stop with a stop-code prints the
             // implementation banner together with the user's code. The
             // earlier lowering threw the code away so all stdlib error
@@ -2878,7 +2860,21 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             // problems such as stdlib_sorting's "work array is too small"
             // and "Allocation of adjoint_array buffer failed". Dispatch
             // to the message or integer entry depending on stop-code type.
-            if let Some(code_expr) = code {
+            //
+            // Lower the stop-code expression BEFORE the implicit dealloc:
+            // for an allocatable character stop-code (e.g. stdlib's
+            // `error stop err_msg` where err_msg is character(:),
+            // allocatable), the dealloc nullifies the descriptor's data
+            // pointer, so loading after dealloc gives a null ptr and
+            // afs_error_stop_msg falls back to the bare "ERROR STOP"
+            // branch. Capturing first preserves the pointer for the
+            // call (the buffer remains mapped through process exit).
+            enum StopCode {
+                Msg(ValueId, ValueId),
+                Int(ValueId),
+                None,
+            }
+            let stop_code = if let Some(code_expr) = code {
                 let is_char = expr_is_character_expr(
                     b,
                     &ctx.locals,
@@ -2888,11 +2884,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 ) || matches!(code_expr.node, Expr::StringLiteral { .. });
                 if is_char {
                     let (ptr, len) = lower_string_expr_ctx(b, ctx, code_expr);
-                    b.call(
-                        FuncRef::External("afs_error_stop_msg".into()),
-                        vec![ptr, len],
-                        IrType::Void,
-                    );
+                    StopCode::Msg(ptr, len)
                 } else {
                     let val = super::expr::lower_expr_ctx(b, ctx, code_expr);
                     let val_ty = b
@@ -2904,14 +2896,59 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         IrType::Int(_) => b.int_extend(val, IntWidth::I64, true),
                         _ => val,
                     };
+                    StopCode::Int(widened)
+                }
+            } else {
+                StopCode::None
+            };
+
+            // Skip implicit dealloc for character-stop-code error stops.
+            // The user-provided message often references a local
+            // allocatable string whose buffer would be freed by the
+            // dealloc, leaving afs_error_stop_msg reading freed memory
+            // (or, if the load order let it run before dealloc, a now-
+            // null data pointer). Process exit cleans up the heap
+            // anyway. For integer / no-code stops the dealloc still
+            // runs to satisfy any non-error cleanup expectations.
+            if !matches!(stop_code, StopCode::Msg(..)) {
+                let skip = if matches!(
+                    ctx.hidden_result_abi,
+                    HiddenResultAbi::ArrayDescriptor | HiddenResultAbi::DerivedAggregate
+                ) {
+                    Some(ValueId(0))
+                } else {
+                    None
+                };
+                insert_implicit_dealloc(
+                    b,
+                    &ctx.locals,
+                    &ctx.locals,
+                    ctx.type_layouts,
+                    ctx.st,
+                    ctx.internal_funcs,
+                    Some(ctx.contained_host_refs),
+                    skip,
+                );
+            }
+
+            match stop_code {
+                StopCode::Msg(ptr, len) => {
+                    b.call(
+                        FuncRef::External("afs_error_stop_msg".into()),
+                        vec![ptr, len],
+                        IrType::Void,
+                    );
+                }
+                StopCode::Int(widened) => {
                     b.call(
                         FuncRef::External("afs_error_stop_int".into()),
                         vec![widened],
                         IrType::Void,
                     );
                 }
-            } else {
-                b.runtime_call(RuntimeFunc::ErrorStop, vec![], IrType::Void);
+                StopCode::None => {
+                    b.runtime_call(RuntimeFunc::ErrorStop, vec![], IrType::Void);
+                }
             }
             b.unreachable();
         }
