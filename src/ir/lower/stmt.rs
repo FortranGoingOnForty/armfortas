@@ -2796,7 +2796,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             b.runtime_call(RuntimeFunc::Stop, vec![], IrType::Void);
             b.unreachable();
         }
-        Stmt::ErrorStop { .. } => {
+        Stmt::ErrorStop { code, .. } => {
             let skip = if matches!(
                 ctx.hidden_result_abi,
                 HiddenResultAbi::ArrayDescriptor | HiddenResultAbi::DerivedAggregate
@@ -2815,7 +2815,48 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 Some(ctx.contained_host_refs),
                 skip,
             );
-            b.runtime_call(RuntimeFunc::ErrorStop, vec![], IrType::Void);
+            // F2018 §11.4: error stop with a stop-code prints the
+            // implementation banner together with the user's code. The
+            // earlier lowering threw the code away so all stdlib error
+            // diagnostics surfaced as bare "ERROR STOP" — masking real
+            // problems such as stdlib_sorting's "work array is too small"
+            // and "Allocation of adjoint_array buffer failed". Dispatch
+            // to the message or integer entry depending on stop-code type.
+            if let Some(code_expr) = code {
+                let is_char = expr_is_character_expr(
+                    b,
+                    &ctx.locals,
+                    code_expr,
+                    ctx.st,
+                    Some(ctx.type_layouts),
+                ) || matches!(code_expr.node, Expr::StringLiteral { .. });
+                if is_char {
+                    let (ptr, len) = lower_string_expr_ctx(b, ctx, code_expr);
+                    b.call(
+                        FuncRef::External("afs_error_stop_msg".into()),
+                        vec![ptr, len],
+                        IrType::Void,
+                    );
+                } else {
+                    let val = super::expr::lower_expr_ctx(b, ctx, code_expr);
+                    let val_ty = b
+                        .func()
+                        .value_type(val)
+                        .unwrap_or(IrType::Int(IntWidth::I64));
+                    let widened = match val_ty {
+                        IrType::Int(IntWidth::I64) => val,
+                        IrType::Int(_) => b.int_extend(val, IntWidth::I64, true),
+                        _ => val,
+                    };
+                    b.call(
+                        FuncRef::External("afs_error_stop_int".into()),
+                        vec![widened],
+                        IrType::Void,
+                    );
+                }
+            } else {
+                b.runtime_call(RuntimeFunc::ErrorStop, vec![], IrType::Void);
+            }
             b.unreachable();
         }
 
