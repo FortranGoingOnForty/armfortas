@@ -540,6 +540,67 @@ fn stream_unformatted_char_write_preserves_exact_bytes() {
 }
 
 #[test]
+fn sequential_unformatted_write_emits_record_markers_and_clears_iostat() {
+    let output_file = unique_path("seq_unformatted_iostat", "bin");
+    let src = write_program(
+        &format!(
+            "program p\n  implicit none\n  integer :: ios = -1\n  character(64) :: msg = 'sentinel'\n  integer :: x = 42\n  open(unit=10, file='{}', status='replace', form='unformatted', action='write')\n  write(10, iostat=ios, iomsg=msg) x\n  write(*, '(a,i0)') 'IOS=', ios\n  write(*, '(a,a)') 'MSG=', trim(msg)\n  close(10)\nend program\n",
+            output_file.display()
+        ),
+        "seq_unformatted_iostat.f90",
+    );
+    let out = unique_path("seq_unformatted_iostat", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("seq unformatted iostat compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "seq unformatted iostat compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("seq unformatted iostat run failed");
+    assert!(
+        run.status.success(),
+        "seq unformatted iostat run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("IOS=0"),
+        "expected IOS=0 from successful sequential unformatted write, got: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("MSG=") && !stdout.contains("MSG=sentinel"),
+        "expected iomsg cleared on success, got: {}",
+        stdout
+    );
+
+    let bytes = std::fs::read(&output_file).expect("cannot read seq unformatted output");
+    // gfortran sequential-unformatted record framing: [u32 len][data][u32 len].
+    // For one i32 (42 = 0x2a), that's 4 bytes of length + 4 bytes of data
+    // + 4 bytes of trailing length = 12 bytes total.
+    assert_eq!(
+        bytes,
+        vec![
+            0x04, 0x00, 0x00, 0x00, 0x2a, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
+        ],
+        "expected sequential-unformatted record framing, got {:?}",
+        bytes
+    );
+
+    let _ = std::fs::remove_file(&output_file);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn repeated_nonadvancing_a1_read_preserves_embedded_nul_bytes() {
     let input = unique_path("nonadvancing_a1_char_read", "bin");
     std::fs::write(&input, b"A\0B").expect("cannot write nonadvancing A1 input");
