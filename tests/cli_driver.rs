@@ -650,6 +650,55 @@ fn sequential_unformatted_roundtrip_recovers_three_integers() {
 }
 
 #[test]
+fn runtime_advance_no_via_optval_suppresses_newline_in_formatted_write() {
+    // Stdlib bitsets `write_bitset_unit_64` calls `write(unit,'(A)',
+    // advance=optval(advance,'YES'),...) string`. Because optval is
+    // not a string literal, the prior lowering ignored the advance=
+    // expression entirely and always emitted a newline, corrupting
+    // the file format. Verify a non-literal advance= now suppresses
+    // the newline at runtime.
+    let output_file = unique_path("runtime_advance_no_optval", "txt");
+    let src = write_program(
+        &format!(
+            "module m\ncontains\n  subroutine emit(unit, adv)\n    integer, intent(in) :: unit\n    character(*), intent(in), optional :: adv\n    character(:), allocatable :: a\n    if (present(adv)) then\n      a = adv\n    else\n      a = 'YES'\n    end if\n    write(unit, '(a)', advance=a) 'XYZ'\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  integer :: unit\n  open(newunit=unit, file='{}', status='replace', form='formatted', action='write')\n  call emit(unit, 'no')\n  call emit(unit, 'no')\n  call emit(unit)\n  close(unit)\nend program\n",
+            output_file.display()
+        ),
+        "runtime_advance_no_optval.f90",
+    );
+    let out = unique_path("runtime_advance_no_optval", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("runtime advance compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "runtime advance compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("runtime advance run failed");
+    assert!(
+        run.status.success(),
+        "runtime advance run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let bytes = std::fs::read(&output_file).expect("cannot read advance output file");
+    assert_eq!(
+        bytes, b"XYZXYZXYZ\n",
+        "expected non-literal advance='no' to suppress newlines, got {:?}",
+        bytes
+    );
+
+    let _ = std::fs::remove_file(&output_file);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn repeated_nonadvancing_a1_read_preserves_embedded_nul_bytes() {
     let input = unique_path("nonadvancing_a1_char_read", "bin");
     std::fs::write(&input, b"A\0B").expect("cannot write nonadvancing A1 input");
