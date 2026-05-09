@@ -4525,7 +4525,28 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 b.const_i32(5) // default stdin
             };
             if is_list_directed {
+                // Wrap the per-item reads in begin/end so the runtime
+                // can slurp a sequential-unformatted record up front
+                // and let the typed helpers consume binary bytes.
+                // Formatted units pass through (begin only resets
+                // iostat). iomsg= isn't yet plumbed on the read side;
+                // stick a null pointer for now.
+                let null_iomsg = {
+                    let z = b.const_i64(0);
+                    b.int_to_ptr(z, IrType::Int(IntWidth::I8))
+                };
+                let zero_len = b.const_i64(0);
+                b.call(
+                    FuncRef::External("afs_list_read_begin".into()),
+                    vec![unit, iostat_addr, null_iomsg, zero_len],
+                    IrType::Void,
+                );
                 lower_list_read_items(b, ctx, items, unit, iostat_addr);
+                b.call(
+                    FuncRef::External("afs_list_read_end".into()),
+                    vec![unit, iostat_addr, null_iomsg, zero_len],
+                    IrType::Void,
+                );
             } else {
                 let (fmt_ptr, fmt_len) = lower_string_expr_with_layouts(
                     b,
