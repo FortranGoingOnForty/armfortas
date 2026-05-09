@@ -1395,6 +1395,43 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 })
                 .unwrap_or(true);
 
+            // Optional iostat=ios / iomsg=msg specifiers. The push-based
+            // formatted runtime ignored these on previous builds, so a
+            // caller's `if (ios /= 0) error_stop` always tripped on the
+            // pre-call sentinel — stdlib's savetxt loops exactly that
+            // pattern around `write(unit, fmt_, iostat=ios) d(i, :)` and
+            // unconditionally error_stops every example_savetxt /
+            // example_loadtxt without proper iostat plumbing.
+            let null_i64 = b.const_i64(0);
+            let null_i8_ptr = b.int_to_ptr(null_i64, IrType::Int(IntWidth::I8));
+            let zero_i64 = b.const_i64(0);
+            let iostat_ctrl = controls.iter().find(|c| {
+                c.keyword
+                    .as_deref()
+                    .map(|k| k.eq_ignore_ascii_case("iostat"))
+                    .unwrap_or(false)
+            });
+            let iomsg_ctrl = controls.iter().find(|c| {
+                c.keyword
+                    .as_deref()
+                    .map(|k| k.eq_ignore_ascii_case("iomsg"))
+                    .unwrap_or(false)
+            });
+            let iostat_ptr = iostat_ctrl
+                .map(|c| lower_arg_by_ref_ctx(b, ctx, &c.value))
+                .unwrap_or(null_i8_ptr);
+            let (iomsg_ptr, iomsg_len) = if let Some(c) = iomsg_ctrl {
+                lower_string_expr_with_layouts(
+                    b,
+                    &ctx.locals,
+                    &c.value,
+                    ctx.st,
+                    Some(ctx.type_layouts),
+                )
+            } else {
+                (null_i8_ptr, zero_i64)
+            };
+
             if let Some(ctrl) = controls.first() {
                 if let Some((buf_ptr, buf_len)) = internal_io_buffer(b, ctx, ctrl) {
                     if is_list_directed {
@@ -1408,8 +1445,11 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             Some(ctx.type_layouts),
                         );
                         b.call(
-                            FuncRef::External("afs_fmt_begin_internal".into()),
-                            vec![buf_ptr, buf_len, fmt_ptr, fmt_len],
+                            FuncRef::External("afs_fmt_begin_internal_ex".into()),
+                            vec![
+                                buf_ptr, buf_len, fmt_ptr, fmt_len, iostat_ptr, iomsg_ptr,
+                                iomsg_len,
+                            ],
                             IrType::Void,
                         );
                         for item in items {
@@ -1449,8 +1489,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     Some(ctx.type_layouts),
                 );
                 b.call(
-                    FuncRef::External("afs_fmt_begin".into()),
-                    vec![unit, fmt_ptr, fmt_len],
+                    FuncRef::External("afs_fmt_begin_ex".into()),
+                    vec![unit, fmt_ptr, fmt_len, iostat_ptr, iomsg_ptr, iomsg_len],
                     IrType::Void,
                 );
 

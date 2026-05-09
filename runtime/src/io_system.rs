@@ -2577,7 +2577,14 @@ struct FmtContext {
     sink: FmtSink,
     format_str: String,
     values: Vec<IoValue>,
+    iostat: *mut i32,
+    iomsg: *mut u8,
+    iomsg_len: i64,
 }
+
+// SAFETY: FmtContext only lives inside a thread-local; the raw
+// pointers are written by the same thread that begins the I/O.
+unsafe impl Send for FmtContext {}
 
 thread_local! {
     static FMT_CTX: RefCell<Option<FmtContext>> = const { RefCell::new(None) };
@@ -2587,12 +2594,36 @@ thread_local! {
 /// to accumulate values.
 #[no_mangle]
 pub extern "C" fn afs_fmt_begin(unit: i32, fmt_str: *const u8, fmt_len: i64) {
+    afs_fmt_begin_ex(
+        unit,
+        fmt_str,
+        fmt_len,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        0,
+    );
+}
+
+/// Extended formatted-write begin: accepts iostat and iomsg pointers
+/// captured from the WRITE-statement specs. Either pointer may be null.
+#[no_mangle]
+pub extern "C" fn afs_fmt_begin_ex(
+    unit: i32,
+    fmt_str: *const u8,
+    fmt_len: i64,
+    iostat: *mut i32,
+    iomsg: *mut u8,
+    iomsg_len: i64,
+) {
     let fmt = unsafe_str(fmt_str, fmt_len);
     FMT_CTX.with(|ctx| {
         *ctx.borrow_mut() = Some(FmtContext {
             sink: FmtSink::Unit(unit),
             format_str: fmt,
             values: Vec::new(),
+            iostat,
+            iomsg,
+            iomsg_len,
         });
     });
 }
@@ -2605,6 +2636,28 @@ pub extern "C" fn afs_fmt_begin_internal(
     fmt_str: *const u8,
     fmt_len: i64,
 ) {
+    afs_fmt_begin_internal_ex(
+        buf,
+        buf_len,
+        fmt_str,
+        fmt_len,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        0,
+    );
+}
+
+/// Extended internal-write begin with iostat/iomsg plumbing.
+#[no_mangle]
+pub extern "C" fn afs_fmt_begin_internal_ex(
+    buf: *mut u8,
+    buf_len: i64,
+    fmt_str: *const u8,
+    fmt_len: i64,
+    iostat: *mut i32,
+    iomsg: *mut u8,
+    iomsg_len: i64,
+) {
     let fmt = unsafe_str(fmt_str, fmt_len);
     FMT_CTX.with(|ctx| {
         *ctx.borrow_mut() = Some(FmtContext {
@@ -2614,6 +2667,9 @@ pub extern "C" fn afs_fmt_begin_internal(
             },
             format_str: fmt,
             values: Vec::new(),
+            iostat,
+            iomsg,
+            iomsg_len,
         });
     });
 }
@@ -2686,18 +2742,52 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
             let mut engine = FormatEngine::new(descriptors);
             let output = engine.format_values(&c.values);
 
+            // Track success across the sink branches. List-directed and
+            // scalar formatted writes both leave `iostat` untouched on
+            // older builds; stdlib's savetxt loops `if (ios/=0) error_stop`
+            // on the post-write value, so a write that silently leaves the
+            // pre-call sentinel in place trips the error-stop branch every
+            // iteration. Set `*iostat = 0` on success and stash an empty
+            // iomsg so callers see a clean state.
+            let mut io_status: i32 = 0;
+            let mut io_msg: Option<&'static str> = None;
+
             match c.sink {
                 FmtSink::Unit(unit) => {
                     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(u) = state.get_unit(unit) {
-                        let _ = u.write_str(&output);
-                        if advance != 0 {
-                            let _ = u.write_str("\n");
+                        if u.write_str(&output).is_err() {
+                            io_status = 1;
+                            io_msg = Some("write failed");
                         }
+                        if io_status == 0 && advance != 0 && u.write_str("\n").is_err() {
+                            io_status = 1;
+                            io_msg = Some("write failed");
+                        }
+                    } else {
+                        io_status = 1;
+                        io_msg = Some("unit not connected");
                     }
                 }
                 FmtSink::Internal { buf, buf_len } => {
                     write_to_buffer(buf, buf_len, 0, output.as_bytes(), std::ptr::null_mut());
+                }
+            }
+
+            if !c.iostat.is_null() {
+                unsafe { *c.iostat = io_status };
+            }
+            if !c.iomsg.is_null() && c.iomsg_len > 0 {
+                let msg = io_msg.unwrap_or("");
+                let cap = c.iomsg_len as usize;
+                let bytes = msg.as_bytes();
+                let copy = bytes.len().min(cap);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), c.iomsg, copy);
+                    if copy < cap {
+                        // Pad remainder with spaces per Fortran character semantics.
+                        std::ptr::write_bytes(c.iomsg.add(copy), b' ', cap - copy);
+                    }
                 }
             }
         }
