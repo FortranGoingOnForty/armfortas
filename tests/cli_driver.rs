@@ -18273,6 +18273,55 @@ fn formatted_section_write_iterates_assumed_shape_dummy_section() {
 }
 
 #[test]
+fn formatted_section_read_iterates_allocatable_dummy_section() {
+    // Regression: stdlib's loadtxt allocates an `intent(out)` rank-2
+    // allocatable inside the subroutine and reads each row via
+    // `read(u, fmt_, iostat=ios) d(i, :)`. Two bugs combined to silently
+    // fill the destination with zeros: (1) the dispatch in
+    // lower_array_read_item only routed through lower_alloc_section_read
+    // when info.allocatable was set, missing assumed-shape dummies that
+    // also use the descriptor (info.descriptor_arg). (2) The descriptor-
+    // driven offset computation multiplied by both cum_extent AND
+    // mem_stride, double-counting the per-dim stride that descriptor
+    // materialization had already folded into the extent product (lost
+    // fix from 4986129).  Verify a 2-D allocatable populated row-by-row
+    // through a dummy section now contains the correct values.
+    let src = write_program(
+        "module mio\n  implicit none\ncontains\n  subroutine load_d(filename, d)\n    character(len=*), intent(in) :: filename\n    real, allocatable, intent(out) :: d(:, :)\n    integer :: i, ios, u\n    character(len=128) :: iomsg\n    character(len=:), allocatable :: fmt_\n    fmt_ = '(*(es15.8,:,1x))'\n    allocate(d(3, 2))\n    open(newunit=u, file=filename, status='old')\n    do i = 1, 3\n      read(u, fmt_, iostat=ios, iomsg=iomsg) d(i, :)\n      if (ios /= 0) error stop 'inner read failed'\n    end do\n    close(u)\n  end subroutine\nend module\n\nprogram p\n  use mio\n  implicit none\n  real, allocatable :: x(:, :)\n  open(unit=20, file='/tmp/afs_section_dummy_read.dat', status='replace')\n  write(20, '(A)') ' 1.00000000E+00  4.00000000E+00'\n  write(20, '(A)') ' 2.00000000E+00  5.00000000E+00'\n  write(20, '(A)') ' 3.00000000E+00  6.00000000E+00'\n  close(20)\n  call load_d('/tmp/afs_section_dummy_read.dat', x)\n  if (.not. allocated(x)) error stop 1\n  if (abs(x(1,1) - 1.0) > 1e-6) error stop 2\n  if (abs(x(3,2) - 6.0) > 1e-6) error stop 3\n  print *, 'DONE'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("section_dummy_read", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("section dummy read compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "section dummy read should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "section dummy read should run cleanly: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("DONE"),
+        "expected DONE in output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file("/tmp/afs_section_dummy_read.dat");
+}
+
+#[test]
 fn list_directed_read_unit_real_returns_correct_f32_value() {
     // Regression: lower_read_into_addr's IrType::Float(F32) arm allocated
     // an f64 temp and called afs_read_real (the f32 entry, *mut f32) on
