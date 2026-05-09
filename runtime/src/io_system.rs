@@ -3450,7 +3450,15 @@ pub extern "C" fn afs_fmt_read_string(
     {
         let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(u) = state.get_unit(unit) {
-            let has_partial_record = u.formatted_read_record.is_some()
+            // Only treat the in-flight record as partial when the
+            // cursor has actually advanced past 0 — i.e. a previous
+            // `read(...,advance='NO')` consumed some chars. A cursor
+            // of 0 means the record was set up by `read_line` for an
+            // advancing read but never partially consumed; in that
+            // case we must let the next advancing read pull a fresh
+            // record (otherwise we'd re-deliver the same line).
+            let has_partial_record = u.formatted_read_cursor > 0
+                && u.formatted_read_record.is_some()
                 && u.formatted_read_cursor
                     < u.formatted_read_record
                         .as_ref()
