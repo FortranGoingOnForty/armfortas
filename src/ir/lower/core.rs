@@ -22732,6 +22732,19 @@ pub(super) fn try_lower_scalarized_subscript_array_assign(
     if dest_info.dims.len() != 1 && !local_uses_array_descriptor(dest_info) {
         return false;
     }
+    // F2018 §10.2.1.3: an allocatable LHS gets reallocated to the RHS
+    // shape before assignment. Synthesizing `dest(i) = rhs(i)` over
+    // `1..size(dest)` iterates 0 times when dest is unallocated, leaving
+    // dest empty and any subsequent dest(1) read trapping with
+    // `index 1 outside [1, 0]`. Bail to lower_array_assign's
+    // descriptor path which materializes the RHS as a fresh descriptor
+    // and calls afs_assign_allocatable to (re)allocate dest. Surfaced
+    // by `r = sqrt(w)` for allocatable r and stdlib_linalg's
+    // `sqrt_w = sqrt(w)` / `b_scaled = sqrt_w * b` setup in
+    // weighted_lstsq.
+    if dest_info.allocatable {
+        return false;
+    }
     // Skip scalarization when the RHS contains a transformational
     // intrinsic that consumes a whole array (transpose, matmul,
     // reshape, shape). Their argument lowering needs the descriptor
