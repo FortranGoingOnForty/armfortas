@@ -44,3 +44,34 @@ pub extern "C" fn afs_error_stop() {
     afs_program_finalize();
     process::exit(1);
 }
+
+/// Fortran `ERROR STOP "message"` (character stop-code). Prints the
+/// implementation-defined banner followed by the user message — gfortran
+/// emits `ERROR STOP <msg>`. Without this, `error stop "Allocation of
+/// adjoint_array buffer failed."` printed only the bare banner, hiding the
+/// actual diagnostic from stdlib's sort_adjoint / sort_index / many other
+/// callers.
+#[no_mangle]
+pub extern "C" fn afs_error_stop_msg(ptr: *const u8, len: i64) {
+    if !ptr.is_null() && len > 0 {
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+        let msg = String::from_utf8_lossy(bytes);
+        eprintln!("ERROR STOP {}", msg);
+    } else {
+        eprintln!("ERROR STOP");
+    }
+    afs_program_finalize();
+    process::exit(1);
+}
+
+/// Fortran `ERROR STOP <int>` (integer stop-code). Prints `ERROR STOP <n>`
+/// and exits with that code (clamped to 1..=255 since Unix exit codes are
+/// 8-bit). A code of 0 still produces exit 1 — `error stop 0` is meant to
+/// be an abnormal termination.
+#[no_mangle]
+pub extern "C" fn afs_error_stop_int(code: i64) {
+    eprintln!("ERROR STOP {}", code);
+    afs_program_finalize();
+    let exit_code = if code > 0 && code <= 255 { code as i32 } else { 1 };
+    process::exit(exit_code);
+}
