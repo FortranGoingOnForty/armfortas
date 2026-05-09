@@ -601,6 +601,55 @@ fn sequential_unformatted_write_emits_record_markers_and_clears_iostat() {
 }
 
 #[test]
+fn sequential_unformatted_roundtrip_recovers_three_integers() {
+    let bin = unique_path("seq_unformatted_roundtrip", "bin");
+    let src = write_program(
+        &format!(
+            "program p\n  implicit none\n  integer :: ios\n  integer :: a, b, c\n  a = 7; b = 11; c = 13\n  open(unit=11, file='{}', status='replace', form='unformatted', action='write')\n  write(11) a, b, c\n  close(11)\n  open(unit=11, file='{}', status='old', form='unformatted', action='read')\n  a = 0; b = 0; c = 0\n  read(11, iostat=ios) a, b, c\n  write(*, '(a,i0)') 'IOS=', ios\n  write(*, '(a,i0,a,i0,a,i0)') 'A=', a, ' B=', b, ' C=', c\n  close(11)\nend program\n",
+            bin.display(),
+            bin.display()
+        ),
+        "seq_unformatted_roundtrip.f90",
+    );
+    let out = unique_path("seq_unformatted_roundtrip", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("seq unformatted roundtrip compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "seq unformatted roundtrip compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("seq unformatted roundtrip run failed");
+    assert!(
+        run.status.success(),
+        "seq unformatted roundtrip run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("IOS=0"),
+        "expected IOS=0 from successful unformatted read, got: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("A=7 B=11 C=13"),
+        "expected the three values to round-trip cleanly, got: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&bin);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn repeated_nonadvancing_a1_read_preserves_embedded_nul_bytes() {
     let input = unique_path("nonadvancing_a1_char_read", "bin");
     std::fs::write(&input, b"A\0B").expect("cannot write nonadvancing A1 input");
