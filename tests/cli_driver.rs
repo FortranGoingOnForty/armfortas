@@ -18222,6 +18222,57 @@ fn formatted_write_of_concat_with_internal_char_function_runs() {
 }
 
 #[test]
+fn formatted_write_iterates_whole_array_real_and_int() {
+    // Regression: lower_fmt_push used to drop array items into the
+    // IrType::Ptr scalar arm and dispatch to afs_fmt_push_string with a
+    // junk length, so `write(*, '(fmt)') array` produced no output for
+    // any rank or element type.  Verify the per-element loop now emits
+    // afs_fmt_push_real / afs_fmt_push_int and walks every element of a
+    // whole-array name AND a 2-D row-section (savetxt's pattern).
+    let src = write_program(
+        "program p\n  implicit none\n  real :: x(3) = [1.0, 2.0, 3.0]\n  integer :: a(3) = [10, 20, 30]\n  real(kind=8) :: m(2, 3)\n  m = reshape([1.0d0, 2.0d0, 3.0d0, 4.0d0, 5.0d0, 6.0d0], shape=[2, 3])\n  write(*, '(*(es10.3,1x))') x\n  write(*, '(*(i0,1x))') a\n  write(*, '(*(es10.3,1x))') m(1, :)\nend program\n",
+        "f90",
+    );
+    let out = unique_path("formatted_array_iter", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("formatted array iter compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "formatted array iter should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "formatted array iter should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("1.000E+00") && stdout.contains("3.000E+00"),
+        "expected whole-array real elements in output: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("10 20 30"),
+        "expected whole-array int elements in output: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("5.000E+00"),
+        "expected 2D row-section element 5 in output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn contained_subroutine_forwards_derived_dummy_by_ref() {
     let src = write_program(
         "module m\n  implicit none\n  type :: t\n    integer :: pad(2000) = 0\n    integer :: x = 0\n  end type\ncontains\n  subroutine setx(a)\n    type(t), intent(inout) :: a\n    a%x = 7\n  end subroutine\nend module\n\nprogram p\n  use m\n  implicit none\n  type(t), allocatable :: v\n  allocate(v)\n  call init(v)\n  print *, v%x\ncontains\n  subroutine init(a)\n    type(t), intent(out) :: a\n    call setx(a)\n  end subroutine\nend program\n",
