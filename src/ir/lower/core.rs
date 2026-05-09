@@ -18816,10 +18816,22 @@ pub(super) fn lower_array_store(
     }
     let elem_ptr = b.gep(base, vec![idx64], info.ty.clone());
     if is_complex_ty(&info.ty) {
+        // RHS may already be a complex buffer pointer (most call/literal
+        // paths) or a plain scalar int/real (Fortran allows `c(i) = n`).
+        // For the scalar case materialize a fresh [fN x 2] buffer first
+        // — passing the scalar value as the memcpy src dereferences a
+        // junk pointer.
+        let src_ty = b.func().value_type(value);
+        let src = if matches!(&src_ty, Some(t) if is_complex_ty(t)) {
+            value
+        } else {
+            let fw = complex_float_width(&info.ty);
+            materialize_complex_operand(b, value, fw)
+        };
         let size = b.const_i64(complex_byte_size(&info.ty));
         b.call(
             FuncRef::External("memcpy".into()),
-            vec![elem_ptr, value, size],
+            vec![elem_ptr, src, size],
             IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
         );
         return;
