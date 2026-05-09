@@ -782,6 +782,50 @@ fn same_module_routine_dispatches_generic_to_complex_specific() {
 }
 
 #[test]
+fn error_stop_with_allocatable_character_message_prints_user_text() {
+    // Stdlib's linalg_error_handling does
+    //   err_msg = ierr%print()
+    //   error stop err_msg
+    // where err_msg is `character(:), allocatable`. Prior to the fix
+    // the implicit-dealloc inserted before the stop-code expression
+    // freed the descriptor's data pointer, so the load that reached
+    // afs_error_stop_msg saw NULL and the runtime fell back to bare
+    // "ERROR STOP". Skip dealloc for character-stop-code error stops:
+    // process exit cleans up the heap anyway.
+    let src = write_program(
+        "program p\n  implicit none\n  character(:), allocatable :: msg\n  msg = 'allocated message test'\n  error stop msg\nend program\n",
+        "error_stop_alloc.f90",
+    );
+    let out = unique_path("error_stop_alloc", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("error stop alloc compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "error stop alloc compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("error stop alloc run failed");
+    assert_eq!(
+        run.status.code(),
+        Some(1),
+        "expected ERROR STOP to exit with code 1, status={:?}",
+        run.status
+    );
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        stderr.contains("ERROR STOP allocated message test"),
+        "expected stderr to contain 'ERROR STOP allocated message test', got: {}",
+        stderr
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn repeated_nonadvancing_a1_read_preserves_embedded_nul_bytes() {
     let input = unique_path("nonadvancing_a1_char_read", "bin");
     std::fs::write(&input, b"A\0B").expect("cannot write nonadvancing A1 input");
