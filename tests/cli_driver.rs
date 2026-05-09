@@ -699,6 +699,62 @@ fn runtime_advance_no_via_optval_suppresses_newline_in_formatted_write() {
 }
 
 #[test]
+fn advancing_a1_read_consumes_in_flight_noadvance_cursor() {
+    // After a `read(...,advance='NO',FMT='(A1)')` consumes part of a
+    // record, an immediately-following advancing read on the same
+    // record (e.g. `advance=optval(adv,'YES')` where optval returns
+    // 'YES') needs to pick up at the saved cursor — not call
+    // `read_line` and discard it. stdlib's `read_bitset_unit_64`
+    // hits this on its final-bit read; without the runtime fix the
+    // example errors with "Failure on read of UNIT".
+    let bin_in = unique_path("a1_advance_after_noadvance", "txt");
+    std::fs::write(&bin_in, b"AB\n").expect("cannot write a1 input");
+    let src = write_program(
+        &format!(
+            "program p\n  implicit none\n  integer :: unit, ierr\n  character(64) :: msg\n  character(len=1) :: ch\n  open(newunit=unit, file='{}', status='old', form='formatted', action='read')\n  read(unit, advance='no', fmt='(a1)', iostat=ierr, iomsg=msg) ch\n  write(*, '(a,i0,a,a)') '1 ierr=', ierr, ' ch=', ch\n  read(unit, advance='yes', fmt='(a1)', iostat=ierr, iomsg=msg) ch\n  write(*, '(a,i0,a,a)') '2 ierr=', ierr, ' ch=', ch\n  close(unit)\nend program\n",
+            bin_in.display()
+        ),
+        "a1_advance_after_noadvance.f90",
+    );
+    let out = unique_path("a1_advance_after_noadvance", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("a1 advance compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "a1 advance compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("a1 advance run failed");
+    assert!(
+        run.status.success(),
+        "a1 advance run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("1 ierr=0 ch=A"),
+        "expected first noadvance read to capture 'A', got: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("2 ierr=0 ch=B"),
+        "expected advancing read to capture 'B' from in-flight record, got: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&bin_in);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn repeated_nonadvancing_a1_read_preserves_embedded_nul_bytes() {
     let input = unique_path("nonadvancing_a1_char_read", "bin");
     std::fs::write(&input, b"A\0B").expect("cannot write nonadvancing A1 input");
