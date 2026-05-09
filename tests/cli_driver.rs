@@ -18222,6 +18222,48 @@ fn formatted_write_of_concat_with_internal_char_function_runs() {
 }
 
 #[test]
+fn list_directed_read_with_no_items_advances_one_record_and_sets_eof_iostat() {
+    // Regression: `read(unit, *, iostat=ios)` with no items used to be
+    // a silent no-op — neither the file position nor iostat was
+    // touched, so stdlib's number_of_rows loop
+    //   do { read(s, *, iostat=ios); if (ios /= 0) exit; n = n+1; end }
+    // spun forever and example_loadtxt timed out. Verify the read now
+    // consumes one record per call and sets iostat at EOF.
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: ios, n\n  open(unit=10, file='/tmp/afs_skip_record_in.txt', status='replace')\n  write(10, '(A)') 'a'\n  write(10, '(A)') 'b'\n  write(10, '(A)') 'c'\n  close(10)\n  open(unit=11, file='/tmp/afs_skip_record_in.txt', status='old')\n  n = 0\n  do\n    read(11, *, iostat=ios)\n    if (ios /= 0) exit\n    n = n + 1\n    if (n > 100) error stop 'runaway'\n  end do\n  close(11)\n  print *, 'rows=', n\nend program\n",
+        "f90",
+    );
+    let out = unique_path("list_skip_record", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("skip-record compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "skip-record should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "skip-record should run cleanly: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("rows=") && stdout.contains("3"),
+        "expected rows=3 in output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file("/tmp/afs_skip_record_in.txt");
+}
+
+#[test]
 fn formatted_write_sets_iostat_zero_on_success_for_scalar_and_array() {
     // Regression: afs_fmt_begin / afs_fmt_end never wrote the
     // iostat= specifier on success, so a caller's
