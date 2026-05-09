@@ -19411,6 +19411,20 @@ pub(super) fn lower_list_read_items(
     unit: ValueId,
     iostat: ValueId,
 ) {
+    // F2018 §12.6.4.5: `read(unit, *)` with no input items advances
+    // the file position past one record. Without this branch the read
+    // is a silent no-op and iostat is never updated, so loops like
+    // stdlib_io's `number_of_rows` (do { read(s,*,iostat=ios); if ios
+    // /= 0 exit } end do) spin forever and example_loadtxt times out.
+    if items.is_empty() {
+        b.call(
+            FuncRef::External("afs_read_skip_record".into()),
+            vec![unit, iostat],
+            IrType::Void,
+        );
+        return;
+    }
+
     let mode = ReadMode::Unit { unit, iostat };
 
     for item in items {
