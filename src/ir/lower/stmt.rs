@@ -1378,14 +1378,24 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             };
 
             // Check for ADVANCE='NO'.
-            let advance = controls
-                .iter()
-                .find(|c| {
-                    c.keyword
-                        .as_deref()
-                        .map(|k| k.eq_ignore_ascii_case("advance"))
-                        .unwrap_or(false)
-                })
+            //
+            // `advance_static` is the compile-time bool used by the
+            // existing per-item helpers. When `advance=` is a string
+            // literal we honor it directly. When it's a non-literal
+            // expression (e.g. `advance=optval(adv, 'YES')` from
+            // stdlib's write_bitset_unit_64), we cannot decide at
+            // compile time, so we keep `advance_static = true`
+            // (preserve item lowering's optional newline emit) and
+            // separately compute `advance_runtime`, an i32 value the
+            // runtime helpers consult to suppress the newline when the
+            // expression evaluates to "no" at runtime.
+            let advance_ctrl = controls.iter().find(|c| {
+                c.keyword
+                    .as_deref()
+                    .map(|k| k.eq_ignore_ascii_case("advance"))
+                    .unwrap_or(false)
+            });
+            let advance_static = advance_ctrl
                 .map(|c| {
                     if let Expr::StringLiteral { value, .. } = &c.value.node {
                         !value.eq_ignore_ascii_case("no")
@@ -1394,6 +1404,25 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     }
                 })
                 .unwrap_or(true);
+            let advance_runtime: Option<ValueId> = advance_ctrl.and_then(|c| {
+                if matches!(&c.value.node, Expr::StringLiteral { .. }) {
+                    None
+                } else {
+                    let (p, l) = lower_string_expr_with_layouts(
+                        b,
+                        &ctx.locals,
+                        &c.value,
+                        ctx.st,
+                        Some(ctx.type_layouts),
+                    );
+                    Some(b.call(
+                        FuncRef::External("afs_advance_eval".into()),
+                        vec![p, l],
+                        IrType::Int(IntWidth::I32),
+                    ))
+                }
+            });
+            let advance = advance_static;
 
             // Optional iostat=ios / iomsg=msg specifiers. The push-based
             // formatted runtime ignored these on previous builds, so a
@@ -1455,7 +1484,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         for item in items {
                             lower_fmt_push(b, ctx, item);
                         }
-                        let adv = b.const_i32(if advance { 1 } else { 0 });
+                        let adv = advance_runtime
+                            .unwrap_or_else(|| b.const_i32(if advance { 1 } else { 0 }));
                         b.call(
                             FuncRef::External("afs_fmt_end".into()),
                             vec![adv],
@@ -1480,14 +1510,25 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             if is_list_directed {
                 // Wrap the per-item writes in begin/end so the runtime
                 // can (a) emit sequential-unformatted record markers,
-                // and (b) thread iostat=/iomsg= through.
+                // and (b) thread iostat=/iomsg= through. Pass
+                // `advance=false` to suppress the per-item helper's
+                // unconditional newline emit; we emit our own
+                // `afs_write_newline_if` afterwards using the i32 that
+                // honors a runtime-evaluated advance= expression
+                // (e.g. `advance=optval(adv,'YES')`).
                 b.call(
                     FuncRef::External("afs_list_write_begin".into()),
                     vec![unit, iostat_ptr, iomsg_ptr, iomsg_len],
                     IrType::Void,
                 );
-                lower_write_items_adv(b, ctx, items, unit, advance);
-                let adv = b.const_i32(if advance { 1 } else { 0 });
+                lower_write_items_adv(b, ctx, items, unit, false);
+                let adv = advance_runtime
+                    .unwrap_or_else(|| b.const_i32(if advance { 1 } else { 0 }));
+                b.call(
+                    FuncRef::External("afs_write_newline_if".into()),
+                    vec![unit, adv],
+                    IrType::Void,
+                );
                 b.call(
                     FuncRef::External("afs_list_write_end".into()),
                     vec![unit, adv, iostat_ptr, iomsg_ptr, iomsg_len],
@@ -1512,7 +1553,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     lower_fmt_push(b, ctx, item);
                 }
 
-                let adv = b.const_i32(if advance { 1 } else { 0 });
+                let adv = advance_runtime
+                    .unwrap_or_else(|| b.const_i32(if advance { 1 } else { 0 }));
                 b.call(
                     FuncRef::External("afs_fmt_end".into()),
                     vec![adv],
@@ -4407,20 +4449,45 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
         }
 
         Stmt::Read { controls, items } => {
-            let nonadvancing = controls
-                .iter()
-                .find(|c| {
-                    c.keyword
-                        .as_deref()
-                        .map(|k| k.eq_ignore_ascii_case("advance"))
-                        .unwrap_or(false)
-                })
+            // `nonadvancing` is the compile-time bool used by the
+            // existing per-item helpers; it stays false when the
+            // advance= expression is non-literal so the static path
+            // calls the advancing helper. `advance_runtime` carries
+            // the runtime i32 (0 = no, 1 = yes) for non-literal
+            // expressions like `advance=optval(adv,'YES')` from
+            // stdlib's read_bitset_unit_64. The char-read helper picks
+            // it up via afs_fmt_read_string_dyn.
+            let advance_ctrl = controls.iter().find(|c| {
+                c.keyword
+                    .as_deref()
+                    .map(|k| k.eq_ignore_ascii_case("advance"))
+                    .unwrap_or(false)
+            });
+            let nonadvancing = advance_ctrl
                 .and_then(|c| match &c.value.node {
                     Expr::StringLiteral { value, .. } => Some(value.eq_ignore_ascii_case("no")),
                     Expr::Name { name } => Some(name.eq_ignore_ascii_case("no")),
                     _ => None,
                 })
                 .unwrap_or(false);
+            let advance_runtime: Option<ValueId> = advance_ctrl.and_then(|c| {
+                if matches!(&c.value.node, Expr::StringLiteral { .. }) {
+                    None
+                } else {
+                    let (p, l) = lower_string_expr_with_layouts(
+                        b,
+                        &ctx.locals,
+                        &c.value,
+                        ctx.st,
+                        Some(ctx.type_layouts),
+                    );
+                    Some(b.call(
+                        FuncRef::External("afs_advance_eval".into()),
+                        vec![p, l],
+                        IrType::Int(IntWidth::I32),
+                    ))
+                }
+            });
             let err_label = controls.iter().find_map(|c| {
                 if c.keyword
                     .as_deref()
@@ -4555,7 +4622,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     ctx.st,
                     Some(ctx.type_layouts),
                 );
-                lower_formatted_read_items(
+                lower_formatted_read_items_with_runtime_advance(
                     b,
                     ctx,
                     items,
@@ -4563,6 +4630,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     fmt_ptr,
                     fmt_len,
                     nonadvancing,
+                    advance_runtime,
                     iostat_addr,
                     size_addr,
                 );
