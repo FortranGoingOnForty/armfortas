@@ -18222,6 +18222,57 @@ fn formatted_write_of_concat_with_internal_char_function_runs() {
 }
 
 #[test]
+fn formatted_section_write_iterates_assumed_shape_dummy_section() {
+    // Regression: the descriptor-driven section iterator was lost in
+    // the lower.rs split (orig fix 4986129). Without it, a write of a
+    // multi-dim section through an assumed-shape dummy
+    // `real, intent(in) :: d(:,:)` saw `info.dims` empty and emitted
+    // zero loop iterations, so stdlib's savetxt produced files of
+    // bare newlines and example_savetxt looked like it succeeded but
+    // wrote no data. Verify a module routine with d(i,:) now writes
+    // each row's elements.
+    let src = write_program(
+        "module mio\n  implicit none\ncontains\n  subroutine save_d(filename, d)\n    character(len=*), intent(in) :: filename\n    real, intent(in) :: d(:, :)\n    integer :: i, ios, unit\n    character(len=64) :: iomsg\n    character(len=:), allocatable :: fmt_\n    fmt_ = '(*(es10.3,1x))'\n    open(newunit=unit, file=filename, status='replace')\n    do i = 1, size(d, 1)\n      write(unit, fmt_, iostat=ios, iomsg=iomsg) d(i, :)\n      if (ios /= 0) error stop 'inner write failed'\n    end do\n    close(unit)\n  end subroutine\nend module\n\nprogram p\n  use mio\n  implicit none\n  real :: x(3, 2)\n  x = reshape([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], shape=[3, 2])\n  call save_d('/tmp/afs_section_dummy.dat', x)\n  print *, 'DONE'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("section_dummy_write", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("section dummy compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "section dummy should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "section dummy should run cleanly: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("DONE"),
+        "expected DONE in output: {}",
+        stdout
+    );
+    let written = std::fs::read_to_string("/tmp/afs_section_dummy.dat")
+        .expect("output file should exist");
+    assert!(
+        written.contains("1.000E+00") && written.contains("6.000E+00"),
+        "expected real elements in written file: {}",
+        written
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file("/tmp/afs_section_dummy.dat");
+}
+
+#[test]
 fn list_directed_read_with_no_items_advances_one_record_and_sets_eof_iostat() {
     // Regression: `read(unit, *, iostat=ios)` with no items used to be
     // a silent no-op — neither the file position nor iostat was
