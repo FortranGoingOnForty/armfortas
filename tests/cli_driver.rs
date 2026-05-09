@@ -755,6 +755,33 @@ fn advancing_a1_read_consumes_in_flight_noadvance_cursor() {
 }
 
 #[test]
+fn same_module_routine_dispatches_generic_to_complex_specific() {
+    // stdlib_linalg_blas_aux::stdlib_icamax calls the generic
+    // stdlib_cabs1 with `zx(1)` of `complex(sp), intent(in) :: zx(*)`.
+    // Compile-time dispatch must pick stdlib_scabs1 (the complex(sp)
+    // specific). Prior to the fix, find_named_interface_symbol's
+    // use-association gate excluded the same module's own scope when
+    // sema's st.current was Global during IR lowering — leaving the
+    // generic unresolved and `[scabs, dcabs]` listed but unmatched.
+    let src = write_program(
+        "module m\n  use, intrinsic :: iso_fortran_env, only: sp => real32, dp => real64\n  implicit none\n  private\n  public :: gen, do_call\n  interface gen\n     module procedure scabs\n     module procedure dcabs\n  end interface\ncontains\n  real(sp) function scabs(z)\n    complex(sp), intent(in) :: z\n    scabs = abs(real(z))\n  end function\n  real(dp) function dcabs(z)\n    complex(dp), intent(in) :: z\n    dcabs = abs(real(z))\n  end function\n  subroutine do_call(zx)\n     complex(sp), intent(in) :: zx(*)\n     real(sp) :: dmax\n     dmax = gen(zx(1))\n  end subroutine\nend module\nprogram p\n  print *, \"ok\"\nend program\n",
+        "same_module_generic_dispatch.f90",
+    );
+    let out = unique_path("same_module_generic_dispatch", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("same-module generic dispatch compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "same-module generic dispatch compile failed: stderr={}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn repeated_nonadvancing_a1_read_preserves_embedded_nul_bytes() {
     let input = unique_path("nonadvancing_a1_char_read", "bin");
     std::fs::write(&input, b"A\0B").expect("cannot write nonadvancing A1 input");
