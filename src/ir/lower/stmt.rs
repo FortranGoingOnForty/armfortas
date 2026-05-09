@@ -580,9 +580,24 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     );
                                     b.store(coerced, tgt);
                                 } else if is_complex_ty(&info.ty) {
-                                    // Complex assignment: RHS returns a ptr to [f32/f64 x 2] buffer.
-                                    // Memcpy the 8 or 16 bytes into the destination slot.
-                                    let src = super::expr::lower_expr_ctx_tl(b, ctx, value);
+                                    // Complex assignment: RHS may evaluate to a
+                                    // ptr<[fN x 2]> (already a complex buffer)
+                                    // or to a scalar int/real value (Fortran
+                                    // permits `c = i` / `c = r` with implicit
+                                    // promotion). For the scalar case we have
+                                    // to materialize a fresh [fN x 2] buffer
+                                    // first — without it we'd memcpy from the
+                                    // scalar's value treated as a pointer
+                                    // (LAPACK CGEEV's `work(1)=maxwrk` was
+                                    // SEGV-ing on this exact path).
+                                    let raw = super::expr::lower_expr_ctx_tl(b, ctx, value);
+                                    let src_ty = b.func().value_type(raw);
+                                    let src = if matches!(&src_ty, Some(t) if is_complex_ty(t)) {
+                                        raw
+                                    } else {
+                                        let fw = complex_float_width(&info.ty);
+                                        materialize_complex_operand(b, raw, fw)
+                                    };
                                     let bytes = complex_byte_size(&info.ty);
                                     let sz = b.const_i64(bytes);
                                     if info.by_ref {
@@ -1276,9 +1291,16 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     && !field.allocatable
                                     && field.dims.is_empty()
                                 {
-                                    let src = super::expr::lower_expr_ctx_tl(b, ctx, value);
-                                    let bytes =
-                                        complex_byte_size(&type_info_to_ir_type(&field.type_info));
+                                    let raw = super::expr::lower_expr_ctx_tl(b, ctx, value);
+                                    let field_ir_ty = type_info_to_ir_type(&field.type_info);
+                                    let src_ty = b.func().value_type(raw);
+                                    let src = if matches!(&src_ty, Some(t) if is_complex_ty(t)) {
+                                        raw
+                                    } else {
+                                        let fw = complex_float_width(&field_ir_ty);
+                                        materialize_complex_operand(b, raw, fw)
+                                    };
+                                    let bytes = complex_byte_size(&field_ir_ty);
                                     let sz = b.const_i64(bytes);
                                     b.call(
                                         FuncRef::External("memcpy".into()),
