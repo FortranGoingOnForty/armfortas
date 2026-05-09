@@ -18273,6 +18273,51 @@ fn formatted_section_write_iterates_assumed_shape_dummy_section() {
 }
 
 #[test]
+fn list_directed_read_unit_real_returns_correct_f32_value() {
+    // Regression: lower_read_into_addr's IrType::Float(F32) arm allocated
+    // an f64 temp and called afs_read_real (the f32 entry, *mut f32) on
+    // it. The runtime wrote 4 bytes of f32 into the 8-byte alloca and the
+    // subsequent f64 load + float_trunc to f32 returned 0.0 for every
+    // input. stdlib's loadtxt_rsp main `read(s, fmt_, iostat=ios) d(i,:)`
+    // for a `real, allocatable :: d(:,:)` therefore hit error_stop with
+    // ios=0 but data=zeros.  Verify a unit read of a real(4) value now
+    // returns the actual value.
+    let src = write_program(
+        "program p\n  implicit none\n  real :: x, y\n  open(unit=10, file='/tmp/afs_real_read.txt', status='replace')\n  write(10, '(A)') ' 1.5  2.5'\n  close(10)\n  open(unit=11, file='/tmp/afs_real_read.txt', status='old')\n  read(11, *) x, y\n  close(11)\n  if (abs(x - 1.5) > 1e-6) then\n    print *, 'x wrong:', x\n    error stop 1\n  end if\n  if (abs(y - 2.5) > 1e-6) then\n    print *, 'y wrong:', y\n    error stop 2\n  end if\n  print *, 'real read OK'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("real_read_unit", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("real read compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "real read should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "real read should run cleanly: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("real read OK"),
+        "expected real read OK in output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file("/tmp/afs_real_read.txt");
+}
+
+#[test]
 fn list_directed_read_with_no_items_advances_one_record_and_sets_eof_iostat() {
     // Regression: `read(unit, *, iostat=ios)` with no items used to be
     // a silent no-op — neither the file position nor iostat was
