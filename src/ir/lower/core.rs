@@ -19785,11 +19785,18 @@ pub(super) fn lower_read_into_addr(b: &mut FuncBuilder, mode: ReadMode, ty: &IrT
             true
         }
         IrType::Float(FloatWidth::F32) => {
+            // Unit-read path takes an f64 buffer to keep the load-then-truncate
+            // shape uniform with the internal/formatted variants below, which
+            // all write f64 into the temp. afs_read_real takes *mut f32 so
+            // calling it on the f64 alloca corrupted the value (only 4 of 8
+            // bytes were initialized; the f64 reload then truncated nonsense
+            // to zero). Use afs_read_real64 here so the alloca and writer
+            // widths match.
             let tmp = b.alloca(IrType::Float(FloatWidth::F64));
             let handled = match mode {
                 ReadMode::Unit { unit, iostat } => {
                     b.call(
-                        FuncRef::External("afs_read_real".into()),
+                        FuncRef::External("afs_read_real64".into()),
                         vec![unit, tmp, iostat],
                         IrType::Void,
                     );
