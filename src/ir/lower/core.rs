@@ -20063,6 +20063,38 @@ pub(super) fn lower_formatted_read_items(
     iostat: ValueId,
     size_out: ValueId,
 ) {
+    lower_formatted_read_items_with_runtime_advance(
+        b,
+        ctx,
+        items,
+        unit,
+        fmt_ptr,
+        fmt_len,
+        nonadvancing,
+        None,
+        iostat,
+        size_out,
+    );
+}
+
+/// Same as `lower_formatted_read_items` but additionally accepts a
+/// runtime-evaluated advance i32 (`advance_runtime`). When present the
+/// per-character read uses `afs_fmt_read_string_dyn` so that
+/// non-literal advance expressions (e.g. `advance=optval(adv,'YES')`)
+/// dispatch to the right helper at runtime instead of being decided
+/// at compile time by `nonadvancing`.
+pub(super) fn lower_formatted_read_items_with_runtime_advance(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    items: &[crate::ast::expr::SpannedExpr],
+    unit: ValueId,
+    fmt_ptr: ValueId,
+    fmt_len: ValueId,
+    nonadvancing: bool,
+    advance_runtime: Option<ValueId>,
+    iostat: ValueId,
+    size_out: ValueId,
+) {
     let item_idx = b.alloca(IrType::Int(IntWidth::I64));
     let zero = b.const_i64(0);
     b.store(zero, item_idx);
@@ -20075,7 +20107,7 @@ pub(super) fn lower_formatted_read_items(
     };
 
     for item in items {
-        if lower_formatted_char_read_item(
+        if lower_formatted_char_read_item_with_runtime_advance(
             b,
             ctx,
             item,
@@ -20084,6 +20116,7 @@ pub(super) fn lower_formatted_read_items(
             fmt_len,
             item_idx,
             nonadvancing,
+            advance_runtime,
             iostat,
             size_out,
         ) {
@@ -20111,6 +20144,34 @@ pub(super) fn lower_formatted_char_read_item(
     iostat: ValueId,
     size_out: ValueId,
 ) -> bool {
+    lower_formatted_char_read_item_with_runtime_advance(
+        b,
+        ctx,
+        item,
+        mode,
+        fmt_ptr,
+        fmt_len,
+        item_idx,
+        nonadvancing,
+        None,
+        iostat,
+        size_out,
+    )
+}
+
+pub(super) fn lower_formatted_char_read_item_with_runtime_advance(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    item: &crate::ast::expr::SpannedExpr,
+    mode: ReadMode,
+    fmt_ptr: ValueId,
+    fmt_len: ValueId,
+    item_idx: ValueId,
+    nonadvancing: bool,
+    advance_runtime: Option<ValueId>,
+    iostat: ValueId,
+    size_out: ValueId,
+) -> bool {
     if !expr_is_character_expr(b, &ctx.locals, item, ctx.st, Some(ctx.type_layouts)) {
         return false;
     }
@@ -20126,7 +20187,16 @@ pub(super) fn lower_formatted_char_read_item(
 
     match mode {
         ReadMode::FormattedUnit { unit, .. } => {
-            if nonadvancing {
+            if let Some(adv) = advance_runtime {
+                b.call(
+                    FuncRef::External("afs_fmt_read_string_dyn".into()),
+                    vec![
+                        unit, fmt_ptr, fmt_len, current_idx, dest_ptr, dest_len, size_out, iostat,
+                        adv,
+                    ],
+                    IrType::Void,
+                );
+            } else if nonadvancing {
                 b.call(
                     FuncRef::External("afs_fmt_read_string_noadvance".into()),
                     vec![unit, fmt_ptr, fmt_len, dest_ptr, dest_len, size_out, iostat],
