@@ -4021,6 +4021,58 @@ end program
 }
 
 #[test]
+fn allocatable_lhs_eq_elemental_of_rank1_array_reallocates() {
+    // F2018 §10.2.1.3: an allocatable LHS gets reallocated to the RHS
+    // shape before assignment. The subscript-scalarization path
+    // synthesized `r(i) = sqrt(w)(i)` over `1..size(r)` for unallocated
+    // r — iterating 0 times, leaving r empty, and any subsequent r(1)
+    // read trapping with `index 1 outside [1, 0]`. Bailing to the
+    // descriptor path runs `lower_array_expr_descriptor` on the
+    // elemental result and `afs_assign_allocatable` to reallocate r.
+    // Surfaced by stdlib_linalg_least_squares' `sqrt_w = sqrt(w)`.
+    let src = write_program(
+        r#"
+program test
+  implicit none
+  real :: w(4) = [1.0, 2.0, 3.0, 4.0]
+  real, allocatable :: r(:)
+  r = sqrt(w)
+  if (.not. allocated(r)) error stop 1
+  if (size(r) /= 4) error stop 2
+  if (abs(r(1) - 1.0) > 1.0e-6) error stop 3
+  if (abs(r(4) - 2.0) > 1.0e-6) error stop 4
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("alloc_lhs_elemental", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "allocatable r = sqrt(w) must reallocate r to size 4: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected 'ok': {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn reshape_typed_array_constructor_preserves_elem_size_through_assumed_shape() {
     // F2018 §7.8: a typed array constructor `[T :: ...]` has element
     // type T regardless of the element expressions' types.  The reshape

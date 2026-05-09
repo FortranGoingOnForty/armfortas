@@ -22732,17 +22732,29 @@ pub(super) fn try_lower_scalarized_subscript_array_assign(
     if dest_info.dims.len() != 1 && !local_uses_array_descriptor(dest_info) {
         return false;
     }
-    // F2018 §10.2.1.3: an allocatable LHS gets reallocated to the RHS
-    // shape before assignment. Synthesizing `dest(i) = rhs(i)` over
-    // `1..size(dest)` iterates 0 times when dest is unallocated, leaving
-    // dest empty and any subsequent dest(1) read trapping with
-    // `index 1 outside [1, 0]`. Bail to lower_array_assign's
-    // descriptor path which materializes the RHS as a fresh descriptor
-    // and calls afs_assign_allocatable to (re)allocate dest. Surfaced
-    // by `r = sqrt(w)` for allocatable r and stdlib_linalg's
-    // `sqrt_w = sqrt(w)` / `b_scaled = sqrt_w * b` setup in
-    // weighted_lstsq.
-    if dest_info.allocatable {
+    // F2018 §10.2.1.3: a Fortran-allocatable LHS gets reallocated to
+    // the RHS shape before assignment. Synthesizing `dest(i) = rhs(i)`
+    // over `1..size(dest)` iterates 0 times when dest is unallocated,
+    // leaving dest empty and any subsequent dest(1) read trapping with
+    // `index 1 outside [1, 0]`. Bail to lower_array_assign's descriptor
+    // path which materializes the RHS as a fresh descriptor and calls
+    // afs_assign_allocatable to (re)allocate dest.
+    //
+    // Discriminate via the Symbol attribute: `LocalInfo.allocatable` is
+    // overloaded to also mean "uses runtime descriptor allocation" for
+    // auto-arrays with runtime bounds (e.g. `real :: r(merge(...))` in
+    // stdlib_stats_var_mask_2_rsp_rsp). Those are NOT Fortran-allocatable
+    // — bailing on them broke `res = res + merge(…)` accumulation
+    // inside the masked-variance loop. Only bail when the *symbol*
+    // carries the allocatable attribute. Surfaced by `r = sqrt(w)` and
+    // stdlib_linalg's `sqrt_w = sqrt(w)` / `b_scaled = sqrt_w * b`
+    // setup in weighted_lstsq.
+    let dest_symbol_allocatable = ctx
+        .st
+        .lookup_local_then_any(ctx.proc_scope_id, &dest_name.to_lowercase())
+        .map(|sym| sym.attrs.allocatable)
+        .unwrap_or(false);
+    if dest_symbol_allocatable {
         return false;
     }
     // Skip scalarization when the RHS contains a transformational
