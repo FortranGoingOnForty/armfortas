@@ -884,6 +884,68 @@ pub extern "C" fn afs_write_newline(unit: i32) {
     }
 }
 
+/// Like `afs_write_newline` but no-ops when `advance == 0`. The
+/// lowering uses this when `advance=` is a runtime-evaluated string
+/// (e.g. `advance=optval(adv, 'YES')`) — `advance` is precomputed by
+/// `afs_advance_eval` to 0 (no advance) or 1 (advance).
+#[no_mangle]
+pub extern "C" fn afs_write_newline_if(unit: i32, advance: i32) {
+    if advance == 0 {
+        let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(u) = state.get_unit(unit) {
+            let _ = u.flush();
+        }
+        return;
+    }
+    afs_write_newline(unit);
+}
+
+/// Evaluate an `advance=` string at runtime. Returns 0 when the
+/// trimmed, case-folded string equals "no", else 1. The lowering
+/// uses this for non-literal advance expressions so that
+/// `advance=optval(adv, 'YES')` produces the correct behavior
+/// (current lowering only honors string-literal advance values).
+#[no_mangle]
+pub extern "C" fn afs_advance_eval(ptr: *const u8, len: i64) -> i32 {
+    if ptr.is_null() || len <= 0 {
+        return 1;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+    let s = std::str::from_utf8(bytes).unwrap_or("");
+    if s.trim().eq_ignore_ascii_case("no") {
+        0
+    } else {
+        1
+    }
+}
+
+/// Read a formatted character item with runtime advance dispatch.
+/// `advance == 0` selects the non-advancing path
+/// (`afs_fmt_read_string_noadvance`); any other value uses
+/// `afs_fmt_read_string` which advances past the record. Used by the
+/// lowering when `advance=` is a non-literal expression and the bool
+/// path can't be statically chosen.
+#[no_mangle]
+pub extern "C" fn afs_fmt_read_string_dyn(
+    unit: i32,
+    fmt_str: *const u8,
+    fmt_len: i64,
+    data_index: i64,
+    dest: *mut u8,
+    dest_len: i64,
+    size_out: *mut i32,
+    iostat: *mut i32,
+    advance: i32,
+) {
+    if advance == 0 {
+        afs_fmt_read_string_noadvance(unit, fmt_str, fmt_len, dest, dest_len, size_out, iostat);
+    } else {
+        afs_fmt_read_string(
+            unit, fmt_str, fmt_len, data_index, dest, dest_len, size_out, iostat,
+        );
+    }
+}
+
 /// Begin a list-directed write statement. Mandatory before the first
 /// per-item helper when iostat=/iomsg= are requested or when the unit
 /// might be sequential-unformatted (which needs record-buffered emit).
