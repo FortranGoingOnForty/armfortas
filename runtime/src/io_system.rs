@@ -110,11 +110,30 @@ struct Unit {
     formatted_read_cursor: usize,
     /// True for STATUS='SCRATCH' units: backing file is deleted on close or exit.
     scratch: bool,
+    /// In-flight sequential-unformatted record buffer. Set by
+    /// `afs_list_write_begin` and drained by `afs_list_write_end`.
+    /// While Some, list-directed write helpers append raw bytes here
+    /// instead of writing ASCII or directly to the file stream — the
+    /// whole statement materializes as one record [len][data][len].
+    pending_record: Option<Vec<u8>>,
 }
 
 impl Unit {
-    fn is_stream_unformatted(&self) -> bool {
-        self.form == Form::Unformatted && self.access == Access::Stream
+    fn is_unformatted(&self) -> bool {
+        self.form == Form::Unformatted
+    }
+
+    /// Append raw bytes to the in-flight unformatted record buffer if
+    /// one is open, otherwise write directly to the stream. Returns
+    /// `true` when bytes were buffered.
+    fn raw_or_buffer(&mut self, bytes: &[u8]) -> bool {
+        if let Some(buf) = self.pending_record.as_mut() {
+            buf.extend_from_slice(bytes);
+            true
+        } else {
+            let _ = self.write_raw(bytes);
+            false
+        }
     }
 
     fn write_bytes(&mut self, data: &[u8]) -> io::Result<()> {
@@ -243,6 +262,7 @@ impl IoState {
                 formatted_read_record: None,
                 formatted_read_cursor: 0,
                 scratch: false,
+                pending_record: None,
             },
         );
         units.insert(
@@ -260,6 +280,7 @@ impl IoState {
                 formatted_read_record: None,
                 formatted_read_cursor: 0,
                 scratch: false,
+                pending_record: None,
             },
         );
         units.insert(
@@ -277,6 +298,7 @@ impl IoState {
                 formatted_read_record: None,
                 formatted_read_cursor: 0,
                 scratch: false,
+                pending_record: None,
             },
         );
 
@@ -573,6 +595,7 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
                     formatted_read_record: None,
                     formatted_read_cursor: 0,
                     scratch: is_scratch,
+                    pending_record: None,
                 },
             );
 
@@ -695,8 +718,8 @@ pub extern "C" fn afs_close_ex(unit: i32, status: *const u8, status_len: i64, io
 pub extern "C" fn afs_write_int(unit: i32, val: i32) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
-        if u.is_stream_unformatted() {
-            let _ = u.write_raw(&val.to_ne_bytes());
+        if u.is_unformatted() {
+            u.raw_or_buffer(&val.to_ne_bytes());
         } else {
             let _ = u.write_str(&format!(" {}", val));
         }
@@ -708,8 +731,8 @@ pub extern "C" fn afs_write_int(unit: i32, val: i32) {
 pub extern "C" fn afs_write_int64(unit: i32, val: i64) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
-        if u.is_stream_unformatted() {
-            let _ = u.write_raw(&val.to_ne_bytes());
+        if u.is_unformatted() {
+            u.raw_or_buffer(&val.to_ne_bytes());
         } else {
             let _ = u.write_str(&format!(" {}", val));
         }
@@ -721,8 +744,8 @@ pub extern "C" fn afs_write_int64(unit: i32, val: i64) {
 pub extern "C" fn afs_write_int128(unit: i32, val: i128) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
-        if u.is_stream_unformatted() {
-            let _ = u.write_raw(&val.to_ne_bytes());
+        if u.is_unformatted() {
+            u.raw_or_buffer(&val.to_ne_bytes());
         } else {
             let _ = u.write_str(&format!(" {}", val));
         }
@@ -734,8 +757,8 @@ pub extern "C" fn afs_write_int128(unit: i32, val: i128) {
 pub extern "C" fn afs_write_real(unit: i32, val: f32) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
-        if u.is_stream_unformatted() {
-            let _ = u.write_raw(&val.to_ne_bytes());
+        if u.is_unformatted() {
+            u.raw_or_buffer(&val.to_ne_bytes());
         } else {
             let _ = u.write_str(&format!("  {:14.7E}", val));
         }
@@ -747,8 +770,8 @@ pub extern "C" fn afs_write_real(unit: i32, val: f32) {
 pub extern "C" fn afs_write_real64(unit: i32, val: f64) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
-        if u.is_stream_unformatted() {
-            let _ = u.write_raw(&val.to_ne_bytes());
+        if u.is_unformatted() {
+            u.raw_or_buffer(&val.to_ne_bytes());
         } else {
             let _ = u.write_str(&format!("  {:22.15E}", val));
         }
@@ -762,9 +785,9 @@ pub extern "C" fn afs_write_complex_f32(unit: i32, ptr: *const f32) {
     let (re, im) = unsafe { (*ptr, *ptr.add(1)) };
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
-        if u.is_stream_unformatted() {
-            let _ = u.write_raw(&re.to_ne_bytes());
-            let _ = u.write_raw(&im.to_ne_bytes());
+        if u.is_unformatted() {
+            u.raw_or_buffer(&re.to_ne_bytes());
+            u.raw_or_buffer(&im.to_ne_bytes());
         } else {
             let _ = u.write_str(&format!(" ({:14.7E},{:14.7E})", re, im));
         }
@@ -778,9 +801,9 @@ pub extern "C" fn afs_write_complex_f64(unit: i32, ptr: *const f64) {
     let (re, im) = unsafe { (*ptr, *ptr.add(1)) };
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
-        if u.is_stream_unformatted() {
-            let _ = u.write_raw(&re.to_ne_bytes());
-            let _ = u.write_raw(&im.to_ne_bytes());
+        if u.is_unformatted() {
+            u.raw_or_buffer(&re.to_ne_bytes());
+            u.raw_or_buffer(&im.to_ne_bytes());
         } else {
             let _ = u.write_str(&format!(" ({:22.15E},{:22.15E})", re, im));
         }
@@ -792,10 +815,10 @@ pub extern "C" fn afs_write_complex_f64(unit: i32, ptr: *const f64) {
 pub extern "C" fn afs_write_string(unit: i32, ptr: *const u8, len: i64) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
-        if u.is_stream_unformatted() {
+        if u.is_unformatted() {
             if !ptr.is_null() && len > 0 {
                 let slice = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
-                let _ = u.write_raw(slice);
+                u.raw_or_buffer(slice);
             }
         } else {
             let _ = u.write_str(" ");
@@ -812,8 +835,8 @@ pub extern "C" fn afs_write_string(unit: i32, ptr: *const u8, len: i64) {
 pub extern "C" fn afs_write_logical(unit: i32, val: i32) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
-        if u.is_stream_unformatted() {
-            let _ = u.write_raw(&val.to_ne_bytes());
+        if u.is_unformatted() {
+            u.raw_or_buffer(&val.to_ne_bytes());
         } else {
             let _ = u.write_str(if val != 0 { " T" } else { " F" });
         }
@@ -825,12 +848,110 @@ pub extern "C" fn afs_write_logical(unit: i32, val: i32) {
 pub extern "C" fn afs_write_newline(unit: i32) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
-        if u.is_stream_unformatted() {
+        if u.is_unformatted() {
+            // Sequential unformatted: a pending record buffer means
+            // afs_list_write_end was not called — flush nothing here.
+            // Stream unformatted has no record terminator.
             let _ = u.flush();
             return;
         }
         let _ = u.write_str("\n");
         let _ = u.flush();
+    }
+}
+
+/// Begin a list-directed write statement. Mandatory before the first
+/// per-item helper when iostat=/iomsg= are requested or when the unit
+/// might be sequential-unformatted (which needs record-buffered emit).
+///
+/// For formatted units this only resets iostat. For sequential
+/// unformatted units it opens a fresh per-statement record buffer that
+/// the per-item helpers will append into. Stream-unformatted units skip
+/// the buffer (each helper writes raw bytes directly).
+#[no_mangle]
+pub extern "C" fn afs_list_write_begin(
+    unit: i32,
+    iostat: *mut i32,
+    iomsg: *mut u8,
+    iomsg_len: i64,
+) {
+    if !iostat.is_null() {
+        unsafe {
+            *iostat = 0;
+        }
+    }
+    if !iomsg.is_null() && iomsg_len > 0 {
+        let buf = unsafe { std::slice::from_raw_parts_mut(iomsg, iomsg_len as usize) };
+        for b in buf.iter_mut() {
+            *b = b' ';
+        }
+    }
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(u) = state.get_unit(unit) {
+        if u.form == Form::Unformatted && u.access == Access::Sequential {
+            u.pending_record = Some(Vec::new());
+        }
+    } else if !iostat.is_null() {
+        unsafe {
+            *iostat = 1;
+        }
+    }
+}
+
+/// End a list-directed write statement. For sequential unformatted
+/// units this drains the per-statement record buffer and writes
+/// `[len][bytes][len]` to the stream. For formatted units the trailing
+/// newline is left to the per-item path's `afs_write_newline` so we
+/// don't double-newline; this only flushes and forwards iostat/iomsg.
+/// `advance` is accepted for symmetry with `afs_fmt_end` but is unused
+/// by the formatted path here.
+#[no_mangle]
+pub extern "C" fn afs_list_write_end(
+    unit: i32,
+    _advance: i32,
+    iostat: *mut i32,
+    iomsg: *mut u8,
+    iomsg_len: i64,
+) {
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(u) = state.get_unit(unit) else {
+        if !iostat.is_null() {
+            unsafe {
+                *iostat = 1;
+            }
+        }
+        return;
+    };
+    let mut err: Option<String> = None;
+    if let Some(buf) = u.pending_record.take() {
+        let len_bytes = (buf.len() as u32).to_ne_bytes();
+        let r1 = u.write_raw(&len_bytes);
+        let r2 = if !buf.is_empty() {
+            u.write_raw(&buf)
+        } else {
+            Ok(())
+        };
+        let r3 = u.write_raw(&len_bytes);
+        if let Err(e) = r1.or(r2).or(r3) {
+            err = Some(e.to_string());
+        }
+    }
+    let _ = u.flush();
+    if let Some(msg) = err {
+        if !iostat.is_null() {
+            unsafe {
+                *iostat = 1;
+            }
+        }
+        if !iomsg.is_null() && iomsg_len > 0 {
+            let buf = unsafe { std::slice::from_raw_parts_mut(iomsg, iomsg_len as usize) };
+            let bytes = msg.as_bytes();
+            let n = bytes.len().min(buf.len());
+            buf[..n].copy_from_slice(&bytes[..n]);
+            for b in buf[n..].iter_mut() {
+                *b = b' ';
+            }
+        }
     }
 }
 
