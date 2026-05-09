@@ -4073,6 +4073,87 @@ end program
 }
 
 #[test]
+fn intrinsic_trim_not_shadowed_by_loaded_only_named_interface() {
+    // F2018 §11.2.2: a name from another module shadows an intrinsic
+    // only when it is actually use-associated. `find_named_interface_symbol`'s
+    // all-scope fallback walked every loaded scope unconditionally,
+    // so a module that brought in a sibling module solely for type-info
+    // (e.g. `use stdlib_string_type, only: string_type`) inherited that
+    // module's `trim`/`adjustl`/`len` named interfaces as "shadows" and
+    // routed character-intrinsic calls through string_type specifics —
+    // returning empty strings for character data. Surfaced as
+    // stdlib_io.parse_mode("w") returning 'r t' (default), making
+    // stdlib_io.open() pick the 'r' branch and ENOENT every
+    // savetxt/loadtxt/loadnpy call.
+    let src = write_program(
+        r#"
+module local_mod
+  implicit none
+  type :: dummy_t
+    integer :: x
+  end type
+  interface trim
+    module procedure trim_dummy
+  end interface
+contains
+  function trim_dummy(d) result(r)
+    type(dummy_t), intent(in) :: d
+    type(dummy_t) :: r
+    r%x = d%x
+  end function
+end module
+
+module caller_mod
+  use local_mod, only: dummy_t
+  implicit none
+contains
+  character(3) function probe(mode) result(mode_)
+    character(*), intent(in) :: mode
+    character(:), allocatable :: a
+    mode_ = 'r t'
+    if (len_trim(mode) == 0) return
+    a = trim(mode)
+    if (len(a) >= 1) mode_(1:1) = a(1:1)
+  end function probe
+end module
+
+program test
+  use caller_mod
+  if (probe("w") /= "w t") error stop 1
+  if (probe("r") /= "r t") error stop 2
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("trim_intrinsic_not_shadowed", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "intrinsic trim must not get shadowed by a non-imported named interface: status={:?} stderr={} stdout={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr),
+        String::from_utf8_lossy(&run.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected 'ok': {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn reshape_typed_array_constructor_preserves_elem_size_through_assumed_shape() {
     // F2018 §7.8: a typed array constructor `[T :: ...]` has element
     // type T regardless of the element expressions' types.  The reshape
