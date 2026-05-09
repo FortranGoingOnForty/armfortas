@@ -116,6 +116,12 @@ struct Unit {
     /// instead of writing ASCII or directly to the file stream — the
     /// whole statement materializes as one record [len][data][len].
     pending_record: Option<Vec<u8>>,
+    /// In-flight sequential-unformatted record being consumed by a
+    /// list-directed READ statement. Set by `afs_list_read_begin`
+    /// (which reads a full [len][data][len] record into memory) and
+    /// cleared by `afs_list_read_end`. The cursor tracks how many
+    /// bytes the per-item helpers have consumed so far.
+    pending_read: Option<(Vec<u8>, usize)>,
 }
 
 impl Unit {
@@ -134,6 +140,20 @@ impl Unit {
             let _ = self.write_raw(bytes);
             false
         }
+    }
+
+    /// Consume `n` bytes from the in-flight unformatted read record
+    /// (advancing the cursor). Returns `Some(slice)` when the record
+    /// has enough bytes; `None` when the record is exhausted, when no
+    /// pending record is open, or when fewer than `n` bytes remain.
+    fn read_buffer_take(&mut self, n: usize) -> Option<Vec<u8>> {
+        let (buf, cur) = self.pending_read.as_mut()?;
+        if *cur + n > buf.len() {
+            return None;
+        }
+        let out = buf[*cur..*cur + n].to_vec();
+        *cur += n;
+        Some(out)
     }
 
     fn write_bytes(&mut self, data: &[u8]) -> io::Result<()> {
@@ -263,6 +283,7 @@ impl IoState {
                 formatted_read_cursor: 0,
                 scratch: false,
                 pending_record: None,
+                pending_read: None,
             },
         );
         units.insert(
@@ -281,6 +302,7 @@ impl IoState {
                 formatted_read_cursor: 0,
                 scratch: false,
                 pending_record: None,
+                pending_read: None,
             },
         );
         units.insert(
@@ -299,6 +321,7 @@ impl IoState {
                 formatted_read_cursor: 0,
                 scratch: false,
                 pending_record: None,
+                pending_read: None,
             },
         );
 
@@ -596,6 +619,7 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
                     formatted_read_cursor: 0,
                     scratch: is_scratch,
                     pending_record: None,
+                    pending_read: None,
                 },
             );
 
@@ -963,6 +987,21 @@ pub extern "C" fn afs_list_write_end(
 pub extern "C" fn afs_read_int(unit: i32, val: *mut i32, iostat: *mut i32) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
+        if let Some(bytes) = u.read_buffer_take(4) {
+            let mut b = [0u8; 4];
+            b.copy_from_slice(&bytes);
+            if !val.is_null() {
+                unsafe {
+                    *val = i32::from_ne_bytes(b);
+                }
+            }
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = 0;
+                }
+            }
+            return;
+        }
         match u.next_read_token() {
             Ok(Some(token)) => match token.parse::<i32>() {
                 Ok(v) => {
@@ -1017,6 +1056,21 @@ pub extern "C" fn afs_read_int(unit: i32, val: *mut i32, iostat: *mut i32) {
 pub extern "C" fn afs_read_int64(unit: i32, val: *mut i64, iostat: *mut i32) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
+        if let Some(bytes) = u.read_buffer_take(8) {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&bytes);
+            if !val.is_null() {
+                unsafe {
+                    *val = i64::from_ne_bytes(b);
+                }
+            }
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = 0;
+                }
+            }
+            return;
+        }
         match u.next_read_token() {
             Ok(Some(token)) => match token.parse::<i64>() {
                 Ok(v) => {
@@ -1065,6 +1119,17 @@ pub extern "C" fn afs_read_int64(unit: i32, val: *mut i64, iostat: *mut i32) {
 pub extern "C" fn afs_read_int128(unit: i32, val: *mut i128, iostat: *mut i32) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
+        if let Some(bytes) = u.read_buffer_take(16) {
+            let mut b = [0u8; 16];
+            b.copy_from_slice(&bytes);
+            write_i128_ptr(val, i128::from_ne_bytes(b));
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = 0;
+                }
+            }
+            return;
+        }
         match u.next_read_token() {
             Ok(Some(token)) => match token.parse::<i128>() {
                 Ok(v) => {
@@ -1109,6 +1174,21 @@ pub extern "C" fn afs_read_int128(unit: i32, val: *mut i128, iostat: *mut i32) {
 pub extern "C" fn afs_read_real(unit: i32, val: *mut f32, iostat: *mut i32) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
+        if let Some(bytes) = u.read_buffer_take(4) {
+            let mut b = [0u8; 4];
+            b.copy_from_slice(&bytes);
+            if !val.is_null() {
+                unsafe {
+                    *val = f32::from_ne_bytes(b);
+                }
+            }
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = 0;
+                }
+            }
+            return;
+        }
         match u.next_read_token() {
             Ok(Some(token)) => {
                 // Handle Fortran D-exponent: replace D with E for parsing.
@@ -1164,6 +1244,21 @@ pub extern "C" fn afs_read_real(unit: i32, val: *mut f32, iostat: *mut i32) {
 pub extern "C" fn afs_read_real64(unit: i32, val: *mut f64, iostat: *mut i32) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
+        if let Some(bytes) = u.read_buffer_take(8) {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&bytes);
+            if !val.is_null() {
+                unsafe {
+                    *val = f64::from_ne_bytes(b);
+                }
+            }
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = 0;
+                }
+            }
+            return;
+        }
         match u.next_read_token() {
             Ok(Some(token)) => {
                 let normalized = token.replace('d', "e").replace('D', "E");
@@ -1210,12 +1305,97 @@ pub extern "C" fn afs_read_real64(unit: i32, val: *mut f64, iostat: *mut i32) {
     }
 }
 
-/// Read a character value from an external unit.
+/// Begin a list-directed READ statement. Mandatory before per-item
+/// helpers when iostat=/iomsg= are requested or when the unit may be
+/// sequential-unformatted (which needs the leading record marker
+/// consumed and the data slurped into a buffer for typed take-bytes).
 ///
-/// For formatted/list-directed units this consumes the next token. For
-/// stream-unformatted units it performs a raw byte read into the caller's
-/// fixed-length character storage.
+/// For formatted units this only resets iostat. For sequential
+/// unformatted units it reads `[u32 len][len bytes][u32 trailer]`,
+/// stashes the data in `pending_read`, and the per-item helpers will
+/// consume from there. Stream-unformatted reads continue using their
+/// existing per-helper raw-byte path.
 #[no_mangle]
+pub extern "C" fn afs_list_read_begin(
+    unit: i32,
+    iostat: *mut i32,
+    iomsg: *mut u8,
+    iomsg_len: i64,
+) {
+    if !iostat.is_null() {
+        unsafe {
+            *iostat = 0;
+        }
+    }
+    if !iomsg.is_null() && iomsg_len > 0 {
+        let buf = unsafe { std::slice::from_raw_parts_mut(iomsg, iomsg_len as usize) };
+        for b in buf.iter_mut() {
+            *b = b' ';
+        }
+    }
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(u) = state.get_unit(unit) else {
+        if !iostat.is_null() {
+            unsafe {
+                *iostat = 1;
+            }
+        }
+        return;
+    };
+    if !(u.form == Form::Unformatted && u.access == Access::Sequential) {
+        return;
+    }
+    let mut len_buf = [0u8; 4];
+    match u.read_raw(&mut len_buf) {
+        Ok(4) => {}
+        Ok(0) => {
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = IOSTAT_END;
+                }
+            }
+            return;
+        }
+        _ => {
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = 1;
+                }
+            }
+            return;
+        }
+    }
+    let record_len = u32::from_ne_bytes(len_buf) as usize;
+    let mut data = vec![0u8; record_len];
+    if record_len > 0 {
+        if u.read_raw(&mut data).is_err() && !iostat.is_null() {
+            unsafe {
+                *iostat = 1;
+            }
+            return;
+        }
+    }
+    let mut trailer = [0u8; 4];
+    let _ = u.read_raw(&mut trailer);
+    u.pending_read = Some((data, 0));
+}
+
+/// End a list-directed READ statement. Drops any unread bytes left in
+/// the in-flight unformatted record buffer (the standard does not
+/// require the program to consume the entire record).
+#[no_mangle]
+pub extern "C" fn afs_list_read_end(
+    unit: i32,
+    _iostat: *mut i32,
+    _iomsg: *mut u8,
+    _iomsg_len: i64,
+) {
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(u) = state.get_unit(unit) {
+        u.pending_read = None;
+    }
+}
+
 /// Advance the file position past one record on a list-directed READ
 /// statement that has no input items: `read(unit, *)` (no items) is
 /// defined by F2018 §12.6.4.5 to position the unit at the next record.
@@ -1269,6 +1449,16 @@ pub extern "C" fn afs_read_string(unit: i32, dest: *mut u8, dest_len: i64, iosta
         if !iostat.is_null() {
             unsafe {
                 *iostat = 1;
+            }
+        }
+        return;
+    }
+
+    if let Some(bytes) = u.read_buffer_take(dest_len as usize) {
+        crate::string::afs_assign_char_fixed(dest, dest_len, bytes.as_ptr(), dest_len);
+        if !iostat.is_null() {
+            unsafe {
+                *iostat = 0;
             }
         }
         return;
