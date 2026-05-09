@@ -13854,6 +13854,49 @@ fn inline_array_intrinsic_in_print_walks_descriptor_elements() {
 }
 
 #[test]
+fn complex_scalar_assigned_from_integer_promotes_via_buffer_not_pointer_cast() {
+    // F2018 §10.2.1.3: complex variables can be assigned a scalar of
+    // numeric type — the right-hand side is promoted to complex with
+    // imag=0. Our complex-assign lowering used to memcpy the 8/16
+    // bytes from the RHS treating its register-resident value as if
+    // it were a pointer to a [fN x 2] buffer; for an integer/real RHS
+    // that meant memcpy(c, value_as_ptr, 8) and faulted on the bogus
+    // address. LAPACK CGEEV's `work(1) = maxwrk` (complex(sp) = i32)
+    // SEGV'd on this exact path, taking out every example_eig*,
+    // example_pseudoinverse, example_solve_{cg,bicgstab,pcg}, etc.
+    // The fix materializes a fresh [fN x 2] buffer when the RHS isn't
+    // already complex — covers scalar `c = i`, array element `a(k)=i`,
+    // and derived-type field `dt%c = i`.
+    let src = write_program(
+        "program t\n  implicit none\n  complex(4) :: c, a(5)\n  type :: tt\n    complex(4) :: f\n  end type\n  type(tt) :: dt\n  integer :: i\n  i = 42\n  c = i\n  a(3) = i\n  dt%f = i\n  if (abs(real(c) - 42.0) > 1.0e-5) error stop 1\n  if (abs(aimag(c)) > 1.0e-5) error stop 2\n  if (abs(real(a(3)) - 42.0) > 1.0e-5) error stop 3\n  if (abs(aimag(a(3))) > 1.0e-5) error stop 4\n  if (abs(real(dt%f) - 42.0) > 1.0e-5) error stop 5\n  if (abs(aimag(dt%f)) > 1.0e-5) error stop 6\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("cmplx_int_assign", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("complex<-int compile failed");
+    assert!(
+        compile.status.success(),
+        "complex<-int should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("complex<-int run failed");
+    assert!(
+        run.status.success(),
+        "complex<-int should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn complex_dp_array_constructor_preserves_imaginary_lane_in_assignment() {
     // F2018 §7.8: array-constructor element values for complex(dp)
     // are 16-byte aggregates (`[f64 x 2]`). The constructor lowering
