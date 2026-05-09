@@ -1,7 +1,7 @@
 ! CHECK: 170141183460469231731687303715884105727
-! IR_CHECK: call @afs_fmt_begin_internal(
+! IR_CHECK: call @afs_fmt_begin_internal_ex(
 ! IR_CHECK: call @afs_fmt_push_int128(
-! ASM_CHECK: _afs_fmt_begin_internal
+! ASM_CHECK: _afs_fmt_begin_internal_ex
 ! ASM_CHECK: _afs_fmt_push_int128
 ! REPRO_CHECK: asm
 ! REPRO_CHECK: obj
