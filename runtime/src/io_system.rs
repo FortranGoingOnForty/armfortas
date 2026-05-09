@@ -1095,6 +1095,44 @@ pub extern "C" fn afs_read_real64(unit: i32, val: *mut f64, iostat: *mut i32) {
 /// stream-unformatted units it performs a raw byte read into the caller's
 /// fixed-length character storage.
 #[no_mangle]
+/// Advance the file position past one record on a list-directed READ
+/// statement that has no input items: `read(unit, *)` (no items) is
+/// defined by F2018 §12.6.4.5 to position the unit at the next record.
+/// stdlib's `number_of_rows(s)` counts rows by repeating exactly that
+/// statement until a nonzero iostat — without this helper the loop is
+/// infinite because the unit never advances and iostat is never set.
+#[no_mangle]
+pub extern "C" fn afs_read_skip_record(unit: i32, iostat: *mut i32) {
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(u) = state.get_unit(unit) else {
+        if !iostat.is_null() {
+            unsafe { *iostat = 1 };
+        }
+        return;
+    };
+    // Drain any pre-tokenized values from the previous list-directed
+    // read so the next iteration genuinely consumes a new record.
+    u.read_tokens.clear();
+    match u.read_line() {
+        Ok(s) if s.is_empty() => {
+            if !iostat.is_null() {
+                unsafe { *iostat = IOSTAT_END };
+            }
+        }
+        Ok(_) => {
+            if !iostat.is_null() {
+                unsafe { *iostat = 0 };
+            }
+        }
+        Err(_) => {
+            if !iostat.is_null() {
+                unsafe { *iostat = 1 };
+            }
+        }
+    }
+}
+
+#[no_mangle]
 pub extern "C" fn afs_read_string(unit: i32, dest: *mut u8, dest_len: i64, iostat: *mut i32) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     let Some(u) = state.get_unit(unit) else {
