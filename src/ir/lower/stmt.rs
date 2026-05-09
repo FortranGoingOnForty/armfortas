@@ -1478,7 +1478,21 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             };
 
             if is_list_directed {
+                // Wrap the per-item writes in begin/end so the runtime
+                // can (a) emit sequential-unformatted record markers,
+                // and (b) thread iostat=/iomsg= through.
+                b.call(
+                    FuncRef::External("afs_list_write_begin".into()),
+                    vec![unit, iostat_ptr, iomsg_ptr, iomsg_len],
+                    IrType::Void,
+                );
                 lower_write_items_adv(b, ctx, items, unit, advance);
+                let adv = b.const_i32(if advance { 1 } else { 0 });
+                b.call(
+                    FuncRef::External("afs_list_write_end".into()),
+                    vec![unit, adv, iostat_ptr, iomsg_ptr, iomsg_len],
+                    IrType::Void,
+                );
             } else {
                 // Formatted I/O: use push-based API.
                 let (fmt_ptr, fmt_len) = lower_string_expr_with_layouts(
