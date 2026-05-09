@@ -1006,7 +1006,9 @@ pub(crate) fn lower_expr_full(
                     .unwrap_or_else(|| key.clone());
                 let has_named_interface = !internal_funcs
                     .is_some_and(|funcs| funcs.contains_key(&key))
-                    && find_named_interface_symbol(st, &key).is_some();
+                    && (find_named_interface_symbol(st, &key).is_some()
+                        || crate::ir::lower::core::named_interface_specific_candidates(st, &key)
+                            .is_some());
 
                 // Check if this is an array element or section access.
                 if let Some(info) = locals.get(&key) {
