@@ -18273,6 +18273,84 @@ fn formatted_section_write_iterates_assumed_shape_dummy_section() {
 }
 
 #[test]
+fn error_stop_with_character_message_prints_user_text_to_stderr() {
+    // Regression: lower_stmt's Stmt::ErrorStop arm threw the stop-code
+    // expression away and called afs_error_stop() (no-arg, prints just
+    // "ERROR STOP"). stdlib's sort_adjoint / sort_index / linalg state
+    // and many other diagnostics relied on the user-supplied character
+    // message making it to stderr per F2018 §11.4. Verify the message
+    // is now passed through.
+    let src = write_program(
+        "program p\n  implicit none\n  error stop 'sentinel-msg-12345'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("error_stop_msg", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("error stop compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "error stop should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        !run.status.success(),
+        "error stop should exit nonzero: status={:?}",
+        run.status
+    );
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        stderr.contains("sentinel-msg-12345"),
+        "expected user message in stderr, got: {}",
+        stderr
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn error_stop_with_integer_code_uses_code_as_exit_status() {
+    // F2018 §11.4: integer stop-code becomes the exit status (clamped
+    // to 1..=255 for Unix).  Verify `error stop 42` exits with 42 and
+    // prints "ERROR STOP 42".
+    let src = write_program(
+        "program p\n  implicit none\n  error stop 42\nend program\n",
+        "f90",
+    );
+    let out = unique_path("error_stop_int", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("error stop int compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "error stop int should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert_eq!(
+        run.status.code(),
+        Some(42),
+        "expected exit code 42, got {:?}",
+        run.status
+    );
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        stderr.contains("ERROR STOP") && stderr.contains("42"),
+        "expected ERROR STOP 42 in stderr, got: {}",
+        stderr
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn formatted_section_read_iterates_allocatable_dummy_section() {
     // Regression: stdlib's loadtxt allocates an `intent(out)` rank-2
     // allocatable inside the subroutine and reads each row via
