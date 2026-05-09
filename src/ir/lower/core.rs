@@ -19897,13 +19897,21 @@ pub(super) fn lower_array_read_item(
             let has_range = args
                 .iter()
                 .any(|arg| matches!(arg.value, crate::ast::expr::SectionSubscript::Range { .. }));
-            if has_range && info.allocatable {
+            // Route through the descriptor-driven section reader whenever the
+            // local is descriptor-backed (allocatable OR assumed-shape dummy).
+            // info.dims is empty for assumed-shape, so the fixed-bound iterator
+            // would emit zero loop iterations and the read would silently leave
+            // the destination zero-filled — exactly the failure mode in stdlib's
+            // loadtxt when called with a `real, allocatable, intent(out) ::
+            // d(:,:)` whose section `d(i, :)` lowered to a dummy descriptor in
+            // the callee.
+            if has_range && local_uses_array_descriptor(&info) {
                 lower_alloc_section_read(b, ctx, &info, args, mode);
                 true
             } else if has_range && args.len() == 1 {
                 lower_1d_slice_read(b, ctx, &info, &args[0], mode);
                 true
-            } else if has_range && args.len() > 1 && !info.allocatable {
+            } else if has_range && args.len() > 1 {
                 lower_section_read_nd(b, ctx, &info, args, mode);
                 true
             } else {
@@ -21471,6 +21479,12 @@ pub(super) fn lower_alloc_section_read(
 
     let elem_bytes = ir_scalar_byte_size(&info.ty);
     let base = array_base_addr(b, info);
+    // For assumed-shape dummies the local slot is a pointer-to-descriptor
+    // (info.by_ref==true); array_descriptor_addr unwraps the indirection so
+    // load_array_desc_i64_field reads the actual descriptor fields. Using
+    // info.addr directly here previously SEGV'd on the first descriptor load
+    // when called via the new descriptor-routed read path.
+    let desc_ptr = array_descriptor_addr(b, info);
     let one64 = b.const_i64(1);
     let zero64 = b.const_i64(0);
 
@@ -21478,9 +21492,9 @@ pub(super) fn lower_alloc_section_read(
     let mut cum_extent = one64;
     for (dim_idx, arg) in args.iter().enumerate() {
         let dim_base = 24 + (dim_idx as i64) * 24;
-        let lo = load_array_desc_i64_field(b, info.addr, dim_base);
-        let up = load_array_desc_i64_field(b, info.addr, dim_base + 8);
-        let mem_stride = load_array_desc_i64_field(b, info.addr, dim_base + 16);
+        let lo = load_array_desc_i64_field(b, desc_ptr, dim_base);
+        let up = load_array_desc_i64_field(b, desc_ptr, dim_base + 8);
+        let mem_stride = load_array_desc_i64_field(b, desc_ptr, dim_base + 16);
         let span = b.isub(up, lo);
         let extent_raw = b.iadd(span, one64);
         let is_empty = b.icmp(CmpOp::Lt, up, lo);
@@ -21573,16 +21587,25 @@ pub(super) fn lower_alloc_section_read(
 
         b.set_block(bodies[d]);
         if d == 0 {
-            let dim_data: Vec<(ValueId, ValueId, ValueId, ValueId)> = dims
+            // Ignore the descriptor's per-dim mem_stride: it is already
+            // pre-multiplied with extent products by descriptor
+            // materialization, so combining it with cum_extent_d would
+            // double-count. The canonical IR convention (see
+            // compute_flat_elem_offset's descriptor branch) is "extent
+            // product only" — matches both allocatables (stride=1) and
+            // assumed-shape dummies fed from fixed-shape callers. Without
+            // this fix (lost from commit 4986129 in the lower.rs split),
+            // descriptor-routed section reads compute the wrong offset and
+            // either read garbage, SEGV, or both.
+            let dim_data: Vec<(ValueId, ValueId, ValueId)> = dims
                 .iter()
-                .map(|dim| (dim.counter, dim.lower_bound, dim.mem_stride, dim.cum_extent))
+                .map(|dim| (dim.counter, dim.lower_bound, dim.cum_extent))
                 .collect();
             let mut elem_offset: Option<ValueId> = None;
-            for (counter, lower_bound, mem_stride, cum_extent_d) in dim_data {
+            for (counter, lower_bound, cum_extent_d) in dim_data {
                 let cnt = b.load(counter);
                 let adjusted = b.isub(cnt, lower_bound);
-                let scaled = b.imul(adjusted, cum_extent_d);
-                let term = b.imul(scaled, mem_stride);
+                let term = b.imul(adjusted, cum_extent_d);
                 elem_offset = Some(match elem_offset {
                     Some(prev) => b.iadd(prev, term),
                     None => term,
