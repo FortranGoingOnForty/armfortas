@@ -18222,6 +18222,51 @@ fn formatted_write_of_concat_with_internal_char_function_runs() {
 }
 
 #[test]
+fn formatted_write_sets_iostat_zero_on_success_for_scalar_and_array() {
+    // Regression: afs_fmt_begin / afs_fmt_end never wrote the
+    // iostat= specifier on success, so a caller's
+    // `if (ios /= 0) error_stop` always tripped on the pre-call
+    // sentinel.  stdlib's savetxt loops exactly that pattern around
+    // `write(unit, fmt_, iostat=ios) d(i,:)` and therefore
+    // unconditionally error_stop'd every example_savetxt and
+    // example_loadtxt regardless of whether the file write itself
+    // succeeded. Verify both scalar and whole-array formatted writes
+    // now leave ios=0 after a successful run.
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: ios = -1\n  character(len=64) :: msg = 'sentinel'\n  open(unit=10, file='/tmp/afs_iostat_test.txt', status='replace')\n  write(10, '(I0)', iostat=ios, iomsg=msg) 42\n  if (ios /= 0) then\n    print *, 'scalar fail ios=', ios\n    error stop 1\n  end if\n  write(10, '(*(I0,1x))', iostat=ios, iomsg=msg) [1, 2, 3]\n  if (ios /= 0) then\n    print *, 'array fail ios=', ios\n    error stop 2\n  end if\n  close(10)\n  print *, 'iostat OK'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("formatted_iostat_zero", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("formatted iostat compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "formatted iostat should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "formatted iostat should run cleanly: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("iostat OK"),
+        "expected iostat OK in output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file("/tmp/afs_iostat_test.txt");
+}
+
+#[test]
 fn formatted_write_iterates_whole_array_real_and_int() {
     // Regression: lower_fmt_push used to drop array items into the
     // IrType::Ptr scalar arm and dispatch to afs_fmt_push_string with a
