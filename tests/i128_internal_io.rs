@@ -130,7 +130,7 @@ fn integer16_internal_format_uses_internal_format_sink() {
         },
         Stage::OptIr,
     );
-    assert!(opt_ir.contains("call @afs_fmt_begin_internal("));
+    assert!(opt_ir.contains("call @afs_fmt_begin_internal_ex("));
     assert!(opt_ir.contains("call @afs_fmt_push_int128("));
 
     let asm = capture_text(
@@ -141,7 +141,7 @@ fn integer16_internal_format_uses_internal_format_sink() {
         },
         Stage::Asm,
     );
-    assert!(asm.contains("_afs_fmt_begin_internal"));
+    assert!(asm.contains("_afs_fmt_begin_internal_ex"));
     assert!(asm.contains("_afs_fmt_push_int128"));
 }
 
