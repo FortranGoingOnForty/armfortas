@@ -7970,6 +7970,26 @@ pub(super) fn find_named_interface_symbol<'a>(
     if let Some(sym) = st.lookup(&key) {
         return is_named_interface_like(sym).then_some(sym);
     }
+    // F2018 §11.2.2: a name from another module shadows an intrinsic
+    // only when it is actually use-associated into the current TU.
+    // Walking all scopes unconditionally picks up named interfaces from
+    // modules that are merely loaded for type-info (e.g. stdlib_io's
+    // `use stdlib_string_type, only: string_type` brings the
+    // string_type scope into all_scopes() but does NOT import its
+    // `trim`/`adjustl`/`len` named interfaces — those should remain
+    // intrinsic in stdlib_io). Without this gate, parse_mode's
+    // `a = trim(adjustl(mode))` silently routed through
+    // trim_string(string_type→string_type), returning empty so
+    // parse_mode kept its 'r t' default and stdlib_io.open ran the
+    // 'r' branch (status='old' / action='read'), failing every
+    // savetxt/loadtxt/loadnpy.
+    let key_is_use_associated = st
+        .all_scopes()
+        .iter()
+        .any(|scope| scope.use_associations.iter().any(|a| a.local_name == key));
+    if !key_is_use_associated {
+        return None;
+    }
     for scope in st.all_scopes() {
         if let Some(sym) = scope.symbols.get(&key) {
             if is_named_interface_like(sym) {
