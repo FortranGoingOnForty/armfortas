@@ -3439,6 +3439,55 @@ pub extern "C" fn afs_fmt_read_string(
     size_out: *mut i32,
     iostat: *mut i32,
 ) {
+    // If a prior `read(...,advance='NO')` left a partial in-flight
+    // record with cursor in the middle, consume from that cursor first
+    // and then mark the record as fully consumed (advancing past it
+    // for the next statement). Without this, switching from
+    // non-advancing to advancing — exactly what stdlib's
+    // `read_bitset_unit_64` does on its final-bit read — would call
+    // `read_line` and discard the cursor, returning the wrong char or
+    // EOF for files with a single physical record.
+    {
+        let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(u) = state.get_unit(unit) {
+            let has_partial_record = u.formatted_read_record.is_some()
+                && u.formatted_read_cursor
+                    < u.formatted_read_record
+                        .as_ref()
+                        .map(|r| r.len())
+                        .unwrap_or(0);
+            if has_partial_record {
+                let fmt = unsafe_str(fmt_str, fmt_len);
+                let descs = parse_format(&fmt);
+                let input = u
+                    .formatted_read_record
+                    .as_ref()
+                    .map(|l| l.as_bytes().to_vec())
+                    .unwrap_or_default();
+                let mut cursor = u.formatted_read_cursor;
+                let mut remaining = 0usize;
+                let outcome =
+                    extract_nth_formatted_field(&descs, &input, &mut cursor, &mut remaining);
+                u.formatted_read_record = None;
+                u.formatted_read_cursor = 0;
+                drop(state);
+                match outcome {
+                    Some((FormatDesc::Character { .. }, field)) => {
+                        store_formatted_char_result(&field, dest, dest_len, size_out, iostat);
+                    }
+                    _ => {
+                        store_formatted_char_error(dest, dest_len, size_out, IOSTAT_EOR);
+                        if !iostat.is_null() {
+                            unsafe {
+                                *iostat = IOSTAT_EOR;
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+        }
+    }
     match formatted_read_record_for_unit(unit, data_index)
         .and_then(|line| parse_nth_formatted_record(line.as_bytes(), fmt_str, fmt_len, data_index))
     {
