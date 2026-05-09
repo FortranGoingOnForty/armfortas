@@ -7970,32 +7970,37 @@ pub(super) fn find_named_interface_symbol<'a>(
     if let Some(sym) = st.lookup(&key) {
         return is_named_interface_like(sym).then_some(sym);
     }
-    // F2018 §11.2.2: a name from another module shadows an intrinsic
-    // only when it is actually use-associated into the current TU.
-    // Walking all scopes unconditionally picks up named interfaces from
-    // modules that are merely loaded for type-info (e.g. stdlib_io's
-    // `use stdlib_string_type, only: string_type` brings the
-    // string_type scope into all_scopes() but does NOT import its
-    // `trim`/`adjustl`/`len` named interfaces — those should remain
-    // intrinsic in stdlib_io). Without this gate, parse_mode's
-    // `a = trim(adjustl(mode))` silently routed through
-    // trim_string(string_type→string_type), returning empty so
-    // parse_mode kept its 'r t' default and stdlib_io.open ran the
-    // 'r' branch (status='old' / action='read'), failing every
-    // savetxt/loadtxt/loadnpy.
+    // F2018 §11.2.2: a named interface from another module shadows an
+    // intrinsic only when it is actually use-associated into the
+    // current TU. all_scopes() also exposes modules that the unit
+    // merely loads for type-info (e.g. `use stdlib_string_type, only:
+    // string_type` brings the whole module scope along but does not
+    // import its trim/adjustl/len named interfaces); without the gate,
+    // parse_mode's `trim(adjustl(mode))` silently re-routed through
+    // trim_string and parse_mode kept its 'r t' default, breaking
+    // open() for every savetxt/loadtxt/loadnpy. The gate applies only
+    // to Module/Submodule scopes — in-TU Program/Function/Subroutine
+    // scopes always feed dispatch (sema's st.current can be stale
+    // during IR lowering, so a generic declared in the program scope
+    // only resurfaces via the all-scope walk).
+    use crate::sema::symtab::ScopeKind;
     let key_is_use_associated = st
         .all_scopes()
         .iter()
         .any(|scope| scope.use_associations.iter().any(|a| a.local_name == key));
-    if !key_is_use_associated {
-        return None;
-    }
     for scope in st.all_scopes() {
+        let in_tu = !matches!(scope.kind, ScopeKind::Module(_) | ScopeKind::Submodule(_));
+        if !in_tu && !key_is_use_associated {
+            continue;
+        }
         if let Some(sym) = scope.symbols.get(&key) {
             if is_named_interface_like(sym) {
                 return Some(sym);
             }
         }
+    }
+    if !key_is_use_associated {
+        return None;
     }
     match st.find_symbol_any_scope(&key) {
         Some(sym) if is_named_interface_like(sym) => Some(sym),
