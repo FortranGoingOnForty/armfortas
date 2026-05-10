@@ -990,6 +990,22 @@ pub extern "C" fn afs_allocate_array(
         }
     }
 
+    // ALLOCATE always produces a single contiguous block, so the
+    // descriptor's per-dim memory stride must be the column-major
+    // canonical step (1 for dim 0, then product of preceding extents).
+    // Compiler-generated dim_buf entries pass stride=1 across the
+    // board (the rank-1 case happens to be correct, multi-dim wasn't),
+    // so fix it up here. Without this, allocatable rank-N section
+    // assignments fed afs_create_section a stride=1 source and the
+    // produced section descriptor stepped through memory contiguously,
+    // collapsing column-major rows into a single linear walk and
+    // corrupting both the LHS write and any subsequent RHS read.
+    let mut running_stride: i64 = 1;
+    for i in 0..rank as usize {
+        desc.dims[i].stride = running_stride;
+        running_stride = running_stride.saturating_mul(desc.dims[i].extent().max(1));
+    }
+
     // Compute total bytes.
     let total = desc.total_elements();
     let bytes = total * elem_size;
@@ -1170,8 +1186,60 @@ pub extern "C" fn afs_copy_array_data(
     let source = unsafe { &*source };
     let bytes = source.total_bytes();
     if bytes > 0 && !source.base_addr.is_null() && !dest.base_addr.is_null() {
-        unsafe {
-            ptr::copy(source.base_addr, dest.base_addr, bytes as usize);
+        // F2018 §9.7.1.2: SOURCE-expr may be a non-contiguous section
+        // (e.g. `allocate(col, source = idx(2, 1:n))` reads only every
+        // other element of `idx`). A flat ptr::copy treats the source
+        // base..base+total_bytes as contiguous, picking up adjacent
+        // dim-0 entries instead of stepping by the per-dim memory
+        // stride. Detect non-contiguous (any source stride != the
+        // canonical column-major step) and walk element-by-element.
+        let elem_size = source.elem_size;
+        let mut canonical: i64 = 1;
+        let mut contiguous = true;
+        for i in 0..source.rank as usize {
+            if source.dims[i].stride != canonical {
+                contiguous = false;
+                break;
+            }
+            canonical = canonical.saturating_mul(source.dims[i].extent().max(1));
+        }
+        if contiguous {
+            unsafe {
+                ptr::copy(source.base_addr, dest.base_addr, bytes as usize);
+            }
+        } else {
+            // Walk every multi-index of the source in column-major
+            // order and copy `elem_size` bytes per slot. Dest is
+            // contiguous (just allocated) so its destination index
+            // is the linear count.
+            let rank = source.rank as usize;
+            let extents: Vec<i64> = (0..rank).map(|i| source.dims[i].extent()).collect();
+            let strides: Vec<i64> = (0..rank).map(|i| source.dims[i].stride).collect();
+            let mut idx = vec![0i64; rank];
+            let total = source.total_elements();
+            for k in 0..total {
+                let mut src_off: i64 = 0;
+                for d in 0..rank {
+                    src_off += idx[d] * strides[d];
+                }
+                src_off *= elem_size;
+                let dst_off = k * elem_size;
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        source.base_addr.offset(src_off as isize),
+                        dest.base_addr.offset(dst_off as isize),
+                        elem_size as usize,
+                    );
+                }
+                // increment column-major: dim 0 fastest
+                for d in 0..rank {
+                    idx[d] += 1;
+                    if idx[d] < extents[d] {
+                        break;
+                    }
+                    idx[d] = 0;
+                }
+            }
         }
     }
     dest.set_scalar_type_tag(source.scalar_type_tag());
@@ -1366,12 +1434,22 @@ pub extern "C" fn afs_assign_allocatable(
             dest.flags &= !DESC_ALLOCATED;
         }
 
-        // Allocate with source's shape.
+        // Allocate with source's shape, but compute canonical
+        // column-major strides (1, ext_0, ext_0*ext_1, ...) — the
+        // dest is freshly contiguous, so per-dim memory step must
+        // match Fortran's column-major convention used by
+        // afs_create_section / load_rank1_array_desc_elem. Setting
+        // stride=1 across the board collapsed dim_1+ accesses onto
+        // the dim_0 axis (e.g. allocatable A = transpose(reshape(...))
+        // produced descriptor with stride=(1,1) and any subsequent
+        // assumed-shape pass read overlapping bytes per "column").
         dest.rank = source.rank;
         dest.elem_size = source.elem_size;
+        let mut running_stride: i64 = 1;
         for i in 0..source.rank as usize {
             dest.dims[i] = source.dims[i];
-            dest.dims[i].stride = 1; // dest is always contiguous
+            dest.dims[i].stride = running_stride;
+            running_stride = running_stride.saturating_mul(source.dims[i].extent().max(1));
         }
 
         let bytes = dest.total_bytes();
@@ -1386,11 +1464,68 @@ pub extern "C" fn afs_assign_allocatable(
         dest.flags = DESC_ALLOCATED | DESC_CONTIGUOUS;
     }
 
-    // Copy data. Use ptr::copy (not copy_nonoverlapping) to handle self-assignment.
+    // Copy data. Source may be non-contiguous (e.g. result of
+    // transpose() returns a descriptor with reversed dim strides
+    // pointing at the original buffer). A flat ptr::copy of
+    // total_bytes from source.base_addr would drag adjacent bytes
+    // forward without honoring per-dim strides — the same class of
+    // bug as the original afs_copy_array_data flat copy. Detect
+    // non-contiguous and walk every multi-index column-major.
+    //
+    // We only treat the source as non-contiguous when at least one
+    // dim's stride is *strictly greater* than its canonical
+    // column-major step. Strides smaller than canonical (e.g.
+    // afs_matmul's 2x2 result emitted with stride=(1,1) instead of
+    // (1,2)) describe an internally inconsistent descriptor whose
+    // base_addr still points at a flat contiguous buffer; walking
+    // those would re-read the same byte offset twice and drop the
+    // last element. The conservative choice is the flat copy that
+    // mirrors total_bytes — which the previous unconditional ptr::copy
+    // did silently for both kinds of source.
     let bytes = source.total_bytes();
     if bytes > 0 && !source.base_addr.is_null() && !dest.base_addr.is_null() {
-        unsafe {
-            ptr::copy(source.base_addr, dest.base_addr, bytes as usize);
+        let elem_size = source.elem_size;
+        let mut canonical: i64 = 1;
+        let mut strided = false;
+        for i in 0..source.rank as usize {
+            if source.dims[i].stride > canonical {
+                strided = true;
+                break;
+            }
+            canonical = canonical.saturating_mul(source.dims[i].extent().max(1));
+        }
+        if !strided {
+            unsafe {
+                ptr::copy(source.base_addr, dest.base_addr, bytes as usize);
+            }
+        } else {
+            let rank = source.rank as usize;
+            let extents: Vec<i64> = (0..rank).map(|i| source.dims[i].extent()).collect();
+            let strides: Vec<i64> = (0..rank).map(|i| source.dims[i].stride).collect();
+            let mut idx = vec![0i64; rank];
+            let total = source.total_elements();
+            for k in 0..total {
+                let mut src_off: i64 = 0;
+                for d in 0..rank {
+                    src_off += idx[d] * strides[d];
+                }
+                src_off *= elem_size;
+                let dst_off = k * elem_size;
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        source.base_addr.offset(src_off as isize),
+                        dest.base_addr.offset(dst_off as isize),
+                        elem_size as usize,
+                    );
+                }
+                for d in 0..rank {
+                    idx[d] += 1;
+                    if idx[d] < extents[d] {
+                        break;
+                    }
+                    idx[d] = 0;
+                }
+            }
         }
     }
     dest.set_scalar_type_tag(source.scalar_type_tag());
@@ -1455,9 +1590,15 @@ pub extern "C" fn afs_assign_allocatable_convert(
         }
         dest_ref.rank = source_ref.rank;
         dest_ref.elem_size = dest_elem_size;
+        // Canonical column-major strides — see matching note in
+        // afs_assign_allocatable. dest is freshly contiguous; the
+        // per-dim memory step must be (1, ext_0, ext_0*ext_1, ...).
+        let mut running_stride: i64 = 1;
         for i in 0..source_ref.rank as usize {
             dest_ref.dims[i] = source_ref.dims[i];
-            dest_ref.dims[i].stride = 1;
+            dest_ref.dims[i].stride = running_stride;
+            running_stride =
+                running_stride.saturating_mul(source_ref.dims[i].extent().max(1));
         }
         let bytes = dest_ref.total_bytes();
         if bytes > 0 {
@@ -1480,28 +1621,71 @@ pub extern "C" fn afs_assign_allocatable_convert(
 
     let src_p = source_ref.base_addr;
     let dst_p = dest_ref.base_addr;
-    for i in 0..n {
+    let src_elem_size: i64 = match src_kind_tag {
+        0 => 1,
+        1 => 2,
+        2 | 4 => 4,
+        3 | 5 => 8,
+        _ => return,
+    };
+    // Source may be non-contiguous (e.g. transpose result, section).
+    // Walk each multi-index column-major and apply per-dim strides.
+    // Mirror the same-class detection used in afs_assign_allocatable
+    // and afs_copy_array_data: only apply per-dim strides when at
+    // least one stride is *strictly greater* than its canonical
+    // column-major step. A stride below canonical describes a
+    // malformed descriptor (e.g. a 2x2 matmul result with stride=(1,1)
+    // instead of (1,2)) whose underlying buffer is still flat
+    // contiguous; walking those re-reads the same offset twice.
+    let rank = source_ref.rank as usize;
+    let extents: Vec<i64> = (0..rank).map(|i| source_ref.dims[i].extent()).collect();
+    let raw_strides: Vec<i64> = (0..rank).map(|i| source_ref.dims[i].stride).collect();
+    let mut canonical_step: i64 = 1;
+    let mut canonical: Vec<i64> = Vec::with_capacity(rank);
+    let mut strided = false;
+    for d in 0..rank {
+        canonical.push(canonical_step);
+        if raw_strides[d] > canonical_step {
+            strided = true;
+        }
+        canonical_step = canonical_step.saturating_mul(extents[d].max(1));
+    }
+    let strides: &[i64] = if strided { &raw_strides } else { &canonical };
+    let mut idx = vec![0i64; rank];
+    for k in 0..n {
+        let mut src_off_elems: i64 = 0;
+        for d in 0..rank {
+            src_off_elems += idx[d] * strides[d];
+        }
+        let src_byte_off = src_off_elems * src_elem_size;
         let src_val_f64: f64 = unsafe {
             match src_kind_tag {
-                0 => *(src_p.add(i) as *const i8) as f64,
-                1 => *(src_p.add(2 * i) as *const i16) as f64,
-                2 => *(src_p.add(4 * i) as *const i32) as f64,
-                3 => *(src_p.add(8 * i) as *const i64) as f64,
-                4 => *(src_p.add(4 * i) as *const f32) as f64,
-                5 => *(src_p.add(8 * i) as *const f64),
+                0 => *(src_p.offset(src_byte_off as isize) as *const i8) as f64,
+                1 => *(src_p.offset(src_byte_off as isize) as *const i16) as f64,
+                2 => *(src_p.offset(src_byte_off as isize) as *const i32) as f64,
+                3 => *(src_p.offset(src_byte_off as isize) as *const i64) as f64,
+                4 => *(src_p.offset(src_byte_off as isize) as *const f32) as f64,
+                5 => *(src_p.offset(src_byte_off as isize) as *const f64),
                 _ => return,
             }
         };
         unsafe {
             match dest_kind_tag {
-                0 => *(dst_p.add(i) as *mut i8) = src_val_f64 as i8,
-                1 => *(dst_p.add(2 * i) as *mut i16) = src_val_f64 as i16,
-                2 => *(dst_p.add(4 * i) as *mut i32) = src_val_f64 as i32,
-                3 => *(dst_p.add(8 * i) as *mut i64) = src_val_f64 as i64,
-                4 => *(dst_p.add(4 * i) as *mut f32) = src_val_f64 as f32,
-                5 => *(dst_p.add(8 * i) as *mut f64) = src_val_f64,
+                0 => *(dst_p.add(k) as *mut i8) = src_val_f64 as i8,
+                1 => *(dst_p.add(2 * k) as *mut i16) = src_val_f64 as i16,
+                2 => *(dst_p.add(4 * k) as *mut i32) = src_val_f64 as i32,
+                3 => *(dst_p.add(8 * k) as *mut i64) = src_val_f64 as i64,
+                4 => *(dst_p.add(4 * k) as *mut f32) = src_val_f64 as f32,
+                5 => *(dst_p.add(8 * k) as *mut f64) = src_val_f64,
                 _ => return,
             }
+        }
+        for d in 0..rank {
+            idx[d] += 1;
+            if idx[d] < extents[d] {
+                break;
+            }
+            idx[d] = 0;
         }
     }
 }
@@ -1736,12 +1920,18 @@ mod tests {
         assert!(dest.is_allocated());
         assert_eq!(dest.elem_size, 8);
         assert_eq!(dest.rank, 2);
+        // Bounds carry over from source. Strides are canonical
+        // column-major (stride[0]=1, stride[k]=Π extent[0..k]) — see
+        // matching note in afs_allocate_array. The previous flat-1
+        // strides made downstream `afs_create_section` compute
+        // colliding byte offsets for any rank-2 reshape.
         assert_eq!(dest.dims[0].lower_bound, -2);
         assert_eq!(dest.dims[0].upper_bound, 1);
         assert_eq!(dest.dims[0].stride, 1);
         assert_eq!(dest.dims[1].lower_bound, 4);
         assert_eq!(dest.dims[1].upper_bound, 6);
-        assert_eq!(dest.dims[1].stride, 1);
+        // dim[1].stride = extent[0] = 1-(-2)+1 = 4
+        assert_eq!(dest.dims[1].stride, 4);
 
         afs_deallocate_array(&mut dest, ptr::null_mut());
     }

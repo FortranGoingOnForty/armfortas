@@ -423,9 +423,47 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                             } else {
                                                 false
                                             };
+                                        // Scalar-returning intrinsic broadcast to a whole array:
+                                        // `x = ieee_value(1.0, NaN)`, `x = epsilon(1.0)`,
+                                        // `x = huge(1.0)`. The fall-through path lowers the
+                                        // call as a scalar then treats the result as a source
+                                        // descriptor pointer — IR verifier catches "load from
+                                        // non-pointer fN" on fixed-size dests, and SEGV inside
+                                        // afs_assign_allocatable on descriptor-backed dests
+                                        // (stdlib's pinv_s_operator on the linalg-error path
+                                        // `pinva = ieee_value(1.0_sp, ieee_quiet_nan)`).
+                                        // Restricted to a known set of always-scalar
+                                        // intrinsics — extending it broadly mis-routes user
+                                        // functions that legitimately return arrays.
+                                        let callee_is_scalar_broadcast_intrinsic =
+                                            local_is_array_like(&info)
+                                                && !callee_is_local_array
+                                                && !callee_is_elemental_array_intrinsic
+                                                && !callee_is_transformational_intrinsic
+                                                && {
+                                                    if let Expr::Name { name: cname } = &callee.node {
+                                                        let lk = cname.to_lowercase();
+                                                        matches!(
+                                                            lk.as_str(),
+                                                            "ieee_value"
+                                                                | "epsilon"
+                                                                | "huge"
+                                                                | "tiny"
+                                                                | "radix"
+                                                                | "digits"
+                                                                | "precision"
+                                                                | "range"
+                                                                | "minexponent"
+                                                                | "maxexponent"
+                                                        )
+                                                    } else {
+                                                        false
+                                                    }
+                                                };
                                         if callee_is_local_array
                                             || callee_is_elemental_array_intrinsic
                                             || callee_is_transformational_intrinsic
+                                            || callee_is_scalar_broadcast_intrinsic
                                         {
                                             lower_array_assign(b, ctx, name, &info, value);
                                             return;
@@ -2993,7 +3031,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             items,
             opts,
         } => {
-            let stat_addr = allocate_status_target_addr(b, ctx, opts);
+            let stat_target = super::core::allocate_status_target(b, ctx, opts);
+            let stat_addr = stat_target.runtime_addr;
             // F2018 §9.7.1.3: stat-variable is 0 on success. Pre-zero so
             // any item path that doesn't update stat_addr (e.g. scalar
             // simple allocates that don't go through a runtime helper)
@@ -3764,10 +3803,12 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     }
                 }
             }
+            super::core::emit_allocate_status_writeback(b, &stat_target);
         }
 
         Stmt::Deallocate { items, opts } => {
-            let stat_addr = allocate_status_target_addr(b, ctx, opts);
+            let dealloc_stat_target = super::core::allocate_status_target(b, ctx, opts);
+            let stat_addr = dealloc_stat_target.runtime_addr;
             let errmsg_target = allocate_errmsg_target(b, ctx, opts);
             for item in items {
                 if let Expr::ComponentAccess { .. } = &item.node {
@@ -3873,6 +3914,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     }
                 }
             }
+            super::core::emit_allocate_status_writeback(b, &dealloc_stat_target);
         }
 
         Stmt::Block {

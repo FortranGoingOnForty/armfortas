@@ -4186,6 +4186,145 @@ end program
 }
 
 #[test]
+fn intrinsic_repeat_keeps_length_through_user_generic_shadow() {
+    // F2008 §12.5.5.2: a user-defined generic only shadows an intrinsic
+    // for argument signatures matching one of its specifics. stdlib's
+    // `repeat` generic only has `(string_type, integer)`, so a call
+    // with a character first arg must dispatch to the intrinsic.
+    //
+    // The string-context FunctionCall arm in lower_string_expr_full was
+    // gating the intrinsic match arms unconditionally on
+    // `find_named_interface_symbol(...).is_some()`, so once a user
+    // module exported a generic with the intrinsic's name the intrinsic
+    // length-computation arm was skipped. The runtime still routed to
+    // `_afs_repeat` correctly, but `lower_string_expr_full` returned
+    // `(buf, 0)` instead of `(buf, src_len * copies)`. Any deferred
+    // assignment downstream (`s = repeat(' ', n)`) then asked
+    // `afs_assign_char_deferred` to copy zero bytes — silently empty
+    // strings, blocking process_1/process_6 and any code that
+    // transitively `use`s stdlib_strings.
+    let src = write_program(
+        r#"
+module mymod
+  implicit none
+  type :: stringy
+    integer :: dummy
+  end type
+  interface repeat
+    module procedure :: repeat_stringy
+  end interface
+contains
+  function repeat_stringy(s, n) result(r)
+    type(stringy), intent(in) :: s
+    integer, intent(in) :: n
+    type(stringy) :: r
+    r%dummy = s%dummy * n
+  end function
+end module
+program p
+  use mymod
+  implicit none
+  character(:), allocatable :: s
+  s = repeat(' ', 5)
+  if (len(s) /= 5) error stop 1
+  if (s /= '     ') error stop 2
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("repeat_user_shadow", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("repeat-shadow compile failed");
+    assert!(
+        compile.status.success(),
+        "should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "intrinsic repeat under user-generic shadow produced wrong length: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected 'ok': {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn allocatable_rank2_assign_from_transpose_uses_column_major_stride() {
+    // F2018 §10.1.5: allocatable LHS = transpose(reshape(...)) reallocates
+    // dest with source's shape and copies the data. afs_assign_allocatable
+    // used to set dest.dims[i].stride = 1 across the board, but the
+    // descriptor convention is that stride encodes per-dim *memory step*
+    // in column-major order — see afs_create_section's matching note.
+    // With stride=(1,1) on a 3x3 contiguous block, any subsequent path
+    // that walked the descriptor (e.g. ALLOCATE(target, source=A) inside
+    // a call where A is the assumed-shape dummy) produced overlapping
+    // byte offsets and corrupted the copy. Surfaced as wrong eigenvalue
+    // matrices in stdlib's eigvals/eig clusters.
+    let src = write_program(
+        r#"
+program p
+  implicit none
+  real, allocatable :: A(:,:)
+  A = transpose(reshape([2.0, 8.0, 4.0, 1.0, 3.0, 5.0, 9.0, 5.0, -2.0], [3,3]))
+  call check(A)
+contains
+  subroutine check(a)
+    real, intent(in), target :: a(:,:)
+    real, allocatable :: amat(:,:)
+    allocate(amat(3,3), source=a)
+    if (abs(amat(1,1) - 2.0) > 1.0e-6) error stop 1
+    if (abs(amat(2,1) - 1.0) > 1.0e-6) error stop 2
+    if (abs(amat(3,1) - 9.0) > 1.0e-6) error stop 3
+    if (abs(amat(1,2) - 8.0) > 1.0e-6) error stop 4
+    if (abs(amat(2,2) - 3.0) > 1.0e-6) error stop 5
+    if (abs(amat(3,2) - 5.0) > 1.0e-6) error stop 6
+    if (abs(amat(1,3) - 4.0) > 1.0e-6) error stop 7
+    if (abs(amat(2,3) - 5.0) > 1.0e-6) error stop 8
+    if (abs(amat(3,3) - (-2.0)) > 1.0e-6) error stop 9
+    print *, 'ok'
+  end subroutine
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("rank2_assign_transpose_stride", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("rank2-stride compile failed");
+    assert!(
+        compile.status.success(),
+        "should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "rank-2 allocatable = transpose() produced wrong values: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected 'ok': {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn runtime_shape_local_uses_column_major_stride_for_row_section_assign() {
     // F2018 §6.5.3.2: Fortran arrays are stored in column-major order.
     // The runtime-shape allocate path in alloc.rs hardcoded
@@ -13848,6 +13987,49 @@ fn inline_array_intrinsic_in_print_walks_descriptor_elements() {
         "shape line missing: {}",
         stdout
     );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn scalar_returning_intrinsic_call_to_whole_array_routes_through_bulk_fill() {
+    // F2018 §10.2.1.3: a scalar RHS assigned to a whole array broadcasts
+    // the value to every element. The literal-scalar case `x = 0.0` was
+    // already handled, but a scalar from a function call (e.g.
+    // `x = ieee_value(1.0, ieee_quiet_nan)`) was falling through to
+    // lower_expr_ctx_tl, which produced an f32 SSA value; the assignment
+    // path then treated it as a source descriptor pointer and emitted a
+    // load-from-non-pointer (caught by the IR verifier when the dest is
+    // fixed-size, and SEGV at afs_assign_allocatable when descriptor-
+    // backed). stdlib's `pinv_s_operator` SEGV'd on
+    // `pinva = ieee_value(1.0_sp, ieee_quiet_nan)` in the linalg-error
+    // path. The fix routes scalar-returning calls to lower_array_assign
+    // so its bulk-fill plan generates afs_fill_f32/_f64.
+    let src = write_program(
+        "program t\n  use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan\n  implicit none\n  real(4) :: x(5)\n  integer :: i\n  x = 0.0_4\n  if (.true.) then\n    x = ieee_value(1.0_4, ieee_quiet_nan)\n  end if\n  do i = 1, 5\n    if (.not. (x(i) /= x(i))) error stop i\n  end do\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("scalar_nan_broadcast", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("scalar-fn-broadcast compile failed");
+    assert!(
+        compile.status.success(),
+        "scalar-fn-broadcast should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "scalar-fn-broadcast should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok, got: {}", stdout);
 
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
@@ -28572,6 +28754,243 @@ fn cmplx_whole_array_with_kind_keyword_returns_correct_kind_descriptor() {
     assert!(
         run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
         "cmplx whole-array run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn allocate_source_from_strided_section_walks_per_element() {
+    // F2018 §9.7.1.2: ALLOCATE(dest, source = strided_section) must
+    // populate dest by reading the source per-element via the
+    // section's per-dim memory stride, not by a flat memcpy of
+    // total_bytes from source base. afs_copy_array_data was doing
+    // ptr::copy(source.base_addr, dest.base_addr, total_bytes), which
+    // for a section like `idx(2, 1:n)` (stride 2 between adjacent
+    // dim-0=2 picks) read consecutive bytes including dim-0=1 entries.
+    // Surfaced inside stdlib_sparse_conversion's coo2csr_dp at line
+    // 426: `allocate(CSR%col, source = COO%index(2, 1:nnz))` populated
+    // CSR%col with row indices instead of column indices, so spmv
+    // walked vec_x past its declared bounds.
+    let src = write_program(
+        "program p\n  implicit none\n  integer, allocatable :: idx(:,:)\n  integer, allocatable :: col(:)\n  integer :: i, n\n  n = 8\n  allocate(idx(2, n), source=0)\n  do i = 1, n\n    idx(1, i) = (i-1) / 2 + 1\n    idx(2, i) = mod(i-1, 2) + 1\n  end do\n  allocate(col(n), source = idx(2, 1:n))\n  do i = 1, n\n    if (col(i) /= idx(2, i)) error stop 1\n  end do\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("alloc_source_strided_section", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("alloc-source strided compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "alloc-source strided compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "alloc-source strided run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn random_number_on_array_fills_every_element() {
+    // F2018 §16.9.171: RANDOM_NUMBER(harvest) fills harvest with
+    // independent draws from [0,1). The intrinsic-subroutine lowering
+    // dispatched all real-kind harvests to the scalar runtime
+    // (afs_random_number_f64), which fills exactly one slot — so for
+    // an array harvest, elements 2..N stayed at uninit-stack-garbage
+    // values (typically tiny denormals or NaN). Surfaced in stdlib
+    // sparse_spmv: `random_number(A); count(abs(A) > tiny(...))`
+    // returned 1 instead of size(A), nnz=1, COO%index allocated as
+    // (2,1), then COO%index(2, idx) walked past dim 0 extent and
+    // tripped "Bounds check failed: index 2 outside [1, 1]".
+    let src = write_program(
+        "program p\n  implicit none\n  integer, parameter :: dp = kind(0.0d0)\n  real(dp) :: a(8)\n  real    :: b(8)\n  integer :: i\n  call random_number(a)\n  call random_number(b)\n  do i = 1, 8\n    if (.not. (a(i) >= 0.0_dp .and. a(i) < 1.0_dp)) error stop 1\n    if (.not. (b(i) >= 0.0    .and. b(i) < 1.0   )) error stop 2\n  end do\n  if (count(a > 0.0_dp) /= 8) error stop 3\n  if (count(b > 0.0   ) /= 8) error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("random_number_array_fill", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("random_number array compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "random_number array compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "random_number array run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn allocatable_array_component_passed_to_assumed_size_unwraps_descriptor() {
+    // F2018 §15.5.2.4: when an allocatable rank-N array component
+    // (e.g. `c%idx` where `idx` is `integer, allocatable :: idx(:,:)`)
+    // is passed to a by-ref dummy declared assumed-size or
+    // explicit-shape (`a(2, *)`), the callee expects an element
+    // pointer it can index column-major directly. lower_arg_by_ref_full
+    // for the ComponentAccess path used to return the field's storage
+    // address — which for an allocatable component is the address of
+    // the 384-byte descriptor itself — so the dummy walked descriptor
+    // bytes (base_addr, elem_size, rank fields) as if they were array
+    // elements. Surfaced inside stdlib_sparse_conversion's
+    // sort_coo_unique_dp where `a(1, ed)` returned descriptor-pointer
+    // bits and triggered "Bounds check failed: index <garbage> outside
+    // [0, num_rows]" inside count_i indexing.
+    let src = write_program(
+        "module m\n  implicit none\n  type :: container\n    integer, allocatable :: idx(:,:)\n  end type\ncontains\n  subroutine sort_check(a, n, ok)\n    integer, intent(inout) :: a(2,*)\n    integer, intent(in) :: n\n    logical, intent(out) :: ok\n    integer :: ed\n    ok = .true.\n    do ed = 1, n\n      if (a(1, ed) /= ed)        ok = .false.\n      if (a(2, ed) /= 100 + ed)  ok = .false.\n    end do\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(container) :: c\n  integer :: ed\n  logical :: ok\n  allocate(c%idx(2, 10), source=0)\n  do ed = 1, 10\n    c%idx(1:2, ed) = [ed, 100 + ed]\n  end do\n  call sort_check(c%idx, 10, ok)\n  if (.not. ok) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("alloc_component_to_assumed_size", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("alloc-component compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "alloc-component compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "alloc-component run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn allocatable_rank2_section_row_assignment_uses_columnmajor_stride() {
+    // F2018 §6.5.3: section assignment to a "row" of a column-major
+    // allocatable matrix (e.g. `a(1,:) = [...]`) must step through
+    // memory by the column extent, not contiguously. The compiler
+    // builds the section descriptor via afs_create_section using the
+    // source array's per-dim stride, so the source descriptor's
+    // strides must match the column-major canonical layout. For
+    // stack arrays, materialize_array_descriptor_for_info computes
+    // those correctly; for allocatables, afs_allocate_array used to
+    // copy whatever stride the compiler emitted (always 1) and the
+    // resulting section view collapsed into a contiguous walk —
+    // `a(1,:) = [10,20,30]; a(2,:) = [100,200,300]` left a as
+    // [[10,200,?],[100,300,?]] instead of [[10,20,30],[100,200,300]].
+    // Matched stdlib_sparse_conversion (rebuild needed): from_ijv was
+    // initializing COO%index via section assignment, then passing the
+    // descriptor to assumed-size dummies that read garbage.
+    let src = write_program(
+        "program p\n  implicit none\n  integer, allocatable :: a(:,:)\n  allocate(a(2, 3))\n  a(1, :) = [10, 20, 30]\n  a(2, :) = [100, 200, 300]\n  if (a(1,1) /= 10  .or. a(1,2) /= 20  .or. a(1,3) /= 30 ) error stop 1\n  if (a(2,1) /= 100 .or. a(2,2) /= 200 .or. a(2,3) /= 300) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("allocatable_rank2_row_section", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("allocatable rank-2 row section compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "allocatable rank-2 row section compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "allocatable rank-2 row section run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn allocate_stat_int64_writes_back_to_user_variable() {
+    // F2018 §9.7.1.3: STAT= variable receives the allocate status.
+    // Runtime writes an i32; when the user's variable is a wider
+    // integer kind (e.g. integer(int64), as in stdlib_sorting where
+    // int_index = int64), the i32 result must be sign-extended back
+    // into the user's slot. Without the writeback the upper 4 bytes
+    // were stack garbage, so `if (stat /= 0)` read non-zero on
+    // success and triggered "Allocation of array buffer failed."
+    // in stdlib_sorting_sort_adjoint at line 121 (matched stdlib
+    // sort_index + sort_adjoint examples).
+    let src = write_program(
+        "program p\n  implicit none\n  integer, parameter :: i64 = selected_int_kind(18)\n  integer(i64) :: stat\n  integer, allocatable :: buf(:)\n  allocate(buf(0:6), stat=stat)\n  if (stat /= 0_i64) error stop 1\n  deallocate(buf, stat=stat)\n  if (stat /= 0_i64) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("alloc_stat_int64", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("alloc-stat-int64 compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "alloc-stat-int64 compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("alloc-stat-int64 run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "alloc-stat-int64 run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn rank2_section_with_vector_subscript_gathers_into_fresh_descriptor() {
+    // F2018 §9.5.3.3: a section like `A(:, pivots)` where one subscript
+    // is a range and another is a rank-1 integer array (vector subscript)
+    // must produce a rank-2 result whose dim 1 is permuted/gathered by
+    // the index array. afs_create_section can only express stride-based
+    // sections, so vector subscripts force a per-element gather into a
+    // fresh allocated descriptor. Without that path, the index array's
+    // base pointer was being stored into the section's start/end i64
+    // slots with stride 0, producing garbage offsets and a SIGBUS
+    // (matched stdlib pivoting_qr cluster).
+    let src = write_program(
+        "program p\n  real :: A(4,3), B(4,3)\n  integer :: pivots(3)\n  integer :: i, j\n  do i = 1, 3\n    do j = 1, 4\n      A(j,i) = real((i-1)*4 + j)\n    end do\n  end do\n  pivots = [3, 1, 2]\n  B = A(:, pivots)\n  if (abs(B(1,1) - 9.0)  > 1.0e-6) error stop 1\n  if (abs(B(4,1) - 12.0) > 1.0e-6) error stop 2\n  if (abs(B(1,2) - 1.0)  > 1.0e-6) error stop 3\n  if (abs(B(4,2) - 4.0)  > 1.0e-6) error stop 4\n  if (abs(B(1,3) - 5.0)  > 1.0e-6) error stop 5\n  if (abs(B(4,3) - 8.0)  > 1.0e-6) error stop 6\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("rank2_vector_subscript_section", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("rank-2 vector subscript compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "rank-2 vector subscript compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("rank-2 vector subscript run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "rank-2 vector subscript run failed: status={:?} stdout={} stderr={}",
         run.status,
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr)

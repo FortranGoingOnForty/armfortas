@@ -309,8 +309,16 @@ pub(crate) fn lower_intrinsic_subroutine(
             true
         }
         "random_number" => {
+            // F2018 §16.9.171: RANDOM_NUMBER(harvest) accepts both
+            // scalar and array harvest. The scalar runtime fills only
+            // one element; routing array actuals to it left N-1 slots
+            // as stack garbage, which surfaced as denormal/NaN values
+            // throughout stdlib examples (e.g. sparse_spmv: count() on
+            // the resulting matrix returned 1 instead of m*n, malloc
+            // sized COO%index(2,1), and the next assign ran past dim 0).
             let harvest = nth_arg_ref(b, ctx, args, 0);
-            let runtime = nth_arg_expr(args, 0)
+            let harvest_expr = nth_arg_expr(args, 0);
+            let kind_is_f32 = harvest_expr
                 .and_then(|expr| {
                     generic_actual_expr_type_info(
                         expr,
@@ -319,17 +327,50 @@ pub(crate) fn lower_intrinsic_subroutine(
                         Some(ctx.type_layouts),
                     )
                 })
-                .map(|ty| match ty {
-                    crate::sema::symtab::TypeInfo::Real { kind: Some(kind) } if kind <= 4 => {
-                        "afs_random_number_f32"
+                .map(|ty| matches!(
+                    ty,
+                    crate::sema::symtab::TypeInfo::Real { kind: Some(k) } if k <= 4
+                ))
+                .unwrap_or(false);
+            let is_array = harvest_expr
+                .map(|e| expr_returns_array(e, &ctx.locals, ctx.st))
+                .unwrap_or(false);
+            if is_array {
+                if let Some(expr) = harvest_expr {
+                    if let Some((desc, _elem_ty)) = lower_array_expr_descriptor(
+                        b,
+                        &ctx.locals,
+                        expr,
+                        ctx.st,
+                        Some(ctx.type_layouts),
+                        Some(ctx.internal_funcs),
+                        Some(ctx.contained_host_refs),
+                        Some(ctx.descriptor_params),
+                    ) {
+                        let n = b.call(
+                            FuncRef::External("afs_array_size".into()),
+                            vec![desc],
+                            IrType::Int(IntWidth::I64),
+                        );
+                        let runtime = if kind_is_f32 {
+                            "afs_random_number_array_f32"
+                        } else {
+                            "afs_random_number_array_f64"
+                        };
+                        b.call(
+                            FuncRef::External(runtime.into()),
+                            vec![harvest, n],
+                            IrType::Void,
+                        );
+                        return true;
                     }
-                    crate::sema::symtab::TypeInfo::Real { .. }
-                    | crate::sema::symtab::TypeInfo::DoublePrecision => {
-                        "afs_random_number_f64"
-                    }
-                    _ => "afs_random_number_f64",
-                })
-                .unwrap_or("afs_random_number_f64");
+                }
+            }
+            let runtime = if kind_is_f32 {
+                "afs_random_number_f32"
+            } else {
+                "afs_random_number_f64"
+            };
             b.call(
                 FuncRef::External(runtime.into()),
                 vec![harvest],
