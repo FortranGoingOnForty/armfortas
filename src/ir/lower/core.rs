@@ -32843,17 +32843,41 @@ pub(super) fn lower_stmt_error(span: crate::lexer::Span, message: &str) -> ! {
     std::process::exit(1);
 }
 
+/// Result of resolving an ALLOCATE/DEALLOCATE STAT= target: the
+/// address the runtime helper writes to (always i32), plus an
+/// optional writeback to the user's variable for kinds wider than
+/// the default integer. `writeback_user_addr` and `writeback_ty` are
+/// Some when the user's variable is e.g. integer(int64): the call
+/// site stores the runtime's i32 result back via sign-extension at
+/// the end of the statement so that subsequent `if (stat /= 0)`
+/// checks read the actual status, not a stale or partially-written
+/// stack slot. F2018 §9.7.1.3 requires the stat-variable to receive
+/// the status code.
+pub(super) struct AllocateStatTarget {
+    pub runtime_addr: ValueId,
+    pub writeback_user_addr: Option<ValueId>,
+    pub writeback_ty: Option<IrType>,
+}
+
 pub(super) fn allocate_status_target_addr(b: &mut FuncBuilder, ctx: &LowerCtx, opts: &[IoControl]) -> ValueId {
+    allocate_status_target(b, ctx, opts).runtime_addr
+}
+
+pub(super) fn allocate_status_target(b: &mut FuncBuilder, ctx: &LowerCtx, opts: &[IoControl]) -> AllocateStatTarget {
     let Some(stat_expr) = allocate_keyword_expr(opts, "stat") else {
-        return b.alloca(IrType::Int(IntWidth::I32));
+        return AllocateStatTarget {
+            runtime_addr: b.alloca(IrType::Int(IntWidth::I32)),
+            writeback_user_addr: None,
+            writeback_ty: None,
+        };
     };
     // F2018 §9.7.1.3: stat-variable must be a scalar variable of type
     // integer with a decimal exponent range of at least four — i.e.
     // any kind ≥ default integer is acceptable, not strictly default.
     // The runtime helpers store an i32 status, so when the user's
     // variable is a wider kind we allocate a scratch i32, pass that
-    // to the runtime, and the caller writes back to the user's var
-    // after the call (handled in the dealloc/alloc emit sites).
+    // to the runtime, and the caller writes the (sign-extended) i32
+    // back to the user's variable after the statement completes.
     match &stat_expr.node {
         Expr::Name { name } => {
             let Some(info) = ctx.locals.get(&name.to_lowercase()) else {
@@ -32871,20 +32895,15 @@ pub(super) fn allocate_status_target_addr(b: &mut FuncBuilder, ctx: &LowerCtx, o
                 );
             }
             if matches!(info.ty, IrType::Int(IntWidth::I32)) {
-                // Default kind — runtime stores directly.
-                if info.by_ref {
-                    b.load(info.addr)
-                } else {
-                    info.addr
-                }
+                let runtime_addr = if info.by_ref { b.load(info.addr) } else { info.addr };
+                AllocateStatTarget { runtime_addr, writeback_user_addr: None, writeback_ty: None }
             } else {
-                // Wider kind — return a scratch i32 the runtime can
-                // store to. The user's variable stays uninitialized
-                // (matches gfortran; stdlib's pattern of `stat /= 0`
-                // checks the scratch's zero/non-zero status which the
-                // user reads via a follow-on assignment from the same
-                // call site, not from this variable directly).
-                b.alloca(IrType::Int(IntWidth::I32))
+                let user_addr = if info.by_ref { b.load(info.addr) } else { info.addr };
+                AllocateStatTarget {
+                    runtime_addr: b.alloca(IrType::Int(IntWidth::I32)),
+                    writeback_user_addr: Some(user_addr),
+                    writeback_ty: Some(info.ty.clone()),
+                }
             }
         }
         Expr::ComponentAccess { .. } => {
@@ -32900,10 +32919,20 @@ pub(super) fn allocate_status_target_addr(b: &mut FuncBuilder, ctx: &LowerCtx, o
                 crate::sema::symtab::TypeInfo::Integer { kind }
                     if *kind == Some(4) && field.dims.is_empty() =>
                 {
-                    field_ptr
+                    AllocateStatTarget { runtime_addr: field_ptr, writeback_user_addr: None, writeback_ty: None }
                 }
-                crate::sema::symtab::TypeInfo::Integer { .. } if field.dims.is_empty() => {
-                    b.alloca(IrType::Int(IntWidth::I32))
+                crate::sema::symtab::TypeInfo::Integer { kind } if field.dims.is_empty() => {
+                    let width = match kind {
+                        Some(1) => IntWidth::I8,
+                        Some(2) => IntWidth::I16,
+                        Some(8) => IntWidth::I64,
+                        _ => IntWidth::I64,
+                    };
+                    AllocateStatTarget {
+                        runtime_addr: b.alloca(IrType::Int(IntWidth::I32)),
+                        writeback_user_addr: Some(field_ptr),
+                        writeback_ty: Some(IrType::Int(width)),
+                    }
                 }
                 _ => lower_stmt_error(
                     stat_expr.span,
@@ -32916,6 +32945,24 @@ pub(super) fn allocate_status_target_addr(b: &mut FuncBuilder, ctx: &LowerCtx, o
             "ALLOCATE/DEALLOCATE STAT= must name a scalar integer variable",
         ),
     }
+}
+
+/// Sign-extend the runtime's i32 stat result back into the user's
+/// wider integer variable, if STAT= named one. No-op when the user
+/// variable is the default integer kind (runtime wrote directly) or
+/// when no STAT= clause is present.
+pub(super) fn emit_allocate_status_writeback(b: &mut FuncBuilder, target: &AllocateStatTarget) {
+    let (Some(user_addr), Some(ty)) = (target.writeback_user_addr, target.writeback_ty.as_ref()) else {
+        return;
+    };
+    let i32_val = b.load_typed(target.runtime_addr, IrType::Int(IntWidth::I32));
+    let widened = match ty {
+        IrType::Int(IntWidth::I32) => i32_val,
+        IrType::Int(width @ (IntWidth::I8 | IntWidth::I16)) => b.int_trunc(i32_val, *width),
+        IrType::Int(width) => b.int_extend(i32_val, *width, true),
+        _ => return,
+    };
+    b.store(widened, user_addr);
 }
 
 pub(super) fn resolve_errmsg_target_expr(
