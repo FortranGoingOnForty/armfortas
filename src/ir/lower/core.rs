@@ -20153,9 +20153,11 @@ pub(super) fn lower_fmt_push(b: &mut FuncBuilder, ctx: &mut LowerCtx, item: &cra
         if let Expr::Name { name } = &item.node {
             let key = name.to_lowercase();
             if let Some(info) = ctx.locals.get(&key).cloned() {
-                if local_is_array_like(&info)
-                    && !(is_complex_ty(&info.ty) && !local_is_array_like(&info))
-                {
+                // Outer arm is the array path. A scalar complex
+                // is_complex_ty check is handled separately at line
+                // 18898; the array case here just needs the array
+                // predicate.
+                if local_is_array_like(&info) {
                     fmt_push_whole_array(b, &info);
                     return;
                 }
