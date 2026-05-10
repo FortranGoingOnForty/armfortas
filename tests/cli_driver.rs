@@ -3521,6 +3521,521 @@ fn allocate_bounds_size_intrinsic_lowers_without_raw_symbol() {
 }
 
 #[test]
+fn rank_remap_pointer_to_array_section_populates_descriptor() {
+    // F2018 §10.2.2.3: rank-remap pointer assignment with section RHS:
+    //   real(sp), pointer :: tau(:)
+    //   real(sp), target  :: q(5, 5)
+    //   tau(1:k) => q(1:k, 1)
+    //
+    // The rank-remap path used to require RHS = bare Name and bail on
+    // any FunctionCall (section/element) — the pointer descriptor never
+    // got its base_addr, rank, or extents populated.  Subsequent
+    // `geqrf(..., tau, ...)` (assumed-size dummy `tau(*)`) then received
+    // tau.base_addr = NULL, and slarfg's `*tau = ...` SEGV'd at depth.
+    // Surfaced across stdlib's qr/eig/schur cluster: example_qr,
+    // example_qr_space, example_pivoting_qr*, example_eig*,
+    // example_schur*.  This test exercises the section-RHS branch
+    // end-to-end: the callee must see the column's data through tau.
+    let src = write_program(
+        r#"
+module m
+  implicit none
+contains
+  subroutine fill(n, t)
+    integer, intent(in) :: n
+    real, intent(inout) :: t(*)
+    integer :: i
+    do i = 1, n
+      t(i) = 99.0
+    end do
+  end subroutine
+end module
+program t
+  use m
+  implicit none
+  integer :: k = 3
+  real, target :: q(5, 5) = 0.0
+  real, pointer :: tau(:)
+  tau(1:k) => q(1:k, 1)
+  call fill(k, tau)
+  if (any(abs(q(1:3, 1) - 99.0) > 1.0e-6)) error stop 1
+  if (any(abs(q(4:5, 1) - 0.0) > 1.0e-6)) error stop 2
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("rank_remap_section_rhs", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("rank-remap-section compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "should compile cleanly: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "rank-remap section runtime failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected 'ok' from rank-remap section: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn print_complex_array_emits_each_element_as_complex() {
+    // F2018 §13.10.2: list-directed output of a complex array
+    // prints each element as `(re, im)`. The per-PRINT-item
+    // dispatch in lower_write_items_adv used to check
+    // `is_complex_ty(&info.ty)` before `local_is_array_like(&info)`,
+    // so a complex *array* matched the complex-scalar branch and
+    // only the first element got written.
+    //
+    // Whole-array (`print *, c`), 1-D slice (`print *, c(1:n)`),
+    // and N-D section (`print *, m(:, j)`) all needed parallel
+    // fixes — without them stdlib's eig / eigvals / schur examples
+    // could only show the first eigenvalue. Surfaced in
+    // example_eig, example_eigvals, example_schur*, example_lstsq*.
+    let src = write_program(
+        r#"
+program t
+  implicit none
+  integer, parameter :: sp = kind(1.0)
+  complex(sp) :: c(3)
+  complex(sp) :: m(3, 3)
+  integer :: j
+  c(1) = (1.0_sp, 4.0_sp)
+  c(2) = (2.0_sp, 5.0_sp)
+  c(3) = (3.0_sp, 6.0_sp)
+  m = (0.0_sp, 0.0_sp)
+  m(:, 2) = c
+  ! whole-array
+  print *, c
+  ! 1-D slice
+  print *, c(1:3)
+  ! N-D section
+  j = 2
+  print *, m(:, j)
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("print_complex_array", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("complex-array print compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "should compile cleanly: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(run.status.success(), "complex-array print runtime failed");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    // Each of the three lines must contain all three (re, im) pairs.
+    let lines: Vec<&str> = stdout.lines().filter(|l| l.contains('(')).collect();
+    assert_eq!(
+        lines.len(),
+        3,
+        "expected 3 lines with complex output, got {}: {}",
+        lines.len(),
+        stdout
+    );
+    for line in &lines {
+        for (re, im) in &[("1.0", "4.0"), ("2.0", "5.0"), ("3.0", "6.0")] {
+            assert!(
+                line.contains(re) && line.contains(im),
+                "expected ({}, {}) in line {:?}: {}",
+                re,
+                im,
+                line,
+                stdout
+            );
+        }
+    }
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn reshape_descriptor_stride_walks_columns_under_dim_reduction() {
+    // F2018 §15.5.2.4: an actual argument that's an intrinsic-call
+    // expression (e.g. `reshape(...)`) passed to an assumed-shape dummy
+    // gets a fresh descriptor.  The reshape descriptor builder used to
+    // hardcode `stride = 1` for every dimension; for column-major dim
+    // k > 0 the stride should be the running product of preceding
+    // extents (so dim[1].stride == extent[0], etc.).  The wrong stride
+    // made `sum(x, 1)` walk consecutive bytes per result column instead
+    // of jumping by `m` rows, returning [x[0]+x[1], x[1]+x[2], …]
+    // instead of the per-column sums.  Surfaced via stdlib_stats `mean`
+    // (= sum/n) → cov_2 / var_2 → example_var / example_cov.
+    let src = write_program(
+        r#"
+program t
+  implicit none
+  call run(reshape([1., 2., 3., 4., 5., 6.], [2, 3]))
+contains
+  subroutine run(x)
+    real, intent(in) :: x(:, :)
+    real :: s(3)
+    s = sum(x, 1)
+    if (any(abs(s - [3.0, 7.0, 11.0]) > 1.0e-6)) error stop 1
+    print *, 'ok'
+  end subroutine
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("reshape_stride_dim_reduce", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "should compile cleanly: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "reshape stride runtime failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected 'ok': {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn matmul_transpose_real_dispatches_to_real_matmul_runtime() {
+    // F2018 §16.9.114 + §16.9.198: `matmul(transpose(A), A)` for real A
+    // should produce a real-valued m×m matrix.  Two latent bugs collided:
+    //   (a) `afs_transpose_real8/_int` used row-major index formulas
+    //       (`rp[j*m+i] = sp[i*n+j]`) on Fortran's column-major data —
+    //       for any non-square A the dest got a permuted-but-not-
+    //       transposed layout that read as zeros once consumed by matmul.
+    //   (b) `first_arg_is_real` only matched `Expr::Name`, so the real
+    //       matmul saw `transpose(A)` (a FunctionCall) as "not real" and
+    //       dispatched to `afs_matmul_int`, which interpreted f32 bytes
+    //       as i32, summed garbage, and dropped the result on store.
+    // Both surfaced in stdlib_stats `cov_2_*` whose body computes
+    // `res = matmul(transpose(center), center)` — example_cov produced
+    // an all-zero covariance matrix instead of the diagonal it should.
+    let src = write_program(
+        r#"
+program t
+  implicit none
+  real :: A(2, 3)
+  real :: R(3, 3)
+  integer :: i, j
+  A(1, :) = -0.5
+  A(2, :) =  0.5
+  R = matmul(transpose(A), A)
+  ! Each (i,j) should be 0.5: sum_k transpose(A)(i,k) * A(k,j)
+  ! = (-0.5)(-0.5) + (0.5)(0.5) = 0.5
+  do j = 1, 3
+    do i = 1, 3
+      if (abs(R(i,j) - 0.5) > 1.0e-6) then
+        print *, 'fail at (', i, ',', j, ') = ', R(i,j)
+        error stop 1
+      end if
+    end do
+  end do
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("matmul_transpose_real", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "should compile cleanly: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "matmul(transpose(A), A) runtime failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected 'ok': {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn count_with_dim_returns_per_slice_integer_array() {
+    // F2018 §16.9.46: COUNT(MASK, DIM=k) returns an integer ARRAY of
+    // rank N-1 with per-slice true-element counts. The scalar logical-
+    // reduction lowering returned a single i32 total — when assigned
+    // into a rank-1 destination (e.g. `n = count(mask, 1)` in
+    // stdlib_stats var_mask_2_*), the integer count was then passed
+    // as the source descriptor pointer to afs_assign_allocatable,
+    // dereferencing a tiny address (e.g. 0x3 for count=3) and
+    // aborting with `misaligned pointer dereference: address must be
+    // a multiple of 0x8 but is 0x3`. Surfaced in stdlib's var / cov /
+    // pseudoinverse examples (the entire `var_mask_*` family).
+    let src = write_program(
+        r#"
+program test
+  implicit none
+  logical :: m(2, 3)
+  integer :: c_fixed(3)
+  integer, allocatable :: c_alloc(:)
+  m = reshape([.false., .false., .false., .true., .true., .true.], [2, 3])
+  ! mask(:,1) = [F,F] count=0; mask(:,2) = [F,T] count=1; mask(:,3) = [T,T] count=2
+  c_fixed = count(m, 1)
+  c_alloc = count(m, 1)
+  if (any(c_fixed /= [0, 1, 2])) error stop 1
+  if (size(c_alloc) /= 3) error stop 2
+  if (any(c_alloc /= [0, 1, 2])) error stop 3
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("count_with_dim", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("count-with-dim compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "should compile cleanly: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "count-with-dim runtime failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected 'ok' from count-with-dim: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn real_of_count_with_dim_does_not_emit_scalar_count_probe() {
+    // F2018 §16.9.46: COUNT(MASK, DIM) returns a rank N-1 integer array.
+    // The elemental-call dispatcher probes argument types via
+    // generic_dispatch_probe_value, which falls through to lower_expr_full
+    // when the probe helper does not recognize the inner intrinsic. Without
+    // recognizing COUNT(MASK, DIM) as array-shaped, the probe materialized
+    // a scalar `_count` external on every elemental wrap (`real(count(...))`,
+    // `int(count(...))`, etc.), surfaced as link-time `Undefined symbol _count`
+    // when the broader stdlib stats sources (mean / corr / cov / moment / pca)
+    // were rebuilt. Verify the assignment compiles and runs without
+    // emitting the scalar external.
+    let src = write_program(
+        r#"
+program test
+  implicit none
+  logical :: m(2, 3)
+  real :: r(3)
+  m = reshape([.false., .false., .false., .true., .true., .true.], [2, 3])
+  r = real(count(m, 1))
+  if (any(abs(r - [0.0, 1.0, 2.0]) > 1.0e-6)) error stop 1
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("real_of_count_with_dim", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("real(count(...)) compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "real(count(mask, dim)) must link without `_count` external: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "real(count(mask, dim)) runtime failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected 'ok' from real(count(...)): {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn reshape_typed_array_constructor_preserves_elem_size_through_assumed_shape() {
+    // F2018 §7.8: a typed array constructor `[T :: ...]` has element
+    // type T regardless of the element expressions' types.  The reshape
+    // lowering used to ignore type_spec and infer elem_ty from the
+    // first value — `[real(dp) :: 1, 2, 3, 4]` would resolve as integer
+    // (4 bytes) instead of real(dp) (8 bytes).  The malformed elem_size
+    // then propagated through the reshape result descriptor; when
+    // passed to an assumed-shape dummy and used as the SOURCE= of an
+    // ALLOCATE, afs_prepare_array_copy saw `dest.elem_size != source.elem_size`,
+    // freed the freshly-allocated dest buffer, zeroed base_addr, and
+    // SEGV'd on the next read.  Surfaced in stdlib's det / determinant /
+    // eig / qr clusters where examples invoke
+    // `det(reshape([real(dp)::1,2,3,4], [2,2]))`.
+    let src = write_program(
+        r#"
+module m
+  implicit none
+  integer, parameter :: dp = kind(1.0d0)
+contains
+  function probe(a) result(s)
+    real(dp), intent(in) :: a(:, :)
+    real(dp) :: s
+    real(dp), allocatable :: amat(:, :)
+    allocate(amat(size(a,1), size(a,2)), source=a)
+    s = amat(1, 1) + amat(2, 2)
+    deallocate(amat)
+  end function
+end module
+program t
+  use m
+  implicit none
+  real(dp) :: r
+  r = probe(reshape([real(dp) :: 1, 2, 3, 4], [2, 2]))
+  if (abs(r - 5.0_dp) > 1.0e-12_dp) error stop 1
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("reshape_typed_ac_elem_size", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("reshape-typed-ac compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "should compile cleanly: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "reshape→source= runtime failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected 'ok' from reshape→source=: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn allocate_with_source_from_assumed_shape_dummy_populates_base_addr() {
+    // F2018 §9.7.1.2: ALLOCATE(..., SOURCE=expr) requires only that
+    // SOURCE-expr have a defined value of the right shape — it doesn't
+    // have to be itself an ALLOCATABLE.  The common stdlib pattern is:
+    //
+    //     pure module function det(a) result(d)
+    //       real(dp), intent(in) :: a(:,:)        ! assumed-shape dummy
+    //       real(dp), allocatable :: amat(:,:)
+    //       allocate(amat(size(a,1), size(a,2)), source=a)
+    //
+    // afs_prepare_array_copy used to require both `dest.is_allocated()`
+    // AND `source.is_allocated()`.  But assumed-shape dummies carry
+    // flags=DESC_CONTIGUOUS only — they're bound to the caller's data,
+    // not owned/allocated.  The check failed, the runtime freed the
+    // freshly-allocated dest buffer, zeroed dest.base_addr, and the
+    // next read of `amat(1,1)` faulted.  Surfaced as SEGV in stdlib's
+    // det / determinant / eig / qr / lstsq / solve_chol clusters.
+    let src = write_program(
+        r#"
+module m
+  implicit none
+  integer, parameter :: dp = kind(1.0d0)
+contains
+  function copy_via_source(a) result(s)
+    real(dp), intent(in) :: a(:, :)
+    real(dp) :: s
+    real(dp), allocatable :: amat(:, :)
+    allocate(amat(size(a,1), size(a,2)), source=a)
+    s = amat(1, 1) + amat(2, 1)
+    deallocate(amat)
+  end function
+end module
+program t
+  use m
+  implicit none
+  real(dp) :: r
+  r = copy_via_source(reshape([1.0_dp, 2.0_dp, 3.0_dp, 4.0_dp], [2, 2]))
+  if (abs(r - 3.0_dp) > 1.0e-12_dp) error stop 1
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("alloc_source_assumed_shape", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("alloc-source compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "should compile cleanly: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "alloc(source=assumed_shape) runtime failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected 'ok' from alloc-source: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn automatic_component_array_bound_size_lowers_without_raw_symbol() {
     let src = write_program(
         "module m\n  implicit none\n  type :: state_set_t\n    integer(8) :: bits(4) = 0_8\n  contains\n    procedure :: f\n  end type\ncontains\n  subroutine f(state_set)\n    type(state_set_t), intent(inout) :: state_set\n    integer(8) :: original_bits(size(state_set%bits))\n    original_bits = state_set%bits\n    print *, size(original_bits)\n  end subroutine\nend module\n",
@@ -13236,6 +13751,79 @@ fn user_function_call_with_section_arg_emits_one_section_descriptor_per_callsite
         n <= 24,
         "expected ≤24 afs_create_section emissions for 8 source sections, \
          got {n} — probe duplication may have regressed"
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn descriptor_actual_passed_to_assumed_size_dummy_extracts_base_addr() {
+    // F2018 §15.5.2.4: assumed-size dummies receive a bare element
+    // pointer.  When the actual is an array section (`arr(:)`) — a
+    // non-Name, non-all-Element shape — `lower_arg_by_ref_full`'s tail
+    // path lowers it to a 384-byte descriptor.  Without explicit base
+    // extraction at the tail, the callee receives the descriptor pointer
+    // and reads its first 8 bytes (= base_addr field) as if it were the
+    // first element.  This surfaces in stdlib's solve / lapack chains
+    // (e.g. `call gesv(n, nrhs, amat, ...)` where amat is a pointer
+    // local feeding `a(lda,*)`) as bounds-check failures of the form
+    // "index <huge> outside [1, n]".
+    //
+    // This test exercises the section→assumed-size path end-to-end:
+    // wrong-base would either crash, fault, or produce a wildly wrong
+    // sum.  6.0 means base was correctly extracted from the section
+    // descriptor before the call.
+    let src = write_program(
+        r#"
+module m
+  implicit none
+  integer, parameter :: dp = kind(1.0d0)
+contains
+  pure function sum_first(n, x) result(s)
+    integer, intent(in) :: n
+    real(dp), intent(in) :: x(*)
+    real(dp) :: s
+    integer :: i
+    s = 0.0_dp
+    do i = 1, n
+      s = s + x(i)
+    end do
+  end function
+end module
+program t
+  use m
+  implicit none
+  real(dp) :: arr(5)
+  real(dp) :: s
+  arr = [1.0_dp, 2.0_dp, 3.0_dp, 4.0_dp, 5.0_dp]
+  s = sum_first(3, arr(:))
+  if (abs(s - 6.0_dp) > 1.0e-12_dp) error stop 1
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("descriptor_actual_to_assumed_size", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("descriptor-actual to assumed-size compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "should compile cleanly: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "section→assumed-size runtime failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected 'ok' from section→assumed-size sum: {}",
+        String::from_utf8_lossy(&run.stdout)
     );
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
