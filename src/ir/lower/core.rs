@@ -21781,6 +21781,12 @@ pub(super) fn lower_section_write_nd(
         const_stride: Option<i64>,
         decl_lo: i64,
         cum_stride: i64,
+        // F2018 §9.5.3.3 vector subscript: when an Element subscript
+        // is itself an array, the iteration counter walks 1..N (with
+        // N = size of the index array) and the value used in flat-
+        // offset arithmetic is `vector_idx_desc[counter-1]`. None for
+        // ordinary Range / scalar Element dims.
+        vector_idx: Option<(ValueId, IrType)>,
     }
 
     let mut dims: Vec<DimSlice> = Vec::with_capacity(args.len());
@@ -21790,7 +21796,7 @@ pub(super) fn lower_section_write_nd(
         let decl_hi = decl_lo + decl_ext - 1;
 
         let counter = b.alloca(IrType::Int(IntWidth::I32));
-        let (start_val, end_val, stride_val, const_stride) = match &arg.value {
+        let (start_val, end_val, stride_val, const_stride, vector_idx) = match &arg.value {
             SectionSubscript::Range { start, end, stride } => {
                 let start_v = match start {
                     Some(e) => super::expr::lower_expr_ctx(b, ctx, e),
@@ -21805,12 +21811,34 @@ pub(super) fn lower_section_write_nd(
                     None => b.const_i32(1),
                 };
                 let cs = stride.as_ref().and_then(eval_const_int);
-                (start_v, end_v, stride_v, cs)
+                (start_v, end_v, stride_v, cs, None)
             }
             SectionSubscript::Element(e) => {
-                let v = super::expr::lower_expr_ctx(b, ctx, e);
-                // Single-element dimension: start == end, stride 1.
-                (v, v, b.const_i32(1), Some(1))
+                if expr_returns_array(e, &ctx.locals, ctx.st) {
+                    let (idx_desc, idx_elem_ty) = lower_array_expr_descriptor(
+                        b,
+                        &ctx.locals,
+                        e,
+                        ctx.st,
+                        Some(ctx.type_layouts),
+                        Some(ctx.internal_funcs),
+                        Some(ctx.contained_host_refs),
+                        Some(ctx.descriptor_params),
+                    )
+                    .expect("vector subscript array must produce descriptor");
+                    let n = b.call(
+                        FuncRef::External("afs_array_size".into()),
+                        vec![idx_desc],
+                        IrType::Int(IntWidth::I64),
+                    );
+                    let n_i32 = b.int_trunc(n, IntWidth::I32);
+                    let one = b.const_i32(1);
+                    (one, n_i32, one, Some(1), Some((idx_desc, idx_elem_ty)))
+                } else {
+                    let v = super::expr::lower_expr_ctx(b, ctx, e);
+                    // Single-element dimension: start == end, stride 1.
+                    (v, v, b.const_i32(1), Some(1), None)
+                }
             }
         };
         b.store(start_val, counter);
@@ -21822,6 +21850,7 @@ pub(super) fn lower_section_write_nd(
             const_stride,
             decl_lo,
             cum_stride,
+            vector_idx,
         });
         cum_stride *= decl_ext.max(1);
     }
@@ -21892,12 +21921,25 @@ pub(super) fn lower_section_write_nd(
             // Borrow `dims` immutably while iterating it; the loop
             // body needs &mut b so we collect the per-dim values
             // first, then emit the IR for the sum afterwards.
-            let dim_data: Vec<(ValueId, i64, i64)> = dims
+            // For vector-subscript dims, load the actual index from
+            // the index array at position counter-1 (1-based); for
+            // ordinary dims use the counter directly. The decl_lo
+            // adjustment is the array's declared lower bound, which
+            // applies to both kinds of indices.
+            let dim_data: Vec<(ValueId, i64, i64, Option<(ValueId, IrType)>)> = dims
                 .iter()
-                .map(|d| (d.counter, d.decl_lo, d.cum_stride))
+                .map(|d| (d.counter, d.decl_lo, d.cum_stride, d.vector_idx.clone()))
                 .collect();
-            for (counter, decl_lo, cum_stride_d) in dim_data {
-                let cnt = b.load(counter);
+            for (counter, decl_lo, cum_stride_d, vector_idx) in dim_data {
+                let cnt = if let Some((idx_desc, idx_elem_ty)) = vector_idx {
+                    let i_val = b.load(counter);
+                    let one = b.const_i32(1);
+                    let zero_based = b.isub(i_val, one);
+                    let zero_based_i64 = widen_idx_to_i64(b, zero_based);
+                    load_rank1_array_desc_elem(b, idx_desc, &idx_elem_ty, zero_based_i64)
+                } else {
+                    b.load(counter)
+                };
                 let lo_const = b.const_i32(decl_lo as i32);
                 let zero_based = b.isub(cnt, lo_const);
                 let zero_based64 = widen_idx_to_i64(b, zero_based);
@@ -27297,6 +27339,34 @@ pub(super) fn lower_array_expr_descriptor(
                         };
                         return Some((desc, info.ty.clone()));
                     }
+                    // F2018 §9.5.3.3: any subscript that is itself an
+                    // array expression is a vector subscript. When mixed
+                    // with ordinary ranges (e.g. `A(:, pivots)`), the
+                    // afs_create_section runtime can't represent it, so
+                    // route those through a per-element gather that
+                    // builds a freshly allocated descriptor.
+                    let any_vector_subscript = args.iter().any(|arg| {
+                        if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
+                            expr_returns_array(e, locals, st)
+                        } else {
+                            false
+                        }
+                    });
+                    if any_vector_subscript {
+                        if let Some(desc) = lower_array_section_with_vector_subscripts(
+                            b,
+                            locals,
+                            info,
+                            args,
+                            st,
+                            type_layouts,
+                            internal_funcs,
+                            contained_host_refs,
+                            descriptor_params,
+                        ) {
+                            return Some((desc, info.ty.clone()));
+                        }
+                    }
                     if args.iter().any(|arg| {
                         matches!(arg.value, crate::ast::expr::SectionSubscript::Range { .. })
                     }) {
@@ -29238,6 +29308,311 @@ pub(super) fn first_arg_is_complex(
             }
         })
         .unwrap_or(false)
+}
+
+/// F2018 §9.5.3.3: array section with one or more vector subscripts mixed
+/// with ordinary range subscripts. afs_create_section can't represent a
+/// vector subscript, so when one is present we materialize the result
+/// into a freshly-allocated descriptor by gathering element-by-element.
+/// Returns Some(result_desc) on success, or None to fall through to the
+/// normal `afs_create_section` path (no vector subscripts present, or
+/// the index array element type isn't an integer kind we handle).
+pub(super) fn lower_array_section_with_vector_subscripts(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    info: &LocalInfo,
+    args: &[crate::ast::expr::Argument],
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) -> Option<ValueId> {
+    use crate::ast::expr::SectionSubscript;
+
+    enum DimKind {
+        Range {
+            start: ValueId,
+            stride: ValueId,
+            result_dim: usize,
+        },
+        Vector {
+            idx_desc: ValueId,
+            idx_elem_ty: IrType,
+            result_dim: usize,
+        },
+        Scalar {
+            val: ValueId,
+        },
+    }
+
+    // Source descriptor — uniform handle whether the local is descriptor-
+    // backed or a contiguous stack array.
+    let source_desc = if local_uses_array_descriptor(info) {
+        array_descriptor_addr(b, info)
+    } else {
+        materialize_array_descriptor_for_info(b, info)
+    };
+
+    let elem_ty = info.ty.clone();
+    let elem_bytes = ir_scalar_byte_size(&elem_ty);
+    let zero32 = b.const_i32(0);
+    let zero64 = b.const_i64(0);
+    let one64 = b.const_i64(1);
+
+    let mut dim_kinds: Vec<DimKind> = Vec::with_capacity(args.len());
+    let mut result_extents: Vec<ValueId> = Vec::new();
+    let mut has_vector = false;
+
+    for (d, arg) in args.iter().enumerate() {
+        let dim_lo_off = 24 + (d as i64) * 24;
+        let dim_ext_off = dim_lo_off + 8;
+        match &arg.value {
+            SectionSubscript::Range { start, end, stride } => {
+                let start_v = match start {
+                    Some(e) => {
+                        let raw = super::expr::lower_expr_with_optional_layouts(b, locals, e, st, type_layouts);
+                        widen_idx_to_i64(b, raw)
+                    }
+                    None => load_array_desc_i64_field(b, source_desc, dim_lo_off),
+                };
+                let end_v = match end {
+                    Some(e) => {
+                        let raw = super::expr::lower_expr_with_optional_layouts(b, locals, e, st, type_layouts);
+                        widen_idx_to_i64(b, raw)
+                    }
+                    None => {
+                        let lo = load_array_desc_i64_field(b, source_desc, dim_lo_off);
+                        let ext = load_array_desc_i64_field(b, source_desc, dim_ext_off);
+                        let lo_minus_one = b.isub(lo, one64);
+                        b.iadd(lo_minus_one, ext)
+                    }
+                };
+                let stride_v = match stride {
+                    Some(e) => {
+                        let raw = super::expr::lower_expr_with_optional_layouts(b, locals, e, st, type_layouts);
+                        widen_idx_to_i64(b, raw)
+                    }
+                    None => one64,
+                };
+                // result_extent = max((end - start)/stride + 1, 0)
+                let diff = b.isub(end_v, start_v);
+                let bumped = b.iadd(diff, stride_v);
+                let raw_extent = b.idiv(bumped, stride_v);
+                let nonneg = b.icmp(CmpOp::Ge, raw_extent, zero64);
+                let extent = b.select(nonneg, raw_extent, zero64);
+                let result_dim = result_extents.len();
+                result_extents.push(extent);
+                dim_kinds.push(DimKind::Range {
+                    start: start_v,
+                    stride: stride_v,
+                    result_dim,
+                });
+            }
+            SectionSubscript::Element(e) if expr_returns_array(e, locals, st) => {
+                has_vector = true;
+                let (idx_desc, idx_elem_ty) = lower_array_expr_descriptor(
+                    b,
+                    locals,
+                    e,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                )?;
+                if !matches!(idx_elem_ty, IrType::Int(_)) {
+                    return None;
+                }
+                let size = b.call(
+                    FuncRef::External("afs_array_size".into()),
+                    vec![idx_desc],
+                    IrType::Int(IntWidth::I64),
+                );
+                let result_dim = result_extents.len();
+                result_extents.push(size);
+                dim_kinds.push(DimKind::Vector {
+                    idx_desc,
+                    idx_elem_ty,
+                    result_dim,
+                });
+            }
+            SectionSubscript::Element(e) => {
+                let raw = super::expr::lower_expr_with_optional_layouts(b, locals, e, st, type_layouts);
+                let val = widen_idx_to_i64(b, raw);
+                dim_kinds.push(DimKind::Scalar { val });
+            }
+        }
+    }
+
+    if !has_vector {
+        return None;
+    }
+
+    let result_rank = result_extents.len();
+    if result_rank == 0 {
+        return None;
+    }
+
+    // Allocate a fresh descriptor for the result with rank=result_rank and
+    // each kept dim having lower_bound 1 and extent = result_extents[k].
+    // afs_allocate_array fills in the heap base and computes column-major
+    // strides (1, ext0, ext0*ext1, ...).
+    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let sz384 = b.const_i64(384);
+    b.call(
+        FuncRef::External("memset".into()),
+        vec![result_desc, zero32, sz384],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+    let dim_buf_words = (3 * result_rank) as u64;
+    let dim_buf = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I64)), dim_buf_words));
+    for (k, ext) in result_extents.iter().enumerate() {
+        let lo_idx = b.const_i64((k * 3) as i64);
+        let lo_dst = b.gep(dim_buf, vec![lo_idx], IrType::Int(IntWidth::I64));
+        b.store(one64, lo_dst);
+        let ub_idx = b.const_i64((k * 3 + 1) as i64);
+        let ub_dst = b.gep(dim_buf, vec![ub_idx], IrType::Int(IntWidth::I64));
+        b.store(*ext, ub_dst);
+        let str_idx = b.const_i64((k * 3 + 2) as i64);
+        let str_dst = b.gep(dim_buf, vec![str_idx], IrType::Int(IntWidth::I64));
+        b.store(one64, str_dst);
+    }
+    let elem_size_v = b.const_i64(elem_bytes);
+    let rank_v = b.const_i32(result_rank as i32);
+    let stat = b.alloca(IrType::Int(IntWidth::I32));
+    b.store(zero32, stat);
+    b.call(
+        FuncRef::External("afs_allocate_array".into()),
+        vec![result_desc, elem_size_v, rank_v, dim_buf, stat],
+        IrType::Void,
+    );
+
+    // Cache source per-dim lower bound and stride (in elements). These are
+    // queried once before the loops to avoid reloading on every iteration.
+    let mut src_los: Vec<ValueId> = Vec::with_capacity(args.len());
+    let mut src_strides: Vec<ValueId> = Vec::with_capacity(args.len());
+    for d in 0..args.len() {
+        let lo_off = 24 + (d as i64) * 24;
+        let stride_off = lo_off + 16;
+        src_los.push(load_array_desc_i64_field(b, source_desc, lo_off));
+        src_strides.push(load_array_desc_i64_field(b, source_desc, stride_off));
+    }
+    let src_base = b.load_typed(source_desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    let dst_base = b.load_typed(result_desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+
+    // One i64 counter per kept dim, all 0-based.
+    let mut counters: Vec<ValueId> = Vec::with_capacity(result_rank);
+    for _ in 0..result_rank {
+        let c = b.alloca(IrType::Int(IntWidth::I64));
+        b.store(zero64, c);
+        counters.push(c);
+    }
+
+    // Nested loop scaffolding: outermost = highest result dim, innermost = 0
+    // (column-major iteration matching the result descriptor's stride layout).
+    let mut checks: Vec<BlockId> = Vec::with_capacity(result_rank);
+    let mut bodies: Vec<BlockId> = Vec::with_capacity(result_rank);
+    let mut incrs: Vec<BlockId> = Vec::with_capacity(result_rank);
+    let mut exits: Vec<BlockId> = Vec::with_capacity(result_rank);
+    for k in 0..result_rank {
+        checks.push(b.create_block(&format!("vsg_check_d{}", k)));
+        bodies.push(b.create_block(&format!("vsg_body_d{}", k)));
+        incrs.push(b.create_block(&format!("vsg_incr_d{}", k)));
+        exits.push(b.create_block(&format!("vsg_exit_d{}", k)));
+    }
+    let outer = result_rank - 1;
+    b.branch(checks[outer], vec![]);
+
+    let elem_bytes_v = b.const_i64(elem_bytes);
+    for k_rev in 0..result_rank {
+        let k = result_rank - 1 - k_rev;
+
+        b.set_block(checks[k]);
+        let cur = b.load(counters[k]);
+        let done = b.icmp(CmpOp::Ge, cur, result_extents[k]);
+        b.cond_branch(done, exits[k], vec![], bodies[k], vec![]);
+
+        b.set_block(bodies[k]);
+        if k == 0 {
+            // Innermost body: gather one source element into the result.
+            // Source byte offset = sum_d (zero_based_src_idx_d * src_stride_d * elem_bytes)
+            let mut src_byte_off: Option<ValueId> = None;
+            // Borrow checker: collect per-dim closures of values needed before mutating b.
+            // dim_kinds has indices into counters, so we walk it directly.
+            for (d, kind) in dim_kinds.iter().enumerate() {
+                let zero_based = match kind {
+                    DimKind::Range { start, stride, result_dim } => {
+                        let cnt = b.load(counters[*result_dim]);
+                        let off = b.imul(cnt, *stride);
+                        let src_idx = b.iadd(*start, off);
+                        b.isub(src_idx, src_los[d])
+                    }
+                    DimKind::Vector { idx_desc, idx_elem_ty, result_dim } => {
+                        let cnt = b.load(counters[*result_dim]);
+                        let raw = load_rank1_array_desc_elem(b, *idx_desc, idx_elem_ty, cnt);
+                        let widened = match idx_elem_ty {
+                            IrType::Int(IntWidth::I64) => raw,
+                            IrType::Int(_) => b.int_extend(raw, IntWidth::I64, true),
+                            _ => return None,
+                        };
+                        b.isub(widened, src_los[d])
+                    }
+                    DimKind::Scalar { val } => b.isub(*val, src_los[d]),
+                };
+                let stride_term = b.imul(zero_based, src_strides[d]);
+                let bytes_term = b.imul(stride_term, elem_bytes_v);
+                src_byte_off = Some(match src_byte_off {
+                    Some(prev) => b.iadd(prev, bytes_term),
+                    None => bytes_term,
+                });
+            }
+            let src_off = src_byte_off.unwrap_or(zero64);
+            let src_p = b.gep(src_base, vec![src_off], IrType::Int(IntWidth::I8));
+            let elem_val = b.load_typed(src_p, elem_ty.clone());
+
+            // Result byte offset (column-major): for each kept dim k2,
+            // contribution = counters[k2] * (prod_{j<k2} ext_j) * elem_bytes.
+            let mut dst_byte_off: Option<ValueId> = None;
+            let mut cum_ext: Option<ValueId> = None;
+            for k2 in 0..result_rank {
+                let cnt = b.load(counters[k2]);
+                let stride_elems = cum_ext.unwrap_or(one64);
+                let term_elements = b.imul(cnt, stride_elems);
+                let term_bytes = b.imul(term_elements, elem_bytes_v);
+                dst_byte_off = Some(match dst_byte_off {
+                    Some(prev) => b.iadd(prev, term_bytes),
+                    None => term_bytes,
+                });
+                cum_ext = Some(match cum_ext {
+                    Some(prev) => b.imul(prev, result_extents[k2]),
+                    None => result_extents[k2],
+                });
+            }
+            let dst_off = dst_byte_off.unwrap_or(zero64);
+            let dst_p = b.gep(dst_base, vec![dst_off], IrType::Int(IntWidth::I8));
+            b.store(elem_val, dst_p);
+            b.branch(incrs[0], vec![]);
+        } else {
+            // Reset next-inner counter to 0 and dive in.
+            b.store(zero64, counters[k - 1]);
+            b.branch(checks[k - 1], vec![]);
+        }
+
+        b.set_block(incrs[k]);
+        let cur2 = b.load(counters[k]);
+        let next = b.iadd(cur2, one64);
+        b.store(next, counters[k]);
+        b.branch(checks[k], vec![]);
+
+        b.set_block(exits[k]);
+        if k < result_rank - 1 {
+            b.branch(incrs[k + 1], vec![]);
+        }
+    }
+
+    b.set_block(exits[outer]);
+    Some(result_desc)
 }
 
 /// Lower an array section expression: a(1:10:2) → create section descriptor.
