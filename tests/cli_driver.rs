@@ -4186,6 +4186,71 @@ end program
 }
 
 #[test]
+fn allocatable_rank2_assign_from_transpose_uses_column_major_stride() {
+    // F2018 §10.1.5: allocatable LHS = transpose(reshape(...)) reallocates
+    // dest with source's shape and copies the data. afs_assign_allocatable
+    // used to set dest.dims[i].stride = 1 across the board, but the
+    // descriptor convention is that stride encodes per-dim *memory step*
+    // in column-major order — see afs_create_section's matching note.
+    // With stride=(1,1) on a 3x3 contiguous block, any subsequent path
+    // that walked the descriptor (e.g. ALLOCATE(target, source=A) inside
+    // a call where A is the assumed-shape dummy) produced overlapping
+    // byte offsets and corrupted the copy. Surfaced as wrong eigenvalue
+    // matrices in stdlib's eigvals/eig clusters.
+    let src = write_program(
+        r#"
+program p
+  implicit none
+  real, allocatable :: A(:,:)
+  A = transpose(reshape([2.0, 8.0, 4.0, 1.0, 3.0, 5.0, 9.0, 5.0, -2.0], [3,3]))
+  call check(A)
+contains
+  subroutine check(a)
+    real, intent(in), target :: a(:,:)
+    real, allocatable :: amat(:,:)
+    allocate(amat(3,3), source=a)
+    if (abs(amat(1,1) - 2.0) > 1.0e-6) error stop 1
+    if (abs(amat(2,1) - 1.0) > 1.0e-6) error stop 2
+    if (abs(amat(3,1) - 9.0) > 1.0e-6) error stop 3
+    if (abs(amat(1,2) - 8.0) > 1.0e-6) error stop 4
+    if (abs(amat(2,2) - 3.0) > 1.0e-6) error stop 5
+    if (abs(amat(3,2) - 5.0) > 1.0e-6) error stop 6
+    if (abs(amat(1,3) - 4.0) > 1.0e-6) error stop 7
+    if (abs(amat(2,3) - 5.0) > 1.0e-6) error stop 8
+    if (abs(amat(3,3) - (-2.0)) > 1.0e-6) error stop 9
+    print *, 'ok'
+  end subroutine
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("rank2_assign_transpose_stride", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("rank2-stride compile failed");
+    assert!(
+        compile.status.success(),
+        "should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "rank-2 allocatable = transpose() produced wrong values: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected 'ok': {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn runtime_shape_local_uses_column_major_stride_for_row_section_assign() {
     // F2018 §6.5.3.2: Fortran arrays are stored in column-major order.
     // The runtime-shape allocate path in alloc.rs hardcoded
