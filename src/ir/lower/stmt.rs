@@ -374,6 +374,19 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                         // a single complex(4) const-zero
                                                         // buffer — wrong shape and wrong kind.
                                                         | "cmplx"
+                                                        // merge(t, f, mask) over arrays:
+                                                        // lower_array_merge_descriptor
+                                                        // materializes a temp via per-element
+                                                        // select. Without this entry the
+                                                        // FunctionCall arm picks up scalar
+                                                        // intrinsic merge, which emits
+                                                        // `select` on pointer operands and
+                                                        // hands a scalar f64 to the assignment
+                                                        // memcpy as a "source descriptor" —
+                                                        // SEGV on dereference. Surfaced in
+                                                        // stdlib's iterative solvers
+                                                        // (solve_cg/bicgstab/pcg).
+                                                        | "merge"
                                                 )
                                                 || (
                                                     // sum(arr, dim) is rank-N-1: route to
