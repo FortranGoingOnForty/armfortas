@@ -22314,6 +22314,23 @@ pub(super) fn local_uses_array_descriptor(info: &LocalInfo) -> bool {
     info.allocatable || info.descriptor_arg
 }
 
+/// True if `expr` is a simple Name reference to a local whose runtime
+/// representation is a descriptor (assumed-shape, allocatable, pointer
+/// array). Used as a fallback when an abstract-interface mask lookup
+/// misses, so we still pass the descriptor instead of the data pointer.
+pub(super) fn actual_is_descriptor_array(
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+) -> bool {
+    if let Expr::Name { name } = &expr.node {
+        if let Some(info) = locals.get(&name.to_lowercase()) {
+            return local_uses_array_descriptor(info)
+                || (!info.dims.is_empty() && info.descriptor_arg);
+        }
+    }
+    false
+}
+
 const DESC_CHAR_SLOT_TABLE: i32 = 1 << 3;
 
 pub(super) fn array_descriptor_addr(b: &mut FuncBuilder, info: &LocalInfo) -> ValueId {
