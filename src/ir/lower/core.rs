@@ -18816,10 +18816,22 @@ pub(super) fn lower_array_store(
     }
     let elem_ptr = b.gep(base, vec![idx64], info.ty.clone());
     if is_complex_ty(&info.ty) {
+        // RHS may already be a complex buffer pointer (most call/literal
+        // paths) or a plain scalar int/real (Fortran allows `c(i) = n`).
+        // For the scalar case materialize a fresh [fN x 2] buffer first
+        // — passing the scalar value as the memcpy src dereferences a
+        // junk pointer.
+        let src_ty = b.func().value_type(value);
+        let src = if matches!(&src_ty, Some(t) if is_complex_ty(t)) {
+            value
+        } else {
+            let fw = complex_float_width(&info.ty);
+            materialize_complex_operand(b, value, fw)
+        };
         let size = b.const_i64(complex_byte_size(&info.ty));
         b.call(
             FuncRef::External("memcpy".into()),
-            vec![elem_ptr, value, size],
+            vec![elem_ptr, src, size],
             IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
         );
         return;
@@ -22302,6 +22314,23 @@ pub(super) fn lower_whole_array_read(b: &mut FuncBuilder, info: &LocalInfo, mode
 
 pub(super) fn local_uses_array_descriptor(info: &LocalInfo) -> bool {
     info.allocatable || info.descriptor_arg
+}
+
+/// True if `expr` is a simple Name reference to a local whose runtime
+/// representation is a descriptor (assumed-shape, allocatable, pointer
+/// array). Used as a fallback when an abstract-interface mask lookup
+/// misses, so we still pass the descriptor instead of the data pointer.
+pub(super) fn actual_is_descriptor_array(
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+) -> bool {
+    if let Expr::Name { name } = &expr.node {
+        if let Some(info) = locals.get(&name.to_lowercase()) {
+            return local_uses_array_descriptor(info)
+                || (!info.dims.is_empty() && info.descriptor_arg);
+        }
+    }
+    false
 }
 
 const DESC_CHAR_SLOT_TABLE: i32 = 1 << 3;

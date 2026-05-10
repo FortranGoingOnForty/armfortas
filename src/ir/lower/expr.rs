@@ -1006,7 +1006,9 @@ pub(crate) fn lower_expr_full(
                     .unwrap_or_else(|| key.clone());
                 let has_named_interface = !internal_funcs
                     .is_some_and(|funcs| funcs.contains_key(&key))
-                    && find_named_interface_symbol(st, &key).is_some();
+                    && (find_named_interface_symbol(st, &key).is_some()
+                        || crate::ir::lower::core::named_interface_specific_candidates(st, &key)
+                            .is_some());
 
                 // Check if this is an array element or section access.
                 if let Some(info) = locals.get(&key) {
@@ -2022,23 +2024,73 @@ pub(crate) fn lower_expr_full(
                                         |k| callee_return_ir_type(st, k),
                                     )
                                     .unwrap_or(IrType::Int(IntWidth::I32));
+                                    // Honor the abstract-interface descriptor
+                                    // mask when forwarding actuals.  When an
+                                    // actual is a descriptor-backed array
+                                    // (assumed-shape dummy / allocatable /
+                                    // pointer), pass its full descriptor —
+                                    // the callee declared via the abstract
+                                    // interface must take a descriptor for
+                                    // assumed-shape parameters. Without this,
+                                    // `lower_arg_by_ref_full` returned the
+                                    // base data pointer (loaded out of the
+                                    // descriptor) and the callee tried to
+                                    // read rank/dims out of the array elements'
+                                    // bytes — stdlib's iterative solvers all
+                                    // dispatch dot_product/matvec through a
+                                    // procedure-pointer field of a class arg
+                                    // this way and SEGV'd deep inside
+                                    // stdlib_dot_product_dp on an indirect
+                                    // load whose target was the array's first
+                                    // f64 (1.0 = bits 0x3ff0...).
+                                    let callee_descriptor_args =
+                                        first_procedure_lookup(&abi_lookup_keys, |k| {
+                                            descriptor_params
+                                                .and_then(|m| cached_param_mask_for_lookup(st, m, k))
+                                        });
                                     let mut arg_vals: Vec<ValueId> =
                                         Vec::with_capacity(args.len());
-                                    for arg in args {
+                                    for (i, arg) in args.iter().enumerate() {
                                         if let crate::ast::expr::SectionSubscript::Element(
                                             e,
                                         ) = &arg.value
                                         {
-                                            arg_vals.push(lower_arg_by_ref_full(
-                                                b,
-                                                locals,
-                                                e,
-                                                st,
-                                                type_layouts,
-                                                internal_funcs,
-                                                contained_host_refs,
-                                                descriptor_params,
-                                            ));
+                                            let mask_says_descriptor = callee_descriptor_args
+                                                .as_ref()
+                                                .map(|mask| mask.get(i).copied().unwrap_or(false))
+                                                .unwrap_or(false);
+                                            // Fallback: if the lookup missed
+                                            // (abstract iface not in
+                                            // descriptor_params), inspect the
+                                            // actual itself. A descriptor-
+                                            // backed local must be passed by
+                                            // descriptor regardless.
+                                            let actual_is_descriptor_backed =
+                                                actual_is_descriptor_array(locals, e);
+                                            let wants_descriptor = mask_says_descriptor
+                                                || actual_is_descriptor_backed;
+                                            let v = if wants_descriptor {
+                                                lower_arg_descriptor(
+                                                    b,
+                                                    locals,
+                                                    e,
+                                                    st,
+                                                    type_layouts,
+                                                    false,
+                                                )
+                                            } else {
+                                                lower_arg_by_ref_full(
+                                                    b,
+                                                    locals,
+                                                    e,
+                                                    st,
+                                                    type_layouts,
+                                                    internal_funcs,
+                                                    contained_host_refs,
+                                                    descriptor_params,
+                                                )
+                                            };
+                                            arg_vals.push(v);
                                         }
                                     }
                                     return b.call(

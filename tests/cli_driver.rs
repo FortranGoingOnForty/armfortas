@@ -755,6 +755,77 @@ fn advancing_a1_read_consumes_in_flight_noadvance_cursor() {
 }
 
 #[test]
+fn same_module_routine_dispatches_generic_to_complex_specific() {
+    // stdlib_linalg_blas_aux::stdlib_icamax calls the generic
+    // stdlib_cabs1 with `zx(1)` of `complex(sp), intent(in) :: zx(*)`.
+    // Compile-time dispatch must pick stdlib_scabs1 (the complex(sp)
+    // specific). Prior to the fix, find_named_interface_symbol's
+    // use-association gate excluded the same module's own scope when
+    // sema's st.current was Global during IR lowering — leaving the
+    // generic unresolved and `[scabs, dcabs]` listed but unmatched.
+    let src = write_program(
+        "module m\n  use, intrinsic :: iso_fortran_env, only: sp => real32, dp => real64\n  implicit none\n  private\n  public :: gen, do_call\n  interface gen\n     module procedure scabs\n     module procedure dcabs\n  end interface\ncontains\n  real(sp) function scabs(z)\n    complex(sp), intent(in) :: z\n    scabs = abs(real(z))\n  end function\n  real(dp) function dcabs(z)\n    complex(dp), intent(in) :: z\n    dcabs = abs(real(z))\n  end function\n  subroutine do_call(zx)\n     complex(sp), intent(in) :: zx(*)\n     real(sp) :: dmax\n     dmax = gen(zx(1))\n  end subroutine\nend module\nprogram p\n  print *, \"ok\"\nend program\n",
+        "same_module_generic_dispatch.f90",
+    );
+    let out = unique_path("same_module_generic_dispatch", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("same-module generic dispatch compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "same-module generic dispatch compile failed: stderr={}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn error_stop_with_allocatable_character_message_prints_user_text() {
+    // Stdlib's linalg_error_handling does
+    //   err_msg = ierr%print()
+    //   error stop err_msg
+    // where err_msg is `character(:), allocatable`. Prior to the fix
+    // the implicit-dealloc inserted before the stop-code expression
+    // freed the descriptor's data pointer, so the load that reached
+    // afs_error_stop_msg saw NULL and the runtime fell back to bare
+    // "ERROR STOP". Skip dealloc for character-stop-code error stops:
+    // process exit cleans up the heap anyway.
+    let src = write_program(
+        "program p\n  implicit none\n  character(:), allocatable :: msg\n  msg = 'allocated message test'\n  error stop msg\nend program\n",
+        "error_stop_alloc.f90",
+    );
+    let out = unique_path("error_stop_alloc", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("error stop alloc compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "error stop alloc compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("error stop alloc run failed");
+    assert_eq!(
+        run.status.code(),
+        Some(1),
+        "expected ERROR STOP to exit with code 1, status={:?}",
+        run.status
+    );
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        stderr.contains("ERROR STOP allocated message test"),
+        "expected stderr to contain 'ERROR STOP allocated message test', got: {}",
+        stderr
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn repeated_nonadvancing_a1_read_preserves_embedded_nul_bytes() {
     let input = unique_path("nonadvancing_a1_char_read", "bin");
     std::fs::write(&input, b"A\0B").expect("cannot write nonadvancing A1 input");
@@ -13777,6 +13848,133 @@ fn inline_array_intrinsic_in_print_walks_descriptor_elements() {
         "shape line missing: {}",
         stdout
     );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn proc_pointer_component_call_passes_assumed_shape_array_as_descriptor() {
+    // F2018 §15.5.2.5: an assumed-shape dummy receives a descriptor.
+    // The procedure-pointer component call dispatch in expr.rs was
+    // using `lower_arg_by_ref_full` for every actual, regardless of
+    // what the abstract interface declared — so an `x(:)` formal got
+    // only the array's base data pointer. The callee then read
+    // dims/rank out of the array bytes (size=1 silently, or SEGV at
+    // afs_array_size when the bogus rank exceeded 15).  stdlib's
+    // iterative solvers (solve_cg/bicgstab/pcg) and pseudoinverse
+    // dispatched dot_product/matvec through procedure-pointer fields
+    // and crashed deep inside stdlib_dot_product_dp on a doubly-
+    // indirected dereference. The fix applies the same descriptor mask
+    // lookup the regular call path uses.
+    let src = write_program(
+        "module m\n  implicit none\n  abstract interface\n    function reduce_iface(x, y) result(r)\n      real(8), intent(in) :: x(:), y(:)\n      real(8) :: r\n    end function\n  end interface\n  type :: linop\n    procedure(reduce_iface), nopass, pointer :: dot => null()\n  end type\ncontains\n  function default_dot(x, y) result(r)\n    real(8), intent(in) :: x(:), y(:)\n    real(8) :: r\n    integer :: i\n    r = 0.0_8\n    do i = 1, size(x)\n      r = r + x(i) * y(i)\n    end do\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  type(linop) :: opa\n  real(8) :: vx(3), vy(3), s\n  vx = [1.0_8, 2.0_8, 3.0_8]\n  vy = [4.0_8, 5.0_8, 6.0_8]\n  opa%dot => default_dot\n  s = opa%dot(vx, vy)\n  if (abs(s - 32.0_8) > 1.0e-12_8) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("proc_ptr_desc", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("proc-ptr compile failed");
+    assert!(
+        compile.status.success(),
+        "proc-ptr compile should succeed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("proc-ptr run failed");
+    assert!(
+        run.status.success(),
+        "proc-ptr run should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn merge_intrinsic_routes_array_operands_through_descriptor_path() {
+    // F2018 §16.9.135: MERGE is elemental and returns an array when any
+    // of its operands is an array. The transformational-intrinsic table
+    // in stmt.rs picks which calls go through `lower_array_assign`, and
+    // `merge` was missing — so `x = merge(b, x, mask)` fell through to
+    // scalar `b.select(mask, ptr_a, ptr_b)`, producing const-zero or
+    // ptr-typed garbage that the assignment treated as a source
+    // descriptor. stdlib's iterative solvers (solve_cg/bicgstab/pcg) and
+    // pseudoinverse (`Am1 = .pinv.A`) all SEGV'd on this path. The fix
+    // routes merge() through `lower_array_merge_descriptor`, which
+    // materializes a temp descriptor via per-element select.
+    let src = write_program(
+        "subroutine s(x, b, mask)\n  real(8), intent(inout) :: x(:)\n  real(8), intent(in) :: b(:)\n  logical, intent(in) :: mask(:)\n  x = merge(b, x, mask)\nend subroutine\nprogram p\n  real(8) :: x(3) = [1.0_8, 2.0_8, 3.0_8]\n  real(8) :: b(3) = [10.0_8, 20.0_8, 30.0_8]\n  logical :: mask(3) = [.true., .false., .true.]\n  call s(x, b, mask)\n  if (abs(x(1) - 10.0_8) > 1.0e-12_8) error stop 1\n  if (abs(x(2) - 2.0_8)  > 1.0e-12_8) error stop 2\n  if (abs(x(3) - 30.0_8) > 1.0e-12_8) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("merge_array", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("merge array compile failed");
+    assert!(
+        compile.status.success(),
+        "merge array should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("merge array run failed");
+    assert!(
+        run.status.success(),
+        "merge array should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn complex_scalar_assigned_from_integer_promotes_via_buffer_not_pointer_cast() {
+    // F2018 §10.2.1.3: complex variables can be assigned a scalar of
+    // numeric type — the right-hand side is promoted to complex with
+    // imag=0. Our complex-assign lowering used to memcpy the 8/16
+    // bytes from the RHS treating its register-resident value as if
+    // it were a pointer to a [fN x 2] buffer; for an integer/real RHS
+    // that meant memcpy(c, value_as_ptr, 8) and faulted on the bogus
+    // address. LAPACK CGEEV's `work(1) = maxwrk` (complex(sp) = i32)
+    // SEGV'd on this exact path, taking out every example_eig*,
+    // example_pseudoinverse, example_solve_{cg,bicgstab,pcg}, etc.
+    // The fix materializes a fresh [fN x 2] buffer when the RHS isn't
+    // already complex — covers scalar `c = i`, array element `a(k)=i`,
+    // and derived-type field `dt%c = i`.
+    let src = write_program(
+        "program t\n  implicit none\n  complex(4) :: c, a(5)\n  type :: tt\n    complex(4) :: f\n  end type\n  type(tt) :: dt\n  integer :: i\n  i = 42\n  c = i\n  a(3) = i\n  dt%f = i\n  if (abs(real(c) - 42.0) > 1.0e-5) error stop 1\n  if (abs(aimag(c)) > 1.0e-5) error stop 2\n  if (abs(real(a(3)) - 42.0) > 1.0e-5) error stop 3\n  if (abs(aimag(a(3))) > 1.0e-5) error stop 4\n  if (abs(real(dt%f) - 42.0) > 1.0e-5) error stop 5\n  if (abs(aimag(dt%f)) > 1.0e-5) error stop 6\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("cmplx_int_assign", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("complex<-int compile failed");
+    assert!(
+        compile.status.success(),
+        "complex<-int should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("complex<-int run failed");
+    assert!(
+        run.status.success(),
+        "complex<-int should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok, got: {}", stdout);
 
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);

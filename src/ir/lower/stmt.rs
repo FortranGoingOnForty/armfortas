@@ -374,6 +374,19 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                         // a single complex(4) const-zero
                                                         // buffer — wrong shape and wrong kind.
                                                         | "cmplx"
+                                                        // merge(t, f, mask) over arrays:
+                                                        // lower_array_merge_descriptor
+                                                        // materializes a temp via per-element
+                                                        // select. Without this entry the
+                                                        // FunctionCall arm picks up scalar
+                                                        // intrinsic merge, which emits
+                                                        // `select` on pointer operands and
+                                                        // hands a scalar f64 to the assignment
+                                                        // memcpy as a "source descriptor" —
+                                                        // SEGV on dereference. Surfaced in
+                                                        // stdlib's iterative solvers
+                                                        // (solve_cg/bicgstab/pcg).
+                                                        | "merge"
                                                 )
                                                 || (
                                                     // sum(arr, dim) is rank-N-1: route to
@@ -580,9 +593,24 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     );
                                     b.store(coerced, tgt);
                                 } else if is_complex_ty(&info.ty) {
-                                    // Complex assignment: RHS returns a ptr to [f32/f64 x 2] buffer.
-                                    // Memcpy the 8 or 16 bytes into the destination slot.
-                                    let src = super::expr::lower_expr_ctx_tl(b, ctx, value);
+                                    // Complex assignment: RHS may evaluate to a
+                                    // ptr<[fN x 2]> (already a complex buffer)
+                                    // or to a scalar int/real value (Fortran
+                                    // permits `c = i` / `c = r` with implicit
+                                    // promotion). For the scalar case we have
+                                    // to materialize a fresh [fN x 2] buffer
+                                    // first — without it we'd memcpy from the
+                                    // scalar's value treated as a pointer
+                                    // (LAPACK CGEEV's `work(1)=maxwrk` was
+                                    // SEGV-ing on this exact path).
+                                    let raw = super::expr::lower_expr_ctx_tl(b, ctx, value);
+                                    let src_ty = b.func().value_type(raw);
+                                    let src = if matches!(&src_ty, Some(t) if is_complex_ty(t)) {
+                                        raw
+                                    } else {
+                                        let fw = complex_float_width(&info.ty);
+                                        materialize_complex_operand(b, raw, fw)
+                                    };
                                     let bytes = complex_byte_size(&info.ty);
                                     let sz = b.const_i64(bytes);
                                     if info.by_ref {
@@ -1276,9 +1304,16 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     && !field.allocatable
                                     && field.dims.is_empty()
                                 {
-                                    let src = super::expr::lower_expr_ctx_tl(b, ctx, value);
-                                    let bytes =
-                                        complex_byte_size(&type_info_to_ir_type(&field.type_info));
+                                    let raw = super::expr::lower_expr_ctx_tl(b, ctx, value);
+                                    let field_ir_ty = type_info_to_ir_type(&field.type_info);
+                                    let src_ty = b.func().value_type(raw);
+                                    let src = if matches!(&src_ty, Some(t) if is_complex_ty(t)) {
+                                        raw
+                                    } else {
+                                        let fw = complex_float_width(&field_ir_ty);
+                                        materialize_complex_operand(b, raw, fw)
+                                    };
+                                    let bytes = complex_byte_size(&field_ir_ty);
                                     let sz = b.const_i64(bytes);
                                     b.call(
                                         FuncRef::External("memcpy".into()),
@@ -2853,24 +2888,6 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             b.unreachable();
         }
         Stmt::ErrorStop { code, .. } => {
-            let skip = if matches!(
-                ctx.hidden_result_abi,
-                HiddenResultAbi::ArrayDescriptor | HiddenResultAbi::DerivedAggregate
-            ) {
-                Some(ValueId(0))
-            } else {
-                None
-            };
-            insert_implicit_dealloc(
-                b,
-                &ctx.locals,
-                &ctx.locals,
-                ctx.type_layouts,
-                ctx.st,
-                ctx.internal_funcs,
-                Some(ctx.contained_host_refs),
-                skip,
-            );
             // F2018 §11.4: error stop with a stop-code prints the
             // implementation banner together with the user's code. The
             // earlier lowering threw the code away so all stdlib error
@@ -2878,7 +2895,21 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             // problems such as stdlib_sorting's "work array is too small"
             // and "Allocation of adjoint_array buffer failed". Dispatch
             // to the message or integer entry depending on stop-code type.
-            if let Some(code_expr) = code {
+            //
+            // Lower the stop-code expression BEFORE the implicit dealloc:
+            // for an allocatable character stop-code (e.g. stdlib's
+            // `error stop err_msg` where err_msg is character(:),
+            // allocatable), the dealloc nullifies the descriptor's data
+            // pointer, so loading after dealloc gives a null ptr and
+            // afs_error_stop_msg falls back to the bare "ERROR STOP"
+            // branch. Capturing first preserves the pointer for the
+            // call (the buffer remains mapped through process exit).
+            enum StopCode {
+                Msg(ValueId, ValueId),
+                Int(ValueId),
+                None,
+            }
+            let stop_code = if let Some(code_expr) = code {
                 let is_char = expr_is_character_expr(
                     b,
                     &ctx.locals,
@@ -2888,11 +2919,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 ) || matches!(code_expr.node, Expr::StringLiteral { .. });
                 if is_char {
                     let (ptr, len) = lower_string_expr_ctx(b, ctx, code_expr);
-                    b.call(
-                        FuncRef::External("afs_error_stop_msg".into()),
-                        vec![ptr, len],
-                        IrType::Void,
-                    );
+                    StopCode::Msg(ptr, len)
                 } else {
                     let val = super::expr::lower_expr_ctx(b, ctx, code_expr);
                     let val_ty = b
@@ -2904,14 +2931,59 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         IrType::Int(_) => b.int_extend(val, IntWidth::I64, true),
                         _ => val,
                     };
+                    StopCode::Int(widened)
+                }
+            } else {
+                StopCode::None
+            };
+
+            // Skip implicit dealloc for character-stop-code error stops.
+            // The user-provided message often references a local
+            // allocatable string whose buffer would be freed by the
+            // dealloc, leaving afs_error_stop_msg reading freed memory
+            // (or, if the load order let it run before dealloc, a now-
+            // null data pointer). Process exit cleans up the heap
+            // anyway. For integer / no-code stops the dealloc still
+            // runs to satisfy any non-error cleanup expectations.
+            if !matches!(stop_code, StopCode::Msg(..)) {
+                let skip = if matches!(
+                    ctx.hidden_result_abi,
+                    HiddenResultAbi::ArrayDescriptor | HiddenResultAbi::DerivedAggregate
+                ) {
+                    Some(ValueId(0))
+                } else {
+                    None
+                };
+                insert_implicit_dealloc(
+                    b,
+                    &ctx.locals,
+                    &ctx.locals,
+                    ctx.type_layouts,
+                    ctx.st,
+                    ctx.internal_funcs,
+                    Some(ctx.contained_host_refs),
+                    skip,
+                );
+            }
+
+            match stop_code {
+                StopCode::Msg(ptr, len) => {
+                    b.call(
+                        FuncRef::External("afs_error_stop_msg".into()),
+                        vec![ptr, len],
+                        IrType::Void,
+                    );
+                }
+                StopCode::Int(widened) => {
                     b.call(
                         FuncRef::External("afs_error_stop_int".into()),
                         vec![widened],
                         IrType::Void,
                     );
                 }
-            } else {
-                b.runtime_call(RuntimeFunc::ErrorStop, vec![], IrType::Void);
+                StopCode::None => {
+                    b.runtime_call(RuntimeFunc::ErrorStop, vec![], IrType::Void);
+                }
             }
             b.unreachable();
         }
