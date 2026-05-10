@@ -15479,8 +15479,25 @@ pub(super) fn lower_string_expr_full(
                 // NamedInterface shadows the name, skip the intrinsic
                 // match arms and fall through to the user-defined
                 // function resolution path.
+                //
+                // F2008 §12.5.5.2 generic resolution: the user-defined
+                // generic only shadows the intrinsic for argument
+                // signatures that match one of its specifics. stdlib's
+                // `repeat` generic only has `(string_type, integer)`,
+                // so `repeat(' ', 5)` (character first arg) must still
+                // dispatch to the intrinsic. Without this refinement
+                // the gate fired unconditionally, the intrinsic match
+                // arm was skipped, the user-resolution path called the
+                // intrinsic runtime correctly but failed to compute
+                // the result length — silently emitting len=0 to
+                // afs_assign_char_deferred and producing empty strings
+                // (blocks process_1/process_6 and any deferred-length
+                // = repeat(char, n) downstream of `use stdlib_strings`).
                 let user_named_interface_shadows_intrinsic =
-                    find_named_interface_symbol(st, &key).is_some();
+                    find_named_interface_symbol(st, &key).is_some()
+                        && !first_char_arg
+                            .map(|arg| expr_is_character_expr(b, locals, arg, st, type_layouts))
+                            .unwrap_or(false);
                 let intrinsic_key = if user_named_interface_shadows_intrinsic {
                     ""
                 } else {
