@@ -1186,8 +1186,60 @@ pub extern "C" fn afs_copy_array_data(
     let source = unsafe { &*source };
     let bytes = source.total_bytes();
     if bytes > 0 && !source.base_addr.is_null() && !dest.base_addr.is_null() {
-        unsafe {
-            ptr::copy(source.base_addr, dest.base_addr, bytes as usize);
+        // F2018 §9.7.1.2: SOURCE-expr may be a non-contiguous section
+        // (e.g. `allocate(col, source = idx(2, 1:n))` reads only every
+        // other element of `idx`). A flat ptr::copy treats the source
+        // base..base+total_bytes as contiguous, picking up adjacent
+        // dim-0 entries instead of stepping by the per-dim memory
+        // stride. Detect non-contiguous (any source stride != the
+        // canonical column-major step) and walk element-by-element.
+        let elem_size = source.elem_size;
+        let mut canonical: i64 = 1;
+        let mut contiguous = true;
+        for i in 0..source.rank as usize {
+            if source.dims[i].stride != canonical {
+                contiguous = false;
+                break;
+            }
+            canonical = canonical.saturating_mul(source.dims[i].extent().max(1));
+        }
+        if contiguous {
+            unsafe {
+                ptr::copy(source.base_addr, dest.base_addr, bytes as usize);
+            }
+        } else {
+            // Walk every multi-index of the source in column-major
+            // order and copy `elem_size` bytes per slot. Dest is
+            // contiguous (just allocated) so its destination index
+            // is the linear count.
+            let rank = source.rank as usize;
+            let extents: Vec<i64> = (0..rank).map(|i| source.dims[i].extent()).collect();
+            let strides: Vec<i64> = (0..rank).map(|i| source.dims[i].stride).collect();
+            let mut idx = vec![0i64; rank];
+            let total = source.total_elements();
+            for k in 0..total {
+                let mut src_off: i64 = 0;
+                for d in 0..rank {
+                    src_off += idx[d] * strides[d];
+                }
+                src_off *= elem_size;
+                let dst_off = k * elem_size;
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        source.base_addr.offset(src_off as isize),
+                        dest.base_addr.offset(dst_off as isize),
+                        elem_size as usize,
+                    );
+                }
+                // increment column-major: dim 0 fastest
+                for d in 0..rank {
+                    idx[d] += 1;
+                    if idx[d] < extents[d] {
+                        break;
+                    }
+                    idx[d] = 0;
+                }
+            }
         }
     }
     dest.set_scalar_type_tag(source.scalar_type_tag());
