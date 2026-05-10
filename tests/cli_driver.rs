@@ -28622,3 +28622,42 @@ fn cmplx_whole_array_with_kind_keyword_returns_correct_kind_descriptor() {
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
 }
+
+#[test]
+fn rank2_section_with_vector_subscript_gathers_into_fresh_descriptor() {
+    // F2018 §9.5.3.3: a section like `A(:, pivots)` where one subscript
+    // is a range and another is a rank-1 integer array (vector subscript)
+    // must produce a rank-2 result whose dim 1 is permuted/gathered by
+    // the index array. afs_create_section can only express stride-based
+    // sections, so vector subscripts force a per-element gather into a
+    // fresh allocated descriptor. Without that path, the index array's
+    // base pointer was being stored into the section's start/end i64
+    // slots with stride 0, producing garbage offsets and a SIGBUS
+    // (matched stdlib pivoting_qr cluster).
+    let src = write_program(
+        "program p\n  real :: A(4,3), B(4,3)\n  integer :: pivots(3)\n  integer :: i, j\n  do i = 1, 3\n    do j = 1, 4\n      A(j,i) = real((i-1)*4 + j)\n    end do\n  end do\n  pivots = [3, 1, 2]\n  B = A(:, pivots)\n  if (abs(B(1,1) - 9.0)  > 1.0e-6) error stop 1\n  if (abs(B(4,1) - 12.0) > 1.0e-6) error stop 2\n  if (abs(B(1,2) - 1.0)  > 1.0e-6) error stop 3\n  if (abs(B(4,2) - 4.0)  > 1.0e-6) error stop 4\n  if (abs(B(1,3) - 5.0)  > 1.0e-6) error stop 5\n  if (abs(B(4,3) - 8.0)  > 1.0e-6) error stop 6\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("rank2_vector_subscript_section", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("rank-2 vector subscript compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "rank-2 vector subscript compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("rank-2 vector subscript run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "rank-2 vector subscript run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
