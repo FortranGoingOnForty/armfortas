@@ -13854,6 +13854,49 @@ fn inline_array_intrinsic_in_print_walks_descriptor_elements() {
 }
 
 #[test]
+fn scalar_returning_intrinsic_call_to_whole_array_routes_through_bulk_fill() {
+    // F2018 §10.2.1.3: a scalar RHS assigned to a whole array broadcasts
+    // the value to every element. The literal-scalar case `x = 0.0` was
+    // already handled, but a scalar from a function call (e.g.
+    // `x = ieee_value(1.0, ieee_quiet_nan)`) was falling through to
+    // lower_expr_ctx_tl, which produced an f32 SSA value; the assignment
+    // path then treated it as a source descriptor pointer and emitted a
+    // load-from-non-pointer (caught by the IR verifier when the dest is
+    // fixed-size, and SEGV at afs_assign_allocatable when descriptor-
+    // backed). stdlib's `pinv_s_operator` SEGV'd on
+    // `pinva = ieee_value(1.0_sp, ieee_quiet_nan)` in the linalg-error
+    // path. The fix routes scalar-returning calls to lower_array_assign
+    // so its bulk-fill plan generates afs_fill_f32/_f64.
+    let src = write_program(
+        "program t\n  use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan\n  implicit none\n  real(4) :: x(5)\n  integer :: i\n  x = 0.0_4\n  if (.true.) then\n    x = ieee_value(1.0_4, ieee_quiet_nan)\n  end if\n  do i = 1, 5\n    if (.not. (x(i) /= x(i))) error stop i\n  end do\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("scalar_nan_broadcast", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("scalar-fn-broadcast compile failed");
+    assert!(
+        compile.status.success(),
+        "scalar-fn-broadcast should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "scalar-fn-broadcast should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn proc_pointer_component_call_passes_assumed_shape_array_as_descriptor() {
     // F2018 §15.5.2.5: an assumed-shape dummy receives a descriptor.
     // The procedure-pointer component call dispatch in expr.rs was
