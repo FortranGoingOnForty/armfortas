@@ -28624,6 +28624,44 @@ fn cmplx_whole_array_with_kind_keyword_returns_correct_kind_descriptor() {
 }
 
 #[test]
+fn random_number_on_array_fills_every_element() {
+    // F2018 §16.9.171: RANDOM_NUMBER(harvest) fills harvest with
+    // independent draws from [0,1). The intrinsic-subroutine lowering
+    // dispatched all real-kind harvests to the scalar runtime
+    // (afs_random_number_f64), which fills exactly one slot — so for
+    // an array harvest, elements 2..N stayed at uninit-stack-garbage
+    // values (typically tiny denormals or NaN). Surfaced in stdlib
+    // sparse_spmv: `random_number(A); count(abs(A) > tiny(...))`
+    // returned 1 instead of size(A), nnz=1, COO%index allocated as
+    // (2,1), then COO%index(2, idx) walked past dim 0 extent and
+    // tripped "Bounds check failed: index 2 outside [1, 1]".
+    let src = write_program(
+        "program p\n  implicit none\n  integer, parameter :: dp = kind(0.0d0)\n  real(dp) :: a(8)\n  real    :: b(8)\n  integer :: i\n  call random_number(a)\n  call random_number(b)\n  do i = 1, 8\n    if (.not. (a(i) >= 0.0_dp .and. a(i) < 1.0_dp)) error stop 1\n    if (.not. (b(i) >= 0.0    .and. b(i) < 1.0   )) error stop 2\n  end do\n  if (count(a > 0.0_dp) /= 8) error stop 3\n  if (count(b > 0.0   ) /= 8) error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("random_number_array_fill", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("random_number array compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "random_number array compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "random_number array run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn allocatable_array_component_passed_to_assumed_size_unwraps_descriptor() {
     // F2018 §15.5.2.4: when an allocatable rank-N array component
     // (e.g. `c%idx` where `idx` is `integer, allocatable :: idx(:,:)`)
