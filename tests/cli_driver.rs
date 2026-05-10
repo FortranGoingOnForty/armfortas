@@ -28624,6 +28624,47 @@ fn cmplx_whole_array_with_kind_keyword_returns_correct_kind_descriptor() {
 }
 
 #[test]
+fn allocatable_array_component_passed_to_assumed_size_unwraps_descriptor() {
+    // F2018 §15.5.2.4: when an allocatable rank-N array component
+    // (e.g. `c%idx` where `idx` is `integer, allocatable :: idx(:,:)`)
+    // is passed to a by-ref dummy declared assumed-size or
+    // explicit-shape (`a(2, *)`), the callee expects an element
+    // pointer it can index column-major directly. lower_arg_by_ref_full
+    // for the ComponentAccess path used to return the field's storage
+    // address — which for an allocatable component is the address of
+    // the 384-byte descriptor itself — so the dummy walked descriptor
+    // bytes (base_addr, elem_size, rank fields) as if they were array
+    // elements. Surfaced inside stdlib_sparse_conversion's
+    // sort_coo_unique_dp where `a(1, ed)` returned descriptor-pointer
+    // bits and triggered "Bounds check failed: index <garbage> outside
+    // [0, num_rows]" inside count_i indexing.
+    let src = write_program(
+        "module m\n  implicit none\n  type :: container\n    integer, allocatable :: idx(:,:)\n  end type\ncontains\n  subroutine sort_check(a, n, ok)\n    integer, intent(inout) :: a(2,*)\n    integer, intent(in) :: n\n    logical, intent(out) :: ok\n    integer :: ed\n    ok = .true.\n    do ed = 1, n\n      if (a(1, ed) /= ed)        ok = .false.\n      if (a(2, ed) /= 100 + ed)  ok = .false.\n    end do\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(container) :: c\n  integer :: ed\n  logical :: ok\n  allocate(c%idx(2, 10), source=0)\n  do ed = 1, 10\n    c%idx(1:2, ed) = [ed, 100 + ed]\n  end do\n  call sort_check(c%idx, 10, ok)\n  if (.not. ok) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("alloc_component_to_assumed_size", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("alloc-component compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "alloc-component compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "alloc-component run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn allocatable_rank2_section_row_assignment_uses_columnmajor_stride() {
     // F2018 §6.5.3: section assignment to a "row" of a column-major
     // allocatable matrix (e.g. `a(1,:) = [...]`) must step through
