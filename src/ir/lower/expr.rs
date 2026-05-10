@@ -2024,23 +2024,54 @@ pub(crate) fn lower_expr_full(
                                         |k| callee_return_ir_type(st, k),
                                     )
                                     .unwrap_or(IrType::Int(IntWidth::I32));
+                                    // Honor the abstract-interface descriptor
+                                    // mask when forwarding actuals.  Without
+                                    // this, an assumed-shape dummy
+                                    // (`real(8), intent(in) :: x(:)`) received
+                                    // only a base data pointer in place of
+                                    // the descriptor — the callee then read
+                                    // dims/rank out of the array elements'
+                                    // bytes and segfaulted (stdlib's iterative
+                                    // solvers all dispatch dot_product through
+                                    // a procedure-pointer field this way).
+                                    let callee_descriptor_args =
+                                        first_procedure_lookup(&abi_lookup_keys, |k| {
+                                            descriptor_params
+                                                .and_then(|m| cached_param_mask_for_lookup(st, m, k))
+                                        });
                                     let mut arg_vals: Vec<ValueId> =
                                         Vec::with_capacity(args.len());
-                                    for arg in args {
+                                    for (i, arg) in args.iter().enumerate() {
                                         if let crate::ast::expr::SectionSubscript::Element(
                                             e,
                                         ) = &arg.value
                                         {
-                                            arg_vals.push(lower_arg_by_ref_full(
-                                                b,
-                                                locals,
-                                                e,
-                                                st,
-                                                type_layouts,
-                                                internal_funcs,
-                                                contained_host_refs,
-                                                descriptor_params,
-                                            ));
+                                            let wants_descriptor = callee_descriptor_args
+                                                .as_ref()
+                                                .map(|mask| mask.get(i).copied().unwrap_or(false))
+                                                .unwrap_or(false);
+                                            let v = if wants_descriptor {
+                                                lower_arg_descriptor(
+                                                    b,
+                                                    locals,
+                                                    e,
+                                                    st,
+                                                    type_layouts,
+                                                    false,
+                                                )
+                                            } else {
+                                                lower_arg_by_ref_full(
+                                                    b,
+                                                    locals,
+                                                    e,
+                                                    st,
+                                                    type_layouts,
+                                                    internal_funcs,
+                                                    contained_host_refs,
+                                                    descriptor_params,
+                                                )
+                                            };
+                                            arg_vals.push(v);
                                         }
                                     }
                                     return b.call(
