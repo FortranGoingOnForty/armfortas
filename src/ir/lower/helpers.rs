@@ -206,6 +206,19 @@ pub(super) fn coerce_to_type(b: &mut FuncBuilder, val: ValueId, target: &IrType)
         (IrType::Ptr(inner), IrType::Bool) if matches!(**inner, IrType::Bool) => {
             b.load_typed(val, IrType::Bool)
         }
+        // Ptr<i8> → Bool: load the byte and treat it as a logical.
+        // Fortran logical(1) flows through the IR as a pointer to i8
+        // (the in-memory representation), but element-wise intrinsic
+        // bodies (merge/where) expect the element value as a Bool.
+        // Without this, merge() with a logical(1) mask array failed
+        // to compile and crashed the IR verifier.
+        (IrType::Ptr(inner), IrType::Bool)
+            if matches!(**inner, IrType::Int(IntWidth::I8)) =>
+        {
+            let byte = b.load_typed(val, IrType::Int(IntWidth::I8));
+            let zero = b.const_int(0, IntWidth::I8);
+            b.icmp(CmpOp::Ne, byte, zero)
+        }
         _ => {
             eprintln!(
                 "coerce_to_type: unhandled coercion {:?} → {:?}",
