@@ -990,6 +990,22 @@ pub extern "C" fn afs_allocate_array(
         }
     }
 
+    // ALLOCATE always produces a single contiguous block, so the
+    // descriptor's per-dim memory stride must be the column-major
+    // canonical step (1 for dim 0, then product of preceding extents).
+    // Compiler-generated dim_buf entries pass stride=1 across the
+    // board (the rank-1 case happens to be correct, multi-dim wasn't),
+    // so fix it up here. Without this, allocatable rank-N section
+    // assignments fed afs_create_section a stride=1 source and the
+    // produced section descriptor stepped through memory contiguously,
+    // collapsing column-major rows into a single linear walk and
+    // corrupting both the LHS write and any subsequent RHS read.
+    let mut running_stride: i64 = 1;
+    for i in 0..rank as usize {
+        desc.dims[i].stride = running_stride;
+        running_stride = running_stride.saturating_mul(desc.dims[i].extent().max(1));
+    }
+
     // Compute total bytes.
     let total = desc.total_elements();
     let bytes = total * elem_size;
