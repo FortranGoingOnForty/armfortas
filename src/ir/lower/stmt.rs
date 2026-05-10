@@ -423,9 +423,45 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                             } else {
                                                 false
                                             };
+                                        // Scalar-returning call assigned to a whole array is a
+                                        // broadcast: `x = ieee_value(...)`, `x = sin(scalar_y)`,
+                                        // user `x = scalar_func()`. The fall-through path
+                                        // lowers the call as a scalar then treats the result as
+                                        // a source descriptor — `load %x from non-pointer f32`
+                                        // in the IR verifier, or afs_assign_allocatable with the
+                                        // scalar value in the wrong arg register at runtime
+                                        // (stdlib's pinv_s_operator hit this on the
+                                        // `pinva = ieee_value(1.0, NaN)` error path). Route
+                                        // through lower_array_assign so its bulk-fill plan
+                                        // applies. Skip when args contain array refs (the
+                                        // call really is producing an array result that other
+                                        // arms above already handle) or when the callee is an
+                                        // alloc-return user function (handled below).
+                                        let callee_is_scalar_broadcast = local_is_array_like(&info)
+                                            && !callee_is_local_array
+                                            && !callee_is_elemental_array_intrinsic
+                                            && !callee_is_transformational_intrinsic
+                                            && call_args.iter().all(|arg| {
+                                                if let crate::ast::expr::SectionSubscript::Element(e)
+                                                    = &arg.value
+                                                {
+                                                    !expr_contains_array_refs(e, &ctx.locals)
+                                                } else {
+                                                    false
+                                                }
+                                            })
+                                            && {
+                                                if let Expr::Name { name: cname } = &callee.node {
+                                                    let lk = cname.to_lowercase();
+                                                    !ctx.alloc_return_funcs.contains(&lk)
+                                                } else {
+                                                    false
+                                                }
+                                            };
                                         if callee_is_local_array
                                             || callee_is_elemental_array_intrinsic
                                             || callee_is_transformational_intrinsic
+                                            || callee_is_scalar_broadcast
                                         {
                                             lower_array_assign(b, ctx, name, &info, value);
                                             return;
