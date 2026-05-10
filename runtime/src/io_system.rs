@@ -1429,13 +1429,11 @@ pub extern "C" fn afs_list_read_begin(
     }
     let record_len = u32::from_ne_bytes(len_buf) as usize;
     let mut data = vec![0u8; record_len];
-    if record_len > 0 {
-        if u.read_raw(&mut data).is_err() && !iostat.is_null() {
-            unsafe {
-                *iostat = 1;
-            }
-            return;
+    if record_len > 0 && u.read_raw(&mut data).is_err() && !iostat.is_null() {
+        unsafe {
+            *iostat = 1;
         }
+        return;
     }
     let mut trailer = [0u8; 4];
     let _ = u.read_raw(&mut trailer);
