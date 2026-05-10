@@ -1920,12 +1920,18 @@ mod tests {
         assert!(dest.is_allocated());
         assert_eq!(dest.elem_size, 8);
         assert_eq!(dest.rank, 2);
+        // Bounds carry over from source. Strides are canonical
+        // column-major (stride[0]=1, stride[k]=Π extent[0..k]) — see
+        // matching note in afs_allocate_array. The previous flat-1
+        // strides made downstream `afs_create_section` compute
+        // colliding byte offsets for any rank-2 reshape.
         assert_eq!(dest.dims[0].lower_bound, -2);
         assert_eq!(dest.dims[0].upper_bound, 1);
         assert_eq!(dest.dims[0].stride, 1);
         assert_eq!(dest.dims[1].lower_bound, 4);
         assert_eq!(dest.dims[1].upper_bound, 6);
-        assert_eq!(dest.dims[1].stride, 1);
+        // dim[1].stride = extent[0] = 1-(-2)+1 = 4
+        assert_eq!(dest.dims[1].stride, 4);
 
         afs_deallocate_array(&mut dest, ptr::null_mut());
     }
