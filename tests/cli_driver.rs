@@ -56,6 +56,29 @@ fn write_program_in(dir: &std::path::Path, name: &str, text: &str) -> PathBuf {
     path
 }
 
+fn run_binary_with_timeout(
+    path: &std::path::Path,
+    timeout: std::time::Duration,
+) -> Option<std::process::Output> {
+    let mut child = Command::new(path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("run failed to spawn");
+    let start = std::time::Instant::now();
+    loop {
+        if child.try_wait().expect("try_wait failed").is_some() {
+            return Some(child.wait_with_output().expect("wait_with_output failed"));
+        }
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 fn undefined_symbols(path: &std::path::Path) -> Vec<String> {
     let out = Command::new("nm")
         .args(["-u", "-j", path.to_str().unwrap()])
@@ -29000,6 +29023,44 @@ fn cmplx_whole_array_with_kind_keyword_returns_correct_kind_descriptor() {
     assert!(
         run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
         "cmplx whole-array run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn complex_array_power_loads_exponent_elements_not_descriptor() {
+    // Surfaced by stdlib_math's logspace_1_cdp_n_rbase:
+    //   res = base ** exponents
+    // where `base` is a real scalar and `exponents` is complex(dp)(:).
+    // The complex-array power path lowered the whole RHS descriptor as a
+    // scalar integer exponent, truncated the descriptor pointer to i32,
+    // and entered a huge repeated-multiply loop. The RHS must be loaded
+    // element-wise and lowered as complex power.
+    let src = write_program(
+        "program p\n  implicit none\n  integer, parameter :: dp = kind(0.0d0)\n  real(dp) :: base\n  complex(dp) :: exponents(3)\n  complex(dp) :: z(3), scalar\n  base = 10.0_dp\n  exponents(1) = cmplx(1.0_dp, 0.0_dp, kind=dp)\n  exponents(2) = cmplx(2.0_dp, 0.0_dp, kind=dp)\n  exponents(3) = cmplx(0.0_dp, 0.0_dp, kind=dp)\n  z = base ** exponents\n  scalar = cmplx(2.0_dp, 0.0_dp, kind=dp) ** cmplx(3.0_dp, 0.0_dp, kind=dp)\n  if (abs(real(z(1)) - 10.0_dp) > 1.0d-8) error stop 1\n  if (abs(aimag(z(1))) > 1.0d-8) error stop 2\n  if (abs(real(z(2)) - 100.0_dp) > 1.0d-7) error stop 3\n  if (abs(aimag(z(2))) > 1.0d-7) error stop 4\n  if (abs(real(z(3)) - 1.0_dp) > 1.0d-8) error stop 5\n  if (abs(aimag(z(3))) > 1.0d-8) error stop 6\n  if (abs(real(scalar) - 8.0_dp) > 1.0d-8) error stop 7\n  if (abs(aimag(scalar)) > 1.0d-8) error stop 8\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("complex_array_power", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("complex array power compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "complex array power compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = run_binary_with_timeout(&out, std::time::Duration::from_secs(15));
+    let Some(run) = run else {
+        panic!("complex array power run timed out");
+    };
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "complex array power run failed: status={:?} stdout={} stderr={}",
         run.status,
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr)

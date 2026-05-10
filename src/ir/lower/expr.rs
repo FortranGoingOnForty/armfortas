@@ -686,6 +686,7 @@ pub(crate) fn lower_expr_full(
                         let imag_num = b.fsub(bc, ad);
                         (b.fdiv(real_num, denom), b.fdiv(imag_num, denom))
                     }
+                    BinaryOp::Pow => lower_complex_pow_lanes(b, fw, re_l, im_l, re_r, im_r),
                     _ => (re_l, im_l), // unsupported: return lhs unchanged
                 };
                 let dst_re = b.gep(buf, vec![zero], IrType::Int(IntWidth::I8));

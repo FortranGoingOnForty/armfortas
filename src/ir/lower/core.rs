@@ -16378,6 +16378,61 @@ pub(super) fn materialize_complex_operand(
     buf
 }
 
+pub(super) fn lower_complex_pow_lanes(
+    b: &mut FuncBuilder,
+    fw: FloatWidth,
+    base_re: ValueId,
+    base_im: ValueId,
+    exp_re: ValueId,
+    exp_im: ValueId,
+) -> (ValueId, ValueId) {
+    let lane_ty = IrType::Float(fw);
+    let libm = |name: &str| {
+        if fw == FloatWidth::F32 {
+            format!("{}f", name)
+        } else {
+            name.to_string()
+        }
+    };
+    let half = match fw {
+        FloatWidth::F32 => b.const_f32(0.5),
+        FloatWidth::F64 => b.const_f64(0.5),
+    };
+
+    // (a+bi)^(c+di) = exp((c+di) * (log(r) + i theta)).
+    let re_sq = b.fmul(base_re, base_re);
+    let im_sq = b.fmul(base_im, base_im);
+    let radius_sq = b.fadd(re_sq, im_sq);
+    let log_radius_sq = b.call(FuncRef::External(libm("log")), vec![radius_sq], lane_ty.clone());
+    let log_radius = b.fmul(half, log_radius_sq);
+    let theta = b.call(
+        FuncRef::External(libm("atan2")),
+        vec![base_im, base_re],
+        lane_ty.clone(),
+    );
+
+    let c_log_r = b.fmul(exp_re, log_radius);
+    let d_theta = b.fmul(exp_im, theta);
+    let magnitude_exp = b.fsub(c_log_r, d_theta);
+
+    let d_log_r = b.fmul(exp_im, log_radius);
+    let c_theta = b.fmul(exp_re, theta);
+    let angle = b.fadd(d_log_r, c_theta);
+
+    let magnitude = b.call(
+        FuncRef::External(libm("exp")),
+        vec![magnitude_exp],
+        lane_ty.clone(),
+    );
+    let angle_cos = b.call(
+        FuncRef::External(libm("cos")),
+        vec![angle],
+        lane_ty.clone(),
+    );
+    let angle_sin = b.call(FuncRef::External(libm("sin")), vec![angle], lane_ty);
+    (b.fmul(magnitude, angle_cos), b.fmul(magnitude, angle_sin))
+}
+
 /// Insert implicit deallocation calls for all local allocatable variables.
 /// Uses a dummy STAT variable so already-deallocated arrays don't abort.
 ///
@@ -26579,14 +26634,28 @@ pub(super) fn lower_rank1_numeric_array_binary_descriptor(
         let zero = b.const_i64(0);
 
         let load_lanes = |b: &mut FuncBuilder, side: Option<&(ValueId, IrType)>, side_expr: &crate::ast::expr::SpannedExpr| -> (ValueId, ValueId) {
-            if let Some((desc, _)) = side {
-                let elem_ptr = rank1_array_desc_elem_ptr(b, *desc, &elem_ty, idx);
-                let re_ptr = b.gep(elem_ptr, vec![zero], IrType::Int(IntWidth::I8));
-                let im_ptr = b.gep(elem_ptr, vec![lane_bytes], IrType::Int(IntWidth::I8));
-                (
-                    b.load_typed(re_ptr, lane_ty.clone()),
-                    b.load_typed(im_ptr, lane_ty.clone()),
-                )
+            if let Some((desc, side_elem_ty)) = side {
+                if is_complex_ty(side_elem_ty) {
+                    let side_fw = complex_float_width(side_elem_ty);
+                    let side_lane_ty = IrType::Float(side_fw);
+                    let side_lane_bytes = b.const_i64(if side_fw == FloatWidth::F64 { 8 } else { 4 });
+                    let elem_ptr = rank1_array_desc_elem_ptr(b, *desc, side_elem_ty, idx);
+                    let re_ptr = b.gep(elem_ptr, vec![zero], IrType::Int(IntWidth::I8));
+                    let im_ptr = b.gep(elem_ptr, vec![side_lane_bytes], IrType::Int(IntWidth::I8));
+                    let raw_re = b.load_typed(re_ptr, side_lane_ty.clone());
+                    let raw_im = b.load_typed(im_ptr, side_lane_ty);
+                    (
+                        coerce_to_type(b, raw_re, &lane_ty),
+                        coerce_to_type(b, raw_im, &lane_ty),
+                    )
+                } else {
+                    let raw = load_rank1_array_desc_elem(b, *desc, side_elem_ty, idx);
+                    let imag_zero = match fw {
+                        FloatWidth::F64 => b.const_f64(0.0),
+                        FloatWidth::F32 => b.const_f32(0.0),
+                    };
+                    (coerce_to_type(b, raw, &lane_ty), imag_zero)
+                }
             } else {
                 let scalar = super::expr::lower_expr_full(
                     b,
@@ -26610,83 +26679,89 @@ pub(super) fn lower_rank1_numeric_array_binary_descriptor(
 
         let (re_l, im_l) = load_lanes(b, lhs.as_ref(), left);
         let (re_res, im_res) = if matches!(op, BinaryOp::Pow) {
-            // F2018 §10.1.3: complex**integer is well-defined for any integer
-            // exponent. Lower per-element as an integer-driven multiplication
-            // loop — the exponent is a scalar, so no element-rank lookup is
-            // needed.  Negative exponents are handled by inverting the base
-            // before the loop (z^-n = (1/z)^n).
-            let order_raw = super::expr::lower_expr_full(
-                b,
-                locals,
-                right,
-                st,
-                type_layouts,
-                internal_funcs,
-                contained_host_refs,
-                descriptor_params,
-            );
-            let order_i32 = match b.func().value_type(order_raw) {
-                Some(IrType::Int(IntWidth::I64)) => b.int_trunc(order_raw, IntWidth::I32),
-                _ => coerce_to_type(b, order_raw, &IrType::Int(IntWidth::I32)),
-            };
-            let zero_i32 = b.const_i32(0);
-            let one_f = match fw {
-                FloatWidth::F64 => b.const_f64(1.0),
-                FloatWidth::F32 => b.const_f32(1.0),
-            };
-            let zero_f = match fw {
-                FloatWidth::F64 => b.const_f64(0.0),
-                FloatWidth::F32 => b.const_f32(0.0),
-            };
-            // base_re/im starts as the element value; if order < 0, replace
-            // with reciprocal so the body of the loop uses |order| iterations.
-            let neg = b.icmp(CmpOp::Lt, order_i32, zero_i32);
-            let neg_order = b.isub(zero_i32, order_i32);
-            let abs_order = b.select(neg, neg_order, order_i32);
-            let re_sq = b.fmul(re_l, re_l);
-            let im_sq = b.fmul(im_l, im_l);
-            let denom = b.fadd(re_sq, im_sq);
-            let inv_re = b.fdiv(re_l, denom);
-            let neg_im = b.fsub(zero_f, im_l);
-            let inv_im = b.fdiv(neg_im, denom);
-            let base_re = b.select(neg, inv_re, re_l);
-            let base_im = b.select(neg, inv_im, im_l);
+            let rhs_is_integer_scalar = rhs.is_none()
+                && matches!(
+                    crate::sema::types::expr_type(right, st),
+                    crate::sema::types::FortranType::Integer { .. }
+                );
+            if rhs_is_integer_scalar {
+                // F2018 §10.1.3: complex**integer is well-defined for any
+                // integer exponent. Keep this scalar path exact, but do not
+                // use it for array-valued exponents.
+                let order_raw = super::expr::lower_expr_full(
+                    b,
+                    locals,
+                    right,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                );
+                let order_i32 = match b.func().value_type(order_raw) {
+                    Some(IrType::Int(IntWidth::I64)) => b.int_trunc(order_raw, IntWidth::I32),
+                    _ => coerce_to_type(b, order_raw, &IrType::Int(IntWidth::I32)),
+                };
+                let zero_i32 = b.const_i32(0);
+                let one_f = match fw {
+                    FloatWidth::F64 => b.const_f64(1.0),
+                    FloatWidth::F32 => b.const_f32(1.0),
+                };
+                let zero_f = match fw {
+                    FloatWidth::F64 => b.const_f64(0.0),
+                    FloatWidth::F32 => b.const_f32(0.0),
+                };
+                let neg = b.icmp(CmpOp::Lt, order_i32, zero_i32);
+                let neg_order = b.isub(zero_i32, order_i32);
+                let abs_order = b.select(neg, neg_order, order_i32);
+                let re_sq = b.fmul(re_l, re_l);
+                let im_sq = b.fmul(im_l, im_l);
+                let denom = b.fadd(re_sq, im_sq);
+                let inv_re = b.fdiv(re_l, denom);
+                let neg_im = b.fsub(zero_f, im_l);
+                let inv_im = b.fdiv(neg_im, denom);
+                let base_re = b.select(neg, inv_re, re_l);
+                let base_im = b.select(neg, inv_im, im_l);
 
-            let res_re_addr = b.alloca(lane_ty.clone());
-            let res_im_addr = b.alloca(lane_ty.clone());
-            b.store(one_f, res_re_addr);
-            b.store(zero_f, res_im_addr);
-            let counter_addr = b.alloca(IrType::Int(IntWidth::I32));
-            b.store(abs_order, counter_addr);
+                let res_re_addr = b.alloca(lane_ty.clone());
+                let res_im_addr = b.alloca(lane_ty.clone());
+                b.store(one_f, res_re_addr);
+                b.store(zero_f, res_im_addr);
+                let counter_addr = b.alloca(IrType::Int(IntWidth::I32));
+                b.store(abs_order, counter_addr);
 
-            let bb_pow_check = b.create_block("complex_pow_check");
-            let bb_pow_body = b.create_block("complex_pow_body");
-            let bb_pow_exit = b.create_block("complex_pow_exit");
-            b.branch(bb_pow_check, vec![]);
+                let bb_pow_check = b.create_block("complex_pow_check");
+                let bb_pow_body = b.create_block("complex_pow_body");
+                let bb_pow_exit = b.create_block("complex_pow_exit");
+                b.branch(bb_pow_check, vec![]);
 
-            b.set_block(bb_pow_check);
-            let counter = b.load(counter_addr);
-            let still_pos = b.icmp(CmpOp::Gt, counter, zero_i32);
-            b.cond_branch(still_pos, bb_pow_body, vec![], bb_pow_exit, vec![]);
+                b.set_block(bb_pow_check);
+                let counter = b.load(counter_addr);
+                let still_pos = b.icmp(CmpOp::Gt, counter, zero_i32);
+                b.cond_branch(still_pos, bb_pow_body, vec![], bb_pow_exit, vec![]);
 
-            b.set_block(bb_pow_body);
-            let cur_re = b.load(res_re_addr);
-            let cur_im = b.load(res_im_addr);
-            let ac = b.fmul(cur_re, base_re);
-            let bd = b.fmul(cur_im, base_im);
-            let ad = b.fmul(cur_re, base_im);
-            let bc = b.fmul(cur_im, base_re);
-            let new_re = b.fsub(ac, bd);
-            let new_im = b.fadd(ad, bc);
-            b.store(new_re, res_re_addr);
-            b.store(new_im, res_im_addr);
-            let one_i32 = b.const_i32(1);
-            let dec = b.isub(counter, one_i32);
-            b.store(dec, counter_addr);
-            b.branch(bb_pow_check, vec![]);
+                b.set_block(bb_pow_body);
+                let cur_re = b.load(res_re_addr);
+                let cur_im = b.load(res_im_addr);
+                let ac = b.fmul(cur_re, base_re);
+                let bd = b.fmul(cur_im, base_im);
+                let ad = b.fmul(cur_re, base_im);
+                let bc = b.fmul(cur_im, base_re);
+                let new_re = b.fsub(ac, bd);
+                let new_im = b.fadd(ad, bc);
+                b.store(new_re, res_re_addr);
+                b.store(new_im, res_im_addr);
+                let one_i32 = b.const_i32(1);
+                let dec = b.isub(counter, one_i32);
+                b.store(dec, counter_addr);
+                b.branch(bb_pow_check, vec![]);
 
-            b.set_block(bb_pow_exit);
-            (b.load(res_re_addr), b.load(res_im_addr))
+                b.set_block(bb_pow_exit);
+                (b.load(res_re_addr), b.load(res_im_addr))
+            } else {
+                let (re_r, im_r) = load_lanes(b, rhs.as_ref(), right);
+                lower_complex_pow_lanes(b, fw, re_l, im_l, re_r, im_r)
+            }
         } else {
             let (re_r, im_r) = load_lanes(b, rhs.as_ref(), right);
             match op {
