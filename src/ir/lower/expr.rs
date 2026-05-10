@@ -2025,15 +2025,24 @@ pub(crate) fn lower_expr_full(
                                     )
                                     .unwrap_or(IrType::Int(IntWidth::I32));
                                     // Honor the abstract-interface descriptor
-                                    // mask when forwarding actuals.  Without
-                                    // this, an assumed-shape dummy
-                                    // (`real(8), intent(in) :: x(:)`) received
-                                    // only a base data pointer in place of
-                                    // the descriptor — the callee then read
-                                    // dims/rank out of the array elements'
-                                    // bytes and segfaulted (stdlib's iterative
-                                    // solvers all dispatch dot_product through
-                                    // a procedure-pointer field this way).
+                                    // mask when forwarding actuals.  When an
+                                    // actual is a descriptor-backed array
+                                    // (assumed-shape dummy / allocatable /
+                                    // pointer), pass its full descriptor —
+                                    // the callee declared via the abstract
+                                    // interface must take a descriptor for
+                                    // assumed-shape parameters. Without this,
+                                    // `lower_arg_by_ref_full` returned the
+                                    // base data pointer (loaded out of the
+                                    // descriptor) and the callee tried to
+                                    // read rank/dims out of the array elements'
+                                    // bytes — stdlib's iterative solvers all
+                                    // dispatch dot_product/matvec through a
+                                    // procedure-pointer field of a class arg
+                                    // this way and SEGV'd deep inside
+                                    // stdlib_dot_product_dp on an indirect
+                                    // load whose target was the array's first
+                                    // f64 (1.0 = bits 0x3ff0...).
                                     let callee_descriptor_args =
                                         first_procedure_lookup(&abi_lookup_keys, |k| {
                                             descriptor_params
@@ -2046,10 +2055,20 @@ pub(crate) fn lower_expr_full(
                                             e,
                                         ) = &arg.value
                                         {
-                                            let wants_descriptor = callee_descriptor_args
+                                            let mask_says_descriptor = callee_descriptor_args
                                                 .as_ref()
                                                 .map(|mask| mask.get(i).copied().unwrap_or(false))
                                                 .unwrap_or(false);
+                                            // Fallback: if the lookup missed
+                                            // (abstract iface not in
+                                            // descriptor_params), inspect the
+                                            // actual itself. A descriptor-
+                                            // backed local must be passed by
+                                            // descriptor regardless.
+                                            let actual_is_descriptor_backed =
+                                                actual_is_descriptor_array(locals, e);
+                                            let wants_descriptor = mask_says_descriptor
+                                                || actual_is_descriptor_backed;
                                             let v = if wants_descriptor {
                                                 lower_arg_descriptor(
                                                     b,
