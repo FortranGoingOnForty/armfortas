@@ -607,6 +607,26 @@ fn emit_parameter(
     }
 }
 
+/// Two TypeInfo values represent the same Fortran type. For CHARACTER,
+/// match both kind AND len so a `character(:), allocatable` local does
+/// not get promoted as the result of a `character(3)` function.
+fn result_type_matches(ret: &TypeInfo, cand: &TypeInfo) -> bool {
+    use TypeInfo::*;
+    match (ret, cand) {
+        (Integer { kind: a }, Integer { kind: b }) => a == b,
+        (Real { kind: a }, Real { kind: b }) => a == b,
+        (DoublePrecision, DoublePrecision) => true,
+        (Complex { kind: a }, Complex { kind: b }) => a == b,
+        (Logical { kind: a }, Logical { kind: b }) => a == b,
+        (Character { kind: ak, len: al }, Character { kind: bk, len: bl }) => ak == bk && al == bl,
+        (Derived(a), Derived(b)) => a.eq_ignore_ascii_case(b),
+        (Class(a), Class(b)) => a.eq_ignore_ascii_case(b),
+        (ClassStar, ClassStar) => true,
+        (TypeStar, TypeStar) => true,
+        _ => false,
+    }
+}
+
 fn emit_procedure(
     out: &mut String,
     name: &str,
@@ -660,12 +680,40 @@ fn emit_procedure(
             .and_then(|pscope| {
                 let arg_set: std::collections::HashSet<String> =
                     pscope.arg_order.iter().map(|n| n.to_lowercase()).collect();
+                // The result variable's type matches the function's return
+                // type. HashMap iteration order is non-deterministic, so
+                // picking the first non-arg variable would non-reproducibly
+                // promote ANY local (e.g. `logical :: lfirst(3)` in
+                // stdlib_io's parse_mode) to the result name. Match on
+                // type_info so the chosen symbol is actually the one
+                // standing in for the function result. Surfaced when
+                // stdlib's `open(filename, "w")` returned 'r t' from
+                // parse_mode — the .amod recorded `result_name=lfirst`,
+                // and the function body's writes to `mode_` never reached
+                // the result slot.
+                let ret_ti = sym.type_info.as_ref();
                 pscope
                     .symbols
                     .iter()
-                    .find(|(key, sym)| {
+                    .find(|(key, candidate)| {
                         !arg_set.contains(*key)
-                            && matches!(sym.kind, SymbolKind::Variable | SymbolKind::Parameter)
+                            && matches!(
+                                candidate.kind,
+                                SymbolKind::Variable | SymbolKind::Parameter
+                            )
+                            && match (ret_ti, candidate.type_info.as_ref()) {
+                                (Some(rt), Some(ct)) => result_type_matches(rt, ct),
+                                _ => true,
+                            }
+                    })
+                    .or_else(|| {
+                        pscope.symbols.iter().find(|(key, candidate)| {
+                            !arg_set.contains(*key)
+                                && matches!(
+                                    candidate.kind,
+                                    SymbolKind::Variable | SymbolKind::Parameter
+                                )
+                        })
                     })
                     .map(|(_, sym)| sym.name.clone())
             });

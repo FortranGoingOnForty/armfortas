@@ -7970,12 +7970,37 @@ pub(super) fn find_named_interface_symbol<'a>(
     if let Some(sym) = st.lookup(&key) {
         return is_named_interface_like(sym).then_some(sym);
     }
+    // F2018 §11.2.2: a named interface from another module shadows an
+    // intrinsic only when it is actually use-associated into the
+    // current TU. all_scopes() also exposes modules that the unit
+    // merely loads for type-info (e.g. `use stdlib_string_type, only:
+    // string_type` brings the whole module scope along but does not
+    // import its trim/adjustl/len named interfaces); without the gate,
+    // parse_mode's `trim(adjustl(mode))` silently re-routed through
+    // trim_string and parse_mode kept its 'r t' default, breaking
+    // open() for every savetxt/loadtxt/loadnpy. The gate applies only
+    // to Module/Submodule scopes — in-TU Program/Function/Subroutine
+    // scopes always feed dispatch (sema's st.current can be stale
+    // during IR lowering, so a generic declared in the program scope
+    // only resurfaces via the all-scope walk).
+    use crate::sema::symtab::ScopeKind;
+    let key_is_use_associated = st
+        .all_scopes()
+        .iter()
+        .any(|scope| scope.use_associations.iter().any(|a| a.local_name == key));
     for scope in st.all_scopes() {
+        let in_tu = !matches!(scope.kind, ScopeKind::Module(_) | ScopeKind::Submodule(_));
+        if !in_tu && !key_is_use_associated {
+            continue;
+        }
         if let Some(sym) = scope.symbols.get(&key) {
             if is_named_interface_like(sym) {
                 return Some(sym);
             }
         }
+    }
+    if !key_is_use_associated {
+        return None;
     }
     match st.find_symbol_any_scope(&key) {
         Some(sym) if is_named_interface_like(sym) => Some(sym),
@@ -20118,6 +20143,69 @@ pub(super) fn lower_formatted_char_read_item(
 pub(super) fn lower_fmt_push(b: &mut FuncBuilder, ctx: &mut LowerCtx, item: &crate::ast::expr::SpannedExpr) {
     let is_char = expr_is_character_expr(b, &ctx.locals, item, ctx.st, Some(ctx.type_layouts));
 
+    // Array-shaped items: iterate elements and push each through the
+    // per-element fmt_push helper. Without this, a formatted write of
+    // an array name or section silently emitted nothing because the
+    // descriptor pointer fell into the IrType::Ptr arm and dispatched
+    // to afs_fmt_push_string with a junk length. Mirrors the array
+    // detection in lower_write_items_adv.
+    if !is_char {
+        if let Expr::Name { name } = &item.node {
+            let key = name.to_lowercase();
+            if let Some(info) = ctx.locals.get(&key).cloned() {
+                // Outer arm is the array path. A scalar complex
+                // is_complex_ty check is handled separately at line
+                // 18898; the array case here just needs the array
+                // predicate.
+                if local_is_array_like(&info) {
+                    fmt_push_whole_array(b, &info);
+                    return;
+                }
+            }
+        }
+        if let Expr::FunctionCall { callee, args } = &item.node {
+            if let Expr::Name { name } = &callee.node {
+                let key = name.to_lowercase();
+                if let Some(info) = ctx.locals.get(&key).cloned() {
+                    if local_is_array_like(&info) {
+                        let has_range = args.iter().any(|a| {
+                            matches!(a.value, crate::ast::expr::SectionSubscript::Range { .. })
+                        });
+                        if has_range {
+                            if args.len() == 1 {
+                                fmt_push_1d_slice(b, ctx, &info, &args[0]);
+                            } else {
+                                fmt_push_section_nd(b, ctx, &info, args);
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        if matches!(
+            item.node,
+            Expr::BinaryOp { .. }
+                | Expr::UnaryOp { .. }
+                | Expr::ParenExpr { .. }
+                | Expr::FunctionCall { .. }
+        ) {
+            if let Some((desc, elem_ty)) = lower_array_expr_descriptor(
+                b,
+                &ctx.locals,
+                item,
+                ctx.st,
+                Some(ctx.type_layouts),
+                Some(ctx.internal_funcs),
+                Some(ctx.contained_host_refs),
+                Some(ctx.descriptor_params),
+            ) {
+                fmt_push_array_desc_loop(b, desc, &elem_ty);
+                return;
+            }
+        }
+    }
+
     if is_char || matches!(item.node, Expr::StringLiteral { .. }) {
         let (ptr, len) = lower_string_expr_ctx(b, ctx, item);
         b.call(
@@ -20202,6 +20290,459 @@ pub(super) fn lower_fmt_push(b: &mut FuncBuilder, ctx: &mut LowerCtx, item: &cra
             }
         }
     }
+}
+
+/// Emit one afs_fmt_push_* call for a per-element value loaded from
+/// an array, picking the right widening/wrap shape per element type.
+fn fmt_push_emit_scalar(b: &mut FuncBuilder, ty: &IrType, val: ValueId) {
+    match ty {
+        IrType::Int(IntWidth::I128) => {
+            let slot = b.alloca(IrType::Int(IntWidth::I128));
+            b.store(val, slot);
+            b.call(
+                FuncRef::External("afs_fmt_push_int128".into()),
+                vec![slot],
+                IrType::Void,
+            );
+        }
+        IrType::Int(IntWidth::I64) => {
+            b.call(
+                FuncRef::External("afs_fmt_push_int".into()),
+                vec![val],
+                IrType::Void,
+            );
+        }
+        IrType::Int(_) => {
+            let widened = b.int_extend(val, IntWidth::I64, true);
+            b.call(
+                FuncRef::External("afs_fmt_push_int".into()),
+                vec![widened],
+                IrType::Void,
+            );
+        }
+        IrType::Float(FloatWidth::F64) => {
+            b.call(
+                FuncRef::External("afs_fmt_push_real".into()),
+                vec![val],
+                IrType::Void,
+            );
+        }
+        IrType::Float(_) => {
+            let widened = b.float_extend(val, FloatWidth::F64);
+            b.call(
+                FuncRef::External("afs_fmt_push_real".into()),
+                vec![widened],
+                IrType::Void,
+            );
+        }
+        IrType::Bool => {
+            let int_val = b.int_extend(val, IntWidth::I32, false);
+            b.call(
+                FuncRef::External("afs_fmt_push_logical".into()),
+                vec![int_val],
+                IrType::Void,
+            );
+        }
+        _ => {
+            let widened = b.int_extend(val, IntWidth::I64, true);
+            b.call(
+                FuncRef::External("afs_fmt_push_int".into()),
+                vec![widened],
+                IrType::Void,
+            );
+        }
+    }
+}
+
+/// Push a fixed-len CHARACTER element via afs_fmt_push_string.
+fn fmt_push_emit_char_fixed(b: &mut FuncBuilder, ptr: ValueId, len: i64) {
+    let len_v = b.const_i64(len);
+    b.call(
+        FuncRef::External("afs_fmt_push_string".into()),
+        vec![ptr, len_v],
+        IrType::Void,
+    );
+}
+
+/// Push a complex element by emitting two real pushes for its lanes.
+/// The runtime has no afs_fmt_push_complex_* yet; this preserves
+/// observable behavior under formats like `(2(es...,1x))` while keeping
+/// stdlib's real-only formatted output paths unblocked.
+fn fmt_push_emit_complex(b: &mut FuncBuilder, lane_f64: bool, ptr: ValueId) {
+    let lane_bytes = if lane_f64 { 8 } else { 4 };
+    let lane_ty = if lane_f64 {
+        IrType::Float(FloatWidth::F64)
+    } else {
+        IrType::Float(FloatWidth::F32)
+    };
+    let v0 = b.load_typed(ptr, lane_ty.clone());
+    let v0w = if lane_f64 { v0 } else { b.float_extend(v0, FloatWidth::F64) };
+    b.call(
+        FuncRef::External("afs_fmt_push_real".into()),
+        vec![v0w],
+        IrType::Void,
+    );
+    let off = b.const_i64(lane_bytes);
+    let p1 = b.gep(ptr, vec![off], IrType::Int(IntWidth::I8));
+    let v1 = b.load_typed(p1, lane_ty);
+    let v1w = if lane_f64 { v1 } else { b.float_extend(v1, FloatWidth::F64) };
+    b.call(
+        FuncRef::External("afs_fmt_push_real".into()),
+        vec![v1w],
+        IrType::Void,
+    );
+}
+
+/// Iterate every element of a whole-array Name item and push each via
+/// afs_fmt_push_*. Mirrors `lower_whole_array_write` minus the unit arg.
+fn fmt_push_whole_array(b: &mut FuncBuilder, info: &LocalInfo) {
+    let base = array_base_addr(b, info);
+    let elem_bytes = ir_scalar_byte_size(&info.ty);
+
+    let char_fixed_len: Option<i64> = match info.char_kind {
+        CharKind::Fixed(n) => Some(n),
+        _ => None,
+    };
+    let is_complex_elem = matches!(
+        &info.ty,
+        IrType::Array(inner, 2) if matches!(inner.as_ref(), IrType::Float(_))
+    );
+    let complex_lane_f64 = matches!(
+        &info.ty,
+        IrType::Array(inner, 2) if matches!(inner.as_ref(), IrType::Float(FloatWidth::F64))
+    );
+
+    let n = array_total_elems_value(b, info);
+    let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let zero = b.const_i64(0);
+    b.store(zero, i_addr);
+
+    let bb_check = b.create_block("fmt_arr_check");
+    let bb_body = b.create_block("fmt_arr_body");
+    let bb_exit = b.create_block("fmt_arr_exit");
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let i = b.load(i_addr);
+    let done = b.icmp(CmpOp::Ge, i, n);
+    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+    b.set_block(bb_body);
+    let i_val = b.load(i_addr);
+    let elem_bytes_v = b.const_i64(elem_bytes);
+    let byte_off = b.imul(i_val, elem_bytes_v);
+    let p = b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
+    if let Some(len) = char_fixed_len {
+        fmt_push_emit_char_fixed(b, p, len);
+    } else if is_complex_elem {
+        fmt_push_emit_complex(b, complex_lane_f64, p);
+    } else {
+        let elem = b.load_typed(p, info.ty.clone());
+        fmt_push_emit_scalar(b, &info.ty, elem);
+    }
+    let one = b.const_i64(1);
+    let next = b.iadd(i_val, one);
+    b.store(next, i_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
+}
+
+/// Iterate a 1-D slice `a(lo:hi[:step])` for formatted output.
+/// Mirrors `lower_1d_slice_write` minus the unit arg.
+fn fmt_push_1d_slice(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    info: &LocalInfo,
+    arg: &crate::ast::expr::Argument,
+) {
+    let (start_e, end_e, stride_e) = match &arg.value {
+        crate::ast::expr::SectionSubscript::Range { start, end, stride } => {
+            (start.as_ref(), end.as_ref(), stride.as_ref())
+        }
+        _ => return,
+    };
+    let (decl_lo, decl_ext) = info.dims.first().copied().unwrap_or((1, 0));
+    let decl_hi = decl_lo + decl_ext - 1;
+
+    let start_val = match start_e {
+        Some(e) => super::expr::lower_expr_ctx(b, ctx, e),
+        None => b.const_i32(decl_lo as i32),
+    };
+    let end_val = match end_e {
+        Some(e) => super::expr::lower_expr_ctx(b, ctx, e),
+        None => b.const_i32(decl_hi as i32),
+    };
+    let stride_val = match stride_e {
+        Some(e) => super::expr::lower_expr_ctx(b, ctx, e),
+        None => b.const_i32(1),
+    };
+
+    let base = array_base_addr(b, info);
+    let elem_bytes = ir_scalar_byte_size(&info.ty);
+    let is_complex_elem = matches!(
+        &info.ty,
+        IrType::Array(inner, 2) if matches!(inner.as_ref(), IrType::Float(_))
+    );
+    let complex_lane_f64 = matches!(
+        &info.ty,
+        IrType::Array(inner, 2) if matches!(inner.as_ref(), IrType::Float(FloatWidth::F64))
+    );
+    let char_fixed_len: Option<i64> = match info.char_kind {
+        CharKind::Fixed(n) => Some(n),
+        _ => None,
+    };
+
+    let i_addr = b.alloca(IrType::Int(IntWidth::I32));
+    b.store(start_val, i_addr);
+
+    let bb_check = b.create_block("fmt_slice_check");
+    let bb_body = b.create_block("fmt_slice_body");
+    let bb_exit = b.create_block("fmt_slice_exit");
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let i = b.load(i_addr);
+    let const_stride = stride_e.and_then(eval_const_int);
+    if let Some(sv) = const_stride {
+        let done_op = if sv < 0 { CmpOp::Lt } else { CmpOp::Gt };
+        let done = b.icmp(done_op, i, end_val);
+        b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+    } else {
+        let zero = b.const_i32(0);
+        let stride_neg = b.icmp(CmpOp::Lt, stride_val, zero);
+        let bb_neg = b.create_block("fmt_slice_neg");
+        let bb_pos = b.create_block("fmt_slice_pos");
+        b.cond_branch(stride_neg, bb_neg, vec![], bb_pos, vec![]);
+        b.set_block(bb_neg);
+        let done_neg = b.icmp(CmpOp::Lt, i, end_val);
+        b.cond_branch(done_neg, bb_exit, vec![], bb_body, vec![]);
+        b.set_block(bb_pos);
+        let done_pos = b.icmp(CmpOp::Gt, i, end_val);
+        b.cond_branch(done_pos, bb_exit, vec![], bb_body, vec![]);
+    }
+
+    b.set_block(bb_body);
+    let i_val = b.load(i_addr);
+    let lo_const = b.const_i32(decl_lo as i32);
+    let zero_based = b.isub(i_val, lo_const);
+    let zero_based64 = widen_idx_to_i64(b, zero_based);
+    let step = b.const_i64(elem_bytes);
+    let byte_off = b.imul(zero_based64, step);
+    let p = b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
+    if let Some(len) = char_fixed_len {
+        fmt_push_emit_char_fixed(b, p, len);
+    } else if is_complex_elem {
+        fmt_push_emit_complex(b, complex_lane_f64, p);
+    } else {
+        let elem = b.load_typed(p, info.ty.clone());
+        fmt_push_emit_scalar(b, &info.ty, elem);
+    }
+    let next = b.iadd(i_val, stride_val);
+    b.store(next, i_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
+}
+
+/// Iterate a multi-D section like `a(i, :)` for formatted output.
+/// Mirrors `lower_section_write_nd` minus the unit arg, column-major.
+fn fmt_push_section_nd(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    info: &LocalInfo,
+    args: &[crate::ast::expr::Argument],
+) {
+    use crate::ast::expr::SectionSubscript;
+
+    let base = array_base_addr(b, info);
+    let elem_bytes = ir_scalar_byte_size(&info.ty);
+    let is_complex_elem = matches!(
+        &info.ty,
+        IrType::Array(inner, 2) if matches!(inner.as_ref(), IrType::Float(_))
+    );
+    let complex_lane_f64 = matches!(
+        &info.ty,
+        IrType::Array(inner, 2) if matches!(inner.as_ref(), IrType::Float(FloatWidth::F64))
+    );
+    let char_fixed_len: Option<i64> = match info.char_kind {
+        CharKind::Fixed(n) => Some(n),
+        _ => None,
+    };
+
+    struct DimSlice {
+        counter: ValueId,
+        start_val: ValueId,
+        end_val: ValueId,
+        stride_val: ValueId,
+        const_stride: Option<i64>,
+        decl_lo: i64,
+        cum_stride: i64,
+    }
+    let mut dims: Vec<DimSlice> = Vec::with_capacity(args.len());
+    let mut cum_stride: i64 = 1;
+    for (dim_idx, arg) in args.iter().enumerate() {
+        let (decl_lo, decl_ext) = info.dims.get(dim_idx).copied().unwrap_or((1, 0));
+        let decl_hi = decl_lo + decl_ext - 1;
+        let counter = b.alloca(IrType::Int(IntWidth::I32));
+        let (start_val, end_val, stride_val, const_stride) = match &arg.value {
+            SectionSubscript::Range { start, end, stride } => {
+                let start_v = match start {
+                    Some(e) => super::expr::lower_expr_ctx(b, ctx, e),
+                    None => b.const_i32(decl_lo as i32),
+                };
+                let end_v = match end {
+                    Some(e) => super::expr::lower_expr_ctx(b, ctx, e),
+                    None => b.const_i32(decl_hi as i32),
+                };
+                let stride_v = match stride {
+                    Some(e) => super::expr::lower_expr_ctx(b, ctx, e),
+                    None => b.const_i32(1),
+                };
+                let cs = stride.as_ref().and_then(eval_const_int);
+                (start_v, end_v, stride_v, cs)
+            }
+            SectionSubscript::Element(e) => {
+                let v = super::expr::lower_expr_ctx(b, ctx, e);
+                (v, v, b.const_i32(1), Some(1))
+            }
+        };
+        b.store(start_val, counter);
+        dims.push(DimSlice {
+            counter,
+            start_val,
+            end_val,
+            stride_val,
+            const_stride,
+            decl_lo,
+            cum_stride,
+        });
+        cum_stride *= decl_ext.max(1);
+    }
+
+    let n = dims.len();
+    let mut checks: Vec<BlockId> = Vec::with_capacity(n);
+    let mut bodies: Vec<BlockId> = Vec::with_capacity(n);
+    let mut incrs: Vec<BlockId> = Vec::with_capacity(n);
+    let mut exits: Vec<BlockId> = Vec::with_capacity(n);
+    for d in 0..n {
+        checks.push(b.create_block(&format!("fmt_sec_check_d{}", d)));
+        bodies.push(b.create_block(&format!("fmt_sec_body_d{}", d)));
+        incrs.push(b.create_block(&format!("fmt_sec_incr_d{}", d)));
+        exits.push(b.create_block(&format!("fmt_sec_exit_d{}", d)));
+    }
+    let outer = n - 1;
+    b.branch(checks[outer], vec![]);
+
+    for d_rev in 0..n {
+        let d = n - 1 - d_rev;
+        b.set_block(checks[d]);
+        let cur = b.load(dims[d].counter);
+        if let Some(sv) = dims[d].const_stride {
+            let done_op = if sv < 0 { CmpOp::Lt } else { CmpOp::Gt };
+            let done = b.icmp(done_op, cur, dims[d].end_val);
+            b.cond_branch(done, exits[d], vec![], bodies[d], vec![]);
+        } else {
+            let zero = b.const_i32(0);
+            let stride_neg = b.icmp(CmpOp::Lt, dims[d].stride_val, zero);
+            let bb_neg = b.create_block(&format!("fmt_sec_neg_d{}", d));
+            let bb_pos = b.create_block(&format!("fmt_sec_pos_d{}", d));
+            b.cond_branch(stride_neg, bb_neg, vec![], bb_pos, vec![]);
+            b.set_block(bb_neg);
+            let done_neg = b.icmp(CmpOp::Lt, cur, dims[d].end_val);
+            b.cond_branch(done_neg, exits[d], vec![], bodies[d], vec![]);
+            b.set_block(bb_pos);
+            let done_pos = b.icmp(CmpOp::Gt, cur, dims[d].end_val);
+            b.cond_branch(done_pos, exits[d], vec![], bodies[d], vec![]);
+        }
+
+        b.set_block(bodies[d]);
+        if d == 0 {
+            let mut byte_offset: Option<ValueId> = None;
+            let dim_data: Vec<(ValueId, i64, i64)> = dims
+                .iter()
+                .map(|d| (d.counter, d.decl_lo, d.cum_stride))
+                .collect();
+            for (counter, decl_lo, cum_stride_d) in dim_data {
+                let cnt = b.load(counter);
+                let lo_const = b.const_i32(decl_lo as i32);
+                let zero_based = b.isub(cnt, lo_const);
+                let zero_based64 = widen_idx_to_i64(b, zero_based);
+                let stride_const = b.const_i64(cum_stride_d * elem_bytes);
+                let term = b.imul(zero_based64, stride_const);
+                byte_offset = Some(match byte_offset {
+                    Some(prev) => b.iadd(prev, term),
+                    None => term,
+                });
+            }
+            let off = byte_offset.unwrap_or_else(|| b.const_i64(0));
+            let p = b.gep(base, vec![off], IrType::Int(IntWidth::I8));
+            if let Some(len) = char_fixed_len {
+                fmt_push_emit_char_fixed(b, p, len);
+            } else if is_complex_elem {
+                fmt_push_emit_complex(b, complex_lane_f64, p);
+            } else {
+                let elem = b.load_typed(p, info.ty.clone());
+                fmt_push_emit_scalar(b, &info.ty, elem);
+            }
+            b.branch(incrs[0], vec![]);
+        } else {
+            b.store(dims[d - 1].start_val, dims[d - 1].counter);
+            b.branch(checks[d - 1], vec![]);
+        }
+
+        b.set_block(incrs[d]);
+        let cur2 = b.load(dims[d].counter);
+        let next = b.iadd(cur2, dims[d].stride_val);
+        b.store(next, dims[d].counter);
+        b.branch(checks[d], vec![]);
+
+        b.set_block(exits[d]);
+        if d < n - 1 {
+            b.branch(incrs[d + 1], vec![]);
+        }
+    }
+    b.set_block(exits[outer]);
+}
+
+/// Walk an array-shaped expression result via afs_array_size and push
+/// each element. Used for transformational intrinsics (matmul, reshape,
+/// transpose, …) and arithmetic on array operands inside formatted I/O.
+fn fmt_push_array_desc_loop(b: &mut FuncBuilder, desc: ValueId, elem_ty: &IrType) {
+    let is_complex_elem = is_complex_ty(elem_ty);
+    let complex_lane_f64 = is_complex_elem && complex_float_width(elem_ty) == FloatWidth::F64;
+
+    let n = b.call(
+        FuncRef::External("afs_array_size".into()),
+        vec![desc],
+        IrType::Int(IntWidth::I64),
+    );
+    let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let zero = b.const_i64(0);
+    b.store(zero, i_addr);
+    let bb_check = b.create_block("fmt_arr_expr_check");
+    let bb_body = b.create_block("fmt_arr_expr_body");
+    let bb_exit = b.create_block("fmt_arr_expr_exit");
+    b.branch(bb_check, vec![]);
+    b.set_block(bb_check);
+    let i = b.load(i_addr);
+    let done = b.icmp(CmpOp::Ge, i, n);
+    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+    b.set_block(bb_body);
+    let i_val = b.load(i_addr);
+    if is_complex_elem {
+        let elem_size = b.const_i64(ir_scalar_byte_size(elem_ty));
+        let elem_ptr = rank1_desc_element_byte_ptr(b, desc, i_val, elem_size);
+        fmt_push_emit_complex(b, complex_lane_f64, elem_ptr);
+    } else {
+        let elem = load_rank1_array_desc_elem(b, desc, elem_ty, i_val);
+        fmt_push_emit_scalar(b, elem_ty, elem);
+    }
+    let one = b.const_i64(1);
+    let next = b.iadd(i_val, one);
+    b.store(next, i_addr);
+    b.branch(bb_check, vec![]);
+    b.set_block(bb_exit);
 }
 
 /// Lower a 1-D slice write item: `print *, a(lo:hi[:step])`.
@@ -22232,6 +22773,19 @@ pub(super) fn expr_contains_array_refs_in_subscripts(
         Expr::ParenExpr { inner } => expr_contains_array_refs_in_subscripts(inner, locals),
         Expr::ComponentAccess { base, .. } => expr_contains_array_refs_in_subscripts(base, locals),
         Expr::FunctionCall { callee, args } => {
+            // Array-reducing intrinsics (size, lbound, sum, count, …) take a
+            // whole array as their primary operand; that array reference is
+            // NOT a subscript expression. Without this guard,
+            // `res = res / (size(arr, dim) - 1)` flagged as "contains array
+            // refs in subscripts" because `arr` shows up as a size() arg,
+            // and the assignment was scalarized to `res(i) = res(i) / …`
+            // for a rank-2 res — which then bounds-checked the rank-1
+            // subscript against dim 1's extent and aborted at i=4 of 9.
+            if let Expr::Name { name } = &callee.node {
+                if is_array_reducing_intrinsic(name) {
+                    return expr_contains_array_refs_in_subscripts(callee, locals);
+                }
+            }
             expr_contains_array_refs_in_subscripts(callee, locals)
                 || args.iter().any(|arg| match &arg.value {
                     crate::ast::expr::SectionSubscript::Element(e) => {
@@ -22717,6 +23271,31 @@ pub(super) fn try_lower_scalarized_subscript_array_assign(
         return false;
     }
     if dest_info.dims.len() != 1 && !local_uses_array_descriptor(dest_info) {
+        return false;
+    }
+    // F2018 §10.2.1.3: a Fortran-allocatable LHS gets reallocated to
+    // the RHS shape before assignment. Synthesizing `dest(i) = rhs(i)`
+    // over `1..size(dest)` iterates 0 times when dest is unallocated,
+    // leaving dest empty and any subsequent dest(1) read trapping with
+    // `index 1 outside [1, 0]`. Bail to lower_array_assign's descriptor
+    // path which materializes the RHS as a fresh descriptor and calls
+    // afs_assign_allocatable to (re)allocate dest.
+    //
+    // Discriminate via the Symbol attribute: `LocalInfo.allocatable` is
+    // overloaded to also mean "uses runtime descriptor allocation" for
+    // auto-arrays with runtime bounds (e.g. `real :: r(merge(...))` in
+    // stdlib_stats_var_mask_2_rsp_rsp). Those are NOT Fortran-allocatable
+    // — bailing on them broke `res = res + merge(…)` accumulation
+    // inside the masked-variance loop. Only bail when the *symbol*
+    // carries the allocatable attribute. Surfaced by `r = sqrt(w)` and
+    // stdlib_linalg's `sqrt_w = sqrt(w)` / `b_scaled = sqrt_w * b`
+    // setup in weighted_lstsq.
+    let dest_symbol_allocatable = ctx
+        .st
+        .lookup_local_then_any(ctx.proc_scope_id, &dest_name.to_lowercase())
+        .map(|sym| sym.attrs.allocatable)
+        .unwrap_or(false);
+    if dest_symbol_allocatable {
         return false;
     }
     // Skip scalarization when the RHS contains a transformational
@@ -26578,7 +27157,18 @@ pub(super) fn lower_multi_d_section_assign(
         return false;
     }
 
-    let n_dims = dest_args.len();
+    // The section descriptor's rank is the number of Range subscripts —
+    // Element subscripts collapse a dim. Without this, `center(i, :)` on a
+    // rank-2 array would walk dest_desc as rank-2, reading garbage past the
+    // first 24-byte dim entry; only column 1 (offset 0) ever got the
+    // RHS values, the rest stayed zero.
+    let n_dims = dest_args
+        .iter()
+        .filter(|a| matches!(a.value, crate::ast::expr::SectionSubscript::Range { .. }))
+        .count();
+    if n_dims == 0 {
+        return false;
+    }
     let dest_desc = lower_array_section(
         b,
         &ctx.locals,

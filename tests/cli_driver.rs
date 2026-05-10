@@ -3900,6 +3900,260 @@ end program
 }
 
 #[test]
+fn runtime_shape_local_uses_column_major_stride_for_row_section_assign() {
+    // F2018 §6.5.3.2: Fortran arrays are stored in column-major order.
+    // The runtime-shape allocate path in alloc.rs hardcoded
+    // dim[k].stride = 1 for every dim, so a rank-2 local
+    // `center(size(x,1), size(x,2))` got both row stride and column
+    // stride set to 1. Section assigns `center(i, :) = ...` walked
+    // the row axis with stride=1 (touching only the first column entry
+    // per row) instead of the column axis with stride=m. Surfaced in
+    // stdlib_stats cov_2_rsp_rsp's `center(i, :) = x(i, :) - mean_`
+    // loop and any other runtime-shape rank>=2 local participating in
+    // multi-d section assignment.
+    let src = write_program(
+        r#"
+program test
+  implicit none
+  real :: y(2, 3) = reshape([1., 2., 3., 4., 5., 6.], [2, 3])
+  call run(y)
+contains
+  subroutine run(x)
+    real, intent(in) :: x(:, :)
+    real :: center(size(x, 1), size(x, 2))
+    integer :: i
+    center = 0.0
+    do i = 1, size(x, 1)
+      center(i, :) = x(i, :)
+    end do
+    if (abs(center(1, 1) - 1.0) > 1.0e-6) error stop 1
+    if (abs(center(1, 2) - 3.0) > 1.0e-6) error stop 2
+    if (abs(center(1, 3) - 5.0) > 1.0e-6) error stop 3
+    if (abs(center(2, 1) - 2.0) > 1.0e-6) error stop 4
+    if (abs(center(2, 2) - 4.0) > 1.0e-6) error stop 5
+    if (abs(center(2, 3) - 6.0) > 1.0e-6) error stop 6
+    print *, 'ok'
+  end subroutine
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("runtime_shape_stride", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("runtime-shape stride compile failed");
+    assert!(
+        compile.status.success(),
+        "should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "runtime-shape stride row-section assign produced wrong values: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected 'ok': {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn rank_2_runtime_shape_assign_with_size_in_scalar_does_not_scalarize() {
+    // F2018 §16.9.171: SIZE(arr, dim) is a whole-array inquiry intrinsic.
+    // The scalarized-subscript-array-assign path detected `arr` as an
+    // "array ref in subscripts" because arr appears as a positional
+    // SIZE() arg, then synthesized `res(loop_var) = res(loop_var) / k`
+    // — which for a rank-2 res emitted a 1-D bounds check against dim 1
+    // and aborted at i=4 of total 9. Surfaced in stdlib_stats
+    // cov_2_rsp_rsp's `res = res / (size(x, dim) - merge(1, 0, …))`.
+    let src = write_program(
+        r#"
+program test
+  implicit none
+  real :: x(2, 3) = reshape([1., 2., 3., 4., 5., 6.], [2, 3])
+  call run(x, 1)
+contains
+  subroutine run(arr, dim)
+    real, intent(in) :: arr(:, :)
+    integer, intent(in) :: dim
+    real :: res(merge(size(arr, 1), size(arr, 2), mask = 1<dim), &
+                merge(size(arr, 1), size(arr, 2), mask = 1<dim))
+    res = 0.0
+    res = res / (size(arr, dim) - 1)
+    if (any(res /= 0.0)) error stop 1
+    print *, 'ok'
+  end subroutine
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("rank2_runtime_size_in_scalar", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "rank-2 runtime-shape assign with size() in scalar must not bounds-fail: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected 'ok': {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn allocatable_lhs_eq_elemental_of_rank1_array_reallocates() {
+    // F2018 §10.2.1.3: an allocatable LHS gets reallocated to the RHS
+    // shape before assignment. The subscript-scalarization path
+    // synthesized `r(i) = sqrt(w)(i)` over `1..size(r)` for unallocated
+    // r — iterating 0 times, leaving r empty, and any subsequent r(1)
+    // read trapping with `index 1 outside [1, 0]`. Bailing to the
+    // descriptor path runs `lower_array_expr_descriptor` on the
+    // elemental result and `afs_assign_allocatable` to reallocate r.
+    // Surfaced by stdlib_linalg_least_squares' `sqrt_w = sqrt(w)`.
+    let src = write_program(
+        r#"
+program test
+  implicit none
+  real :: w(4) = [1.0, 2.0, 3.0, 4.0]
+  real, allocatable :: r(:)
+  r = sqrt(w)
+  if (.not. allocated(r)) error stop 1
+  if (size(r) /= 4) error stop 2
+  if (abs(r(1) - 1.0) > 1.0e-6) error stop 3
+  if (abs(r(4) - 2.0) > 1.0e-6) error stop 4
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("alloc_lhs_elemental", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "allocatable r = sqrt(w) must reallocate r to size 4: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected 'ok': {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn intrinsic_trim_not_shadowed_by_loaded_only_named_interface() {
+    // F2018 §11.2.2: a name from another module shadows an intrinsic
+    // only when it is actually use-associated. `find_named_interface_symbol`'s
+    // all-scope fallback walked every loaded scope unconditionally,
+    // so a module that brought in a sibling module solely for type-info
+    // (e.g. `use stdlib_string_type, only: string_type`) inherited that
+    // module's `trim`/`adjustl`/`len` named interfaces as "shadows" and
+    // routed character-intrinsic calls through string_type specifics —
+    // returning empty strings for character data. Surfaced as
+    // stdlib_io.parse_mode("w") returning 'r t' (default), making
+    // stdlib_io.open() pick the 'r' branch and ENOENT every
+    // savetxt/loadtxt/loadnpy call.
+    let src = write_program(
+        r#"
+module local_mod
+  implicit none
+  type :: dummy_t
+    integer :: x
+  end type
+  interface trim
+    module procedure trim_dummy
+  end interface
+contains
+  function trim_dummy(d) result(r)
+    type(dummy_t), intent(in) :: d
+    type(dummy_t) :: r
+    r%x = d%x
+  end function
+end module
+
+module caller_mod
+  use local_mod, only: dummy_t
+  implicit none
+contains
+  character(3) function probe(mode) result(mode_)
+    character(*), intent(in) :: mode
+    character(:), allocatable :: a
+    mode_ = 'r t'
+    if (len_trim(mode) == 0) return
+    a = trim(mode)
+    if (len(a) >= 1) mode_(1:1) = a(1:1)
+  end function probe
+end module
+
+program test
+  use caller_mod
+  if (probe("w") /= "w t") error stop 1
+  if (probe("r") /= "r t") error stop 2
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("trim_intrinsic_not_shadowed", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "intrinsic trim must not get shadowed by a non-imported named interface: status={:?} stderr={} stdout={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr),
+        String::from_utf8_lossy(&run.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected 'ok': {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn reshape_typed_array_constructor_preserves_elem_size_through_assumed_shape() {
     // F2018 §7.8: a typed array constructor `[T :: ...]` has element
     // type T regardless of the element expressions' types.  The reshape
@@ -17960,6 +18214,57 @@ fn formatted_write_of_concat_with_internal_char_function_runs() {
     assert!(
         stdout.contains("x=ok"),
         "unexpected formatted concat internal-char output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn formatted_write_iterates_whole_array_real_and_int() {
+    // Regression: lower_fmt_push used to drop array items into the
+    // IrType::Ptr scalar arm and dispatch to afs_fmt_push_string with a
+    // junk length, so `write(*, '(fmt)') array` produced no output for
+    // any rank or element type.  Verify the per-element loop now emits
+    // afs_fmt_push_real / afs_fmt_push_int and walks every element of a
+    // whole-array name AND a 2-D row-section (savetxt's pattern).
+    let src = write_program(
+        "program p\n  implicit none\n  real :: x(3) = [1.0, 2.0, 3.0]\n  integer :: a(3) = [10, 20, 30]\n  real(kind=8) :: m(2, 3)\n  m = reshape([1.0d0, 2.0d0, 3.0d0, 4.0d0, 5.0d0, 6.0d0], shape=[2, 3])\n  write(*, '(*(es10.3,1x))') x\n  write(*, '(*(i0,1x))') a\n  write(*, '(*(es10.3,1x))') m(1, :)\nend program\n",
+        "f90",
+    );
+    let out = unique_path("formatted_array_iter", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("formatted array iter compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "formatted array iter should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "formatted array iter should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("1.000E+00") && stdout.contains("3.000E+00"),
+        "expected whole-array real elements in output: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("10 20 30"),
+        "expected whole-array int elements in output: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("5.000E+00"),
+        "expected 2D row-section element 5 in output: {}",
         stdout
     );
 
