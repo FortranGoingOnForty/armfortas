@@ -18965,6 +18965,13 @@ pub(super) fn lower_write_items_adv(
                             if has_range {
                                 if args.len() == 1 {
                                     lower_1d_slice_write(b, ctx, &info, &args[0], unit);
+                                } else if local_uses_array_descriptor(&info) {
+                                    // Assumed-shape / allocatable: read
+                                    // bounds and strides from the runtime
+                                    // descriptor instead of info.dims
+                                    // (empty for assumed-shape and would
+                                    // emit zero iterations).
+                                    lower_alloc_section_write_nd(b, ctx, &info, args, unit);
                                 } else {
                                     // Audit CRITICAL-3: multi-dim
                                     // slice prints used to fall
@@ -19411,6 +19418,20 @@ pub(super) fn lower_list_read_items(
     unit: ValueId,
     iostat: ValueId,
 ) {
+    // F2018 §12.6.4.5: `read(unit, *)` with no input items advances
+    // the file position past one record. Without this branch the read
+    // is a silent no-op and iostat is never updated, so loops like
+    // stdlib_io's `number_of_rows` (do { read(s,*,iostat=ios); if ios
+    // /= 0 exit } end do) spin forever and example_loadtxt times out.
+    if items.is_empty() {
+        b.call(
+            FuncRef::External("afs_read_skip_record".into()),
+            vec![unit, iostat],
+            IrType::Void,
+        );
+        return;
+    }
+
     let mode = ReadMode::Unit { unit, iostat };
 
     for item in items {
@@ -19764,11 +19785,18 @@ pub(super) fn lower_read_into_addr(b: &mut FuncBuilder, mode: ReadMode, ty: &IrT
             true
         }
         IrType::Float(FloatWidth::F32) => {
+            // Unit-read path takes an f64 buffer to keep the load-then-truncate
+            // shape uniform with the internal/formatted variants below, which
+            // all write f64 into the temp. afs_read_real takes *mut f32 so
+            // calling it on the f64 alloca corrupted the value (only 4 of 8
+            // bytes were initialized; the f64 reload then truncated nonsense
+            // to zero). Use afs_read_real64 here so the alloca and writer
+            // widths match.
             let tmp = b.alloca(IrType::Float(FloatWidth::F64));
             let handled = match mode {
                 ReadMode::Unit { unit, iostat } => {
                     b.call(
-                        FuncRef::External("afs_read_real".into()),
+                        FuncRef::External("afs_read_real64".into()),
                         vec![unit, tmp, iostat],
                         IrType::Void,
                     );
@@ -19869,13 +19897,21 @@ pub(super) fn lower_array_read_item(
             let has_range = args
                 .iter()
                 .any(|arg| matches!(arg.value, crate::ast::expr::SectionSubscript::Range { .. }));
-            if has_range && info.allocatable {
+            // Route through the descriptor-driven section reader whenever the
+            // local is descriptor-backed (allocatable OR assumed-shape dummy).
+            // info.dims is empty for assumed-shape, so the fixed-bound iterator
+            // would emit zero loop iterations and the read would silently leave
+            // the destination zero-filled — exactly the failure mode in stdlib's
+            // loadtxt when called with a `real, allocatable, intent(out) ::
+            // d(:,:)` whose section `d(i, :)` lowered to a dummy descriptor in
+            // the callee.
+            if has_range && local_uses_array_descriptor(&info) {
                 lower_alloc_section_read(b, ctx, &info, args, mode);
                 true
             } else if has_range && args.len() == 1 {
                 lower_1d_slice_read(b, ctx, &info, &args[0], mode);
                 true
-            } else if has_range && args.len() > 1 && !info.allocatable {
+            } else if has_range && args.len() > 1 {
                 lower_section_read_nd(b, ctx, &info, args, mode);
                 true
             } else {
@@ -20027,6 +20063,38 @@ pub(super) fn lower_formatted_read_items(
     iostat: ValueId,
     size_out: ValueId,
 ) {
+    lower_formatted_read_items_with_runtime_advance(
+        b,
+        ctx,
+        items,
+        unit,
+        fmt_ptr,
+        fmt_len,
+        nonadvancing,
+        None,
+        iostat,
+        size_out,
+    );
+}
+
+/// Same as `lower_formatted_read_items` but additionally accepts a
+/// runtime-evaluated advance i32 (`advance_runtime`). When present the
+/// per-character read uses `afs_fmt_read_string_dyn` so that
+/// non-literal advance expressions (e.g. `advance=optval(adv,'YES')`)
+/// dispatch to the right helper at runtime instead of being decided
+/// at compile time by `nonadvancing`.
+pub(super) fn lower_formatted_read_items_with_runtime_advance(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    items: &[crate::ast::expr::SpannedExpr],
+    unit: ValueId,
+    fmt_ptr: ValueId,
+    fmt_len: ValueId,
+    nonadvancing: bool,
+    advance_runtime: Option<ValueId>,
+    iostat: ValueId,
+    size_out: ValueId,
+) {
     let item_idx = b.alloca(IrType::Int(IntWidth::I64));
     let zero = b.const_i64(0);
     b.store(zero, item_idx);
@@ -20039,7 +20107,7 @@ pub(super) fn lower_formatted_read_items(
     };
 
     for item in items {
-        if lower_formatted_char_read_item(
+        if lower_formatted_char_read_item_with_runtime_advance(
             b,
             ctx,
             item,
@@ -20048,6 +20116,7 @@ pub(super) fn lower_formatted_read_items(
             fmt_len,
             item_idx,
             nonadvancing,
+            advance_runtime,
             iostat,
             size_out,
         ) {
@@ -20075,6 +20144,34 @@ pub(super) fn lower_formatted_char_read_item(
     iostat: ValueId,
     size_out: ValueId,
 ) -> bool {
+    lower_formatted_char_read_item_with_runtime_advance(
+        b,
+        ctx,
+        item,
+        mode,
+        fmt_ptr,
+        fmt_len,
+        item_idx,
+        nonadvancing,
+        None,
+        iostat,
+        size_out,
+    )
+}
+
+pub(super) fn lower_formatted_char_read_item_with_runtime_advance(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    item: &crate::ast::expr::SpannedExpr,
+    mode: ReadMode,
+    fmt_ptr: ValueId,
+    fmt_len: ValueId,
+    item_idx: ValueId,
+    nonadvancing: bool,
+    advance_runtime: Option<ValueId>,
+    iostat: ValueId,
+    size_out: ValueId,
+) -> bool {
     if !expr_is_character_expr(b, &ctx.locals, item, ctx.st, Some(ctx.type_layouts)) {
         return false;
     }
@@ -20090,7 +20187,16 @@ pub(super) fn lower_formatted_char_read_item(
 
     match mode {
         ReadMode::FormattedUnit { unit, .. } => {
-            if nonadvancing {
+            if let Some(adv) = advance_runtime {
+                b.call(
+                    FuncRef::External("afs_fmt_read_string_dyn".into()),
+                    vec![
+                        unit, fmt_ptr, fmt_len, current_idx, dest_ptr, dest_len, size_out, iostat,
+                        adv,
+                    ],
+                    IrType::Void,
+                );
+            } else if nonadvancing {
                 b.call(
                     FuncRef::External("afs_fmt_read_string_noadvance".into()),
                     vec![unit, fmt_ptr, fmt_len, dest_ptr, dest_len, size_out, iostat],
@@ -20174,6 +20280,8 @@ pub(super) fn lower_fmt_push(b: &mut FuncBuilder, ctx: &mut LowerCtx, item: &cra
                         if has_range {
                             if args.len() == 1 {
                                 fmt_push_1d_slice(b, ctx, &info, &args[0]);
+                            } else if local_uses_array_descriptor(&info) {
+                                fmt_push_alloc_section_nd(b, ctx, &info, args);
                             } else {
                                 fmt_push_section_nd(b, ctx, &info, args);
                             }
@@ -20702,6 +20810,203 @@ fn fmt_push_section_nd(
             b.branch(incrs[d + 1], vec![]);
         }
     }
+    b.set_block(exits[outer]);
+}
+
+/// Descriptor-driven counterpart to `fmt_push_section_nd`. For
+/// assumed-shape dummies (`real, intent(in) :: d(:,:)`) and
+/// allocatables, declared bounds in `info.dims` are zero-extent
+/// placeholders, so the fixed-bound section iterator emits zero
+/// values and produces empty rows. Read lower bound, upper bound,
+/// and per-dim memory stride from the runtime descriptor instead.
+/// stdlib_io.savetxt's `write(unit, fmt_, iostat=ios) d(i, :)` flows
+/// through here when the formatted-write fix lands together with
+/// proper assumed-shape iteration. Lost in the lower.rs split (orig
+/// fix 4986129); reinstated here.
+fn fmt_push_alloc_section_nd(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    info: &LocalInfo,
+    args: &[crate::ast::expr::Argument],
+) {
+    use crate::ast::expr::SectionSubscript;
+
+    struct DimSlice {
+        counter: ValueId,
+        start_val: ValueId,
+        end_val: ValueId,
+        stride_val: ValueId,
+        const_stride: Option<i64>,
+        lower_bound: ValueId,
+        cum_extent: ValueId,
+    }
+
+    let elem_bytes = ir_scalar_byte_size(&info.ty);
+    let base = array_base_addr(b, info);
+    let desc_ptr = array_descriptor_addr(b, info);
+    let one64 = b.const_i64(1);
+    let zero64 = b.const_i64(0);
+    let is_complex_elem = matches!(
+        &info.ty,
+        IrType::Array(inner, 2) if matches!(inner.as_ref(), IrType::Float(_))
+    );
+    let complex_lane_f64 = matches!(
+        &info.ty,
+        IrType::Array(inner, 2) if matches!(inner.as_ref(), IrType::Float(FloatWidth::F64))
+    );
+    let char_fixed_len: Option<i64> = match info.char_kind {
+        CharKind::Fixed(n) => Some(n),
+        _ => None,
+    };
+
+    let mut dims: Vec<DimSlice> = Vec::with_capacity(args.len());
+    let mut cum_extent = one64;
+    for (dim_idx, arg) in args.iter().enumerate() {
+        let dim_base = 24 + (dim_idx as i64) * 24;
+        let lo = load_array_desc_i64_field(b, desc_ptr, dim_base);
+        let up = load_array_desc_i64_field(b, desc_ptr, dim_base + 8);
+        let span = b.isub(up, lo);
+        let extent_raw = b.iadd(span, one64);
+        let is_empty = b.icmp(CmpOp::Lt, up, lo);
+        let extent = b.select(is_empty, zero64, extent_raw);
+        let (start_val, end_val, stride_val, const_stride) = match &arg.value {
+            SectionSubscript::Range { start, end, stride } => {
+                let start_v = match start {
+                    Some(e) => {
+                        let raw = super::expr::lower_expr_ctx(b, ctx, e);
+                        widen_idx_to_i64(b, raw)
+                    }
+                    None => lo,
+                };
+                let end_v = match end {
+                    Some(e) => {
+                        let raw = super::expr::lower_expr_ctx(b, ctx, e);
+                        widen_idx_to_i64(b, raw)
+                    }
+                    None => up,
+                };
+                let stride_v = match stride {
+                    Some(e) => {
+                        let raw = super::expr::lower_expr_ctx(b, ctx, e);
+                        widen_idx_to_i64(b, raw)
+                    }
+                    None => one64,
+                };
+                let cs = stride.as_ref().and_then(eval_const_int);
+                (start_v, end_v, stride_v, cs)
+            }
+            SectionSubscript::Element(e) => {
+                let raw = super::expr::lower_expr_ctx(b, ctx, e);
+                let val = widen_idx_to_i64(b, raw);
+                (val, val, one64, Some(1))
+            }
+        };
+        let counter = b.alloca(IrType::Int(IntWidth::I64));
+        b.store(start_val, counter);
+        dims.push(DimSlice {
+            counter,
+            start_val,
+            end_val,
+            stride_val,
+            const_stride,
+            lower_bound: lo,
+            cum_extent,
+        });
+        cum_extent = b.imul(cum_extent, extent);
+    }
+
+    let n = dims.len();
+    let mut checks: Vec<BlockId> = Vec::with_capacity(n);
+    let mut bodies: Vec<BlockId> = Vec::with_capacity(n);
+    let mut incrs: Vec<BlockId> = Vec::with_capacity(n);
+    let mut exits: Vec<BlockId> = Vec::with_capacity(n);
+    for d in 0..n {
+        checks.push(b.create_block(&format!("fmtsec_dyn_check_d{}", d)));
+        bodies.push(b.create_block(&format!("fmtsec_dyn_body_d{}", d)));
+        incrs.push(b.create_block(&format!("fmtsec_dyn_incr_d{}", d)));
+        exits.push(b.create_block(&format!("fmtsec_dyn_exit_d{}", d)));
+    }
+
+    let outer = n - 1;
+    b.branch(checks[outer], vec![]);
+
+    for d_rev in 0..n {
+        let d = n - 1 - d_rev;
+
+        b.set_block(checks[d]);
+        let cur = b.load(dims[d].counter);
+        if let Some(sv) = dims[d].const_stride {
+            let done_op = if sv < 0 { CmpOp::Lt } else { CmpOp::Gt };
+            let done = b.icmp(done_op, cur, dims[d].end_val);
+            b.cond_branch(done, exits[d], vec![], bodies[d], vec![]);
+        } else {
+            let stride_neg = b.icmp(CmpOp::Lt, dims[d].stride_val, zero64);
+            let bb_neg = b.create_block(&format!("fmtsec_dyn_neg_d{}", d));
+            let bb_pos = b.create_block(&format!("fmtsec_dyn_pos_d{}", d));
+            b.cond_branch(stride_neg, bb_neg, vec![], bb_pos, vec![]);
+
+            b.set_block(bb_neg);
+            let done_neg = b.icmp(CmpOp::Lt, cur, dims[d].end_val);
+            b.cond_branch(done_neg, exits[d], vec![], bodies[d], vec![]);
+
+            b.set_block(bb_pos);
+            let done_pos = b.icmp(CmpOp::Gt, cur, dims[d].end_val);
+            b.cond_branch(done_pos, exits[d], vec![], bodies[d], vec![]);
+        }
+
+        b.set_block(bodies[d]);
+        if d == 0 {
+            // Ignore the descriptor's per-dim mem_stride: it's already
+            // pre-multiplied with extent products by descriptor
+            // materialization, so combining it with cum_extent_d would
+            // double-count. The canonical IR convention (see
+            // compute_flat_elem_offset's descriptor branch) is "extent
+            // product only" — matches both allocatables (stride=1) and
+            // assumed-shape dummies fed from fixed-shape callers.
+            let dim_data: Vec<(ValueId, ValueId, ValueId)> = dims
+                .iter()
+                .map(|dim| (dim.counter, dim.lower_bound, dim.cum_extent))
+                .collect();
+            let mut elem_offset: Option<ValueId> = None;
+            for (counter, lower_bound, cum_extent_d) in dim_data {
+                let cnt = b.load(counter);
+                let adjusted = b.isub(cnt, lower_bound);
+                let term = b.imul(adjusted, cum_extent_d);
+                elem_offset = Some(match elem_offset {
+                    Some(prev) => b.iadd(prev, term),
+                    None => term,
+                });
+            }
+            let off_elems = elem_offset.unwrap_or_else(|| b.const_i64(0));
+            let elem_bytes_v = b.const_i64(elem_bytes);
+            let byte_off = b.imul(off_elems, elem_bytes_v);
+            let p = b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
+            if let Some(len) = char_fixed_len {
+                fmt_push_emit_char_fixed(b, p, len);
+            } else if is_complex_elem {
+                fmt_push_emit_complex(b, complex_lane_f64, p);
+            } else {
+                let elem = b.load_typed(p, info.ty.clone());
+                fmt_push_emit_scalar(b, &info.ty, elem);
+            }
+            b.branch(incrs[0], vec![]);
+        } else {
+            b.store(dims[d - 1].start_val, dims[d - 1].counter);
+            b.branch(checks[d - 1], vec![]);
+        }
+
+        b.set_block(incrs[d]);
+        let cur2 = b.load(dims[d].counter);
+        let next = b.iadd(cur2, dims[d].stride_val);
+        b.store(next, dims[d].counter);
+        b.branch(checks[d], vec![]);
+
+        b.set_block(exits[d]);
+        if d < n - 1 {
+            b.branch(incrs[d + 1], vec![]);
+        }
+    }
+
     b.set_block(exits[outer]);
 }
 
@@ -21244,6 +21549,12 @@ pub(super) fn lower_alloc_section_read(
 
     let elem_bytes = ir_scalar_byte_size(&info.ty);
     let base = array_base_addr(b, info);
+    // For assumed-shape dummies the local slot is a pointer-to-descriptor
+    // (info.by_ref==true); array_descriptor_addr unwraps the indirection so
+    // load_array_desc_i64_field reads the actual descriptor fields. Using
+    // info.addr directly here previously SEGV'd on the first descriptor load
+    // when called via the new descriptor-routed read path.
+    let desc_ptr = array_descriptor_addr(b, info);
     let one64 = b.const_i64(1);
     let zero64 = b.const_i64(0);
 
@@ -21251,9 +21562,9 @@ pub(super) fn lower_alloc_section_read(
     let mut cum_extent = one64;
     for (dim_idx, arg) in args.iter().enumerate() {
         let dim_base = 24 + (dim_idx as i64) * 24;
-        let lo = load_array_desc_i64_field(b, info.addr, dim_base);
-        let up = load_array_desc_i64_field(b, info.addr, dim_base + 8);
-        let mem_stride = load_array_desc_i64_field(b, info.addr, dim_base + 16);
+        let lo = load_array_desc_i64_field(b, desc_ptr, dim_base);
+        let up = load_array_desc_i64_field(b, desc_ptr, dim_base + 8);
+        let mem_stride = load_array_desc_i64_field(b, desc_ptr, dim_base + 16);
         let span = b.isub(up, lo);
         let extent_raw = b.iadd(span, one64);
         let is_empty = b.icmp(CmpOp::Lt, up, lo);
@@ -21346,16 +21657,25 @@ pub(super) fn lower_alloc_section_read(
 
         b.set_block(bodies[d]);
         if d == 0 {
-            let dim_data: Vec<(ValueId, ValueId, ValueId, ValueId)> = dims
+            // Ignore the descriptor's per-dim mem_stride: it is already
+            // pre-multiplied with extent products by descriptor
+            // materialization, so combining it with cum_extent_d would
+            // double-count. The canonical IR convention (see
+            // compute_flat_elem_offset's descriptor branch) is "extent
+            // product only" — matches both allocatables (stride=1) and
+            // assumed-shape dummies fed from fixed-shape callers. Without
+            // this fix (lost from commit 4986129 in the lower.rs split),
+            // descriptor-routed section reads compute the wrong offset and
+            // either read garbage, SEGV, or both.
+            let dim_data: Vec<(ValueId, ValueId, ValueId)> = dims
                 .iter()
-                .map(|dim| (dim.counter, dim.lower_bound, dim.mem_stride, dim.cum_extent))
+                .map(|dim| (dim.counter, dim.lower_bound, dim.cum_extent))
                 .collect();
             let mut elem_offset: Option<ValueId> = None;
-            for (counter, lower_bound, mem_stride, cum_extent_d) in dim_data {
+            for (counter, lower_bound, cum_extent_d) in dim_data {
                 let cnt = b.load(counter);
                 let adjusted = b.isub(cnt, lower_bound);
-                let scaled = b.imul(adjusted, cum_extent_d);
-                let term = b.imul(scaled, mem_stride);
+                let term = b.imul(adjusted, cum_extent_d);
                 elem_offset = Some(match elem_offset {
                     Some(prev) => b.iadd(prev, term),
                     None => term,
@@ -21623,6 +21943,220 @@ pub(super) fn lower_section_write_nd(
 
     // The final current block must be exits[outer] so subsequent
     // statement lowering continues after the section loop.
+    b.set_block(exits[outer]);
+}
+
+/// Descriptor-driven counterpart to `lower_section_write_nd`. For
+/// assumed-shape dummies (`real, intent(in) :: d(:,:)`) and
+/// allocatables, declared bounds in `info.dims` are zero-extent
+/// placeholders — iterating them emits no values and the caller
+/// silently produces empty rows. Read lower bound, upper bound,
+/// and per-dim memory stride from the runtime descriptor instead
+/// so every element of the section is actually written. Lost in
+/// the lower.rs split (orig fix 4986129); reinstated here.
+pub(super) fn lower_alloc_section_write_nd(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    info: &LocalInfo,
+    args: &[crate::ast::expr::Argument],
+    unit: ValueId,
+) {
+    use crate::ast::expr::SectionSubscript;
+
+    struct DimSlice {
+        counter: ValueId,
+        start_val: ValueId,
+        end_val: ValueId,
+        stride_val: ValueId,
+        const_stride: Option<i64>,
+        lower_bound: ValueId,
+        cum_extent: ValueId,
+    }
+
+    let elem_bytes = ir_scalar_byte_size(&info.ty);
+    let base = array_base_addr(b, info);
+    let desc_ptr = array_descriptor_addr(b, info);
+    let one64 = b.const_i64(1);
+    let zero64 = b.const_i64(0);
+    let is_complex_elem = matches!(
+        &info.ty,
+        IrType::Array(inner, 2) if matches!(inner.as_ref(), IrType::Float(_))
+    );
+    let complex_lane_f64 = matches!(
+        &info.ty,
+        IrType::Array(inner, 2) if matches!(inner.as_ref(), IrType::Float(FloatWidth::F64))
+    );
+    let char_fixed_len: Option<i64> = match info.char_kind {
+        CharKind::Fixed(n) => Some(n),
+        _ => None,
+    };
+    let writer = match &info.ty {
+        _ if char_fixed_len.is_some() => "afs_write_string",
+        _ if is_complex_elem && complex_lane_f64 => "afs_write_complex_f64",
+        _ if is_complex_elem => "afs_write_complex_f32",
+        IrType::Int(IntWidth::I128) => "afs_write_int128",
+        IrType::Int(IntWidth::I64) => "afs_write_int64",
+        IrType::Int(_) => "afs_write_int",
+        IrType::Float(FloatWidth::F64) => "afs_write_real64",
+        IrType::Float(_) => "afs_write_real",
+        IrType::Bool => "afs_write_logical",
+        _ => "afs_write_int",
+    };
+
+    let mut dims: Vec<DimSlice> = Vec::with_capacity(args.len());
+    let mut cum_extent = one64;
+    for (dim_idx, arg) in args.iter().enumerate() {
+        let dim_base = 24 + (dim_idx as i64) * 24;
+        let lo = load_array_desc_i64_field(b, desc_ptr, dim_base);
+        let up = load_array_desc_i64_field(b, desc_ptr, dim_base + 8);
+        let span = b.isub(up, lo);
+        let extent_raw = b.iadd(span, one64);
+        let is_empty = b.icmp(CmpOp::Lt, up, lo);
+        let extent = b.select(is_empty, zero64, extent_raw);
+        let (start_val, end_val, stride_val, const_stride) = match &arg.value {
+            SectionSubscript::Range { start, end, stride } => {
+                let start_v = match start {
+                    Some(e) => {
+                        let raw = super::expr::lower_expr_ctx(b, ctx, e);
+                        widen_idx_to_i64(b, raw)
+                    }
+                    None => lo,
+                };
+                let end_v = match end {
+                    Some(e) => {
+                        let raw = super::expr::lower_expr_ctx(b, ctx, e);
+                        widen_idx_to_i64(b, raw)
+                    }
+                    None => up,
+                };
+                let stride_v = match stride {
+                    Some(e) => {
+                        let raw = super::expr::lower_expr_ctx(b, ctx, e);
+                        widen_idx_to_i64(b, raw)
+                    }
+                    None => one64,
+                };
+                let cs = stride.as_ref().and_then(eval_const_int);
+                (start_v, end_v, stride_v, cs)
+            }
+            SectionSubscript::Element(e) => {
+                let raw = super::expr::lower_expr_ctx(b, ctx, e);
+                let val = widen_idx_to_i64(b, raw);
+                (val, val, one64, Some(1))
+            }
+        };
+        let counter = b.alloca(IrType::Int(IntWidth::I64));
+        b.store(start_val, counter);
+        dims.push(DimSlice {
+            counter,
+            start_val,
+            end_val,
+            stride_val,
+            const_stride,
+            lower_bound: lo,
+            cum_extent,
+        });
+        cum_extent = b.imul(cum_extent, extent);
+    }
+
+    let n = dims.len();
+    let mut checks: Vec<BlockId> = Vec::with_capacity(n);
+    let mut bodies: Vec<BlockId> = Vec::with_capacity(n);
+    let mut incrs: Vec<BlockId> = Vec::with_capacity(n);
+    let mut exits: Vec<BlockId> = Vec::with_capacity(n);
+    for d in 0..n {
+        checks.push(b.create_block(&format!("secw_dyn_check_d{}", d)));
+        bodies.push(b.create_block(&format!("secw_dyn_body_d{}", d)));
+        incrs.push(b.create_block(&format!("secw_dyn_incr_d{}", d)));
+        exits.push(b.create_block(&format!("secw_dyn_exit_d{}", d)));
+    }
+
+    let outer = n - 1;
+    b.branch(checks[outer], vec![]);
+
+    for d_rev in 0..n {
+        let d = n - 1 - d_rev;
+
+        b.set_block(checks[d]);
+        let cur = b.load(dims[d].counter);
+        if let Some(sv) = dims[d].const_stride {
+            let done_op = if sv < 0 { CmpOp::Lt } else { CmpOp::Gt };
+            let done = b.icmp(done_op, cur, dims[d].end_val);
+            b.cond_branch(done, exits[d], vec![], bodies[d], vec![]);
+        } else {
+            let stride_neg = b.icmp(CmpOp::Lt, dims[d].stride_val, zero64);
+            let bb_neg = b.create_block(&format!("secw_dyn_neg_d{}", d));
+            let bb_pos = b.create_block(&format!("secw_dyn_pos_d{}", d));
+            b.cond_branch(stride_neg, bb_neg, vec![], bb_pos, vec![]);
+
+            b.set_block(bb_neg);
+            let done_neg = b.icmp(CmpOp::Lt, cur, dims[d].end_val);
+            b.cond_branch(done_neg, exits[d], vec![], bodies[d], vec![]);
+
+            b.set_block(bb_pos);
+            let done_pos = b.icmp(CmpOp::Gt, cur, dims[d].end_val);
+            b.cond_branch(done_pos, exits[d], vec![], bodies[d], vec![]);
+        }
+
+        b.set_block(bodies[d]);
+        if d == 0 {
+            let dim_data: Vec<(ValueId, ValueId, ValueId)> = dims
+                .iter()
+                .map(|dim| (dim.counter, dim.lower_bound, dim.cum_extent))
+                .collect();
+            let mut elem_offset: Option<ValueId> = None;
+            for (counter, lower_bound, cum_extent_d) in dim_data {
+                let cnt = b.load(counter);
+                let adjusted = b.isub(cnt, lower_bound);
+                let term = b.imul(adjusted, cum_extent_d);
+                elem_offset = Some(match elem_offset {
+                    Some(prev) => b.iadd(prev, term),
+                    None => term,
+                });
+            }
+            let off_elems = elem_offset.unwrap_or_else(|| b.const_i64(0));
+            let elem_bytes_v = b.const_i64(elem_bytes);
+            let byte_off = b.imul(off_elems, elem_bytes_v);
+            let p = b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
+            if let Some(len) = char_fixed_len {
+                let len_v = b.const_i64(len);
+                b.call(
+                    FuncRef::External(writer.into()),
+                    vec![unit, p, len_v],
+                    IrType::Void,
+                );
+            } else if is_complex_elem {
+                b.call(
+                    FuncRef::External(writer.into()),
+                    vec![unit, p],
+                    IrType::Void,
+                );
+            } else {
+                let elem = b.load_typed(p, info.ty.clone());
+                b.call(
+                    FuncRef::External(writer.into()),
+                    vec![unit, elem],
+                    IrType::Void,
+                );
+            }
+            b.branch(incrs[0], vec![]);
+        } else {
+            b.store(dims[d - 1].start_val, dims[d - 1].counter);
+            b.branch(checks[d - 1], vec![]);
+        }
+
+        b.set_block(incrs[d]);
+        let cur2 = b.load(dims[d].counter);
+        let next = b.iadd(cur2, dims[d].stride_val);
+        b.store(next, dims[d].counter);
+        b.branch(checks[d], vec![]);
+
+        b.set_block(exits[d]);
+        if d < n - 1 {
+            b.branch(incrs[d + 1], vec![]);
+        }
+    }
+
     b.set_block(exits[outer]);
 }
 

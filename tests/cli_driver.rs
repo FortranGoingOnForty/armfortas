@@ -540,6 +540,221 @@ fn stream_unformatted_char_write_preserves_exact_bytes() {
 }
 
 #[test]
+fn sequential_unformatted_write_emits_record_markers_and_clears_iostat() {
+    let output_file = unique_path("seq_unformatted_iostat", "bin");
+    let src = write_program(
+        &format!(
+            "program p\n  implicit none\n  integer :: ios = -1\n  character(64) :: msg = 'sentinel'\n  integer :: x = 42\n  open(unit=10, file='{}', status='replace', form='unformatted', action='write')\n  write(10, iostat=ios, iomsg=msg) x\n  write(*, '(a,i0)') 'IOS=', ios\n  write(*, '(a,a)') 'MSG=', trim(msg)\n  close(10)\nend program\n",
+            output_file.display()
+        ),
+        "seq_unformatted_iostat.f90",
+    );
+    let out = unique_path("seq_unformatted_iostat", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("seq unformatted iostat compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "seq unformatted iostat compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("seq unformatted iostat run failed");
+    assert!(
+        run.status.success(),
+        "seq unformatted iostat run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("IOS=0"),
+        "expected IOS=0 from successful sequential unformatted write, got: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("MSG=") && !stdout.contains("MSG=sentinel"),
+        "expected iomsg cleared on success, got: {}",
+        stdout
+    );
+
+    let bytes = std::fs::read(&output_file).expect("cannot read seq unformatted output");
+    // gfortran sequential-unformatted record framing: [u32 len][data][u32 len].
+    // For one i32 (42 = 0x2a), that's 4 bytes of length + 4 bytes of data
+    // + 4 bytes of trailing length = 12 bytes total.
+    assert_eq!(
+        bytes,
+        vec![
+            0x04, 0x00, 0x00, 0x00, 0x2a, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
+        ],
+        "expected sequential-unformatted record framing, got {:?}",
+        bytes
+    );
+
+    let _ = std::fs::remove_file(&output_file);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn sequential_unformatted_roundtrip_recovers_three_integers() {
+    let bin = unique_path("seq_unformatted_roundtrip", "bin");
+    let src = write_program(
+        &format!(
+            "program p\n  implicit none\n  integer :: ios\n  integer :: a, b, c\n  a = 7; b = 11; c = 13\n  open(unit=11, file='{}', status='replace', form='unformatted', action='write')\n  write(11) a, b, c\n  close(11)\n  open(unit=11, file='{}', status='old', form='unformatted', action='read')\n  a = 0; b = 0; c = 0\n  read(11, iostat=ios) a, b, c\n  write(*, '(a,i0)') 'IOS=', ios\n  write(*, '(a,i0,a,i0,a,i0)') 'A=', a, ' B=', b, ' C=', c\n  close(11)\nend program\n",
+            bin.display(),
+            bin.display()
+        ),
+        "seq_unformatted_roundtrip.f90",
+    );
+    let out = unique_path("seq_unformatted_roundtrip", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("seq unformatted roundtrip compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "seq unformatted roundtrip compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("seq unformatted roundtrip run failed");
+    assert!(
+        run.status.success(),
+        "seq unformatted roundtrip run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("IOS=0"),
+        "expected IOS=0 from successful unformatted read, got: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("A=7 B=11 C=13"),
+        "expected the three values to round-trip cleanly, got: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&bin);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn runtime_advance_no_via_optval_suppresses_newline_in_formatted_write() {
+    // Stdlib bitsets `write_bitset_unit_64` calls `write(unit,'(A)',
+    // advance=optval(advance,'YES'),...) string`. Because optval is
+    // not a string literal, the prior lowering ignored the advance=
+    // expression entirely and always emitted a newline, corrupting
+    // the file format. Verify a non-literal advance= now suppresses
+    // the newline at runtime.
+    let output_file = unique_path("runtime_advance_no_optval", "txt");
+    let src = write_program(
+        &format!(
+            "module m\ncontains\n  subroutine emit(unit, adv)\n    integer, intent(in) :: unit\n    character(*), intent(in), optional :: adv\n    character(:), allocatable :: a\n    if (present(adv)) then\n      a = adv\n    else\n      a = 'YES'\n    end if\n    write(unit, '(a)', advance=a) 'XYZ'\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  integer :: unit\n  open(newunit=unit, file='{}', status='replace', form='formatted', action='write')\n  call emit(unit, 'no')\n  call emit(unit, 'no')\n  call emit(unit)\n  close(unit)\nend program\n",
+            output_file.display()
+        ),
+        "runtime_advance_no_optval.f90",
+    );
+    let out = unique_path("runtime_advance_no_optval", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("runtime advance compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "runtime advance compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("runtime advance run failed");
+    assert!(
+        run.status.success(),
+        "runtime advance run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let bytes = std::fs::read(&output_file).expect("cannot read advance output file");
+    assert_eq!(
+        bytes, b"XYZXYZXYZ\n",
+        "expected non-literal advance='no' to suppress newlines, got {:?}",
+        bytes
+    );
+
+    let _ = std::fs::remove_file(&output_file);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn advancing_a1_read_consumes_in_flight_noadvance_cursor() {
+    // After a `read(...,advance='NO',FMT='(A1)')` consumes part of a
+    // record, an immediately-following advancing read on the same
+    // record (e.g. `advance=optval(adv,'YES')` where optval returns
+    // 'YES') needs to pick up at the saved cursor — not call
+    // `read_line` and discard it. stdlib's `read_bitset_unit_64`
+    // hits this on its final-bit read; without the runtime fix the
+    // example errors with "Failure on read of UNIT".
+    let bin_in = unique_path("a1_advance_after_noadvance", "txt");
+    std::fs::write(&bin_in, b"AB\n").expect("cannot write a1 input");
+    let src = write_program(
+        &format!(
+            "program p\n  implicit none\n  integer :: unit, ierr\n  character(64) :: msg\n  character(len=1) :: ch\n  open(newunit=unit, file='{}', status='old', form='formatted', action='read')\n  read(unit, advance='no', fmt='(a1)', iostat=ierr, iomsg=msg) ch\n  write(*, '(a,i0,a,a)') '1 ierr=', ierr, ' ch=', ch\n  read(unit, advance='yes', fmt='(a1)', iostat=ierr, iomsg=msg) ch\n  write(*, '(a,i0,a,a)') '2 ierr=', ierr, ' ch=', ch\n  close(unit)\nend program\n",
+            bin_in.display()
+        ),
+        "a1_advance_after_noadvance.f90",
+    );
+    let out = unique_path("a1_advance_after_noadvance", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("a1 advance compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "a1 advance compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("a1 advance run failed");
+    assert!(
+        run.status.success(),
+        "a1 advance run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("1 ierr=0 ch=A"),
+        "expected first noadvance read to capture 'A', got: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("2 ierr=0 ch=B"),
+        "expected advancing read to capture 'B' from in-flight record, got: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&bin_in);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn repeated_nonadvancing_a1_read_preserves_embedded_nul_bytes() {
     let input = unique_path("nonadvancing_a1_char_read", "bin");
     std::fs::write(&input, b"A\0B").expect("cannot write nonadvancing A1 input");
@@ -18219,6 +18434,316 @@ fn formatted_write_of_concat_with_internal_char_function_runs() {
 
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn formatted_section_write_iterates_assumed_shape_dummy_section() {
+    // Regression: the descriptor-driven section iterator was lost in
+    // the lower.rs split (orig fix 4986129). Without it, a write of a
+    // multi-dim section through an assumed-shape dummy
+    // `real, intent(in) :: d(:,:)` saw `info.dims` empty and emitted
+    // zero loop iterations, so stdlib's savetxt produced files of
+    // bare newlines and example_savetxt looked like it succeeded but
+    // wrote no data. Verify a module routine with d(i,:) now writes
+    // each row's elements.
+    let src = write_program(
+        "module mio\n  implicit none\ncontains\n  subroutine save_d(filename, d)\n    character(len=*), intent(in) :: filename\n    real, intent(in) :: d(:, :)\n    integer :: i, ios, unit\n    character(len=64) :: iomsg\n    character(len=:), allocatable :: fmt_\n    fmt_ = '(*(es10.3,1x))'\n    open(newunit=unit, file=filename, status='replace')\n    do i = 1, size(d, 1)\n      write(unit, fmt_, iostat=ios, iomsg=iomsg) d(i, :)\n      if (ios /= 0) error stop 'inner write failed'\n    end do\n    close(unit)\n  end subroutine\nend module\n\nprogram p\n  use mio\n  implicit none\n  real :: x(3, 2)\n  x = reshape([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], shape=[3, 2])\n  call save_d('/tmp/afs_section_dummy.dat', x)\n  print *, 'DONE'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("section_dummy_write", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("section dummy compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "section dummy should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "section dummy should run cleanly: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("DONE"),
+        "expected DONE in output: {}",
+        stdout
+    );
+    let written = std::fs::read_to_string("/tmp/afs_section_dummy.dat")
+        .expect("output file should exist");
+    assert!(
+        written.contains("1.000E+00") && written.contains("6.000E+00"),
+        "expected real elements in written file: {}",
+        written
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file("/tmp/afs_section_dummy.dat");
+}
+
+#[test]
+fn error_stop_with_character_message_prints_user_text_to_stderr() {
+    // Regression: lower_stmt's Stmt::ErrorStop arm threw the stop-code
+    // expression away and called afs_error_stop() (no-arg, prints just
+    // "ERROR STOP"). stdlib's sort_adjoint / sort_index / linalg state
+    // and many other diagnostics relied on the user-supplied character
+    // message making it to stderr per F2018 §11.4. Verify the message
+    // is now passed through.
+    let src = write_program(
+        "program p\n  implicit none\n  error stop 'sentinel-msg-12345'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("error_stop_msg", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("error stop compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "error stop should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        !run.status.success(),
+        "error stop should exit nonzero: status={:?}",
+        run.status
+    );
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        stderr.contains("sentinel-msg-12345"),
+        "expected user message in stderr, got: {}",
+        stderr
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn error_stop_with_integer_code_uses_code_as_exit_status() {
+    // F2018 §11.4: integer stop-code becomes the exit status (clamped
+    // to 1..=255 for Unix).  Verify `error stop 42` exits with 42 and
+    // prints "ERROR STOP 42".
+    let src = write_program(
+        "program p\n  implicit none\n  error stop 42\nend program\n",
+        "f90",
+    );
+    let out = unique_path("error_stop_int", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("error stop int compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "error stop int should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert_eq!(
+        run.status.code(),
+        Some(42),
+        "expected exit code 42, got {:?}",
+        run.status
+    );
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        stderr.contains("ERROR STOP") && stderr.contains("42"),
+        "expected ERROR STOP 42 in stderr, got: {}",
+        stderr
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn formatted_section_read_iterates_allocatable_dummy_section() {
+    // Regression: stdlib's loadtxt allocates an `intent(out)` rank-2
+    // allocatable inside the subroutine and reads each row via
+    // `read(u, fmt_, iostat=ios) d(i, :)`. Two bugs combined to silently
+    // fill the destination with zeros: (1) the dispatch in
+    // lower_array_read_item only routed through lower_alloc_section_read
+    // when info.allocatable was set, missing assumed-shape dummies that
+    // also use the descriptor (info.descriptor_arg). (2) The descriptor-
+    // driven offset computation multiplied by both cum_extent AND
+    // mem_stride, double-counting the per-dim stride that descriptor
+    // materialization had already folded into the extent product (lost
+    // fix from 4986129).  Verify a 2-D allocatable populated row-by-row
+    // through a dummy section now contains the correct values.
+    let src = write_program(
+        "module mio\n  implicit none\ncontains\n  subroutine load_d(filename, d)\n    character(len=*), intent(in) :: filename\n    real, allocatable, intent(out) :: d(:, :)\n    integer :: i, ios, u\n    character(len=128) :: iomsg\n    character(len=:), allocatable :: fmt_\n    fmt_ = '(*(es15.8,:,1x))'\n    allocate(d(3, 2))\n    open(newunit=u, file=filename, status='old')\n    do i = 1, 3\n      read(u, fmt_, iostat=ios, iomsg=iomsg) d(i, :)\n      if (ios /= 0) error stop 'inner read failed'\n    end do\n    close(u)\n  end subroutine\nend module\n\nprogram p\n  use mio\n  implicit none\n  real, allocatable :: x(:, :)\n  open(unit=20, file='/tmp/afs_section_dummy_read.dat', status='replace')\n  write(20, '(A)') ' 1.00000000E+00  4.00000000E+00'\n  write(20, '(A)') ' 2.00000000E+00  5.00000000E+00'\n  write(20, '(A)') ' 3.00000000E+00  6.00000000E+00'\n  close(20)\n  call load_d('/tmp/afs_section_dummy_read.dat', x)\n  if (.not. allocated(x)) error stop 1\n  if (abs(x(1,1) - 1.0) > 1e-6) error stop 2\n  if (abs(x(3,2) - 6.0) > 1e-6) error stop 3\n  print *, 'DONE'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("section_dummy_read", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("section dummy read compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "section dummy read should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "section dummy read should run cleanly: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("DONE"),
+        "expected DONE in output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file("/tmp/afs_section_dummy_read.dat");
+}
+
+#[test]
+fn list_directed_read_unit_real_returns_correct_f32_value() {
+    // Regression: lower_read_into_addr's IrType::Float(F32) arm allocated
+    // an f64 temp and called afs_read_real (the f32 entry, *mut f32) on
+    // it. The runtime wrote 4 bytes of f32 into the 8-byte alloca and the
+    // subsequent f64 load + float_trunc to f32 returned 0.0 for every
+    // input. stdlib's loadtxt_rsp main `read(s, fmt_, iostat=ios) d(i,:)`
+    // for a `real, allocatable :: d(:,:)` therefore hit error_stop with
+    // ios=0 but data=zeros.  Verify a unit read of a real(4) value now
+    // returns the actual value.
+    let src = write_program(
+        "program p\n  implicit none\n  real :: x, y\n  open(unit=10, file='/tmp/afs_real_read.txt', status='replace')\n  write(10, '(A)') ' 1.5  2.5'\n  close(10)\n  open(unit=11, file='/tmp/afs_real_read.txt', status='old')\n  read(11, *) x, y\n  close(11)\n  if (abs(x - 1.5) > 1e-6) then\n    print *, 'x wrong:', x\n    error stop 1\n  end if\n  if (abs(y - 2.5) > 1e-6) then\n    print *, 'y wrong:', y\n    error stop 2\n  end if\n  print *, 'real read OK'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("real_read_unit", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("real read compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "real read should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "real read should run cleanly: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("real read OK"),
+        "expected real read OK in output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file("/tmp/afs_real_read.txt");
+}
+
+#[test]
+fn list_directed_read_with_no_items_advances_one_record_and_sets_eof_iostat() {
+    // Regression: `read(unit, *, iostat=ios)` with no items used to be
+    // a silent no-op — neither the file position nor iostat was
+    // touched, so stdlib's number_of_rows loop
+    //   do { read(s, *, iostat=ios); if (ios /= 0) exit; n = n+1; end }
+    // spun forever and example_loadtxt timed out. Verify the read now
+    // consumes one record per call and sets iostat at EOF.
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: ios, n\n  open(unit=10, file='/tmp/afs_skip_record_in.txt', status='replace')\n  write(10, '(A)') 'a'\n  write(10, '(A)') 'b'\n  write(10, '(A)') 'c'\n  close(10)\n  open(unit=11, file='/tmp/afs_skip_record_in.txt', status='old')\n  n = 0\n  do\n    read(11, *, iostat=ios)\n    if (ios /= 0) exit\n    n = n + 1\n    if (n > 100) error stop 'runaway'\n  end do\n  close(11)\n  print *, 'rows=', n\nend program\n",
+        "f90",
+    );
+    let out = unique_path("list_skip_record", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("skip-record compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "skip-record should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "skip-record should run cleanly: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("rows=") && stdout.contains("3"),
+        "expected rows=3 in output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file("/tmp/afs_skip_record_in.txt");
+}
+
+#[test]
+fn formatted_write_sets_iostat_zero_on_success_for_scalar_and_array() {
+    // Regression: afs_fmt_begin / afs_fmt_end never wrote the
+    // iostat= specifier on success, so a caller's
+    // `if (ios /= 0) error_stop` always tripped on the pre-call
+    // sentinel.  stdlib's savetxt loops exactly that pattern around
+    // `write(unit, fmt_, iostat=ios) d(i,:)` and therefore
+    // unconditionally error_stop'd every example_savetxt and
+    // example_loadtxt regardless of whether the file write itself
+    // succeeded. Verify both scalar and whole-array formatted writes
+    // now leave ios=0 after a successful run.
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: ios = -1\n  character(len=64) :: msg = 'sentinel'\n  open(unit=10, file='/tmp/afs_iostat_test.txt', status='replace')\n  write(10, '(I0)', iostat=ios, iomsg=msg) 42\n  if (ios /= 0) then\n    print *, 'scalar fail ios=', ios\n    error stop 1\n  end if\n  write(10, '(*(I0,1x))', iostat=ios, iomsg=msg) [1, 2, 3]\n  if (ios /= 0) then\n    print *, 'array fail ios=', ios\n    error stop 2\n  end if\n  close(10)\n  print *, 'iostat OK'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("formatted_iostat_zero", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("formatted iostat compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "formatted iostat should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "formatted iostat should run cleanly: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("iostat OK"),
+        "expected iostat OK in output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file("/tmp/afs_iostat_test.txt");
 }
 
 #[test]

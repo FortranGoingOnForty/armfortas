@@ -110,11 +110,50 @@ struct Unit {
     formatted_read_cursor: usize,
     /// True for STATUS='SCRATCH' units: backing file is deleted on close or exit.
     scratch: bool,
+    /// In-flight sequential-unformatted record buffer. Set by
+    /// `afs_list_write_begin` and drained by `afs_list_write_end`.
+    /// While Some, list-directed write helpers append raw bytes here
+    /// instead of writing ASCII or directly to the file stream — the
+    /// whole statement materializes as one record [len][data][len].
+    pending_record: Option<Vec<u8>>,
+    /// In-flight sequential-unformatted record being consumed by a
+    /// list-directed READ statement. Set by `afs_list_read_begin`
+    /// (which reads a full [len][data][len] record into memory) and
+    /// cleared by `afs_list_read_end`. The cursor tracks how many
+    /// bytes the per-item helpers have consumed so far.
+    pending_read: Option<(Vec<u8>, usize)>,
 }
 
 impl Unit {
-    fn is_stream_unformatted(&self) -> bool {
-        self.form == Form::Unformatted && self.access == Access::Stream
+    fn is_unformatted(&self) -> bool {
+        self.form == Form::Unformatted
+    }
+
+    /// Append raw bytes to the in-flight unformatted record buffer if
+    /// one is open, otherwise write directly to the stream. Returns
+    /// `true` when bytes were buffered.
+    fn raw_or_buffer(&mut self, bytes: &[u8]) -> bool {
+        if let Some(buf) = self.pending_record.as_mut() {
+            buf.extend_from_slice(bytes);
+            true
+        } else {
+            let _ = self.write_raw(bytes);
+            false
+        }
+    }
+
+    /// Consume `n` bytes from the in-flight unformatted read record
+    /// (advancing the cursor). Returns `Some(slice)` when the record
+    /// has enough bytes; `None` when the record is exhausted, when no
+    /// pending record is open, or when fewer than `n` bytes remain.
+    fn read_buffer_take(&mut self, n: usize) -> Option<Vec<u8>> {
+        let (buf, cur) = self.pending_read.as_mut()?;
+        if *cur + n > buf.len() {
+            return None;
+        }
+        let out = buf[*cur..*cur + n].to_vec();
+        *cur += n;
+        Some(out)
     }
 
     fn write_bytes(&mut self, data: &[u8]) -> io::Result<()> {
@@ -243,6 +282,8 @@ impl IoState {
                 formatted_read_record: None,
                 formatted_read_cursor: 0,
                 scratch: false,
+                pending_record: None,
+                pending_read: None,
             },
         );
         units.insert(
@@ -260,6 +301,8 @@ impl IoState {
                 formatted_read_record: None,
                 formatted_read_cursor: 0,
                 scratch: false,
+                pending_record: None,
+                pending_read: None,
             },
         );
         units.insert(
@@ -277,6 +320,8 @@ impl IoState {
                 formatted_read_record: None,
                 formatted_read_cursor: 0,
                 scratch: false,
+                pending_record: None,
+                pending_read: None,
             },
         );
 
@@ -573,6 +618,8 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
                     formatted_read_record: None,
                     formatted_read_cursor: 0,
                     scratch: is_scratch,
+                    pending_record: None,
+                    pending_read: None,
                 },
             );
 
@@ -695,8 +742,8 @@ pub extern "C" fn afs_close_ex(unit: i32, status: *const u8, status_len: i64, io
 pub extern "C" fn afs_write_int(unit: i32, val: i32) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
-        if u.is_stream_unformatted() {
-            let _ = u.write_raw(&val.to_ne_bytes());
+        if u.is_unformatted() {
+            u.raw_or_buffer(&val.to_ne_bytes());
         } else {
             let _ = u.write_str(&format!(" {}", val));
         }
@@ -708,8 +755,8 @@ pub extern "C" fn afs_write_int(unit: i32, val: i32) {
 pub extern "C" fn afs_write_int64(unit: i32, val: i64) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
-        if u.is_stream_unformatted() {
-            let _ = u.write_raw(&val.to_ne_bytes());
+        if u.is_unformatted() {
+            u.raw_or_buffer(&val.to_ne_bytes());
         } else {
             let _ = u.write_str(&format!(" {}", val));
         }
@@ -721,8 +768,8 @@ pub extern "C" fn afs_write_int64(unit: i32, val: i64) {
 pub extern "C" fn afs_write_int128(unit: i32, val: i128) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
-        if u.is_stream_unformatted() {
-            let _ = u.write_raw(&val.to_ne_bytes());
+        if u.is_unformatted() {
+            u.raw_or_buffer(&val.to_ne_bytes());
         } else {
             let _ = u.write_str(&format!(" {}", val));
         }
@@ -734,8 +781,8 @@ pub extern "C" fn afs_write_int128(unit: i32, val: i128) {
 pub extern "C" fn afs_write_real(unit: i32, val: f32) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
-        if u.is_stream_unformatted() {
-            let _ = u.write_raw(&val.to_ne_bytes());
+        if u.is_unformatted() {
+            u.raw_or_buffer(&val.to_ne_bytes());
         } else {
             let _ = u.write_str(&format!("  {:14.7E}", val));
         }
@@ -747,8 +794,8 @@ pub extern "C" fn afs_write_real(unit: i32, val: f32) {
 pub extern "C" fn afs_write_real64(unit: i32, val: f64) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
-        if u.is_stream_unformatted() {
-            let _ = u.write_raw(&val.to_ne_bytes());
+        if u.is_unformatted() {
+            u.raw_or_buffer(&val.to_ne_bytes());
         } else {
             let _ = u.write_str(&format!("  {:22.15E}", val));
         }
@@ -762,9 +809,9 @@ pub extern "C" fn afs_write_complex_f32(unit: i32, ptr: *const f32) {
     let (re, im) = unsafe { (*ptr, *ptr.add(1)) };
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
-        if u.is_stream_unformatted() {
-            let _ = u.write_raw(&re.to_ne_bytes());
-            let _ = u.write_raw(&im.to_ne_bytes());
+        if u.is_unformatted() {
+            u.raw_or_buffer(&re.to_ne_bytes());
+            u.raw_or_buffer(&im.to_ne_bytes());
         } else {
             let _ = u.write_str(&format!(" ({:14.7E},{:14.7E})", re, im));
         }
@@ -778,9 +825,9 @@ pub extern "C" fn afs_write_complex_f64(unit: i32, ptr: *const f64) {
     let (re, im) = unsafe { (*ptr, *ptr.add(1)) };
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
-        if u.is_stream_unformatted() {
-            let _ = u.write_raw(&re.to_ne_bytes());
-            let _ = u.write_raw(&im.to_ne_bytes());
+        if u.is_unformatted() {
+            u.raw_or_buffer(&re.to_ne_bytes());
+            u.raw_or_buffer(&im.to_ne_bytes());
         } else {
             let _ = u.write_str(&format!(" ({:22.15E},{:22.15E})", re, im));
         }
@@ -792,10 +839,10 @@ pub extern "C" fn afs_write_complex_f64(unit: i32, ptr: *const f64) {
 pub extern "C" fn afs_write_string(unit: i32, ptr: *const u8, len: i64) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
-        if u.is_stream_unformatted() {
+        if u.is_unformatted() {
             if !ptr.is_null() && len > 0 {
                 let slice = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
-                let _ = u.write_raw(slice);
+                u.raw_or_buffer(slice);
             }
         } else {
             let _ = u.write_str(" ");
@@ -812,8 +859,8 @@ pub extern "C" fn afs_write_string(unit: i32, ptr: *const u8, len: i64) {
 pub extern "C" fn afs_write_logical(unit: i32, val: i32) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
-        if u.is_stream_unformatted() {
-            let _ = u.write_raw(&val.to_ne_bytes());
+        if u.is_unformatted() {
+            u.raw_or_buffer(&val.to_ne_bytes());
         } else {
             let _ = u.write_str(if val != 0 { " T" } else { " F" });
         }
@@ -825,12 +872,172 @@ pub extern "C" fn afs_write_logical(unit: i32, val: i32) {
 pub extern "C" fn afs_write_newline(unit: i32) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
-        if u.is_stream_unformatted() {
+        if u.is_unformatted() {
+            // Sequential unformatted: a pending record buffer means
+            // afs_list_write_end was not called — flush nothing here.
+            // Stream unformatted has no record terminator.
             let _ = u.flush();
             return;
         }
         let _ = u.write_str("\n");
         let _ = u.flush();
+    }
+}
+
+/// Like `afs_write_newline` but no-ops when `advance == 0`. The
+/// lowering uses this when `advance=` is a runtime-evaluated string
+/// (e.g. `advance=optval(adv, 'YES')`) — `advance` is precomputed by
+/// `afs_advance_eval` to 0 (no advance) or 1 (advance).
+#[no_mangle]
+pub extern "C" fn afs_write_newline_if(unit: i32, advance: i32) {
+    if advance == 0 {
+        let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(u) = state.get_unit(unit) {
+            let _ = u.flush();
+        }
+        return;
+    }
+    afs_write_newline(unit);
+}
+
+/// Evaluate an `advance=` string at runtime. Returns 0 when the
+/// trimmed, case-folded string equals "no", else 1. The lowering
+/// uses this for non-literal advance expressions so that
+/// `advance=optval(adv, 'YES')` produces the correct behavior
+/// (current lowering only honors string-literal advance values).
+#[no_mangle]
+pub extern "C" fn afs_advance_eval(ptr: *const u8, len: i64) -> i32 {
+    if ptr.is_null() || len <= 0 {
+        return 1;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+    let s = std::str::from_utf8(bytes).unwrap_or("");
+    if s.trim().eq_ignore_ascii_case("no") {
+        0
+    } else {
+        1
+    }
+}
+
+/// Read a formatted character item with runtime advance dispatch.
+/// `advance == 0` selects the non-advancing path
+/// (`afs_fmt_read_string_noadvance`); any other value uses
+/// `afs_fmt_read_string` which advances past the record. Used by the
+/// lowering when `advance=` is a non-literal expression and the bool
+/// path can't be statically chosen.
+#[no_mangle]
+pub extern "C" fn afs_fmt_read_string_dyn(
+    unit: i32,
+    fmt_str: *const u8,
+    fmt_len: i64,
+    data_index: i64,
+    dest: *mut u8,
+    dest_len: i64,
+    size_out: *mut i32,
+    iostat: *mut i32,
+    advance: i32,
+) {
+    if advance == 0 {
+        afs_fmt_read_string_noadvance(unit, fmt_str, fmt_len, dest, dest_len, size_out, iostat);
+    } else {
+        afs_fmt_read_string(
+            unit, fmt_str, fmt_len, data_index, dest, dest_len, size_out, iostat,
+        );
+    }
+}
+
+/// Begin a list-directed write statement. Mandatory before the first
+/// per-item helper when iostat=/iomsg= are requested or when the unit
+/// might be sequential-unformatted (which needs record-buffered emit).
+///
+/// For formatted units this only resets iostat. For sequential
+/// unformatted units it opens a fresh per-statement record buffer that
+/// the per-item helpers will append into. Stream-unformatted units skip
+/// the buffer (each helper writes raw bytes directly).
+#[no_mangle]
+pub extern "C" fn afs_list_write_begin(
+    unit: i32,
+    iostat: *mut i32,
+    iomsg: *mut u8,
+    iomsg_len: i64,
+) {
+    if !iostat.is_null() {
+        unsafe {
+            *iostat = 0;
+        }
+    }
+    if !iomsg.is_null() && iomsg_len > 0 {
+        let buf = unsafe { std::slice::from_raw_parts_mut(iomsg, iomsg_len as usize) };
+        for b in buf.iter_mut() {
+            *b = b' ';
+        }
+    }
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(u) = state.get_unit(unit) {
+        if u.form == Form::Unformatted && u.access == Access::Sequential {
+            u.pending_record = Some(Vec::new());
+        }
+    } else if !iostat.is_null() {
+        unsafe {
+            *iostat = 1;
+        }
+    }
+}
+
+/// End a list-directed write statement. For sequential unformatted
+/// units this drains the per-statement record buffer and writes
+/// `[len][bytes][len]` to the stream. For formatted units the trailing
+/// newline is left to the per-item path's `afs_write_newline` so we
+/// don't double-newline; this only flushes and forwards iostat/iomsg.
+/// `advance` is accepted for symmetry with `afs_fmt_end` but is unused
+/// by the formatted path here.
+#[no_mangle]
+pub extern "C" fn afs_list_write_end(
+    unit: i32,
+    _advance: i32,
+    iostat: *mut i32,
+    iomsg: *mut u8,
+    iomsg_len: i64,
+) {
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(u) = state.get_unit(unit) else {
+        if !iostat.is_null() {
+            unsafe {
+                *iostat = 1;
+            }
+        }
+        return;
+    };
+    let mut err: Option<String> = None;
+    if let Some(buf) = u.pending_record.take() {
+        let len_bytes = (buf.len() as u32).to_ne_bytes();
+        let r1 = u.write_raw(&len_bytes);
+        let r2 = if !buf.is_empty() {
+            u.write_raw(&buf)
+        } else {
+            Ok(())
+        };
+        let r3 = u.write_raw(&len_bytes);
+        if let Err(e) = r1.or(r2).or(r3) {
+            err = Some(e.to_string());
+        }
+    }
+    let _ = u.flush();
+    if let Some(msg) = err {
+        if !iostat.is_null() {
+            unsafe {
+                *iostat = 1;
+            }
+        }
+        if !iomsg.is_null() && iomsg_len > 0 {
+            let buf = unsafe { std::slice::from_raw_parts_mut(iomsg, iomsg_len as usize) };
+            let bytes = msg.as_bytes();
+            let n = bytes.len().min(buf.len());
+            buf[..n].copy_from_slice(&bytes[..n]);
+            for b in buf[n..].iter_mut() {
+                *b = b' ';
+            }
+        }
     }
 }
 
@@ -842,6 +1049,21 @@ pub extern "C" fn afs_write_newline(unit: i32) {
 pub extern "C" fn afs_read_int(unit: i32, val: *mut i32, iostat: *mut i32) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
+        if let Some(bytes) = u.read_buffer_take(4) {
+            let mut b = [0u8; 4];
+            b.copy_from_slice(&bytes);
+            if !val.is_null() {
+                unsafe {
+                    *val = i32::from_ne_bytes(b);
+                }
+            }
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = 0;
+                }
+            }
+            return;
+        }
         match u.next_read_token() {
             Ok(Some(token)) => match token.parse::<i32>() {
                 Ok(v) => {
@@ -896,6 +1118,21 @@ pub extern "C" fn afs_read_int(unit: i32, val: *mut i32, iostat: *mut i32) {
 pub extern "C" fn afs_read_int64(unit: i32, val: *mut i64, iostat: *mut i32) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
+        if let Some(bytes) = u.read_buffer_take(8) {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&bytes);
+            if !val.is_null() {
+                unsafe {
+                    *val = i64::from_ne_bytes(b);
+                }
+            }
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = 0;
+                }
+            }
+            return;
+        }
         match u.next_read_token() {
             Ok(Some(token)) => match token.parse::<i64>() {
                 Ok(v) => {
@@ -944,6 +1181,17 @@ pub extern "C" fn afs_read_int64(unit: i32, val: *mut i64, iostat: *mut i32) {
 pub extern "C" fn afs_read_int128(unit: i32, val: *mut i128, iostat: *mut i32) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
+        if let Some(bytes) = u.read_buffer_take(16) {
+            let mut b = [0u8; 16];
+            b.copy_from_slice(&bytes);
+            write_i128_ptr(val, i128::from_ne_bytes(b));
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = 0;
+                }
+            }
+            return;
+        }
         match u.next_read_token() {
             Ok(Some(token)) => match token.parse::<i128>() {
                 Ok(v) => {
@@ -988,6 +1236,21 @@ pub extern "C" fn afs_read_int128(unit: i32, val: *mut i128, iostat: *mut i32) {
 pub extern "C" fn afs_read_real(unit: i32, val: *mut f32, iostat: *mut i32) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
+        if let Some(bytes) = u.read_buffer_take(4) {
+            let mut b = [0u8; 4];
+            b.copy_from_slice(&bytes);
+            if !val.is_null() {
+                unsafe {
+                    *val = f32::from_ne_bytes(b);
+                }
+            }
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = 0;
+                }
+            }
+            return;
+        }
         match u.next_read_token() {
             Ok(Some(token)) => {
                 // Handle Fortran D-exponent: replace D with E for parsing.
@@ -1043,6 +1306,21 @@ pub extern "C" fn afs_read_real(unit: i32, val: *mut f32, iostat: *mut i32) {
 pub extern "C" fn afs_read_real64(unit: i32, val: *mut f64, iostat: *mut i32) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
+        if let Some(bytes) = u.read_buffer_take(8) {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&bytes);
+            if !val.is_null() {
+                unsafe {
+                    *val = f64::from_ne_bytes(b);
+                }
+            }
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = 0;
+                }
+            }
+            return;
+        }
         match u.next_read_token() {
             Ok(Some(token)) => {
                 let normalized = token.replace('d', "e").replace('D', "E");
@@ -1089,11 +1367,132 @@ pub extern "C" fn afs_read_real64(unit: i32, val: *mut f64, iostat: *mut i32) {
     }
 }
 
-/// Read a character value from an external unit.
+/// Begin a list-directed READ statement. Mandatory before per-item
+/// helpers when iostat=/iomsg= are requested or when the unit may be
+/// sequential-unformatted (which needs the leading record marker
+/// consumed and the data slurped into a buffer for typed take-bytes).
 ///
-/// For formatted/list-directed units this consumes the next token. For
-/// stream-unformatted units it performs a raw byte read into the caller's
-/// fixed-length character storage.
+/// For formatted units this only resets iostat. For sequential
+/// unformatted units it reads `[u32 len][len bytes][u32 trailer]`,
+/// stashes the data in `pending_read`, and the per-item helpers will
+/// consume from there. Stream-unformatted reads continue using their
+/// existing per-helper raw-byte path.
+#[no_mangle]
+pub extern "C" fn afs_list_read_begin(
+    unit: i32,
+    iostat: *mut i32,
+    iomsg: *mut u8,
+    iomsg_len: i64,
+) {
+    if !iostat.is_null() {
+        unsafe {
+            *iostat = 0;
+        }
+    }
+    if !iomsg.is_null() && iomsg_len > 0 {
+        let buf = unsafe { std::slice::from_raw_parts_mut(iomsg, iomsg_len as usize) };
+        for b in buf.iter_mut() {
+            *b = b' ';
+        }
+    }
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(u) = state.get_unit(unit) else {
+        if !iostat.is_null() {
+            unsafe {
+                *iostat = 1;
+            }
+        }
+        return;
+    };
+    if !(u.form == Form::Unformatted && u.access == Access::Sequential) {
+        return;
+    }
+    let mut len_buf = [0u8; 4];
+    match u.read_raw(&mut len_buf) {
+        Ok(4) => {}
+        Ok(0) => {
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = IOSTAT_END;
+                }
+            }
+            return;
+        }
+        _ => {
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = 1;
+                }
+            }
+            return;
+        }
+    }
+    let record_len = u32::from_ne_bytes(len_buf) as usize;
+    let mut data = vec![0u8; record_len];
+    if record_len > 0 && u.read_raw(&mut data).is_err() && !iostat.is_null() {
+        unsafe {
+            *iostat = 1;
+        }
+        return;
+    }
+    let mut trailer = [0u8; 4];
+    let _ = u.read_raw(&mut trailer);
+    u.pending_read = Some((data, 0));
+}
+
+/// End a list-directed READ statement. Drops any unread bytes left in
+/// the in-flight unformatted record buffer (the standard does not
+/// require the program to consume the entire record).
+#[no_mangle]
+pub extern "C" fn afs_list_read_end(
+    unit: i32,
+    _iostat: *mut i32,
+    _iomsg: *mut u8,
+    _iomsg_len: i64,
+) {
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(u) = state.get_unit(unit) {
+        u.pending_read = None;
+    }
+}
+
+/// Advance the file position past one record on a list-directed READ
+/// statement that has no input items: `read(unit, *)` (no items) is
+/// defined by F2018 §12.6.4.5 to position the unit at the next record.
+/// stdlib's `number_of_rows(s)` counts rows by repeating exactly that
+/// statement until a nonzero iostat — without this helper the loop is
+/// infinite because the unit never advances and iostat is never set.
+#[no_mangle]
+pub extern "C" fn afs_read_skip_record(unit: i32, iostat: *mut i32) {
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(u) = state.get_unit(unit) else {
+        if !iostat.is_null() {
+            unsafe { *iostat = 1 };
+        }
+        return;
+    };
+    // Drain any pre-tokenized values from the previous list-directed
+    // read so the next iteration genuinely consumes a new record.
+    u.read_tokens.clear();
+    match u.read_line() {
+        Ok(s) if s.is_empty() => {
+            if !iostat.is_null() {
+                unsafe { *iostat = IOSTAT_END };
+            }
+        }
+        Ok(_) => {
+            if !iostat.is_null() {
+                unsafe { *iostat = 0 };
+            }
+        }
+        Err(_) => {
+            if !iostat.is_null() {
+                unsafe { *iostat = 1 };
+            }
+        }
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn afs_read_string(unit: i32, dest: *mut u8, dest_len: i64, iostat: *mut i32) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
@@ -1110,6 +1509,16 @@ pub extern "C" fn afs_read_string(unit: i32, dest: *mut u8, dest_len: i64, iosta
         if !iostat.is_null() {
             unsafe {
                 *iostat = 1;
+            }
+        }
+        return;
+    }
+
+    if let Some(bytes) = u.read_buffer_take(dest_len as usize) {
+        crate::string::afs_assign_char_fixed(dest, dest_len, bytes.as_ptr(), dest_len);
+        if !iostat.is_null() {
+            unsafe {
+                *iostat = 0;
             }
         }
         return;
@@ -2577,7 +2986,14 @@ struct FmtContext {
     sink: FmtSink,
     format_str: String,
     values: Vec<IoValue>,
+    iostat: *mut i32,
+    iomsg: *mut u8,
+    iomsg_len: i64,
 }
+
+// SAFETY: FmtContext only lives inside a thread-local; the raw
+// pointers are written by the same thread that begins the I/O.
+unsafe impl Send for FmtContext {}
 
 thread_local! {
     static FMT_CTX: RefCell<Option<FmtContext>> = const { RefCell::new(None) };
@@ -2587,12 +3003,36 @@ thread_local! {
 /// to accumulate values.
 #[no_mangle]
 pub extern "C" fn afs_fmt_begin(unit: i32, fmt_str: *const u8, fmt_len: i64) {
+    afs_fmt_begin_ex(
+        unit,
+        fmt_str,
+        fmt_len,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        0,
+    );
+}
+
+/// Extended formatted-write begin: accepts iostat and iomsg pointers
+/// captured from the WRITE-statement specs. Either pointer may be null.
+#[no_mangle]
+pub extern "C" fn afs_fmt_begin_ex(
+    unit: i32,
+    fmt_str: *const u8,
+    fmt_len: i64,
+    iostat: *mut i32,
+    iomsg: *mut u8,
+    iomsg_len: i64,
+) {
     let fmt = unsafe_str(fmt_str, fmt_len);
     FMT_CTX.with(|ctx| {
         *ctx.borrow_mut() = Some(FmtContext {
             sink: FmtSink::Unit(unit),
             format_str: fmt,
             values: Vec::new(),
+            iostat,
+            iomsg,
+            iomsg_len,
         });
     });
 }
@@ -2605,6 +3045,28 @@ pub extern "C" fn afs_fmt_begin_internal(
     fmt_str: *const u8,
     fmt_len: i64,
 ) {
+    afs_fmt_begin_internal_ex(
+        buf,
+        buf_len,
+        fmt_str,
+        fmt_len,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        0,
+    );
+}
+
+/// Extended internal-write begin with iostat/iomsg plumbing.
+#[no_mangle]
+pub extern "C" fn afs_fmt_begin_internal_ex(
+    buf: *mut u8,
+    buf_len: i64,
+    fmt_str: *const u8,
+    fmt_len: i64,
+    iostat: *mut i32,
+    iomsg: *mut u8,
+    iomsg_len: i64,
+) {
     let fmt = unsafe_str(fmt_str, fmt_len);
     FMT_CTX.with(|ctx| {
         *ctx.borrow_mut() = Some(FmtContext {
@@ -2614,6 +3076,9 @@ pub extern "C" fn afs_fmt_begin_internal(
             },
             format_str: fmt,
             values: Vec::new(),
+            iostat,
+            iomsg,
+            iomsg_len,
         });
     });
 }
@@ -2686,18 +3151,52 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
             let mut engine = FormatEngine::new(descriptors);
             let output = engine.format_values(&c.values);
 
+            // Track success across the sink branches. List-directed and
+            // scalar formatted writes both leave `iostat` untouched on
+            // older builds; stdlib's savetxt loops `if (ios/=0) error_stop`
+            // on the post-write value, so a write that silently leaves the
+            // pre-call sentinel in place trips the error-stop branch every
+            // iteration. Set `*iostat = 0` on success and stash an empty
+            // iomsg so callers see a clean state.
+            let mut io_status: i32 = 0;
+            let mut io_msg: Option<&'static str> = None;
+
             match c.sink {
                 FmtSink::Unit(unit) => {
                     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(u) = state.get_unit(unit) {
-                        let _ = u.write_str(&output);
-                        if advance != 0 {
-                            let _ = u.write_str("\n");
+                        if u.write_str(&output).is_err() {
+                            io_status = 1;
+                            io_msg = Some("write failed");
                         }
+                        if io_status == 0 && advance != 0 && u.write_str("\n").is_err() {
+                            io_status = 1;
+                            io_msg = Some("write failed");
+                        }
+                    } else {
+                        io_status = 1;
+                        io_msg = Some("unit not connected");
                     }
                 }
                 FmtSink::Internal { buf, buf_len } => {
                     write_to_buffer(buf, buf_len, 0, output.as_bytes(), std::ptr::null_mut());
+                }
+            }
+
+            if !c.iostat.is_null() {
+                unsafe { *c.iostat = io_status };
+            }
+            if !c.iomsg.is_null() && c.iomsg_len > 0 {
+                let msg = io_msg.unwrap_or("");
+                let cap = c.iomsg_len as usize;
+                let bytes = msg.as_bytes();
+                let copy = bytes.len().min(cap);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), c.iomsg, copy);
+                    if copy < cap {
+                        // Pad remainder with spaces per Fortran character semantics.
+                        std::ptr::write_bytes(c.iomsg.add(copy), b' ', cap - copy);
+                    }
                 }
             }
         }
@@ -2938,6 +3437,63 @@ pub extern "C" fn afs_fmt_read_string(
     size_out: *mut i32,
     iostat: *mut i32,
 ) {
+    // If a prior `read(...,advance='NO')` left a partial in-flight
+    // record with cursor in the middle, consume from that cursor first
+    // and then mark the record as fully consumed (advancing past it
+    // for the next statement). Without this, switching from
+    // non-advancing to advancing — exactly what stdlib's
+    // `read_bitset_unit_64` does on its final-bit read — would call
+    // `read_line` and discard the cursor, returning the wrong char or
+    // EOF for files with a single physical record.
+    {
+        let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(u) = state.get_unit(unit) {
+            // Only treat the in-flight record as partial when the
+            // cursor has actually advanced past 0 — i.e. a previous
+            // `read(...,advance='NO')` consumed some chars. A cursor
+            // of 0 means the record was set up by `read_line` for an
+            // advancing read but never partially consumed; in that
+            // case we must let the next advancing read pull a fresh
+            // record (otherwise we'd re-deliver the same line).
+            let has_partial_record = u.formatted_read_cursor > 0
+                && u.formatted_read_record.is_some()
+                && u.formatted_read_cursor
+                    < u.formatted_read_record
+                        .as_ref()
+                        .map(|r| r.len())
+                        .unwrap_or(0);
+            if has_partial_record {
+                let fmt = unsafe_str(fmt_str, fmt_len);
+                let descs = parse_format(&fmt);
+                let input = u
+                    .formatted_read_record
+                    .as_ref()
+                    .map(|l| l.as_bytes().to_vec())
+                    .unwrap_or_default();
+                let mut cursor = u.formatted_read_cursor;
+                let mut remaining = 0usize;
+                let outcome =
+                    extract_nth_formatted_field(&descs, &input, &mut cursor, &mut remaining);
+                u.formatted_read_record = None;
+                u.formatted_read_cursor = 0;
+                drop(state);
+                match outcome {
+                    Some((FormatDesc::Character { .. }, field)) => {
+                        store_formatted_char_result(&field, dest, dest_len, size_out, iostat);
+                    }
+                    _ => {
+                        store_formatted_char_error(dest, dest_len, size_out, IOSTAT_EOR);
+                        if !iostat.is_null() {
+                            unsafe {
+                                *iostat = IOSTAT_EOR;
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+        }
+    }
     match formatted_read_record_for_unit(unit, data_index)
         .and_then(|line| parse_nth_formatted_record(line.as_bytes(), fmt_str, fmt_len, data_index))
     {
