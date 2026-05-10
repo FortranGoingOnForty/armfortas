@@ -1067,6 +1067,9 @@ fn emit_type(out: &mut String, name: &str, type_layouts: &TypeLayoutRegistry) {
             if field.pointer {
                 attrs.push_str(" @pointer");
             }
+            if field.procedure_pointer {
+                attrs.push_str(" @procptr");
+            }
             if field.target {
                 attrs.push_str(" @target");
             }
@@ -1984,11 +1987,13 @@ fn parse_type(
                 let mut pointer = false;
                 let mut target = false;
                 let mut declared_array = false;
+                let mut procedure_pointer = false;
                 let mut default_init = None;
                 for token in flag_tail.split_whitespace() {
                     match token {
                         "@allocatable" => allocatable = true,
                         "@pointer" => pointer = true,
+                        "@procptr" => procedure_pointer = true,
                         "@target" => target = true,
                         "@declared_array" => declared_array = true,
                         _ => {
@@ -2010,6 +2015,7 @@ fn parse_type(
                     allocatable,
                     pointer,
                     target,
+                    procedure_pointer,
                     default_init,
                 });
             }

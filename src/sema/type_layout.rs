@@ -7,6 +7,11 @@ use super::symtab::TypeInfo;
 use std::borrow::Cow;
 use std::collections::HashMap;
 
+/// Procedure-pointer components carry a code pointer followed by a small
+/// fixed closure payload for contained-procedure host references.
+pub const PROC_PTR_CLOSURE_SLOTS: usize = 8;
+pub const PROC_PTR_COMPONENT_SIZE: usize = 8 * (1 + PROC_PTR_CLOSURE_SLOTS);
+
 /// Sprint 07: borrow when the input is already canonical lowercase,
 /// allocate only when at least one ASCII uppercase byte needs folding.
 fn ensure_ascii_lowercase(s: &str) -> Cow<'_, str> {
@@ -54,6 +59,7 @@ pub struct FieldLayout {
     pub allocatable: bool,
     pub pointer: bool,
     pub target: bool,
+    pub procedure_pointer: bool,
     pub default_init: Option<FieldDefaultInit>,
 }
 
@@ -726,12 +732,21 @@ pub fn compute_layout_with_attrs(
                 } else {
                     eval_explicit_array_dims(entity.array_spec.as_ref(), const_params)
                 };
+                let is_proc_pointer_component = is_pointer
+                    && attrs
+                        .iter()
+                        .any(|a| matches!(a, crate::ast::decl::Attribute::External))
+                    && matches!(ti, TypeInfo::Derived(_))
+                    && dims.is_empty()
+                    && !declared_array;
                 let (elem_size, elem_align) =
                     if matches!(&ti, TypeInfo::Character { len: None, .. })
                         && (is_allocatable || is_pointer)
                         && !declared_array
                     {
                         (32, 8) // StringDescriptor for deferred-length scalar char components
+                    } else if is_proc_pointer_component {
+                        (PROC_PTR_COMPONENT_SIZE, 8)
                     } else if is_pointer && !declared_array && !matches!(ti, TypeInfo::Class(_)) {
                         (8, 8) // Scalar POINTER components are pointer slots, not descriptors
                     } else if is_allocatable || is_pointer {
@@ -762,11 +777,6 @@ pub fn compute_layout_with_attrs(
                 // landing in `ptr_init`.  These are 8-byte slots, not
                 // descriptors, and the initialization writes the
                 // function address — not a const integer or character.
-                let is_proc_pointer_component = is_pointer
-                    && attrs
-                        .iter()
-                        .any(|a| matches!(a, crate::ast::decl::Attribute::External))
-                    && elem_size == 8;
                 let default_init = if is_proc_pointer_component {
                     if let Some(init_expr) = entity.ptr_init.as_ref() {
                         if let crate::ast::expr::Expr::Name { name } = &init_expr.node {
@@ -810,6 +820,7 @@ pub fn compute_layout_with_attrs(
                     allocatable: is_allocatable,
                     pointer: is_pointer,
                     target: is_target,
+                    procedure_pointer: is_proc_pointer_component,
                     default_init,
                 });
                 offset += field_size;
@@ -998,6 +1009,7 @@ mod tests {
                     allocatable: false,
                     pointer: false,
                     target: false,
+                    procedure_pointer: false,
                     default_init: None,
                 },
                 FieldLayout {
@@ -1010,6 +1022,7 @@ mod tests {
                     allocatable: false,
                     pointer: false,
                     target: false,
+                    procedure_pointer: false,
                     default_init: None,
                 },
             ],
@@ -1048,6 +1061,7 @@ mod tests {
                     allocatable: false,
                     pointer: false,
                     target: false,
+                    procedure_pointer: false,
                     default_init: None,
                 },
                 FieldLayout {
@@ -1060,6 +1074,7 @@ mod tests {
                     allocatable: false,
                     pointer: false,
                     target: false,
+                    procedure_pointer: false,
                     default_init: None,
                 },
                 FieldLayout {
@@ -1072,6 +1087,7 @@ mod tests {
                     allocatable: false,
                     pointer: false,
                     target: false,
+                    procedure_pointer: false,
                     default_init: None,
                 },
             ],
