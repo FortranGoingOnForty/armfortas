@@ -28624,6 +28624,43 @@ fn cmplx_whole_array_with_kind_keyword_returns_correct_kind_descriptor() {
 }
 
 #[test]
+fn allocate_stat_int64_writes_back_to_user_variable() {
+    // F2018 §9.7.1.3: STAT= variable receives the allocate status.
+    // Runtime writes an i32; when the user's variable is a wider
+    // integer kind (e.g. integer(int64), as in stdlib_sorting where
+    // int_index = int64), the i32 result must be sign-extended back
+    // into the user's slot. Without the writeback the upper 4 bytes
+    // were stack garbage, so `if (stat /= 0)` read non-zero on
+    // success and triggered "Allocation of array buffer failed."
+    // in stdlib_sorting_sort_adjoint at line 121 (matched stdlib
+    // sort_index + sort_adjoint examples).
+    let src = write_program(
+        "program p\n  implicit none\n  integer, parameter :: i64 = selected_int_kind(18)\n  integer(i64) :: stat\n  integer, allocatable :: buf(:)\n  allocate(buf(0:6), stat=stat)\n  if (stat /= 0_i64) error stop 1\n  deallocate(buf, stat=stat)\n  if (stat /= 0_i64) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("alloc_stat_int64", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("alloc-stat-int64 compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "alloc-stat-int64 compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("alloc-stat-int64 run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "alloc-stat-int64 run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn rank2_section_with_vector_subscript_gathers_into_fresh_descriptor() {
     // F2018 §9.5.3.3: a section like `A(:, pivots)` where one subscript
     // is a range and another is a rank-1 integer array (vector subscript)
