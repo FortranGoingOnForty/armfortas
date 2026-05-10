@@ -3031,7 +3031,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             items,
             opts,
         } => {
-            let stat_addr = allocate_status_target_addr(b, ctx, opts);
+            let stat_target = super::core::allocate_status_target(b, ctx, opts);
+            let stat_addr = stat_target.runtime_addr;
             // F2018 §9.7.1.3: stat-variable is 0 on success. Pre-zero so
             // any item path that doesn't update stat_addr (e.g. scalar
             // simple allocates that don't go through a runtime helper)
@@ -3802,10 +3803,12 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     }
                 }
             }
+            super::core::emit_allocate_status_writeback(b, &stat_target);
         }
 
         Stmt::Deallocate { items, opts } => {
-            let stat_addr = allocate_status_target_addr(b, ctx, opts);
+            let dealloc_stat_target = super::core::allocate_status_target(b, ctx, opts);
+            let stat_addr = dealloc_stat_target.runtime_addr;
             let errmsg_target = allocate_errmsg_target(b, ctx, opts);
             for item in items {
                 if let Expr::ComponentAccess { .. } = &item.node {
@@ -3911,6 +3914,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     }
                 }
             }
+            super::core::emit_allocate_status_writeback(b, &dealloc_stat_target);
         }
 
         Stmt::Block {
