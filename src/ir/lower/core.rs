@@ -34083,6 +34083,23 @@ pub(super) fn lower_arg_by_ref_full(
                     let slot_ty = IrType::Ptr(Box::new(pointee_ty));
                     return b.load_typed(field_ptr, slot_ty);
                 }
+                // Allocatable array component actual (e.g. `c%idx` where
+                // idx is `integer, allocatable :: idx(:,:)`) passed to a
+                // by-ref dummy that is assumed-size or explicit-shape:
+                // field_ptr is the address of the 384-byte descriptor,
+                // not of the array data. The callee, declared as
+                // `a(2,*)` or similar, expects an element pointer it
+                // can index column-major directly. Load base_addr from
+                // the descriptor so the assumed-size dummy walks actual
+                // data instead of the descriptor's first 8 bytes.
+                // Surfaced as stdlib_sparse_conversion sort_coo_unique:
+                // `call sort_coo(COO%index, ...)` where COO%index is an
+                // allocatable rank-2 component and the callee declares
+                // `a(2, *)`.
+                if field.allocatable && field.size == 384 && !field.pointer {
+                    let pointee_ty = type_info_to_ir_type(&field.type_info);
+                    return b.load_typed(field_ptr, IrType::Ptr(Box::new(pointee_ty)));
+                }
                 let _ = field;
                 // Component actuals like `state%num_tokens` are lvalues:
                 // pass the field storage itself so intent(out/inout)
