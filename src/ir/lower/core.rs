@@ -21750,6 +21750,10 @@ pub(super) fn lower_alloc_section_read(
 /// Audit CRITICAL-3: multi-dim slice prints used to mis-dispatch
 /// through afs_create_section on a bare stack pointer and crash
 /// at runtime reading 384 bytes of garbage as a descriptor.
+// Local intermediate `dim_data` collects per-dim values to release the
+// `dims` borrow before emitting IR; a one-shot named struct here would
+// just be ceremony.
+#[allow(clippy::type_complexity)]
 pub(super) fn lower_section_write_nd(
     b: &mut FuncBuilder,
     ctx: &mut LowerCtx,
