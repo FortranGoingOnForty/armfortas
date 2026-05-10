@@ -28624,6 +28624,49 @@ fn cmplx_whole_array_with_kind_keyword_returns_correct_kind_descriptor() {
 }
 
 #[test]
+fn allocatable_rank2_section_row_assignment_uses_columnmajor_stride() {
+    // F2018 §6.5.3: section assignment to a "row" of a column-major
+    // allocatable matrix (e.g. `a(1,:) = [...]`) must step through
+    // memory by the column extent, not contiguously. The compiler
+    // builds the section descriptor via afs_create_section using the
+    // source array's per-dim stride, so the source descriptor's
+    // strides must match the column-major canonical layout. For
+    // stack arrays, materialize_array_descriptor_for_info computes
+    // those correctly; for allocatables, afs_allocate_array used to
+    // copy whatever stride the compiler emitted (always 1) and the
+    // resulting section view collapsed into a contiguous walk —
+    // `a(1,:) = [10,20,30]; a(2,:) = [100,200,300]` left a as
+    // [[10,200,?],[100,300,?]] instead of [[10,20,30],[100,200,300]].
+    // Matched stdlib_sparse_conversion (rebuild needed): from_ijv was
+    // initializing COO%index via section assignment, then passing the
+    // descriptor to assumed-size dummies that read garbage.
+    let src = write_program(
+        "program p\n  implicit none\n  integer, allocatable :: a(:,:)\n  allocate(a(2, 3))\n  a(1, :) = [10, 20, 30]\n  a(2, :) = [100, 200, 300]\n  if (a(1,1) /= 10  .or. a(1,2) /= 20  .or. a(1,3) /= 30 ) error stop 1\n  if (a(2,1) /= 100 .or. a(2,2) /= 200 .or. a(2,3) /= 300) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("allocatable_rank2_row_section", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("allocatable rank-2 row section compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "allocatable rank-2 row section compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "allocatable rank-2 row section run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn allocate_stat_int64_writes_back_to_user_variable() {
     // F2018 §9.7.1.3: STAT= variable receives the allocate status.
     // Runtime writes an i32; when the user's variable is a wider
