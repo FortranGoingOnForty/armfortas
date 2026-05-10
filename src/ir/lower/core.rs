@@ -16437,13 +16437,15 @@ pub(super) fn insert_implicit_dealloc(
     // frame and the IR — and DCE couldn't drop it because allocas
     // are classified as side-effecting.
     let needs_dealloc = owned_locals.values().any(|info| {
-        info.allocatable
+        (!info.by_ref && info.allocatable)
             || matches!(
                 info.char_kind,
                 CharKind::Deferred | CharKind::FixedRuntime { .. }
             )
     });
-    let needs_stat = owned_locals.values().any(|info| info.allocatable);
+    let needs_stat = owned_locals
+        .values()
+        .any(|info| !info.by_ref && info.allocatable);
     if !needs_dealloc
         && !owned_locals.values().any(|info| {
             !info.by_ref
@@ -16499,6 +16501,9 @@ pub(super) fn insert_implicit_dealloc(
                 b.runtime_call(RuntimeFunc::Deallocate, vec![ptr], IrType::Void);
             }
         } else if info.allocatable {
+            if info.by_ref {
+                continue;
+            }
             b.call(
                 FuncRef::External("afs_deallocate_array".into()),
                 vec![info.addr, stat_addr.unwrap()],
