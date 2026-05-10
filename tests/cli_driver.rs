@@ -13854,6 +13854,47 @@ fn inline_array_intrinsic_in_print_walks_descriptor_elements() {
 }
 
 #[test]
+fn merge_intrinsic_routes_array_operands_through_descriptor_path() {
+    // F2018 §16.9.135: MERGE is elemental and returns an array when any
+    // of its operands is an array. The transformational-intrinsic table
+    // in stmt.rs picks which calls go through `lower_array_assign`, and
+    // `merge` was missing — so `x = merge(b, x, mask)` fell through to
+    // scalar `b.select(mask, ptr_a, ptr_b)`, producing const-zero or
+    // ptr-typed garbage that the assignment treated as a source
+    // descriptor. stdlib's iterative solvers (solve_cg/bicgstab/pcg) and
+    // pseudoinverse (`Am1 = .pinv.A`) all SEGV'd on this path. The fix
+    // routes merge() through `lower_array_merge_descriptor`, which
+    // materializes a temp descriptor via per-element select.
+    let src = write_program(
+        "subroutine s(x, b, mask)\n  real(8), intent(inout) :: x(:)\n  real(8), intent(in) :: b(:)\n  logical, intent(in) :: mask(:)\n  x = merge(b, x, mask)\nend subroutine\nprogram p\n  real(8) :: x(3) = [1.0_8, 2.0_8, 3.0_8]\n  real(8) :: b(3) = [10.0_8, 20.0_8, 30.0_8]\n  logical :: mask(3) = [.true., .false., .true.]\n  call s(x, b, mask)\n  if (abs(x(1) - 10.0_8) > 1.0e-12_8) error stop 1\n  if (abs(x(2) - 2.0_8)  > 1.0e-12_8) error stop 2\n  if (abs(x(3) - 30.0_8) > 1.0e-12_8) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("merge_array", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("merge array compile failed");
+    assert!(
+        compile.status.success(),
+        "merge array should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("merge array run failed");
+    assert!(
+        run.status.success(),
+        "merge array should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn complex_scalar_assigned_from_integer_promotes_via_buffer_not_pointer_cast() {
     // F2018 §10.2.1.3: complex variables can be assigned a scalar of
     // numeric type — the right-hand side is promoted to complex with
