@@ -28624,6 +28624,45 @@ fn cmplx_whole_array_with_kind_keyword_returns_correct_kind_descriptor() {
 }
 
 #[test]
+fn allocate_source_from_strided_section_walks_per_element() {
+    // F2018 §9.7.1.2: ALLOCATE(dest, source = strided_section) must
+    // populate dest by reading the source per-element via the
+    // section's per-dim memory stride, not by a flat memcpy of
+    // total_bytes from source base. afs_copy_array_data was doing
+    // ptr::copy(source.base_addr, dest.base_addr, total_bytes), which
+    // for a section like `idx(2, 1:n)` (stride 2 between adjacent
+    // dim-0=2 picks) read consecutive bytes including dim-0=1 entries.
+    // Surfaced inside stdlib_sparse_conversion's coo2csr_dp at line
+    // 426: `allocate(CSR%col, source = COO%index(2, 1:nnz))` populated
+    // CSR%col with row indices instead of column indices, so spmv
+    // walked vec_x past its declared bounds.
+    let src = write_program(
+        "program p\n  implicit none\n  integer, allocatable :: idx(:,:)\n  integer, allocatable :: col(:)\n  integer :: i, n\n  n = 8\n  allocate(idx(2, n), source=0)\n  do i = 1, n\n    idx(1, i) = (i-1) / 2 + 1\n    idx(2, i) = mod(i-1, 2) + 1\n  end do\n  allocate(col(n), source = idx(2, 1:n))\n  do i = 1, n\n    if (col(i) /= idx(2, i)) error stop 1\n  end do\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("alloc_source_strided_section", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("alloc-source strided compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "alloc-source strided compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "alloc-source strided run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn random_number_on_array_fills_every_element() {
     // F2018 §16.9.171: RANDOM_NUMBER(harvest) fills harvest with
     // independent draws from [0,1). The intrinsic-subroutine lowering
