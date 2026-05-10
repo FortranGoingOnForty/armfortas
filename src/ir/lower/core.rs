@@ -12864,9 +12864,9 @@ pub(super) fn procedure_pointer_component_call_target(
     expr: &crate::ast::expr::SpannedExpr,
     st: &SymbolTable,
     type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
-) -> Option<(ValueId, String)> {
+) -> Option<(ValueId, Vec<ValueId>, String)> {
     let (field_ptr, field) = resolve_component_field_access(b, locals, expr, st, type_layouts)?;
-    if !field.pointer {
+    if !field.pointer || !field.procedure_pointer {
         return None;
     }
     let crate::sema::symtab::TypeInfo::Derived(signature_name) = &field.type_info else {
@@ -12876,10 +12876,14 @@ pub(super) fn procedure_pointer_component_call_target(
         return None;
     }
     let load_ty = IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)));
-    Some((
-        b.load_typed(field_ptr, load_ty),
-        signature_name.to_lowercase(),
-    ))
+    let target = b.load_typed(field_ptr, load_ty.clone());
+    let mut closure_args = Vec::with_capacity(crate::sema::type_layout::PROC_PTR_CLOSURE_SLOTS);
+    for slot_idx in 0..crate::sema::type_layout::PROC_PTR_CLOSURE_SLOTS {
+        let offset = b.const_i64(8 * (slot_idx as i64 + 1));
+        let slot_ptr = b.gep(field_ptr, vec![offset], IrType::Int(IntWidth::I8));
+        closure_args.push(b.load_typed(slot_ptr, load_ty.clone()));
+    }
+    Some((target, closure_args, signature_name.to_lowercase()))
 }
 
 pub(super) fn procedure_pointer_symbol_addr_elem_type(info: &LocalInfo) -> IrType {
@@ -22432,6 +22436,42 @@ pub(super) fn store_scalar_pointer_slot_value(b: &mut FuncBuilder, info: &LocalI
     }
 }
 
+pub(super) fn store_procedure_pointer_component_record(
+    b: &mut FuncBuilder,
+    field_ptr: ValueId,
+    target: ValueId,
+    closure_args: &[ValueId],
+) {
+    let zero = b.const_i32(0);
+    let size = b.const_i64(crate::sema::type_layout::PROC_PTR_COMPONENT_SIZE as i64);
+    b.call(
+        FuncRef::External("memset".into()),
+        vec![field_ptr, zero, size],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+    b.store(target, field_ptr);
+    let ptr_ty = IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)));
+    for (idx, arg) in closure_args
+        .iter()
+        .take(crate::sema::type_layout::PROC_PTR_CLOSURE_SLOTS)
+        .enumerate()
+    {
+        let offset = b.const_i64(8 * (idx as i64 + 1));
+        let slot_ptr = b.gep(field_ptr, vec![offset], IrType::Int(IntWidth::I8));
+        let val = match b.func().value_type(*arg) {
+            Some(ty) if ty == ptr_ty => *arg,
+            Some(ty) if ty.is_ptr() => {
+                let raw = b.ptr_to_int(*arg);
+                b.int_to_ptr(raw, IrType::Int(IntWidth::I8))
+            }
+            Some(IrType::Int(_)) => b.int_to_ptr(*arg, IrType::Int(IntWidth::I8)),
+            None => *arg,
+            Some(_) => *arg,
+        };
+        b.store(val, slot_ptr);
+    }
+}
+
 pub(super) fn store_byte_aggregate_field(
     b: &mut FuncBuilder,
     base: ValueId,
@@ -31444,14 +31484,12 @@ pub(super) fn apply_field_default_init_runtime(
         crate::sema::type_layout::FieldDefaultInit::ProcedurePointer(target_symbol) => {
             // Take the function's link-time address (the layout
             // builder pre-mangles to `afs_modproc_<mod>_<proc>` for
-            // module procedures) and store the i64 value into the
-            // 8-byte field slot.  See FieldDefaultInit::
-            // ProcedurePointer's comment for why this can't go
-            // through the compile-time const-bytes path.
+            // module procedures) and store it in the procedure-pointer
+            // record. Default component initializers cannot capture a
+            // dynamic host frame, so the closure payload is null.
             let _ = registry;
             let addr = b.global_addr(target_symbol, IrType::Int(IntWidth::I8));
-            let addr_int = b.ptr_to_int(addr);
-            b.store(addr_int, field_ptr);
+            store_procedure_pointer_component_record(b, field_ptr, addr, &[]);
         }
     }
 }
@@ -32299,6 +32337,76 @@ pub(super) fn store_derived_field_expr(
     }
 
     if field.pointer {
+        if field.procedure_pointer {
+            if let Expr::Name { name: src_name } = &value.node {
+                let src_key = src_name.to_lowercase();
+                if let Some(src_info) = locals.get(&src_key) {
+                    let load_ty = if src_info.ty.is_ptr() {
+                        src_info.ty.clone()
+                    } else {
+                        IrType::Ptr(Box::new(src_info.ty.clone()))
+                    };
+                    let addr = if src_info.by_ref {
+                        let slot = b.load(src_info.addr);
+                        b.load_typed(slot, load_ty)
+                    } else {
+                        b.load_typed(src_info.addr, load_ty)
+                    };
+                    store_procedure_pointer_component_record(b, field_ptr, addr, &[]);
+                    return;
+                }
+
+                if let Some(sym) = find_linkable_symbol_any_scope(st, &src_key) {
+                    if matches!(
+                        sym.kind,
+                        crate::sema::symtab::SymbolKind::Function
+                            | crate::sema::symtab::SymbolKind::Subroutine
+                            | crate::sema::symtab::SymbolKind::ExternalProc
+                            | crate::sema::symtab::SymbolKind::ProcedurePointer
+                    ) {
+                        let (link_name, resolved_key) =
+                            resolved_symbol_call_target(st, &src_key, src_name);
+                        let lowered_name = internal_funcs
+                            .filter(|m| m.contains_key(&resolved_key) || m.contains_key(&src_key))
+                            .map(|m| {
+                                lowered_procedure_symbol_name(
+                                    resolved_key.as_str(),
+                                    None,
+                                    Some(b.func().name.as_str()),
+                                    None,
+                                    true,
+                                    m,
+                                )
+                            })
+                            .unwrap_or(link_name);
+                        let addr = b.global_addr(&lowered_name, IrType::Int(IntWidth::I8));
+                        let mut closure_args = Vec::new();
+                        let closure_key = if contained_host_refs
+                            .and_then(|m| m.get(&resolved_key))
+                            .is_some()
+                        {
+                            resolved_key.as_str()
+                        } else {
+                            src_key.as_str()
+                        };
+                        append_host_closure_args_raw(
+                            b,
+                            locals,
+                            contained_host_refs,
+                            closure_key,
+                            &mut closure_args,
+                        );
+                        store_procedure_pointer_component_record(
+                            b,
+                            field_ptr,
+                            addr,
+                            &closure_args,
+                        );
+                        return;
+                    }
+                }
+            }
+        }
         match &value.node {
             Expr::Name { name: src_name } => {
                 let src_key = src_name.to_lowercase();

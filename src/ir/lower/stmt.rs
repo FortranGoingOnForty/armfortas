@@ -1713,13 +1713,15 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         }
                     }
                 }
-                if let Some((target, signature_key)) = procedure_pointer_component_call_target(
-                    b,
-                    &ctx.locals,
-                    callee,
-                    ctx.st,
-                    ctx.type_layouts,
-                ) {
+                if let Some((target, closure_args, signature_key)) =
+                    procedure_pointer_component_call_target(
+                        b,
+                        &ctx.locals,
+                        callee,
+                        ctx.st,
+                        ctx.type_layouts,
+                    )
+                {
                     let arg_slots = reorder_args_by_keyword_slots(args, &signature_key, ctx.st);
                     let abi_lookup_keys = procedure_abi_lookup_keys(ctx.st, &[&signature_key]);
                     let abi_primary_key = abi_lookup_keys
@@ -1754,7 +1756,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             .as_ref()
                             .map(|mask| mask.get(i).copied().unwrap_or(false))
                             .unwrap_or(false);
-                        let wants_descriptor = desc_mask
+                        let mask_wants_descriptor = desc_mask
                             .as_ref()
                             .map(|mask| mask.get(i).copied().unwrap_or(false))
                             .unwrap_or(false);
@@ -1770,17 +1772,18 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             .as_ref()
                             .map(|mask| mask.get(i).copied().unwrap_or(false))
                             .unwrap_or(false);
-                        let wants_descriptor = wants_descriptor && !wants_bind_c_char;
-                        let wants_polymorphic_descriptor = wants_descriptor
-                            && class_mask
-                                .as_ref()
-                                .map(|mask| mask.get(i).copied().unwrap_or(false))
-                                .unwrap_or(false);
+                        let wants_polymorphic_descriptor = class_mask
+                            .as_ref()
+                            .map(|mask| mask.get(i).copied().unwrap_or(false))
+                            .unwrap_or(false);
                         let wants_string_descriptor =
                             wants_string_descriptor && !wants_bind_c_char;
                         let value = match slot {
                             Some(arg) => match &arg.value {
                                 crate::ast::expr::SectionSubscript::Element(e) => {
+                                    let wants_descriptor = (mask_wants_descriptor
+                                        || actual_is_descriptor_array(&ctx.locals, e))
+                                        && !wants_bind_c_char;
                                     if is_value && wants_bind_c_char {
                                         lower_bind_c_char_value_arg(
                                             b,
@@ -1895,6 +1898,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             }
                         }
                     }
+                    arg_vals.extend(closure_args);
                     b.call(FuncRef::Indirect(target), arg_vals, IrType::Void);
                 }
             } else if let Expr::Name { name } = &callee.node {
@@ -5030,6 +5034,72 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             if let Some((tgt_field_ptr, tgt_field)) = component_target.as_ref() {
                 if !tgt_field.pointer {
                     return;
+                }
+                if tgt_field.procedure_pointer {
+                    if let Expr::FunctionCall { callee, .. } = &value.node {
+                        if let Expr::Name { name } = &callee.node {
+                            if name.eq_ignore_ascii_case("null") {
+                                let zero = b.const_i64(0);
+                                let null = b.int_to_ptr(zero, IrType::Int(IntWidth::I8));
+                                store_procedure_pointer_component_record(
+                                    b,
+                                    *tgt_field_ptr,
+                                    null,
+                                    &[],
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    if let Expr::Name { name: src_name } = &value.node {
+                        let src_key = src_name.to_lowercase();
+                        if let Some(sym) = ctx.st.lookup_local_then_any(ctx.proc_scope_id, &src_key)
+                        {
+                            if matches!(
+                                sym.kind,
+                                crate::sema::symtab::SymbolKind::Function
+                                    | crate::sema::symtab::SymbolKind::Subroutine
+                                    | crate::sema::symtab::SymbolKind::ExternalProc
+                                    | crate::sema::symtab::SymbolKind::ProcedurePointer
+                            ) {
+                                let (link_name, resolved_key) =
+                                    resolved_symbol_call_target(ctx.st, &src_key, src_name);
+                                let lowered_name = if ctx.internal_funcs.contains_key(&resolved_key)
+                                    || ctx.internal_funcs.contains_key(&src_key)
+                                {
+                                    lowered_procedure_symbol_name(
+                                        resolved_key.as_str(),
+                                        None,
+                                        Some(b.func().name.as_str()),
+                                        None,
+                                        true,
+                                        ctx.internal_funcs,
+                                    )
+                                } else {
+                                    link_name
+                                };
+                                let addr = b.global_addr(&lowered_name, IrType::Int(IntWidth::I8));
+                                let mut closure_args = Vec::new();
+                                append_host_closure_args(
+                                    b,
+                                    ctx,
+                                    if ctx.contained_host_refs.contains_key(&resolved_key) {
+                                        &resolved_key
+                                    } else {
+                                        &src_key
+                                    },
+                                    &mut closure_args,
+                                );
+                                store_procedure_pointer_component_record(
+                                    b,
+                                    *tgt_field_ptr,
+                                    addr,
+                                    &closure_args,
+                                );
+                                return;
+                            }
+                        }
+                    }
                 }
                 if is_deferred_char_component_field(tgt_field) {
                     if let Expr::FunctionCall { callee, .. } = &value.node {

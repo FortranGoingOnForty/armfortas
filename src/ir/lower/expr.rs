@@ -2012,7 +2012,7 @@ pub(crate) fn lower_expr_full(
                             // stdlib_hashmaps where `map % hasher(key)`
                             // dispatches through a proc-pointer field.
                             if bp_opt.is_none() {
-                                if let Some((target_ptr, signature_key)) =
+                                if let Some((target_ptr, closure_args, signature_key)) =
                                     procedure_pointer_component_call_target(
                                         b, locals, callee, st, tl,
                                     )
@@ -2093,6 +2093,7 @@ pub(crate) fn lower_expr_full(
                                             arg_vals.push(v);
                                         }
                                     }
+                                    arg_vals.extend(closure_args);
                                     return b.call(
                                         FuncRef::Indirect(target_ptr),
                                         arg_vals,

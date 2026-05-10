@@ -24975,6 +24975,129 @@ fn procedure_pointer_component_call_updates_integer_argument() {
 }
 
 #[test]
+fn imported_procptr_component_call_passes_assumed_shape_descriptors() {
+    let dir = unique_dir("imported_procptr_component_descriptors");
+    let mod_src = write_program_in(
+        &dir,
+        "callbacks.f90",
+        "module callbacks\n  implicit none\n  abstract interface\n    subroutine cb(x, y, alpha, beta, op)\n      real(8), intent(in) :: x(:)\n      real(8), intent(inout) :: y(:)\n      real(8), intent(in) :: alpha, beta\n      character(1), intent(in) :: op\n    end subroutine\n  end interface\n  type :: holder_t\n    procedure(cb), pointer, nopass :: apply => null()\n  end type\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use callbacks\n  implicit none\n  type(holder_t) :: holder\n  real(8) :: x(3)\n  real(8), allocatable :: tmp(:,:)\n  x = [1.0_8, 2.0_8, 3.0_8]\n  allocate(tmp(3,2))\n  tmp = 10.0_8\n  holder%apply => scale\n  call kernel(holder, x, tmp)\n  if (abs(tmp(1,1) - 8.0_8) > 1.0e-12_8) error stop 10\n  if (abs(tmp(3,1) - 4.0_8) > 1.0e-12_8) error stop 11\n  if (abs(tmp(2,2) - 10.0_8) > 1.0e-12_8) error stop 12\n  print *, 'ok'\ncontains\n  subroutine kernel(holder, x, tmp)\n    class(holder_t), intent(in) :: holder\n    real(8), intent(in) :: x(:)\n    real(8), intent(inout) :: tmp(:,:)\n    associate (r => tmp(:,1))\n      call holder%apply(x, r, alpha=-2.0_8, beta=1.0_8, op='N')\n    end associate\n  end subroutine\n\n  subroutine scale(x, y, alpha, beta, op)\n    real(8), intent(in) :: x(:)\n    real(8), intent(inout) :: y(:)\n    real(8), intent(in) :: alpha, beta\n    character(1), intent(in) :: op\n    if (op /= 'N') error stop 20\n    if (size(x) /= 3) error stop 21\n    if (size(y) /= 3) error stop 22\n    y = beta * y + alpha * x\n  end subroutine\nend program\n",
+    );
+
+    let mod_obj = dir.join("callbacks.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            mod_src.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("callbacks compile failed to spawn");
+    assert!(
+        compile_mod.status.success(),
+        "callbacks module should compile: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_main = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            main_src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("main compile failed to spawn");
+    assert!(
+        compile_main.status.success(),
+        "main should compile with imported procptr holder: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let exe = dir.join("imported_procptr_component_descriptors.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            mod_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link spawn failed");
+    assert!(
+        link.status.success(),
+        "imported procptr descriptor objects should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("imported procptr descriptor run failed");
+    assert!(
+        run.status.success(),
+        "imported procptr descriptor run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected imported procptr descriptor output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+}
+
+#[test]
+fn contained_procptr_component_preserves_host_derived_dummy() {
+    let src = write_program(
+        "module m\n  implicit none\n  type :: matrix_t\n    integer :: n = 0\n    real(8), allocatable :: data(:)\n  end type\n  abstract interface\n    subroutine cb(x, y, alpha, beta, op)\n      real(8), intent(in) :: x(:)\n      real(8), intent(inout) :: y(:)\n      real(8), intent(in) :: alpha, beta\n      character(1), intent(in) :: op\n    end subroutine\n  end interface\n  type :: holder_t\n    procedure(cb), pointer, nopass :: apply => null()\n  end type\n  type :: workspace_t\n    real(8), allocatable :: tmp(:,:)\n  end type\ncontains\n  subroutine apply_matrix(matrix, x, y, alpha, beta, op)\n    type(matrix_t), intent(in) :: matrix\n    real(8), intent(in) :: x(:)\n    real(8), intent(inout) :: y(:)\n    real(8), intent(in) :: alpha, beta\n    character(1), intent(in) :: op\n    if (op /= 'N') error stop 9\n    if (matrix%n /= 5) error stop 10\n    if (size(matrix%data) /= 5) error stop 11\n    y(1) = beta * y(1) + alpha * matrix%data(1) * x(1)\n  end subroutine\n\n  subroutine kernel(holder, x, workspace)\n    class(holder_t), intent(in) :: holder\n    real(8), intent(in) :: x(:)\n    type(workspace_t), intent(inout) :: workspace\n    associate (r => workspace%tmp(:,1))\n      r = 10.0_8\n      call holder%apply(x, r, alpha=-1.0_8, beta=1.0_8, op='N')\n      if (abs(r(1) - 4.0_8) > 1.0e-12_8) error stop 12\n    end associate\n  end subroutine\n\n  subroutine solve(matrix, x)\n    type(matrix_t), intent(in) :: matrix\n    real(8), intent(in) :: x(:)\n    type(holder_t) :: holder\n    type(workspace_t) :: workspace\n    allocate(workspace%tmp(size(x), 4))\n    holder%apply => local_apply\n    call kernel(holder, x, workspace)\n  contains\n    subroutine local_apply(x, y, alpha, beta, op)\n      real(8), intent(in) :: x(:)\n      real(8), intent(inout) :: y(:)\n      real(8), intent(in) :: alpha, beta\n      character(1), intent(in) :: op\n      call apply_matrix(matrix, x, y, alpha, beta, op)\n    end subroutine\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(matrix_t) :: matrix\n  real(8) :: x(5)\n  matrix%n = 5\n  allocate(matrix%data(5))\n  matrix%data = [3.0_8, 0.0_8, 0.0_8, 0.0_8, 0.0_8]\n  x = [2.0_8, 3.0_8, 4.0_8, 5.0_8, 6.0_8]\n  call solve(matrix, x)\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("contained_procptr_host_derived", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("contained procptr host-derived compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "contained procptr host-derived compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("contained procptr host-derived run failed");
+    assert!(
+        run.status.success(),
+        "contained procptr host-derived run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected contained procptr host-derived output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn procedure_pointer_component_actual_to_procedure_dummy_runs() {
     let src = write_program(
         "program p\n  implicit none\n  abstract interface\n    subroutine cb(value)\n      integer, intent(inout) :: value\n    end subroutine\n  end interface\n  type :: holder_t\n    procedure(cb), pointer, nopass :: handler => null()\n  end type\n  type(holder_t) :: holder\n  integer :: value\n  value = 0\n  holder%handler => inc\n  call run(holder%handler, value)\n  if (value /= 1) error stop 1\n  print *, 'ok'\ncontains\n  subroutine run(proc, value)\n    procedure(cb) :: proc\n    integer, intent(inout) :: value\n    call proc(value)\n  end subroutine\n\n  subroutine inc(value)\n    integer, intent(inout) :: value\n    value = value + 1\n  end subroutine\nend program\n",
