@@ -25062,6 +25062,93 @@ fn imported_procptr_component_call_passes_assumed_shape_descriptors() {
 }
 
 #[test]
+fn imported_procptr_component_function_preserves_return_type() {
+    let dir = unique_dir("imported_procptr_component_function_return");
+    let mod_src = write_program_in(
+        &dir,
+        "callbacks.f90",
+        "module callbacks\n  implicit none\n  abstract interface\n    real(8) function reduce(x, y) result(r)\n      real(8), intent(in) :: x(:)\n      real(8), intent(in) :: y(:)\n    end function\n  end interface\n  type :: holder_t\n    procedure(reduce), pointer, nopass :: dot => null()\n  end type\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use callbacks\n  implicit none\n  type(holder_t) :: holder\n  real(8) :: x(3)\n  real(8) :: got\n  x = [1.0_8, 2.0_8, 3.0_8]\n  holder%dot => my_dot\n  call kernel(holder, x, got)\n  if (abs(got - 14.0_8) > 1.0e-12_8) error stop 10\n  print *, 'ok'\ncontains\n  subroutine kernel(holder, x, got)\n    class(holder_t), intent(in) :: holder\n    real(8), intent(in) :: x(:)\n    real(8), intent(out) :: got\n    got = holder%dot(x, x)\n  end subroutine\n\n  real(8) function my_dot(x, y) result(r)\n    real(8), intent(in) :: x(:)\n    real(8), intent(in) :: y(:)\n    r = dot_product(x, y)\n  end function\nend program\n",
+    );
+
+    let mod_obj = dir.join("callbacks.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            mod_src.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("callbacks compile failed to spawn");
+    assert!(
+        compile_mod.status.success(),
+        "callbacks module should compile: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_main = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            main_src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("main compile failed to spawn");
+    assert!(
+        compile_main.status.success(),
+        "main should compile with imported procptr function holder: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let exe = dir.join("imported_procptr_component_function_return.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            mod_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link spawn failed");
+    assert!(
+        link.status.success(),
+        "imported procptr function objects should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("imported procptr function run failed");
+    assert!(
+        run.status.success(),
+        "imported procptr function run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected imported procptr function output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+}
+
+#[test]
 fn contained_procptr_component_preserves_host_derived_dummy() {
     let src = write_program(
         "module m\n  implicit none\n  type :: matrix_t\n    integer :: n = 0\n    real(8), allocatable :: data(:)\n  end type\n  abstract interface\n    subroutine cb(x, y, alpha, beta, op)\n      real(8), intent(in) :: x(:)\n      real(8), intent(inout) :: y(:)\n      real(8), intent(in) :: alpha, beta\n      character(1), intent(in) :: op\n    end subroutine\n  end interface\n  type :: holder_t\n    procedure(cb), pointer, nopass :: apply => null()\n  end type\n  type :: workspace_t\n    real(8), allocatable :: tmp(:,:)\n  end type\ncontains\n  subroutine apply_matrix(matrix, x, y, alpha, beta, op)\n    type(matrix_t), intent(in) :: matrix\n    real(8), intent(in) :: x(:)\n    real(8), intent(inout) :: y(:)\n    real(8), intent(in) :: alpha, beta\n    character(1), intent(in) :: op\n    if (op /= 'N') error stop 9\n    if (matrix%n /= 5) error stop 10\n    if (size(matrix%data) /= 5) error stop 11\n    y(1) = beta * y(1) + alpha * matrix%data(1) * x(1)\n  end subroutine\n\n  subroutine kernel(holder, x, workspace)\n    class(holder_t), intent(in) :: holder\n    real(8), intent(in) :: x(:)\n    type(workspace_t), intent(inout) :: workspace\n    associate (r => workspace%tmp(:,1))\n      r = 10.0_8\n      call holder%apply(x, r, alpha=-1.0_8, beta=1.0_8, op='N')\n      if (abs(r(1) - 4.0_8) > 1.0e-12_8) error stop 12\n    end associate\n  end subroutine\n\n  subroutine solve(matrix, x)\n    type(matrix_t), intent(in) :: matrix\n    real(8), intent(in) :: x(:)\n    type(holder_t) :: holder\n    type(workspace_t) :: workspace\n    allocate(workspace%tmp(size(x), 4))\n    holder%apply => local_apply\n    call kernel(holder, x, workspace)\n  contains\n    subroutine local_apply(x, y, alpha, beta, op)\n      real(8), intent(in) :: x(:)\n      real(8), intent(inout) :: y(:)\n      real(8), intent(in) :: alpha, beta\n      character(1), intent(in) :: op\n      call apply_matrix(matrix, x, y, alpha, beta, op)\n    end subroutine\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(matrix_t) :: matrix\n  real(8) :: x(5)\n  matrix%n = 5\n  allocate(matrix%data(5))\n  matrix%data = [3.0_8, 0.0_8, 0.0_8, 0.0_8, 0.0_8]\n  x = [2.0_8, 3.0_8, 4.0_8, 5.0_8, 6.0_8]\n  call solve(matrix, x)\n  print *, 'ok'\nend program\n",
@@ -25090,6 +25177,42 @@ fn contained_procptr_component_preserves_host_derived_dummy() {
     assert!(
         String::from_utf8_lossy(&run.stdout).contains("ok"),
         "unexpected contained procptr host-derived output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn contained_proc_does_not_deallocate_host_allocatable_array() {
+    let src = write_program(
+        "program p\n  implicit none\n  real(8), allocatable :: scale(:)\n  real(8) :: x(3), y(3)\n  allocate(scale(3))\n  scale = [2.0_8, 3.0_8, 4.0_8]\n  x = [1.0_8, 2.0_8, 3.0_8]\n  y = 0.0_8\n  call apply(x, y)\n  if (abs(y(1) - 2.0_8) > 1.0e-12_8) error stop 1\n  if (abs(y(2) - 6.0_8) > 1.0e-12_8) error stop 2\n  if (abs(y(3) - 12.0_8) > 1.0e-12_8) error stop 3\n  if (.not. allocated(scale)) error stop 4\n  if (abs(scale(2) - 3.0_8) > 1.0e-12_8) error stop 5\n  print *, 'ok'\ncontains\n  subroutine apply(x, y)\n    real(8), intent(in) :: x(:)\n    real(8), intent(out) :: y(:)\n    y = scale * x\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("contained_host_allocatable_owner", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("contained host allocatable compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "contained host allocatable compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("contained host allocatable run failed");
+    assert!(
+        run.status.success(),
+        "contained host allocatable run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected contained host allocatable output: {}",
         String::from_utf8_lossy(&run.stdout)
     );
 

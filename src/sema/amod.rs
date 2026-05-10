@@ -372,6 +372,21 @@ pub fn write_amod(
             }
         }
     }
+    for layout in type_layouts.layouts.values() {
+        if layout
+            .owner_module
+            .as_ref()
+            .is_some_and(|owner| owner.eq_ignore_ascii_case(&mod_key))
+        {
+            for field in &layout.fields {
+                if field.procedure_pointer {
+                    if let TypeInfo::Derived(signature_name) = &field.type_info {
+                        proc_export_names.insert(signature_name.to_lowercase());
+                    }
+                }
+            }
+        }
+    }
     let mut procs: Vec<_> = scope
         .symbols
         .iter()
