@@ -4186,6 +4186,80 @@ end program
 }
 
 #[test]
+fn intrinsic_repeat_keeps_length_through_user_generic_shadow() {
+    // F2008 §12.5.5.2: a user-defined generic only shadows an intrinsic
+    // for argument signatures matching one of its specifics. stdlib's
+    // `repeat` generic only has `(string_type, integer)`, so a call
+    // with a character first arg must dispatch to the intrinsic.
+    //
+    // The string-context FunctionCall arm in lower_string_expr_full was
+    // gating the intrinsic match arms unconditionally on
+    // `find_named_interface_symbol(...).is_some()`, so once a user
+    // module exported a generic with the intrinsic's name the intrinsic
+    // length-computation arm was skipped. The runtime still routed to
+    // `_afs_repeat` correctly, but `lower_string_expr_full` returned
+    // `(buf, 0)` instead of `(buf, src_len * copies)`. Any deferred
+    // assignment downstream (`s = repeat(' ', n)`) then asked
+    // `afs_assign_char_deferred` to copy zero bytes — silently empty
+    // strings, blocking process_1/process_6 and any code that
+    // transitively `use`s stdlib_strings.
+    let src = write_program(
+        r#"
+module mymod
+  implicit none
+  type :: stringy
+    integer :: dummy
+  end type
+  interface repeat
+    module procedure :: repeat_stringy
+  end interface
+contains
+  function repeat_stringy(s, n) result(r)
+    type(stringy), intent(in) :: s
+    integer, intent(in) :: n
+    type(stringy) :: r
+    r%dummy = s%dummy * n
+  end function
+end module
+program p
+  use mymod
+  implicit none
+  character(:), allocatable :: s
+  s = repeat(' ', 5)
+  if (len(s) /= 5) error stop 1
+  if (s /= '     ') error stop 2
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("repeat_user_shadow", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("repeat-shadow compile failed");
+    assert!(
+        compile.status.success(),
+        "should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "intrinsic repeat under user-generic shadow produced wrong length: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected 'ok': {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn allocatable_rank2_assign_from_transpose_uses_column_major_stride() {
     // F2018 §10.1.5: allocatable LHS = transpose(reshape(...)) reallocates
     // dest with source's shape and copies the data. afs_assign_allocatable
