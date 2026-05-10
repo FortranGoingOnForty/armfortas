@@ -13854,6 +13854,49 @@ fn inline_array_intrinsic_in_print_walks_descriptor_elements() {
 }
 
 #[test]
+fn proc_pointer_component_call_passes_assumed_shape_array_as_descriptor() {
+    // F2018 §15.5.2.5: an assumed-shape dummy receives a descriptor.
+    // The procedure-pointer component call dispatch in expr.rs was
+    // using `lower_arg_by_ref_full` for every actual, regardless of
+    // what the abstract interface declared — so an `x(:)` formal got
+    // only the array's base data pointer. The callee then read
+    // dims/rank out of the array bytes (size=1 silently, or SEGV at
+    // afs_array_size when the bogus rank exceeded 15).  stdlib's
+    // iterative solvers (solve_cg/bicgstab/pcg) and pseudoinverse
+    // dispatched dot_product/matvec through procedure-pointer fields
+    // and crashed deep inside stdlib_dot_product_dp on a doubly-
+    // indirected dereference. The fix applies the same descriptor mask
+    // lookup the regular call path uses.
+    let src = write_program(
+        "module m\n  implicit none\n  abstract interface\n    function reduce_iface(x, y) result(r)\n      real(8), intent(in) :: x(:), y(:)\n      real(8) :: r\n    end function\n  end interface\n  type :: linop\n    procedure(reduce_iface), nopass, pointer :: dot => null()\n  end type\ncontains\n  function default_dot(x, y) result(r)\n    real(8), intent(in) :: x(:), y(:)\n    real(8) :: r\n    integer :: i\n    r = 0.0_8\n    do i = 1, size(x)\n      r = r + x(i) * y(i)\n    end do\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  type(linop) :: opa\n  real(8) :: vx(3), vy(3), s\n  vx = [1.0_8, 2.0_8, 3.0_8]\n  vy = [4.0_8, 5.0_8, 6.0_8]\n  opa%dot => default_dot\n  s = opa%dot(vx, vy)\n  if (abs(s - 32.0_8) > 1.0e-12_8) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("proc_ptr_desc", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("proc-ptr compile failed");
+    assert!(
+        compile.status.success(),
+        "proc-ptr compile should succeed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("proc-ptr run failed");
+    assert!(
+        run.status.success(),
+        "proc-ptr run should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn merge_intrinsic_routes_array_operands_through_descriptor_path() {
     // F2018 §16.9.135: MERGE is elemental and returns an array when any
     // of its operands is an array. The transformational-intrinsic table
