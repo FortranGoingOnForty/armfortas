@@ -19,3 +19,7 @@ starting the full Sprint 29 audit:
   conservative source form instead of the typed constructor spelling.
 - Revisit ambitious array/vectorization-style `integer(16)` rewrites only after the
   scalar/runtime ABI surface is fully closed and audited.
+- Stdlib sweep provenance: `example_solve_custom` passed as the fpm-linked v47
+  binary, but previously aborted in one repacked/direct archive path. The fresh
+  v51 stdlib rebuild plus direct relink sweep now reports `example_solve_custom
+  0`; keep this note as provenance if the archive-order discrepancy returns.
