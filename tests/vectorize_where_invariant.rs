@@ -46,11 +46,7 @@ fn o3_vectorizes_where_with_invariant_scalar_threshold() {
         "expected vbroadcast (loop-invariant threshold):\n{}",
         o3_ir
     );
-    assert!(
-        o3_ir.contains("vselect"),
-        "expected vselect:\n{}",
-        o3_ir
-    );
+    assert!(o3_ir.contains("vselect"), "expected vselect:\n{}", o3_ir);
 
     let stdout = capture_run_stdout(CaptureRequest {
         input: source,
@@ -64,5 +60,9 @@ fn o3_vectorizes_where_with_invariant_scalar_threshold() {
         .collect();
     assert_eq!(trimmed.len(), 1, "expected one output line:\n{}", stdout);
     let expected = "1.0000000E0     2.0000000E1     2.1000000E1     1.6000000E1";
-    assert_eq!(trimmed[0], expected, "WHERE invariant wrong: {:?}", trimmed[0]);
+    assert_eq!(
+        trimmed[0], expected,
+        "WHERE invariant wrong: {:?}",
+        trimmed[0]
+    );
 }

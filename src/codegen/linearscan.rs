@@ -152,10 +152,8 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
         }
         (caller, callees)
     };
-    let (mut free_gp_caller, mut free_gp_callee) =
-        split_pool(&GP_ALLOC_ORDER, &GP_CALLEE_SAVED);
-    let (mut free_fp_caller, mut free_fp_callee) =
-        split_pool(&FP_ALLOC_ORDER, &FP_CALLEE_SAVED);
+    let (mut free_gp_caller, mut free_gp_callee) = split_pool(&GP_ALLOC_ORDER, &GP_CALLEE_SAVED);
+    let (mut free_fp_caller, mut free_fp_callee) = split_pool(&FP_ALLOC_ORDER, &FP_CALLEE_SAVED);
     let mut callee_saved_used: HashSet<PhysReg> = HashSet::new();
 
     // Hard-coded PhysReg writes inside instructions: positions
@@ -237,8 +235,7 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
     // at -O2+ exhibits this: V_iv defined in `if_end_1`, used in
     // `do_check_3`/`do_body_4`, but `if_then_2` carrying the
     // recursive call is lexically between if_end_1 and do_check_3.)
-    let mut vreg_def_blocks: HashMap<VRegId, std::collections::HashSet<usize>> =
-        HashMap::new();
+    let mut vreg_def_blocks: HashMap<VRegId, std::collections::HashSet<usize>> = HashMap::new();
     {
         let mut p: u32 = 0;
         for (block_idx, block) in mf.blocks.iter().enumerate() {
@@ -350,9 +347,7 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
             // predecessor must land in the same physreg as every
             // use, and splitting fundamentally breaks that.
             false
-        } else if let Some(&(real_start, real_end)) =
-            vreg_actual_range.get(&interval.vreg)
-        {
+        } else if let Some(&(real_start, real_end)) = vreg_actual_range.get(&interval.vreg) {
             interval.call_crossings.len() == 1
                 && interval.call_crossings[0] > real_start
                 && interval.call_crossings[0] < real_end
@@ -368,9 +363,9 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
         let safe_pre_phys = if !free_caller.is_empty() && interval.call_crossings.len() == 1 {
             let cp = interval.call_crossings[0];
             let pre_end = cp.saturating_sub(1);
-            free_caller.iter().rposition(|&r| {
-                !phys_written_in(r, is_fp, interval.start, pre_end)
-            })
+            free_caller
+                .iter()
+                .rposition(|&r| !phys_written_in(r, is_fp, interval.start, pre_end))
         } else {
             None
         };
@@ -638,7 +633,11 @@ pub fn apply_allocation(
         if let Some(p) = result.assignments.get(&vid) {
             Some(LogicalAssignment::Reg(*p))
         } else {
-            result.spills.get(&vid).copied().map(LogicalAssignment::Slot)
+            result
+                .spills
+                .get(&vid)
+                .copied()
+                .map(LogicalAssignment::Slot)
         }
     };
 
@@ -762,8 +761,7 @@ pub fn apply_allocation(
             let mut fp_temp_idx = 0usize;
             for (i, op) in inst.operands.iter().enumerate() {
                 if let MachineOperand::VReg(vid) = op {
-                    if let Some(LogicalAssignment::Slot(offset)) =
-                        logical_assignment(*vid, cur_pos)
+                    if let Some(LogicalAssignment::Slot(offset)) = logical_assignment(*vid, cur_pos)
                     {
                         let class = vreg_classes.get(vid).copied().unwrap_or(RegClass::Gp64);
                         let (temp_reg, load_op) = match class {
@@ -837,9 +835,7 @@ pub fn apply_allocation(
             // correct half.
             for op in &mut rewritten.operands {
                 if let MachineOperand::VReg(vid) = op {
-                    if let Some(LogicalAssignment::Reg(phys)) =
-                        logical_assignment(*vid, cur_pos)
-                    {
+                    if let Some(LogicalAssignment::Reg(phys)) = logical_assignment(*vid, cur_pos) {
                         *op = MachineOperand::PhysReg(phys);
                     }
                 }
@@ -848,8 +844,7 @@ pub fn apply_allocation(
             // Handle def — use a temp that doesn't alias any input temp.
             let def_temp_idx = gp_temp_idx.max(fp_temp_idx);
             let def_spill = if let Some(def_vid) = &inst.def {
-                if let Some(LogicalAssignment::Slot(offset)) =
-                    logical_assignment(*def_vid, cur_pos)
+                if let Some(LogicalAssignment::Slot(offset)) = logical_assignment(*def_vid, cur_pos)
                 {
                     let class = vreg_classes.get(def_vid).copied().unwrap_or(RegClass::Gp64);
                     let temp_reg = match class {
@@ -928,12 +923,7 @@ pub fn apply_allocation(
 /// `(-256, 255)`. For wider frames we substitute
 /// `sub x8, x29, #|offset|; ldr/str rt, [x8, #0]`. Positive
 /// out-of-scaled-range offsets get the symmetric `add` treatment.
-fn emit_spill_access(
-    insts: &mut Vec<MachineInst>,
-    op: ArmOpcode,
-    rt: PhysReg,
-    offset: i64,
-) {
+fn emit_spill_access(insts: &mut Vec<MachineInst>, op: ArmOpcode, rt: PhysReg, offset: i64) {
     // Most spill ops encode comfortably with FP-relative immediates.
     // Only fall back to address materialization when out of LDUR
     // range. (Positive offsets up to 65520 step 16 are handled by
@@ -1991,10 +1981,7 @@ mod tests {
         );
         let blr = mf.blocks[0].insts.last().unwrap();
         assert_eq!(blr.opcode, ArmOpcode::Blr);
-        assert_eq!(
-            blr.operands,
-            vec![MachineOperand::PhysReg(PhysReg::Gp(10))]
-        );
+        assert_eq!(blr.operands, vec![MachineOperand::PhysReg(PhysReg::Gp(10))]);
     }
 
     #[test]

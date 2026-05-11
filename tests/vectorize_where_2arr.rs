@@ -70,8 +70,7 @@ fn o3_vectorizes_where_with_array_plus_array_body() {
         .collect();
     assert_eq!(trimmed.len(), 1, "expected one output line:\n{}", stdout);
     assert_eq!(
-        trimmed[0],
-        "1.0000000E0     1.6000000E1     1.0100000E2     1.1600000E2",
+        trimmed[0], "1.0000000E0     1.6000000E1     1.0100000E2     1.1600000E2",
         "array+array WHERE wrong: {:?}",
         trimmed[0]
     );

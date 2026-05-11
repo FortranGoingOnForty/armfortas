@@ -1416,7 +1416,9 @@ thread_local! {
 /// result is cached per-thread, keyed by canonical path + mtime.
 pub fn read_amod(path: &Path) -> Result<ModuleInterface, String> {
     let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let mtime = std::fs::metadata(&canonical).and_then(|m| m.modified()).ok();
+    let mtime = std::fs::metadata(&canonical)
+        .and_then(|m| m.modified())
+        .ok();
 
     if let Some(now) = mtime {
         let cached = AMOD_CACHE.with(|c| {

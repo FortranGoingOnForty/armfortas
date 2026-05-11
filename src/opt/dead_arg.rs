@@ -216,9 +216,7 @@ fn inst_uses_param(kind: &InstKind, param_id: ValueId) -> bool {
         | InstKind::VBroadcast(..)
         | InstKind::VReduceSum(..)
         | InstKind::VReduceMin(..)
-        | InstKind::VReduceMax(..)) => {
-            crate::ir::walk::inst_uses(kind).contains(&param_id)
-        }
+        | InstKind::VReduceMax(..)) => crate::ir::walk::inst_uses(kind).contains(&param_id),
     }
 }
 

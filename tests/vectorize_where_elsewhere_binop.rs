@@ -70,8 +70,7 @@ fn o3_vectorizes_where_elsewhere_with_then_binop() {
         .collect();
     assert_eq!(trimmed.len(), 1, "expected one output line:\n{}", stdout);
     assert_eq!(
-        trimmed[0],
-        "-1.0000000E0    -1.0000000E0     2.0000000E0     3.2000000E1",
+        trimmed[0], "-1.0000000E0    -1.0000000E0     2.0000000E0     3.2000000E1",
         "WHERE/ELSEWHERE+binop wrong: {:?}",
         trimmed[0]
     );

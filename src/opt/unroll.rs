@@ -611,9 +611,7 @@ fn check_latch(
 
     let expected_args = if acc_lane_idx.is_some() { 2 } else { 1 };
     let args = match &blk.terminator {
-        Some(Terminator::Branch(dest, args))
-            if *dest == header && args.len() == expected_args =>
-        {
+        Some(Terminator::Branch(dest, args)) if *dest == header && args.len() == expected_args => {
             args.clone()
         }
         _ => return None,
@@ -1165,9 +1163,7 @@ fn detect_partial_unroll_loop(
     let ph = func.block(preheader);
     let expected_args = if acc_param.is_some() { 2 } else { 1 };
     let iv_init = match &ph.terminator {
-        Some(Terminator::Branch(d, args))
-            if *d == header && args.len() == expected_args =>
-        {
+        Some(Terminator::Branch(d, args)) if *d == header && args.len() == expected_args => {
             resolve_const_int(func, args[0])?
         }
         _ => return None,
@@ -1175,9 +1171,7 @@ fn detect_partial_unroll_loop(
     // Latch: `... insts ...; iadd iv, 1; br header(iv_next [, new_acc])`.
     let latch_blk = func.block(latch);
     let latch_term_args = match &latch_blk.terminator {
-        Some(Terminator::Branch(d, args))
-            if *d == header && args.len() == expected_args =>
-        {
+        Some(Terminator::Branch(d, args)) if *d == header && args.len() == expected_args => {
             args.clone()
         }
         _ => return None,
@@ -1479,12 +1473,15 @@ fn detect_partial_unroll_runtime_loop(
     // other param (when 2 params) is the accumulator.
     let icmp_lhs: Option<ValueId> = hdr.terminator.as_ref().and_then(|t| {
         if let Terminator::CondBranch { cond, .. } = t {
-            hdr.insts.iter().find(|i| i.id == *cond).and_then(|c| match c.kind {
-                InstKind::ICmp(CmpOp::Le, lhs, _) | InstKind::ICmp(CmpOp::Lt, lhs, _) => {
-                    Some(lhs)
-                }
-                _ => None,
-            })
+            hdr.insts
+                .iter()
+                .find(|i| i.id == *cond)
+                .and_then(|c| match c.kind {
+                    InstKind::ICmp(CmpOp::Le, lhs, _) | InstKind::ICmp(CmpOp::Lt, lhs, _) => {
+                        Some(lhs)
+                    }
+                    _ => None,
+                })
         } else {
             None
         }
@@ -1504,7 +1501,11 @@ fn detect_partial_unroll_runtime_loop(
     } else {
         None
     };
-    let acc_idx: Option<usize> = if hdr.params.len() == 2 { Some(1 - iv_idx) } else { None };
+    let acc_idx: Option<usize> = if hdr.params.len() == 2 {
+        Some(1 - iv_idx)
+    } else {
+        None
+    };
     // Header's icmp pattern. Accept icmp.le or icmp.lt with the IV on
     // the LHS; capture the rhs ValueId regardless of whether it's a
     // const.
@@ -1592,9 +1593,7 @@ fn detect_partial_unroll_runtime_loop(
     let ph = func.block(preheader);
     let want_arity = if acc_param_info.is_some() { 2 } else { 1 };
     let (iv_init, acc_init_v) = match &ph.terminator {
-        Some(Terminator::Branch(d, args))
-            if *d == header && args.len() == want_arity =>
-        {
+        Some(Terminator::Branch(d, args)) if *d == header && args.len() == want_arity => {
             let init = resolve_const_int(func, args[iv_idx])?;
             let acc_init = acc_idx.map(|i| args[i]);
             (init, acc_init)
@@ -1606,9 +1605,7 @@ fn detect_partial_unroll_runtime_loop(
     // matches header.params ordering.
     let latch_blk = func.block(latch);
     let latch_term_args = match &latch_blk.terminator {
-        Some(Terminator::Branch(d, args))
-            if *d == header && args.len() == want_arity =>
-        {
+        Some(Terminator::Branch(d, args)) if *d == header && args.len() == want_arity => {
             args.clone()
         }
         _ => return None,
@@ -2018,8 +2015,7 @@ fn do_partial_unroll_runtime(func: &mut Function, shape: PartialRuntimeShape) {
     //         used to be dominated by header (along the false branch).
     if let (Some(r), Some(remain_acc)) = (shape.reduction.as_ref(), remain_acc_id) {
         if !r.exit_takes_acc {
-            let body_set: HashSet<BlockId> =
-                [shape.header, shape.latch].iter().copied().collect();
+            let body_set: HashSet<BlockId> = [shape.header, shape.latch].iter().copied().collect();
             for block in func.blocks.iter_mut() {
                 if body_set.contains(&block.id) || block.id == shape.preheader {
                     continue;
@@ -2335,7 +2331,7 @@ fn do_partial_unroll_multiblock(func: &mut Function, shape: PartialMultiBlockSha
     // ---- 2. Build each clone ----
     for (k, &(body_c, latch_c)) in clone_blocks.iter().enumerate() {
         let k_val = (k + 1) as i64; // k=0 in Vec → iv+1
-        // body_c: iv_k_const + iv_k_iadd + cloned body insts + br latch_c
+                                    // body_c: iv_k_const + iv_k_iadd + cloned body insts + br latch_c
         let mut body_c_insts: Vec<Inst> = Vec::new();
         let k_const_id = func.next_value_id();
         func.register_type(k_const_id, int_ty.clone());
@@ -2418,8 +2414,7 @@ fn do_partial_unroll_multiblock(func: &mut Function, shape: PartialMultiBlockSha
     //         skipped clones — shouldn't happen since min U=2 means
     //         exactly 1 clone).
     if let Some(&(first_clone_body, _)) = clone_blocks.first() {
-        func.block_mut(shape.latch).terminator =
-            Some(Terminator::Branch(first_clone_body, vec![]));
+        func.block_mut(shape.latch).terminator = Some(Terminator::Branch(first_clone_body, vec![]));
     }
 }
 
@@ -2801,10 +2796,7 @@ mod tests {
         let blocks_before = m.functions[0].blocks.len();
         let pass = LoopUnroll;
         let changed = pass.run(&mut m);
-        assert!(
-            changed,
-            "runtime-trip 2-block loop should partial-unroll"
-        );
+        assert!(changed, "runtime-trip 2-block loop should partial-unroll");
         let f = &m.functions[0];
         // Two new blocks: header_remain + latch_remain.
         assert_eq!(
@@ -2818,9 +2810,7 @@ mod tests {
         // ISub, IAdd, IMod feeding into the header's icmp via a fresh value.
         let preheader = &f.blocks[0];
         let kinds: Vec<&InstKind> = preheader.insts.iter().map(|i| &i.kind).collect();
-        let has_imod = kinds
-            .iter()
-            .any(|k| matches!(k, InstKind::IMod(..)));
+        let has_imod = kinds.iter().any(|k| matches!(k, InstKind::IMod(..)));
         assert!(has_imod, "preheader should compute head_bound via IMod");
     }
 
@@ -3033,7 +3023,10 @@ mod tests {
                 if *dest == exit_id {
                     found_branch_to_exit = true;
                     assert_eq!(args.len(), 1, "exit takes one arg (the accumulator)");
-                    assert_ne!(args[0], acc, "must not reference the pruned header acc param");
+                    assert_ne!(
+                        args[0], acc,
+                        "must not reference the pruned header acc param"
+                    );
                     assert_ne!(args[0], iv, "must not reference the pruned header iv param");
                     break;
                 }

@@ -63,8 +63,7 @@ fn o3_vectorizes_where_elsewhere_with_unary_on_else_load() {
         .collect();
     assert_eq!(trimmed.len(), 1, "expected one output line:\n{}", stdout);
     assert_eq!(
-        trimmed[0],
-        "-1.0000000E0    -1.6000000E1     1.0000000E0     1.6000000E1",
+        trimmed[0], "-1.0000000E0    -1.6000000E1     1.0000000E0     1.6000000E1",
         "WHERE/ELSEWHERE-arr-unary wrong: {:?}",
         trimmed[0]
     );

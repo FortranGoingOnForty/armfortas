@@ -89,8 +89,7 @@ pub(super) fn coerce_to_type(b: &mut FuncBuilder, val: ValueId, target: &IrType)
             };
             let buf = b.alloca(IrType::Array(Box::new(IrType::Float(fw)), 2));
             let zero_off = b.const_i64(0);
-            let lane_bytes =
-                b.const_i64(if fw == FloatWidth::F64 { 8 } else { 4 });
+            let lane_bytes = b.const_i64(if fw == FloatWidth::F64 { 8 } else { 4 });
             let re_ptr = b.gep(buf, vec![zero_off], IrType::Int(IntWidth::I8));
             let im_ptr = b.gep(buf, vec![lane_bytes], IrType::Int(IntWidth::I8));
             b.store(re, re_ptr);
@@ -100,7 +99,9 @@ pub(super) fn coerce_to_type(b: &mut FuncBuilder, val: ValueId, target: &IrType)
         // Real → Complex (F2018 §10.1.10.1): real becomes real part,
         // imaginary part 0. Width-adjusts when source and target
         // float widths differ (e.g. real(sp) literal → complex(dp)).
-        (IrType::Float(src_fw), IrType::Array(elem, 2)) if matches!(elem.as_ref(), IrType::Float(_)) => {
+        (IrType::Float(src_fw), IrType::Array(elem, 2))
+            if matches!(elem.as_ref(), IrType::Float(_)) =>
+        {
             let target_fw = match elem.as_ref() {
                 IrType::Float(fw) => *fw,
                 _ => unreachable!(),
@@ -118,8 +119,7 @@ pub(super) fn coerce_to_type(b: &mut FuncBuilder, val: ValueId, target: &IrType)
             };
             let buf = b.alloca(IrType::Array(Box::new(IrType::Float(target_fw)), 2));
             let zero_off = b.const_i64(0);
-            let lane_bytes =
-                b.const_i64(if target_fw == FloatWidth::F64 { 8 } else { 4 });
+            let lane_bytes = b.const_i64(if target_fw == FloatWidth::F64 { 8 } else { 4 });
             let re_ptr = b.gep(buf, vec![zero_off], IrType::Int(IntWidth::I8));
             let im_ptr = b.gep(buf, vec![lane_bytes], IrType::Int(IntWidth::I8));
             b.store(re, re_ptr);
@@ -212,9 +212,7 @@ pub(super) fn coerce_to_type(b: &mut FuncBuilder, val: ValueId, target: &IrType)
         // bodies (merge/where) expect the element value as a Bool.
         // Without this, merge() with a logical(1) mask array failed
         // to compile and crashed the IR verifier.
-        (IrType::Ptr(inner), IrType::Bool)
-            if matches!(**inner, IrType::Int(IntWidth::I8)) =>
-        {
+        (IrType::Ptr(inner), IrType::Bool) if matches!(**inner, IrType::Int(IntWidth::I8)) => {
             let byte = b.load_typed(val, IrType::Int(IntWidth::I8));
             let zero = b.const_int(0, IntWidth::I8);
             b.icmp(CmpOp::Ne, byte, zero)

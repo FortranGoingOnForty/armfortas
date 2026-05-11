@@ -214,7 +214,6 @@ pub(super) fn preload_stmt_uses(
     }
 }
 
-
 /// Try to load a module interface from an .amod file on the search path.
 /// Creates a synthetic module scope in the symbol table and returns its ID.
 pub(super) fn load_external_module(
@@ -295,9 +294,9 @@ pub(super) fn load_external_module(
     // :: dummy` falls back to default kind=4 and silently truncates a
     // 64-bit local to 32 bits.
     for rename in &iface.renames {
-        let src_scope = st
-            .find_module_scope(&rename.source_module)
-            .or_else(|| load_external_module(st, &rename.source_module, search_paths, type_layouts));
+        let src_scope = st.find_module_scope(&rename.source_module).or_else(|| {
+            load_external_module(st, &rename.source_module, search_paths, type_layouts)
+        });
         let Some(src_scope) = src_scope else {
             continue;
         };
@@ -466,9 +465,7 @@ pub(super) fn load_external_module(
         // and reject `allocate(result(...))`. Use a doubly-underscored
         // synth name so SMP-body synthesis can find it (via the body
         // scope after sema injection) but no user code can collide.
-        if matches!(proc.kind, crate::sema::symtab::SymbolKind::Function)
-            && proc.result_rank > 0
-        {
+        if matches!(proc.kind, crate::sema::symtab::SymbolKind::Function) && proc.result_rank > 0 {
             let synth_name = format!(
                 "__amod_result_{}",
                 proc.result_name.as_deref().unwrap_or(&proc.name)

@@ -320,17 +320,14 @@ pub(crate) fn lower_intrinsic_subroutine(
             let harvest_expr = nth_arg_expr(args, 0);
             let kind_is_f32 = harvest_expr
                 .and_then(|expr| {
-                    generic_actual_expr_type_info(
-                        expr,
-                        &ctx.locals,
-                        ctx.st,
-                        Some(ctx.type_layouts),
+                    generic_actual_expr_type_info(expr, &ctx.locals, ctx.st, Some(ctx.type_layouts))
+                })
+                .map(|ty| {
+                    matches!(
+                        ty,
+                        crate::sema::symtab::TypeInfo::Real { kind: Some(k) } if k <= 4
                     )
                 })
-                .map(|ty| matches!(
-                    ty,
-                    crate::sema::symtab::TypeInfo::Real { kind: Some(k) } if k <= 4
-                ))
                 .unwrap_or(false);
             let is_array = harvest_expr
                 .map(|e| expr_returns_array(e, &ctx.locals, ctx.st))

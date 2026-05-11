@@ -63,8 +63,7 @@ fn o3_vectorizes_where_with_binop_on_second_array_load() {
         .collect();
     assert_eq!(trimmed.len(), 1, "expected one output line:\n{}", stdout);
     assert_eq!(
-        trimmed[0],
-        "0.0000000E0     0.0000000E0     1.1700000E2     1.3200000E2",
+        trimmed[0], "0.0000000E0     0.0000000E0     1.1700000E2     1.3200000E2",
         "WHERE-binop-on-b wrong: {:?}",
         trimmed[0]
     );

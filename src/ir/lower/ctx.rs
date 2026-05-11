@@ -326,7 +326,7 @@ impl<'a> LowerCtx<'a> {
                 is_pointer: false,
                 runtime_dim_upper: vec![],
                 is_class: false,
-            logical_kind: None,
+                logical_kind: None,
                 last_dim_assumed_size: false,
             },
         );
@@ -348,7 +348,7 @@ impl<'a> LowerCtx<'a> {
                 is_pointer: false,
                 runtime_dim_upper: vec![],
                 is_class: false,
-            logical_kind: None,
+                logical_kind: None,
                 last_dim_assumed_size: false,
             },
         );

@@ -106,11 +106,11 @@ pub enum ArmOpcode {
     // Operands across this family: dest VReg of class V128 plus the
     // expected source operands for that op. Lane shape is implicit
     // in the opcode; emit just dispatches.
-    AddV4S,  // ADD Vd.4s, Vn.4s, Vm.4s    (integer)
-    AddV2D,  // ADD Vd.2d, Vn.2d, Vm.2d
+    AddV4S, // ADD Vd.4s, Vn.4s, Vm.4s    (integer)
+    AddV2D, // ADD Vd.2d, Vn.2d, Vm.2d
     SubV4S,
     SubV2D,
-    MulV4S,  // MUL Vd.4s, Vn.4s, Vm.4s    (integer; 2D not in NEON)
+    MulV4S, // MUL Vd.4s, Vn.4s, Vm.4s    (integer; 2D not in NEON)
     NegV4S,
     NegV2D,
     FaddV4S, // FADD Vd.4s, Vn.4s, Vm.4s
@@ -179,23 +179,23 @@ pub enum ArmOpcode {
     AddpV2D,
     Uminv4S,
     Umaxv4S,
-    Addv4S,   // integer cross-lane add over 4×i32
+    Addv4S, // integer cross-lane add over 4×i32
 
     // Lane move / broadcast
     DupGen4S, // DUP Vd.4s, Wn       (broadcast scalar to 4 lanes)
     DupGen2D, // DUP Vd.2d, Xn
     DupEl4S,  // DUP Vd.4s, Vn.s[0]  (broadcast lane 0 to 4 lanes)
     DupEl2D,
-    Ins4S,    // INS Vd.s[lane], Wn  (insert scalar into one lane)
+    Ins4S, // INS Vd.s[lane], Wn  (insert scalar into one lane)
     Ins2D,
-    Umov4S,   // UMOV Wd, Vn.s[lane] (extract lane to scalar)
+    Umov4S, // UMOV Wd, Vn.s[lane] (extract lane to scalar)
     Umov2D,
     FmovEl4S, // FMOV Sd, Vn.s[lane] (extract f32 lane)
     FmovEl2D,
 
     // Vector load/store (128-bit Q register)
-    LdrQ,     // LDR Qt, [Xn, #imm]
-    StrQ,     // STR Qt, [Xn, #imm]
+    LdrQ, // LDR Qt, [Xn, #imm]
+    StrQ, // STR Qt, [Xn, #imm]
     /// `mov.16b vN, vM` — 128-bit register-to-register copy.
     /// Used by regalloc when moving a V128 vreg between physical
     /// regs; FmovReg only handles the low 64 bits and would corrupt
@@ -226,14 +226,14 @@ pub enum ArmOpcode {
     FmovReg, // FMOV Dd, Dm
 
     // ---- Memory ----
-    StrImm,    // STR Xt, [Xn, #imm]
-    LdrImm,    // LDR Xt, [Xn, #imm]
-    StrhImm,   // STRH Wt, [Xn, #imm]  (store 16-bit half)
-    LdrshImm,  // LDRSH Wt, [Xn, #imm] (load 16-bit half, sign-extended)
-    StrbImm,   // STRB Wt, [Xn, #imm]  (store 8-bit byte)
-    LdrsbImm,  // LDRSB Wt, [Xn, #imm] (load 8-bit byte, sign-extended)
-    StrFpImm,  // STR Dt, [Xn, #imm]  (float store)
-    LdrFpImm,  // LDR Dt, [Xn, #imm]  (float load)
+    StrImm,   // STR Xt, [Xn, #imm]
+    LdrImm,   // LDR Xt, [Xn, #imm]
+    StrhImm,  // STRH Wt, [Xn, #imm]  (store 16-bit half)
+    LdrshImm, // LDRSH Wt, [Xn, #imm] (load 16-bit half, sign-extended)
+    StrbImm,  // STRB Wt, [Xn, #imm]  (store 8-bit byte)
+    LdrsbImm, // LDRSB Wt, [Xn, #imm] (load 8-bit byte, sign-extended)
+    StrFpImm, // STR Dt, [Xn, #imm]  (float store)
+    LdrFpImm, // LDR Dt, [Xn, #imm]  (float load)
     // Register-offset loads/stores: address = base + index << shift.
     // Operands: [dest, base, idx, Imm(shift)]. Shift ∈ {0,1,2,3}.
     // Sprint 05: emitted by `scaled_addressing_fusion` from a
@@ -263,9 +263,9 @@ pub enum ArmOpcode {
     // ±32KB range (14-bit signed × 4), tighter than BCond — needs its own relax bound.
     Tbz,
     Tbnz,
-    Bl,    // BL label  (call)
-    Blr,   // BLR reg   (indirect call)
-    Ret,   // RET
+    Bl,  // BL label  (call)
+    Blr, // BLR reg   (indirect call)
+    Ret, // RET
 
     // ---- Extend ----
     Sxtw, // SXTW Xd, Wn (sign-extend 32→64)

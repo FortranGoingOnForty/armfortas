@@ -177,15 +177,15 @@ pub enum InstKind {
     VMax(ValueId, ValueId),
     VICmp(CmpOp, ValueId, ValueId),
     VFCmp(CmpOp, ValueId, ValueId),
-    VLoad(ValueId),                 // ptr → vector
-    VStore(ValueId, ValueId),       // (vector, ptr)
-    VBitcast(ValueId, IrType),      // reinterpret element layout
-    VExtract(ValueId, u8),          // extract lane `n`
-    VInsert(ValueId, u8, ValueId),  // (vector, lane, scalar) → vector
-    VBroadcast(ValueId),            // scalar → vector (every lane)
-    VReduceSum(ValueId),            // vector → scalar (cross-lane sum)
-    VReduceMin(ValueId),            // vector → scalar (cross-lane min)
-    VReduceMax(ValueId),            // vector → scalar (cross-lane max)
+    VLoad(ValueId),                // ptr → vector
+    VStore(ValueId, ValueId),      // (vector, ptr)
+    VBitcast(ValueId, IrType),     // reinterpret element layout
+    VExtract(ValueId, u8),         // extract lane `n`
+    VInsert(ValueId, u8, ValueId), // (vector, lane, scalar) → vector
+    VBroadcast(ValueId),           // scalar → vector (every lane)
+    VReduceSum(ValueId),           // vector → scalar (cross-lane sum)
+    VReduceMin(ValueId),           // vector → scalar (cross-lane min)
+    VReduceMax(ValueId),           // vector → scalar (cross-lane max)
 }
 
 /// Block terminator — exactly one per basic block.

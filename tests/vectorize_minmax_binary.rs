@@ -69,17 +69,9 @@ fn o3_vectorizes_elementwise_minmax_binary() {
     assert_eq!(trimmed[1], "1 16 16 1", "i32 min wrong: {:?}", trimmed[1]);
     // f32 / f64 max start "3.2"; min start "1.".
     for max_line in [trimmed[2], trimmed[4]] {
-        assert!(
-            max_line.starts_with("3.2"),
-            "fp max wrong: {:?}",
-            max_line
-        );
+        assert!(max_line.starts_with("3.2"), "fp max wrong: {:?}", max_line);
     }
     for min_line in [trimmed[3], trimmed[5]] {
-        assert!(
-            min_line.starts_with("1."),
-            "fp min wrong: {:?}",
-            min_line
-        );
+        assert!(min_line.starts_with("1."), "fp min wrong: {:?}", min_line);
     }
 }

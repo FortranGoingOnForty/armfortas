@@ -43,9 +43,7 @@ fn o3_vectorizes_manual_sum_reduction_loop() {
     // VAdd of two <V x i32> vectors in the body, and a VReduceSum
     // after the loop.
     assert!(
-        o3_ir.contains("vbroadcast")
-            && o3_ir.contains("vadd")
-            && o3_ir.contains("vreduce_sum"),
+        o3_ir.contains("vbroadcast") && o3_ir.contains("vadd") && o3_ir.contains("vreduce_sum"),
         "expected NeonVectorize reduction shape (vbroadcast + vadd + vreduce_sum):\n{}",
         o3_ir
     );

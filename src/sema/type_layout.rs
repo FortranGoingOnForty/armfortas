@@ -100,7 +100,9 @@ impl TypeLayout {
     /// scan stays the dominant cost — a HashMap-based field index
     /// (full Sprint 07 scope) will land in a follow-up.
     pub fn field(&self, name: &str) -> Option<&FieldLayout> {
-        self.fields.iter().find(|f| f.name.eq_ignore_ascii_case(name))
+        self.fields
+            .iter()
+            .find(|f| f.name.eq_ignore_ascii_case(name))
     }
 
     /// Look up a type-bound procedure by method name.
