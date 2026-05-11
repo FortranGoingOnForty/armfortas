@@ -216,6 +216,32 @@ fn simple_local_i128_ordered_branch_runs_at_o0() {
 }
 
 #[test]
+fn pointer_to_i128_storage_round_trips_through_c_ptr_at_o0() {
+    let result = capture_from_path(&CaptureRequest {
+        input: fixture("integer16_pointer_roundtrip.f90"),
+        requested: BTreeSet::from([Stage::Run]),
+        opt_level: OptLevel::O0,
+    })
+    .expect("i128 pointer roundtrip program should run");
+
+    let run = result
+        .get(Stage::Run)
+        .and_then(CapturedStage::as_run)
+        .expect("missing run capture");
+
+    assert_eq!(
+        run.exit_code, 0,
+        "expected successful i128 pointer roundtrip:\n{:#?}",
+        run
+    );
+    assert!(
+        run.stdout.contains("ok"),
+        "i128 pointer roundtrip should print ok:\n{}",
+        run.stdout
+    );
+}
+
+#[test]
 fn simple_local_i128_select_lowers_to_ir_select_and_pair_csel_at_o0() {
     let ir = capture_text(
         CaptureRequest {
