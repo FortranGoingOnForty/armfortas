@@ -39,16 +39,8 @@ fn o3_vectorizes_where_block_int() {
         },
         Stage::OptIr,
     );
-    assert!(
-        o3_ir.contains("vselect"),
-        "expected vselect:\n{}",
-        o3_ir
-    );
-    assert!(
-        o3_ir.contains("vicmp"),
-        "expected vicmp:\n{}",
-        o3_ir
-    );
+    assert!(o3_ir.contains("vselect"), "expected vselect:\n{}", o3_ir);
+    assert!(o3_ir.contains("vicmp"), "expected vicmp:\n{}", o3_ir);
 
     let stdout = capture_run_stdout(CaptureRequest {
         input: source,

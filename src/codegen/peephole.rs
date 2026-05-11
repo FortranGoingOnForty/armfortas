@@ -649,66 +649,67 @@ fn scaled_addressing_fuse_block(
         // The scaled-index operand: defined by a single-use Mul. Try
         // either commuted order — `add base, scaled` or `add scaled,
         // base` (isel emits the former, but be defensive).
-        let try_pair = |scaled: VRegId, base: VRegId| -> Option<(usize, VRegId, VRegId, i64, usize)> {
-            let &(mul_idx, mul_op) = defs.get(&scaled)?;
-            if mul_op != ArmOpcode::Mul {
-                return None;
-            }
-            if use_count.get(&scaled).copied().unwrap_or(0) != 1 {
-                return None;
-            }
-            let mul_inst = &block.insts[mul_idx];
-            if mul_inst.operands.len() < 3 {
-                return None;
-            }
-            let m_lhs = match &mul_inst.operands[1] {
-                MachineOperand::VReg(v) => *v,
-                _ => return None,
-            };
-            let m_rhs = match &mul_inst.operands[2] {
-                MachineOperand::VReg(v) => *v,
-                _ => return None,
-            };
-            // The constant operand of the Mul — must be defined by a
-            // single-use Movz with chunk ∈ {1,2,4,8} at shift 0.
-            let try_const = |const_v: VRegId, idx_v: VRegId| -> Option<(VRegId, i64, usize)> {
-                let &(movz_idx, movz_op) = defs.get(&const_v)?;
-                if movz_op != ArmOpcode::Movz {
+        let try_pair =
+            |scaled: VRegId, base: VRegId| -> Option<(usize, VRegId, VRegId, i64, usize)> {
+                let &(mul_idx, mul_op) = defs.get(&scaled)?;
+                if mul_op != ArmOpcode::Mul {
                     return None;
                 }
-                if use_count.get(&const_v).copied().unwrap_or(0) != 1 {
+                if use_count.get(&scaled).copied().unwrap_or(0) != 1 {
                     return None;
                 }
-                let movz_inst = &block.insts[movz_idx];
-                // Movz operands: [dest, Imm(chunk), Shift(amount)]. We
-                // require shift==0 and chunk ∈ {1,2,4,8}.
-                if movz_inst.operands.len() < 3 {
+                let mul_inst = &block.insts[mul_idx];
+                if mul_inst.operands.len() < 3 {
                     return None;
                 }
-                let chunk = match &movz_inst.operands[1] {
-                    MachineOperand::Imm(v) => *v,
+                let m_lhs = match &mul_inst.operands[1] {
+                    MachineOperand::VReg(v) => *v,
                     _ => return None,
                 };
-                let shift_amount = match &movz_inst.operands[2] {
-                    MachineOperand::Shift(s) => *s,
+                let m_rhs = match &mul_inst.operands[2] {
+                    MachineOperand::VReg(v) => *v,
                     _ => return None,
                 };
-                if shift_amount != 0 {
-                    return None;
-                }
-                let lsl_shift: i64 = match chunk {
-                    1 => 0,
-                    2 => 1,
-                    4 => 2,
-                    8 => 3,
-                    _ => return None,
+                // The constant operand of the Mul — must be defined by a
+                // single-use Movz with chunk ∈ {1,2,4,8} at shift 0.
+                let try_const = |const_v: VRegId, idx_v: VRegId| -> Option<(VRegId, i64, usize)> {
+                    let &(movz_idx, movz_op) = defs.get(&const_v)?;
+                    if movz_op != ArmOpcode::Movz {
+                        return None;
+                    }
+                    if use_count.get(&const_v).copied().unwrap_or(0) != 1 {
+                        return None;
+                    }
+                    let movz_inst = &block.insts[movz_idx];
+                    // Movz operands: [dest, Imm(chunk), Shift(amount)]. We
+                    // require shift==0 and chunk ∈ {1,2,4,8}.
+                    if movz_inst.operands.len() < 3 {
+                        return None;
+                    }
+                    let chunk = match &movz_inst.operands[1] {
+                        MachineOperand::Imm(v) => *v,
+                        _ => return None,
+                    };
+                    let shift_amount = match &movz_inst.operands[2] {
+                        MachineOperand::Shift(s) => *s,
+                        _ => return None,
+                    };
+                    if shift_amount != 0 {
+                        return None;
+                    }
+                    let lsl_shift: i64 = match chunk {
+                        1 => 0,
+                        2 => 1,
+                        4 => 2,
+                        8 => 3,
+                        _ => return None,
+                    };
+                    Some((idx_v, lsl_shift, movz_idx))
                 };
-                Some((idx_v, lsl_shift, movz_idx))
+                try_const(m_rhs, m_lhs)
+                    .or_else(|| try_const(m_lhs, m_rhs))
+                    .map(|(idx, shift, movz_idx)| (mul_idx, base, idx, shift, movz_idx))
             };
-            try_const(m_rhs, m_lhs)
-                .or_else(|| try_const(m_lhs, m_rhs))
-                .map(|(idx, shift, movz_idx)| (mul_idx, base, idx, shift, movz_idx))
-        };
 
         let resolved = try_pair(add_rhs, add_lhs).or_else(|| try_pair(add_lhs, add_rhs));
         let Some((mul_idx, base_v, idx_v, shift, movz_idx)) = resolved else {
@@ -936,7 +937,11 @@ fn ldp_stp_fuse_block(mf: &mut MachineFunction, mb_idx: usize) {
             i += 1;
             continue;
         };
-        let lower_op_value = if lower_idx_in_pair == 0 { av.clone() } else { bv.clone() };
+        let lower_op_value = if lower_idx_in_pair == 0 {
+            av.clone()
+        } else {
+            bv.clone()
+        };
 
         if !ldp_imm_in_range(lower_off, width) {
             i += 1;
@@ -1026,7 +1031,8 @@ fn ldp_stp_fuse_block(mf: &mut MachineFunction, mb_idx: usize) {
     // Apply rewrites. Order doesn't matter because plans don't
     // overlap (consumed set ensures each index is in at most one).
     let block = &mut mf.blocks[mb_idx];
-    let mut remove_idxs: std::collections::HashSet<usize> = plans.iter().map(|p| p.upper_idx).collect();
+    let mut remove_idxs: std::collections::HashSet<usize> =
+        plans.iter().map(|p| p.upper_idx).collect();
     for plan in &plans {
         block.insts[plan.lower_idx] = plan.new_inst.clone();
     }

@@ -102,7 +102,8 @@ pub(super) struct Ctx<'a> {
     pub(super) type_layouts: Option<&'a crate::sema::type_layout::TypeLayoutRegistry>,
     /// Array names declared in each scope with allocatable/pointer storage.
     pub(super) allocatable_array_targets: HashSet<(ScopeId, String)>,
-    pub(super) lookup_cache: RefCell<std::collections::HashMap<(ScopeId, String), Option<&'a Symbol>>>,
+    pub(super) lookup_cache:
+        RefCell<std::collections::HashMap<(ScopeId, String), Option<&'a Symbol>>>,
     /// Stack of associate-name frames. Each frame is the lowercase set of
     /// associate-names introduced by an enclosing ASSOCIATE construct. Names
     /// in any active frame shadow same-named USE-imported or host-scope

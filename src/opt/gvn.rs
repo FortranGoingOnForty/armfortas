@@ -119,14 +119,60 @@ impl PureCallPolicy {
 /// armfortas runtime symbols emitted by lower.
 const PURE_EXTERNAL_INTRINSICS: &[&str] = &[
     // libm scalar math (single + double).
-    "sinf", "cosf", "tanf", "asinf", "acosf", "atanf", "atan2f",
-    "sinhf", "coshf", "tanhf", "expf", "expm1f", "logf", "log2f",
-    "log10f", "log1pf", "sqrtf", "cbrtf", "fabsf", "ceilf", "floorf",
-    "roundf", "truncf", "powf", "fmodf", "hypotf", "copysignf",
-    "sin", "cos", "tan", "asin", "acos", "atan", "atan2",
-    "sinh", "cosh", "tanh", "exp", "expm1", "log", "log2",
-    "log10", "log1p", "sqrt", "cbrt", "fabs", "ceil", "floor",
-    "round", "trunc", "pow", "fmod", "hypot", "copysign",
+    "sinf",
+    "cosf",
+    "tanf",
+    "asinf",
+    "acosf",
+    "atanf",
+    "atan2f",
+    "sinhf",
+    "coshf",
+    "tanhf",
+    "expf",
+    "expm1f",
+    "logf",
+    "log2f",
+    "log10f",
+    "log1pf",
+    "sqrtf",
+    "cbrtf",
+    "fabsf",
+    "ceilf",
+    "floorf",
+    "roundf",
+    "truncf",
+    "powf",
+    "fmodf",
+    "hypotf",
+    "copysignf",
+    "sin",
+    "cos",
+    "tan",
+    "asin",
+    "acos",
+    "atan",
+    "atan2",
+    "sinh",
+    "cosh",
+    "tanh",
+    "exp",
+    "expm1",
+    "log",
+    "log2",
+    "log10",
+    "log1p",
+    "sqrt",
+    "cbrt",
+    "fabs",
+    "ceil",
+    "floor",
+    "round",
+    "trunc",
+    "pow",
+    "fmod",
+    "hypot",
+    "copysign",
 ];
 
 fn is_pure_external_intrinsic(name: &str) -> bool {
@@ -138,9 +184,7 @@ fn reads_non_argument_memory(func: &Function) -> bool {
         for inst in &block.insts {
             match &inst.kind {
                 InstKind::GlobalAddr(_) => return true,
-                InstKind::Call(FuncRef::External(name), _)
-                    if !is_pure_external_intrinsic(name) =>
-                {
+                InstKind::Call(FuncRef::External(name), _) if !is_pure_external_intrinsic(name) => {
                     return true;
                 }
                 InstKind::RuntimeCall(_, _) => return true,
@@ -805,9 +849,24 @@ mod tests {
         let mut f = Function::new("test".into(), vec![], IrType::Int(IntWidth::I32));
         let entry = f.entry;
         let i32t = IrType::Int(IntWidth::I32);
-        let a = push_inst(&mut f, entry, InstKind::ConstInt(7, IntWidth::I32), i32t.clone());
-        let b = push_inst(&mut f, entry, InstKind::ConstInt(11, IntWidth::I32), i32t.clone());
-        let c = push_inst(&mut f, entry, InstKind::ConstInt(13, IntWidth::I32), i32t.clone());
+        let a = push_inst(
+            &mut f,
+            entry,
+            InstKind::ConstInt(7, IntWidth::I32),
+            i32t.clone(),
+        );
+        let b = push_inst(
+            &mut f,
+            entry,
+            InstKind::ConstInt(11, IntWidth::I32),
+            i32t.clone(),
+        );
+        let c = push_inst(
+            &mut f,
+            entry,
+            InstKind::ConstInt(13, IntWidth::I32),
+            i32t.clone(),
+        );
         // (a + b) + c
         let ab = push_inst(&mut f, entry, InstKind::IAdd(a, b), i32t.clone());
         let r1 = push_inst(&mut f, entry, InstKind::IAdd(ab, c), i32t.clone());
@@ -1294,10 +1353,22 @@ mod tests {
             .find(|inst| inst.id == call2)
             .expect("call2 inst");
         let test_defs = inst_map(caller_before);
-        let key1 = key_of(call1_inst, &replacements, &pure_calls, &wrappers, &test_defs)
-            .expect("call1 should key");
-        let key2 = key_of(call2_inst, &replacements, &pure_calls, &wrappers, &test_defs)
-            .expect("call2 should key");
+        let key1 = key_of(
+            call1_inst,
+            &replacements,
+            &pure_calls,
+            &wrappers,
+            &test_defs,
+        )
+        .expect("call1 should key");
+        let key2 = key_of(
+            call2_inst,
+            &replacements,
+            &pure_calls,
+            &wrappers,
+            &test_defs,
+        )
+        .expect("call2 should key");
         assert_eq!(
             key1, key2,
             "wrapper-based call keys should line up before the pass runs"

@@ -1378,12 +1378,7 @@ pub extern "C" fn afs_read_real64(unit: i32, val: *mut f64, iostat: *mut i32) {
 /// consume from there. Stream-unformatted reads continue using their
 /// existing per-helper raw-byte path.
 #[no_mangle]
-pub extern "C" fn afs_list_read_begin(
-    unit: i32,
-    iostat: *mut i32,
-    iomsg: *mut u8,
-    iomsg_len: i64,
-) {
+pub extern "C" fn afs_list_read_begin(unit: i32, iostat: *mut i32, iomsg: *mut u8, iomsg_len: i64) {
     if !iostat.is_null() {
         unsafe {
             *iostat = 0;

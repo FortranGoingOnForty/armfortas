@@ -180,7 +180,7 @@ pub(crate) fn alloc_decls(
                                 .map(|specs| vec![None; specs.len()])
                                 .unwrap_or_default(),
                             is_class: false,
-            logical_kind: None,
+                            logical_kind: None,
                             last_dim_assumed_size: false,
                         },
                     );
@@ -217,14 +217,16 @@ pub(crate) fn alloc_decls(
                                 is_pointer: true,
                                 runtime_dim_upper: vec![],
                                 is_class: false,
-            logical_kind: None,
+                                logical_kind: None,
                                 last_dim_assumed_size: false,
                             },
                         );
                         continue;
                     }
                 }
-                if is_pointer_attr && matches!(type_spec, TypeSpec::Class(_)) && array_spec.is_none()
+                if is_pointer_attr
+                    && matches!(type_spec, TypeSpec::Class(_))
+                    && array_spec.is_none()
                 {
                     if let TypeSpec::Class(ref type_name) = type_spec {
                         let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384);
@@ -286,7 +288,7 @@ pub(crate) fn alloc_decls(
                             is_pointer: is_pointer_attr,
                             runtime_dim_upper: vec![],
                             is_class: false,
-            logical_kind: None,
+                            logical_kind: None,
                             last_dim_assumed_size: false,
                         },
                     );
@@ -297,12 +299,8 @@ pub(crate) fn alloc_decls(
                     if (!matches!(type_spec, TypeSpec::Character(_)) || char_len.is_some())
                         && array_spec_has_runtime_bounds(specs, &param_consts, Some(st))
                     {
-                        let dims = extract_array_dims_with_init(
-                            specs,
-                            init_expr,
-                            &param_consts,
-                            Some(st),
-                        );
+                        let dims =
+                            extract_array_dims_with_init(specs, init_expr, &param_consts, Some(st));
                         let (array_elem_ty, array_derived_type, array_char_kind) = if matches!(
                             type_spec,
                             TypeSpec::Character(_)
@@ -384,19 +382,22 @@ pub(crate) fn alloc_decls(
                                                     b.const_i64(1)
                                                 }
                                             });
-                                        let up64 =
-                                            eval_const_array_bound(upper, &param_consts, Some(st))
-                                                .map(|value| b.const_i64(value))
-                                                .unwrap_or_else(|| {
-                                                    let raw = super::expr::lower_expr_with_optional_layouts(
-                                                        b,
-                                                        locals,
-                                                        upper,
-                                                        st,
-                                                        Some(type_layouts),
-                                                    );
-                                                    widen_to_i64(b, raw)
-                                                });
+                                        let up64 = eval_const_array_bound(
+                                            upper,
+                                            &param_consts,
+                                            Some(st),
+                                        )
+                                        .map(|value| b.const_i64(value))
+                                        .unwrap_or_else(|| {
+                                            let raw = super::expr::lower_expr_with_optional_layouts(
+                                                b,
+                                                locals,
+                                                upper,
+                                                st,
+                                                Some(type_layouts),
+                                            );
+                                            widen_to_i64(b, raw)
+                                        });
                                         (lo64, up64)
                                     }
                                     _ => (b.const_i64(1), b.const_i64(1)),
@@ -472,7 +473,7 @@ pub(crate) fn alloc_decls(
                                 is_pointer: false,
                                 runtime_dim_upper: vec![],
                                 is_class: false,
-            logical_kind: None,
+                                logical_kind: None,
                                 last_dim_assumed_size: false,
                             },
                         );
@@ -489,12 +490,8 @@ pub(crate) fn alloc_decls(
                         // which is exactly how local `character(len=N),
                         // parameter :: builtins(...)` ended up crashing fortsh
                         // `type`/`command` with `0x202020...` memmove faults.
-                        let dims = extract_array_dims_with_init(
-                            specs,
-                            init_expr,
-                            &param_consts,
-                            Some(st),
-                        );
+                        let dims =
+                            extract_array_dims_with_init(specs, init_expr, &param_consts, Some(st));
                         let total_size: i64 = dims.iter().map(|(_, size)| *size).product();
                         let elem_ty = fixed_char_storage_ir_type(len);
                         let elem_bytes = ir_scalar_byte_size(&elem_ty);
@@ -542,7 +539,7 @@ pub(crate) fn alloc_decls(
                                     is_pointer: false,
                                     runtime_dim_upper: vec![],
                                     is_class: false,
-            logical_kind: None,
+                                    logical_kind: None,
                                     last_dim_assumed_size: false,
                                 },
                             );
@@ -570,7 +567,7 @@ pub(crate) fn alloc_decls(
                                     is_pointer: false,
                                     runtime_dim_upper: vec![],
                                     is_class: false,
-            logical_kind: None,
+                                    logical_kind: None,
                                     last_dim_assumed_size: false,
                                 },
                             );
@@ -606,7 +603,7 @@ pub(crate) fn alloc_decls(
                                 is_pointer: true,
                                 runtime_dim_upper: vec![],
                                 is_class: false,
-            logical_kind: None,
+                                logical_kind: None,
                                 last_dim_assumed_size: false,
                             },
                         );
@@ -649,7 +646,7 @@ pub(crate) fn alloc_decls(
                                 is_pointer: false,
                                 runtime_dim_upper: vec![],
                                 is_class: false,
-            logical_kind: None,
+                                logical_kind: None,
                                 last_dim_assumed_size: false,
                             },
                         );
@@ -710,7 +707,7 @@ pub(crate) fn alloc_decls(
                                 is_pointer: false,
                                 runtime_dim_upper: vec![],
                                 is_class: false,
-            logical_kind: None,
+                                logical_kind: None,
                                 last_dim_assumed_size: false,
                             },
                         );
@@ -769,21 +766,22 @@ pub(crate) fn alloc_decls(
                                 .unwrap_or_default(),
                             is_class: matches!(type_spec, TypeSpec::Class(_)),
                             logical_kind: if let TypeSpec::Logical(sel) = type_spec {
-                                Some(extract_kind_with_context(sel, 4, Some(&param_consts), Some(st)))
+                                Some(extract_kind_with_context(
+                                    sel,
+                                    4,
+                                    Some(&param_consts),
+                                    Some(st),
+                                ))
                             } else {
                                 None
                             },
-                                                    last_dim_assumed_size: false,
+                            last_dim_assumed_size: false,
                         },
                     );
                 } else if let Some(specs) = array_spec {
                     // Fixed-size array variable.
-                    let dims = extract_array_dims_with_init(
-                        specs,
-                        init_expr,
-                        &param_consts,
-                        Some(st),
-                    );
+                    let dims =
+                        extract_array_dims_with_init(specs, init_expr, &param_consts, Some(st));
                     let total_size: i64 = dims.iter().map(|(_, size)| *size).product();
                     let (array_elem_ty, array_derived_type, array_char_kind) =
                         if matches!(type_spec, TypeSpec::Character(_)) {
@@ -866,11 +864,16 @@ pub(crate) fn alloc_decls(
                                 runtime_dim_upper: vec![],
                                 is_class: false,
                                 logical_kind: if let TypeSpec::Logical(sel) = type_spec {
-                                    Some(extract_kind_with_context(sel, 4, Some(&param_consts), Some(st)))
+                                    Some(extract_kind_with_context(
+                                        sel,
+                                        4,
+                                        Some(&param_consts),
+                                        Some(st),
+                                    ))
                                 } else {
                                     None
                                 },
-                                                            last_dim_assumed_size: false,
+                                last_dim_assumed_size: false,
                             },
                         );
                     } else {
@@ -907,8 +910,12 @@ pub(crate) fn alloc_decls(
                                 is_pointer: false,
                                 runtime_dim_upper: vec![],
                                 is_class: false,
-                                logical_kind: type_spec_logical_kind(type_spec, Some(&param_consts), Some(st)),
-                                                            last_dim_assumed_size: false,
+                                logical_kind: type_spec_logical_kind(
+                                    type_spec,
+                                    Some(&param_consts),
+                                    Some(st),
+                                ),
+                                last_dim_assumed_size: false,
                             },
                         );
                     }
@@ -938,7 +945,7 @@ pub(crate) fn alloc_decls(
                                 is_pointer: false,
                                 runtime_dim_upper: vec![],
                                 is_class: false,
-            logical_kind: None,
+                                logical_kind: None,
                                 last_dim_assumed_size: false,
                             },
                         );
@@ -960,7 +967,7 @@ pub(crate) fn alloc_decls(
                                 is_pointer: false,
                                 runtime_dim_upper: vec![],
                                 is_class: false,
-            logical_kind: None,
+                                logical_kind: None,
                                 last_dim_assumed_size: false,
                             },
                         );
@@ -999,7 +1006,7 @@ pub(crate) fn alloc_decls(
                             is_pointer: true,
                             runtime_dim_upper: vec![],
                             is_class: false,
-            logical_kind: None,
+                            logical_kind: None,
                             last_dim_assumed_size: false,
                         },
                     );
@@ -1041,7 +1048,7 @@ pub(crate) fn alloc_decls(
                                     is_pointer: false,
                                     runtime_dim_upper: vec![],
                                     is_class: false,
-            logical_kind: None,
+                                    logical_kind: None,
                                     last_dim_assumed_size: false,
                                 },
                             );
@@ -1079,8 +1086,12 @@ pub(crate) fn alloc_decls(
                                 is_pointer: false,
                                 runtime_dim_upper: vec![],
                                 is_class: false,
-                                logical_kind: type_spec_logical_kind(type_spec, Some(&param_consts), Some(st)),
-                                                            last_dim_assumed_size: false,
+                                logical_kind: type_spec_logical_kind(
+                                    type_spec,
+                                    Some(&param_consts),
+                                    Some(st),
+                                ),
+                                last_dim_assumed_size: false,
                             },
                         );
                     } else {
@@ -1100,8 +1111,12 @@ pub(crate) fn alloc_decls(
                                 is_pointer: false,
                                 runtime_dim_upper: vec![],
                                 is_class: false,
-                                logical_kind: type_spec_logical_kind(type_spec, Some(&param_consts), Some(st)),
-                                                            last_dim_assumed_size: false,
+                                logical_kind: type_spec_logical_kind(
+                                    type_spec,
+                                    Some(&param_consts),
+                                    Some(st),
+                                ),
+                                last_dim_assumed_size: false,
                             },
                         );
                     }

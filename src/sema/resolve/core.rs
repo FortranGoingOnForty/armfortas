@@ -3,10 +3,10 @@
 //! First pass: collect declarations, create scopes, process USE/IMPLICIT.
 //! This establishes the symbol table that type checking (Sprint 13) will use.
 
-use crate::sema::symtab::*;
 use crate::ast::decl;
 use crate::ast::decl::{Attribute, Decl, SpannedDecl, TypeSpec};
 use crate::ast::unit::*;
+use crate::sema::symtab::*;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
@@ -138,7 +138,11 @@ fn backfill_function_result_type(
     let result_key = result_name.to_ascii_lowercase();
     let (type_info, pointer, allocatable) = match st.scope(function_scope).symbols.get(&result_key)
     {
-        Some(sym) => (sym.type_info.clone(), sym.attrs.pointer, sym.attrs.allocatable),
+        Some(sym) => (
+            sym.type_info.clone(),
+            sym.attrs.pointer,
+            sym.attrs.allocatable,
+        ),
         None => return,
     };
     let Some(type_info) = type_info else {
@@ -558,16 +562,8 @@ pub(super) fn resolve_unit(
             // Surface each declared procedure to the enclosing scope
             // so callers under IMPLICIT NONE can resolve the name,
             // and so BIND(C) external prototypes are callable.
-            for (
-                fn_name,
-                kind,
-                ti,
-                arg_names,
-                binding_label,
-                pure,
-                elemental,
-                result_rank,
-            ) in outer_refs
+            for (fn_name, kind, ti, arg_names, binding_label, pure, elemental, result_rank) in
+                outer_refs
             {
                 let span = unit.span;
                 let _ = st.define(Symbol {
@@ -629,7 +625,6 @@ pub(super) fn resolve_unit(
     }
     Ok(())
 }
-
 
 /// Walk all program units and compute layouts for derived types.
 fn compute_all_layouts(
@@ -718,10 +713,13 @@ fn inject_separate_module_procedure_args(
     let proc_lc = proc_name.to_lowercase();
     let iface_scope = st.all_scopes().iter().find_map(|scope| {
         let direct_parent_matches = scope.parent == Some(parent_module_scope);
-        let via_interface = scope.parent.map(|pid| {
-            matches!(st.scope(pid).kind, ScopeKind::Interface)
-                && st.scope(pid).parent == Some(parent_module_scope)
-        }).unwrap_or(false);
+        let via_interface = scope
+            .parent
+            .map(|pid| {
+                matches!(st.scope(pid).kind, ScopeKind::Interface)
+                    && st.scope(pid).parent == Some(parent_module_scope)
+            })
+            .unwrap_or(false);
         if !direct_parent_matches && !via_interface {
             return None;
         }
@@ -744,17 +742,13 @@ fn inject_separate_module_procedure_args(
     let arg_symbols: Vec<Symbol> = arg_order
         .iter()
         .filter_map(|n| {
-            st.scope(iface_scope)
-                .symbols
-                .get(n)
-                .cloned()
-                .or_else(|| {
-                    st.scope(iface_scope)
-                        .symbols
-                        .iter()
-                        .find(|(_, s)| s.name.eq_ignore_ascii_case(n))
-                        .map(|(_, s)| s.clone())
-                })
+            st.scope(iface_scope).symbols.get(n).cloned().or_else(|| {
+                st.scope(iface_scope)
+                    .symbols
+                    .iter()
+                    .find(|(_, s)| s.name.eq_ignore_ascii_case(n))
+                    .map(|(_, s)| s.clone())
+            })
         })
         .collect();
 
@@ -1250,10 +1244,7 @@ fn collect_const_derived_field_inits(
                     }
                 }
                 for (field_name, field_init) in overrides {
-                    combined.insert(
-                        field_name.to_ascii_lowercase(),
-                        (field_name, field_init),
-                    );
+                    combined.insert(field_name.to_ascii_lowercase(), (field_name, field_init));
                 }
 
                 for (_field_key, (field_name, field_init)) in combined {
@@ -1374,11 +1365,7 @@ fn resolve_proc_pointer_default_targets(
 /// unmodified.  USE associations are followed transitively so renames
 /// like `default_hasher => fnv_1_hasher` resolve to the underlying
 /// procedure's origin module.
-fn resolve_proc_pointer_link_symbol(
-    st: &SymbolTable,
-    from_scope: ScopeId,
-    target: &str,
-) -> String {
+fn resolve_proc_pointer_link_symbol(st: &SymbolTable, from_scope: ScopeId, target: &str) -> String {
     let key = target.to_lowercase();
     let mut seen = std::collections::HashSet::new();
     let mut current_scope = from_scope;
@@ -1658,7 +1645,8 @@ fn process_contains(
 ) -> Result<(), SemaError> {
     for unit in contains {
         // Register the subprogram name in the current scope before descending.
-        let host_is_submodule = matches!(st.scope(st.current_scope()).kind, ScopeKind::Submodule(_));
+        let host_is_submodule =
+            matches!(st.scope(st.current_scope()).kind, ScopeKind::Submodule(_));
         match &unit.node {
             ProgramUnit::Subroutine {
                 name, prefix, bind, ..
@@ -1905,23 +1893,23 @@ pub(super) fn eval_const_int_expr(
                             _ => None,
                         }?;
                         match ty {
-                            TypeInfo::Integer { kind } => Some(match kind
-                                .unwrap_or(crate::driver::defaults::default_int_kind())
-                            {
-                                1 => 2,
-                                2 => 4,
-                                4 => 9,
-                                8 => 18,
-                                16 => 38,
-                                _ => return None,
-                            }),
-                            TypeInfo::Real { kind } => Some(match kind
-                                .unwrap_or(crate::driver::defaults::default_real_kind())
-                            {
-                                4 => 37,
-                                8 => 307,
-                                _ => return None,
-                            }),
+                            TypeInfo::Integer { kind } => Some(
+                                match kind.unwrap_or(crate::driver::defaults::default_int_kind()) {
+                                    1 => 2,
+                                    2 => 4,
+                                    4 => 9,
+                                    8 => 18,
+                                    16 => 38,
+                                    _ => return None,
+                                },
+                            ),
+                            TypeInfo::Real { kind } => Some(
+                                match kind.unwrap_or(crate::driver::defaults::default_real_kind()) {
+                                    4 => 37,
+                                    8 => 307,
+                                    _ => return None,
+                                },
+                            ),
                             TypeInfo::DoublePrecision => Some(307),
                             _ => None,
                         }
@@ -1935,7 +1923,6 @@ pub(super) fn eval_const_int_expr(
         _ => None,
     }
 }
-
 
 fn attrs_to_symbol_attrs(attrs: &[Attribute], default_access: Access) -> SymbolAttrs {
     let mut sa = SymbolAttrs {

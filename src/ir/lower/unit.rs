@@ -90,16 +90,15 @@ pub(crate) fn lower_unit(
             );
             ctx.proc_scope_id = {
                 let raw_name = name.as_deref();
-                st.all_scopes()
-                    .iter()
-                    .enumerate()
-                    .find_map(|(idx, scope)| match (&scope.kind, raw_name) {
+                st.all_scopes().iter().enumerate().find_map(|(idx, scope)| {
+                    match (&scope.kind, raw_name) {
                         (crate::sema::symtab::ScopeKind::Program(scope_name), Some(n)) => {
                             scope_name.eq_ignore_ascii_case(n).then_some(idx)
                         }
                         (crate::sema::symtab::ScopeKind::Program(_), None) => Some(idx),
                         _ => None,
-                    })
+                    }
+                })
             };
             let mut pending_globals: Vec<PendingGlobal> = Vec::new();
 
@@ -110,7 +109,13 @@ pub(crate) fn lower_unit(
             {
                 let mut b = FuncBuilder::new(&mut func);
                 install_common_locals(&mut b, &mut ctx.locals, decls);
-                install_equivalence_locals(&mut b, &mut ctx.locals, decls, &visible_param_consts, st);
+                install_equivalence_locals(
+                    &mut b,
+                    &mut ctx.locals,
+                    decls,
+                    &visible_param_consts,
+                    st,
+                );
                 super::alloc::alloc_decls(
                     &mut b,
                     &mut ctx.locals,
@@ -418,12 +423,8 @@ pub(crate) fn lower_unit(
                         b.store(*pid, slot);
                         ctx.insert_scalar(pname.clone(), slot, elem_ty.clone());
                     } else {
-                        let uses_descriptor = arg_uses_descriptor_for_lowering(
-                            pname,
-                            decls,
-                            st,
-                            proc_scope_id,
-                        );
+                        let uses_descriptor =
+                            arg_uses_descriptor_for_lowering(pname, decls, st, proc_scope_id);
                         let uses_string_descriptor =
                             arg_uses_string_descriptor_from_decls(pname, decls);
                         let dt_name = arg_derived_type_name(pname, decls);
@@ -466,7 +467,9 @@ pub(crate) fn lower_unit(
                                 Some(&visible_param_consts),
                                 st,
                             ),
-                            last_dim_assumed_size: arg_last_dim_assumed_size_from_decls(pname, decls),
+                            last_dim_assumed_size: arg_last_dim_assumed_size_from_decls(
+                                pname, decls,
+                            ),
                         };
                         ctx.locals.insert(pname.clone(), info);
                         if decl_is_optional(pname, decls) {
@@ -539,7 +542,13 @@ pub(crate) fn lower_unit(
                 );
 
                 install_common_locals(&mut b, &mut ctx.locals, decls);
-                install_equivalence_locals(&mut b, &mut ctx.locals, decls, &visible_param_consts, st);
+                install_equivalence_locals(
+                    &mut b,
+                    &mut ctx.locals,
+                    decls,
+                    &visible_param_consts,
+                    st,
+                );
                 // Install host-association by_ref locals before alloc_decls
                 // so any same-named callee local (shouldn't occur per F
                 // scoping rules) is short-circuited, and so init_decls has
@@ -674,12 +683,13 @@ pub(crate) fn lower_unit(
                     HiddenResultAbi::ArrayDescriptor => 384,
                     HiddenResultAbi::StringDescriptor => 32,
                     HiddenResultAbi::DerivedAggregate => {
-                        let result_name = result
-                            .as_deref()
-                            .unwrap_or(name.as_str())
-                            .to_lowercase();
+                        let result_name = result.as_deref().unwrap_or(name.as_str()).to_lowercase();
                         derived_type_name_for_result_var(return_type, &result_name, decls)
-                            .and_then(|dt_name| type_layouts.get(&dt_name).map(|layout| layout.size.max(1) as u64))
+                            .and_then(|dt_name| {
+                                type_layouts
+                                    .get(&dt_name)
+                                    .map(|layout| layout.size.max(1) as u64)
+                            })
                             .unwrap_or(8)
                     }
                     HiddenResultAbi::ComplexBuffer => {
@@ -901,12 +911,8 @@ pub(crate) fn lower_unit(
                         b.store(*pid, slot);
                         ctx.insert_scalar(pname.clone(), slot, elem_ty.clone());
                     } else {
-                        let uses_descriptor = arg_uses_descriptor_for_lowering(
-                            pname,
-                            decls,
-                            st,
-                            proc_scope_id,
-                        );
+                        let uses_descriptor =
+                            arg_uses_descriptor_for_lowering(pname, decls, st, proc_scope_id);
                         let uses_string_descriptor =
                             arg_uses_string_descriptor_from_decls(pname, decls);
                         let dt_name = arg_derived_type_name(pname, decls);
@@ -950,7 +956,9 @@ pub(crate) fn lower_unit(
                                     Some(&visible_param_consts),
                                     st,
                                 ),
-                                last_dim_assumed_size: arg_last_dim_assumed_size_from_decls(pname, decls),
+                                last_dim_assumed_size: arg_last_dim_assumed_size_from_decls(
+                                    pname, decls,
+                                ),
                             },
                         );
                         if decl_is_optional(pname, decls) {
@@ -1043,17 +1051,14 @@ pub(crate) fn lower_unit(
                             is_pointer: false,
                             runtime_dim_upper: vec![],
                             is_class: false,
-            logical_kind: None,
+                            logical_kind: None,
                             last_dim_assumed_size: false,
                         },
                     );
                 } else if hidden_result_abi == HiddenResultAbi::DerivedAggregate {
-                    let dt_name = derived_type_name_for_result_var(
-                        return_type,
-                        &result_name,
-                        decls,
-                    )
-                    .expect("derived hidden-result function missing result type");
+                    let dt_name =
+                        derived_type_name_for_result_var(return_type, &result_name, decls)
+                            .expect("derived hidden-result function missing result type");
                     if let Some(layout) = type_layouts.get(&dt_name) {
                         if derived_layout_needs_runtime_initialization(layout, type_layouts) {
                             initialize_derived_storage(&mut b, ValueId(0), layout, type_layouts);
@@ -1074,7 +1079,7 @@ pub(crate) fn lower_unit(
                             is_pointer: false,
                             runtime_dim_upper: vec![],
                             is_class: false,
-            logical_kind: None,
+                            logical_kind: None,
                             last_dim_assumed_size: false,
                         },
                     );
@@ -1103,7 +1108,11 @@ pub(crate) fn lower_unit(
                         decls,
                         st,
                     );
-                    let fw = if kind == 8 { FloatWidth::F64 } else { FloatWidth::F32 };
+                    let fw = if kind == 8 {
+                        FloatWidth::F64
+                    } else {
+                        FloatWidth::F32
+                    };
                     let cplx_ty = IrType::Array(Box::new(IrType::Float(fw)), 2);
                     let zero_off = b.const_i64(0);
                     let typed_addr = b.gep(ValueId(0), vec![zero_off], cplx_ty.clone());
@@ -1165,7 +1174,7 @@ pub(crate) fn lower_unit(
                             is_pointer: true,
                             runtime_dim_upper: vec![],
                             is_class: false,
-            logical_kind: None,
+                            logical_kind: None,
                             last_dim_assumed_size: false,
                         },
                     );
@@ -1209,7 +1218,7 @@ pub(crate) fn lower_unit(
                             is_pointer: false,
                             runtime_dim_upper: vec![],
                             is_class: false,
-            logical_kind: None,
+                            logical_kind: None,
                             last_dim_assumed_size: false,
                         },
                     );
@@ -1223,7 +1232,13 @@ pub(crate) fn lower_unit(
                 }
 
                 install_common_locals(&mut b, &mut ctx.locals, decls);
-                install_equivalence_locals(&mut b, &mut ctx.locals, decls, &visible_param_consts, st);
+                install_equivalence_locals(
+                    &mut b,
+                    &mut ctx.locals,
+                    decls,
+                    &visible_param_consts,
+                    st,
+                );
                 install_host_ref_locals(&mut b, &mut ctx.locals, &host_ref_infos);
                 super::alloc::alloc_decls(
                     &mut b,
@@ -1495,16 +1510,18 @@ pub(crate) fn lower_unit(
                 } else {
                     None
                 };
-                let submod_scope = st.all_scopes().iter().enumerate().find_map(|(idx, scope)| {
-                    match &scope.kind {
-                        crate::sema::symtab::ScopeKind::Submodule(scope_name)
-                            if scope_name.eq_ignore_ascii_case(submodule_name) =>
-                        {
-                            Some(idx)
-                        }
-                        _ => None,
-                    }
-                });
+                let submod_scope =
+                    st.all_scopes()
+                        .iter()
+                        .enumerate()
+                        .find_map(|(idx, scope)| match &scope.kind {
+                            crate::sema::symtab::ScopeKind::Submodule(scope_name)
+                                if scope_name.eq_ignore_ascii_case(submodule_name) =>
+                            {
+                                Some(idx)
+                            }
+                            _ => None,
+                        });
                 lower_unit(
                     module,
                     sub,

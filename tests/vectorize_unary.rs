@@ -58,13 +58,33 @@ fn o3_vectorizes_unary_neg_and_abs_bodies() {
         .collect();
     assert_eq!(trimmed.len(), 5, "expected five output lines:\n{}", stdout);
     // n(1) = -b(1) = -(1-16) = 15
-    assert!(trimmed[0].starts_with("1.5"), "n(1) should be 15, got {:?}", trimmed[0]);
+    assert!(
+        trimmed[0].starts_with("1.5"),
+        "n(1) should be 15, got {:?}",
+        trimmed[0]
+    );
     // n(32) = -b(32) = -(32-16) = -16
-    assert!(trimmed[1].starts_with("-1.6"), "n(32) should be -16, got {:?}", trimmed[1]);
+    assert!(
+        trimmed[1].starts_with("-1.6"),
+        "n(32) should be -16, got {:?}",
+        trimmed[1]
+    );
     // a(1) = abs(-15) = 15
-    assert!(trimmed[2].starts_with("1.5"), "a(1) should be 15, got {:?}", trimmed[2]);
+    assert!(
+        trimmed[2].starts_with("1.5"),
+        "a(1) should be 15, got {:?}",
+        trimmed[2]
+    );
     // a(16) = abs(0) = 0
-    assert!(trimmed[3].starts_with("0.0"), "a(16) should be 0, got {:?}", trimmed[3]);
+    assert!(
+        trimmed[3].starts_with("0.0"),
+        "a(16) should be 0, got {:?}",
+        trimmed[3]
+    );
     // a(32) = abs(16) = 16
-    assert!(trimmed[4].starts_with("1.6"), "a(32) should be 16, got {:?}", trimmed[4]);
+    assert!(
+        trimmed[4].starts_with("1.6"),
+        "a(32) should be 16, got {:?}",
+        trimmed[4]
+    );
 }

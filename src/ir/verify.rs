@@ -599,9 +599,11 @@ fn check_type_consistency(func: &Function, inst: &Inst, errors: &mut Vec<VerifyE
             }
         }
         InstKind::VFma(a, b, c) => {
-            if let (Some(ta), Some(tb), Some(tc)) =
-                (func.value_type(*a), func.value_type(*b), func.value_type(*c))
-            {
+            if let (Some(ta), Some(tb), Some(tc)) = (
+                func.value_type(*a),
+                func.value_type(*b),
+                func.value_type(*c),
+            ) {
                 if ta != tb || tb != tc || ta != inst.ty {
                     errors.push(VerifyError {
                         msg: format!(
@@ -643,7 +645,10 @@ fn check_type_consistency(func: &Function, inst: &Inst, errors: &mut Vec<VerifyE
             if let Some(IrType::Vector { lanes, .. }) = func.value_type(*v) {
                 if *lane >= lanes {
                     errors.push(VerifyError {
-                        msg: format!("vextract lane {} out of range (vector has {} lanes)", lane, lanes),
+                        msg: format!(
+                            "vextract lane {} out of range (vector has {} lanes)",
+                            lane, lanes
+                        ),
                     });
                 }
             }
@@ -652,7 +657,10 @@ fn check_type_consistency(func: &Function, inst: &Inst, errors: &mut Vec<VerifyE
             if let Some(IrType::Vector { lanes, .. }) = func.value_type(*v) {
                 if *lane >= lanes {
                     errors.push(VerifyError {
-                        msg: format!("vinsert lane {} out of range (vector has {} lanes)", lane, lanes),
+                        msg: format!(
+                            "vinsert lane {} out of range (vector has {} lanes)",
+                            lane, lanes
+                        ),
                     });
                 }
             }

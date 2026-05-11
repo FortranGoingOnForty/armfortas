@@ -63,8 +63,7 @@ fn o3_vectorizes_where_with_unary_on_second_array_load() {
         .collect();
     assert_eq!(trimmed.len(), 1, "expected one output line:\n{}", stdout);
     assert_eq!(
-        trimmed[0],
-        "0.0000000E0     0.0000000E0    -1.7000000E1    -3.2000000E1",
+        trimmed[0], "0.0000000E0     0.0000000E0    -1.7000000E1    -3.2000000E1",
         "WHERE-unary-on-b wrong: {:?}",
         trimmed[0]
     );

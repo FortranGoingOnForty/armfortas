@@ -41,16 +41,8 @@ fn o3_vectorizes_where_block_masked_assign() {
     );
     // The diamond should be rewritten into a single body with vload a,
     // vload b_old, vfcmp, vselect, vstore.
-    assert!(
-        o3_ir.contains("vselect"),
-        "expected vselect:\n{}",
-        o3_ir
-    );
-    assert!(
-        o3_ir.contains("vfcmp"),
-        "expected vfcmp:\n{}",
-        o3_ir
-    );
+    assert!(o3_ir.contains("vselect"), "expected vselect:\n{}", o3_ir);
+    assert!(o3_ir.contains("vfcmp"), "expected vfcmp:\n{}", o3_ir);
     // Two vloads in the WHERE body: source `a` and old `b`.
     assert!(
         o3_ir.matches("vload").count() >= 2,

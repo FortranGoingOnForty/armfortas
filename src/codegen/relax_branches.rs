@@ -143,7 +143,10 @@ enum RelaxKind {
     /// `b.cond far` → `b.{!cond} skip; b far`
     BCond { cond: ArmCond },
     /// `cbz/cbnz reg far` → `cbnz/cbz reg skip; b far`
-    Cbz { invert_to: ArmOpcode, reg: MachineOperand },
+    Cbz {
+        invert_to: ArmOpcode,
+        reg: MachineOperand,
+    },
     /// `tbz/tbnz reg, #bit far` → `tbnz/tbz reg, #bit skip; b far`
     Tbz {
         invert_to: ArmOpcode,
@@ -490,7 +493,11 @@ mod tests {
         assert_eq!(mf.blocks.len(), blocks_before + 1);
         let entry = &mf.blocks[0];
         assert_eq!(entry.insts.len(), 2);
-        assert_eq!(entry.insts[0].opcode, ArmOpcode::Cbnz, "cbz inverts to cbnz");
+        assert_eq!(
+            entry.insts[0].opcode,
+            ArmOpcode::Cbnz,
+            "cbz inverts to cbnz"
+        );
         assert_eq!(entry.insts[1].opcode, ArmOpcode::B);
         assert!(matches!(
             entry.insts[1].operands[0],
@@ -591,7 +598,11 @@ mod tests {
         assert_eq!(mf.blocks.len(), blocks_before + 1);
         let entry = &mf.blocks[0];
         assert_eq!(entry.insts.len(), 2);
-        assert_eq!(entry.insts[0].opcode, ArmOpcode::Tbnz, "tbz inverts to tbnz");
+        assert_eq!(
+            entry.insts[0].opcode,
+            ArmOpcode::Tbnz,
+            "tbz inverts to tbnz"
+        );
         // Bit operand survives the rewrite.
         assert!(matches!(entry.insts[0].operands[1], MachineOperand::Imm(7)));
         assert_eq!(entry.insts[1].opcode, ArmOpcode::B);

@@ -65,8 +65,7 @@ fn o3_vectorizes_where_with_constant_scalar_store() {
         .collect();
     assert_eq!(trimmed.len(), 1, "expected one output line:\n{}", stdout);
     assert_eq!(
-        trimmed[0],
-        "1.0000000E0     1.6000000E1    -1.0000000E0    -1.0000000E0",
+        trimmed[0], "1.0000000E0     1.6000000E1    -1.0000000E0    -1.0000000E0",
         "const WHERE wrong: {:?}",
         trimmed[0]
     );

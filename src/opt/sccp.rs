@@ -837,7 +837,10 @@ mod tests {
         // First inst should be a ConstInt(7).
         match merge.insts.first().map(|i| &i.kind) {
             Some(InstKind::ConstInt(7, IntWidth::I32)) => {}
-            other => panic!("expected ConstInt(7,I32) at start of merge, got {:?}", other),
+            other => panic!(
+                "expected ConstInt(7,I32) at start of merge, got {:?}",
+                other
+            ),
         }
         // bb_b is unreachable post-fold and should be pruned.
         assert!(

@@ -148,10 +148,7 @@ struct ThreadAction {
     arm: bool,
 }
 
-fn plan_threads(
-    func: &Function,
-    consts: &HashMap<ValueId, ConstKey>,
-) -> Vec<ThreadAction> {
+fn plan_threads(func: &Function, consts: &HashMap<ValueId, ConstKey>) -> Vec<ThreadAction> {
     // Block id → (cond_param_id, true_dest, true_args, false_dest, false_args)
     let mut actions: Vec<ThreadAction> = Vec::new();
     let mut seen_pred_join: HashSet<(BlockId, BlockId)> = HashSet::new();
@@ -435,8 +432,7 @@ mod tests {
             ty: IrType::Bool,
         });
         // Entry passes function param `x` (non-constant) into join.
-        f.block_mut(f.entry).terminator =
-            Some(Terminator::Branch(bb_join, vec![ValueId(0)]));
+        f.block_mut(f.entry).terminator = Some(Terminator::Branch(bb_join, vec![ValueId(0)]));
         f.block_mut(bb_join).terminator = Some(Terminator::CondBranch {
             cond: join_p,
             true_dest: bb_a,
@@ -493,8 +489,7 @@ mod tests {
             ty: IrType::Bool,
             span: dummy_span(),
         });
-        f.block_mut(f.entry).terminator =
-            Some(Terminator::Branch(bb_join, vec![const_t]));
+        f.block_mut(f.entry).terminator = Some(Terminator::Branch(bb_join, vec![const_t]));
         f.block_mut(bb_join).terminator = Some(Terminator::CondBranch {
             cond: join_p,
             true_dest: bb_a,

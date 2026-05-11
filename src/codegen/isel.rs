@@ -1469,7 +1469,8 @@ fn select_inst(
             // generic offset cursor, so dispatching by the pointee
             // would silently truncate non-byte stores.
             let val_ty = func.value_type(*val);
-            let val_class = mf.vregs
+            let val_class = mf
+                .vregs
                 .iter()
                 .find(|v| v.id == val_vreg)
                 .map(|v| v.class)
@@ -3028,10 +3029,7 @@ fn store_opcode_for(ty: Option<&IrType>, class: RegClass) -> ArmOpcode {
 /// arms in `select_inst`. The wide-i128 paths build their own operand
 /// pairs directly because they target the `emit_*_phys_i128_pair`
 /// helpers, which take `i64` offsets and only need a base operand.
-fn narrow_load_store_addr(
-    ctx: &ISelCtx,
-    addr: ValueId,
-) -> (MachineOperand, MachineOperand) {
+fn narrow_load_store_addr(ctx: &ISelCtx, addr: ValueId) -> (MachineOperand, MachineOperand) {
     if let Some(&offset) = ctx.alloca_offsets.get(&addr) {
         (
             MachineOperand::PhysReg(PhysReg::FP),
@@ -3069,7 +3067,14 @@ fn emit_i128_binop_via_slots(
     let lhs_slot = ctx.lookup_wide_slot(lhs_id);
     let rhs_slot = ctx.lookup_wide_slot(rhs_id);
     let fp = || MachineOperand::PhysReg(PhysReg::FP);
-    emit_load_phys_i128_pair(mf, mb, fp(), lhs_slot as i64, PhysReg::Gp(16), PhysReg::Gp(17));
+    emit_load_phys_i128_pair(
+        mf,
+        mb,
+        fp(),
+        lhs_slot as i64,
+        PhysReg::Gp(16),
+        PhysReg::Gp(17),
+    );
     match op {
         I128BinOp::Add => emit_i128_add_from_slot(
             mf,
@@ -3090,7 +3095,14 @@ fn emit_i128_binop_via_slots(
             PhysReg::Gp(8),
         ),
     }
-    emit_store_phys_i128_pair(mf, mb, fp(), dest_slot as i64, PhysReg::Gp(16), PhysReg::Gp(17));
+    emit_store_phys_i128_pair(
+        mf,
+        mb,
+        fp(),
+        dest_slot as i64,
+        PhysReg::Gp(16),
+        PhysReg::Gp(17),
+    );
 }
 
 fn type_to_reg_class(ty: &IrType) -> RegClass {
@@ -3419,7 +3431,7 @@ fn alloca_size(ty: &IrType) -> u32 {
             elem_size * (*count as u32)
         }
         IrType::FuncPtr(_) => 8,
-        IrType::Struct(_) => 8, // placeholder
+        IrType::Struct(_) => 8,      // placeholder
         IrType::Vector { .. } => 16, // 128-bit NEON
     }
 }
@@ -4125,8 +4137,12 @@ mod tests {
         }
 
         let mf = select_function(&func);
-        let opcodes: Vec<ArmOpcode> =
-            mf.blocks.iter().flat_map(|b| b.insts.iter()).map(|i| i.opcode).collect();
+        let opcodes: Vec<ArmOpcode> = mf
+            .blocks
+            .iter()
+            .flat_map(|b| b.insts.iter())
+            .map(|i| i.opcode)
+            .collect();
         assert!(
             opcodes.contains(&ArmOpcode::FaddV4S),
             "expected FaddV4S in MIR, got {:?}",
@@ -4207,8 +4223,12 @@ mod tests {
         }
 
         let mf = select_function(&func);
-        let opcodes: Vec<ArmOpcode> =
-            mf.blocks.iter().flat_map(|b| b.insts.iter()).map(|i| i.opcode).collect();
+        let opcodes: Vec<ArmOpcode> = mf
+            .blocks
+            .iter()
+            .flat_map(|b| b.insts.iter())
+            .map(|i| i.opcode)
+            .collect();
         assert!(
             opcodes.contains(&ArmOpcode::FmlaV2D),
             "expected FmlaV2D, got {:?}",
