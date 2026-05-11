@@ -53,6 +53,34 @@ fn write_i128_ptr(dst: *mut i128, value: i128) {
     }
 }
 
+#[inline]
+fn write_i64_ptr(dst: *mut i64, value: i64) {
+    if !dst.is_null() {
+        unsafe { std::ptr::write_unaligned(dst, value) };
+    }
+}
+
+#[inline]
+fn write_i32_ptr(dst: *mut i32, value: i32) {
+    if !dst.is_null() {
+        unsafe { std::ptr::write_unaligned(dst, value) };
+    }
+}
+
+#[inline]
+fn write_f64_ptr(dst: *mut f64, value: f64) {
+    if !dst.is_null() {
+        unsafe { std::ptr::write_unaligned(dst, value) };
+    }
+}
+
+#[inline]
+fn write_f32_ptr(dst: *mut f32, value: f32) {
+    if !dst.is_null() {
+        unsafe { std::ptr::write_unaligned(dst, value) };
+    }
+}
+
 // ---- Unit status types ----
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1052,11 +1080,7 @@ pub extern "C" fn afs_read_int(unit: i32, val: *mut i32, iostat: *mut i32) {
         if let Some(bytes) = u.read_buffer_take(4) {
             let mut b = [0u8; 4];
             b.copy_from_slice(&bytes);
-            if !val.is_null() {
-                unsafe {
-                    *val = i32::from_ne_bytes(b);
-                }
-            }
+            write_i32_ptr(val, i32::from_ne_bytes(b));
             if !iostat.is_null() {
                 unsafe {
                     *iostat = 0;
@@ -1064,14 +1088,17 @@ pub extern "C" fn afs_read_int(unit: i32, val: *mut i32, iostat: *mut i32) {
             }
             return;
         }
+        if u.form == Form::Unformatted && u.access == Access::Stream {
+            let mut b = [0u8; 4];
+            if read_stream_unformatted_exact(u, &mut b, iostat) == Some(true) {
+                write_i32_ptr(val, i32::from_ne_bytes(b));
+            }
+            return;
+        }
         match u.next_read_token() {
             Ok(Some(token)) => match token.parse::<i32>() {
                 Ok(v) => {
-                    if !val.is_null() {
-                        unsafe {
-                            *val = v;
-                        }
-                    }
+                    write_i32_ptr(val, v);
                     if !iostat.is_null() {
                         unsafe {
                             *iostat = 0;
@@ -1121,11 +1148,7 @@ pub extern "C" fn afs_read_int64(unit: i32, val: *mut i64, iostat: *mut i32) {
         if let Some(bytes) = u.read_buffer_take(8) {
             let mut b = [0u8; 8];
             b.copy_from_slice(&bytes);
-            if !val.is_null() {
-                unsafe {
-                    *val = i64::from_ne_bytes(b);
-                }
-            }
+            write_i64_ptr(val, i64::from_ne_bytes(b));
             if !iostat.is_null() {
                 unsafe {
                     *iostat = 0;
@@ -1133,14 +1156,17 @@ pub extern "C" fn afs_read_int64(unit: i32, val: *mut i64, iostat: *mut i32) {
             }
             return;
         }
+        if u.form == Form::Unformatted && u.access == Access::Stream {
+            let mut b = [0u8; 8];
+            if read_stream_unformatted_exact(u, &mut b, iostat) == Some(true) {
+                write_i64_ptr(val, i64::from_ne_bytes(b));
+            }
+            return;
+        }
         match u.next_read_token() {
             Ok(Some(token)) => match token.parse::<i64>() {
                 Ok(v) => {
-                    if !val.is_null() {
-                        unsafe {
-                            *val = v;
-                        }
-                    }
+                    write_i64_ptr(val, v);
                     if !iostat.is_null() {
                         unsafe {
                             *iostat = 0;
@@ -1192,6 +1218,13 @@ pub extern "C" fn afs_read_int128(unit: i32, val: *mut i128, iostat: *mut i32) {
             }
             return;
         }
+        if u.form == Form::Unformatted && u.access == Access::Stream {
+            let mut b = [0u8; 16];
+            if read_stream_unformatted_exact(u, &mut b, iostat) == Some(true) {
+                write_i128_ptr(val, i128::from_ne_bytes(b));
+            }
+            return;
+        }
         match u.next_read_token() {
             Ok(Some(token)) => match token.parse::<i128>() {
                 Ok(v) => {
@@ -1239,15 +1272,18 @@ pub extern "C" fn afs_read_real(unit: i32, val: *mut f32, iostat: *mut i32) {
         if let Some(bytes) = u.read_buffer_take(4) {
             let mut b = [0u8; 4];
             b.copy_from_slice(&bytes);
-            if !val.is_null() {
-                unsafe {
-                    *val = f32::from_ne_bytes(b);
-                }
-            }
+            write_f32_ptr(val, f32::from_ne_bytes(b));
             if !iostat.is_null() {
                 unsafe {
                     *iostat = 0;
                 }
+            }
+            return;
+        }
+        if u.form == Form::Unformatted && u.access == Access::Stream {
+            let mut b = [0u8; 4];
+            if read_stream_unformatted_exact(u, &mut b, iostat) == Some(true) {
+                write_f32_ptr(val, f32::from_ne_bytes(b));
             }
             return;
         }
@@ -1257,11 +1293,7 @@ pub extern "C" fn afs_read_real(unit: i32, val: *mut f32, iostat: *mut i32) {
                 let normalized = token.replace('d', "e").replace('D', "E");
                 match normalized.parse::<f32>() {
                     Ok(v) => {
-                        if !val.is_null() {
-                            unsafe {
-                                *val = v;
-                            }
-                        }
+                        write_f32_ptr(val, v);
                         if !iostat.is_null() {
                             unsafe {
                                 *iostat = 0;
@@ -1309,15 +1341,18 @@ pub extern "C" fn afs_read_real64(unit: i32, val: *mut f64, iostat: *mut i32) {
         if let Some(bytes) = u.read_buffer_take(8) {
             let mut b = [0u8; 8];
             b.copy_from_slice(&bytes);
-            if !val.is_null() {
-                unsafe {
-                    *val = f64::from_ne_bytes(b);
-                }
-            }
+            write_f64_ptr(val, f64::from_ne_bytes(b));
             if !iostat.is_null() {
                 unsafe {
                     *iostat = 0;
                 }
+            }
+            return;
+        }
+        if u.form == Form::Unformatted && u.access == Access::Stream {
+            let mut b = [0u8; 8];
+            if read_stream_unformatted_exact(u, &mut b, iostat) == Some(true) {
+                write_f64_ptr(val, f64::from_ne_bytes(b));
             }
             return;
         }
@@ -1326,11 +1361,7 @@ pub extern "C" fn afs_read_real64(unit: i32, val: *mut f64, iostat: *mut i32) {
                 let normalized = token.replace('d', "e").replace('D', "E");
                 match normalized.parse::<f64>() {
                     Ok(v) => {
-                        if !val.is_null() {
-                            unsafe {
-                                *val = v;
-                            }
-                        }
+                        write_f64_ptr(val, v);
                         if !iostat.is_null() {
                             unsafe {
                                 *iostat = 0;
@@ -1653,6 +1684,49 @@ impl Unit {
             )),
         }
     }
+}
+
+fn set_read_iostat_or_exit(iostat: *mut i32, status: i32, message: &str) {
+    if !iostat.is_null() {
+        unsafe {
+            *iostat = status;
+        }
+    } else {
+        eprintln!("READ: {}", message);
+        std::process::exit(1);
+    }
+}
+
+fn read_stream_unformatted_exact(u: &mut Unit, buf: &mut [u8], iostat: *mut i32) -> Option<bool> {
+    if !(u.form == Form::Unformatted && u.access == Access::Stream) {
+        return None;
+    }
+
+    let mut offset = 0usize;
+    while offset < buf.len() {
+        match u.read_raw(&mut buf[offset..]) {
+            Ok(0) if offset == 0 => {
+                set_read_iostat_or_exit(iostat, IOSTAT_END, "end of file");
+                return Some(false);
+            }
+            Ok(0) => {
+                set_read_iostat_or_exit(iostat, 1, "unexpected end of stream item");
+                return Some(false);
+            }
+            Ok(n) => offset += n,
+            Err(e) => {
+                set_read_iostat_or_exit(iostat, 1, &e.to_string());
+                return Some(false);
+            }
+        }
+    }
+
+    if !iostat.is_null() {
+        unsafe {
+            *iostat = 0;
+        }
+    }
+    Some(true)
 }
 
 /// Write a direct-access record (formatted string padded to recl).
@@ -2332,11 +2406,7 @@ pub extern "C" fn afs_read_internal_int(
     if let Some(token) = next_internal_token(buf, buf_len, pos) {
         match token.replace(',', "").parse::<i32>() {
             Ok(v) => {
-                if !val.is_null() {
-                    unsafe {
-                        *val = v;
-                    }
-                }
+                write_i32_ptr(val, v);
                 if !iostat.is_null() {
                     unsafe {
                         *iostat = 0;
@@ -2372,11 +2442,7 @@ pub extern "C" fn afs_read_internal_int64(
     if let Some(token) = next_internal_token(buf, buf_len, pos) {
         match token.replace(',', "").parse::<i64>() {
             Ok(v) => {
-                if !val.is_null() {
-                    unsafe {
-                        *val = v;
-                    }
-                }
+                write_i64_ptr(val, v);
                 if !iostat.is_null() {
                     unsafe {
                         *iostat = 0;
@@ -2449,11 +2515,7 @@ pub extern "C" fn afs_read_internal_real(
         let normalized = token.replace('d', "e").replace('D', "E").replace(',', "");
         match normalized.parse::<f64>() {
             Ok(v) => {
-                if !val.is_null() {
-                    unsafe {
-                        *val = v;
-                    }
-                }
+                write_f64_ptr(val, v);
                 if !iostat.is_null() {
                     unsafe {
                         *iostat = 0;
@@ -3628,11 +3690,7 @@ pub extern "C" fn afs_fmt_read_int(
         | Ok((desc @ FormatDesc::IntegerZ { .. }, field)) => {
             match parse_formatted_integer_field(&desc, &field).and_then(|v| i32::try_from(v).ok()) {
                 Some(v) => {
-                    if !val.is_null() {
-                        unsafe {
-                            *val = v;
-                        }
-                    }
+                    write_i32_ptr(val, v);
                     if !iostat.is_null() {
                         unsafe {
                             *iostat = 0;
@@ -3683,11 +3741,7 @@ pub extern "C" fn afs_fmt_read_int64(
         | Ok((desc @ FormatDesc::IntegerZ { .. }, field)) => {
             match parse_formatted_integer_field(&desc, &field).and_then(|v| i64::try_from(v).ok()) {
                 Some(v) => {
-                    if !val.is_null() {
-                        unsafe {
-                            *val = v;
-                        }
-                    }
+                    write_i64_ptr(val, v);
                     if !iostat.is_null() {
                         unsafe {
                             *iostat = 0;
@@ -3797,11 +3851,7 @@ pub extern "C" fn afs_fmt_read_real(
                 .replace(',', "");
             match normalized.parse::<f64>() {
                 Ok(v) => {
-                    if !val.is_null() {
-                        unsafe {
-                            *val = v;
-                        }
-                    }
+                    write_f64_ptr(val, v);
                     if !iostat.is_null() {
                         unsafe {
                             *iostat = 0;
@@ -3886,11 +3936,7 @@ pub extern "C" fn afs_fmt_read_int_internal(
         | Ok((desc @ FormatDesc::IntegerZ { .. }, field)) => {
             match parse_formatted_integer_field(&desc, &field).and_then(|v| i32::try_from(v).ok()) {
                 Some(v) => {
-                    if !val.is_null() {
-                        unsafe {
-                            *val = v;
-                        }
-                    }
+                    write_i32_ptr(val, v);
                     if !iostat.is_null() {
                         unsafe {
                             *iostat = 0;
@@ -3940,11 +3986,7 @@ pub extern "C" fn afs_fmt_read_int64_internal(
         | Ok((desc @ FormatDesc::IntegerZ { .. }, field)) => {
             match parse_formatted_integer_field(&desc, &field).and_then(|v| i64::try_from(v).ok()) {
                 Some(v) => {
-                    if !val.is_null() {
-                        unsafe {
-                            *val = v;
-                        }
-                    }
+                    write_i64_ptr(val, v);
                     if !iostat.is_null() {
                         unsafe {
                             *iostat = 0;
@@ -4052,11 +4094,7 @@ pub extern "C" fn afs_fmt_read_real_internal(
                 .replace(',', "");
             match normalized.parse::<f64>() {
                 Ok(v) => {
-                    if !val.is_null() {
-                        unsafe {
-                            *val = v;
-                        }
-                    }
+                    write_f64_ptr(val, v);
                     if !iostat.is_null() {
                         unsafe {
                             *iostat = 0;

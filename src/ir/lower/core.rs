@@ -20283,22 +20283,13 @@ pub(super) fn lower_read_into_addr(
             true
         }
         IrType::Float(FloatWidth::F32) => {
-            // Unit-read path takes an f64 buffer to keep the load-then-truncate
-            // shape uniform with the internal/formatted variants below, which
-            // all write f64 into the temp. afs_read_real takes *mut f32 so
-            // calling it on the f64 alloca corrupted the value (only 4 of 8
-            // bytes were initialized; the f64 reload then truncated nonsense
-            // to zero). Use afs_read_real64 here so the alloca and writer
-            // widths match.
-            let tmp = b.alloca(IrType::Float(FloatWidth::F64));
-            let handled = match mode {
+            match mode {
                 ReadMode::Unit { unit, iostat } => {
                     b.call(
-                        FuncRef::External("afs_read_real64".into()),
-                        vec![unit, tmp, iostat],
+                        FuncRef::External("afs_read_real".into()),
+                        vec![unit, addr, iostat],
                         IrType::Void,
                     );
-                    true
                 }
                 ReadMode::Internal {
                     buf_ptr,
@@ -20306,12 +20297,15 @@ pub(super) fn lower_read_into_addr(
                     pos,
                     iostat,
                 } => {
+                    let tmp = b.alloca(IrType::Float(FloatWidth::F64));
                     b.call(
                         FuncRef::External("afs_read_internal_real".into()),
                         vec![buf_ptr, buf_len, pos, tmp, iostat],
                         IrType::Void,
                     );
-                    true
+                    let wide = b.load_typed(tmp, IrType::Float(FloatWidth::F64));
+                    let narrow = b.float_trunc(wide, FloatWidth::F32);
+                    b.store(narrow, addr);
                 }
                 ReadMode::FormattedUnit {
                     unit,
@@ -20320,6 +20314,7 @@ pub(super) fn lower_read_into_addr(
                     item_idx,
                     iostat,
                 } => {
+                    let tmp = b.alloca(IrType::Float(FloatWidth::F64));
                     let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
                     b.call(
                         FuncRef::External("afs_fmt_read_real".into()),
@@ -20327,7 +20322,9 @@ pub(super) fn lower_read_into_addr(
                         IrType::Void,
                     );
                     bump_formatted_read_index(b, item_idx);
-                    true
+                    let wide = b.load_typed(tmp, IrType::Float(FloatWidth::F64));
+                    let narrow = b.float_trunc(wide, FloatWidth::F32);
+                    b.store(narrow, addr);
                 }
                 ReadMode::FormattedInternal {
                     buf_ptr,
@@ -20337,6 +20334,7 @@ pub(super) fn lower_read_into_addr(
                     item_idx,
                     iostat,
                 } => {
+                    let tmp = b.alloca(IrType::Float(FloatWidth::F64));
                     let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
                     b.call(
                         FuncRef::External("afs_fmt_read_real_internal".into()),
@@ -20344,13 +20342,32 @@ pub(super) fn lower_read_into_addr(
                         IrType::Void,
                     );
                     bump_formatted_read_index(b, item_idx);
-                    true
+                    let wide = b.load_typed(tmp, IrType::Float(FloatWidth::F64));
+                    let narrow = b.float_trunc(wide, FloatWidth::F32);
+                    b.store(narrow, addr);
                 }
-            };
-            let wide = b.load_typed(tmp, IrType::Float(FloatWidth::F64));
-            let narrow = b.float_trunc(wide, FloatWidth::F32);
-            b.store(narrow, addr);
-            handled
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+fn lower_read_fixed_char_into_addr(
+    b: &mut FuncBuilder,
+    mode: ReadMode,
+    addr: ValueId,
+    len: i64,
+) -> bool {
+    match mode {
+        ReadMode::Unit { unit, iostat } => {
+            let len_v = b.const_i64(len);
+            b.call(
+                FuncRef::External("afs_read_string".into()),
+                vec![unit, addr, len_v, iostat],
+                IrType::Void,
+            );
+            true
         }
         _ => false,
     }
@@ -21735,6 +21752,10 @@ pub(super) fn lower_1d_slice_read(
 
     let base = array_base_addr(b, info);
     let elem_bytes = ir_scalar_byte_size(&info.ty);
+    let char_fixed_len = match info.char_kind {
+        CharKind::Fixed(n) => Some(n),
+        _ => None,
+    };
 
     let i_addr = b.alloca(IrType::Int(IntWidth::I32));
     b.store(start_val, i_addr);
@@ -21775,7 +21796,9 @@ pub(super) fn lower_1d_slice_read(
     let step = b.const_i64(elem_bytes);
     let byte_off = b.imul(zero_based64, step);
     let p = b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
-    let _ = lower_read_into_addr(b, mode, &info.ty, p);
+    if char_fixed_len.map(|len| lower_read_fixed_char_into_addr(b, mode, p, len)) != Some(true) {
+        let _ = lower_read_into_addr(b, mode, &info.ty, p);
+    }
     let next = b.iadd(i_val, stride_val);
     b.store(next, i_addr);
     b.branch(bb_check, vec![]);
@@ -21794,6 +21817,10 @@ pub(super) fn lower_section_read_nd(
 
     let base = array_base_addr(b, info);
     let elem_bytes = ir_scalar_byte_size(&info.ty);
+    let char_fixed_len = match info.char_kind {
+        CharKind::Fixed(n) => Some(n),
+        _ => None,
+    };
 
     struct DimSlice {
         counter: ValueId,
@@ -21908,7 +21935,11 @@ pub(super) fn lower_section_read_nd(
             }
             let off = byte_offset.unwrap_or_else(|| b.const_i64(0));
             let ptr = b.gep(base, vec![off], IrType::Int(IntWidth::I8));
-            let _ = lower_read_into_addr(b, mode, &info.ty, ptr);
+            if char_fixed_len.map(|len| lower_read_fixed_char_into_addr(b, mode, ptr, len))
+                != Some(true)
+            {
+                let _ = lower_read_into_addr(b, mode, &info.ty, ptr);
+            }
             b.branch(incrs[0], vec![]);
         } else {
             b.store(dims[d - 1].start_val, dims[d - 1].counter);
@@ -22078,6 +22109,10 @@ pub(super) fn lower_alloc_section_read(
 
     let elem_bytes = ir_scalar_byte_size(&info.ty);
     let base = array_base_addr(b, info);
+    let char_fixed_len = match info.char_kind {
+        CharKind::Fixed(n) => Some(n),
+        _ => None,
+    };
     // For assumed-shape dummies the local slot is a pointer-to-descriptor
     // (info.by_ref==true); array_descriptor_addr unwraps the indirection so
     // load_array_desc_i64_field reads the actual descriptor fields. Using
@@ -22214,7 +22249,11 @@ pub(super) fn lower_alloc_section_read(
             let elem_bytes_v = b.const_i64(elem_bytes);
             let byte_off = b.imul(off_elems, elem_bytes_v);
             let ptr = b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
-            let _ = lower_read_into_addr(b, mode, &info.ty, ptr);
+            if char_fixed_len.map(|len| lower_read_fixed_char_into_addr(b, mode, ptr, len))
+                != Some(true)
+            {
+                let _ = lower_read_into_addr(b, mode, &info.ty, ptr);
+            }
             b.branch(incrs[0], vec![]);
         } else {
             b.store(dims[d - 1].start_val, dims[d - 1].counter);
@@ -22845,6 +22884,10 @@ pub(super) fn lower_whole_array_write(
 pub(super) fn lower_whole_array_read(b: &mut FuncBuilder, info: &LocalInfo, mode: ReadMode) {
     let base = array_base_addr(b, info);
     let elem_bytes = ir_scalar_byte_size(&info.ty);
+    let char_fixed_len = match info.char_kind {
+        CharKind::Fixed(n) => Some(n),
+        _ => None,
+    };
     let n = array_total_elems_value(b, info);
 
     let i_addr = b.alloca(IrType::Int(IntWidth::I64));
@@ -22866,7 +22909,9 @@ pub(super) fn lower_whole_array_read(b: &mut FuncBuilder, info: &LocalInfo, mode
     let elem_bytes_v = b.const_i64(elem_bytes);
     let byte_off = b.imul(i_val, elem_bytes_v);
     let ptr = b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
-    let _ = lower_read_into_addr(b, mode, &info.ty, ptr);
+    if char_fixed_len.map(|len| lower_read_fixed_char_into_addr(b, mode, ptr, len)) != Some(true) {
+        let _ = lower_read_into_addr(b, mode, &info.ty, ptr);
+    }
     let one = b.const_i64(1);
     let next = b.iadd(i_val, one);
     b.store(next, i_addr);

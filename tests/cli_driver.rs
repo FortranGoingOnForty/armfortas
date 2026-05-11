@@ -563,6 +563,99 @@ fn stream_unformatted_char_write_preserves_exact_bytes() {
 }
 
 #[test]
+fn stream_unformatted_char_array_section_read_preserves_byte_count() {
+    let input = unique_path("stream_unformatted_char_array_section_read", "bin");
+    std::fs::write(&input, [118u8, 0, b'{', b'd', b'e', b's'])
+        .expect("cannot seed stream char section input");
+
+    let src = write_program(
+        &format!(
+            "program p\n  implicit none\n  integer :: unit_num, ios\n  character :: buf(4)\n  character(len=1) :: next\n  buf = 'Z'\n  open(newunit=unit_num, file='{}', status='old', action='read', access='stream', form='unformatted', iostat=ios)\n  if (ios /= 0) error stop 1\n  read(unit_num, iostat=ios) buf(1:2)\n  if (ios /= 0) error stop 2\n  if (iachar(buf(1)) /= 118) error stop 3\n  if (iachar(buf(2)) /= 0) error stop 4\n  if (buf(3) /= 'Z') error stop 5\n  if (buf(4) /= 'Z') error stop 6\n  read(unit_num, iostat=ios) next\n  if (ios /= 0) error stop 7\n  if (next /= '{{') error stop 8\n  print *, 'ok'\n  close(unit_num)\nend program\n",
+            input.display()
+        ),
+        "stream_unformatted_char_array_section_read.f90",
+    );
+    let out = unique_path("stream_unformatted_char_array_section_read", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("stream unformatted char array section read compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "stream unformatted char array section read compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("stream unformatted char array section read run failed");
+    assert!(
+        run.status.success(),
+        "stream unformatted char array section read failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected ok output, got: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&input);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn stream_unformatted_real_array_read_preserves_raw_f32_bytes() {
+    let input = unique_path("stream_unformatted_real_array_read", "dat");
+    let mut bytes = Vec::new();
+    for value in [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0] {
+        bytes.extend_from_slice(&value.to_ne_bytes());
+    }
+    std::fs::write(&input, bytes).expect("cannot seed stream real array input");
+
+    let src = write_program(
+        &format!(
+            "program p\n  implicit none\n  integer :: unit_num, ios\n  real :: x(2, 3)\n  x = 0.0\n  open(newunit=unit_num, file='{}', status='old', action='read', access='stream', form='unformatted', iostat=ios)\n  if (ios /= 0) error stop 1\n  read(unit_num, iostat=ios) x\n  close(unit_num)\n  if (ios /= 0) error stop 2\n  if (abs(x(1,1) - 1.0) > 1.0e-6) error stop 3\n  if (abs(x(2,1) - 2.0) > 1.0e-6) error stop 4\n  if (abs(x(1,3) - 5.0) > 1.0e-6) error stop 5\n  if (abs(x(2,3) - 6.0) > 1.0e-6) error stop 6\n  print *, 'ok'\nend program\n",
+            input.display()
+        ),
+        "stream_unformatted_real_array_read.f90",
+    );
+    let out = unique_path("stream_unformatted_real_array_read", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("stream unformatted real array read compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "stream unformatted real array read compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("stream unformatted real array read run failed");
+    assert!(
+        run.status.success(),
+        "stream unformatted real array read failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected ok output, got: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&input);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn sequential_unformatted_write_emits_record_markers_and_clears_iostat() {
     let output_file = unique_path("seq_unformatted_iostat", "bin");
     let src = write_program(
