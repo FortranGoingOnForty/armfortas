@@ -2946,6 +2946,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             if let Some(lp) = ctx.find_loop(name) {
                 let exit = lp.exit;
                 b.branch(exit, vec![]);
+            } else if let Some(exit) = ctx.find_construct_exit(name) {
+                b.branch(exit, vec![]);
             }
         }
 
@@ -4001,6 +4003,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
         }
 
         Stmt::Block {
+            name,
             uses,
             implicit,
             decls,
@@ -4137,7 +4140,18 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     &ctx.ambiguous_use_warnings,
                 );
             }
+            let bb_cleanup = b.create_block("block_cleanup");
+            let bb_after = b.create_block("block_after");
+
+            ctx.push_construct_exit(name.clone(), bb_cleanup);
             lower_stmts(b, ctx, body);
+            ctx.pop_construct_exit(name);
+
+            if b.func().block(b.current_block()).terminator.is_none() {
+                b.branch(bb_cleanup, vec![]);
+            }
+
+            b.set_block(bb_cleanup);
             // F2018 §7.5.6.3 / §9.7.3.2: at END BLOCK, finalize derived-type
             // locals that have FINAL subroutines and deallocate
             // block-scoped allocatables.  Only do this for keys that were
@@ -4162,6 +4176,11 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     );
                 }
             }
+            if b.func().block(b.current_block()).terminator.is_none() {
+                b.branch(bb_after, vec![]);
+            }
+
+            b.set_block(bb_after);
             // Restore the outer scope's locals.
             for (k, orig) in saved {
                 if let Some(info) = orig {
