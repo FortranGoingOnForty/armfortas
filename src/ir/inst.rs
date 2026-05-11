@@ -738,6 +738,14 @@ fn inst_i128_backend_o0_supported(module: &Module, func: &Function, inst: &Inst)
         InstKind::RuntimeCall(rf, args) if inst_ty_has_i128 || uses_i128 => {
             runtime_call_i128_backend_o0_supported(module, func, rf, args, &inst.ty)
         }
+        // Pointer/integer address casts are address-sized GP moves even when
+        // the pointer's pointee contains i128. Keep rejecting i128 integer
+        // values cast directly to pointers until the backend has a defined
+        // narrowing rule for that surface.
+        InstKind::PtrToInt(_) => true,
+        InstKind::IntToPtr(value, _) => func
+            .value_type(*value)
+            .is_some_and(|ty| !type_contains_i128(module, &ty)),
         InstKind::Store(..) => true,
         // Address-producing ops are safe even when they walk storage that
         // contains i128. The widened backend already knows how to carry the
