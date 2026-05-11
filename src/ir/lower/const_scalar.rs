@@ -301,18 +301,9 @@ pub(super) fn eval_const_scalar(
                     // without folding here the const ends up at runtime-zero
                     // because there is no module-level evaluator emitting
                     // the value into storage for non-trivial initializers.
-                    "sqrt" | "dsqrt"
-                    | "exp" | "dexp"
-                    | "log" | "dlog"
-                    | "log10" | "dlog10"
-                    | "sin" | "dsin"
-                    | "cos" | "dcos"
-                    | "tan" | "dtan"
-                    | "asin" | "dasin"
-                    | "acos" | "dacos"
-                    | "atan" | "datan"
-                    | "sinh" | "dsinh"
-                    | "cosh" | "dcosh"
+                    "sqrt" | "dsqrt" | "exp" | "dexp" | "log" | "dlog" | "log10" | "dlog10"
+                    | "sin" | "dsin" | "cos" | "dcos" | "tan" | "dtan" | "asin" | "dasin"
+                    | "acos" | "dacos" | "atan" | "datan" | "sinh" | "dsinh" | "cosh" | "dcosh"
                     | "tanh" | "dtanh" => {
                         let v = first_arg?.to_float();
                         let r = match key.as_str() {
@@ -370,7 +361,12 @@ pub(super) fn eval_const_scalar(
                         // suffix (1.0d0 → 8). Integer literal → 4. Named
                         // constant — look up in param_consts to recover
                         // its kind by value range.
-                        enum Kind { F32, F64, I32, I64 }
+                        enum Kind {
+                            F32,
+                            F64,
+                            I32,
+                            I64,
+                        }
                         let kind = match &e.node {
                             Expr::RealLiteral { text, kind, .. } => {
                                 let lower = text.to_ascii_lowercase();
@@ -400,7 +396,9 @@ pub(super) fn eval_const_scalar(
                         match (key.as_str(), kind) {
                             ("epsilon", Kind::F32) => Some(ConstScalar::Float(f32::EPSILON as f64)),
                             ("epsilon", Kind::F64) => Some(ConstScalar::Float(f64::EPSILON)),
-                            ("tiny", Kind::F32) => Some(ConstScalar::Float(f32::MIN_POSITIVE as f64)),
+                            ("tiny", Kind::F32) => {
+                                Some(ConstScalar::Float(f32::MIN_POSITIVE as f64))
+                            }
                             ("tiny", Kind::F64) => Some(ConstScalar::Float(f64::MIN_POSITIVE)),
                             ("huge", Kind::F32) => Some(ConstScalar::Float(f32::MAX as f64)),
                             ("huge", Kind::F64) => Some(ConstScalar::Float(f64::MAX)),
