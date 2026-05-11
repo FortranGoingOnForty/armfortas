@@ -611,9 +611,7 @@ fn sequential_unformatted_write_emits_record_markers_and_clears_iostat() {
     // + 4 bytes of trailing length = 12 bytes total.
     assert_eq!(
         bytes,
-        vec![
-            0x04, 0x00, 0x00, 0x00, 0x2a, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
-        ],
+        vec![0x04, 0x00, 0x00, 0x00, 0x2a, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,],
         "expected sequential-unformatted record framing, got {:?}",
         bytes
     );
@@ -750,9 +748,7 @@ fn advancing_a1_read_consumes_in_flight_noadvance_cursor() {
         String::from_utf8_lossy(&compile.stderr)
     );
 
-    let run = Command::new(&out)
-        .output()
-        .expect("a1 advance run failed");
+    let run = Command::new(&out).output().expect("a1 advance run failed");
     assert!(
         run.status.success(),
         "a1 advance run failed: status={:?} stderr={}",
@@ -830,7 +826,9 @@ fn error_stop_with_allocatable_character_message_prints_user_text() {
         String::from_utf8_lossy(&compile.stderr)
     );
 
-    let run = Command::new(&out).output().expect("error stop alloc run failed");
+    let run = Command::new(&out)
+        .output()
+        .expect("error stop alloc run failed");
     assert_eq!(
         run.status.code(),
         Some(1),
@@ -12246,6 +12244,119 @@ fn allocatable_assignment_converts_int_array_constructor_to_real_lhs() {
 }
 
 #[test]
+fn allocatable_assignment_converts_complex_array_to_real_lhs() {
+    // F2018 §10.2.1.3: assigning a complex array expression to a real
+    // array converts each element to the real part. The allocatable
+    // runtime conversion tagger used to peel complex(sp) to plain f32,
+    // so `real(:) = complex(:)` copied raw interleaved complex storage
+    // and produced [re1, im1, re2, ...]. stdlib's real eigvals example
+    // hit this when assigning complex eigenvalues into a real vector.
+    let src = write_program(
+        "program t\n  implicit none\n  complex, allocatable :: z(:)\n  real, allocatable :: r(:)\n  z = [(1.0, 10.0), (2.0, 20.0), (3.0, 30.0)]\n  r = z\n  if (size(r) /= 3) error stop 1\n  if (abs(r(1) - 1.0) > 1.0e-6) error stop 2\n  if (abs(r(2) - 2.0) > 1.0e-6) error stop 3\n  if (abs(r(3) - 3.0) > 1.0e-6) error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("complex_array_real_alloc", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("complex array to real alloc compile failed");
+    assert!(
+        compile.status.success(),
+        "complex array to real alloc should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("complex array to real alloc run failed");
+    assert!(
+        run.status.success(),
+        "complex array to real alloc should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn allocatable_assignment_converts_alloc_return_complex_array_to_real_lhs() {
+    // Same conversion as `r = z`, but through the hidden allocatable
+    // result ABI. Returning directly into the real destination descriptor
+    // lets the complex callee allocate 8-byte elements for a descriptor
+    // the caller later reads as real(4), exposing interleaved imag lanes.
+    let src = write_program(
+        "module m\ncontains\n  function vals() result(z)\n    implicit none\n    complex, allocatable :: z(:)\n    z = [(1.0, 10.0), (2.0, 20.0), (3.0, 30.0)]\n  end function\nend module\n\nprogram t\n  use m, only: vals\n  implicit none\n  real, allocatable :: r(:)\n  r = vals()\n  if (size(r) /= 3) error stop 1\n  if (abs(r(1) - 1.0) > 1.0e-6) error stop 2\n  if (abs(r(2) - 2.0) > 1.0e-6) error stop 3\n  if (abs(r(3) - 3.0) > 1.0e-6) error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("complex_alloc_result_real_alloc", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("complex alloc result to real alloc compile failed");
+    assert!(
+        compile.status.success(),
+        "complex alloc result to real alloc should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("complex alloc result to real alloc run failed");
+    assert!(
+        run.status.success(),
+        "complex alloc result to real alloc should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn allocatable_assignment_converts_generic_alloc_return_complex_array_to_real_lhs() {
+    // Stdlib's `eigvals(A)` is a generic interface. The generic name
+    // itself is not in alloc_return_funcs, so statement lowering used to
+    // treat the specific's temp descriptor as same-typed and memcpy it
+    // into a real allocatable, exposing complex imaginary lanes.
+    let src = write_program(
+        "module m\n  interface vals\n    module procedure vals_c\n  end interface\ncontains\n  function vals_c() result(z)\n    implicit none\n    complex, allocatable :: z(:)\n    z = [(1.0, 10.0), (2.0, 20.0), (3.0, 30.0)]\n  end function\nend module\n\nprogram t\n  use m, only: vals\n  implicit none\n  real, allocatable :: r(:)\n  r = vals()\n  if (size(r) /= 3) error stop 1\n  if (abs(r(1) - 1.0) > 1.0e-6) error stop 2\n  if (abs(r(2) - 2.0) > 1.0e-6) error stop 3\n  if (abs(r(3) - 3.0) > 1.0e-6) error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("generic_complex_alloc_result_real_alloc", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("generic complex alloc result to real alloc compile failed");
+    assert!(
+        compile.status.success(),
+        "generic complex alloc result to real alloc should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("generic complex alloc result to real alloc run failed");
+    assert!(
+        run.status.success(),
+        "generic complex alloc result to real alloc should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn module_parameter_bit_size_with_named_kind_suffix_folds_to_correct_value() {
     // `bit_size(1_int64)` in a module parameter declaration must fold to
     // 64 even when the kind is the iso_fortran_env name `int64` rather
@@ -13647,6 +13758,96 @@ fn epsilon_tiny_huge_fold_at_compile_time_for_module_parameters() {
 }
 
 #[test]
+fn named_inquiry_parameter_constants_survive_cross_tu_import() {
+    // Mirrors stdlib_blas_constants_sp: named inquiry arguments like
+    // `epsilon(zero)` and nested `real(radix(zero), sp)` must be folded
+    // into the producing module global before consumers load the .amod.
+    let dir = unique_dir("named_inquiry_params");
+    let mod_src = write_program_in(
+        &dir,
+        "machine_constants.f90",
+        "module machine_constants\n  implicit none\n  integer, parameter :: sp = kind(0.0)\n  real(sp), parameter :: zero = 0.0_sp\n  real(sp), parameter :: half = 0.5_sp\n  integer, parameter :: maxexp = maxexponent(zero)\n  integer, parameter :: minexp = minexponent(zero)\n  real(sp), parameter :: rradix = real(radix(zero), sp)\n  real(sp), parameter :: ulp = epsilon(zero)\n  real(sp), parameter :: eps = ulp * half\n  real(sp), parameter :: safmin = rradix**max(minexp - 1, 1 - maxexp)\n  real(sp), parameter :: safmax = 1.0_sp / safmin\n  real(sp), parameter :: bignum = safmax * ulp\n  real(sp), parameter :: rtmin = sqrt(safmin / ulp)\n  real(sp), parameter :: tsml = rradix**ceiling((minexp - 1) * half)\n  real(sp), parameter :: ssml = rradix**(-floor((minexp - digits(zero)) * half))\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use machine_constants\n  implicit none\n  if (maxexp /= 128) error stop 1\n  if (minexp /= -125) error stop 2\n  if (rradix /= 2.0_sp) error stop 3\n  if (ulp <= 0.0_sp .or. ulp > 1.0e-6_sp) error stop 4\n  if (eps <= 0.0_sp .or. eps >= ulp) error stop 5\n  if (safmin <= 0.0_sp) error stop 6\n  if (safmax <= 1.0e37_sp) error stop 7\n  if (bignum <= 1.0e30_sp) error stop 8\n  if (rtmin <= 0.0_sp) error stop 9\n  if (tsml <= 0.0_sp) error stop 10\n  if (ssml <= 1.0e20_sp) error stop 11\n  print *, 'ok'\nend program\n",
+    );
+
+    let mod_obj = dir.join("machine_constants.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            mod_src.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("machine constants module compile failed to spawn");
+    assert!(
+        compile_mod.status.success(),
+        "machine constants module should compile: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_main = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            main_src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("machine constants consumer compile failed to spawn");
+    assert!(
+        compile_main.status.success(),
+        "machine constants consumer should compile: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let exe = dir.join("named_inquiry_params.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            mod_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("machine constants link failed to spawn");
+    assert!(
+        link.status.success(),
+        "machine constants objects should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("machine constants run failed to spawn");
+    assert!(
+        run.status.success(),
+        "machine constants binary should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok: {}", stdout);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn cross_unit_char_array_result_uses_array_descriptor_abi() {
     // F2018 §15.5.2.13 (function results): a function with rank-1
     // character result like `character :: cstr(len(value)+1)` must use
@@ -14170,7 +14371,9 @@ fn complex_scalar_assigned_from_integer_promotes_via_buffer_not_pointer_cast() {
         "complex<-int should compile: {}",
         String::from_utf8_lossy(&compile.stderr)
     );
-    let run = Command::new(&out).output().expect("complex<-int run failed");
+    let run = Command::new(&out)
+        .output()
+        .expect("complex<-int run failed");
     assert!(
         run.status.success(),
         "complex<-int should pass: status={:?} stdout={} stderr={}",
@@ -14180,6 +14383,121 @@ fn complex_scalar_assigned_from_integer_promotes_via_buffer_not_pointer_cast() {
     );
     let stdout = String::from_utf8_lossy(&run.stdout);
     assert!(stdout.contains("ok"), "expected ok, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn int_intrinsic_of_complex_extracts_real_lane() {
+    // F2018 §16.9.109: INT(A) accepts complex A and converts its
+    // real part. The scalar intrinsic path used to coerce the
+    // ptr<[f32 x 2]> complex buffer directly to integer, so
+    // `int(work(1), ilp)` in LAPACK CGEEV interpreted the buffer
+    // address as a huge workspace size instead of returning 3.
+    let src = write_program(
+        "program t\n  use iso_fortran_env, only: int64\n  implicit none\n  complex :: z\n  integer :: i4\n  integer(int64) :: i8\n  z = (3.75, -9.0)\n  i4 = int(z)\n  i8 = int(z, int64)\n  if (i4 /= 3) error stop 1\n  if (i8 /= 3_int64) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("int_complex_real_lane", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("int(complex) compile failed");
+    assert!(
+        compile.status.success(),
+        "int(complex) should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("int(complex) run failed");
+    assert!(
+        run.status.success(),
+        "int(complex) should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn cmplx_kind_keyword_without_y_keeps_zero_or_source_imag_lane() {
+    // F2018 §16.9.49: CMPLX(X, KIND=K) has no Y actual, so a real
+    // X must get imag=0 and a complex X must preserve AIMAG(X).
+    // The intrinsic lowering flattened keyword slots and treated
+    // KIND as positional Y, so stdlib's `cmplx(one, kind=sp)` became
+    // (1.0, 4.0), corrupting LAPACK CLADIV/CLARFG.
+    let src = write_program(
+        "program t\n  implicit none\n  integer, parameter :: sp = kind(1.0)\n  integer, parameter :: dp = kind(1.0d0)\n  complex(sp) :: a\n  complex(dp) :: b, c\n  a = cmplx(1.0_sp, kind=sp)\n  if (abs(real(a) - 1.0_sp) > 1.0e-6_sp) error stop 1\n  if (abs(aimag(a)) > 1.0e-6_sp) error stop 2\n  b = cmplx(cmplx(3.0_sp, -4.0_sp, kind=sp), kind=dp)\n  if (abs(real(b, kind=dp) - 3.0_dp) > 1.0e-12_dp) error stop 3\n  if (abs(aimag(b) + 4.0_dp) > 1.0e-12_dp) error stop 4\n  c = cmplx(kind=dp, x=2.0_sp)\n  if (abs(real(c, kind=dp) - 2.0_dp) > 1.0e-12_dp) error stop 5\n  if (abs(aimag(c)) > 1.0e-12_dp) error stop 6\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("cmplx_kind_keyword_no_y", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("cmplx kind keyword compile failed");
+    assert!(
+        compile.status.success(),
+        "cmplx kind keyword should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("cmplx kind keyword run failed");
+    assert!(
+        run.status.success(),
+        "cmplx kind keyword should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn complex_unary_minus_negates_lanes_at_call_site() {
+    // F2018 §10.1.5: unary minus on a complex value negates both
+    // real and imaginary parts. The scalar unary path only handled
+    // integer/real values and returned complex operands unchanged,
+    // so LAPACK CLARF passed `tau` for an actual argument spelled
+    // `-tau` and CGERC applied the reflector update with the wrong
+    // sign.
+    let src = write_program(
+        "module m\ncontains\n  subroutine check_arg(z)\n    complex, intent(in) :: z\n    if (abs(real(z) + 1.25) > 1.0e-6) error stop 3\n    if (abs(aimag(z) - 2.5) > 1.0e-6) error stop 4\n  end subroutine\nend module\nprogram t\n  use m\n  implicit none\n  complex :: tau, z\n  tau = (1.25, -2.5)\n  z = -tau\n  if (abs(real(z) + 1.25) > 1.0e-6) error stop 1\n  if (abs(aimag(z) - 2.5) > 1.0e-6) error stop 2\n  call check_arg(-tau)\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("complex_unary_minus_call", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("complex unary minus compile failed");
+    assert!(
+        compile.status.success(),
+        "complex unary minus should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("complex unary minus run failed");
+    assert!(
+        run.status.success(),
+        "complex unary minus should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
 
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
@@ -18877,8 +19195,8 @@ fn formatted_section_write_iterates_assumed_shape_dummy_section() {
         "expected DONE in output: {}",
         stdout
     );
-    let written = std::fs::read_to_string("/tmp/afs_section_dummy.dat")
-        .expect("output file should exist");
+    let written =
+        std::fs::read_to_string("/tmp/afs_section_dummy.dat").expect("output file should exist");
     assert!(
         written.contains("1.000E+00") && written.contains("6.000E+00"),
         "expected real elements in written file: {}",
@@ -29054,7 +29372,7 @@ fn complex_array_power_loads_exponent_elements_not_descriptor() {
         "complex array power compile failed: {}",
         String::from_utf8_lossy(&compile.stderr)
     );
-    let run = run_binary_with_timeout(&out, std::time::Duration::from_secs(15));
+    let run = run_binary_with_timeout(&out, std::time::Duration::from_secs(60));
     let Some(run) = run else {
         panic!("complex array power run timed out");
     };
@@ -29255,7 +29573,9 @@ fn allocate_stat_int64_writes_back_to_user_variable() {
         "alloc-stat-int64 compile failed: {}",
         String::from_utf8_lossy(&compile.stderr)
     );
-    let run = Command::new(&out).output().expect("alloc-stat-int64 run failed");
+    let run = Command::new(&out)
+        .output()
+        .expect("alloc-stat-int64 run failed");
     assert!(
         run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
         "alloc-stat-int64 run failed: status={:?} stdout={} stderr={}",

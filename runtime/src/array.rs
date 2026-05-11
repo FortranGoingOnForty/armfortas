@@ -1572,6 +1572,8 @@ pub extern "C" fn afs_assign_allocatable_convert(
         1 => 2,
         2 | 4 => 4,
         3 | 5 => 8,
+        6 => 8,
+        7 => 16,
         _ => return,
     };
 
@@ -1597,8 +1599,7 @@ pub extern "C" fn afs_assign_allocatable_convert(
         for i in 0..source_ref.rank as usize {
             dest_ref.dims[i] = source_ref.dims[i];
             dest_ref.dims[i].stride = running_stride;
-            running_stride =
-                running_stride.saturating_mul(source_ref.dims[i].extent().max(1));
+            running_stride = running_stride.saturating_mul(source_ref.dims[i].extent().max(1));
         }
         let bytes = dest_ref.total_bytes();
         if bytes > 0 {
@@ -1626,6 +1627,8 @@ pub extern "C" fn afs_assign_allocatable_convert(
         1 => 2,
         2 | 4 => 4,
         3 | 5 => 8,
+        6 => 8,
+        7 => 16,
         _ => return,
     };
     // Source may be non-contiguous (e.g. transpose result, section).
@@ -1658,25 +1661,58 @@ pub extern "C" fn afs_assign_allocatable_convert(
             src_off_elems += idx[d] * strides[d];
         }
         let src_byte_off = src_off_elems * src_elem_size;
-        let src_val_f64: f64 = unsafe {
+        let (src_re_f64, src_im_f64): (f64, f64) = unsafe {
             match src_kind_tag {
-                0 => *(src_p.offset(src_byte_off as isize) as *const i8) as f64,
-                1 => *(src_p.offset(src_byte_off as isize) as *const i16) as f64,
-                2 => *(src_p.offset(src_byte_off as isize) as *const i32) as f64,
-                3 => *(src_p.offset(src_byte_off as isize) as *const i64) as f64,
-                4 => *(src_p.offset(src_byte_off as isize) as *const f32) as f64,
-                5 => *(src_p.offset(src_byte_off as isize) as *const f64),
+                0 => (
+                    *(src_p.offset(src_byte_off as isize) as *const i8) as f64,
+                    0.0,
+                ),
+                1 => (
+                    *(src_p.offset(src_byte_off as isize) as *const i16) as f64,
+                    0.0,
+                ),
+                2 => (
+                    *(src_p.offset(src_byte_off as isize) as *const i32) as f64,
+                    0.0,
+                ),
+                3 => (
+                    *(src_p.offset(src_byte_off as isize) as *const i64) as f64,
+                    0.0,
+                ),
+                4 => (
+                    *(src_p.offset(src_byte_off as isize) as *const f32) as f64,
+                    0.0,
+                ),
+                5 => (*(src_p.offset(src_byte_off as isize) as *const f64), 0.0),
+                6 => {
+                    let p = src_p.offset(src_byte_off as isize) as *const f32;
+                    ((*p) as f64, (*p.add(1)) as f64)
+                }
+                7 => {
+                    let p = src_p.offset(src_byte_off as isize) as *const f64;
+                    (*p, *p.add(1))
+                }
                 _ => return,
             }
         };
         unsafe {
             match dest_kind_tag {
-                0 => *(dst_p.add(k) as *mut i8) = src_val_f64 as i8,
-                1 => *(dst_p.add(2 * k) as *mut i16) = src_val_f64 as i16,
-                2 => *(dst_p.add(4 * k) as *mut i32) = src_val_f64 as i32,
-                3 => *(dst_p.add(8 * k) as *mut i64) = src_val_f64 as i64,
-                4 => *(dst_p.add(4 * k) as *mut f32) = src_val_f64 as f32,
-                5 => *(dst_p.add(8 * k) as *mut f64) = src_val_f64,
+                0 => *(dst_p.add(k) as *mut i8) = src_re_f64 as i8,
+                1 => *(dst_p.add(2 * k) as *mut i16) = src_re_f64 as i16,
+                2 => *(dst_p.add(4 * k) as *mut i32) = src_re_f64 as i32,
+                3 => *(dst_p.add(8 * k) as *mut i64) = src_re_f64 as i64,
+                4 => *(dst_p.add(4 * k) as *mut f32) = src_re_f64 as f32,
+                5 => *(dst_p.add(8 * k) as *mut f64) = src_re_f64,
+                6 => {
+                    let p = dst_p.add(8 * k) as *mut f32;
+                    *p = src_re_f64 as f32;
+                    *p.add(1) = src_im_f64 as f32;
+                }
+                7 => {
+                    let p = dst_p.add(16 * k) as *mut f64;
+                    *p = src_re_f64;
+                    *p.add(1) = src_im_f64;
+                }
                 _ => return,
             }
         }
