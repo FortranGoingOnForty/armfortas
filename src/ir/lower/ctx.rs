@@ -93,6 +93,12 @@ pub(super) struct LoopScope {
     pub(super) exit: BlockId,   // EXIT target
 }
 
+/// Non-loop construct target for named EXIT statements.
+pub(super) struct ConstructExitScope {
+    pub(super) name: String,
+    pub(super) exit: BlockId,
+}
+
 /// Character variable kind: how string storage is managed.
 #[derive(Clone, PartialEq)]
 pub(crate) enum CharKind {
@@ -201,6 +207,7 @@ pub(super) struct LowerCtx<'a> {
     /// character dummy as length zero instead of dereferencing its null slot.
     pub(super) optional_locals: HashSet<String>,
     pub(super) loops: Vec<LoopScope>,
+    pub(super) construct_exits: Vec<ConstructExitScope>,
     pub(super) st: &'a SymbolTable,
     /// Module-scoped globals visible by (lowercase module name,
     /// lowercase variable name). Populated by the lower_file
@@ -289,6 +296,7 @@ impl<'a> LowerCtx<'a> {
             locals: HashMap::new(),
             optional_locals: HashSet::new(),
             loops: Vec::new(),
+            construct_exits: Vec::new(),
             st,
             globals,
             type_layouts,
@@ -362,6 +370,21 @@ impl<'a> LowerCtx<'a> {
         self.loops.pop();
     }
 
+    pub(super) fn push_construct_exit(&mut self, name: Option<String>, exit: BlockId) {
+        if let Some(name) = name {
+            self.construct_exits.push(ConstructExitScope {
+                name: name.to_ascii_lowercase(),
+                exit,
+            });
+        }
+    }
+
+    pub(super) fn pop_construct_exit(&mut self, name: &Option<String>) {
+        if name.is_some() {
+            self.construct_exits.pop();
+        }
+    }
+
     /// Look up an F77 statement function by name in the current
     /// procedure scope. Returns `None` when the name doesn't refer to
     /// a statement function (or no procedure scope is set).
@@ -385,5 +408,14 @@ impl<'a> LowerCtx<'a> {
         } else {
             self.loops.last()
         }
+    }
+
+    pub(super) fn find_construct_exit(&self, name: &Option<String>) -> Option<BlockId> {
+        let name = name.as_ref()?;
+        self.construct_exits
+            .iter()
+            .rev()
+            .find(|scope| scope.name.eq_ignore_ascii_case(name))
+            .map(|scope| scope.exit)
     }
 }

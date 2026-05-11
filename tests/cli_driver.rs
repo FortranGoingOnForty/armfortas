@@ -9292,6 +9292,36 @@ fn block_interface_declares_callable_under_implicit_none() {
 }
 
 #[test]
+fn named_block_exit_after_deferred_char_assignment_skips_remaining_body() {
+    let src = write_program(
+        "program p\n  implicit none\n  integer, allocatable :: vshape(:)\n  integer :: stat\n  character(len=:), allocatable :: msg\n\n  allocate(vshape(0))\n  stat = 0\n\n  catch: block\n    if (size(vshape) /= 2) then\n      stat = 1\n      msg = 'rank mismatch'\n      exit catch\n    end if\n    call allocator(vshape)\n  end block catch\n\n  if (stat /= 1) error stop 20\n  if (.not. allocated(msg)) error stop 21\ncontains\n  subroutine allocator(vshape)\n    integer, intent(in) :: vshape(:)\n    integer, allocatable :: array(:, :)\n    allocate(array(vshape(1), vshape(2)))\n  end subroutine allocator\nend program\n",
+        "f90",
+    );
+    let out = unique_path("block_exit_after_msg", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("named block EXIT compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "named block EXIT should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("named block EXIT run spawn failed");
+    assert!(
+        run.status.success(),
+        "named block EXIT should skip block tail: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn public_derived_type_in_private_module_is_emitted_and_importable() {
     let dir = unique_dir("public_type_mod");
     let mod_src = write_program_in(
