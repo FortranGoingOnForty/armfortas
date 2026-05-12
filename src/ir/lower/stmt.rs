@@ -2763,10 +2763,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 Some(ctx.type_layouts),
             );
             let selector_info = associate_alias_local_info(b, ctx, selector);
+            let selector_is_unlimited = matches!(
+                selector_type.as_ref(),
+                Some(crate::sema::symtab::TypeInfo::ClassStar)
+            );
             let dynamic_class_selector = selector_info.as_ref().filter(|info| {
-                info.derived_type.is_some()
-                    && local_uses_array_descriptor(info)
+                local_uses_array_descriptor(info)
                     && local_declared_rank(info) == 0
+                    && (info.derived_type.is_some() || info.is_class || selector_is_unlimited)
             });
 
             if let Some(info) = dynamic_class_selector {
@@ -2782,7 +2786,30 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             type_name: guard_type,
                             body,
                         } => {
-                            if let Some(guard_layout) = ctx.type_layouts.get(guard_type) {
+                            if let Some(guard_tag) =
+                                intrinsic_class_star_type_tag_for_guard(guard_type)
+                            {
+                                let guard_tag = b.const_i64(guard_tag as i64);
+                                let matches = b.icmp(CmpOp::Eq, tag_val, guard_tag);
+                                let bb_match = b.create_block("type_is_intrinsic_match");
+                                let bb_next = b.create_block("type_is_intrinsic_next");
+                                b.cond_branch(matches, bb_match, vec![], bb_next, vec![]);
+
+                                b.set_block(bb_match);
+                                with_select_type_intrinsic_guard_binding(
+                                    b,
+                                    ctx,
+                                    selector,
+                                    assoc_name.as_deref(),
+                                    guard_type,
+                                    |b, ctx| lower_stmts(b, ctx, body),
+                                );
+                                if b.func().block(b.current_block()).terminator.is_none() {
+                                    b.branch(bb_end, vec![]);
+                                }
+
+                                b.set_block(bb_next);
+                            } else if let Some(guard_layout) = ctx.type_layouts.get(guard_type) {
                                 let guard_tag = b.const_i64(guard_layout.type_tag as i64);
                                 let matches = b.icmp(CmpOp::Eq, tag_val, guard_tag);
                                 let bb_match = b.create_block("type_is_match");
@@ -5317,6 +5344,76 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     }
                     let (ptr, len) = lower_string_expr_ctx(b, ctx, value);
                     store_string_descriptor_view(b, *tgt_field_ptr, ptr, len);
+                    return;
+                }
+                if field_is_class_star_pointer_descriptor(tgt_field) {
+                    let null_value = if let Expr::FunctionCall { callee, .. } = &value.node {
+                        if let Expr::Name { name } = &callee.node {
+                            name.eq_ignore_ascii_case("null")
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    let desc = if null_value {
+                        let zero = b.const_i64(0);
+                        b.int_to_ptr(zero, IrType::Int(IntWidth::I8))
+                    } else if let Some(desc) = match &value.node {
+                        Expr::ComponentAccess { .. } => {
+                            class_star_pointer_component_descriptor_value(
+                                b,
+                                &ctx.locals,
+                                value,
+                                ctx.st,
+                                ctx.type_layouts,
+                            )
+                        }
+                        _ => None,
+                    } {
+                        desc
+                    } else if let Expr::Name { name: src_name } = &value.node {
+                        let src_key = src_name.to_lowercase();
+                        if let Some(src_info) = ctx.locals.get(&src_key) {
+                            if local_uses_array_descriptor(src_info)
+                                && local_declared_rank(src_info) == 0
+                                && src_info.is_class
+                            {
+                                array_descriptor_addr(b, src_info)
+                            } else {
+                                box_actual_into_class_star_descriptor(
+                                    b,
+                                    &ctx.locals,
+                                    value,
+                                    ctx.st,
+                                    Some(ctx.type_layouts),
+                                )
+                            }
+                        } else {
+                            box_actual_into_class_star_descriptor(
+                                b,
+                                &ctx.locals,
+                                value,
+                                ctx.st,
+                                Some(ctx.type_layouts),
+                            )
+                        }
+                    } else {
+                        box_actual_into_class_star_descriptor(
+                            b,
+                            &ctx.locals,
+                            value,
+                            ctx.st,
+                            Some(ctx.type_layouts),
+                        )
+                    };
+                    store_byte_aggregate_field(
+                        b,
+                        *tgt_field_ptr,
+                        0,
+                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                        desc,
+                    );
                     return;
                 }
             }

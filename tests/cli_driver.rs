@@ -13226,6 +13226,151 @@ fn class_star_optional_argument_forwards_through_intermediate_subroutine() {
 }
 
 #[test]
+fn class_star_scalar_payload_reaches_procedure_callback() {
+    let src = write_program(
+        "module m\n\
+           implicit none\n\
+           abstract interface\n\
+             subroutine cb_i(payload)\n\
+               class(*), optional, intent(inout) :: payload\n\
+             end subroutine\n\
+           end interface\n\
+         contains\n\
+           subroutine run(callback, payload)\n\
+             procedure(cb_i), optional :: callback\n\
+             class(*), optional, intent(inout), target :: payload\n\
+             if (present(callback)) call callback(payload)\n\
+           end subroutine\n\
+         end module\n\
+         program p\n\
+           use m\n\
+           implicit none\n\
+           integer, target :: n\n\
+           n = 0\n\
+           call run(callback=mark, payload=n)\n\
+           if (n /= 7) error stop 1\n\
+           call run(callback=mark)\n\
+           if (n /= 7) error stop 2\n\
+           print *, 'ok'\n\
+         contains\n\
+           subroutine mark(payload)\n\
+             class(*), optional, intent(inout) :: payload\n\
+             if (.not. present(payload)) return\n\
+             select type (payload)\n\
+             type is (integer)\n\
+               payload = 7\n\
+             class default\n\
+               error stop 3\n\
+             end select\n\
+           end subroutine\n\
+         end program\n",
+        "f90",
+    );
+    let out = unique_path("class_star_scalar_payload_cb", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "expected class(*) scalar payload callback to mutate n: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn class_star_pointer_component_payload_forwards_to_callback() {
+    let src = write_program(
+        "module m\n\
+           implicit none\n\
+           abstract interface\n\
+             subroutine cb_i(payload)\n\
+               class(*), optional, intent(inout) :: payload\n\
+             end subroutine\n\
+           end interface\n\
+           type :: holder_t\n\
+             procedure(cb_i), pointer, nopass :: callback => null()\n\
+             class(*), pointer :: payload => null()\n\
+           end type\n\
+         contains\n\
+           subroutine open(h, callback, payload)\n\
+             type(holder_t), intent(out) :: h\n\
+             procedure(cb_i), optional :: callback\n\
+             class(*), optional, intent(inout), target :: payload\n\
+             if (present(callback)) h%callback => callback\n\
+             if (present(payload)) h%payload => payload\n\
+           end subroutine\n\
+           subroutine finish(h)\n\
+             type(holder_t), intent(inout) :: h\n\
+             if (associated(h%callback)) call h%callback(h%payload)\n\
+           end subroutine\n\
+         end module\n\
+         program p\n\
+           use m\n\
+           implicit none\n\
+           type(holder_t) :: h\n\
+           integer, target :: n\n\
+           n = 0\n\
+           call open(h, mark, n)\n\
+           call finish(h)\n\
+           if (n /= 9) error stop 1\n\
+           call open(h, mark)\n\
+           call finish(h)\n\
+           if (n /= 9) error stop 2\n\
+           print *, 'ok'\n\
+         contains\n\
+           subroutine mark(payload)\n\
+             class(*), optional, intent(inout) :: payload\n\
+             if (.not. present(payload)) return\n\
+             select type (payload)\n\
+             type is (integer)\n\
+               payload = 9\n\
+             class default\n\
+               error stop 3\n\
+             end select\n\
+           end subroutine\n\
+         end program\n",
+        "f90",
+    );
+    let out = unique_path("class_star_component_payload_cb", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "expected class(*) pointer component payload to forward as descriptor: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn tbp_dispatch_boxes_class_star_literal_actual_into_descriptor() {
     // F2018 §15.5.2.4 + §7.3.2.3: a class(*) intent(in) dummy must
     // receive the actual as a polymorphic descriptor.  The plain-call
