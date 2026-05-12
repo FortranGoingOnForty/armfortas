@@ -2079,9 +2079,10 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         },
                         ctx.st,
                     );
-                    let abi_lookup_keys = procedure_abi_lookup_keys(
+                    let abi_lookup_keys = procedure_abi_lookup_keys_for_call_target(
                         ctx.st,
-                        &[resolved_name.as_str(), &resolved_key, &signature_key, &key],
+                        resolved_name.as_str(),
+                        &[&resolved_key, &signature_key, &key],
                     );
                     let abi_primary_key = abi_lookup_keys
                         .first()

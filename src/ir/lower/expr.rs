@@ -1818,9 +1818,10 @@ pub(crate) fn lower_expr_full(
                 } else {
                     arg_slots
                 };
-                let abi_lookup_keys = procedure_abi_lookup_keys(
+                let abi_lookup_keys = procedure_abi_lookup_keys_for_call_target(
                     st,
-                    &[call_name.as_str(), &callee_key, &signature_key, &key],
+                    call_name.as_str(),
+                    &[&callee_key, &signature_key, &key],
                 );
                 let abi_primary_key = abi_lookup_keys
                     .first()

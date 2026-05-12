@@ -11096,7 +11096,8 @@ pub(super) fn emit_resolved_operator_call(
 ) -> ValueId {
     let specific_key = specific.to_lowercase();
     let (call_name, _) = resolved_symbol_call_target(st, &specific_key, specific);
-    let abi_lookup_keys = procedure_abi_lookup_keys(st, &[call_name.as_str(), &specific_key]);
+    let abi_lookup_keys =
+        procedure_abi_lookup_keys_for_call_target(st, call_name.as_str(), &[&specific_key]);
     let abi_primary_key = abi_lookup_keys
         .first()
         .map(String::as_str)
@@ -11983,6 +11984,29 @@ pub(super) fn procedure_abi_lookup_keys(st: &SymbolTable, keys: &[&str]) -> Vec<
     out
 }
 
+pub(super) fn procedure_abi_lookup_keys_for_call_target(
+    st: &SymbolTable,
+    call_name: &str,
+    source_keys: &[&str],
+) -> Vec<String> {
+    let source_first = source_keys.iter().any(|key| {
+        find_linkable_symbol_any_scope(st, key).is_some_and(|sym| {
+            sym.attrs.binding_label.as_ref().is_some_and(|label| {
+                label.eq_ignore_ascii_case(call_name) && !sym.name.eq_ignore_ascii_case(call_name)
+            })
+        })
+    });
+    let mut keys = Vec::with_capacity(source_keys.len() + 1);
+    if source_first {
+        keys.extend(source_keys.iter().copied());
+        keys.push(call_name);
+    } else {
+        keys.push(call_name);
+        keys.extend(source_keys.iter().copied());
+    }
+    procedure_abi_lookup_keys(st, &keys)
+}
+
 pub(super) fn first_procedure_lookup<T, F>(lookup_keys: &[String], mut lookup: F) -> Option<T>
 where
     F: FnMut(&str) -> Option<T>,
@@ -12049,7 +12073,8 @@ pub(super) fn emit_named_function_call(
         .as_ref()
         .and_then(|candidate| reorder_args_for_specific_candidate(st, candidate, args))
         .unwrap_or_else(|| reorder_args_by_keyword_slots(args, &callee_key, st));
-    let abi_lookup_keys = procedure_abi_lookup_keys(st, &[call_name.as_str(), &callee_key, &key]);
+    let abi_lookup_keys =
+        procedure_abi_lookup_keys_for_call_target(st, call_name.as_str(), &[&callee_key, &key]);
     let abi_primary_key = abi_lookup_keys
         .first()
         .map(String::as_str)
@@ -13051,7 +13076,7 @@ pub(super) fn lower_alloc_return_call_into_desc(
         }
     };
     let abi_lookup_keys =
-        procedure_abi_lookup_keys(ctx.st, &[call_name.as_str(), &callee_key, &key]);
+        procedure_abi_lookup_keys_for_call_target(ctx.st, call_name.as_str(), &[&callee_key, &key]);
     let abi_primary_key = abi_lookup_keys
         .first()
         .map(String::as_str)
@@ -25942,8 +25967,11 @@ pub(super) fn array_function_result_elem_type(
                     resolved_symbol_call_target(st, &resolved_key, &resolved_name)
                 }
             };
-            let mut abi_lookup_keys =
-                procedure_abi_lookup_keys(st, &[call_name.as_str(), &callee_key, &key]);
+            let mut abi_lookup_keys = procedure_abi_lookup_keys_for_call_target(
+                st,
+                call_name.as_str(),
+                &[&callee_key, &key],
+            );
             // If the callee is a generic interface and dispatch
             // didn't pick a specific (e.g. arg type info wasn't
             // available at probe time), expand the lookup to every
