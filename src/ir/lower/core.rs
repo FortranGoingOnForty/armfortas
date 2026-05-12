@@ -22131,6 +22131,71 @@ pub(super) fn store_scalar_polymorphic_descriptor_view(
     }
 }
 
+const CLASS_STAR_TAG_INTEGER: u64 = 0x0AF5_C1A5_5000_0001;
+const CLASS_STAR_TAG_REAL: u64 = 0x0AF5_C1A5_5000_0002;
+const CLASS_STAR_TAG_DOUBLE: u64 = 0x0AF5_C1A5_5000_0003;
+const CLASS_STAR_TAG_COMPLEX: u64 = 0x0AF5_C1A5_5000_0004;
+const CLASS_STAR_TAG_LOGICAL: u64 = 0x0AF5_C1A5_5000_0005;
+const CLASS_STAR_TAG_CHARACTER: u64 = 0x0AF5_C1A5_5000_0006;
+
+pub(super) fn intrinsic_class_star_type_tag_for_type_info(
+    ti: &crate::sema::symtab::TypeInfo,
+) -> Option<u64> {
+    use crate::sema::symtab::TypeInfo;
+    match ti {
+        TypeInfo::Integer { .. } => Some(CLASS_STAR_TAG_INTEGER),
+        TypeInfo::Real { .. } => Some(CLASS_STAR_TAG_REAL),
+        TypeInfo::DoublePrecision => Some(CLASS_STAR_TAG_DOUBLE),
+        TypeInfo::Complex { .. } => Some(CLASS_STAR_TAG_COMPLEX),
+        TypeInfo::Logical { .. } => Some(CLASS_STAR_TAG_LOGICAL),
+        TypeInfo::Character { .. } => Some(CLASS_STAR_TAG_CHARACTER),
+        _ => None,
+    }
+}
+
+pub(super) fn intrinsic_class_star_type_tag_for_guard(type_name: &str) -> Option<u64> {
+    match type_name.to_ascii_lowercase().replace(' ', "").as_str() {
+        "integer" => Some(CLASS_STAR_TAG_INTEGER),
+        "real" => Some(CLASS_STAR_TAG_REAL),
+        "double" | "doubleprecision" => Some(CLASS_STAR_TAG_DOUBLE),
+        "complex" => Some(CLASS_STAR_TAG_COMPLEX),
+        "logical" => Some(CLASS_STAR_TAG_LOGICAL),
+        "character" => Some(CLASS_STAR_TAG_CHARACTER),
+        _ => None,
+    }
+}
+
+pub(super) fn intrinsic_class_star_type_info_for_guard(
+    type_name: &str,
+) -> Option<crate::sema::symtab::TypeInfo> {
+    use crate::sema::symtab::TypeInfo;
+    match type_name.to_ascii_lowercase().replace(' ', "").as_str() {
+        "integer" => Some(TypeInfo::Integer { kind: None }),
+        "real" => Some(TypeInfo::Real { kind: None }),
+        "double" | "doubleprecision" => Some(TypeInfo::DoublePrecision),
+        "complex" => Some(TypeInfo::Complex { kind: None }),
+        "logical" => Some(TypeInfo::Logical { kind: None }),
+        "character" => Some(TypeInfo::Character {
+            len: None,
+            kind: Some(1),
+        }),
+        _ => None,
+    }
+}
+
+pub(super) fn intrinsic_class_star_type_tag_value_for_expr(
+    b: &mut FuncBuilder,
+    expr: &SpannedExpr,
+    locals: Option<&HashMap<String, LocalInfo>>,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> Option<ValueId> {
+    operator_expr_type_info(expr, locals, st, type_layouts)
+        .as_ref()
+        .and_then(intrinsic_class_star_type_tag_for_type_info)
+        .map(|tag| b.const_i64(tag as i64))
+}
+
 pub(super) fn load_array_desc_i32_field(
     b: &mut FuncBuilder,
     desc: ValueId,
@@ -23522,11 +23587,25 @@ pub(super) fn lower_arg_descriptor(
     if let Expr::Name { name } = &expr.node {
         let key = name.to_lowercase();
         if let Some(info) = locals.get(&key) {
+            if force_static_scalar_polymorphic_view
+                && local_declared_rank(info) == 0
+                && !local_uses_array_descriptor(info)
+                && info.derived_type.is_none()
+            {
+                return box_actual_into_class_star_descriptor(b, locals, expr, st, type_layouts);
+            }
             return lower_descriptor_actual_from_info(b, info, type_layouts, false);
         }
     }
     if matches!(expr.node, Expr::ComponentAccess { .. }) {
         if let Some(tl) = type_layouts {
+            if force_static_scalar_polymorphic_view {
+                if let Some(desc) =
+                    class_star_pointer_component_descriptor_value(b, locals, expr, st, tl)
+                {
+                    return desc;
+                }
+            }
             if let Some(info) = component_array_local_info(b, locals, expr, st, tl) {
                 return lower_descriptor_actual_from_info(b, &info, type_layouts, false);
             }
@@ -23535,6 +23614,15 @@ pub(super) fn lower_arg_descriptor(
                     || (local_declared_rank(&info) == 0 && info.derived_type.is_some())
                 {
                     return lower_descriptor_actual_from_info(b, &info, type_layouts, false);
+                }
+                if force_static_scalar_polymorphic_view && local_declared_rank(&info) == 0 {
+                    return box_actual_into_class_star_descriptor(
+                        b,
+                        locals,
+                        expr,
+                        st,
+                        type_layouts,
+                    );
                 }
             }
         }
@@ -23568,25 +23656,18 @@ pub(super) fn lower_arg_descriptor(
             }
         }
     }
-    // F2018 §7.3.2.3: a CLASS(*) optional dummy can receive any actual.
-    // When the formal is class(*) and the actual is a scalar/literal we
-    // can't otherwise descriptor-ize, box it into a minimal rank-1
-    // descriptor with a single element. The runtime semantics in
-    // callees that `select type` on these args won't recover the
-    // dynamic type without a real type-tag, but the IR verifier and
-    // call ABI are satisfied — and the most common use (variadic-style
-    // error message arg lists like `linalg_state_type`'s a1..a20)
-    // tolerates unknown-type fallthrough gracefully.
+    // F2018 §7.3.2.3: a CLASS(*) optional dummy can receive any scalar
+    // actual. If none of the descriptor-preserving paths above applies,
+    // box the scalar in a rank-0 descriptor with a concrete intrinsic
+    // type tag so SELECT TYPE can discriminate the dynamic type.
     if force_static_scalar_polymorphic_view {
         return box_actual_into_class_star_descriptor(b, locals, expr, st, type_layouts);
     }
     b.const_i64(0)
 }
 
-/// Build a minimal CLASS(*) descriptor wrapping `expr` so it can be
-/// passed by descriptor to a `class(*), dimension(..)` formal. The
-/// descriptor reports rank=1 with a single element — sufficient for
-/// the IR call ABI even when the actual is scalar.
+/// Build a minimal rank-0 CLASS(*) descriptor wrapping `expr` so it
+/// can be passed by descriptor to a scalar `class(*)` formal.
 pub(super) fn box_actual_into_class_star_descriptor(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -23594,29 +23675,87 @@ pub(super) fn box_actual_into_class_star_descriptor(
     st: &SymbolTable,
     type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
 ) -> ValueId {
-    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
-    let zero32 = b.const_i32(0);
-    let sz384 = b.const_i64(384);
-    b.call(
-        FuncRef::External("memset".into()),
-        vec![desc, zero32, sz384],
-        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-    );
-
     // Materialize the actual into a stack slot so we have an address
     // to put in the descriptor's base_addr. For scalars we lower the
     // expression and store into a temp; for whole-array names we use
     // their existing storage.
     let (base_ptr, elem_size_bytes): (ValueId, i64) = if let Expr::Name { name } = &expr.node {
         if let Some(info) = locals.get(&name.to_lowercase()) {
-            let bytes = ir_scalar_byte_size(&info.ty).max(1);
-            let addr = if info.by_ref {
+            let bytes = descriptor_element_size_bytes(info).max(1);
+            let addr = if info.is_pointer {
+                let load_ty = if info.ty.is_ptr() {
+                    info.ty.clone()
+                } else {
+                    IrType::Ptr(Box::new(info.ty.clone()))
+                };
+                let ptr = if info.by_ref {
+                    let caller_slot =
+                        b.load_typed(info.addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                    b.load_typed(caller_slot, load_ty)
+                } else {
+                    b.load_typed(info.addr, load_ty)
+                };
+                let raw = b.ptr_to_int(ptr);
+                b.int_to_ptr(raw, IrType::Int(IntWidth::I8))
+            } else if info.by_ref {
                 b.load_typed(info.addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
             } else {
                 let raw = b.ptr_to_int(info.addr);
                 b.int_to_ptr(raw, IrType::Int(IntWidth::I8))
             };
             (addr, bytes)
+        } else {
+            let raw =
+                super::expr::lower_expr_full(b, locals, expr, st, type_layouts, None, None, None);
+            let ty = b
+                .func()
+                .value_type(raw)
+                .unwrap_or(IrType::Int(IntWidth::I32));
+            box_value_into_addr(b, raw, &ty)
+        }
+    } else if matches!(expr.node, Expr::ComponentAccess { .. }) {
+        if let Some(tl) = type_layouts {
+            if let Some((field_ptr, field)) =
+                resolve_component_field_access(b, locals, expr, st, tl)
+            {
+                let storage_ty = field_storage_ir_type(&field, tl);
+                let bytes = field
+                    .size
+                    .try_into()
+                    .ok()
+                    .filter(|size: &i64| *size > 0)
+                    .unwrap_or_else(|| ir_scalar_byte_size(&storage_ty).max(1));
+                let addr = if field.pointer {
+                    let load_ty = if storage_ty.is_ptr() {
+                        storage_ty
+                    } else {
+                        IrType::Ptr(Box::new(storage_ty))
+                    };
+                    let ptr = b.load_typed(field_ptr, load_ty);
+                    let raw = b.ptr_to_int(ptr);
+                    b.int_to_ptr(raw, IrType::Int(IntWidth::I8))
+                } else {
+                    let raw = b.ptr_to_int(field_ptr);
+                    b.int_to_ptr(raw, IrType::Int(IntWidth::I8))
+                };
+                (addr, bytes)
+            } else {
+                let raw = super::expr::lower_expr_full(
+                    b,
+                    locals,
+                    expr,
+                    st,
+                    type_layouts,
+                    None,
+                    None,
+                    None,
+                );
+                let ty = b
+                    .func()
+                    .value_type(raw)
+                    .unwrap_or(IrType::Int(IntWidth::I32));
+                box_value_into_addr(b, raw, &ty)
+            }
         } else {
             let raw =
                 super::expr::lower_expr_full(b, locals, expr, st, type_layouts, None, None, None);
@@ -23635,21 +23774,23 @@ pub(super) fn box_actual_into_class_star_descriptor(
         box_value_into_addr(b, raw, &ty)
     };
 
-    store_byte_aggregate_field(
+    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let elem_size = b.const_i64(elem_size_bytes);
+    let type_tag =
+        intrinsic_class_star_type_tag_value_for_expr(b, expr, Some(locals), st, type_layouts)
+            .or_else(|| {
+                type_layouts.and_then(|tl| expr_type_tag_value(b, expr, Some(locals), st, tl))
+            });
+    let tbp_lookup =
+        type_layouts.and_then(|tl| expr_tbp_lookup_value(b, expr, Some(locals), st, tl));
+    store_scalar_polymorphic_descriptor_view(
         b,
         desc,
-        0,
-        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
         base_ptr,
+        Some(elem_size),
+        type_tag,
+        tbp_lookup,
     );
-    let elem_size = b.const_i64(elem_size_bytes);
-    store_byte_aggregate_field(b, desc, 8, IrType::Int(IntWidth::I64), elem_size);
-    let rank = b.const_i32(1);
-    store_byte_aggregate_field(b, desc, 16, IrType::Int(IntWidth::I32), rank);
-    let one64 = b.const_i64(1);
-    store_byte_aggregate_field(b, desc, 24, IrType::Int(IntWidth::I64), one64);
-    store_byte_aggregate_field(b, desc, 32, IrType::Int(IntWidth::I64), one64);
-    store_byte_aggregate_field(b, desc, 40, IrType::Int(IntWidth::I64), one64);
     desc
 }
 
@@ -30990,6 +31131,95 @@ pub(super) fn with_select_type_guard_binding<F>(
     }
 }
 
+pub(super) fn with_select_type_intrinsic_guard_binding<F>(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    selector: &crate::ast::expr::SpannedExpr,
+    assoc_name: Option<&str>,
+    guard_type: &str,
+    f: F,
+) where
+    F: FnOnce(&mut FuncBuilder, &mut LowerCtx),
+{
+    let Some(selector_info) = associate_alias_local_info(b, ctx, selector) else {
+        f(b, ctx);
+        return;
+    };
+    let Some(guard_ti) = intrinsic_class_star_type_info_for_guard(guard_type) else {
+        f(b, ctx);
+        return;
+    };
+    let binding_name =
+        assoc_name
+            .map(|name| name.to_lowercase())
+            .or_else(|| match &selector.node {
+                Expr::Name { name } => Some(name.to_lowercase()),
+                _ => None,
+            });
+    let Some(binding_name) = binding_name else {
+        f(b, ctx);
+        return;
+    };
+
+    let desc = array_descriptor_addr(b, &selector_info);
+    let base = scalar_descriptor_base_addr_raw(
+        b,
+        &LocalInfo {
+            addr: desc,
+            ty: selector_info.ty.clone(),
+            dims: vec![],
+            allocatable: false,
+            descriptor_arg: true,
+            by_ref: false,
+            char_kind: CharKind::None,
+            derived_type: None,
+            inline_const: None,
+            is_pointer: false,
+            runtime_dim_upper: vec![],
+            is_class: false,
+            logical_kind: None,
+            last_dim_assumed_size: false,
+        },
+    );
+    let scalar_ty = type_info_to_ir_type(&guard_ti);
+    let typed_base = {
+        let raw = b.ptr_to_int(base);
+        b.int_to_ptr(raw, scalar_ty.clone())
+    };
+    let logical_kind = match &guard_ti {
+        crate::sema::symtab::TypeInfo::Logical { kind } => *kind,
+        _ => None,
+    };
+    let char_kind = match &guard_ti {
+        crate::sema::symtab::TypeInfo::Character { len: Some(len), .. } => CharKind::Fixed(*len),
+        _ => CharKind::None,
+    };
+    let info = LocalInfo {
+        addr: typed_base,
+        ty: scalar_ty,
+        dims: vec![],
+        allocatable: false,
+        descriptor_arg: false,
+        by_ref: false,
+        char_kind,
+        derived_type: None,
+        inline_const: None,
+        is_pointer: false,
+        runtime_dim_upper: vec![],
+        is_class: false,
+        logical_kind,
+        last_dim_assumed_size: false,
+    };
+
+    let saved = ctx.locals.insert(binding_name.clone(), info);
+    f(b, ctx);
+    if let Some(orig) = saved {
+        ctx.locals.insert(binding_name, orig);
+    } else {
+        ctx.locals.remove(&binding_name);
+    }
+}
+
 pub(super) fn lower_array_intrinsic(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -32693,6 +32923,28 @@ pub(super) fn field_uses_array_descriptor(field: &crate::sema::type_layout::Fiel
     field.size == 384
         && (field.allocatable || field.pointer)
         && (field.declared_array || !field.dims.is_empty())
+}
+
+pub(super) fn field_is_class_star_pointer_descriptor(
+    field: &crate::sema::type_layout::FieldLayout,
+) -> bool {
+    field.pointer
+        && field.dims.is_empty()
+        && matches!(field.type_info, crate::sema::symtab::TypeInfo::ClassStar)
+}
+
+pub(super) fn class_star_pointer_component_descriptor_value(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    tl: &crate::sema::type_layout::TypeLayoutRegistry,
+) -> Option<ValueId> {
+    let (field_ptr, field) = resolve_component_field_access(b, locals, expr, st, tl)?;
+    if !field_is_class_star_pointer_descriptor(&field) {
+        return None;
+    }
+    Some(b.load_typed(field_ptr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)))))
 }
 
 pub(super) fn component_array_local_info(
