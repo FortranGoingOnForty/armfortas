@@ -1860,6 +1860,10 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             .as_ref()
                             .map(|mask| mask.get(i).copied().unwrap_or(false))
                             .unwrap_or(false);
+                        let is_optional = opt_flags
+                            .as_ref()
+                            .map(|mask| mask.get(i).copied().unwrap_or(false))
+                            .unwrap_or(false);
                         let wants_polymorphic_descriptor = class_mask
                             .as_ref()
                             .map(|mask| mask.get(i).copied().unwrap_or(false))
@@ -1871,7 +1875,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     let wants_descriptor = (mask_wants_descriptor
                                         || actual_is_descriptor_array(&ctx.locals, e))
                                         && !wants_bind_c_char;
-                                    if is_value && wants_bind_c_char {
+                                    let value = if is_value && wants_bind_c_char {
                                         lower_bind_c_char_value_arg(
                                             b,
                                             &ctx.locals,
@@ -1936,7 +1940,21 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         .unwrap_or_else(|| lower_arg_by_ref_ctx(b, ctx, e))
                                     } else {
                                         lower_arg_by_ref_ctx(b, ctx, e)
-                                    }
+                                    };
+                                    optional_arg_absent_if_unallocated_allocatable_char(
+                                        b,
+                                        &ctx.locals,
+                                        e,
+                                        ctx.st,
+                                        Some(ctx.type_layouts),
+                                        is_optional
+                                            && !is_value
+                                            && !wants_descriptor
+                                            && !wants_string_descriptor
+                                            && !wants_bind_c_char
+                                            && !wants_pointer,
+                                        value,
+                                    )
                                 }
                                 _ => b.const_i32(0),
                             },
@@ -2111,6 +2129,10 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             .as_ref()
                             .map(|mask| mask.get(i).copied().unwrap_or(false))
                             .unwrap_or(false);
+                        let is_optional = opt_flags
+                            .as_ref()
+                            .map(|mask| mask.get(i).copied().unwrap_or(false))
+                            .unwrap_or(false);
                         let wants_string_descriptor = string_desc_mask
                             .as_ref()
                             .map(|mask| mask.get(i).copied().unwrap_or(false))
@@ -2125,7 +2147,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         let value = match slot {
                             Some(arg) => match &arg.value {
                                 crate::ast::expr::SectionSubscript::Element(e) => {
-                                    if is_value && wants_bind_c_char {
+                                    let value = if is_value && wants_bind_c_char {
                                         lower_bind_c_char_value_arg(
                                             b,
                                             &ctx.locals,
@@ -2190,7 +2212,21 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         .unwrap_or_else(|| lower_arg_by_ref_ctx(b, ctx, e))
                                     } else {
                                         lower_arg_by_ref_ctx(b, ctx, e)
-                                    }
+                                    };
+                                    optional_arg_absent_if_unallocated_allocatable_char(
+                                        b,
+                                        &ctx.locals,
+                                        e,
+                                        ctx.st,
+                                        Some(ctx.type_layouts),
+                                        is_optional
+                                            && !is_value
+                                            && !wants_descriptor
+                                            && !wants_string_descriptor
+                                            && !wants_bind_c_char
+                                            && !wants_pointer,
+                                        value,
+                                    )
                                 }
                                 _ => b.const_i32(0),
                             },

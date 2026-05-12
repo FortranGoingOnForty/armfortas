@@ -1932,10 +1932,14 @@ pub(crate) fn lower_expr_full(
                         .as_ref()
                         .map(|mask| mask.get(i).copied().unwrap_or(false))
                         .unwrap_or(false);
+                    let is_optional = opt_flags
+                        .as_ref()
+                        .map(|mask| mask.get(i).copied().unwrap_or(false))
+                        .unwrap_or(false);
                     let value = match slot {
                         Some(arg) => match &arg.value {
                             crate::ast::expr::SectionSubscript::Element(e) => {
-                                if is_value && wants_bind_c_char {
+                                let value = if is_value && wants_bind_c_char {
                                     lower_bind_c_char_value_arg(
                                         b,
                                         locals,
@@ -2014,7 +2018,21 @@ pub(crate) fn lower_expr_full(
                                         contained_host_refs,
                                         descriptor_params,
                                     )
-                                }
+                                };
+                                optional_arg_absent_if_unallocated_allocatable_char(
+                                    b,
+                                    locals,
+                                    e,
+                                    st,
+                                    type_layouts,
+                                    is_optional
+                                        && !is_value
+                                        && !wants_descriptor
+                                        && !wants_string_descriptor
+                                        && !wants_bind_c_char
+                                        && !wants_pointer,
+                                    value,
+                                )
                             }
                             _ => b.const_i32(0),
                         },
@@ -2392,10 +2410,14 @@ pub(crate) fn lower_expr_full(
                                     .as_ref()
                                     .map(|mask| mask.get(i).copied().unwrap_or(false))
                                     .unwrap_or(false);
+                                let is_optional = opt_flags
+                                    .as_ref()
+                                    .map(|mask| mask.get(i).copied().unwrap_or(false))
+                                    .unwrap_or(false);
                                 let value = match slot {
                                     Some(arg) => match &arg.value {
                                         crate::ast::expr::SectionSubscript::Element(e) => {
-                                            if is_value && wants_bind_c_char {
+                                            let value = if is_value && wants_bind_c_char {
                                                 lower_bind_c_char_value_arg(
                                                     b,
                                                     locals,
@@ -2486,7 +2508,21 @@ pub(crate) fn lower_expr_full(
                                                     contained_host_refs,
                                                     descriptor_params,
                                                 )
-                                            }
+                                            };
+                                            optional_arg_absent_if_unallocated_allocatable_char(
+                                                b,
+                                                locals,
+                                                e,
+                                                st,
+                                                type_layouts,
+                                                is_optional
+                                                    && !is_value
+                                                    && !wants_descriptor
+                                                    && !wants_string_descriptor
+                                                    && !wants_bind_c_char
+                                                    && !wants_pointer,
+                                                value,
+                                            )
                                         }
                                         _ => b.const_i32(0),
                                     },
