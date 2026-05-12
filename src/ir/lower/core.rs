@@ -12103,6 +12103,10 @@ pub(super) fn emit_named_function_call(
             .as_ref()
             .map(|mask| i < mask.len() && mask[i])
             .unwrap_or(false);
+        let is_optional = opt_flags
+            .as_ref()
+            .map(|mask| mask.get(i).copied().unwrap_or(false))
+            .unwrap_or(false);
         let arg = match slot {
             Some(arg) => arg,
             None => {
@@ -12132,7 +12136,7 @@ pub(super) fn emit_named_function_call(
         };
         let value = match &arg.value {
             crate::ast::expr::SectionSubscript::Element(e) => {
-                if is_value && wants_bind_c_char {
+                let value = if is_value && wants_bind_c_char {
                     lower_bind_c_char_value_arg(
                         b,
                         locals,
@@ -12217,7 +12221,21 @@ pub(super) fn emit_named_function_call(
                     )
                 } else {
                     lower_arg_by_ref(b, locals, e, st)
-                }
+                };
+                optional_arg_absent_if_unallocated_allocatable_char(
+                    b,
+                    locals,
+                    e,
+                    st,
+                    type_layouts,
+                    is_optional
+                        && !is_value
+                        && !wants_descriptor
+                        && !wants_string_descriptor
+                        && !wants_bind_c_char
+                        && !wants_pointer,
+                    value,
+                )
             }
             _ => b.const_i32(0),
         };
@@ -12452,6 +12470,10 @@ pub(super) fn emit_resolved_bound_proc_call(
             .as_ref()
             .map(|mask| mask.get(i).copied().unwrap_or(false))
             .unwrap_or(false);
+        let is_optional = opt_flags
+            .as_ref()
+            .map(|mask| mask.get(i).copied().unwrap_or(false))
+            .unwrap_or(false);
         // F2018 §15.5.2.4: a class(*) dummy needs the actual boxed into
         // a polymorphic descriptor when the actual is a literal/scalar
         // expression. The plain-call path threads this through; without
@@ -12465,7 +12487,7 @@ pub(super) fn emit_resolved_bound_proc_call(
         let value = match slot {
             Some(arg) => match &arg.value {
                 crate::ast::expr::SectionSubscript::Element(e) => {
-                    if is_value && wants_bind_c_char {
+                    let value = if is_value && wants_bind_c_char {
                         lower_bind_c_char_value_arg(
                             b,
                             locals,
@@ -12551,7 +12573,21 @@ pub(super) fn emit_resolved_bound_proc_call(
                             contained_host_refs,
                             descriptor_params,
                         )
-                    }
+                    };
+                    optional_arg_absent_if_unallocated_allocatable_char(
+                        b,
+                        locals,
+                        e,
+                        st,
+                        type_layouts,
+                        is_optional
+                            && !is_value
+                            && !wants_descriptor
+                            && !wants_string_descriptor
+                            && !wants_bind_c_char
+                            && !wants_pointer,
+                        value,
+                    )
                 }
                 _ => b.const_i32(0),
             },
@@ -13067,6 +13103,10 @@ pub(super) fn lower_alloc_return_call_into_desc(
             .as_ref()
             .map(|mask| i < mask.len() && mask[i])
             .unwrap_or(false);
+        let is_optional = opt_flags
+            .as_ref()
+            .map(|mask| mask.get(i).copied().unwrap_or(false))
+            .unwrap_or(false);
         let arg = match slot {
             Some(arg) => arg,
             None => {
@@ -13096,7 +13136,7 @@ pub(super) fn lower_alloc_return_call_into_desc(
         };
         let value = match &arg.value {
             crate::ast::expr::SectionSubscript::Element(e) => {
-                if is_value && wants_bind_c_char {
+                let value = if is_value && wants_bind_c_char {
                     lower_bind_c_char_value_arg(
                         b,
                         &ctx.locals,
@@ -13146,7 +13186,21 @@ pub(super) fn lower_alloc_return_call_into_desc(
                     .unwrap_or_else(|| lower_arg_by_ref_ctx(b, ctx, e))
                 } else {
                     lower_arg_by_ref_ctx(b, ctx, e)
-                }
+                };
+                optional_arg_absent_if_unallocated_allocatable_char(
+                    b,
+                    &ctx.locals,
+                    e,
+                    ctx.st,
+                    Some(ctx.type_layouts),
+                    is_optional
+                        && !is_value
+                        && !wants_descriptor
+                        && !wants_string_descriptor
+                        && !wants_bind_c_char
+                        && !wants_pointer,
+                    value,
+                )
             }
             _ => b.const_i32(0),
         };
@@ -32524,6 +32578,84 @@ pub(super) fn field_char_kind(field: &crate::sema::type_layout::FieldLayout) -> 
         }
         _ => CharKind::None,
     }
+}
+
+fn allocatable_deferred_char_actual_descriptor(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> Option<ValueId> {
+    match &expr.node {
+        Expr::ParenExpr { inner } => {
+            allocatable_deferred_char_actual_descriptor(b, locals, inner, st, type_layouts)
+        }
+        Expr::Name { name } => {
+            let info = locals.get(&name.to_lowercase())?;
+            if info.allocatable
+                && info.dims.is_empty()
+                && matches!(info.char_kind, CharKind::Deferred)
+            {
+                Some(string_descriptor_addr(b, info))
+            } else {
+                None
+            }
+        }
+        Expr::ComponentAccess { .. } => {
+            let tl = type_layouts?;
+            let (field_ptr, field) = resolve_component_field_access(b, locals, expr, st, tl)?;
+            if field.allocatable
+                && field.dims.is_empty()
+                && matches!(field_char_kind(&field), CharKind::Deferred)
+            {
+                Some(field_ptr)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn typed_null_for_value(b: &mut FuncBuilder, value: ValueId) -> Option<ValueId> {
+    match b.func().value_type(value)? {
+        IrType::Ptr(inner) => {
+            let zero = b.const_i64(0);
+            Some(b.int_to_ptr(zero, *inner))
+        }
+        _ => None,
+    }
+}
+
+pub(super) fn optional_arg_absent_if_unallocated_allocatable_char(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    enabled: bool,
+    value: ValueId,
+) -> ValueId {
+    if !enabled {
+        return value;
+    }
+    let Some(desc) = allocatable_deferred_char_actual_descriptor(b, locals, expr, st, type_layouts)
+    else {
+        return value;
+    };
+    let Some(null_value) = typed_null_for_value(b, value) else {
+        return value;
+    };
+
+    let allocated = b.call(
+        FuncRef::External("afs_string_allocated".into()),
+        vec![desc],
+        IrType::Int(IntWidth::I32),
+    );
+    let zero = b.const_i32(0);
+    let is_allocated = b.icmp(CmpOp::Ne, allocated, zero);
+    b.select(is_allocated, value, null_value)
 }
 
 pub(super) fn field_derived_type_name(

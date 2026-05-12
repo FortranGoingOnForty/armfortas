@@ -3026,6 +3026,43 @@ fn absent_optional_char_array_forwarding_uses_zero_hidden_length() {
 }
 
 #[test]
+fn unallocated_allocatable_char_actual_is_absent_for_optional_dummy() {
+    let src = write_program(
+        "module m\n  implicit none\n  type :: holder_t\n    character(:), allocatable :: missing\n    character(:), allocatable :: value\n  end type\ncontains\n  subroutine require_absent_and_value(missing, value)\n    character(len=*), intent(in), optional :: missing\n    character(len=*), intent(in), optional :: value\n    if (present(missing)) error stop 1\n    if (.not. present(value)) error stop 2\n    if (len(value) /= 0) error stop 3\n  end subroutine\n\n  integer function component_code(missing, value) result(code)\n    character(len=*), intent(in), optional :: missing\n    character(len=*), intent(in), optional :: value\n    code = 0\n    if (present(missing)) code = code + 10 + len(missing)\n    if (present(value)) code = code + 100 + len(value)\n  end function\n\n  subroutine run()\n    character(:), allocatable :: missing\n    character(:), allocatable :: value\n    type(holder_t) :: holder\n    value = ''\n    call require_absent_and_value(missing, value)\n    holder%value = ''\n    if (component_code(holder%missing, holder%value) /= 100) error stop 4\n  end subroutine\nend module\n\nprogram p\n  use m\n  implicit none\n  call run()\n  print *, 'ok'\nend program\n",
+        "optional_unallocated_allocatable_char.f90",
+    );
+    let out = unique_path("optional_unallocated_allocatable_char", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("optional allocatable char compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "optional allocatable char should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("optional allocatable char run failed");
+    assert!(
+        run.status.success(),
+        "optional allocatable char should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected optional allocatable char output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn cross_tu_absent_optional_char_array_forwarding_survives_function_result_wrapper() {
     let dir = unique_dir("cross_tu_optional_char_array_forward");
     let types_src = write_program_in(
