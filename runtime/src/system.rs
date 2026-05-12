@@ -370,11 +370,33 @@ pub extern "C" fn afs_execute_command_line(
 // Shared RNG state for RANDOM_NUMBER / RANDOM_SEED.
 use std::cell::Cell;
 thread_local! {
-    static RNG_SEED: Cell<u64> = const { Cell::new(12345678901234567) };
+    static RNG_SEED: Cell<u64> = const { Cell::new(0) };
+    static RNG_INITIALIZED: Cell<bool> = const { Cell::new(false) };
+}
+
+fn default_random_seed() -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let pid = (std::process::id() as u64) << 32;
+    let stack_probe = 0u8;
+    let addr = (&stack_probe as *const u8 as usize) as u64;
+    let mut seed = now ^ pid ^ addr ^ 0x9e37_79b9_7f4a_7c15;
+    if seed == 0 {
+        seed = 0x0123_4567_89ab_cdef;
+    }
+    seed
 }
 
 fn next_random_u64() -> u64 {
     RNG_SEED.with(|s| {
+        RNG_INITIALIZED.with(|initialized| {
+            if !initialized.get() {
+                s.set(default_random_seed());
+                initialized.set(true);
+            }
+        });
         let mut x = s.get();
         x = x
             .wrapping_mul(6364136223846793005)
@@ -445,6 +467,7 @@ pub extern "C" fn afs_random_number_array_f64(harvest: *mut f64, n: i64) {
 #[no_mangle]
 pub extern "C" fn afs_random_seed(seed_val: i64) {
     RNG_SEED.with(|s| s.set(seed_val as u64));
+    RNG_INITIALIZED.with(|initialized| initialized.set(true));
 }
 
 /// POPCOUNT: count set bits in an integer (Hamming weight).
@@ -494,5 +517,16 @@ mod tests {
             afs_random_number_f64(&mut x);
             assert!(x >= 0.0 && x < 1.0, "random out of range: {}", x);
         }
+    }
+
+    #[test]
+    fn random_seed_keeps_explicit_sequences_reproducible() {
+        let mut first = 0.0f64;
+        let mut second = 0.0f64;
+        afs_random_seed(42);
+        afs_random_number_f64(&mut first);
+        afs_random_seed(42);
+        afs_random_number_f64(&mut second);
+        assert_eq!(first, second);
     }
 }
