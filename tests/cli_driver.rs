@@ -2237,6 +2237,71 @@ fn bind_c_subroutine_value_arg_is_passed_by_value() {
 }
 
 #[test]
+fn bind_c_value_arg_uses_alias_abi_when_label_collides() {
+    let dir = unique_dir("bind_c_value_label_collision");
+    let c_src = write_program_in(
+        &dir,
+        "clash.c",
+        "#include <stdint.h>\n\nint32_t clash(int64_t value) {\n    return value == 1234567890123LL ? 77 : -1;\n}\n",
+    );
+    let c_obj = dir.join("clash.o");
+    compile_c_object(&c_src, &c_obj);
+
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "module m\n  use iso_c_binding, only: c_int, c_int64_t\n  implicit none\n  interface\n    integer(c_int) function c_check(value) bind(C, name='clash')\n      import :: c_int, c_int64_t\n      integer(c_int64_t), value :: value\n    end function c_check\n  end interface\n  type :: holder\n    integer(c_int64_t) :: value = 0_c_int64_t\n  end type holder\ncontains\n  subroutine clash(x, ok)\n    class(holder), intent(inout) :: x\n    logical, intent(out) :: ok\n    ok = x%value /= 0_c_int64_t\n  end subroutine clash\nend module m\n\nprogram p\n  use iso_c_binding, only: c_int64_t\n  use m\n  implicit none\n  type(holder) :: h\n  h%value = 1234567890123_c_int64_t\n  if (c_check(h%value) /= 77) error stop 1\n  print *, 'ok'\nend program\n",
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_obj = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("bind(c) value label collision object compile failed to spawn");
+    assert!(
+        compile_obj.status.success(),
+        "bind(c) value label collision should compile: {}",
+        String::from_utf8_lossy(&compile_obj.stderr)
+    );
+
+    let exe = dir.join("bind_c_value_label_collision.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            main_obj.to_str().unwrap(),
+            c_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("bind(c) value label collision link failed to spawn");
+    assert!(
+        link.status.success(),
+        "bind(c) value label collision should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("bind(c) value label collision run failed");
+    assert!(
+        run.status.success(),
+        "bind(c) value label collision should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn bind_c_interface_subroutine_value_survives_amod_import_and_runs() {
     let dir = unique_dir("bind_c_interface_value_amod");
     let c_src = write_program_in(
@@ -19956,6 +20021,41 @@ fn default_integer_system_clock_runs_without_runtime_abi_crash() {
     assert!(
         stdout.contains("ok"),
         "unexpected default integer system_clock output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn system_clock_component_writeback_uses_component_width() {
+    let src = write_program(
+        "program p\n  implicit none\n  type :: clock_state\n    integer(8) :: count = 0\n    real(8) :: rate = 0.0_8\n    integer(8) :: max_count = 0\n  end type\n  type(clock_state) :: state\n  call system_clock(state%count, state%rate, state%max_count)\n  if (state%count < 1000000_8) error stop 1\n  if (state%rate <= 0.0_8) error stop 2\n  if (state%max_count == 0_8) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("system_clock_component_writeback", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("system_clock component writeback compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "system_clock component writeback should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "system_clock component writeback should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected system_clock component writeback output: {}",
         stdout
     );
 

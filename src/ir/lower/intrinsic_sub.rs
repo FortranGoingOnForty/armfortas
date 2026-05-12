@@ -93,8 +93,14 @@ pub(crate) fn lower_intrinsic_subroutine(
         if let Some(Some(arg)) = args.get(n) {
             if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
                 let dest_ptr = lower_arg_by_ref_ctx(b, ctx, e);
-                if let Some(IrType::Ptr(inner)) = b.func().value_type(dest_ptr) {
-                    let dest_ty = (*inner).clone();
+                let semantic_dest_ty =
+                    generic_actual_expr_type_info(e, &ctx.locals, ctx.st, Some(ctx.type_layouts))
+                        .map(|ti| type_info_to_ir_type(&ti));
+                let pointer_dest_ty = match b.func().value_type(dest_ptr) {
+                    Some(IrType::Ptr(inner)) => Some((*inner).clone()),
+                    _ => None,
+                };
+                if let Some(dest_ty) = semantic_dest_ty.or(pointer_dest_ty) {
                     if dest_ty == IrType::Int(IntWidth::I64) {
                         return (dest_ptr, None);
                     }
