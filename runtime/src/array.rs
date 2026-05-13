@@ -4658,13 +4658,16 @@ pub extern "C" fn afs_array_abs_complex(
 /// inputs (real(sp) ↔ real(dp)) by reading the per-side elem_size.
 ///
 /// `out_lane_bytes` is 4 (single) or 8 (double); result elem_size is
-/// `2 * out_lane_bytes`.
+/// `2 * out_lane_bytes`. Kind tags match afs_assign_allocatable_convert:
+/// 0=i8, 1=i16, 2=i32, 3=i64, 4=f32, 5=f64, 6=complex(f32), 7=complex(f64).
 #[no_mangle]
 pub extern "C" fn afs_array_cmplx(
     re_source: *const ArrayDescriptor,
     im_source: *const ArrayDescriptor,
     out_lane_bytes: i32,
     result: *mut ArrayDescriptor,
+    re_kind_tag: i32,
+    im_kind_tag: i32,
 ) {
     if re_source.is_null() || result.is_null() {
         return;
@@ -4702,31 +4705,64 @@ pub extern "C" fn afs_array_cmplx(
 
     let res = unsafe { &mut *result };
     let total = re.total_elements() as usize;
-    let re_elem = re.elem_size.max(1) as usize;
-    let im_elem = im_opt.map(|im| im.elem_size.max(1) as usize).unwrap_or(0);
+    let kind_elem_size = |tag: i32, fallback: i64| -> usize {
+        match tag {
+            0 => 1,
+            1 => 2,
+            2 | 4 => 4,
+            3 | 5 => 8,
+            6 => 8,
+            7 => 16,
+            _ => fallback.max(1) as usize,
+        }
+    };
+    let re_elem = kind_elem_size(re_kind_tag, re.elem_size);
+    let im_elem = im_opt
+        .map(|im| kind_elem_size(im_kind_tag, im.elem_size))
+        .unwrap_or(0);
     let re_buf = re.base_addr as *const u8;
     let im_buf = im_opt
         .map(|im| im.base_addr as *const u8)
         .unwrap_or(ptr::null());
     let rp_buf = res.base_addr;
+    let read_numeric_lane = |buf: *const u8, off: usize, tag: i32, elem: usize| -> f64 {
+        unsafe {
+            match tag {
+                0 => *(buf.add(off) as *const i8) as f64,
+                1 => *(buf.add(off) as *const i16) as f64,
+                2 => *(buf.add(off) as *const i32) as f64,
+                3 => *(buf.add(off) as *const i64) as f64,
+                4 => *(buf.add(off) as *const f32) as f64,
+                5 => *(buf.add(off) as *const f64),
+                6 => *(buf.add(off) as *const f32) as f64,
+                7 => *(buf.add(off) as *const f64),
+                _ => match elem {
+                    4 => *(buf.add(off) as *const f32) as f64,
+                    8 => *(buf.add(off) as *const f64),
+                    _ => 0.0,
+                },
+            }
+        }
+    };
+    let read_complex_imag_lane = |buf: *const u8, off: usize, tag: i32| -> f64 {
+        unsafe {
+            match tag {
+                6 => *(buf.add(off + 4) as *const f32) as f64,
+                7 => *(buf.add(off + 8) as *const f64),
+                _ => 0.0,
+            }
+        }
+    };
     for i in 0..total {
         let dst_off = i * elem_size;
         unsafe {
-            // Read real lane as f64 from source kind.
-            let r_val: f64 = match re_elem {
-                4 => *(re_buf.add(i * 4) as *const f32) as f64,
-                8 => *(re_buf.add(i * 8) as *const f64),
-                _ => 0.0,
-            };
+            let re_off = i * re_elem;
+            let r_val = read_numeric_lane(re_buf, re_off, re_kind_tag, re_elem);
             // Read imag lane (zero when source absent).
             let i_val: f64 = if im_buf.is_null() {
-                0.0
+                read_complex_imag_lane(re_buf, re_off, re_kind_tag)
             } else {
-                match im_elem {
-                    4 => *(im_buf.add(i * 4) as *const f32) as f64,
-                    8 => *(im_buf.add(i * 8) as *const f64),
-                    _ => 0.0,
-                }
+                read_numeric_lane(im_buf, i * im_elem, im_kind_tag, im_elem)
             };
             // Write per result kind.
             match lane {
