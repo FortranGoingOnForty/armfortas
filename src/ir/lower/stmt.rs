@@ -312,23 +312,17 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                             .find_symbol_any_scope(&lname)
                                                             .is_some_and(|s| s.attrs.elemental);
                                                 let generic_specifics_elemental = !direct_elemental
-                                                    && named_interface_specifics(ctx.st, &lname)
-                                                        .map(|specs| {
-                                                            !specs.is_empty()
-                                                                && specs.iter().all(|s| {
-                                                                    ctx.elemental_funcs
-                                                                        .contains(&s.to_lowercase())
-                                                                        || ctx
-                                                                            .st
-                                                                            .find_symbol_any_scope(
-                                                                                s,
-                                                                            )
-                                                                            .is_some_and(|sym| {
-                                                                                sym.attrs.elemental
-                                                                            })
-                                                                })
-                                                        })
-                                                        .unwrap_or(false);
+                                                    && resolved_named_callee_is_elemental(
+                                                        b,
+                                                        &ctx.locals,
+                                                        cname,
+                                                        call_args,
+                                                        ctx.st,
+                                                        Some(ctx.type_layouts),
+                                                        Some(ctx.internal_funcs),
+                                                        Some(ctx.contained_host_refs),
+                                                        Some(ctx.descriptor_params),
+                                                    );
                                                 let is_elemental =
                                                     direct_elemental || generic_specifics_elemental;
                                                 is_elemental

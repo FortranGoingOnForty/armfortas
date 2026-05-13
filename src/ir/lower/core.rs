@@ -8892,6 +8892,25 @@ pub(super) fn append_named_interface_specific_candidates(
     }
 }
 
+fn specific_candidate_is_elemental(st: &SymbolTable, candidate: &SpecificProcCandidate) -> bool {
+    use crate::sema::symtab::SymbolKind;
+
+    let key = candidate.name.to_ascii_lowercase();
+    st.all_scopes().iter().any(|scope| {
+        scope.symbols.get(&key).is_some_and(|sym| {
+            sym.attrs.elemental
+                && matches!(
+                    sym.kind,
+                    SymbolKind::Function
+                        | SymbolKind::Subroutine
+                        | SymbolKind::ExternalProc
+                        | SymbolKind::IntrinsicProc
+                        | SymbolKind::ProcedurePointer
+                )
+        })
+    })
+}
+
 pub(super) fn named_interface_specific_candidates(
     st: &SymbolTable,
     name: &str,
@@ -9357,12 +9376,7 @@ fn resolve_generic_call_by_semantics_impl(
         let Some(scope) = procedure_scope_for_candidate(st, candidate) else {
             continue;
         };
-        let candidate_is_elemental = st
-            .scope(candidate.owner_scope)
-            .symbols
-            .get(&candidate.name.to_lowercase())
-            .map(|sym| sym.attrs.elemental)
-            .unwrap_or(false);
+        let candidate_is_elemental = specific_candidate_is_elemental(st, candidate);
         let declared_args = declared_args_for_scope(scope);
         let required = declared_args
             .iter()
@@ -9448,12 +9462,7 @@ pub(super) fn resolve_generic_call_actuals(
         let Some(scope) = procedure_scope_for_candidate(st, candidate) else {
             continue;
         };
-        let candidate_is_elemental = st
-            .scope(candidate.owner_scope)
-            .symbols
-            .get(&candidate.name.to_lowercase())
-            .map(|sym| sym.attrs.elemental)
-            .unwrap_or(false);
+        let candidate_is_elemental = specific_candidate_is_elemental(st, candidate);
         let declared_args = declared_args_for_scope(scope);
         // F2018 §15.5.2: actual arity must lie within the formal range
         // — at least the count of required (non-optional) formals, at
@@ -11067,12 +11076,7 @@ pub(super) fn defined_binary_operator_result_type_info(
         let Some(scope) = procedure_scope_for_candidate(st, candidate) else {
             continue;
         };
-        let candidate_is_elemental = st
-            .scope(candidate.owner_scope)
-            .symbols
-            .get(&candidate.name.to_ascii_lowercase())
-            .map(|sym| sym.attrs.elemental)
-            .unwrap_or(false);
+        let candidate_is_elemental = specific_candidate_is_elemental(st, candidate);
         let declared_args = declared_args_for_scope(scope);
         if declared_args.len() != 2 {
             continue;
@@ -28105,7 +28109,80 @@ pub(super) fn resolved_named_callee_is_elemental(
             return true;
         }
     }
+    if let Some(candidate) =
+        resolve_generic_call_by_semantics(st, Some(locals), callee_name, args, type_layouts)
+    {
+        if specific_candidate_is_elemental(st, &candidate) {
+            return true;
+        }
+    }
+    if generic_interface_has_elemental_candidate_for_actuals(
+        st,
+        locals,
+        callee_name,
+        args,
+        type_layouts,
+    ) {
+        return true;
+    }
     is_elemental_math_intrinsic(&resolved_name)
+}
+
+fn generic_interface_has_elemental_candidate_for_actuals(
+    st: &SymbolTable,
+    locals: &HashMap<String, LocalInfo>,
+    callee_name: &str,
+    args: &[crate::ast::expr::Argument],
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> bool {
+    let Some(specifics) = named_interface_specific_candidates(st, callee_name) else {
+        return false;
+    };
+    let actual_type_infos: Vec<Option<crate::sema::symtab::TypeInfo>> = args
+        .iter()
+        .map(|arg| match &arg.value {
+            crate::ast::expr::SectionSubscript::Element(expr) => {
+                generic_actual_expr_type_info(expr, locals, st, type_layouts)
+            }
+            _ => None,
+        })
+        .collect();
+
+    specifics.iter().any(|candidate| {
+        if !specific_candidate_is_elemental(st, candidate) {
+            return false;
+        }
+        let Some(scope) = procedure_scope_for_candidate(st, candidate) else {
+            return false;
+        };
+        let declared_args = declared_args_for_scope(scope);
+        let required = declared_args
+            .iter()
+            .filter(|sym| !sym.attrs.optional)
+            .count();
+        if args.len() < required || args.len() > declared_args.len() {
+            return false;
+        }
+        let Some(semantic_slots) = reorder_semantic_type_slots_by_formal_skip(
+            args,
+            &actual_type_infos,
+            &scope.arg_order,
+            0,
+        ) else {
+            return false;
+        };
+        declared_args.iter().enumerate().all(|(idx, declared_arg)| {
+            let Some(declared_type) = declared_arg.type_info.as_ref() else {
+                return true;
+            };
+            match semantic_slots.get(idx).and_then(|slot| slot.as_ref()) {
+                Some(actual) => {
+                    generic_declared_semantic_match(declared_type, Some(actual), type_layouts)
+                }
+                None => true,
+            }
+        })
+    })
 }
 
 /// Standard elemental math/conversion intrinsics (F2018 §16.9). When
@@ -28422,7 +28499,7 @@ pub(super) fn lower_rank1_elemental_call_descriptor(
 
     let mut mapped_args = Vec::with_capacity(args.len());
     let mut loop_locals = locals.clone();
-    let mut array_actuals: Vec<(String, ValueId, IrType, Option<CharKind>)> = Vec::new();
+    let mut array_actuals: Vec<(String, ValueId, IrType, Option<CharKind>, bool)> = Vec::new();
     let mut control_desc = None;
 
     for (idx, arg) in args.iter().enumerate() {
@@ -28442,108 +28519,116 @@ pub(super) fn lower_rank1_elemental_call_descriptor(
             let actual_type = operator_expr_type_info(actual_expr, Some(locals), st, type_layouts);
             let actual_is_character =
                 expr_is_character_expr(b, locals, actual_expr, st, type_layouts);
+            let pass_optional_element_by_ref =
+                !actual_is_character && elemental_actual_may_be_absent(actual_expr, locals, st);
             control_desc.get_or_insert(actual_desc);
             let temp_name = fresh_elemental_temp_name(&loop_locals, "afs_elem_arg", idx);
             let mut char_kind = CharKind::None;
-            let temp_addr = match actual_type {
-                Some(crate::sema::symtab::TypeInfo::Character { len: Some(len), .. })
-                    if actual_is_character =>
-                {
-                    char_kind = CharKind::Fixed(len);
-                    let storage = b.alloca(IrType::Array(
-                        Box::new(IrType::Int(IntWidth::I8)),
-                        len.max(1) as u64,
-                    ));
-                    let space = b.const_i32(b' ' as i32);
-                    let len_val = b.const_i64(len);
-                    b.call(
-                        FuncRef::External("memset".into()),
-                        vec![storage, space, len_val],
-                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                    );
-                    storage
-                }
-                Some(crate::sema::symtab::TypeInfo::Character { .. }) if actual_is_character => {
-                    let len_val = actual_char_arg_runtime_len(
-                        b,
-                        locals,
-                        None,
-                        actual_expr,
-                        st,
-                        type_layouts,
-                        internal_funcs,
-                        contained_host_refs,
-                        descriptor_params,
-                    )
-                    .unwrap_or_else(|| descriptor_elem_size(b, actual_desc));
-                    let len_addr = b.alloca(IrType::Int(IntWidth::I64));
-                    b.store(len_val, len_addr);
-                    char_kind = CharKind::FixedRuntime { len_addr };
+            let temp_addr = if pass_optional_element_by_ref {
+                b.alloca(IrType::Ptr(Box::new(actual_elem_ty.clone())))
+            } else {
+                match actual_type {
+                    Some(crate::sema::symtab::TypeInfo::Character { len: Some(len), .. })
+                        if actual_is_character =>
+                    {
+                        char_kind = CharKind::Fixed(len);
+                        let storage = b.alloca(IrType::Array(
+                            Box::new(IrType::Int(IntWidth::I8)),
+                            len.max(1) as u64,
+                        ));
+                        let space = b.const_i32(b' ' as i32);
+                        let len_val = b.const_i64(len);
+                        b.call(
+                            FuncRef::External("memset".into()),
+                            vec![storage, space, len_val],
+                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                        );
+                        storage
+                    }
+                    Some(crate::sema::symtab::TypeInfo::Character { .. })
+                        if actual_is_character =>
+                    {
+                        let len_val = actual_char_arg_runtime_len(
+                            b,
+                            locals,
+                            None,
+                            actual_expr,
+                            st,
+                            type_layouts,
+                            internal_funcs,
+                            contained_host_refs,
+                            descriptor_params,
+                        )
+                        .unwrap_or_else(|| descriptor_elem_size(b, actual_desc));
+                        let len_addr = b.alloca(IrType::Int(IntWidth::I64));
+                        b.store(len_val, len_addr);
+                        char_kind = CharKind::FixedRuntime { len_addr };
 
-                    let one = b.const_i64(1);
-                    let total = b.iadd(len_val, one);
-                    let ptr = b.runtime_call(
-                        RuntimeFunc::Allocate,
-                        vec![total],
-                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                    );
-                    let ptr_slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
-                    b.store(ptr, ptr_slot);
-                    let zero = b.const_i32(0);
-                    b.call(
-                        FuncRef::External("memset".into()),
-                        vec![ptr, zero, total],
-                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                    );
-                    let space = b.const_i32(b' ' as i32);
-                    b.call(
-                        FuncRef::External("memset".into()),
-                        vec![ptr, space, len_val],
-                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                    );
-                    ptr_slot
-                }
-                _ if actual_is_character => {
-                    let len_val = actual_char_arg_runtime_len(
-                        b,
-                        locals,
-                        None,
-                        actual_expr,
-                        st,
-                        type_layouts,
-                        internal_funcs,
-                        contained_host_refs,
-                        descriptor_params,
-                    )
-                    .unwrap_or_else(|| descriptor_elem_size(b, actual_desc));
-                    let len_addr = b.alloca(IrType::Int(IntWidth::I64));
-                    b.store(len_val, len_addr);
-                    char_kind = CharKind::FixedRuntime { len_addr };
+                        let one = b.const_i64(1);
+                        let total = b.iadd(len_val, one);
+                        let ptr = b.runtime_call(
+                            RuntimeFunc::Allocate,
+                            vec![total],
+                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                        );
+                        let ptr_slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                        b.store(ptr, ptr_slot);
+                        let zero = b.const_i32(0);
+                        b.call(
+                            FuncRef::External("memset".into()),
+                            vec![ptr, zero, total],
+                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                        );
+                        let space = b.const_i32(b' ' as i32);
+                        b.call(
+                            FuncRef::External("memset".into()),
+                            vec![ptr, space, len_val],
+                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                        );
+                        ptr_slot
+                    }
+                    _ if actual_is_character => {
+                        let len_val = actual_char_arg_runtime_len(
+                            b,
+                            locals,
+                            None,
+                            actual_expr,
+                            st,
+                            type_layouts,
+                            internal_funcs,
+                            contained_host_refs,
+                            descriptor_params,
+                        )
+                        .unwrap_or_else(|| descriptor_elem_size(b, actual_desc));
+                        let len_addr = b.alloca(IrType::Int(IntWidth::I64));
+                        b.store(len_val, len_addr);
+                        char_kind = CharKind::FixedRuntime { len_addr };
 
-                    let one = b.const_i64(1);
-                    let total = b.iadd(len_val, one);
-                    let ptr = b.runtime_call(
-                        RuntimeFunc::Allocate,
-                        vec![total],
-                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                    );
-                    let ptr_slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
-                    b.store(ptr, ptr_slot);
-                    let zero = b.const_i32(0);
-                    b.call(
-                        FuncRef::External("memset".into()),
-                        vec![ptr, zero, total],
-                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                    );
-                    let space = b.const_i32(b' ' as i32);
-                    b.call(
-                        FuncRef::External("memset".into()),
-                        vec![ptr, space, len_val],
-                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                    );
-                    ptr_slot
+                        let one = b.const_i64(1);
+                        let total = b.iadd(len_val, one);
+                        let ptr = b.runtime_call(
+                            RuntimeFunc::Allocate,
+                            vec![total],
+                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                        );
+                        let ptr_slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                        b.store(ptr, ptr_slot);
+                        let zero = b.const_i32(0);
+                        b.call(
+                            FuncRef::External("memset".into()),
+                            vec![ptr, zero, total],
+                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                        );
+                        let space = b.const_i32(b' ' as i32);
+                        b.call(
+                            FuncRef::External("memset".into()),
+                            vec![ptr, space, len_val],
+                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                        );
+                        ptr_slot
+                    }
+                    _ => b.alloca(actual_elem_ty.clone()),
                 }
-                _ => b.alloca(actual_elem_ty.clone()),
             };
             let temp_derived_type = match &actual_type {
                 Some(crate::sema::symtab::TypeInfo::Derived(name)) => Some(name.clone()),
@@ -28560,7 +28645,7 @@ pub(super) fn lower_rank1_elemental_call_descriptor(
                     dims: vec![],
                     allocatable: false,
                     descriptor_arg: false,
-                    by_ref: false,
+                    by_ref: pass_optional_element_by_ref,
                     char_kind: char_kind.clone(),
                     derived_type: temp_derived_type.clone(),
                     inline_const: None,
@@ -28576,6 +28661,7 @@ pub(super) fn lower_rank1_elemental_call_descriptor(
                 actual_desc,
                 actual_elem_ty,
                 (char_kind != CharKind::None).then_some(char_kind),
+                pass_optional_element_by_ref,
             ));
             // Track the derived-type name for the loop-body copy step.
             // (No ABI change: kept in a sibling vec keyed by index.)
@@ -28650,15 +28736,19 @@ pub(super) fn lower_rank1_elemental_call_descriptor(
 
     b.set_block(bb_body);
     let cur_idx = b.load(idx_addr);
-    for (temp_name, actual_desc, actual_elem_ty, char_kind) in &array_actuals {
+    for (temp_name, actual_desc, actual_elem_ty, char_kind, optional_by_ref) in &array_actuals {
         let temp_info = loop_locals
             .get(temp_name)
             .expect("elemental temp local must exist");
-        if temp_info.derived_type.is_some() {
+        if *optional_by_ref {
+            store_optional_element_actual_ptr(b, temp_info, *actual_desc, actual_elem_ty, cur_idx);
+        } else if temp_info.derived_type.is_some() || is_complex_ty(actual_elem_ty) {
             // Derived/class actual: memcpy elem_size bytes from the
             // i-th array element into the per-iteration temp slot.
             // Loading and re-storing as a value would emit a `[i8 x N]`
             // load that codegen can't materialize cleanly.
+            // Complex values have the same aggregate-register hazard,
+            // especially complex(real64), so copy their storage bytes too.
             let src_ptr = rank1_array_desc_elem_ptr(b, *actual_desc, actual_elem_ty, cur_idx);
             let elem_bytes = b.const_i64(ir_scalar_byte_size(actual_elem_ty));
             b.call(
@@ -28745,6 +28835,61 @@ pub(super) fn lower_rank1_elemental_call_descriptor(
 
     b.set_block(bb_exit);
     Some((result_desc, result_elem_ty))
+}
+
+fn elemental_actual_may_be_absent(
+    actual_expr: &crate::ast::expr::SpannedExpr,
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+) -> bool {
+    match &actual_expr.node {
+        Expr::ParenExpr { inner } => elemental_actual_may_be_absent(inner, locals, st),
+        Expr::Name { name } => {
+            let key = name.to_lowercase();
+            let Some(info) = locals.get(&key) else {
+                return false;
+            };
+            if !info.by_ref || (info.dims.is_empty() && !local_uses_array_descriptor(info)) {
+                return false;
+            }
+            st.find_symbol_any_scope(&key)
+                .map(|sym| sym.attrs.optional)
+                .unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
+fn store_optional_element_actual_ptr(
+    b: &mut FuncBuilder,
+    temp_info: &LocalInfo,
+    actual_desc: ValueId,
+    actual_elem_ty: &IrType,
+    cur_idx: ValueId,
+) {
+    let base = b.load_typed(actual_desc, IrType::Ptr(Box::new(actual_elem_ty.clone())));
+    let base_addr = b.ptr_to_int(base);
+    let zero = b.const_i64(0);
+    let present = b.icmp(CmpOp::Ne, base_addr, zero);
+
+    let bb_present = b.create_block("elemental_optional_arg_present");
+    let bb_absent = b.create_block("elemental_optional_arg_absent");
+    let bb_done = b.create_block("elemental_optional_arg_done");
+    b.cond_branch(present, bb_present, vec![], bb_absent, vec![]);
+
+    b.set_block(bb_present);
+    let elem_byte_ptr = rank1_array_desc_elem_ptr(b, actual_desc, actual_elem_ty, cur_idx);
+    let elem_addr = b.ptr_to_int(elem_byte_ptr);
+    let elem_ptr = b.int_to_ptr(elem_addr, actual_elem_ty.clone());
+    b.store(elem_ptr, temp_info.addr);
+    b.branch(bb_done, vec![]);
+
+    b.set_block(bb_absent);
+    let null_ptr = b.int_to_ptr(zero, actual_elem_ty.clone());
+    b.store(null_ptr, temp_info.addr);
+    b.branch(bb_done, vec![]);
+
+    b.set_block(bb_done);
 }
 
 /// F2018 §9.5.3.3: vector-subscript gather. Lower `base(idx)` where
@@ -28866,6 +29011,30 @@ pub(super) fn allocate_like_array_temp_descriptor(
     desc
 }
 
+pub(super) fn allocate_like_array_temp_descriptor_with_elem_type(
+    b: &mut FuncBuilder,
+    source_desc: ValueId,
+    elem_ty: &IrType,
+) -> ValueId {
+    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let zero32 = b.const_i32(0);
+    let sz384 = b.const_i64(384);
+    b.call(
+        FuncRef::External("memset".into()),
+        vec![desc, zero32, sz384],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+    let stat = b.alloca(IrType::Int(IntWidth::I32));
+    b.store(zero32, stat);
+    let elem_size = b.const_i64(ir_scalar_byte_size(elem_ty));
+    b.call(
+        FuncRef::External("afs_allocate_like_with_elem_size".into()),
+        vec![desc, source_desc, elem_size, stat],
+        IrType::Void,
+    );
+    desc
+}
+
 pub(super) fn load_rank1_array_desc_elem(
     b: &mut FuncBuilder,
     desc: ValueId,
@@ -28894,6 +29063,21 @@ pub(super) fn store_rank1_array_desc_elem(
     let logical_index = b.imul(index, stride);
     let byte_off = b.imul(logical_index, elem_size);
     let ptr = b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
+    if is_complex_ty(elem_ty) {
+        let src_ptr = match b.func().value_type(value) {
+            Some(IrType::Ptr(inner)) if inner.as_ref() == elem_ty => value,
+            _ => {
+                let fw = complex_float_width(elem_ty);
+                materialize_complex_operand(b, value, fw)
+            }
+        };
+        b.call(
+            FuncRef::External("memcpy".into()),
+            vec![ptr, src_ptr, elem_size],
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        );
+        return;
+    }
     let stored = coerce_to_type(b, value, elem_ty);
     b.store(stored, ptr);
 }
@@ -29344,10 +29528,30 @@ pub(super) fn lower_rank1_numeric_array_binary_descriptor(
     // and we load element-by-element; `is_none` means scalar-shaped
     // and we broadcast.
 
-    let elem_ty = lhs
+    let array_elem_ty = lhs
         .as_ref()
         .map(|(_, ty)| ty.clone())
         .or_else(|| rhs.as_ref().map(|(_, ty)| ty.clone()))?;
+    let is_compare_op = matches!(
+        op,
+        BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge
+    );
+    let semantic_elem_ty = if is_compare_op {
+        None
+    } else {
+        let left_ti = operator_expr_type_info(left, Some(locals), st, type_layouts);
+        let right_ti = operator_expr_type_info(right, Some(locals), st, type_layouts);
+        let left_fty = left_ti
+            .map(|ti| crate::sema::types::type_info_to_fortran_type(&ti))
+            .unwrap_or_else(|| crate::sema::types::expr_type(left, st));
+        let right_fty = right_ti
+            .map(|ti| crate::sema::types::type_info_to_fortran_type(&ti))
+            .unwrap_or_else(|| crate::sema::types::expr_type(right, st));
+        crate::sema::types::binary_op_result_type(op, &left_fty, &right_fty)
+            .and_then(|fty| fortran_type_to_type_info(&fty))
+            .map(|ti| type_info_to_ir_type(&ti))
+    };
+    let elem_ty = semantic_elem_ty.unwrap_or(array_elem_ty);
     let is_complex_elem =
         matches!(&elem_ty, IrType::Array(inner, 2) if matches!(inner.as_ref(), IrType::Float(_)));
     match &elem_ty {
@@ -29366,10 +29570,6 @@ pub(super) fn lower_rank1_numeric_array_binary_descriptor(
     // (lower_logical_reduction_intrinsic_ast) handles char vector subscript
     // ANY by iterating a different way. Only apply when both sides are
     // Integer or Real semantic types.
-    let is_compare_op = matches!(
-        op,
-        BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge
-    );
     if is_compare_op {
         let lt = crate::sema::types::expr_type(left, st);
         let rt = crate::sema::types::expr_type(right, st);
@@ -29460,7 +29660,7 @@ pub(super) fn lower_rank1_numeric_array_binary_descriptor(
         .as_ref()
         .map(|(desc, _)| *desc)
         .or_else(|| rhs.as_ref().map(|(desc, _)| *desc))?;
-    let result_desc = allocate_like_array_temp_descriptor(b, source_desc);
+    let result_desc = allocate_like_array_temp_descriptor_with_elem_type(b, source_desc, &elem_ty);
     let n = b.call(
         FuncRef::External("afs_array_size".into()),
         vec![source_desc],
@@ -32294,12 +32494,22 @@ pub(super) fn lower_array_assign(
                 b.cond_branch(done, bb_ext, vec![], bb_bdy, vec![]);
                 b.set_block(bb_bdy);
                 let iv = b.load(i_addr);
-                let elem_val = load_rank1_array_desc_elem(b, src_desc, &src_elem_ty, iv);
-                let coerced = coerce_to_type(b, elem_val, &dest_info.ty);
                 let logical_idx = b.imul(iv, dest_stride);
                 let doff = b.imul(logical_idx, dest_elem_bytes);
                 let dp = b.gep(dest_base, vec![doff], IrType::Int(IntWidth::I8));
-                b.store(coerced, dp);
+                if is_complex_ty(&src_elem_ty) && is_complex_ty(&dest_info.ty) {
+                    let src_ptr = rank1_array_desc_elem_ptr(b, src_desc, &src_elem_ty, iv);
+                    let copy_bytes = b.const_i64(ir_scalar_byte_size(&dest_info.ty));
+                    b.call(
+                        FuncRef::External("memcpy".into()),
+                        vec![dp, src_ptr, copy_bytes],
+                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                    );
+                } else {
+                    let elem_val = load_rank1_array_desc_elem(b, src_desc, &src_elem_ty, iv);
+                    let coerced = coerce_to_type(b, elem_val, &dest_info.ty);
+                    b.store(coerced, dp);
+                }
                 let one = b.const_i64(1);
                 let ni = b.iadd(iv, one);
                 b.store(ni, i_addr);

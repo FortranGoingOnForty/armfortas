@@ -21784,6 +21784,228 @@ fn optional_logical_present_guard_does_not_deref_absent_dummy() {
 }
 
 #[test]
+fn elemental_optional_array_actual_reaches_scalar_present_check() {
+    let src = write_program(
+        "module m\n  use iso_fortran_env, only: real32\n  implicit none\n  interface optval\n    module procedure optval_rsp\n  end interface\ncontains\n  pure elemental function optval_rsp(x, default) result(y)\n    real(real32), intent(in), optional :: x\n    real(real32), intent(in) :: default\n    real(real32) :: y\n    if (present(x)) then\n      y = x\n    else\n      y = default\n    end if\n  end function optval_rsp\n\n  function foo_sp_arr(x) result(z)\n    real(real32), dimension(2), intent(in), optional :: x\n    real(real32), dimension(2) :: z\n    z = optval(x, [2.0_real32, -2.0_real32])\n  end function foo_sp_arr\nend module m\n\nprogram p\n  use iso_fortran_env, only: real32\n  use m, only: foo_sp_arr\n  implicit none\n  real(real32) :: a(2)\n  a = foo_sp_arr([1.0_real32, -1.0_real32])\n  if (any(a /= [1.0_real32, -1.0_real32])) error stop 1\n  a = foo_sp_arr()\n  if (any(a /= [2.0_real32, -2.0_real32])) error stop 2\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("elemental_optional_array_actual", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("elemental optional array compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "elemental optional array should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "elemental optional array should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected elemental optional array output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn imported_elemental_generic_optional_array_uses_descriptor_wrapper() {
+    let dir = unique_dir("imported_elemental_optional_array");
+    let mod_src = write_program_in(
+        &dir,
+        "optval_m.f90",
+        r#"module optval_m
+  use iso_fortran_env, only: real32, real64
+  implicit none
+  private
+  public :: optval
+  interface optval
+    module procedure optval_rsp
+    module procedure optval_csp
+    module procedure optval_cdp
+    module procedure optval_character
+  end interface
+contains
+  pure elemental function optval_rsp(x, default) result(y)
+    real(real32), intent(in), optional :: x
+    real(real32), intent(in) :: default
+    real(real32) :: y
+    if (present(x)) then
+      y = x
+    else
+      y = default
+    end if
+  end function optval_rsp
+
+  pure elemental function optval_csp(x, default) result(y)
+    complex(real32), intent(in), optional :: x
+    complex(real32), intent(in) :: default
+    complex(real32) :: y
+    if (present(x)) then
+      y = x
+    else
+      y = default
+    end if
+  end function optval_csp
+
+  pure elemental function optval_cdp(x, default) result(y)
+    complex(real64), intent(in), optional :: x
+    complex(real64), intent(in) :: default
+    complex(real64) :: y
+    if (present(x)) then
+      y = x
+    else
+      y = default
+    end if
+  end function optval_cdp
+
+  pure function optval_character(x, default) result(y)
+    character(len=*), intent(in), optional :: x
+    character(len=*), intent(in) :: default
+    character(len=:), allocatable :: y
+    if (present(x)) then
+      y = x
+    else
+      y = default
+    end if
+  end function optval_character
+end module optval_m
+"#,
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        r#"module test_m
+  use iso_fortran_env, only: real32, real64
+  use optval_m, only: optval
+  implicit none
+contains
+  function foo_sp_arr(x) result(z)
+    real(real32), dimension(2), intent(in), optional :: x
+    real(real32), dimension(2) :: z
+    z = optval(x, [2.0_real32, -2.0_real32])
+  end function foo_sp_arr
+
+  function foo_csp_arr(x) result(z)
+    complex(real32), dimension(2), intent(in), optional :: x
+    complex(real32), dimension(2) :: z
+    z = optval(x, cmplx(2.0_real32, 2.0_real32, kind=real32) * [1.0_real32, -1.0_real32])
+  end function foo_csp_arr
+
+  function foo_cdp_arr(x) result(z)
+    complex(real64), dimension(2), intent(in), optional :: x
+    complex(real64), dimension(2) :: z
+    z = optval(x, cmplx(2.0_real64, 2.0_real64, kind=real64) * [1.0_real64, -1.0_real64])
+  end function foo_cdp_arr
+end module test_m
+
+program p
+  use iso_fortran_env, only: real32, real64
+  use test_m, only: foo_sp_arr, foo_csp_arr, foo_cdp_arr
+  implicit none
+  complex(real32), dimension(2) :: z1, z2
+  complex(real64), dimension(2) :: z3, z4
+
+  if (.not. all(foo_sp_arr([1.0_real32, -1.0_real32]) == [1.0_real32, -1.0_real32])) error stop 1
+  if (.not. all(foo_sp_arr() == [2.0_real32, -2.0_real32])) error stop 2
+
+  z1 = cmplx(1.0_real32, 2.0_real32, kind=real32) * [1.0_real32, -1.0_real32]
+  z2 = cmplx(2.0_real32, 2.0_real32, kind=real32) * [1.0_real32, -1.0_real32]
+  if (.not. all(foo_csp_arr(z1) == z1)) error stop 3
+  if (.not. all(foo_csp_arr() == z2)) error stop 4
+
+  z3 = cmplx(1.0_real64, 2.0_real64, kind=real64) * [1.0_real64, -1.0_real64]
+  z4 = cmplx(2.0_real64, 2.0_real64, kind=real64) * [1.0_real64, -1.0_real64]
+  if (.not. all(foo_cdp_arr(z3) == z3)) error stop 5
+  if (.not. all(foo_cdp_arr() == z4)) error stop 6
+  print *, 'ok'
+end program p
+"#,
+    );
+    let mod_obj = dir.join("optval_m.o");
+    let main_obj = dir.join("main.o");
+    let out = dir.join("imported_elemental_optional_array.bin");
+    let compiler = compiler("armfortas");
+
+    let compile_mod = Command::new(&compiler)
+        .args([
+            "-c",
+            mod_src.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("imported elemental module compile spawn failed");
+    assert!(
+        compile_mod.status.success(),
+        "imported elemental module should compile: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let compile_main = Command::new(&compiler)
+        .args([
+            "-c",
+            main_src.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("imported elemental main compile spawn failed");
+    assert!(
+        compile_main.status.success(),
+        "imported elemental main should compile: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let link = Command::new(&compiler)
+        .args([
+            main_obj.to_str().unwrap(),
+            mod_obj.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("imported elemental link spawn failed");
+    assert!(
+        link.status.success(),
+        "imported elemental binary should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "imported elemental optional array should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected imported elemental optional array output: {}",
+        stdout
+    );
+}
+
+#[test]
 fn default_integer_system_clock_runs_without_runtime_abi_crash() {
     let src = write_program(
         "program p\n  implicit none\n  integer :: count, rate, max_count\n  call system_clock(count, rate, max_count)\n  if (rate == 0) error stop 1\n  if (max_count == 0) error stop 2\n  print *, 'ok'\nend program\n",
