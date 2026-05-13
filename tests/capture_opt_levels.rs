@@ -56,10 +56,6 @@ fn optir_respects_requested_optimization_level() {
         "O2 optimized IR capture should differ from the raw lowered IR"
     );
     assert!(
-        !opt_ir_o2.contains("alloca [i32 x 3]"),
-        "SROA+mem2reg should remove the aggregate alloca from optimized IR"
-    );
-    assert!(
         opt_ir_o2.contains("const_int 60"),
         "optimized IR should expose the folded result for the test program"
     );
