@@ -118,6 +118,12 @@ pub(super) fn eval_const_scalar(
                     // x = 1.0/0.0 → +inf` behavior.
                     BinaryOp::Div => Some(ConstScalar::Float(l / r)),
                     BinaryOp::Pow => Some(ConstScalar::Float(l.powf(r))),
+                    BinaryOp::Eq => Some(ConstScalar::Int((l == r) as i128)),
+                    BinaryOp::Ne => Some(ConstScalar::Int((l != r) as i128)),
+                    BinaryOp::Lt => Some(ConstScalar::Int((l < r) as i128)),
+                    BinaryOp::Le => Some(ConstScalar::Int((l <= r) as i128)),
+                    BinaryOp::Gt => Some(ConstScalar::Int((l > r) as i128)),
+                    BinaryOp::Ge => Some(ConstScalar::Int((l >= r) as i128)),
                     _ => None,
                 }
             } else {
@@ -146,6 +152,16 @@ pub(super) fn eval_const_scalar(
                         }
                         Some(ConstScalar::Int(acc))
                     }
+                    BinaryOp::Eq => Some(ConstScalar::Int((l == r) as i128)),
+                    BinaryOp::Ne => Some(ConstScalar::Int((l != r) as i128)),
+                    BinaryOp::Lt => Some(ConstScalar::Int((l < r) as i128)),
+                    BinaryOp::Le => Some(ConstScalar::Int((l <= r) as i128)),
+                    BinaryOp::Gt => Some(ConstScalar::Int((l > r) as i128)),
+                    BinaryOp::Ge => Some(ConstScalar::Int((l >= r) as i128)),
+                    BinaryOp::And => Some(ConstScalar::Int(((l != 0) && (r != 0)) as i128)),
+                    BinaryOp::Or => Some(ConstScalar::Int(((l != 0) || (r != 0)) as i128)),
+                    BinaryOp::Eqv => Some(ConstScalar::Int(((l != 0) == (r != 0)) as i128)),
+                    BinaryOp::Neqv => Some(ConstScalar::Int(((l != 0) != (r != 0)) as i128)),
                     _ => None,
                 }
             }
@@ -284,6 +300,7 @@ pub(super) fn eval_const_scalar(
                             ConstScalar::Float(f) => Some(ConstScalar::Int(f.trunc() as i128)),
                         }
                     }
+                    "transfer" => eval_const_transfer(args, param_consts),
                     "ichar" | "iachar" => {
                         let arg = args.first()?;
                         let crate::ast::expr::SectionSubscript::Element(e) = &arg.value else {
@@ -442,6 +459,124 @@ pub(super) fn eval_const_scalar(
             }
         }
         _ => None,
+    }
+}
+
+fn const_call_arg_expr(arg: &crate::ast::expr::Argument) -> Option<&crate::ast::expr::SpannedExpr> {
+    match &arg.value {
+        crate::ast::expr::SectionSubscript::Element(expr) => Some(expr),
+        _ => None,
+    }
+}
+
+fn eval_const_transfer(
+    args: &[crate::ast::expr::Argument],
+    param_consts: &HashMap<String, ConstScalar>,
+) -> Option<ConstScalar> {
+    if args.len() < 2 || args.iter().take(2).any(|arg| arg.keyword.is_some()) {
+        return None;
+    }
+    if args.get(2).is_some() {
+        // SIZE requests an array result; this scalar folder must not
+        // collapse that to a single mold element.
+        return None;
+    }
+
+    let source = const_call_arg_expr(args.first()?)?;
+    let mold = const_call_arg_expr(args.get(1)?)?;
+    let target_bytes = const_integer_storage_bytes(mold, param_consts)?;
+    let source_bytes = const_transfer_source_bytes(source, param_consts)?;
+    Some(ConstScalar::Int(read_signed_le_int(
+        &source_bytes,
+        target_bytes,
+    )))
+}
+
+fn const_transfer_source_bytes(
+    expr: &crate::ast::expr::SpannedExpr,
+    param_consts: &HashMap<String, ConstScalar>,
+) -> Option<Vec<u8>> {
+    match &expr.node {
+        Expr::ArrayConstructor { values, .. } => {
+            let mut out = Vec::new();
+            for value in values {
+                let crate::ast::expr::AcValue::Expr(elem) = value else {
+                    return None;
+                };
+                let width = const_integer_storage_bytes(elem, param_consts)?;
+                let scalar = eval_const_scalar(elem, param_consts)?;
+                let ConstScalar::Int(raw) = scalar else {
+                    return None;
+                };
+                append_le_int_bytes(&mut out, raw, width);
+            }
+            Some(out)
+        }
+        _ => {
+            let width = const_integer_storage_bytes(expr, param_consts)?;
+            let scalar = eval_const_scalar(expr, param_consts)?;
+            let ConstScalar::Int(raw) = scalar else {
+                return None;
+            };
+            let mut out = Vec::new();
+            append_le_int_bytes(&mut out, raw, width);
+            Some(out)
+        }
+    }
+}
+
+fn const_integer_storage_bytes(
+    expr: &crate::ast::expr::SpannedExpr,
+    param_consts: &HashMap<String, ConstScalar>,
+) -> Option<usize> {
+    match &expr.node {
+        Expr::IntegerLiteral { kind, .. } | Expr::LogicalLiteral { kind, .. } => Some(
+            kind.as_deref()
+                .and_then(|k| kind_bytes(k, param_consts))
+                .unwrap_or(4),
+        ),
+        Expr::ParenExpr { inner } => const_integer_storage_bytes(inner, param_consts),
+        _ => None,
+    }
+}
+
+fn kind_bytes(kind: &str, param_consts: &HashMap<String, ConstScalar>) -> Option<usize> {
+    let key = kind.to_ascii_lowercase();
+    if let Ok(value) = key.parse::<usize>() {
+        return Some(value).filter(|b| matches!(b, 1 | 2 | 4 | 8 | 16));
+    }
+    match key.as_str() {
+        "int8" | "c_int8_t" => Some(1),
+        "int16" | "c_int16_t" => Some(2),
+        "int32" | "c_int32_t" | "c_int" => Some(4),
+        "int64" | "c_int64_t" | "c_long" | "c_long_long" => Some(8),
+        _ => match param_consts.get(&key).copied()? {
+            ConstScalar::Int(value) => usize::try_from(value)
+                .ok()
+                .filter(|b| matches!(b, 1 | 2 | 4 | 8 | 16)),
+            ConstScalar::Float(_) => None,
+        },
+    }
+}
+
+fn append_le_int_bytes(out: &mut Vec<u8>, value: i128, bytes: usize) {
+    for offset in 0..bytes {
+        out.push(((value >> (offset * 8)) & 0xff) as u8);
+    }
+}
+
+fn read_signed_le_int(bytes: &[u8], target_bytes: usize) -> i128 {
+    let mut value = 0_i128;
+    for idx in 0..target_bytes {
+        let byte = bytes.get(idx).copied().unwrap_or(0) as i128;
+        value |= byte << (idx * 8);
+    }
+    let bits = target_bytes * 8;
+    let sign_bit = 1_i128 << (bits - 1);
+    if value & sign_bit != 0 {
+        value - (1_i128 << bits)
+    } else {
+        value
     }
 }
 
