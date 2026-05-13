@@ -19350,6 +19350,20 @@ pub(super) fn ir_scalar_byte_size(ty: &IrType) -> i64 {
     }
 }
 
+fn scalar_runtime_write_func(ty: &IrType) -> &'static str {
+    match ty {
+        IrType::Int(IntWidth::I8) => "afs_write_int8",
+        IrType::Int(IntWidth::I16) => "afs_write_int16",
+        IrType::Int(IntWidth::I32) => "afs_write_int",
+        IrType::Int(IntWidth::I64) => "afs_write_int64",
+        IrType::Int(IntWidth::I128) => "afs_write_int128",
+        IrType::Float(FloatWidth::F64) => "afs_write_real64",
+        IrType::Float(_) => "afs_write_real",
+        IrType::Bool => "afs_write_logical",
+        _ => "afs_write_int",
+    }
+}
+
 pub(super) fn descriptor_element_size_bytes(info: &LocalInfo) -> i64 {
     match &info.ty {
         IrType::Array(_, _) => info.ty.size_bytes() as i64,
@@ -20603,15 +20617,7 @@ pub(super) fn lower_write_items_adv(
                             "afs_write_complex_f32"
                         }
                     } else {
-                        match &elem_ty {
-                            IrType::Int(IntWidth::I128) => "afs_write_int128",
-                            IrType::Int(IntWidth::I64) => "afs_write_int64",
-                            IrType::Int(_) => "afs_write_int",
-                            IrType::Float(FloatWidth::F64) => "afs_write_real64",
-                            IrType::Float(_) => "afs_write_real",
-                            IrType::Bool => "afs_write_logical",
-                            _ => "afs_write_int",
-                        }
+                        scalar_runtime_write_func(&elem_ty)
                     };
                     let n = b.call(
                         FuncRef::External("afs_array_size".into()),
@@ -20663,12 +20669,6 @@ pub(super) fn lower_write_items_adv(
                 .value_type(val)
                 .unwrap_or(IrType::Int(IntWidth::I32));
             let func_name = match &ty {
-                IrType::Int(IntWidth::I128) => "afs_write_int128",
-                IrType::Int(IntWidth::I64) => "afs_write_int64",
-                IrType::Int(_) => "afs_write_int",
-                IrType::Float(FloatWidth::F64) => "afs_write_real64",
-                IrType::Float(_) => "afs_write_real",
-                IrType::Bool => "afs_write_logical",
                 IrType::Ptr(ref inner) => {
                     // Complex expression result: ptr<[f32/f64 x 2]>
                     if is_complex_ty(&ty) {
@@ -20696,7 +20696,7 @@ pub(super) fn lower_write_items_adv(
                     );
                     continue;
                 }
-                _ => "afs_write_int",
+                _ => scalar_runtime_write_func(&ty),
             };
             b.call(
                 FuncRef::External(func_name.into()),
@@ -21198,6 +21198,78 @@ pub(super) fn lower_read_into_addr(
                         IrType::Void,
                     );
                     bump_formatted_read_index(b, item_idx);
+                }
+            }
+            true
+        }
+        IrType::Int(width @ (IntWidth::I8 | IntWidth::I16)) => {
+            match mode {
+                ReadMode::Unit { unit, iostat } => {
+                    let func = match width {
+                        IntWidth::I8 => "afs_read_int8",
+                        IntWidth::I16 => "afs_read_int16",
+                        _ => unreachable!(),
+                    };
+                    b.call(
+                        FuncRef::External(func.into()),
+                        vec![unit, addr, iostat],
+                        IrType::Void,
+                    );
+                }
+                ReadMode::Internal {
+                    buf_ptr,
+                    buf_len,
+                    pos,
+                    iostat,
+                } => {
+                    let tmp = b.alloca(IrType::Int(IntWidth::I32));
+                    b.call(
+                        FuncRef::External("afs_read_internal_int".into()),
+                        vec![buf_ptr, buf_len, pos, tmp, iostat],
+                        IrType::Void,
+                    );
+                    let raw = b.load_typed(tmp, IrType::Int(IntWidth::I32));
+                    let narrowed = b.int_trunc(raw, *width);
+                    b.store(narrowed, addr);
+                }
+                ReadMode::FormattedUnit {
+                    unit,
+                    fmt_ptr,
+                    fmt_len,
+                    item_idx,
+                    iostat,
+                } => {
+                    let tmp = b.alloca(IrType::Int(IntWidth::I32));
+                    let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
+                    b.call(
+                        FuncRef::External("afs_fmt_read_int".into()),
+                        vec![unit, fmt_ptr, fmt_len, current_idx, tmp, iostat],
+                        IrType::Void,
+                    );
+                    bump_formatted_read_index(b, item_idx);
+                    let raw = b.load_typed(tmp, IrType::Int(IntWidth::I32));
+                    let narrowed = b.int_trunc(raw, *width);
+                    b.store(narrowed, addr);
+                }
+                ReadMode::FormattedInternal {
+                    buf_ptr,
+                    buf_len,
+                    fmt_ptr,
+                    fmt_len,
+                    item_idx,
+                    iostat,
+                } => {
+                    let tmp = b.alloca(IrType::Int(IntWidth::I32));
+                    let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
+                    b.call(
+                        FuncRef::External("afs_fmt_read_int_internal".into()),
+                        vec![buf_ptr, buf_len, fmt_ptr, fmt_len, current_idx, tmp, iostat],
+                        IrType::Void,
+                    );
+                    bump_formatted_read_index(b, item_idx);
+                    let raw = b.load_typed(tmp, IrType::Int(IntWidth::I32));
+                    let narrowed = b.int_trunc(raw, *width);
+                    b.store(narrowed, addr);
                 }
             }
             true
@@ -22705,13 +22777,7 @@ pub(super) fn lower_1d_slice_write(
     let writer = match &info.ty {
         _ if is_complex_elem && complex_lane_f64 => "afs_write_complex_f64",
         _ if is_complex_elem => "afs_write_complex_f32",
-        IrType::Int(IntWidth::I128) => "afs_write_int128",
-        IrType::Int(IntWidth::I64) => "afs_write_int64",
-        IrType::Int(_) => "afs_write_int",
-        IrType::Float(FloatWidth::F64) => "afs_write_real64",
-        IrType::Float(_) => "afs_write_real",
-        IrType::Bool => "afs_write_logical",
-        _ => "afs_write_int",
+        _ => scalar_runtime_write_func(&info.ty),
     };
 
     // `i` counter, starts at the slice's first index.
@@ -23455,13 +23521,7 @@ pub(super) fn lower_section_write_nd(
     let writer = match &info.ty {
         _ if is_complex_elem && complex_lane_f64 => "afs_write_complex_f64",
         _ if is_complex_elem => "afs_write_complex_f32",
-        IrType::Int(IntWidth::I128) => "afs_write_int128",
-        IrType::Int(IntWidth::I64) => "afs_write_int64",
-        IrType::Int(_) => "afs_write_int",
-        IrType::Float(FloatWidth::F64) => "afs_write_real64",
-        IrType::Float(_) => "afs_write_real",
-        IrType::Bool => "afs_write_logical",
-        _ => "afs_write_int",
+        _ => scalar_runtime_write_func(&info.ty),
     };
 
     // For each dimension we need: a runtime counter alloca plus
@@ -23743,13 +23803,7 @@ pub(super) fn lower_alloc_section_write_nd(
         _ if char_fixed_len.is_some() => "afs_write_string",
         _ if is_complex_elem && complex_lane_f64 => "afs_write_complex_f64",
         _ if is_complex_elem => "afs_write_complex_f32",
-        IrType::Int(IntWidth::I128) => "afs_write_int128",
-        IrType::Int(IntWidth::I64) => "afs_write_int64",
-        IrType::Int(_) => "afs_write_int",
-        IrType::Float(FloatWidth::F64) => "afs_write_real64",
-        IrType::Float(_) => "afs_write_real",
-        IrType::Bool => "afs_write_logical",
-        _ => "afs_write_int",
+        _ => scalar_runtime_write_func(&info.ty),
     };
 
     let mut dims: Vec<DimSlice> = Vec::with_capacity(args.len());
@@ -23952,13 +24006,7 @@ pub(super) fn lower_whole_array_write(
         _ if char_fixed_len.is_some() => "afs_write_string",
         _ if is_complex_elem && complex_lane_f64 => "afs_write_complex_f64",
         _ if is_complex_elem => "afs_write_complex_f32",
-        IrType::Int(IntWidth::I128) => "afs_write_int128",
-        IrType::Int(IntWidth::I64) => "afs_write_int64",
-        IrType::Int(_) => "afs_write_int",
-        IrType::Float(FloatWidth::F64) => "afs_write_real64",
-        IrType::Float(_) => "afs_write_real",
-        IrType::Bool => "afs_write_logical",
-        _ => "afs_write_int",
+        _ => scalar_runtime_write_func(&info.ty),
     };
 
     // Compile-time-known size for stack arrays; runtime descriptor

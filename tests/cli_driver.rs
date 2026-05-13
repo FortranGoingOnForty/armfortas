@@ -563,6 +563,62 @@ fn stream_unformatted_char_write_preserves_exact_bytes() {
 }
 
 #[test]
+fn stream_unformatted_narrow_integer_io_preserves_raw_widths() {
+    let input = unique_path("stream_unformatted_narrow_integer_read", "bin");
+    std::fs::write(&input, [0x32u8, 0x00, 0x09, 0xde, 0x34, 0x12, 0xfe, 0xff])
+        .expect("cannot seed narrow integer stream input");
+
+    let output_file = unique_path("stream_unformatted_narrow_integer_write", "bin");
+    let src = write_program(
+        &format!(
+            "program p\n  use iso_fortran_env, only: int8, int16\n  implicit none\n  integer :: unit_num, ios\n  integer(int8) :: bytes(4), got_bytes(4)\n  integer(int16) :: words(2), got_words(2)\n  bytes = [50_int8, 9_int8, 46_int8, -34_int8]\n  words = [4660_int16, -2_int16]\n  open(newunit=unit_num, file='{}', status='replace', action='write', access='stream', form='unformatted', iostat=ios)\n  if (ios /= 0) error stop 1\n  write(unit_num, iostat=ios) bytes\n  if (ios /= 0) error stop 2\n  write(unit_num, iostat=ios) words\n  if (ios /= 0) error stop 3\n  close(unit_num)\n  got_bytes = 0_int8\n  got_words = 0_int16\n  open(newunit=unit_num, file='{}', status='old', action='read', access='stream', form='unformatted', iostat=ios)\n  if (ios /= 0) error stop 4\n  read(unit_num, iostat=ios) got_bytes\n  if (ios /= 0) error stop 5\n  read(unit_num, iostat=ios) got_words\n  if (ios /= 0) error stop 6\n  close(unit_num)\n  if (got_bytes(1) /= 50_int8) error stop 7\n  if (got_bytes(2) /= 0_int8) error stop 8\n  if (got_bytes(3) /= 9_int8) error stop 9\n  if (got_bytes(4) /= -34_int8) error stop 10\n  if (got_words(1) /= 4660_int16) error stop 11\n  if (got_words(2) /= -2_int16) error stop 12\n  print *, 'ok'\nend program\n",
+            output_file.display(),
+            input.display()
+        ),
+        "stream_unformatted_narrow_integer_io.f90",
+    );
+    let out = unique_path("stream_unformatted_narrow_integer_io", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("stream unformatted narrow integer compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "stream unformatted narrow integer compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("stream unformatted narrow integer run failed");
+    assert!(
+        run.status.success(),
+        "stream unformatted narrow integer run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected ok output, got: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let bytes = std::fs::read(&output_file).expect("cannot read narrow integer stream output");
+    assert_eq!(
+        bytes,
+        vec![0x32, 0x09, 0x2e, 0xde, 0x34, 0x12, 0xfe, 0xff],
+        "expected exact int8/int16 stream bytes, got {:?}",
+        bytes
+    );
+
+    let _ = std::fs::remove_file(&input);
+    let _ = std::fs::remove_file(&output_file);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn stream_unformatted_char_array_section_read_preserves_byte_count() {
     let input = unique_path("stream_unformatted_char_array_section_read", "bin");
     std::fs::write(&input, [118u8, 0, b'{', b'd', b'e', b's'])

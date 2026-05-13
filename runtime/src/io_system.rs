@@ -68,6 +68,20 @@ fn write_i32_ptr(dst: *mut i32, value: i32) {
 }
 
 #[inline]
+fn write_i16_ptr(dst: *mut i16, value: i16) {
+    if !dst.is_null() {
+        unsafe { std::ptr::write_unaligned(dst, value) };
+    }
+}
+
+#[inline]
+fn write_i8_ptr(dst: *mut i8, value: i8) {
+    if !dst.is_null() {
+        unsafe { std::ptr::write_unaligned(dst, value) };
+    }
+}
+
+#[inline]
 fn write_f64_ptr(dst: *mut f64, value: f64) {
     if !dst.is_null() {
         unsafe { std::ptr::write_unaligned(dst, value) };
@@ -765,6 +779,32 @@ pub extern "C" fn afs_close_ex(unit: i32, status: *const u8, status_len: i64, io
 
 // ---- Public C API: List-directed WRITE ----
 
+/// Write an 8-bit integer value (list-directed).
+#[no_mangle]
+pub extern "C" fn afs_write_int8(unit: i32, val: i8) {
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(u) = state.get_unit(unit) {
+        if u.is_unformatted() {
+            u.raw_or_buffer(&val.to_ne_bytes());
+        } else {
+            let _ = u.write_str(&format!(" {}", val));
+        }
+    }
+}
+
+/// Write a 16-bit integer value (list-directed).
+#[no_mangle]
+pub extern "C" fn afs_write_int16(unit: i32, val: i16) {
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(u) = state.get_unit(unit) {
+        if u.is_unformatted() {
+            u.raw_or_buffer(&val.to_ne_bytes());
+        } else {
+            let _ = u.write_str(&format!(" {}", val));
+        }
+    }
+}
+
 /// Write an integer value (list-directed).
 #[no_mangle]
 pub extern "C" fn afs_write_int(unit: i32, val: i32) {
@@ -1070,6 +1110,140 @@ pub extern "C" fn afs_list_write_end(
 }
 
 // ---- Public C API: List-directed READ ----
+
+/// Read an i8 value (list-directed) from a unit.
+#[no_mangle]
+pub extern "C" fn afs_read_int8(unit: i32, val: *mut i8, iostat: *mut i32) {
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(u) = state.get_unit(unit) {
+        if let Some(bytes) = u.read_buffer_take(1) {
+            write_i8_ptr(val, i8::from_ne_bytes([bytes[0]]));
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = 0;
+                }
+            }
+            return;
+        }
+        if u.form == Form::Unformatted && u.access == Access::Stream {
+            let mut b = [0u8; 1];
+            if read_stream_unformatted_exact(u, &mut b, iostat) == Some(true) {
+                write_i8_ptr(val, i8::from_ne_bytes(b));
+            }
+            return;
+        }
+        match u.next_read_token() {
+            Ok(Some(token)) => match token.parse::<i8>() {
+                Ok(v) => {
+                    write_i8_ptr(val, v);
+                    if !iostat.is_null() {
+                        unsafe {
+                            *iostat = 0;
+                        }
+                    }
+                }
+                Err(_) => {
+                    if !iostat.is_null() {
+                        unsafe {
+                            *iostat = 1;
+                        }
+                    } else {
+                        eprintln!("READ: cannot parse integer from '{}'", token);
+                        std::process::exit(1);
+                    }
+                }
+            },
+            Ok(None) => {
+                if !iostat.is_null() {
+                    unsafe {
+                        *iostat = IOSTAT_END;
+                    }
+                } else {
+                    eprintln!("READ: end of file");
+                    std::process::exit(1);
+                }
+            }
+            Err(e) => {
+                if !iostat.is_null() {
+                    unsafe {
+                        *iostat = 1;
+                    }
+                } else {
+                    eprintln!("READ: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+}
+
+/// Read an i16 value (list-directed) from a unit.
+#[no_mangle]
+pub extern "C" fn afs_read_int16(unit: i32, val: *mut i16, iostat: *mut i32) {
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(u) = state.get_unit(unit) {
+        if let Some(bytes) = u.read_buffer_take(2) {
+            let mut b = [0u8; 2];
+            b.copy_from_slice(&bytes);
+            write_i16_ptr(val, i16::from_ne_bytes(b));
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = 0;
+                }
+            }
+            return;
+        }
+        if u.form == Form::Unformatted && u.access == Access::Stream {
+            let mut b = [0u8; 2];
+            if read_stream_unformatted_exact(u, &mut b, iostat) == Some(true) {
+                write_i16_ptr(val, i16::from_ne_bytes(b));
+            }
+            return;
+        }
+        match u.next_read_token() {
+            Ok(Some(token)) => match token.parse::<i16>() {
+                Ok(v) => {
+                    write_i16_ptr(val, v);
+                    if !iostat.is_null() {
+                        unsafe {
+                            *iostat = 0;
+                        }
+                    }
+                }
+                Err(_) => {
+                    if !iostat.is_null() {
+                        unsafe {
+                            *iostat = 1;
+                        }
+                    } else {
+                        eprintln!("READ: cannot parse integer from '{}'", token);
+                        std::process::exit(1);
+                    }
+                }
+            },
+            Ok(None) => {
+                if !iostat.is_null() {
+                    unsafe {
+                        *iostat = IOSTAT_END;
+                    }
+                } else {
+                    eprintln!("READ: end of file");
+                    std::process::exit(1);
+                }
+            }
+            Err(e) => {
+                if !iostat.is_null() {
+                    unsafe {
+                        *iostat = 1;
+                    }
+                } else {
+                    eprintln!("READ: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+}
 
 /// Read an i32 value (list-directed) from a unit.
 /// Uses token buffer: multiple values on one line are consumed left-to-right.
