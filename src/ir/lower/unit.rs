@@ -72,7 +72,7 @@ pub(crate) fn lower_unit(
         } => {
             let fname = name.clone().unwrap_or_else(|| "main".into());
             let visible_param_consts =
-                collect_decl_param_consts_with_host(decls, host_param_consts);
+                collect_decl_param_consts_with_scope(decls, host_param_consts, st);
             let body_fname = format!("__prog_{}", fname);
             let mut func = Function::new(body_fname.clone(), vec![], IrType::Void);
             let mut ctx = LowerCtx::new(
@@ -279,7 +279,7 @@ pub(crate) fn lower_unit(
             let proc_scope_id =
                 procedure_scope_for_dummy_args_with_host(st, name, args, host_scope_id);
             let visible_param_consts =
-                collect_decl_param_consts_with_host(decls, host_param_consts);
+                collect_decl_param_consts_with_scope(decls, host_param_consts, st);
             let mut params: Vec<Param> = args
                 .iter()
                 .enumerate()
@@ -663,7 +663,7 @@ pub(crate) fn lower_unit(
             let proc_scope_id =
                 procedure_scope_for_dummy_args_with_host(st, name, args, host_scope_id);
             let visible_param_consts =
-                collect_decl_param_consts_with_host(decls, host_param_consts);
+                collect_decl_param_consts_with_scope(decls, host_param_consts, st);
 
             // Hidden-result ABI: allocatable arrays use a 384-byte array
             // descriptor, while scalar character results use a 32-byte
@@ -1396,7 +1396,7 @@ pub(crate) fn lower_unit(
             // subprograms (module procedures) must be lowered as top-level
             // functions so they are emitted into the object file.
             let visible_param_consts =
-                collect_decl_param_consts_with_host(decls, host_param_consts);
+                collect_decl_param_consts_with_scope(decls, host_param_consts, st);
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
                 host_uses.iter().chain(uses.iter()).cloned().collect();
             let module_name = match &unit.node {

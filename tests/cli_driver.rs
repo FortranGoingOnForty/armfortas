@@ -16424,6 +16424,205 @@ fn transfer_with_parameter_size_into_fixed_array_dest_byte_copies_source() {
 }
 
 #[test]
+fn transfer_named_int32_parameter_is_visible_in_contained_body() {
+    // stdlib_hash_64bit_spookyv2 builds:
+    //
+    //   integer(int32), parameter :: sc_constsub = int(z'deadbeef', int32)
+    //   integer(int64), parameter :: sc_const =
+    //       transfer([sc_constsub, sc_constsub], 0_int64)
+    //
+    // Scalar PARAMETERs are not closure-passed into contained procedures; they
+    // must be folded into the host parameter table. The width of sc_constsub
+    // matters here: using value-derived width reads 8 bytes per lane instead
+    // of the declared int32 representation.
+    let src = write_program(
+        r#"program p
+  use iso_fortran_env, only: int32, int64
+  implicit none
+  integer(int32), parameter :: sc_constsub = int(z'deadbeef', int32)
+  integer(int64), parameter :: sc_const = transfer([sc_constsub, sc_constsub], 0_int64)
+
+  call probe()
+  print *, 'ok'
+
+contains
+  subroutine probe()
+    if (sc_const /= -2401053088876216593_int64) error stop 1
+  end subroutine probe
+end program p
+"#,
+        "f90",
+    );
+    let out = unique_path("transfer_named_param_host", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("transfer named parameter host compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "transfer named parameter host should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("transfer named parameter host run failed");
+    assert!(
+        run.status.success(),
+        "transfer named parameter host should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn transfer_named_int32_parameter_survives_submodule_amod_boundary() {
+    let dir = unique_dir("transfer_named_param_submodule");
+    let mod_src = write_program_in(
+        &dir,
+        "spooky_const_mod.f90",
+        r#"module spooky_const_mod
+  use iso_fortran_env, only: int32, int64
+  implicit none
+  integer(int32), parameter :: sc_constsub = int(z'deadbeef', int32)
+  integer(int64), parameter :: sc_const = transfer([sc_constsub, sc_constsub], 0_int64)
+
+  interface
+    module subroutine get_spooky_const(x)
+      import :: int64
+      integer(int64), intent(out) :: x
+    end subroutine get_spooky_const
+  end interface
+end module spooky_const_mod
+"#,
+    );
+    let impl_src = write_program_in(
+        &dir,
+        "spooky_const_impl.f90",
+        r#"submodule(spooky_const_mod) spooky_const_impl
+  use iso_fortran_env, only: int64
+  implicit none
+contains
+  module subroutine get_spooky_const(x)
+    integer(int64), intent(out) :: x
+    x = sc_const
+  end subroutine get_spooky_const
+end submodule spooky_const_impl
+"#,
+    );
+    let use_src = write_program_in(
+        &dir,
+        "use_spooky_const.f90",
+        r#"program p
+  use iso_fortran_env, only: int64
+  use spooky_const_mod, only: get_spooky_const
+  implicit none
+  integer(int64) :: x
+  call get_spooky_const(x)
+  if (x /= -2401053088876216593_int64) error stop 1
+  print *, 'ok'
+end program p
+"#,
+    );
+    let mod_obj = dir.join("spooky_const_mod.o");
+    let impl_obj = dir.join("spooky_const_impl.o");
+    let use_obj = dir.join("use_spooky_const.o");
+    let out = dir.join("use_spooky_const");
+
+    let compile_mod = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            mod_src.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spooky const module compile failed to spawn");
+    assert!(
+        compile_mod.status.success(),
+        "spooky const module should compile: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let compile_impl = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            impl_src.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-o",
+            impl_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spooky const submodule compile failed to spawn");
+    assert!(
+        compile_impl.status.success(),
+        "spooky const submodule should compile: {}",
+        String::from_utf8_lossy(&compile_impl.stderr)
+    );
+
+    let compile_use = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            use_src.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            "-o",
+            use_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spooky const consumer compile failed to spawn");
+    assert!(
+        compile_use.status.success(),
+        "spooky const consumer should compile: {}",
+        String::from_utf8_lossy(&compile_use.stderr)
+    );
+
+    let link = Command::new(compiler("armfortas"))
+        .args([
+            mod_obj.to_str().unwrap(),
+            impl_obj.to_str().unwrap(),
+            use_obj.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spooky const repro link failed to spawn");
+    assert!(
+        link.status.success(),
+        "spooky const repro should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("spooky const repro run failed");
+    assert!(
+        run.status.success(),
+        "imported transfer parameter should keep its bits: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected ok marker, got: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn transfer_logical_parameter_survives_amod_boundary() {
     // stdlib_hash_32bit exposes:
     //   logical, parameter :: little_endian =
