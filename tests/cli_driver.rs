@@ -16254,6 +16254,100 @@ fn transfer_with_parameter_size_into_fixed_array_dest_byte_copies_source() {
 }
 
 #[test]
+fn transfer_logical_parameter_survives_amod_boundary() {
+    // stdlib_hash_32bit exposes:
+    //   logical, parameter :: little_endian =
+    //       1 == transfer([1_int8, 0_int8], 0_int16)
+    //
+    // In the producer TU this nontrivial PARAMETER initializer was not
+    // const-folded for module global storage, so the .o exported a
+    // zero-initialized bool and consumers imported `.false.` from the
+    // .amod-backed global. On Apple Silicon that made stdlib's hash
+    // tests take the big-endian path.
+    let dir = unique_dir("transfer_logical_param_amod");
+    let mod_src = write_program_in(
+        &dir,
+        "endian_mod.f90",
+        "module endian_mod\n  use iso_fortran_env, only: int8, int16\n  implicit none\n  logical, parameter, public :: little_endian = (1 == transfer([1_int8, 0_int8], 0_int16))\nend module\n",
+    );
+    let use_src = write_program_in(
+        &dir,
+        "use_endian.f90",
+        "program p\n  use endian_mod, only: little_endian\n  implicit none\n  if (.not. little_endian) error stop 1\n  print *, 'ok'\nend program\n",
+    );
+    let mod_obj = dir.join("endian_mod.o");
+    let use_obj = dir.join("use_endian.o");
+    let out = dir.join("use_endian");
+
+    let compile_mod = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            mod_src.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("endian module compile failed to spawn");
+    assert!(
+        compile_mod.status.success(),
+        "endian module should compile: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let compile_use = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            use_src.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            "-o",
+            use_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("endian consumer compile failed to spawn");
+    assert!(
+        compile_use.status.success(),
+        "endian consumer should compile: {}",
+        String::from_utf8_lossy(&compile_use.stderr)
+    );
+
+    let link = Command::new(compiler("armfortas"))
+        .args([
+            mod_obj.to_str().unwrap(),
+            use_obj.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("endian repro link failed to spawn");
+    assert!(
+        link.status.success(),
+        "endian repro should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("endian repro run failed");
+    assert!(
+        run.status.success(),
+        "imported logical parameter should be true: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected ok marker, got: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn pack_result_vector_subscript_assignment_lowers_intrinsic() {
     // PACK is array-valued and can appear directly as a vector
     // subscript. If that result is misclassified as scalar, lowering
