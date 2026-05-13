@@ -16216,6 +16216,81 @@ fn transfer_with_constant_size_into_array_dest_byte_copies_source() {
 }
 
 #[test]
+fn scalar_transfer_from_assumed_shape_section_copies_section_data() {
+    // stdlib_hash_32bit's nmh_readle16 receives an assumed-shape
+    // byte dummy and computes `transfer(p(1:2), 0_int16)`. The section
+    // source lowers to an array descriptor; scalar TRANSFER must memcpy
+    // from the descriptor's base_addr, not from the descriptor header.
+    let src = write_program(
+        "program p\n  use iso_fortran_env, only: int8, int16\n  implicit none\n  integer(int8) :: key(300)\n  integer :: i\n  do i = 1, 300\n    key(i) = int(iand(i, 255), int8)\n  end do\n  call probe(key(1:2))\ncontains\n  subroutine probe(key)\n    integer(int8), intent(in) :: key(0:)\n    integer(int16) :: got\n    got = readle16(key)\n    if (got /= int(z'0201', int16)) error stop 1\n    print *, 'ok'\n  contains\n    pure function readle16(p) result(v)\n      integer(int16) :: v\n      integer(int8), intent(in) :: p(:)\n      v = transfer(p(1:2), 0_int16)\n    end function\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("transfer_section_scalar", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("section scalar transfer compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "section scalar transfer should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("section scalar transfer run failed");
+    assert!(
+        run.status.success(),
+        "section scalar transfer should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn array_binary_uses_array_valued_transfer_operand_lanes() {
+    // stdlib_hash_32bit uses expressions like
+    // `vx16 = vx16 * transfer(m1, 0_int16, 2)`. TRANSFER with SIZE
+    // is an array result; if scalar lowering handles it, the first
+    // lane is broadcast and the second lane multiplies by the wrong
+    // halfword.
+    let src = write_program(
+        "program p\n  use iso_fortran_env, only: int16, int32\n  implicit none\n  integer(int16) :: lhs(2), got(2)\n  lhs = transfer(int(z'11223344', int32), 0_int16, 2)\n  got = lhs * transfer(int(z'01020304', int32), 0_int16, 2)\n  if (got(1) /= int(-26352, int16)) error stop 1\n  if (got(2) /= int(17476, int16)) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("transfer_array_binary_lanes", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("array transfer binary compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "array transfer binary should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("array transfer binary run failed");
+    assert!(
+        run.status.success(),
+        "array transfer binary should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn transfer_with_parameter_size_into_fixed_array_dest_byte_copies_source() {
     // stdlib hash tests use `transfer(dummy, 0_int8, size_key_array)`,
     // where SIZE is a module parameter rather than a literal. The
