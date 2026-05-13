@@ -111,6 +111,9 @@ pub(super) fn reject_pure_nonlocal_definition(
     let Some(name) = extract_base_name(target) else {
         return;
     };
+    if ctx.is_block_local_name(&name) {
+        return;
+    }
     let Some(sym) = ctx.lookup(&name) else {
         return;
     };

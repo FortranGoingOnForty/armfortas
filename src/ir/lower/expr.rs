@@ -321,23 +321,22 @@ fn lower_cmplx_intrinsic_expr(
     let y_arg = arg_slots.get(1).and_then(|slot| slot.as_ref());
     let kind_arg = arg_slots.get(2).and_then(|slot| slot.as_ref());
 
-    let lower_element_arg = |b: &mut FuncBuilder,
-                             arg: &crate::ast::expr::Argument|
-     -> Option<ValueId> {
-        match &arg.value {
-            crate::ast::expr::SectionSubscript::Element(e) => Some(generic_dispatch_probe_value(
-                b,
-                locals,
-                e,
-                st,
-                type_layouts,
-                internal_funcs,
-                contained_host_refs,
-                descriptor_params,
-            )),
-            crate::ast::expr::SectionSubscript::Range { .. } => None,
-        }
-    };
+    let lower_element_arg =
+        |b: &mut FuncBuilder, arg: &crate::ast::expr::Argument| -> Option<ValueId> {
+            match &arg.value {
+                crate::ast::expr::SectionSubscript::Element(e) => Some(lower_expr_full(
+                    b,
+                    locals,
+                    e,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                )),
+                crate::ast::expr::SectionSubscript::Range { .. } => None,
+            }
+        };
 
     let x_val = lower_element_arg(b, x_arg)?;
     let y_val = y_arg.and_then(|arg| lower_element_arg(b, arg));
@@ -1166,6 +1165,20 @@ pub(crate) fn lower_expr_full(
                     }
                 }
 
+                if let Some(result) = lower_logical_reduction_intrinsic_ast(
+                    b,
+                    &key,
+                    args,
+                    locals,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                ) {
+                    return result;
+                }
+
                 // Check for pointer intrinsics (ASSOCIATED) first —
                 // these work on every pointer shape and don't care
                 // about the array-intrinsic filter.
@@ -1179,20 +1192,6 @@ pub(crate) fn lower_expr_full(
                     if let Some(result) =
                         lower_scalar_allocated_intrinsic(b, locals, &key, args, st, type_layouts)
                     {
-                        return result;
-                    }
-
-                    if let Some(result) = lower_logical_reduction_intrinsic_ast(
-                        b,
-                        &key,
-                        args,
-                        locals,
-                        st,
-                        type_layouts,
-                        internal_funcs,
-                        contained_host_refs,
-                        descriptor_params,
-                    ) {
                         return result;
                     }
 
@@ -1407,6 +1406,71 @@ pub(crate) fn lower_expr_full(
                                 let im2 = b.fmul(im, im);
                                 let sum = b.fadd(re2, im2);
                                 return b.fsqrt(sum);
+                            }
+                        }
+                    }
+                }
+
+                // exp(z) for complex: exp(a+bi) = exp(a) * (cos(b)+i*sin(b)).
+                // Keep this on the expression side of intrinsic lowering so
+                // the scalar libm path never sees the pointer-backed complex
+                // buffer as its argument.
+                if key == "exp" && args.len() == 1 {
+                    if let Some(arg0) = args.first() {
+                        if let crate::ast::expr::SectionSubscript::Element(e) = &arg0.value {
+                            let val = lower_expr_full(
+                                b,
+                                locals,
+                                e,
+                                st,
+                                type_layouts,
+                                internal_funcs,
+                                contained_host_refs,
+                                descriptor_params,
+                            );
+                            let ty = b
+                                .func()
+                                .value_type(val)
+                                .unwrap_or(IrType::Int(IntWidth::I32));
+                            if is_complex_ty(&ty) {
+                                let fw = complex_float_width(&ty);
+                                let elem = IrType::Float(fw);
+                                let lane_bytes =
+                                    b.const_i64(if fw == FloatWidth::F64 { 8 } else { 4 });
+                                let zero = b.const_i64(0);
+                                let src = materialize_complex_operand(b, val, fw);
+                                let re_ptr = b.gep(src, vec![zero], IrType::Int(IntWidth::I8));
+                                let im_ptr =
+                                    b.gep(src, vec![lane_bytes], IrType::Int(IntWidth::I8));
+                                let re_in = b.load_typed(re_ptr, elem.clone());
+                                let im_in = b.load_typed(im_ptr, elem.clone());
+
+                                let suffix = if fw == FloatWidth::F32 { "f" } else { "" };
+                                let exp_re = b.call(
+                                    FuncRef::External(format!("exp{}", suffix)),
+                                    vec![re_in],
+                                    elem.clone(),
+                                );
+                                let cos_im = b.call(
+                                    FuncRef::External(format!("cos{}", suffix)),
+                                    vec![im_in],
+                                    elem.clone(),
+                                );
+                                let sin_im = b.call(
+                                    FuncRef::External(format!("sin{}", suffix)),
+                                    vec![im_in],
+                                    elem.clone(),
+                                );
+                                let re_out = b.fmul(exp_re, cos_im);
+                                let im_out = b.fmul(exp_re, sin_im);
+
+                                let out = b.alloca(IrType::Array(Box::new(elem), 2));
+                                let out_re = b.gep(out, vec![zero], IrType::Int(IntWidth::I8));
+                                let out_im =
+                                    b.gep(out, vec![lane_bytes], IrType::Int(IntWidth::I8));
+                                b.store(re_out, out_re);
+                                b.store(im_out, out_im);
+                                return out;
                             }
                         }
                     }
@@ -1651,18 +1715,16 @@ pub(crate) fn lower_expr_full(
                     let intrinsic_arg_vals: Vec<ValueId> = intrinsic_args
                         .iter()
                         .map(|a| match &a.value {
-                            crate::ast::expr::SectionSubscript::Element(e) => {
-                                generic_dispatch_probe_value(
-                                    b,
-                                    locals,
-                                    e,
-                                    st,
-                                    type_layouts,
-                                    internal_funcs,
-                                    contained_host_refs,
-                                    descriptor_params,
-                                )
-                            }
+                            crate::ast::expr::SectionSubscript::Element(e) => lower_expr_full(
+                                b,
+                                locals,
+                                e,
+                                st,
+                                type_layouts,
+                                internal_funcs,
+                                contained_host_refs,
+                                descriptor_params,
+                            ),
                             _ => b.const_i32(0),
                         })
                         .collect();
@@ -1964,12 +2026,15 @@ pub(crate) fn lower_expr_full(
                                     );
                                     coerce_value_call_arg(b, st, abi_primary_key, i, raw)
                                 } else if wants_descriptor {
-                                    lower_arg_descriptor(
+                                    lower_arg_descriptor_full(
                                         b,
                                         locals,
                                         e,
                                         st,
                                         type_layouts,
+                                        internal_funcs,
+                                        contained_host_refs,
+                                        descriptor_params,
                                         wants_polymorphic_descriptor,
                                     )
                                 } else if wants_string_descriptor {
@@ -2235,12 +2300,15 @@ pub(crate) fn lower_expr_full(
                                             let wants_descriptor =
                                                 mask_says_descriptor || actual_is_descriptor_backed;
                                             let v = if wants_descriptor {
-                                                lower_arg_descriptor(
+                                                lower_arg_descriptor_full(
                                                     b,
                                                     locals,
                                                     e,
                                                     st,
                                                     type_layouts,
+                                                    internal_funcs,
+                                                    contained_host_refs,
+                                                    descriptor_params,
                                                     false,
                                                 )
                                             } else {
@@ -2375,12 +2443,15 @@ pub(crate) fn lower_expr_full(
                                         .unwrap_or(false)
                                         && !wants_bind_c_char;
                                     call_args.push(if wants_descriptor {
-                                        lower_arg_descriptor(
+                                        lower_arg_descriptor_full(
                                             b,
                                             locals,
                                             base,
                                             st,
                                             type_layouts,
+                                            internal_funcs,
+                                            contained_host_refs,
+                                            descriptor_params,
                                             false,
                                         )
                                     } else {
@@ -2448,12 +2519,15 @@ pub(crate) fn lower_expr_full(
                                                     raw,
                                                 )
                                             } else if wants_descriptor {
-                                                lower_arg_descriptor(
+                                                lower_arg_descriptor_full(
                                                     b,
                                                     locals,
                                                     e,
                                                     st,
                                                     type_layouts,
+                                                    internal_funcs,
+                                                    contained_host_refs,
+                                                    descriptor_params,
                                                     false,
                                                 )
                                             } else if wants_string_descriptor {
