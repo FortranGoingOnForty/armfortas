@@ -33244,6 +33244,46 @@ fn cmplx_whole_array_with_kind_keyword_returns_correct_kind_descriptor() {
 }
 
 #[test]
+fn default_cmplx_array_assignment_converts_lanes_to_complex_dp() {
+    // Stdlib's `test_swap_cdp` initializes complex(dp) arrays from
+    // default-kind CMPLX array expressions before calling the generic
+    // elemental `swap`. The descriptor assignment must widen each real
+    // and imaginary lane, not memcpy 16 bytes from an 8-byte complex(sp)
+    // element.
+    let src = write_program(
+        "module m\n  use iso_fortran_env, only: real32, real64\n  implicit none\n  interface swap\n    module procedure swap_csp\n    module procedure swap_cdp\n  end interface\ncontains\n  elemental subroutine swap_csp(lhs, rhs)\n    complex(real32), intent(inout) :: lhs, rhs\n    complex(real32) :: temp\n    temp = lhs\n    lhs = rhs\n    rhs = temp\n  end subroutine\n  elemental subroutine swap_cdp(lhs, rhs)\n    complex(real64), intent(inout) :: lhs, rhs\n    complex(real64) :: temp\n    temp = lhs\n    lhs = rhs\n    rhs = temp\n  end subroutine\nend module\nprogram p\n  use iso_fortran_env, only: real64\n  use m, only: swap\n  implicit none\n  complex(real64) :: x(3), y(3)\n  x = cmplx([1, 2, 3], [4, 5, 6])\n  y = cmplx([4, 5, 6], [1, 2, 3])\n  call swap(x, y)\n  if (.not. all(x == cmplx([4, 5, 6], [1, 2, 3]))) error stop 1\n  if (.not. all(y == cmplx([1, 2, 3], [4, 5, 6]))) error stop 2\n  call swap(x, x)\n  if (.not. all(x == cmplx([4, 5, 6], [1, 2, 3]))) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("cmplx_array_assign_widen", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("cmplx array assignment compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "cmplx array assignment compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&compile.stderr).is_empty(),
+        "cmplx array assignment should not warn: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("cmplx array assignment run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "cmplx array assignment run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn complex_array_power_loads_exponent_elements_not_descriptor() {
     // Surfaced by stdlib_math's logspace_1_cdp_n_rbase:
     //   res = base ** exponents

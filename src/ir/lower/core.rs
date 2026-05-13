@@ -28423,8 +28423,18 @@ pub(super) fn try_lower_elemental_subroutine_call(
     // Copy-in: load element[i] of each array actual into its scalar temp.
     for (class, slot) in classes.iter().zip(temps.iter()) {
         if let (Class::Array { desc, elem_ty }, Some((_, addr, _))) = (class, slot) {
-            let val = load_rank1_array_desc_elem(b, *desc, elem_ty, cur_idx);
-            b.store(val, *addr);
+            if is_complex_ty(elem_ty) {
+                let src_ptr = rank1_array_desc_elem_ptr(b, *desc, elem_ty, cur_idx);
+                let bytes = b.const_i64(ir_scalar_byte_size(elem_ty));
+                b.call(
+                    FuncRef::External("memcpy".into()),
+                    vec![*addr, src_ptr, bytes],
+                    IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                );
+            } else {
+                let val = load_rank1_array_desc_elem(b, *desc, elem_ty, cur_idx);
+                b.store(val, *addr);
+            }
         }
     }
 
@@ -28452,8 +28462,18 @@ pub(super) fn try_lower_elemental_subroutine_call(
     // intent(inout) it propagates the per-iteration update.
     for (class, slot) in classes.iter().zip(temps.iter()) {
         if let (Class::Array { desc, elem_ty }, Some((_, addr, _))) = (class, slot) {
-            let val = b.load_typed(*addr, elem_ty.clone());
-            store_rank1_array_desc_elem(b, *desc, elem_ty, cur_idx, val);
+            if is_complex_ty(elem_ty) {
+                let dest_ptr = rank1_array_desc_elem_ptr(b, *desc, elem_ty, cur_idx);
+                let bytes = b.const_i64(ir_scalar_byte_size(elem_ty));
+                b.call(
+                    FuncRef::External("memcpy".into()),
+                    vec![dest_ptr, *addr, bytes],
+                    IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                );
+            } else {
+                let val = b.load_typed(*addr, elem_ty.clone());
+                store_rank1_array_desc_elem(b, *desc, elem_ty, cur_idx, val);
+            }
         }
     }
 
@@ -30376,7 +30396,7 @@ pub(super) fn lower_array_expr_descriptor(
                         }
                     }
                 }
-                // F2018 §16.9.43: CMPLX(re [, im] [, kind]) over real
+                // F2018 §16.9.43: CMPLX(re [, im] [, kind]) over numeric
                 // arrays. The whole-call form `res = cmplx(x, y, kind=dp)`
                 // (where x, y are real(dp) arrays) used to fall through
                 // to the scalar `lower_intrinsic("cmplx")` path with
@@ -30392,7 +30412,7 @@ pub(super) fn lower_array_expr_descriptor(
                         _ => None,
                     });
                     if let Some(re_expr) = re_arg {
-                        if let Some((re_desc, IrType::Float(src_fw))) = lower_array_expr_descriptor(
+                        if let Some((re_desc, re_elem_ty)) = lower_array_expr_descriptor(
                             b,
                             locals,
                             re_expr,
@@ -30402,15 +30422,15 @@ pub(super) fn lower_array_expr_descriptor(
                             contained_host_refs,
                             descriptor_params,
                         ) {
-                            // Source must be a real array — match Float
-                            // element type. Skip any complex/integer
-                            // case (cmplx of complex/int is handled
-                            // scalarly).
-                            {
-                                let src_lane_bytes: i64 = match src_fw {
-                                    FloatWidth::F64 => 8,
-                                    FloatWidth::F32 => 4,
-                                };
+                            if let Some(re_kind_tag) = numeric_kind_tag_for_ir_type(&re_elem_ty) {
+                                let src_lane_bytes: i64 =
+                                    if complex_float_width(&re_elem_ty) == FloatWidth::F64 {
+                                        8
+                                    } else if matches!(re_elem_ty, IrType::Float(FloatWidth::F64)) {
+                                        8
+                                    } else {
+                                        4
+                                    };
                                 // Walk the actual args; identify im (positional
                                 // arg 1 with no keyword, OR keyword `y=`) and
                                 // kind (keyword `kind=` OR positional arg 2).
@@ -30451,10 +30471,14 @@ pub(super) fn lower_array_expr_descriptor(
                                         descriptor_params,
                                     )
                                 });
-                                let im_desc = if let Some((d, _)) = im_pair {
-                                    d
+                                let (im_desc, im_kind_tag) = if let Some((d, ty)) = im_pair {
+                                    if let Some(tag) = numeric_kind_tag_for_ir_type(&ty) {
+                                        (d, tag)
+                                    } else {
+                                        (b.const_i64(0), -1)
+                                    }
                                 } else {
-                                    b.const_i64(0)
+                                    (b.const_i64(0), -1)
                                 };
                                 // Default out kind = source kind. If a kind
                                 // arg is present, lower it and try to
@@ -30487,9 +30511,18 @@ pub(super) fn lower_array_expr_descriptor(
                                     vec![result_desc, zero_b, sz384],
                                     IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
                                 );
+                                let re_kind_v = b.const_i32(re_kind_tag);
+                                let im_kind_v = b.const_i32(im_kind_tag);
                                 b.call(
                                     FuncRef::External("afs_array_cmplx".into()),
-                                    vec![re_desc, im_desc, out_lane_v, result_desc],
+                                    vec![
+                                        re_desc,
+                                        im_desc,
+                                        out_lane_v,
+                                        result_desc,
+                                        re_kind_v,
+                                        im_kind_v,
+                                    ],
                                     IrType::Void,
                                 );
                                 let out_fw = if out_lane_bytes == 8 {
@@ -32505,6 +32538,14 @@ pub(super) fn lower_array_assign(
                 if is_complex_ty(&src_elem_ty) && is_complex_ty(&dest_info.ty) {
                     let src_ptr = rank1_array_desc_elem_ptr(b, src_desc, &src_elem_ty, iv);
                     let copy_bytes = b.const_i64(ir_scalar_byte_size(&dest_info.ty));
+                    let src_ptr = if complex_float_width(&src_elem_ty)
+                        == complex_float_width(&dest_info.ty)
+                    {
+                        src_ptr
+                    } else {
+                        let src_val = load_rank1_array_desc_elem(b, src_desc, &src_elem_ty, iv);
+                        materialize_complex_operand(b, src_val, complex_float_width(&dest_info.ty))
+                    };
                     b.call(
                         FuncRef::External("memcpy".into()),
                         vec![dp, src_ptr, copy_bytes],
