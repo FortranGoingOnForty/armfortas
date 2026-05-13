@@ -26548,12 +26548,14 @@ pub(super) fn lower_transfer_array_expr_descriptor(
     let mold_ir_ty = type_info_to_ir_type(&mold_ti);
 
     // Resolve the source's contiguous byte storage and its total size.
-    // Two source forms are supported here:
+    // Three source forms are supported here:
     //   * a Name resolving to a whole-array local — read base_addr +
     //     element count from the runtime descriptor
     //   * an inline ArrayConstructor — materialize once via
     //     lower_array_expr_descriptor and read its base_addr; total
     //     bytes are constant from the constructor length × elem size.
+    //   * a scalar expression — spill it into a byte temp and expose
+    //     that temp as the result storage.
     let tl = type_layouts?;
     let (src_base, src_total_bytes_v, src_total_bytes_const): (ValueId, ValueId, Option<i64>) =
         if let Some(src_info) = whole_array_expr_local_info(b, locals, src_expr, st, tl) {
@@ -26604,7 +26606,36 @@ pub(super) fn lower_transfer_array_expr_descriptor(
             let total_const = n_elems * src_elem_bytes;
             (base, b.const_i64(total_const), Some(total_const))
         } else {
-            return None;
+            let src_val = super::expr::lower_expr_full(
+                b,
+                locals,
+                src_expr,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
+            let src_ty = b.func().value_type(src_val)?;
+            if !matches!(src_ty, IrType::Int(_) | IrType::Float(_) | IrType::Bool) {
+                return None;
+            }
+            let src_bytes = ir_scalar_byte_size(&src_ty);
+            let tmp = b.alloca(IrType::Array(
+                Box::new(IrType::Int(IntWidth::I8)),
+                src_bytes as u64,
+            ));
+            let zero = b.const_i32(0);
+            let src_bytes_v = b.const_i64(src_bytes);
+            b.call(
+                FuncRef::External("memset".into()),
+                vec![tmp, zero, src_bytes_v],
+                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+            );
+            let zero_off = b.const_i64(0);
+            let dst = b.gep(tmp, vec![zero_off], IrType::Int(IntWidth::I8));
+            b.store(src_val, dst);
+            (tmp, src_bytes_v, Some(src_bytes))
         };
 
     // Result extent: SIZE (constant or runtime) or
@@ -38038,12 +38069,18 @@ pub(super) fn lower_transfer_intrinsic(
     };
 
     // Determine the mold's IR type from its semantic type. The
-    // value-context lowering only handles the scalar shape — array
-    // shape (when SIZE > 1) is taken care of by
-    // `try_lower_transfer_into_array` at the array-assign site. If a
-    // size>1 transfer reaches this path, fall through to the general
-    // call lowering so we don't return a scalar that the caller will
-    // mishandle.
+    // value-context lowering only handles the scalar result shape.
+    // With SIZE present, TRANSFER returns an array even when SIZE is
+    // one; array expression lowering must handle that descriptor.
+    if args.get(2).is_some() {
+        return None;
+    }
+    let mold_is_array_constructor = matches!(mold_expr.node, Expr::ArrayConstructor { .. });
+    if mold_is_array_constructor || expr_returns_array(mold_expr, locals, st) {
+        return None;
+    }
+
+    // Scalar mold: bit-cast SOURCE into one mold-sized value.
     let mold_ti = operator_expr_type_info(mold_expr, Some(locals), st, type_layouts)?;
     let mold_ty = match &mold_ti {
         crate::sema::symtab::TypeInfo::Integer { kind } => IrType::int_from_kind(kind.unwrap_or(4)),
@@ -38104,6 +38141,26 @@ pub(super) fn lower_transfer_intrinsic(
             b.store(elem_val, dst);
             byte_off += elem_size;
         }
+        return Some(b.load_typed(buf, mold_ty));
+    }
+
+    if let Some((src_desc, _)) = lower_array_expr_descriptor(
+        b,
+        locals,
+        source_expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    ) {
+        let src_base = b.load_typed(src_desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+        let src_bytes = b.const_i64(buf_bytes);
+        b.call(
+            FuncRef::External("memcpy".into()),
+            vec![buf, src_base, src_bytes],
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        );
         return Some(b.load_typed(buf, mold_ty));
     }
 
