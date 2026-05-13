@@ -9960,35 +9960,45 @@ pub(super) fn operator_expr_type_info(
             }
             if let Expr::Name { name } = &callee.node {
                 let key = name.to_lowercase();
-                st.lookup(&key)
-                    .and_then(|sym| sym.type_info.clone())
+                let intrinsic_type_info = if crate::sema::validate::is_intrinsic_name(&key) {
+                    local_intrinsic_call_type_info(expr, locals, st, type_layouts)
+                } else {
+                    None
+                };
+                // Intrinsic result kinds are actual-dependent. Prefer that over
+                // stale implicit callable entries from earlier same-name uses.
+                intrinsic_type_info
+                    .or_else(|| generic_function_call_type_info(expr, locals, st, type_layouts))
                     .or_else(|| {
-                        st.find_symbol_any_scope(&key)
+                        st.lookup(&key)
                             .and_then(|sym| sym.type_info.clone())
-                    })
-                    // find_symbol_any_scope can latch onto a same-named
-                    // NamedInterface (type_info=None) before reaching the
-                    // Function — happens with cross-module generics like
-                    // stdlib_string_type's `reverse` masking
-                    // stdlib_ascii's `reverse` function. Walk every scope
-                    // explicitly to recover the Function's return type.
-                    .or_else(|| {
-                        for scope in st.all_scopes() {
-                            if let Some(sym) = scope.symbols.get(&key) {
-                                if matches!(
-                                    sym.kind,
-                                    crate::sema::symtab::SymbolKind::Function
-                                        | crate::sema::symtab::SymbolKind::Subroutine
-                                ) {
-                                    if let Some(ti) = sym.type_info.clone() {
-                                        return Some(ti);
+                            .or_else(|| {
+                                st.find_symbol_any_scope(&key)
+                                    .and_then(|sym| sym.type_info.clone())
+                            })
+                            // find_symbol_any_scope can latch onto a same-named
+                            // NamedInterface (type_info=None) before reaching the
+                            // Function — happens with cross-module generics like
+                            // stdlib_string_type's `reverse` masking
+                            // stdlib_ascii's `reverse` function. Walk every scope
+                            // explicitly to recover the Function's return type.
+                            .or_else(|| {
+                                for scope in st.all_scopes() {
+                                    if let Some(sym) = scope.symbols.get(&key) {
+                                        if matches!(
+                                            sym.kind,
+                                            crate::sema::symtab::SymbolKind::Function
+                                                | crate::sema::symtab::SymbolKind::Subroutine
+                                        ) {
+                                            if let Some(ti) = sym.type_info.clone() {
+                                                return Some(ti);
+                                            }
+                                        }
                                     }
                                 }
-                            }
-                        }
-                        None
+                                None
+                            })
                     })
-                    .or_else(|| generic_function_call_type_info(expr, locals, st, type_layouts))
                     .or_else(|| local_intrinsic_call_type_info(expr, locals, st, type_layouts))
                     .or_else(|| derived_constructor_type_info(name, st))
                     .or_else(|| fortran_type_to_type_info(&crate::sema::types::expr_type(expr, st)))
