@@ -5859,6 +5859,9 @@ pub(super) fn eval_const_scalar_with_any_scope(
             if matches!(key.as_str(), "max" | "min") {
                 return eval_const_minmax_with_any_scope(&key, args, param_consts, st);
             }
+            if key == "transfer" {
+                return eval_const_transfer_with_any_scope(args, param_consts, st);
+            }
             if key != "size" {
                 return None;
             }
@@ -5997,6 +6000,298 @@ fn const_call_arg_expr(arg: &crate::ast::expr::Argument) -> Option<&crate::ast::
     match &arg.value {
         crate::ast::expr::SectionSubscript::Element(expr) => Some(expr),
         _ => None,
+    }
+}
+
+fn eval_const_transfer_with_any_scope(
+    args: &[crate::ast::expr::Argument],
+    param_consts: &HashMap<String, ConstScalar>,
+    st: &SymbolTable,
+) -> Option<ConstScalar> {
+    if args.len() < 2 || args.iter().take(2).any(|arg| arg.keyword.is_some()) {
+        return None;
+    }
+    if args.get(2).is_some() {
+        // SIZE requests an array result; this scalar folder must not
+        // collapse that to a single mold element.
+        return None;
+    }
+
+    let source = const_call_arg_expr(args.first()?)?;
+    let mold = const_call_arg_expr(args.get(1)?)?;
+    let target_bytes = const_integer_storage_bytes_any_scope(mold, param_consts, st)?;
+    let source_bytes = const_transfer_source_bytes_any_scope(source, param_consts, st)?;
+    Some(ConstScalar::Int(read_signed_le_int_for_transfer(
+        &source_bytes,
+        target_bytes,
+    )))
+}
+
+fn eval_const_transfer_with_decl_scope(
+    args: &[crate::ast::expr::Argument],
+    decls: &[crate::ast::decl::SpannedDecl],
+    param_consts: &HashMap<String, ConstScalar>,
+    st: &SymbolTable,
+) -> Option<ConstScalar> {
+    if args.len() < 2 || args.iter().take(2).any(|arg| arg.keyword.is_some()) {
+        return None;
+    }
+    if args.get(2).is_some() {
+        return None;
+    }
+
+    let source = const_call_arg_expr(args.first()?)?;
+    let mold = const_call_arg_expr(args.get(1)?)?;
+    let target_bytes = const_integer_storage_bytes_decl_scope(mold, decls, param_consts, st)?;
+    let source_bytes = const_transfer_source_bytes_decl_scope(source, decls, param_consts, st)?;
+    Some(ConstScalar::Int(read_signed_le_int_for_transfer(
+        &source_bytes,
+        target_bytes,
+    )))
+}
+
+fn const_transfer_source_bytes_any_scope(
+    expr: &crate::ast::expr::SpannedExpr,
+    param_consts: &HashMap<String, ConstScalar>,
+    st: &SymbolTable,
+) -> Option<Vec<u8>> {
+    match &expr.node {
+        Expr::ArrayConstructor { values, .. } => {
+            let mut out = Vec::new();
+            for value in values {
+                let crate::ast::expr::AcValue::Expr(elem) = value else {
+                    return None;
+                };
+                let width = const_integer_storage_bytes_any_scope(elem, param_consts, st)?;
+                let ConstScalar::Int(raw) =
+                    eval_const_scalar_with_any_scope(elem, param_consts, st)?
+                else {
+                    return None;
+                };
+                append_le_int_bytes_for_transfer(&mut out, raw, width);
+            }
+            Some(out)
+        }
+        _ => {
+            let width = const_integer_storage_bytes_any_scope(expr, param_consts, st)?;
+            let ConstScalar::Int(raw) = eval_const_scalar_with_any_scope(expr, param_consts, st)?
+            else {
+                return None;
+            };
+            let mut out = Vec::new();
+            append_le_int_bytes_for_transfer(&mut out, raw, width);
+            Some(out)
+        }
+    }
+}
+
+fn const_transfer_source_bytes_decl_scope(
+    expr: &crate::ast::expr::SpannedExpr,
+    decls: &[crate::ast::decl::SpannedDecl],
+    param_consts: &HashMap<String, ConstScalar>,
+    st: &SymbolTable,
+) -> Option<Vec<u8>> {
+    match &expr.node {
+        Expr::ArrayConstructor { values, .. } => {
+            let mut out = Vec::new();
+            for value in values {
+                let crate::ast::expr::AcValue::Expr(elem) = value else {
+                    return None;
+                };
+                let width = const_integer_storage_bytes_decl_scope(elem, decls, param_consts, st)?;
+                let ConstScalar::Int(raw) =
+                    eval_const_scalar_with_decl_scope(elem, decls, param_consts, st)?
+                else {
+                    return None;
+                };
+                append_le_int_bytes_for_transfer(&mut out, raw, width);
+            }
+            Some(out)
+        }
+        _ => {
+            let width = const_integer_storage_bytes_decl_scope(expr, decls, param_consts, st)?;
+            let ConstScalar::Int(raw) =
+                eval_const_scalar_with_decl_scope(expr, decls, param_consts, st)?
+            else {
+                return None;
+            };
+            let mut out = Vec::new();
+            append_le_int_bytes_for_transfer(&mut out, raw, width);
+            Some(out)
+        }
+    }
+}
+
+fn const_integer_storage_bytes_any_scope(
+    expr: &crate::ast::expr::SpannedExpr,
+    param_consts: &HashMap<String, ConstScalar>,
+    st: &SymbolTable,
+) -> Option<usize> {
+    match &expr.node {
+        Expr::IntegerLiteral { kind, .. } | Expr::LogicalLiteral { kind, .. } => kind
+            .as_deref()
+            .map(|kind| integer_kind_storage_bytes(kind, param_consts, st))
+            .unwrap_or_else(|| Some(crate::driver::defaults::default_int_kind() as usize)),
+        Expr::ParenExpr { inner } => const_integer_storage_bytes_any_scope(inner, param_consts, st),
+        Expr::FunctionCall { callee, args } => {
+            if matches!(&callee.node, Expr::Name { name } if name.eq_ignore_ascii_case("int")) {
+                int_intrinsic_result_storage_bytes_any_scope(args, param_consts, st)
+            } else {
+                const_expr_ir_type_from_any_scope(expr, param_consts, st)
+                    .as_ref()
+                    .and_then(ir_integer_storage_bytes)
+            }
+        }
+        _ => const_expr_ir_type_from_any_scope(expr, param_consts, st)
+            .as_ref()
+            .and_then(ir_integer_storage_bytes),
+    }
+}
+
+fn const_integer_storage_bytes_decl_scope(
+    expr: &crate::ast::expr::SpannedExpr,
+    decls: &[crate::ast::decl::SpannedDecl],
+    param_consts: &HashMap<String, ConstScalar>,
+    st: &SymbolTable,
+) -> Option<usize> {
+    match &expr.node {
+        Expr::IntegerLiteral { kind, .. } | Expr::LogicalLiteral { kind, .. } => kind
+            .as_deref()
+            .map(|kind| integer_kind_storage_bytes(kind, param_consts, st))
+            .unwrap_or_else(|| Some(crate::driver::defaults::default_int_kind() as usize)),
+        Expr::ParenExpr { inner } => {
+            const_integer_storage_bytes_decl_scope(inner, decls, param_consts, st)
+        }
+        Expr::FunctionCall { callee, args } => {
+            if matches!(&callee.node, Expr::Name { name } if name.eq_ignore_ascii_case("int")) {
+                int_intrinsic_result_storage_bytes_decl_scope(args, decls, param_consts, st)
+            } else {
+                decl_scope_const_ir_type(expr, decls, param_consts, st)
+                    .as_ref()
+                    .and_then(ir_integer_storage_bytes)
+            }
+        }
+        _ => decl_scope_const_ir_type(expr, decls, param_consts, st)
+            .as_ref()
+            .and_then(ir_integer_storage_bytes),
+    }
+}
+
+fn int_intrinsic_result_storage_bytes_any_scope(
+    args: &[crate::ast::expr::Argument],
+    param_consts: &HashMap<String, ConstScalar>,
+    st: &SymbolTable,
+) -> Option<usize> {
+    let Some(kind_expr) = int_intrinsic_kind_expr(args) else {
+        return Some(crate::driver::defaults::default_int_kind() as usize);
+    };
+    let ConstScalar::Int(kind) = eval_const_scalar_with_any_scope(kind_expr, param_consts, st)?
+    else {
+        return None;
+    };
+    integer_kind_value_storage_bytes(kind)
+}
+
+fn int_intrinsic_result_storage_bytes_decl_scope(
+    args: &[crate::ast::expr::Argument],
+    decls: &[crate::ast::decl::SpannedDecl],
+    param_consts: &HashMap<String, ConstScalar>,
+    st: &SymbolTable,
+) -> Option<usize> {
+    let Some(kind_expr) = int_intrinsic_kind_expr(args) else {
+        return Some(crate::driver::defaults::default_int_kind() as usize);
+    };
+    let ConstScalar::Int(kind) =
+        eval_const_scalar_with_decl_scope(kind_expr, decls, param_consts, st)?
+    else {
+        return None;
+    };
+    integer_kind_value_storage_bytes(kind)
+}
+
+fn int_intrinsic_kind_expr(
+    args: &[crate::ast::expr::Argument],
+) -> Option<&crate::ast::expr::SpannedExpr> {
+    args.iter().enumerate().find_map(|(idx, arg)| {
+        let is_kind = arg
+            .keyword
+            .as_deref()
+            .is_some_and(|kw| kw.eq_ignore_ascii_case("kind"))
+            || (idx == 1 && arg.keyword.is_none());
+        is_kind.then(|| const_call_arg_expr(arg)).flatten()
+    })
+}
+
+fn integer_kind_storage_bytes(
+    kind: &str,
+    param_consts: &HashMap<String, ConstScalar>,
+    st: &SymbolTable,
+) -> Option<usize> {
+    let key = kind.to_ascii_lowercase();
+    if let Ok(value) = key.parse::<i128>() {
+        return integer_kind_value_storage_bytes(value);
+    }
+    match key.as_str() {
+        "int8" | "c_int8_t" => Some(1),
+        "int16" | "c_int16_t" => Some(2),
+        "int32" | "c_int" | "c_int32_t" => Some(4),
+        "int64" | "c_long" | "c_long_long" | "c_int64_t" => Some(8),
+        _ => param_consts
+            .get(&key)
+            .copied()
+            .and_then(|value| match value {
+                ConstScalar::Int(kind) => integer_kind_value_storage_bytes(kind),
+                ConstScalar::Float(_) => None,
+            })
+            .or_else(|| {
+                st.find_symbol_any_scope(&key)
+                    .and_then(|sym| sym.const_value)
+                    .and_then(|value| integer_kind_value_storage_bytes(value as i128))
+            }),
+    }
+}
+
+fn integer_kind_value_storage_bytes(value: i128) -> Option<usize> {
+    usize::try_from(value)
+        .ok()
+        .filter(|bytes| matches!(bytes, 1 | 2 | 4 | 8 | 16))
+}
+
+fn ir_integer_storage_bytes(ty: &IrType) -> Option<usize> {
+    match ty {
+        IrType::Int(IntWidth::I8) => Some(1),
+        IrType::Int(IntWidth::I16) => Some(2),
+        IrType::Int(IntWidth::I32) => Some(4),
+        IrType::Int(IntWidth::I64) => Some(8),
+        IrType::Int(IntWidth::I128) => Some(16),
+        IrType::Bool => Some(1),
+        _ => None,
+    }
+}
+
+fn append_le_int_bytes_for_transfer(out: &mut Vec<u8>, value: i128, bytes: usize) {
+    let raw = value as u128;
+    for offset in 0..bytes {
+        out.push(((raw >> (offset * 8)) & 0xff) as u8);
+    }
+}
+
+fn read_signed_le_int_for_transfer(bytes: &[u8], target_bytes: usize) -> i128 {
+    let mut value = 0_u128;
+    for idx in 0..target_bytes {
+        let byte = bytes.get(idx).copied().unwrap_or(0) as u128;
+        value |= byte << (idx * 8);
+    }
+    let bits = target_bytes * 8;
+    if bits >= 128 {
+        value as i128
+    } else {
+        let sign_bit = 1_u128 << (bits - 1);
+        if value & sign_bit != 0 {
+            (value as i128) - (1_i128 << bits)
+        } else {
+            value as i128
+        }
     }
 }
 
@@ -6330,6 +6625,7 @@ pub(super) fn eval_const_scalar_with_decl_scope(
                 "max" | "min" => {
                     eval_const_minmax_with_decl_scope(&key, args, decls, param_consts, st)
                 }
+                "transfer" => eval_const_transfer_with_decl_scope(args, decls, param_consts, st),
                 _ => eval_const_scalar_with_any_scope(expr, param_consts, st),
             }
         }
@@ -38927,7 +39223,9 @@ module m
 contains
   subroutine set_flag(flag)
     integer, intent(out) :: flag
-    if (.true.) then
+    logical :: take_true
+    take_true = .true.
+    if (take_true) then
       flag = 7
     else
       flag = -1
