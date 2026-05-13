@@ -75,6 +75,18 @@ pub(super) fn process_uses(
                     }
                 } else {
                     // USE without ONLY: import all public symbols.
+                    //
+                    // Keep a bare module edge even when the producer has no
+                    // local symbols. Empty façade modules such as
+                    // stdlib_sparse re-export through their USE chain; without
+                    // this edge the consumer has no source scope to walk.
+                    st.add_use_association(UseAssociation {
+                        local_name: String::new(),
+                        original_name: String::new(),
+                        source_scope: mod_scope,
+                        is_submodule_access: false,
+                        from_bare_use: true,
+                    });
                     let mod_symbols: Vec<(String, String)> = st
                         .scope(mod_scope)
                         .symbols
@@ -263,6 +275,13 @@ pub(super) fn load_external_module(
             .or_else(|| load_external_module(st, dep, search_paths, type_layouts));
         if let Some(dep_scope) = dep_scope {
             st.enter_scope(scope_id);
+            st.add_use_association(crate::sema::symtab::UseAssociation {
+                local_name: String::new(),
+                original_name: String::new(),
+                source_scope: dep_scope,
+                is_submodule_access: false,
+                from_bare_use: true,
+            });
             // Re-export every public symbol of the dep by name, like
             // a bare `use <dep>` in source. The transitive lookup in
             // SymbolTable::lookup_in_guarded handles onward chaining.

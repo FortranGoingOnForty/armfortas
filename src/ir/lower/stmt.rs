@@ -360,6 +360,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                         | "shape"
                                                         | "pack"
                                                         | "spread"
+                                                        | "transfer"
                                                         // cmplx(re, im, kind) over real
                                                         // arrays: lower_array_expr_descriptor
                                                         // has a dedicated arm (afs_array_cmplx).
@@ -891,6 +892,12 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         return;
                                     }
                                 }
+                            }
+                            if local_is_array_like(&info)
+                                && !is_scalar_fixed_alloc_char
+                                && lower_vector_subscript_section_assign(b, ctx, &info, args, value)
+                            {
+                                return;
                             }
                             if local_is_array_like(&info)
                                 && !is_scalar_fixed_alloc_char
@@ -2015,8 +2022,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 if try_lower_elemental_subroutine_call(b, ctx, name, &key, args, callee.span) {
                     return;
                 }
-                // Try intrinsic subroutine lowering first.
-                if !super::intrinsic_sub::lower_intrinsic_subroutine(b, ctx, &key, args) {
+                // Intrinsic subroutines share the global procedure
+                // namespace with user procedures. If USE association
+                // or a local declaration made a callable with this
+                // name visible, resolve that call normally instead
+                // of eagerly lowering the intrinsic runtime hook.
+                if user_callable_shadows_intrinsic(ctx.st, &key)
+                    || !super::intrinsic_sub::lower_intrinsic_subroutine(b, ctx, &key, args)
+                {
                     let procptr_target =
                         procedure_pointer_call_target(b, &ctx.locals, ctx.st, &key);
                     let signature_key = procptr_target
