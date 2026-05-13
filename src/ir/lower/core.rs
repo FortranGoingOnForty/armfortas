@@ -2151,6 +2151,10 @@ pub struct ModuleGlobalInfo {
     pub deferred_char: bool,
     pub derived_type: Option<String>,
     pub(crate) char_kind: CharKind,
+    /// Folded scalar value for a named constant that still has backing
+    /// storage in the current object. Importers should inline this instead
+    /// of loading through the global.
+    pub const_value: Option<i128>,
     /// External modules (from .amod files) — skip emitting Global
     /// data entries since the storage lives in the other .o file.
     pub external: bool,
@@ -3190,6 +3194,7 @@ pub(super) fn collect_module_globals(
                             deferred_char: false,
                             derived_type: derived_type_name.clone(),
                             char_kind: global_char_kind.clone(),
+                            const_value: None,
                             external: false,
                             private: false,
                         },
@@ -3220,6 +3225,7 @@ pub(super) fn collect_module_globals(
                             deferred_char: true,
                             derived_type: None,
                             char_kind: CharKind::Deferred,
+                            const_value: None,
                             external: false,
                             private: false,
                         },
@@ -3326,6 +3332,7 @@ pub(super) fn collect_module_globals(
                             deferred_char: false,
                             derived_type: derived_type_name.clone(),
                             char_kind: global_char_kind.clone(),
+                            const_value: None,
                             external: false,
                             private: false,
                         },
@@ -3350,6 +3357,7 @@ pub(super) fn collect_module_globals(
                                 deferred_char: false,
                                 derived_type: derived_type_name.clone(),
                                 char_kind: global_char_kind.clone(),
+                                const_value: None,
                                 external: false,
                                 private: false,
                             },
@@ -3383,6 +3391,7 @@ pub(super) fn collect_module_globals(
                                     deferred_char: false,
                                     derived_type: None,
                                     char_kind: CharKind::Fixed(len),
+                                    const_value: None,
                                     external: false,
                                     private: false,
                                 },
@@ -3430,6 +3439,7 @@ pub(super) fn collect_module_globals(
                                     deferred_char: false,
                                     derived_type: Some(type_name.clone()),
                                     char_kind: CharKind::None,
+                                    const_value: None,
                                     external: false,
                                     private: false,
                                 },
@@ -3461,6 +3471,14 @@ pub(super) fn collect_module_globals(
                             eval_const_global_init(e, &param_consts, Some(&ir_ty))
                         }
                     });
+                    let const_value = if is_parameter {
+                        match init.as_ref() {
+                            Some(GlobalInit::Int(v)) => Some(*v),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
                     module.add_global(Global {
                         name: symbol.clone(),
                         ty: ir_ty.clone(),
@@ -3477,6 +3495,7 @@ pub(super) fn collect_module_globals(
                             deferred_char: false,
                             derived_type: None,
                             char_kind: global_char_kind.clone(),
+                            const_value,
                             external: false,
                             private: false,
                         },
@@ -5165,6 +5184,48 @@ pub(super) fn install_one_global(
     );
 }
 
+fn install_global_inline_const(
+    b: &mut FuncBuilder,
+    locals: &mut HashMap<String, LocalInfo>,
+    local_key: String,
+    info: &ModuleGlobalInfo,
+) -> bool {
+    let Some(value) = info.const_value else {
+        return false;
+    };
+    if locals.contains_key(&local_key)
+        || !info.dims.is_empty()
+        || info.allocatable
+        || info.is_pointer
+        || info.deferred_char
+        || info.derived_type.is_some()
+    {
+        return false;
+    }
+
+    let addr = b.alloca(info.ty.clone());
+    locals.insert(
+        local_key,
+        LocalInfo {
+            addr,
+            ty: info.ty.clone(),
+            dims: vec![],
+            allocatable: false,
+            descriptor_arg: false,
+            by_ref: false,
+            char_kind: info.char_kind.clone(),
+            derived_type: None,
+            inline_const: Some(ConstScalar::Int(value)),
+            is_pointer: false,
+            runtime_dim_upper: vec![],
+            is_class: false,
+            logical_kind: None,
+            last_dim_assumed_size: false,
+        },
+    );
+    true
+}
+
 fn module_scope_name_for_symbol(
     st: &SymbolTable,
     scope_id: crate::sema::symtab::ScopeId,
@@ -5467,7 +5528,9 @@ pub(super) fn install_globals_as_locals_in(
                 }
             }
             installed_from.insert(local_key.clone(), resolved_mod);
-            install_one_global(b, locals, local_key, info);
+            if !install_global_inline_const(b, locals, local_key.clone(), info) {
+                install_one_global(b, locals, local_key, info);
+            }
         } else {
             // Not an IR global — check if it's an intrinsic module parameter constant
             // (iso_c_binding, iso_fortran_env). These are registered in the symbol
@@ -5514,7 +5577,11 @@ pub(super) fn install_globals_as_locals_in(
                                     },
                                 );
                             } else {
-                                let ty = IrType::Int(IntWidth::I32);
+                                let ty = sym
+                                    .type_info
+                                    .as_ref()
+                                    .map(type_info_to_ir_type)
+                                    .unwrap_or(IrType::Int(IntWidth::I32));
                                 // Create a dummy alloca (never loaded from; inline_const
                                 // short-circuits at every use site via materialize_const_scalar).
                                 let addr = b.alloca(ty.clone());
@@ -18279,6 +18346,17 @@ pub(super) fn lower_if(
     else_ifs: &[(crate::ast::expr::SpannedExpr, Vec<SpannedStmt>)],
     else_body: &Option<Vec<SpannedStmt>>,
 ) {
+    if else_ifs.is_empty() {
+        if let Some(value) = known_logical_condition(condition, &ctx.locals, ctx.st) {
+            if value {
+                super::stmt::lower_stmts(b, ctx, then_body);
+            } else if let Some(eb) = else_body {
+                super::stmt::lower_stmts(b, ctx, eb);
+            }
+            return;
+        }
+    }
+
     // Fast path: simple diamond `if (cond) x = a; else x = b` → Select.
     if try_lower_select(b, ctx, condition, then_body, else_ifs, else_body) {
         return;
@@ -18341,6 +18419,11 @@ pub(super) fn lower_condition_branch(
     bb_true: BlockId,
     bb_false: BlockId,
 ) {
+    if let Some(value) = known_logical_condition(condition, &ctx.locals, ctx.st) {
+        b.branch(if value { bb_true } else { bb_false }, vec![]);
+        return;
+    }
+
     match &condition.node {
         Expr::ParenExpr { inner } => lower_condition_branch(b, ctx, inner, bb_true, bb_false),
         Expr::UnaryOp {
@@ -18371,6 +18454,63 @@ pub(super) fn lower_condition_branch(
             let cond = super::expr::lower_expr_ctx(b, ctx, condition);
             b.cond_branch(cond, bb_true, vec![], bb_false, vec![]);
         }
+    }
+}
+
+fn known_logical_condition(
+    condition: &crate::ast::expr::SpannedExpr,
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+) -> Option<bool> {
+    match &condition.node {
+        Expr::LogicalLiteral { value, .. } => Some(*value),
+        Expr::ParenExpr { inner } => known_logical_condition(inner, locals, st),
+        Expr::UnaryOp {
+            op: UnaryOp::Not,
+            operand,
+        } => Some(!known_logical_condition(operand, locals, st)?),
+        Expr::BinaryOp {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => Some(
+            known_logical_condition(left, locals, st)?
+                && known_logical_condition(right, locals, st)?,
+        ),
+        Expr::BinaryOp {
+            op: BinaryOp::Or,
+            left,
+            right,
+        } => Some(
+            known_logical_condition(left, locals, st)?
+                || known_logical_condition(right, locals, st)?,
+        ),
+        Expr::Name { name } => {
+            let key = name.to_lowercase();
+            if let Some(info) = locals.get(&key) {
+                let ConstScalar::Int(value) = info.inline_const? else {
+                    return None;
+                };
+                return match info.ty {
+                    IrType::Bool => Some(value != 0),
+                    _ => None,
+                };
+            }
+
+            let sym = st.find_symbol_any_scope(&key)?;
+            if !sym.attrs.parameter {
+                return None;
+            }
+            if matches!(
+                sym.type_info,
+                Some(crate::sema::symtab::TypeInfo::Logical { .. })
+            ) {
+                sym.const_value.map(|value| value != 0)
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
 
