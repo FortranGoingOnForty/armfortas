@@ -26737,30 +26737,36 @@ pub(super) fn lower_transfer_array_expr_descriptor(
 
     // Resolve the source's contiguous byte storage and its total size.
     // Three source forms are supported here:
-    //   * a Name resolving to a whole-array local — read base_addr +
-    //     element count from the runtime descriptor
+    //   * an array expression/section/name — read base_addr and element
+    //     count from the runtime descriptor
     //   * an inline ArrayConstructor — materialize once via
     //     lower_array_expr_descriptor and read its base_addr; total
     //     bytes are constant from the constructor length × elem size.
     //   * a scalar expression — spill it into a byte temp and expose
     //     that temp as the result storage.
-    let tl = type_layouts?;
     let (src_base, src_total_bytes_v, src_total_bytes_const): (ValueId, ValueId, Option<i64>) =
-        if let Some(src_info) = whole_array_expr_local_info(b, locals, src_expr, st, tl) {
-            let elem_bytes = descriptor_element_size_bytes(&src_info);
+        if let Some((src_desc, src_elem_ty)) = lower_array_expr_descriptor(
+            b,
+            locals,
+            src_expr,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        ) {
+            let elem_bytes = ir_scalar_byte_size(&src_elem_ty);
             if elem_bytes <= 0 {
                 return None;
             }
-            let total_elems = array_total_elems_value(b, &src_info);
+            let total_elems = b.call(
+                FuncRef::External("afs_array_size".into()),
+                vec![src_desc],
+                IrType::Int(IntWidth::I64),
+            );
             let elem_v = b.const_i64(elem_bytes);
             let total_v = b.imul(total_elems, elem_v);
-            let base = if local_uses_array_descriptor(&src_info) {
-                let desc = array_descriptor_addr(b, &src_info);
-                b.load_typed(desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
-            } else {
-                let raw = b.ptr_to_int(src_info.addr);
-                b.int_to_ptr(raw, IrType::Int(IntWidth::I8))
-            };
+            let base = b.load_typed(src_desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
             (base, total_v, None)
         } else if matches!(src_expr.node, Expr::ArrayConstructor { .. }) {
             let (src_desc, _) = lower_array_expr_descriptor(
@@ -38178,10 +38184,17 @@ pub(super) fn try_lower_transfer_into_array(
     };
     let src_addr: ValueId = if let Some(addr) = char_name_src_addr {
         addr
-    } else if let Some((src_desc, _src_elem_ty)) =
-        whole_array_expr_descriptor(b, &ctx.locals, src_expr, ctx.st, Some(ctx.type_layouts))
-    {
-        // Array source: use the data pointer field of the descriptor.
+    } else if let Some((src_desc, _src_elem_ty)) = lower_array_expr_descriptor(
+        b,
+        &ctx.locals,
+        src_expr,
+        ctx.st,
+        Some(ctx.type_layouts),
+        Some(ctx.internal_funcs),
+        Some(ctx.contained_host_refs),
+        Some(ctx.descriptor_params),
+    ) {
+        // Array/section source: use the data pointer field of the descriptor.
         b.load_typed(src_desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
     } else {
         // Lower the expression. If it's a scalar value, spill to a

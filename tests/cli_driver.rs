@@ -16309,6 +16309,45 @@ fn scalar_transfer_from_assumed_shape_section_copies_section_data() {
 }
 
 #[test]
+fn transfer_from_runtime_section_into_array_section_copies_source_data() {
+    // stdlib_hash_64bit_pengy uses:
+    //   b(0:3) = transfer(key(index:index+31), 0_int64, 4)
+    // where key is an assumed-shape byte dummy and index is runtime.
+    // The RHS must lower as an array descriptor over the section data.
+    // Previously the section assignment scalarized the TRANSFER result
+    // and stored the descriptor address into each int64 lane.
+    let src = write_program(
+        "program p\n  use iso_fortran_env, only: int8, int64\n  implicit none\n  integer(int8) :: key(64)\n  integer :: i\n  do i = 1, 64\n    key(i) = int(i, int8)\n  end do\n  call probe(key(1:32))\n  print *, 'ok'\ncontains\n  subroutine probe(x)\n    integer(int8), intent(in) :: x(0:)\n    integer(int64) :: whole(0:3), sliced(0:3)\n    integer(int64) :: index\n    whole = -1_int64\n    sliced = -1_int64\n    index = 0_int64\n    whole = transfer(x(0:31), 0_int64, 4)\n    sliced(0:3) = transfer(x(index:index+31), 0_int64, 4)\n    if (whole(0) /= int(z'0807060504030201', int64)) error stop 1\n    if (whole(1) /= int(z'100f0e0d0c0b0a09', int64)) error stop 2\n    if (whole(2) /= int(z'1817161514131211', int64)) error stop 3\n    if (whole(3) /= int(z'201f1e1d1c1b1a19', int64)) error stop 4\n    if (sliced(0) /= int(z'0807060504030201', int64)) error stop 5\n    if (sliced(1) /= int(z'100f0e0d0c0b0a09', int64)) error stop 6\n    if (sliced(2) /= int(z'1817161514131211', int64)) error stop 7\n    if (sliced(3) /= int(z'201f1e1d1c1b1a19', int64)) error stop 8\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("transfer_runtime_section_array_section", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("runtime section transfer compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "runtime section transfer should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("runtime section transfer run failed");
+    assert!(
+        run.status.success(),
+        "runtime section transfer should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn array_binary_uses_array_valued_transfer_operand_lanes() {
     // stdlib_hash_32bit uses expressions like
     // `vx16 = vx16 * transfer(m1, 0_int16, 2)`. TRANSFER with SIZE
