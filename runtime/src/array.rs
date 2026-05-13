@@ -2614,6 +2614,132 @@ pub extern "C" fn afs_array_norm2_real4(desc: *const ArrayDescriptor) -> f32 {
     acc.sqrt() as f32
 }
 
+#[no_mangle]
+pub extern "C" fn afs_array_norm2_real8_dim(
+    src: *const ArrayDescriptor,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+) {
+    if src.is_null() || dst.is_null() || dim < 1 {
+        return;
+    }
+    let s = unsafe { &*src };
+    if s.base_addr.is_null() || dim as usize > s.rank as usize {
+        return;
+    }
+    let d = unsafe { &mut *dst };
+    if !d.is_allocated() {
+        let new_rank = (s.rank - 1).max(0);
+        let mut dim_buf: [DimDescriptor; 15] = [DimDescriptor {
+            lower_bound: 0,
+            upper_bound: 0,
+            stride: 0,
+        }; 15];
+        let mut k = 0usize;
+        let mut acc: i64 = 1;
+        for i in 0..s.rank as usize {
+            if i + 1 == dim as usize {
+                continue;
+            }
+            let extent = s.dims[i].extent();
+            dim_buf[k].lower_bound = 1;
+            dim_buf[k].upper_bound = extent;
+            dim_buf[k].stride = acc;
+            acc *= extent;
+            k += 1;
+        }
+        let dim_ptr = if new_rank > 0 {
+            dim_buf.as_ptr()
+        } else {
+            ptr::null()
+        };
+        let mut stat: i32 = 0;
+        afs_allocate_array(dst, 8, new_rank, dim_ptr, &mut stat);
+        if stat != 0 || d.base_addr.is_null() {
+            return;
+        }
+    }
+    let dst_total = d.total_elements() as usize;
+    let buf = d.base_addr as *mut f64;
+    for i in 0..dst_total {
+        unsafe {
+            *buf.add(i) = 0.0;
+        }
+    }
+    let src_ptr = s.base_addr as *const u8;
+    for_each_reduce_along_dim(s, dim, |byte_off, dst_flat| {
+        let v = unsafe { *(src_ptr.add(byte_off) as *const f64) };
+        unsafe {
+            *buf.add(dst_flat) += v * v;
+        }
+    });
+    for i in 0..dst_total {
+        unsafe {
+            *buf.add(i) = (*buf.add(i)).sqrt();
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_array_norm2_real4_dim(
+    src: *const ArrayDescriptor,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+) {
+    if src.is_null() || dst.is_null() || dim < 1 {
+        return;
+    }
+    let s = unsafe { &*src };
+    if s.base_addr.is_null() || dim as usize > s.rank as usize {
+        return;
+    }
+    let d = unsafe { &mut *dst };
+    if !d.is_allocated() {
+        let new_rank = (s.rank - 1).max(0);
+        let mut dim_buf: [DimDescriptor; 15] = [DimDescriptor {
+            lower_bound: 0,
+            upper_bound: 0,
+            stride: 0,
+        }; 15];
+        let mut k = 0usize;
+        let mut acc: i64 = 1;
+        for i in 0..s.rank as usize {
+            if i + 1 == dim as usize {
+                continue;
+            }
+            let extent = s.dims[i].extent();
+            dim_buf[k].lower_bound = 1;
+            dim_buf[k].upper_bound = extent;
+            dim_buf[k].stride = acc;
+            acc *= extent;
+            k += 1;
+        }
+        let dim_ptr = if new_rank > 0 {
+            dim_buf.as_ptr()
+        } else {
+            ptr::null()
+        };
+        let mut stat: i32 = 0;
+        afs_allocate_array(dst, 4, new_rank, dim_ptr, &mut stat);
+        if stat != 0 || d.base_addr.is_null() {
+            return;
+        }
+    }
+    let dst_total = d.total_elements() as usize;
+    let mut acc = vec![0.0_f64; dst_total];
+    let src_ptr = s.base_addr as *const u8;
+    for_each_reduce_along_dim(s, dim, |byte_off, dst_flat| {
+        let v = unsafe { *(src_ptr.add(byte_off) as *const f32) } as f64;
+        acc[dst_flat] += v * v;
+    });
+    let buf = d.base_addr as *mut f32;
+    for (i, value) in acc.into_iter().enumerate() {
+        unsafe {
+            *buf.add(i) = value.sqrt() as f32;
+        }
+    }
+}
+
 /// SUM(array) — sum all elements (real version).
 /// Dispatches on `elem_size` so real(4) and real(8) arrays both sum
 /// correctly. Returns f64 (callers downcast for real(4) destinations).
@@ -4730,6 +4856,75 @@ pub extern "C" fn afs_array_pack(
     }
 }
 
+/// F2018 §16.9.194 UNPACK(VECTOR, MASK, FIELD).
+///
+/// Allocates `result` with MASK's shape and VECTOR's element size.
+/// Elements whose mask is true are copied from VECTOR in order; false
+/// elements are copied from FIELD at the same flat array position.
+#[no_mangle]
+pub extern "C" fn afs_array_unpack(
+    vector: *const ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+    field: *const ArrayDescriptor,
+    result: *mut ArrayDescriptor,
+) {
+    if vector.is_null() || mask.is_null() || field.is_null() || result.is_null() {
+        return;
+    }
+    let vec = unsafe { &*vector };
+    let msk = unsafe { &*mask };
+    let fld = unsafe { &*field };
+    if vec.base_addr.is_null() || msk.base_addr.is_null() || fld.base_addr.is_null() {
+        return;
+    }
+
+    let elem_size = vec.elem_size.max(1) as usize;
+    let mut stat = 0i32;
+    afs_allocate_like_with_elem_size(result, mask, elem_size as i64, &mut stat as *mut i32);
+    if stat != 0 {
+        return;
+    }
+    let res = unsafe { &mut *result };
+    if res.base_addr.is_null() {
+        return;
+    }
+
+    let total = msk.total_elements().max(0) as usize;
+    let vec_total = vec.total_elements().max(0) as usize;
+    let field_total = fld.total_elements().max(0) as usize;
+    let mask_elem = msk.elem_size.max(1) as usize;
+    let field_elem = fld.elem_size.max(1) as usize;
+    let vp = vec.base_addr as *const u8;
+    let fp = fld.base_addr as *const u8;
+    let rp = res.base_addr;
+    let mut vec_idx = 0usize;
+
+    for i in 0..total {
+        let dest = unsafe { rp.add(i * elem_size) };
+        let take_vector = unsafe { mask_byte_is_true(msk, i * mask_elem) };
+        if take_vector {
+            if vec_idx < vec_total {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(vp.add(vec_idx * elem_size), dest, elem_size);
+                }
+            } else {
+                unsafe {
+                    core::ptr::write_bytes(dest, 0, elem_size);
+                }
+            }
+            vec_idx += 1;
+        } else if i < field_total {
+            unsafe {
+                core::ptr::copy_nonoverlapping(fp.add(i * field_elem), dest, elem_size);
+            }
+        } else {
+            unsafe {
+                core::ptr::write_bytes(dest, 0, elem_size);
+            }
+        }
+    }
+}
+
 /// F2018 §16.9.163: RESHAPE(SOURCE, SHAPE [, PAD, ORDER]).
 ///
 /// Allocates a fresh result descriptor of rank = size(shape) and
@@ -4937,6 +5132,98 @@ pub extern "C" fn afs_dot_product_real4(
         dot += unsafe { *pa.add(i * stride_a) * *pb.add(i * stride_b) };
     }
     dot
+}
+
+/// DOT_PRODUCT(a, b) — vector dot product (complex(real32) version).
+/// Fortran conjugates the first complex vector argument.
+#[no_mangle]
+pub extern "C" fn afs_dot_product_complex4(
+    a: *const ArrayDescriptor,
+    b: *const ArrayDescriptor,
+    out: *mut f32,
+) {
+    if out.is_null() {
+        return;
+    }
+    unsafe {
+        *out = 0.0;
+        *out.add(1) = 0.0;
+    }
+    if a.is_null() || b.is_null() {
+        return;
+    }
+    let da = unsafe { &*a };
+    let db = unsafe { &*b };
+    if da.base_addr.is_null() || db.base_addr.is_null() {
+        return;
+    }
+    let n = da.dims[0].extent().min(db.dims[0].extent()) as usize;
+    let stride_a = da.dims[0].stride.max(1) as usize;
+    let stride_b = db.dims[0].stride.max(1) as usize;
+    let elem_a = da.elem_size.max(8) as usize;
+    let elem_b = db.elem_size.max(8) as usize;
+    let mut re = 0.0f32;
+    let mut im = 0.0f32;
+    for i in 0..n {
+        let pa = unsafe { da.base_addr.add(i * stride_a * elem_a) as *const f32 };
+        let pb = unsafe { db.base_addr.add(i * stride_b * elem_b) as *const f32 };
+        let ar = unsafe { *pa };
+        let ai = unsafe { *pa.add(1) };
+        let br = unsafe { *pb };
+        let bi = unsafe { *pb.add(1) };
+        re += ar * br + ai * bi;
+        im += ar * bi - ai * br;
+    }
+    unsafe {
+        *out = re;
+        *out.add(1) = im;
+    }
+}
+
+/// DOT_PRODUCT(a, b) — vector dot product (complex(real64) version).
+/// Fortran conjugates the first complex vector argument.
+#[no_mangle]
+pub extern "C" fn afs_dot_product_complex8(
+    a: *const ArrayDescriptor,
+    b: *const ArrayDescriptor,
+    out: *mut f64,
+) {
+    if out.is_null() {
+        return;
+    }
+    unsafe {
+        *out = 0.0;
+        *out.add(1) = 0.0;
+    }
+    if a.is_null() || b.is_null() {
+        return;
+    }
+    let da = unsafe { &*a };
+    let db = unsafe { &*b };
+    if da.base_addr.is_null() || db.base_addr.is_null() {
+        return;
+    }
+    let n = da.dims[0].extent().min(db.dims[0].extent()) as usize;
+    let stride_a = da.dims[0].stride.max(1) as usize;
+    let stride_b = db.dims[0].stride.max(1) as usize;
+    let elem_a = da.elem_size.max(16) as usize;
+    let elem_b = db.elem_size.max(16) as usize;
+    let mut re = 0.0f64;
+    let mut im = 0.0f64;
+    for i in 0..n {
+        let pa = unsafe { da.base_addr.add(i * stride_a * elem_a) as *const f64 };
+        let pb = unsafe { db.base_addr.add(i * stride_b * elem_b) as *const f64 };
+        let ar = unsafe { *pa };
+        let ai = unsafe { *pa.add(1) };
+        let br = unsafe { *pb };
+        let bi = unsafe { *pb.add(1) };
+        re += ar * br + ai * bi;
+        im += ar * bi - ai * br;
+    }
+    unsafe {
+        *out = re;
+        *out.add(1) = im;
+    }
 }
 
 /// DOT_PRODUCT(a, b) — vector dot product (integer(4) version).
