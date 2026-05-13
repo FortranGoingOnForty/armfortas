@@ -10000,11 +10000,18 @@ pub(super) fn resolve_bound_proc_actuals<'a>(
             .filter(|(idx, _)| *idx >= formal_skip)
             .all(
                 |(idx, declared_arg)| match declared_arg.type_info.as_ref() {
-                    Some(declared_type) => generic_declared_semantic_match(
-                        declared_type,
-                        semantic_slots.get(idx).and_then(|slot| slot.as_ref()),
-                        type_layouts,
-                    ),
+                    Some(declared_type) => {
+                        let actual = semantic_slots.get(idx).and_then(|slot| slot.as_ref());
+                        if matches!(
+                            declared_type,
+                            crate::sema::symtab::TypeInfo::Derived(_)
+                                | crate::sema::symtab::TypeInfo::Class(_)
+                        ) && actual.is_none()
+                        {
+                            return false;
+                        }
+                        generic_declared_semantic_match(declared_type, actual, type_layouts)
+                    }
                     None => true,
                 },
             );
@@ -12648,9 +12655,7 @@ pub(super) fn coerce_value_call_arg(
 
 pub(super) fn zero_value_for_ir_type(b: &mut FuncBuilder, ty: &IrType) -> ValueId {
     match ty {
-        IrType::Int(IntWidth::I64) => b.const_i64(0),
-        IrType::Int(IntWidth::I128) => b.const_i64(0),
-        IrType::Int(_) => b.const_i32(0),
+        IrType::Int(width) => b.const_int(0, *width),
         IrType::Float(FloatWidth::F32) => b.const_f32(0.0),
         IrType::Float(FloatWidth::F64) => b.const_f64(0.0),
         IrType::Bool => b.const_bool(false),
