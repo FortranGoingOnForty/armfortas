@@ -33284,6 +33284,41 @@ fn default_cmplx_array_assignment_converts_lanes_to_complex_dp() {
 }
 
 #[test]
+fn elemental_character_array_swap_and_constructor_equality_runs() {
+    // Stdlib's `test_swap_str` calls an elemental character(*) swap over
+    // character arrays, then checks the result with ALL(array == constructor).
+    // The elemental wrapper must copy fixed-length character elements through
+    // memory, not scalar registers, and the reduction must compare each array
+    // element against the matching constructor element.
+    let src = write_program(
+        "module m\n  implicit none\n  interface swap\n    module procedure swap_str\n  end interface\ncontains\n  elemental subroutine swap_str(lhs, rhs)\n    character(*), intent(inout) :: lhs, rhs\n    character(len=max(len(lhs), len(rhs))) :: temp\n    temp = lhs\n    lhs = rhs\n    rhs = temp\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  block\n    character(5) :: x(2), y(2)\n    x = ['abcde', 'fghij']\n    y = ['fghij', 'abcde']\n    call swap(x, y)\n    if (.not. all(x == ['fghij', 'abcde'])) error stop 1\n    if (.not. all(y == ['abcde', 'fghij'])) error stop 2\n    call swap(x, x)\n    if (.not. all(x == ['fghij', 'abcde'])) error stop 3\n  end block\n  block\n    character(4) :: x\n    character(6) :: y\n    x = 'abcd'\n    y = 'efghij'\n    call swap(x, y)\n    if (x /= 'efgh') error stop 4\n    if (y /= 'abcd  ') error stop 5\n    x = 'abcd'\n    y = 'efghij'\n    call swap(x, y(1:4))\n    if (x /= 'efgh') error stop 6\n    if (y /= 'abcdij') error stop 7\n  end block\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("elemental_character_swap", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("elemental character swap compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "elemental character swap compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("elemental character swap run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "elemental character swap run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn complex_array_power_loads_exponent_elements_not_descriptor() {
     // Surfaced by stdlib_math's logspace_1_cdp_n_rbase:
     //   res = base ** exponents
