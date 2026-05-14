@@ -8092,6 +8092,80 @@ pub(super) fn step_logical_reduction_acc(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn lower_logical_reduction_char_array_ctor_compare(
+    b: &mut FuncBuilder,
+    name: &str,
+    op: &crate::ast::expr::BinaryOp,
+    array_expr: &crate::ast::expr::SpannedExpr,
+    ctor_values: &[crate::ast::expr::AcValue],
+    array_on_left: bool,
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) -> Option<ValueId> {
+    let char_len = fixed_char_expr_len(b, array_expr, locals, st, type_layouts)?;
+    let (array_desc, elem_ty) = lower_array_expr_descriptor(
+        b,
+        locals,
+        array_expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    )?;
+    if ir_scalar_byte_size(&elem_ty) < char_len {
+        return None;
+    }
+
+    let mut acc = init_logical_reduction_acc(b, name);
+    for (i, value) in ctor_values.iter().enumerate() {
+        let crate::ast::expr::AcValue::Expr(ctor_expr) = value else {
+            return None;
+        };
+        fixed_char_expr_len(b, ctor_expr, locals, st, type_layouts)?;
+        let idx = b.const_i64(i as i64);
+        let array_ptr = rank1_array_desc_elem_ptr(b, array_desc, &elem_ty, idx);
+        let array_len = b.const_i64(char_len);
+        let (ctor_ptr, ctor_len) = lower_string_expr_full(
+            b,
+            locals,
+            ctor_expr,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        );
+        let (lhs_ptr, lhs_len, rhs_ptr, rhs_len) = if array_on_left {
+            (array_ptr, array_len, ctor_ptr, ctor_len)
+        } else {
+            (ctor_ptr, ctor_len, array_ptr, array_len)
+        };
+        let cmp_raw = b.call(
+            FuncRef::External("afs_compare_char".into()),
+            vec![lhs_ptr, lhs_len, rhs_ptr, rhs_len],
+            IrType::Int(IntWidth::I32),
+        );
+        let zero = b.const_i32(0);
+        let pred = match op {
+            crate::ast::expr::BinaryOp::Eq => b.icmp(CmpOp::Eq, cmp_raw, zero),
+            crate::ast::expr::BinaryOp::Ne => b.icmp(CmpOp::Ne, cmp_raw, zero),
+            crate::ast::expr::BinaryOp::Lt => b.icmp(CmpOp::Lt, cmp_raw, zero),
+            crate::ast::expr::BinaryOp::Le => b.icmp(CmpOp::Le, cmp_raw, zero),
+            crate::ast::expr::BinaryOp::Gt => b.icmp(CmpOp::Gt, cmp_raw, zero),
+            crate::ast::expr::BinaryOp::Ge => b.icmp(CmpOp::Ge, cmp_raw, zero),
+            _ => return None,
+        };
+        acc = step_logical_reduction_acc(b, name, acc, pred);
+    }
+    Some(acc)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) fn lower_logical_reduction_predicate(
     b: &mut FuncBuilder,
     expr: &crate::ast::expr::SpannedExpr,
@@ -8499,6 +8573,45 @@ pub(super) fn lower_logical_reduction_intrinsic_ast(
                     acc = step_logical_reduction_acc(b, name, acc, pred);
                 }
                 return Some(acc);
+            }
+            match (&left.node, &right.node) {
+                (_, Expr::ArrayConstructor { values, .. }) => {
+                    if let Some(acc) = lower_logical_reduction_char_array_ctor_compare(
+                        b,
+                        name,
+                        op,
+                        left,
+                        values,
+                        true,
+                        locals,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
+                    ) {
+                        return Some(acc);
+                    }
+                }
+                (Expr::ArrayConstructor { values, .. }, _) => {
+                    if let Some(acc) = lower_logical_reduction_char_array_ctor_compare(
+                        b,
+                        name,
+                        op,
+                        right,
+                        values,
+                        false,
+                        locals,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
+                    ) {
+                        return Some(acc);
+                    }
+                }
+                _ => {}
             }
             let unfolded_left = unfold_array_ctor_binop(left);
             let unfolded_right = unfold_array_ctor_binop(right);
@@ -28303,7 +28416,11 @@ pub(super) fn try_lower_elemental_subroutine_call(
     // pair; a scalar actual is left to the regular call dispatch.
     enum Class {
         Scalar,
-        Array { desc: ValueId, elem_ty: IrType },
+        Array {
+            desc: ValueId,
+            elem_ty: IrType,
+            char_len: Option<i64>,
+        },
     }
     let mut classes: Vec<Class> = Vec::with_capacity(args.len());
     let mut control_desc: Option<ValueId> = None;
@@ -28322,18 +28439,25 @@ pub(super) fn try_lower_elemental_subroutine_call(
             Some(ctx.descriptor_params),
         ) {
             // Limit to numeric scalar element types we know how to load/store
-            // through the rank1_array_desc_elem helpers — no character or
-            // derived elemental dispatch yet.
+            // through the rank1_array_desc_elem helpers, plus fixed-length
+            // character elements copied byte-for-byte through the same
+            // descriptor element pointers.
+            let char_len = fixed_char_expr_len(b, e, &ctx.locals, ctx.st, Some(ctx.type_layouts));
             let supported = matches!(&elem_ty, IrType::Int(_) | IrType::Float(_))
                 || matches!(&elem_ty,
-                    IrType::Array(inner, 2) if matches!(inner.as_ref(), IrType::Float(_)));
+                    IrType::Array(inner, 2) if matches!(inner.as_ref(), IrType::Float(_)))
+                || char_len.is_some();
             if !supported {
                 return false;
             }
             if control_desc.is_none() {
                 control_desc = Some(desc);
             }
-            classes.push(Class::Array { desc, elem_ty });
+            classes.push(Class::Array {
+                desc,
+                elem_ty,
+                char_len,
+            });
         } else {
             classes.push(Class::Scalar);
         }
@@ -28350,9 +28474,13 @@ pub(super) fn try_lower_elemental_subroutine_call(
     let mut temps: Vec<Option<(String, ValueId, IrType)>> = Vec::with_capacity(classes.len());
     let mut temp_names_to_clean: Vec<String> = Vec::new();
     for (i, class) in classes.iter().enumerate() {
-        if let Class::Array { elem_ty, .. } = class {
+        if let Class::Array {
+            elem_ty, char_len, ..
+        } = class
+        {
             let temp_name = fresh_elemental_temp_name(&ctx.locals, "afs_elem_sub_arg", i);
             let temp_addr = b.alloca(elem_ty.clone());
+            let char_kind = char_len.map(CharKind::Fixed).unwrap_or(CharKind::None);
             ctx.locals.insert(
                 temp_name.clone(),
                 LocalInfo {
@@ -28362,7 +28490,7 @@ pub(super) fn try_lower_elemental_subroutine_call(
                     allocatable: false,
                     descriptor_arg: false,
                     by_ref: false,
-                    char_kind: CharKind::None,
+                    char_kind,
                     derived_type: None,
                     inline_const: None,
                     is_pointer: false,
@@ -28422,8 +28550,24 @@ pub(super) fn try_lower_elemental_subroutine_call(
 
     // Copy-in: load element[i] of each array actual into its scalar temp.
     for (class, slot) in classes.iter().zip(temps.iter()) {
-        if let (Class::Array { desc, elem_ty }, Some((_, addr, _))) = (class, slot) {
-            if is_complex_ty(elem_ty) {
+        if let (
+            Class::Array {
+                desc,
+                elem_ty,
+                char_len,
+            },
+            Some((_, addr, _)),
+        ) = (class, slot)
+        {
+            if let Some(len) = char_len {
+                let src_ptr = rank1_array_desc_elem_ptr(b, *desc, elem_ty, cur_idx);
+                let bytes = b.const_i64(*len);
+                b.call(
+                    FuncRef::External("memcpy".into()),
+                    vec![*addr, src_ptr, bytes],
+                    IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                );
+            } else if is_complex_ty(elem_ty) {
                 let src_ptr = rank1_array_desc_elem_ptr(b, *desc, elem_ty, cur_idx);
                 let bytes = b.const_i64(ir_scalar_byte_size(elem_ty));
                 b.call(
@@ -28461,8 +28605,24 @@ pub(super) fn try_lower_elemental_subroutine_call(
     // For intent(in) the writeback is a no-op redundancy; for intent(out)/
     // intent(inout) it propagates the per-iteration update.
     for (class, slot) in classes.iter().zip(temps.iter()) {
-        if let (Class::Array { desc, elem_ty }, Some((_, addr, _))) = (class, slot) {
-            if is_complex_ty(elem_ty) {
+        if let (
+            Class::Array {
+                desc,
+                elem_ty,
+                char_len,
+            },
+            Some((_, addr, _)),
+        ) = (class, slot)
+        {
+            if let Some(len) = char_len {
+                let dest_ptr = rank1_array_desc_elem_ptr(b, *desc, elem_ty, cur_idx);
+                let bytes = b.const_i64(*len);
+                b.call(
+                    FuncRef::External("memcpy".into()),
+                    vec![dest_ptr, *addr, bytes],
+                    IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                );
+            } else if is_complex_ty(elem_ty) {
                 let dest_ptr = rank1_array_desc_elem_ptr(b, *desc, elem_ty, cur_idx);
                 let bytes = b.const_i64(ir_scalar_byte_size(elem_ty));
                 b.call(
