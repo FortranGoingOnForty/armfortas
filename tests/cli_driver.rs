@@ -17146,6 +17146,43 @@ fn array_reductions_with_mask_keyword_apply_mask_instead_of_ignoring_it() {
 }
 
 #[test]
+fn sum_with_positional_logical_mask_applies_mask_instead_of_dim() {
+    // F2018 §16.9.231 permits SUM(ARRAY, MASK) when the second
+    // positional actual is logical. stdlib_intrinsics uses this form in
+    // its masked real sum accuracy checks; pre-fix the scalar reduction
+    // lowering only recognized `mask=` and reduced the full array.
+    let src = write_program(
+        "program t\n  implicit none\n  real :: a(5) = [1.0, 2.0, 3.0, 4.0, 5.0]\n  integer :: ai(5) = [1, 2, 3, 4, 5]\n  logical :: m(5) = [.true., .false., .true., .false., .true.]\n  if (abs(sum(a, m) - 9.0) > 1.0e-6) error stop 1\n  if (sum(ai, m) /= 9) error stop 2\n  if (abs(sum(a, .not. m) - 6.0) > 1.0e-6) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("sum_positional_mask", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("sum positional mask compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "sum positional mask should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("sum positional mask run failed");
+    assert!(
+        run.status.success(),
+        "sum positional mask should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn array_sum_and_maxval_over_real_kind4_array_uses_correct_element_width() {
     // The real array reductions (`afs_array_sum_real8`,
     // `afs_array_maxval_real8`, `afs_array_minval_real8`,

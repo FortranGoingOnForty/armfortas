@@ -35186,19 +35186,40 @@ pub(super) fn lower_array_intrinsic(
         }
         "sum" => {
             // F2018 §16.9.231: SUM(ARRAY [, DIM] [, MASK]).
-            // Look for `mask=` keyword arg (or a positional 3rd arg, but
-            // SUM with a positional mask is stylistically rare and DIM
-            // would have to come first).
-            let mask_arg_expr = args.iter().find_map(|a| match a.keyword.as_deref() {
-                Some(k) if k.eq_ignore_ascii_case("mask") => {
-                    if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
-                        Some(e)
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            });
+            // `sum(x, mask)` is valid when the second positional actual is
+            // logical; `sum(x, dim)` uses an integer DIM. Keep the
+            // positional DIM path intact while recognizing logical masks.
+            let mask_arg_expr =
+                args.iter()
+                    .enumerate()
+                    .find_map(|(idx, a)| match a.keyword.as_deref() {
+                        Some(k) if k.eq_ignore_ascii_case("mask") => {
+                            if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+                                Some(e)
+                            } else {
+                                None
+                            }
+                        }
+                        None if idx == 2 => {
+                            if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+                                Some(e)
+                            } else {
+                                None
+                            }
+                        }
+                        None if idx == 1 => {
+                            if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+                                let is_logical = matches!(
+                                    generic_actual_expr_type_info(e, locals, st, type_layouts),
+                                    Some(crate::sema::symtab::TypeInfo::Logical { .. })
+                                );
+                                is_logical.then_some(e)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    });
             let mask_desc = mask_arg_expr.and_then(|e| {
                 lower_array_expr_descriptor(
                     b,
