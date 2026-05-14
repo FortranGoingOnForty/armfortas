@@ -3693,6 +3693,88 @@ fn coerce_param_array_values(
     }
 }
 
+fn collect_const_array_conversion_intrinsic(
+    name: &str,
+    args: &[crate::ast::expr::Argument],
+    elem_ty: &IrType,
+    param_consts: &HashMap<String, ConstScalar>,
+    param_array_consts: &HashMap<String, Vec<ConstScalar>>,
+    param_array_elem_tys: &HashMap<String, IrType>,
+) -> Option<Vec<ConstScalar>> {
+    let intrinsic = name.to_ascii_lowercase();
+    if !matches!(
+        intrinsic.as_str(),
+        "real" | "dble" | "dfloat" | "float" | "int"
+    ) {
+        return None;
+    }
+    let first = args.first()?;
+    let crate::ast::expr::SectionSubscript::Element(src) = &first.value else {
+        return None;
+    };
+
+    let source_key = match &src.node {
+        Expr::Name { name } => Some(name.to_lowercase()),
+        _ => None,
+    };
+    let source_elem_ty = source_key
+        .as_ref()
+        .and_then(|key| param_array_elem_tys.get(key));
+    let source_is_complex = source_elem_ty.and_then(complex_component_ty).is_some();
+
+    let source_values = if let Some(key) = source_key {
+        param_array_consts.get(&key)?.clone()
+    } else {
+        collect_const_array_scalars(
+            src,
+            elem_ty,
+            param_consts,
+            param_array_consts,
+            param_array_elem_tys,
+        )?
+    };
+
+    if intrinsic == "int" {
+        if source_is_complex {
+            return None;
+        }
+        let mut out = Vec::new();
+        for value in source_values {
+            let int_value = match value {
+                ConstScalar::Int(i) => i,
+                ConstScalar::Float(f) => f.trunc() as i128,
+            };
+            out.extend(coerce_scalar_to_array_lanes(
+                ConstScalar::Int(int_value),
+                elem_ty,
+            ));
+        }
+        return Some(out);
+    }
+
+    let mut out = Vec::new();
+    if source_is_complex {
+        let mut chunks = source_values.chunks_exact(2);
+        for lanes in &mut chunks {
+            out.extend(coerce_scalar_to_array_lanes(
+                ConstScalar::Float(lanes[0].to_float()),
+                elem_ty,
+            ));
+        }
+        if !chunks.remainder().is_empty() {
+            return None;
+        }
+    } else {
+        for value in source_values {
+            out.extend(coerce_scalar_to_array_lanes(
+                ConstScalar::Float(value.to_float()),
+                elem_ty,
+            ));
+        }
+    }
+    Some(out)
+}
+
 fn collect_const_complex_lanes(
     real: &crate::ast::expr::SpannedExpr,
     imag: &crate::ast::expr::SpannedExpr,
@@ -3758,6 +3840,16 @@ pub(super) fn collect_const_array_scalars(
         // the result extent.
         Expr::FunctionCall { callee, args } => {
             if let Expr::Name { name } = &callee.node {
+                if let Some(values) = collect_const_array_conversion_intrinsic(
+                    name,
+                    args,
+                    elem_ty,
+                    param_consts,
+                    param_array_consts,
+                    param_array_elem_tys,
+                ) {
+                    return Some(values);
+                }
                 if name.eq_ignore_ascii_case("reshape") && !args.is_empty() {
                     if let crate::ast::expr::SectionSubscript::Element(src) = &args[0].value {
                         let mut values = collect_const_array_scalars(
