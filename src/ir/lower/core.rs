@@ -11158,11 +11158,16 @@ pub(super) fn operator_expr_type_info(
                 } else {
                     None
                 };
-                // Intrinsic result kinds are actual-dependent. Prefer
-                // that over stale implicit callable entries such as an
-                // earlier int8 SHIFTR use in the same module.
-                intrinsic_type_info
-                    .or_else(|| generic_function_call_type_info(expr, locals, st, type_layouts))
+                // A USE-associated or local named interface shadows an
+                // intrinsic with the same spelling. Prefer the generic
+                // interface first; otherwise calls like stdlib's
+                // `log_gamma(integer)` are typed by the intrinsic
+                // `log_gamma` rule as integer-valued and later reject
+                // the real-valued stdlib specific. Intrinsic result
+                // kinds still win over stale implicit callable entries
+                // such as an earlier int8 SHIFTR use in the same module.
+                generic_function_call_type_info(expr, locals, st, type_layouts)
+                    .or(intrinsic_type_info)
                     .or_else(|| st.lookup(&key).and_then(callable_type_info))
                     .or_else(|| local_intrinsic_call_type_info(expr, locals, st, type_layouts))
                     .or_else(|| derived_constructor_type_info(name, st))
