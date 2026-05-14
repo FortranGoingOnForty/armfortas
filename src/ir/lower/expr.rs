@@ -613,6 +613,49 @@ pub(crate) fn lower_expr_full(
                 );
                 return ptr;
             }
+            if let Some(specific) = resolve_defined_binary_operator_specific_by_semantics(
+                st,
+                Some(locals),
+                type_layouts,
+                op,
+                left,
+                right,
+            ) {
+                let lhs = lower_expr_full(
+                    b,
+                    locals,
+                    left,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                );
+                let rhs = lower_expr_full(
+                    b,
+                    locals,
+                    right,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                );
+                return emit_resolved_operator_call(
+                    b,
+                    locals,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                    &specific,
+                    left,
+                    right,
+                    lhs,
+                    rhs,
+                );
+            }
             if matches!(
                 op,
                 BinaryOp::Eq
