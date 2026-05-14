@@ -17425,6 +17425,80 @@ fn explicit_shape_dummy_runtime_bound_materializes_descriptor_extent() {
 }
 
 #[test]
+fn same_name_contained_function_return_type_is_caller_relative() {
+    // stdlib_intrinsics_sum defines many contained helpers with the
+    // same bare name under different kind/rank wrappers. The call
+    // target was already caller-relative, but return-type lookup still
+    // scanned every scope and let an earlier integer helper type a later
+    // real helper call as i8.
+    let src = write_program(
+        "module m\ncontains\n  function first(a) result(s)\n    integer(1), intent(in) :: a(:)\n    integer(1) :: s\n    s = helper(a, size(a))\n  contains\n    integer(1) function helper(b, n)\n      integer, intent(in) :: n\n      integer(1), intent(in) :: b(n)\n      integer :: i\n      helper = 0_1\n      do i = 1, n\n        helper = helper + b(i)\n      end do\n    end function\n  end function\n\n  function second(x) result(s)\n    real, intent(in) :: x(:,:,:)\n    real :: s\n    s = helper(x, size(x))\n  contains\n    real function helper(b, n)\n      integer, intent(in) :: n\n      real, intent(in) :: b(n)\n      helper = sum(b)\n    end function\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  integer(1) :: a(2)\n  real :: x(2,2,2)\n  a = [1_1, 2_1]\n  if (first(a) /= 3_1) error stop 1\n  x = 1.0\n  if (abs(second(x) - 8.0) > 1.0e-6) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let ir = unique_path("same_name_contained_return", "ir");
+    let emit_ir = Command::new(compiler("armfortas"))
+        .args([
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("same-name contained return emit-ir failed to spawn");
+    assert!(
+        emit_ir.status.success(),
+        "same-name contained return should emit IR: {}",
+        String::from_utf8_lossy(&emit_ir.stderr)
+    );
+    let ir_text = fs::read_to_string(&ir).expect("cannot read same-name contained return IR");
+    let second_helper_calls: Vec<_> = ir_text
+        .lines()
+        .filter(|line| line.contains("call @afs_internal_afs_modproc_m_second"))
+        .collect();
+    assert!(
+        second_helper_calls
+            .iter()
+            .any(|line| line.contains(": f32")),
+        "second helper call should be typed f32, saw: {:?}",
+        second_helper_calls
+    );
+    assert!(
+        second_helper_calls
+            .iter()
+            .all(|line| !line.contains(": i8")),
+        "second helper call should not inherit first helper's i8 return type: {:?}",
+        second_helper_calls
+    );
+
+    let out = unique_path("same_name_contained_return", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("same-name contained return compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "same-name contained return should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("same-name contained return run failed");
+    assert!(
+        run.status.success(),
+        "same-name contained return should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&ir);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn imported_generic_array_function_assignment_keeps_whole_array_actual() {
     let dir = unique_dir("imported_generic_array_assign");
     let mod_src = write_program_in(

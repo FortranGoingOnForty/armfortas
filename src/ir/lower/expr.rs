@@ -2259,9 +2259,10 @@ pub(crate) fn lower_expr_full(
                 }
 
                 // Look up callee return type from symbol table.
-                let ret_ty =
-                    first_procedure_lookup(&abi_lookup_keys, |k| callee_return_ir_type(st, k))
-                        .unwrap_or(IrType::Int(IntWidth::I32));
+                let ret_ty = first_procedure_lookup(&abi_lookup_keys, |k| {
+                    callee_return_ir_type_for_caller(st, k, internal_funcs)
+                })
+                .unwrap_or(IrType::Int(IntWidth::I32));
                 let func_ref = if let Some((target, _)) = procptr_target {
                     FuncRef::Indirect(target)
                 } else {
