@@ -16209,6 +16209,45 @@ fn module_parameter_array_scalar_broadcast_init_keeps_array_global() {
 }
 
 #[test]
+fn module_parameter_array_conversion_init_keeps_array_global() {
+    // stdlib_stats_moment declares module globals like
+    // `real(sp) :: x1(5) = real(d1, sp)` where d1 is a real(dp)
+    // PARAMETER array. The constant-array folder used to recognize only
+    // direct parameter-array names and constructors; wrapping the name in
+    // the elemental REAL intrinsic made the module global fall back to
+    // zeroinit.
+    let src = write_program(
+        "module m\n  use iso_fortran_env, only: real32, real64, int32\n  implicit none\n  real(real64), parameter :: d1(5) = [1.0_real64, 2.0_real64, 3.0_real64, 4.0_real64, 5.0_real64]\n  real(real32) :: x1(5) = real(d1, real32)\n  real(real64) :: dx1(5) = d1\n  integer(int32) :: ix1(5) = int(d1, int32)\ncontains\n  subroutine check\n    if (x1(1) /= 1.0_real32) error stop 1\n    if (x1(5) /= 5.0_real32) error stop 2\n    if (dx1(1) /= 1.0_real64) error stop 3\n    if (dx1(5) /= 5.0_real64) error stop 4\n    if (ix1(1) /= 1_int32) error stop 5\n    if (ix1(5) /= 5_int32) error stop 6\n  end subroutine\nend module\n\nprogram t\n  use m\n  call check\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("param_array_convert", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("parameter array conversion compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "parameter array conversion should compile + link: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("parameter array conversion run failed");
+    assert!(
+        run.status.success(),
+        "parameter array conversion should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn user_function_call_with_section_arg_emits_one_section_descriptor_per_callsite() {
     // Asm-level guard against re-introducing the resolution_arg_vals /
     // intrinsic_arg_vals probe duplication that compiled
