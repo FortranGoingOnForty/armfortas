@@ -86,17 +86,27 @@ pub fn emit_globals(globals: &[crate::ir::inst::Global]) -> String {
         // as exact bit patterns; large finite decimal literals can
         // exceed what Apple's assembler accepts for `.single`.
         if let IrType::Array(elem_ty, count) = &g.ty {
-            let (align, directive, _elem_bytes, is_float) = match elem_ty.as_ref() {
+            let (align, directive, _elem_bytes, is_float, float_lane_ty) = match elem_ty.as_ref() {
                 IrType::Int(IntWidth::I8) | IrType::Bool => {
-                    (byte_array_align_log2(*count), ".byte", 1, false)
+                    (byte_array_align_log2(*count), ".byte", 1, false, None)
                 }
-                IrType::Int(IntWidth::I16) => (1, ".short", 2, false),
-                IrType::Int(IntWidth::I32) => (2, ".long", 4, false),
-                IrType::Int(IntWidth::I64) => (3, ".quad", 8, false),
-                IrType::Int(IntWidth::I128) => (4, ".quad", 16, false),
-                IrType::Float(FloatWidth::F32) => (2, ".long", 4, true),
-                IrType::Float(FloatWidth::F64) => (3, ".quad", 8, true),
-                _ => (3, ".quad", 8, false),
+                IrType::Int(IntWidth::I16) => (1, ".short", 2, false, None),
+                IrType::Int(IntWidth::I32) => (2, ".long", 4, false, None),
+                IrType::Int(IntWidth::I64) => (3, ".quad", 8, false, None),
+                IrType::Int(IntWidth::I128) => (4, ".quad", 16, false, None),
+                IrType::Float(FloatWidth::F32) => (2, ".long", 4, true, Some(elem_ty.as_ref())),
+                IrType::Float(FloatWidth::F64) => (3, ".quad", 8, true, Some(elem_ty.as_ref())),
+                IrType::Array(inner, _)
+                    if matches!(inner.as_ref(), IrType::Float(FloatWidth::F32)) =>
+                {
+                    (2, ".long", 4, true, Some(inner.as_ref()))
+                }
+                IrType::Array(inner, _)
+                    if matches!(inner.as_ref(), IrType::Float(FloatWidth::F64)) =>
+                {
+                    (3, ".quad", 8, true, Some(inner.as_ref()))
+                }
+                _ => (3, ".quad", 8, false, None),
             };
             if align > 0 {
                 writeln!(out, ".p2align {}", align).unwrap();
@@ -116,12 +126,13 @@ pub fn emit_globals(globals: &[crate::ir::inst::Global]) -> String {
                     }
                 }
                 Some(GlobalInit::FloatArray(vs)) if is_float => {
+                    let float_lane_ty = float_lane_ty.unwrap_or(elem_ty.as_ref());
                     for v in vs {
                         writeln!(
                             out,
                             "    {} {}",
                             directive,
-                            float_bits_literal(elem_ty.as_ref(), *v)
+                            float_bits_literal(float_lane_ty, *v)
                         )
                         .unwrap();
                     }

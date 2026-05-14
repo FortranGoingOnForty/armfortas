@@ -12617,6 +12617,70 @@ fn module_complex_parameter_const_initializes_data_section_with_both_lanes() {
 }
 
 #[test]
+fn module_complex_parameter_array_from_real_parameter_interleaves_zero_imag_lanes() {
+    let src = write_program(
+        "module m\n  use, intrinsic :: iso_fortran_env, only: real32, real64\n  implicit none\n  real(real32), parameter :: r_sp(4) = [-10.0_real32, 2.0_real32, 3.0_real32, 4.0_real32]\n  real(real64), parameter :: r_dp(4) = [-10.0_real64, 2.0_real64, 3.0_real64, 4.0_real64]\n  complex(real32), parameter :: c_sp(4) = r_sp\n  complex(real64), parameter :: c_dp(4) = r_dp\n  complex(real32) :: d_sp(3,2) = reshape(c_sp, [3,2], [(7.0_real32, -1.0_real32)])\nend module\nprogram p\n  use, intrinsic :: iso_fortran_env, only: real32, real64\n  use m, only: c_sp, c_dp, d_sp\n  implicit none\n  if (.not. (abs(real(c_sp(1)) + 10.0_real32) < 1.0e-5_real32)) error stop 1\n  if (.not. (abs(aimag(c_sp(1))) < 1.0e-5_real32)) error stop 2\n  if (.not. (abs(real(c_dp(2)) - 2.0_real64) < 1.0e-10_real64)) error stop 3\n  if (.not. (abs(aimag(c_dp(2))) < 1.0e-10_real64)) error stop 4\n  if (.not. (abs(real(d_sp(2,2)) - 7.0_real32) < 1.0e-5_real32)) error stop 5\n  if (.not. (abs(aimag(d_sp(2,2)) + 1.0_real32) < 1.0e-5_real32)) error stop 6\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let ir = unique_path("module_complex_param_array_from_real", "ir");
+    let emit_ir = Command::new(compiler("armfortas"))
+        .args([
+            src.to_str().unwrap(),
+            "--emit-ir",
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("emit-ir failed");
+    assert!(
+        emit_ir.status.success(),
+        "emit-ir failed: {}",
+        String::from_utf8_lossy(&emit_ir.stderr)
+    );
+    let ir_text = std::fs::read_to_string(&ir).expect("read ir");
+    assert!(
+        ir_text.contains("global @afs_mod_m_c_sp: [[f32 x 2] x 4] = [-10, 0, 2, 0, 3, 0, 4, 0]"),
+        "complex(sp) real-source parameter array not lane-interleaved:\n{}",
+        ir_text
+    );
+    assert!(
+        ir_text.contains(
+            "global @afs_mod_m_d_sp: [[f32 x 2] x 6] = [-10, 0, 2, 0, 3, 0, 4, 0, 7, -1, 7, -1]"
+        ),
+        "complex reshape PAD not lane-interleaved:\n{}",
+        ir_text
+    );
+
+    let out = unique_path("module_complex_param_array_from_real", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&ir);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn module_array_global_reshape_from_parameter_array_initializes_data_section() {
     // stdlib's stats tests declare rank-N module data as
     // `d2 = reshape(d1, shape)` where `d1` is a named array
