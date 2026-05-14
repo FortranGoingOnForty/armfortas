@@ -3108,6 +3108,7 @@ pub(super) fn collect_module_globals(
     // parameter declaration can reference earlier ones.
     let param_consts = collect_decl_param_consts_with_scope(decls, &HashMap::new(), st);
     let param_char_consts = collect_decl_param_char_consts(decls, &param_consts, type_layouts);
+    let mut param_array_consts: HashMap<String, Vec<ConstScalar>> = HashMap::new();
     let mut parameter_inits: HashMap<String, &crate::ast::expr::SpannedExpr> = HashMap::new();
     for decl in decls {
         if let Decl::ParameterStmt { pairs } = &decl.node {
@@ -3270,9 +3271,12 @@ pub(super) fn collect_module_globals(
                     // must conform with the variable's declared
                     // shape; over-long is a hard error.
                     if let Some(init_e) = init_expr {
-                        if let Some(scalars) =
-                            collect_const_array_scalars(init_e, &ir_ty, &param_consts)
-                        {
+                        if let Some(scalars) = collect_const_array_scalars(
+                            init_e,
+                            &ir_ty,
+                            &param_consts,
+                            &param_array_consts,
+                        ) {
                             if (scalars.len() as i64) > total {
                                 eprintln!(
                                     "armfortas: error: {}:{}: initializer for '{}' has \
@@ -3312,10 +3316,42 @@ pub(super) fn collect_module_globals(
                                     )
                                 })
                             } else {
-                                eval_const_array_init(e, &ir_ty, total, &param_consts)
+                                eval_const_array_init(
+                                    e,
+                                    &ir_ty,
+                                    total,
+                                    &param_consts,
+                                    &param_array_consts,
+                                )
                             }
                         })
                     };
+                    if is_parameter
+                        && derived_type_name.is_none()
+                        && !matches!(type_spec, TypeSpec::Character(_))
+                    {
+                        if let Some(init_e) = init_expr {
+                            if let Some(mut scalars) = collect_const_array_scalars(
+                                init_e,
+                                &ir_ty,
+                                &param_consts,
+                                &param_array_consts,
+                            )
+                            .or_else(|| eval_const_scalar(init_e, &param_consts).map(|s| vec![s]))
+                            {
+                                if (scalars.len() as i64) <= total {
+                                    if scalars.len() == 1 && total > 1 {
+                                        scalars.resize(total as usize, scalars[0]);
+                                    } else {
+                                        while (scalars.len() as i64) < total {
+                                            scalars.push(ConstScalar::Int(0));
+                                        }
+                                    }
+                                    param_array_consts.insert(key.clone(), scalars);
+                                }
+                            }
+                        }
+                    }
                     module.add_global(Global {
                         name: symbol.clone(),
                         ty: global_ty,
@@ -3523,11 +3559,13 @@ pub(super) fn eval_const_array_init(
     elem_ty: &IrType,
     total: i64,
     param_consts: &HashMap<String, ConstScalar>,
+    param_array_consts: &HashMap<String, Vec<ConstScalar>>,
 ) -> Option<GlobalInit> {
     // F2018 §7.4.4: a scalar initializer for an array PARAMETER is
     // broadcast to every element. Try the array-shaped collector
     // first; if that fails, fall back to scalar broadcast.
-    let scalars = match collect_const_array_scalars(expr, elem_ty, param_consts) {
+    let scalars = match collect_const_array_scalars(expr, elem_ty, param_consts, param_array_consts)
+    {
         Some(s) => s,
         None => {
             let scalar = eval_const_scalar(expr, param_consts)?;
@@ -3578,12 +3616,17 @@ pub(super) fn collect_const_array_scalars(
     expr: &crate::ast::expr::SpannedExpr,
     elem_ty: &IrType,
     param_consts: &HashMap<String, ConstScalar>,
+    param_array_consts: &HashMap<String, Vec<ConstScalar>>,
 ) -> Option<Vec<ConstScalar>> {
     match &expr.node {
+        Expr::Name { name } => param_array_consts.get(&name.to_lowercase()).cloned(),
+        Expr::ParenExpr { inner } => {
+            collect_const_array_scalars(inner, elem_ty, param_consts, param_array_consts)
+        }
         Expr::ArrayConstructor { values, .. } => {
             let mut out: Vec<ConstScalar> = Vec::new();
             for v in values {
-                collect_ac_value(v, elem_ty, param_consts, &mut out)?;
+                collect_ac_value(v, elem_ty, param_consts, param_array_consts, &mut out)?;
             }
             Some(out)
         }
@@ -3592,7 +3635,12 @@ pub(super) fn collect_const_array_scalars(
             if let Expr::Name { name } = &callee.node {
                 if name.eq_ignore_ascii_case("reshape") && !args.is_empty() {
                     if let crate::ast::expr::SectionSubscript::Element(src) = &args[0].value {
-                        return collect_const_array_scalars(src, elem_ty, param_consts);
+                        return collect_const_array_scalars(
+                            src,
+                            elem_ty,
+                            param_consts,
+                            param_array_consts,
+                        );
                     }
                 }
             }
@@ -3608,11 +3656,18 @@ pub(super) fn collect_ac_value(
     v: &crate::ast::expr::AcValue,
     elem_ty: &IrType,
     param_consts: &HashMap<String, ConstScalar>,
+    param_array_consts: &HashMap<String, Vec<ConstScalar>>,
     out: &mut Vec<ConstScalar>,
 ) -> Option<()> {
     use crate::ast::expr::AcValue;
     match v {
         AcValue::Expr(e) => {
+            if let Some(values) =
+                collect_const_array_scalars(e, elem_ty, param_consts, param_array_consts)
+            {
+                out.extend(values);
+                return Some(());
+            }
             let raw = eval_const_scalar(e, param_consts)?;
             // Coerce int → float when the destination is float.
             let coerced = if matches!(elem_ty, IrType::Float(_)) {
@@ -3662,7 +3717,7 @@ pub(super) fn collect_ac_value(
                 }
                 local_consts.insert(var_key.clone(), ConstScalar::Int(i));
                 for inner in values {
-                    collect_ac_value(inner, elem_ty, &local_consts, out)?;
+                    collect_ac_value(inner, elem_ty, &local_consts, param_array_consts, out)?;
                 }
                 i = i.wrapping_add(stp);
             }
@@ -9950,10 +10005,27 @@ pub(super) fn formal_rank_matches_actual(formal: Option<usize>, actual: Option<u
     }
 }
 
-fn has_reduction_dim_arg(args: &[crate::ast::expr::Argument]) -> bool {
+fn has_reduction_dim_arg(
+    args: &[crate::ast::expr::Argument],
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> bool {
     args.iter().enumerate().any(|(idx, arg)| {
         let kw = arg.keyword.as_deref().map(|s| s.to_lowercase());
-        matches!(kw.as_deref(), Some("dim")) || (idx == 1 && kw.is_none())
+        if matches!(kw.as_deref(), Some("dim")) {
+            return true;
+        }
+        if idx == 1 && kw.is_none() {
+            if let crate::ast::expr::SectionSubscript::Element(expr) = &arg.value {
+                return !matches!(
+                    generic_actual_expr_type_info(expr, locals, st, type_layouts),
+                    Some(crate::sema::symtab::TypeInfo::Logical { .. })
+                );
+            }
+            return true;
+        }
+        false
     })
 }
 
@@ -10063,7 +10135,7 @@ pub(super) fn actual_expr_rank(
                     }
                 }
                 if matches!(key.as_str(), "all" | "any" | "count") {
-                    if !has_reduction_dim_arg(args) {
+                    if !has_reduction_dim_arg(args, locals, st, type_layouts) {
                         return Some(0);
                     }
                     if let Some(first_arg) = args.first() {
@@ -10076,7 +10148,7 @@ pub(super) fn actual_expr_rank(
                     }
                     return None;
                 }
-                if key == "norm2" && has_reduction_dim_arg(args) {
+                if key == "norm2" && has_reduction_dim_arg(args, locals, st, type_layouts) {
                     if let Some(first_arg) = args.first() {
                         if let crate::ast::expr::SectionSubscript::Element(first_expr) =
                             &first_arg.value
@@ -11993,10 +12065,7 @@ pub(super) fn array_expr_elem_type_only(
                         // to lower_expr_full and emits `_count` external on
                         // every probe. KIND defaults to default integer (i32);
                         // honor an explicit `kind = int64` argument.
-                        let has_dim = args.iter().enumerate().any(|(i, a)| {
-                            let kw = a.keyword.as_deref().map(|s| s.to_lowercase());
-                            matches!(kw.as_deref(), Some("dim")) || (i == 1 && kw.is_none())
-                        });
+                        let has_dim = has_reduction_dim_arg(args, locals, st, type_layouts);
                         if has_dim {
                             let kind_is_i64 = args.iter().any(|a| {
                                 if a.keyword.as_deref().map(|s| s.to_lowercase())
@@ -12026,10 +12095,7 @@ pub(super) fn array_expr_elem_type_only(
                         // sum(arr, dim) / similar dim-reductions return rank N-1
                         // arrays of the source element type. Without dim they're
                         // scalar — bail and let lower_expr_full handle.
-                        let has_dim = args.iter().enumerate().any(|(i, a)| {
-                            let kw = a.keyword.as_deref().map(|s| s.to_lowercase());
-                            matches!(kw.as_deref(), Some("dim")) || (i == 1 && kw.is_none())
-                        });
+                        let has_dim = has_reduction_dim_arg(args, locals, st, type_layouts);
                         if has_dim {
                             if let Some(arg) = args.first() {
                                 if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
@@ -28127,7 +28193,20 @@ pub(super) fn lower_array_sum_dim_descriptor(
     for (i, arg) in args.iter().enumerate() {
         let kw = arg.keyword.as_deref().map(|s| s.to_lowercase());
         match (i, kw.as_deref()) {
-            (1, None) | (_, Some("dim")) => {
+            (1, None) => {
+                if let SectionSubscript::Element(e) = &arg.value {
+                    let is_logical = matches!(
+                        generic_actual_expr_type_info(e, locals, st, type_layouts),
+                        Some(crate::sema::symtab::TypeInfo::Logical { .. })
+                    );
+                    if is_logical {
+                        mask_expr = Some(e);
+                    } else {
+                        dim_expr = Some(e);
+                    }
+                }
+            }
+            (_, Some("dim")) => {
                 if let SectionSubscript::Element(e) = &arg.value {
                     dim_expr = Some(e);
                 }
