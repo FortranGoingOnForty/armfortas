@@ -1252,6 +1252,48 @@ pub extern "C" fn afs_copy_array_data(
     }
 }
 
+/// Copy an array descriptor result into a fixed-shape caller buffer.
+///
+/// Fixed-shape assignment from an allocatable function result cannot hand the
+/// callee the caller's raw stack buffer as the hidden result slot, so generated
+/// code receives a descriptor temp and then copies payload bytes back into the
+/// fixed destination. A valid zero-size result has `base_addr == NULL`; treat
+/// it as a zero-fill instead of forwarding a null source pointer to `memcpy`.
+#[no_mangle]
+pub extern "C" fn afs_copy_array_result_to_fixed(
+    dest: *mut u8,
+    source: *const ArrayDescriptor,
+    dest_bytes: i64,
+) {
+    if dest.is_null() || dest_bytes <= 0 {
+        return;
+    }
+
+    let dest_len = dest_bytes as usize;
+    unsafe {
+        ptr::write_bytes(dest, 0, dest_len);
+    }
+
+    if source.is_null() {
+        return;
+    }
+
+    let source = unsafe { &*source };
+    let source_bytes = source.total_bytes();
+    if source_bytes <= 0 || source.base_addr.is_null() {
+        return;
+    }
+
+    let copy_bytes = dest_bytes.min(source_bytes) as usize;
+    if copy_bytes == 0 {
+        return;
+    }
+
+    unsafe {
+        ptr::copy(source.base_addr, dest, copy_bytes);
+    }
+}
+
 /// Validate `ALLOCATE(..., SOURCE=...)` array conformance after the destination
 /// has already been allocated with its final shape.
 ///
