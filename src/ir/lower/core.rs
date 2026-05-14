@@ -9699,6 +9699,26 @@ pub(super) fn resolve_generic_call_actuals(
     type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
 ) -> Option<SpecificProcCandidate> {
     let specifics = named_interface_specific_candidates(st, callee)?;
+    resolve_generic_call_actuals_from_specifics(
+        st,
+        b,
+        locals,
+        args,
+        actual_vals,
+        type_layouts,
+        &specifics,
+    )
+}
+
+fn resolve_generic_call_actuals_from_specifics(
+    st: &SymbolTable,
+    b: &FuncBuilder,
+    locals: Option<&HashMap<String, LocalInfo>>,
+    args: &[crate::ast::expr::Argument],
+    actual_vals: &[ValueId],
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    specifics: &[SpecificProcCandidate],
+) -> Option<SpecificProcCandidate> {
     let actual_type_infos: Vec<Option<crate::sema::symtab::TypeInfo>> = args
         .iter()
         .map(|arg| match &arg.value {
@@ -9722,7 +9742,7 @@ pub(super) fn resolve_generic_call_actuals(
         })
         .collect();
 
-    for candidate in &specifics {
+    for candidate in specifics {
         let Some(scope) = procedure_scope_for_candidate(st, candidate) else {
             continue;
         };
@@ -9855,6 +9875,18 @@ pub(super) fn resolve_generic_call_actuals(
     }
 
     None
+}
+
+fn named_interface_specific_candidates_from_symbol(
+    sym: &crate::sema::symtab::Symbol,
+) -> Option<Vec<SpecificProcCandidate>> {
+    if !is_named_interface_like(sym) {
+        return None;
+    }
+    let mut specifics = Vec::new();
+    let mut seen = HashSet::new();
+    append_named_interface_specific_candidates(sym, &mut specifics, &mut seen);
+    (!specifics.is_empty()).then_some(specifics)
 }
 
 /// Compute the declared rank of a formal argument from its array-spec
@@ -13206,8 +13238,50 @@ pub(super) fn resolve_subroutine_call_name(
     actual_vals: &[ValueId],
     span: crate::lexer::Span,
 ) -> (String, String) {
+    let caller_scope_id = callee_scope_id_for_lookup(st, b.func().name.as_str());
     if internal_funcs.is_some_and(|funcs| funcs.contains_key(key)) {
-        return resolved_symbol_call_target(st, key, orig_name);
+        return resolved_symbol_call_target_from_scope(st, caller_scope_id, key, orig_name);
+    }
+    if let Some(scope_id) = caller_scope_id {
+        if let Some(sym) = st.lookup_in(scope_id, key) {
+            if let Some(specifics) = named_interface_specific_candidates_from_symbol(sym) {
+                match resolve_generic_call_actuals_from_specifics(
+                    st,
+                    b,
+                    locals,
+                    args,
+                    actual_vals,
+                    type_layouts,
+                    &specifics,
+                ) {
+                    Some(resolved) => {
+                        let rk = resolved.name.to_lowercase();
+                        let (call_name, _) =
+                            resolved_symbol_call_target_for_candidate(st, &resolved);
+                        return (call_name, rk);
+                    }
+                    None => {
+                        let candidate_names = specifics
+                            .iter()
+                            .map(|candidate| candidate.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        eprintln!(
+                            "armfortas: error: {}:{}: no specific procedure of generic '{}' matches the actual arguments; candidates: [{}]",
+                            span.start.line,
+                            span.start.col,
+                            orig_name,
+                            candidate_names,
+                        );
+                        let _ = std::io::stderr().flush();
+                        std::process::exit(1);
+                    }
+                }
+            }
+            if is_linkable_callable_symbol(sym) || sym.attrs.binding_label.is_some() {
+                return (symbol_link_name(st, sym), key.to_string());
+            }
+        }
     }
     if let Some(specifics) = named_interface_specifics(st, key) {
         match resolve_generic_call_actuals(st, b, locals, key, args, actual_vals, type_layouts) {
@@ -13229,7 +13303,7 @@ pub(super) fn resolve_subroutine_call_name(
             }
         }
     }
-    resolved_symbol_call_target(st, key, orig_name)
+    resolved_symbol_call_target_from_scope(st, caller_scope_id, key, orig_name)
 }
 
 pub(super) fn module_procedure_symbol_name(module_name: &str, proc_name: &str) -> String {
@@ -13561,29 +13635,40 @@ pub(super) fn find_linkable_symbol_any_scope<'a>(
     st: &'a SymbolTable,
     key: &str,
 ) -> Option<&'a crate::sema::symtab::Symbol> {
-    use crate::sema::symtab::SymbolKind;
-
     let mut callable_fallback: Option<&crate::sema::symtab::Symbol> = None;
     for scope in st.all_scopes() {
         if let Some(sym) = scope.symbols.get(key) {
             if sym.attrs.binding_label.is_some() {
                 return Some(sym);
             }
-            if callable_fallback.is_none()
-                && matches!(
-                    sym.kind,
-                    SymbolKind::Function
-                        | SymbolKind::Subroutine
-                        | SymbolKind::ExternalProc
-                        | SymbolKind::IntrinsicProc
-                        | SymbolKind::ProcedurePointer
-                )
-            {
+            if callable_fallback.is_none() && is_linkable_callable_symbol(sym) {
                 callable_fallback = Some(sym);
             }
         }
     }
     callable_fallback.or_else(|| st.find_symbol_any_scope(key))
+}
+
+fn is_linkable_callable_symbol(sym: &crate::sema::symtab::Symbol) -> bool {
+    use crate::sema::symtab::SymbolKind;
+
+    matches!(
+        sym.kind,
+        SymbolKind::Function
+            | SymbolKind::Subroutine
+            | SymbolKind::ExternalProc
+            | SymbolKind::IntrinsicProc
+            | SymbolKind::ProcedurePointer
+    )
+}
+
+fn find_linkable_symbol_from_scope<'a>(
+    st: &'a SymbolTable,
+    key: &str,
+    scope_id: crate::sema::symtab::ScopeId,
+) -> Option<&'a crate::sema::symtab::Symbol> {
+    let sym = st.lookup_in(scope_id, key)?;
+    (sym.attrs.binding_label.is_some() || is_linkable_callable_symbol(sym)).then_some(sym)
 }
 
 pub(super) fn find_linkable_symbol_in_owner_scope<'a>(
@@ -13626,6 +13711,20 @@ pub(super) fn resolved_symbol_call_target(
         return (call_name, key.to_string());
     }
     (fallback_name.to_string(), key.to_string())
+}
+
+fn resolved_symbol_call_target_from_scope(
+    st: &SymbolTable,
+    scope_id: Option<crate::sema::symtab::ScopeId>,
+    key: &str,
+    fallback_name: &str,
+) -> (String, String) {
+    if let Some(scope_id) = scope_id {
+        if let Some(sym) = find_linkable_symbol_from_scope(st, key, scope_id) {
+            return (symbol_link_name(st, sym), key.to_string());
+        }
+    }
+    resolved_symbol_call_target(st, key, fallback_name)
 }
 
 pub(super) fn resolved_symbol_call_target_for_candidate(
@@ -16841,11 +16940,21 @@ pub(super) fn callee_scope_id_for_lookup(
     let mut name_match = None;
     for (scope_id, scope) in st.all_scopes().iter().enumerate().rev() {
         let proc_name = match &scope.kind {
-            ScopeKind::Function(name) | ScopeKind::Subroutine(name) => name,
+            ScopeKind::Function(name) | ScopeKind::Subroutine(name) | ScopeKind::Program(name) => {
+                name
+            }
             _ => continue,
         };
         if proc_name.eq_ignore_ascii_case(callee_name) && name_match.is_none() {
             name_match = Some(scope_id);
+        }
+        if matches!(scope.kind, ScopeKind::Program(_))
+            && format!("__prog_{}", proc_name.to_lowercase()).eq_ignore_ascii_case(callee_name)
+        {
+            return Some(scope_id);
+        }
+        if matches!(scope.kind, ScopeKind::Program(_)) {
+            continue;
         }
         let Some(parent_id) = scope.parent else {
             continue;

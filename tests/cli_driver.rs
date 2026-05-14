@@ -22274,6 +22274,41 @@ fn host_associated_large_explicit_array_sections_pass_descriptor() {
 }
 
 #[test]
+fn use_only_generic_call_resolution_beats_private_reexport() {
+    let src = write_program(
+        "module hidden_error\n  implicit none\ncontains\n  subroutine check(condition, msg, code, warn)\n    logical, intent(in) :: condition\n    character(*), intent(in), optional :: msg\n    integer, intent(in), optional :: code\n    logical, intent(in), optional :: warn\n    if (.not. condition) error stop 1\n  end subroutine\nend module\nmodule private_carrier\n  use hidden_error, only: check\n  implicit none\n  private\nend module\nmodule local_testdrive\n  implicit none\n  type :: error_type\n    integer :: dummy = 0\n  end type\n  interface check\n    module procedure check_logical\n  end interface\ncontains\n  subroutine check_logical(error, expression, message)\n    type(error_type), allocatable, intent(out) :: error\n    logical, intent(in) :: expression\n    character(*), intent(in) :: message\n    if (.not. expression) allocate(error)\n  end subroutine\nend module\nprogram p\n  use local_testdrive, only: error_type, check\n  use private_carrier\n  implicit none\n  type(error_type), allocatable :: error\n  call check(error, .true., 'ok')\n  if (allocated(error)) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("use_only_generic_private_reexport", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("use-only generic resolution compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "use-only generic resolution should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "use-only generic resolution should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected use-only generic resolution output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn saved_derived_global_after_small_globals_keeps_descriptor_alignment() {
     let src = write_program(
         "module m\n  implicit none\n  logical, save :: flag1 = .false.\n  logical, save :: flag2 = .false.\n  logical, save :: flag3 = .false.\n  type :: history_t\n    character(len=16), allocatable :: lines(:)\n    integer :: count = 0\n    integer :: current = 0\n    logical :: initialized = .false.\n  end type\n  type(history_t), save :: history\ncontains\n  subroutine init_history()\n    if (.not. history%initialized) then\n      allocate(history%lines(4))\n      history%lines = ''\n      history%count = 1\n      history%initialized = .true.\n    end if\n    print *, history%count, size(history%lines)\n  end subroutine\nend module\nprogram p\n  use m\n  call init_history()\nend program\n",
