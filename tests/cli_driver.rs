@@ -14023,6 +14023,42 @@ fn sum_with_dim_and_mask_filters_per_column_using_descriptor_strides() {
 }
 
 #[test]
+fn count_with_dim_over_expression_mask_returns_per_column_counts() {
+    // COUNT(MASK, DIM) is a rank-reducing array result even when MASK
+    // is an expression such as `y > 0`. The descriptor path used to
+    // recognize only bare named masks, so expression masks lowered to
+    // scalar `afs_array_count_logical` and broadcast the total count
+    // into the result. stdlib's `mean(x, dim, mask)` divides the
+    // correct per-column sum by this count result.
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: y(3,4)\n  integer :: c(4)\n  y = reshape([-1,2,3, 4,-5,6, -7,8,9, 10,11,-12], [3,4])\n  c = count(y > 0, 1)\n  if (any(c /= [2,2,2,2])) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("count_dim_expr_mask", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "run failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected 'ok': {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn ieee_is_nan_over_rank_n_array_dispatches_elementally() {
     // F2018 §17.11: ieee_is_nan is elemental — applied to a rank-N
     // numeric array it must yield a same-shape logical array. Without

@@ -31384,10 +31384,7 @@ pub(super) fn lower_array_expr_descriptor(
                         .first()
                         .and_then(|a| {
                             if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
-                                if let Expr::Name { name: arg_name } = &e.node {
-                                    let key = arg_name.to_lowercase();
-                                    return locals.get(&key).map(|info| info.dims.len());
-                                }
+                                return actual_expr_rank(e, locals, st, type_layouts);
                             }
                             None
                         })
