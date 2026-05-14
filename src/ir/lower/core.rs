@@ -3630,17 +3630,54 @@ pub(super) fn collect_const_array_scalars(
             }
             Some(out)
         }
-        // reshape(source, shape) — pass through source elements.
+        // reshape(source, shape[, pad]) — flat element order is source
+        // order; if a constant shape is visible, trim or PAD-fill to
+        // the result extent.
         Expr::FunctionCall { callee, args } => {
             if let Expr::Name { name } = &callee.node {
                 if name.eq_ignore_ascii_case("reshape") && !args.is_empty() {
                     if let crate::ast::expr::SectionSubscript::Element(src) = &args[0].value {
-                        return collect_const_array_scalars(
+                        let mut values = collect_const_array_scalars(
                             src,
                             elem_ty,
                             param_consts,
                             param_array_consts,
-                        );
+                        )?;
+                        if let Some(total) =
+                            const_reshape_total(args.get(1), param_consts, param_array_consts)
+                        {
+                            values.truncate(total);
+                            if values.len() < total {
+                                let pad_values =
+                                    args.get(2)
+                                        .and_then(|arg| {
+                                            if let crate::ast::expr::SectionSubscript::Element(
+                                                pad,
+                                            ) = &arg.value
+                                            {
+                                                collect_const_array_scalars(
+                                                    pad,
+                                                    elem_ty,
+                                                    param_consts,
+                                                    param_array_consts,
+                                                )
+                                                .or_else(|| {
+                                                    eval_const_scalar(pad, param_consts)
+                                                        .map(|scalar| vec![scalar])
+                                                })
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .filter(|pad| !pad.is_empty())?;
+                                let mut idx = 0usize;
+                                while values.len() < total {
+                                    values.push(pad_values[idx % pad_values.len()]);
+                                    idx += 1;
+                                }
+                            }
+                        }
+                        return Some(values);
                     }
                 }
             }
@@ -3648,6 +3685,33 @@ pub(super) fn collect_const_array_scalars(
         }
         _ => None,
     }
+}
+
+fn const_reshape_total(
+    shape_arg: Option<&crate::ast::expr::Argument>,
+    param_consts: &HashMap<String, ConstScalar>,
+    param_array_consts: &HashMap<String, Vec<ConstScalar>>,
+) -> Option<usize> {
+    let crate::ast::expr::SectionSubscript::Element(shape_expr) = &shape_arg?.value else {
+        return None;
+    };
+    let shape_values = collect_const_array_scalars(
+        shape_expr,
+        &IrType::Int(IntWidth::I32),
+        param_consts,
+        param_array_consts,
+    )?;
+    let mut total = 1usize;
+    for value in shape_values {
+        let ConstScalar::Int(extent) = value else {
+            return None;
+        };
+        if extent < 0 {
+            return None;
+        }
+        total = total.checked_mul(extent as usize)?;
+    }
+    Some(total)
 }
 
 /// Collect a single AcValue (which may be a literal element or
