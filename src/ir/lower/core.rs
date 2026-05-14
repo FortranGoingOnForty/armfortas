@@ -28494,11 +28494,31 @@ pub(super) fn lower_array_sum_dim_descriptor(
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
     );
 
-    let helper = match (mask_desc.is_some(), elem_ty.is_float()) {
-        (true, true) => "afs_array_sum_real8_dim_mask",
-        (true, false) => "afs_array_sum_int_dim_mask",
-        (false, true) => "afs_array_sum_real8_dim",
-        (false, false) => "afs_array_sum_int_dim",
+    let helper = match (mask_desc.is_some(), &elem_ty) {
+        (true, IrType::Array(inner, 2))
+            if matches!(inner.as_ref(), IrType::Float(FloatWidth::F32)) =>
+        {
+            "afs_array_sum_complex4_dim_mask"
+        }
+        (true, IrType::Array(inner, 2))
+            if matches!(inner.as_ref(), IrType::Float(FloatWidth::F64)) =>
+        {
+            "afs_array_sum_complex8_dim_mask"
+        }
+        (true, ty) if ty.is_float() => "afs_array_sum_real8_dim_mask",
+        (true, _) => "afs_array_sum_int_dim_mask",
+        (false, IrType::Array(inner, 2))
+            if matches!(inner.as_ref(), IrType::Float(FloatWidth::F32)) =>
+        {
+            "afs_array_sum_complex4_dim"
+        }
+        (false, IrType::Array(inner, 2))
+            if matches!(inner.as_ref(), IrType::Float(FloatWidth::F64)) =>
+        {
+            "afs_array_sum_complex8_dim"
+        }
+        (false, ty) if ty.is_float() => "afs_array_sum_real8_dim",
+        (false, _) => "afs_array_sum_int_dim",
     };
     let mut call_args = vec![src_desc, dim_val, result_desc];
     if let Some(md) = mask_desc {
@@ -33869,7 +33889,20 @@ pub(super) fn lower_array_assign(
         // `counts(bin_idx) = counts(bin_idx) + 1` produced bogus
         // accumulation that overshot the input length on read-back.
         let scalar_raw = super::expr::lower_expr_ctx_tl(b, ctx, value);
-        let scalar = coerce_to_type(b, scalar_raw, &dest_info.ty);
+        let complex_scalar_src = if is_complex_ty(&dest_info.ty) {
+            let raw_ty = b.func().value_type(scalar_raw);
+            Some(match raw_ty {
+                Some(IrType::Ptr(inner)) if inner.as_ref() == &dest_info.ty => scalar_raw,
+                _ => materialize_complex_operand(b, scalar_raw, complex_float_width(&dest_info.ty)),
+            })
+        } else {
+            None
+        };
+        let scalar = if complex_scalar_src.is_none() {
+            Some(coerce_to_type(b, scalar_raw, &dest_info.ty))
+        } else {
+            None
+        };
         let dest_base = array_base_addr(b, dest_info);
         let n = array_total_elems_value(b, dest_info);
 
@@ -33898,7 +33931,16 @@ pub(super) fn lower_array_assign(
         let elem_bytes = b.const_i64(ir_scalar_byte_size(&dest_info.ty));
         let byte_offset = b.imul(i_val, elem_bytes);
         let elem_ptr = b.gep(dest_base, vec![byte_offset], IrType::Int(IntWidth::I8));
-        b.store(scalar, elem_ptr);
+        if let Some(src_ptr) = complex_scalar_src {
+            let copy_bytes = b.const_i64(complex_byte_size(&dest_info.ty));
+            b.call(
+                FuncRef::External("memcpy".into()),
+                vec![elem_ptr, src_ptr, copy_bytes],
+                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+            );
+        } else if let Some(scalar) = scalar {
+            b.store(scalar, elem_ptr);
+        }
         let one = b.const_i64(1);
         let next_i = b.iadd(i_val, one);
         b.store(next_i, i_addr);
