@@ -12617,6 +12617,45 @@ fn module_complex_parameter_const_initializes_data_section_with_both_lanes() {
 }
 
 #[test]
+fn module_array_global_reshape_from_parameter_array_initializes_data_section() {
+    // stdlib's stats tests declare rank-N module data as
+    // `d2 = reshape(d1, shape)` where `d1` is a named array
+    // PARAMETER. The constant array folder handled literal
+    // constructors and reshape, but not a reshape source that names
+    // an earlier parameter array, so the global was emitted as
+    // zeroinit and mask expressions like `d2 > 0` collapsed.
+    let src = write_program(
+        "module m\n  use, intrinsic :: iso_fortran_env, only: int8\n  implicit none\n  integer(int8), parameter :: d1(6) = [-1_int8, 2_int8, 3_int8, -4_int8, 5_int8, -6_int8]\n  integer(int8) :: d2(2,3) = reshape(d1, [2,3])\nend module\nprogram p\n  use, intrinsic :: iso_fortran_env, only: int8, real64\n  use m, only: d2\n  implicit none\n  if (d2(1,1) /= -1_int8) error stop 1\n  if (d2(2,1) /= 2_int8) error stop 2\n  if (d2(1,2) /= 3_int8) error stop 3\n  if (d2(2,2) /= -4_int8) error stop 4\n  if (d2(1,3) /= 5_int8) error stop 5\n  if (d2(2,3) /= -6_int8) error stop 6\n  if (count(d2 > 0_int8) /= 3) error stop 7\n  if (sum(d2, mask=d2 > 0_int8) /= 10_int8) error stop 8\n  if (abs(sum(real(d2, real64), d2 > 0_int8) - 10.0_real64) > 1.0e-10_real64) error stop 9\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("module_param_array_reshape", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("module parameter array reshape compile failed");
+    assert!(
+        compile.status.success(),
+        "module parameter array reshape should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("module parameter array reshape run failed");
+    assert!(
+        run.status.success(),
+        "module parameter array reshape should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn allocatable_assignment_converts_int_array_constructor_to_real_lhs() {
     // F2018 §10.2.1.3: numeric element type mismatch between an array RHS
     // and an allocatable LHS forces per-element conversion. Without the
