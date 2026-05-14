@@ -34204,6 +34204,129 @@ fn generic_actual_all_of_defined_operator_has_logical_type() {
 }
 
 #[test]
+fn imported_generic_all_of_ranked_function_comparison_is_scalar() {
+    let dir = unique_dir("generic_all_ranked_result");
+    let stats = write_program_in(
+        &dir,
+        "stats_like.f90",
+        "module stats_like\n  implicit none\n  private\n  public :: mean, moment\n  interface mean\n    module procedure mean_r3\n  end interface\n  interface moment\n    module procedure moment_r3\n  end interface\ncontains\n  function mean_r3(x, dim) result(res)\n    real, intent(in) :: x(:,:,:)\n    integer, intent(in) :: dim\n    real :: res(size(x, 1), size(x, 2))\n    res = 1.0\n    if (dim < 1) res = -1.0\n  end function\n  function moment_r3(x, order, dim, center) result(res)\n    real, intent(in) :: x(:,:,:)\n    integer, intent(in) :: order, dim\n    real, intent(in) :: center(:,:)\n    real :: res(size(x, 1), size(x, 2))\n    res = 1.0 + 0.0 * real(order + dim) + 0.0 * center\n  end function\nend module\n",
+    );
+    let check = write_program_in(
+        &dir,
+        "check_like.f90",
+        "module check_like\n  implicit none\n  private\n  public :: error_type, check\n  type :: error_type\n    integer :: code = 0\n  end type\n  interface check\n    module procedure check_logical\n  end interface\ncontains\n  subroutine check_logical(error, expression)\n    type(error_type), allocatable, intent(out) :: error\n    logical, intent(in) :: expression\n    if (.not. expression) allocate(error)\n  end subroutine\nend module\n",
+    );
+    let prog = write_program_in(
+        &dir,
+        "p.f90",
+        "program p\n  use check_like, only: error_type, check\n  use stats_like, only: mean, moment\n  implicit none\n  type(error_type), allocatable :: error\n  real :: x3(2,2,3), zero3(2,2)\n  integer :: order\n  x3 = 1.0\n  zero3 = 0.0\n  order = 1\n  call check(error, all(abs(moment(x3, order, dim = 3, center = zero3) - mean(x3, 3)) < 1.0e-5))\n  if (allocated(error)) error stop 1\n  print *, 'ok'\nend program\n",
+    );
+    let stats_o = dir.join("stats_like.o");
+    let check_o = dir.join("check_like.o");
+    let prog_o = dir.join("p.o");
+    for (src, obj) in [(&stats, &stats_o), (&check, &check_o), (&prog, &prog_o)] {
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-c",
+                src.to_str().unwrap(),
+                "-I",
+                dir.to_str().unwrap(),
+                "-J",
+                dir.to_str().unwrap(),
+                "-o",
+                obj.to_str().unwrap(),
+            ])
+            .output()
+            .expect("ranked ALL generic compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "ranked ALL generic compile failed for {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn imported_generic_keyword_actual_does_not_skip_required_formal() {
+    let dir = unique_dir("generic_keyword_required_slot");
+    let stats = write_program_in(
+        &dir,
+        "stats_like.f90",
+        "module stats_like\n  implicit none\n  private\n  public :: mean, moment\n  interface mean\n    module procedure mean_all_c2\n  end interface\n  interface moment\n    module procedure moment_dim_c2\n    module procedure moment_all_c2\n  end interface\ncontains\n  function mean_all_c2(x) result(res)\n    complex, intent(in) :: x(:,:)\n    complex :: res\n    res = (1.0, 0.0)\n  end function\n  function moment_dim_c2(x, order, dim, center) result(res)\n    complex, intent(in) :: x(:,:)\n    integer, intent(in) :: order, dim\n    complex, intent(in), optional :: center(:)\n    complex :: res(size(x, 1))\n    res = (1.0, 0.0) + 0.0 * real(order + dim)\n  end function\n  function moment_all_c2(x, order, center) result(res)\n    complex, intent(in) :: x(:,:)\n    integer, intent(in) :: order\n    complex, intent(in), optional :: center\n    complex :: res\n    res = (1.0, 0.0) + 0.0 * real(order)\n  end function\nend module\n",
+    );
+    let check = write_program_in(
+        &dir,
+        "check_like.f90",
+        "module check_like\n  implicit none\n  private\n  public :: error_type, check\n  type :: error_type\n    integer :: code = 0\n  end type\n  interface check\n    module procedure check_logical\n  end interface\ncontains\n  subroutine check_logical(error, expression)\n    type(error_type), allocatable, intent(out) :: error\n    logical, intent(in) :: expression\n    if (.not. expression) allocate(error)\n  end subroutine\nend module\n",
+    );
+    let prog = write_program_in(
+        &dir,
+        "p.f90",
+        "program p\n  use check_like, only: error_type, check\n  use stats_like, only: mean, moment\n  implicit none\n  type(error_type), allocatable :: error\n  complex :: x2(2,2)\n  integer :: order\n  x2 = (1.0, 0.0)\n  order = 1\n  call check(error, abs(moment(x2, order, center = (0.0, 0.0)) - mean(x2)) < 1.0e-5)\n  if (allocated(error)) error stop 1\n  print *, 'ok'\nend program\n",
+    );
+    let stats_o = dir.join("stats_like.o");
+    let check_o = dir.join("check_like.o");
+    let prog_o = dir.join("p.o");
+    for (src, obj) in [(&stats, &stats_o), (&check, &check_o), (&prog, &prog_o)] {
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-c",
+                src.to_str().unwrap(),
+                "-I",
+                dir.to_str().unwrap(),
+                "-J",
+                dir.to_str().unwrap(),
+                "-o",
+                obj.to_str().unwrap(),
+            ])
+            .output()
+            .expect("keyword required-slot generic compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "keyword required-slot generic compile failed for {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn local_generic_gamma_falls_back_to_intrinsic_for_real_actual() {
+    let src = write_program(
+        "module gamma_like\n  implicit none\n  private\n  public :: gamma\n  interface gamma\n    module procedure gamma_iint32\n    module procedure gamma_csp\n  end interface\ncontains\n  elemental real function gamma_iint32(z) result(res)\n    integer, intent(in) :: z\n    res = real(z)\n  end function\n  impure elemental complex function gamma_csp(z) result(res)\n    complex, intent(in) :: z\n    res = cmplx(gamma(z%re), kind=4)\n  end function\nend module\nprogram p\n  use gamma_like, only: gamma\n  implicit none\n  complex :: got\n  got = gamma((2.0, 0.0))\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let ir = unique_path("generic_gamma_intrinsic_fallback", "ir");
+    let emit = Command::new(compiler("armfortas"))
+        .args([
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("gamma intrinsic fallback IR compile failed to spawn");
+    assert!(
+        emit.status.success(),
+        "gamma intrinsic fallback IR compile failed: {}",
+        String::from_utf8_lossy(&emit.stderr)
+    );
+    let ir_text = fs::read_to_string(&ir).expect("cannot read gamma fallback IR");
+    assert!(
+        ir_text.contains("call @tgammaf"),
+        "real gamma actual did not fall back to intrinsic:\n{}",
+        ir_text
+    );
+    let _ = std::fs::remove_file(&ir);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn generic_callee_type_ignores_unrelated_same_name_data_symbol() {
     let src = write_program(
         "module m\n  implicit none\n  private\n  public :: run\n  interface arg\n    module procedure arg_sp\n    module procedure arg_dp\n  end interface\n  interface check\n    module procedure check_logical\n    module procedure check_integer\n  end interface\ncontains\n  elemental real(4) function arg_sp(z) result(result)\n    complex(4), intent(in) :: z\n    result = 0.5_4\n  end function\n  elemental real(8) function arg_dp(z) result(result)\n    complex(8), intent(in) :: z\n    result = 0.5_8\n  end function\n  subroutine check_logical(ok, message)\n    logical, intent(in) :: ok\n    character(*), intent(in), optional :: message\n    if (.not. ok) error stop 10\n  end subroutine\n  subroutine check_integer(value, message)\n    integer, intent(in) :: value\n    character(*), intent(in), optional :: message\n    error stop value\n  end subroutine\n  subroutine pollute\n    character(:), allocatable :: arg\n    arg = 'not the generic'\n  end subroutine\n  subroutine run\n    real(4), parameter :: tol = 1.0e-4_4\n    call check(abs(arg(2*exp((0.0_4, 0.5_4))) - 0.5_4) < tol, 'test_nonzero_scalar')\n  end subroutine\nend module\nprogram p\n  use m, only: run\n  call run\n  print *, 'ok'\nend program\n",

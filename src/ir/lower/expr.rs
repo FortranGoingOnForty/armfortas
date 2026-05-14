@@ -1942,6 +1942,18 @@ pub(crate) fn lower_expr_full(
                     if let Some(result) = intrinsic_result {
                         return result;
                     }
+                    if has_named_interface
+                        && original_args.len() == resolution_arg_vals.len()
+                        && (original_args.len() <= 1
+                            || original_args.iter().all(|arg| arg.keyword.is_none()))
+                        && crate::sema::validate::is_intrinsic_name(&key)
+                    {
+                        if let Some(result) =
+                            super::intrinsic::lower_intrinsic(b, &key, &resolution_arg_vals)
+                        {
+                            return result;
+                        }
+                    }
                     if let Some(specifics) = named_interface_specifics(st, &key) {
                         eprintln!(
                             "armfortas: error: {}:{}: no specific procedure of generic '{}' matches the actual arguments; candidates: [{}]",

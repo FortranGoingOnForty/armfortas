@@ -9574,6 +9574,20 @@ pub(super) fn reorder_argument_slots_by_formal_skip(
     Some(slots)
 }
 
+fn required_formal_slots_present<T>(
+    declared_args: &[&crate::sema::symtab::Symbol],
+    slots: &[Option<T>],
+    formal_skip: usize,
+) -> bool {
+    declared_args
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| *idx >= formal_skip)
+        .all(|(idx, declared_arg)| {
+            declared_arg.attrs.optional || slots.get(idx).is_some_and(Option::is_some)
+        })
+}
+
 pub(super) fn reorder_args_for_specific_candidate(
     st: &SymbolTable,
     candidate: &SpecificProcCandidate,
@@ -9647,6 +9661,13 @@ fn resolve_generic_call_by_semantics_impl(
             .filter(|sym| !sym.attrs.optional)
             .count();
         if args.len() < required || args.len() > declared_args.len() {
+            continue;
+        }
+        let Some(argument_slots) = reorder_argument_slots_by_formal_skip(args, &scope.arg_order, 0)
+        else {
+            continue;
+        };
+        if !required_formal_slots_present(&declared_args, &argument_slots, 0) {
             continue;
         }
         let Some(semantic_slots) = reorder_semantic_type_slots_by_formal_skip(
@@ -9766,6 +9787,9 @@ fn resolve_generic_call_actuals_from_specifics(
         else {
             continue;
         };
+        if !required_formal_slots_present(&declared_args, &arg_slots, 0) {
+            continue;
+        }
         let Some(semantic_slots) = reorder_semantic_type_slots_by_formal_skip(
             args,
             &actual_type_infos,
@@ -9926,6 +9950,13 @@ pub(super) fn formal_rank_matches_actual(formal: Option<usize>, actual: Option<u
     }
 }
 
+fn has_reduction_dim_arg(args: &[crate::ast::expr::Argument]) -> bool {
+    args.iter().enumerate().any(|(idx, arg)| {
+        let kw = arg.keyword.as_deref().map(|s| s.to_lowercase());
+        matches!(kw.as_deref(), Some("dim")) || (idx == 1 && kw.is_none())
+    })
+}
+
 /// Best-effort rank inference for an actual expression. Used by the
 /// generic dispatcher to disambiguate specifics that differ only by
 /// formal rank (e.g. `mnorm`'s rank-2 vs rank-3 entries).
@@ -10031,12 +10062,21 @@ pub(super) fn actual_expr_rank(
                         }
                     }
                 }
-                if key == "norm2"
-                    && args.iter().enumerate().any(|(idx, arg)| {
-                        let kw = arg.keyword.as_deref().map(|s| s.to_lowercase());
-                        matches!(kw.as_deref(), Some("dim")) || (idx == 1 && kw.is_none())
-                    })
-                {
+                if matches!(key.as_str(), "all" | "any" | "count") {
+                    if !has_reduction_dim_arg(args) {
+                        return Some(0);
+                    }
+                    if let Some(first_arg) = args.first() {
+                        if let crate::ast::expr::SectionSubscript::Element(first_expr) =
+                            &first_arg.value
+                        {
+                            return actual_expr_rank(first_expr, locals, st, type_layouts)
+                                .map(|rank| rank.saturating_sub(1));
+                        }
+                    }
+                    return None;
+                }
+                if key == "norm2" && has_reduction_dim_arg(args) {
                     if let Some(first_arg) = args.first() {
                         if let crate::ast::expr::SectionSubscript::Element(first_expr) =
                             &first_arg.value
