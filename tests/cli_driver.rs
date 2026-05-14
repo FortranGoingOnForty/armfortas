@@ -17387,6 +17387,44 @@ fn generic_elemental_subroutine_with_logical_array_actual_scalarizes_all_lanes()
 }
 
 #[test]
+fn explicit_shape_dummy_runtime_bound_materializes_descriptor_extent() {
+    // stdlib_sum_3d_sp recasts an assumed-shape rank-3 array to a
+    // contained rank-1 explicit-shape dummy (`real :: b(n)`) before
+    // summing. The dummy is passed as a raw pointer, so the callee must
+    // materialize a local descriptor using the runtime `n` bound; falling
+    // back to the static `(1,1)` placeholder sums only the first element.
+    let src = write_program(
+        "module m\ncontains\n  function outer(x) result(s)\n    real, intent(in) :: x(:,:,:)\n    real :: s\n    s = inner(x, size(x))\n  contains\n    real function inner(b, n)\n      integer, intent(in) :: n\n      real, intent(in) :: b(n)\n      inner = sum(b)\n    end function\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  real :: x(2,2,2)\n  x = 1.0\n  if (abs(outer(x) - 8.0) > 1.0e-6) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("explicit_shape_dummy_runtime_bound", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("explicit-shape runtime bound compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "explicit-shape runtime bound should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("explicit-shape runtime bound run failed");
+    assert!(
+        run.status.success(),
+        "explicit-shape runtime bound should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn imported_generic_array_function_assignment_keeps_whole_array_actual() {
     let dir = unique_dir("imported_generic_array_assign");
     let mod_src = write_program_in(
