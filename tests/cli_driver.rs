@@ -12245,6 +12245,45 @@ fn rank1_runtime_shape_array_function_result_into_fixed_dest() {
 }
 
 #[test]
+fn zero_size_allocatable_function_result_into_fixed_dest_zero_fills() {
+    // stdlib_intrinsics calls `d = stdlib_matmul(a,b,c,err=linerr)` on an
+    // error path where the function result is `allocate(res(0,0))`. The caller
+    // lowered fixed-shape assignment by loading the result descriptor's
+    // base_addr and memcpying the destination's static byte count, so a valid
+    // zero-size result became `memcpy(dest, NULL, n)` and crashed in
+    // test_intrinsics before it could inspect `linerr`.
+    let src = write_program(
+        "module m\ncontains\n  function make(flag) result(r)\n    logical, intent(in) :: flag\n    real, allocatable :: r(:,:)\n    if (flag) then\n      allocate(r(0, 0))\n    else\n      allocate(r(2, 2))\n      r = reshape([1.0, 2.0, 3.0, 4.0], [2, 2])\n    end if\n  end function\nend module\n\nprogram t\n  use m\n  implicit none\n  real :: a(2, 2)\n  a = -1.0\n  a = make(.true.)\n  if (a(1,1) /= 0.0 .or. a(2,2) /= 0.0) error stop 1\n  a = make(.false.)\n  if (abs(a(1,1) - 1.0) > 1.0e-6) error stop 2\n  if (abs(a(2,2) - 4.0) > 1.0e-6) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("zero_size_result_fixed_dest", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("zero-size function result compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "zero-size function result should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("zero-size function result run failed");
+    assert!(
+        run.status.success(),
+        "zero-size function result should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn size_with_kind_keyword_arg_returns_total_size_not_size_along_dim() {
     // F2018 §16.9.193: SIZE(array [, dim] [, kind]). The KIND keyword
     // selects the integer kind of the result; it is *not* a DIM

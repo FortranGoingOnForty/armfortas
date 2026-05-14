@@ -33,6 +33,17 @@ pub(crate) fn lower_stmts(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmts: &[Span
     }
 }
 
+fn copy_array_result_to_fixed_dest(b: &mut FuncBuilder, info: &LocalInfo, src_desc: ValueId) {
+    let n = array_total_elems_value(b, info);
+    let elem_bytes = b.const_i64(ir_scalar_byte_size(&info.ty));
+    let byte_count = b.imul(n, elem_bytes);
+    b.call(
+        FuncRef::External("afs_copy_array_result_to_fixed".into()),
+        vec![info.addr, src_desc, byte_count],
+        IrType::Void,
+    );
+}
+
 /// Lower a single statement.
 pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
     match &stmt.node {
@@ -505,22 +516,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                         callee_name,
                                                         call_args,
                                                     );
-                                                    let n = array_total_elems_value(b, &info);
-                                                    let elem_bytes =
-                                                        b.const_i64(ir_scalar_byte_size(&info.ty));
-                                                    let byte_count = b.imul(n, elem_bytes);
-                                                    let src_base = b.load_typed(
-                                                        tmp_desc,
-                                                        IrType::Ptr(Box::new(IrType::Int(
-                                                            IntWidth::I8,
-                                                        ))),
-                                                    );
-                                                    b.call(
-                                                        FuncRef::External("memcpy".into()),
-                                                        vec![info.addr, src_base, byte_count],
-                                                        IrType::Ptr(Box::new(IrType::Int(
-                                                            IntWidth::I8,
-                                                        ))),
+                                                    copy_array_result_to_fixed_dest(
+                                                        b, &info, tmp_desc,
                                                     );
                                                     let stat = b.alloca(IrType::Int(IntWidth::I32));
                                                     b.store(zero32, stat);
@@ -593,22 +590,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                         );
                                                     }
                                                 } else {
-                                                    let n = array_total_elems_value(b, &info);
-                                                    let elem_bytes =
-                                                        b.const_i64(ir_scalar_byte_size(&info.ty));
-                                                    let byte_count = b.imul(n, elem_bytes);
-                                                    let src_base = b.load_typed(
-                                                        src_desc,
-                                                        IrType::Ptr(Box::new(IrType::Int(
-                                                            IntWidth::I8,
-                                                        ))),
-                                                    );
-                                                    b.call(
-                                                        FuncRef::External("memcpy".into()),
-                                                        vec![info.addr, src_base, byte_count],
-                                                        IrType::Ptr(Box::new(IrType::Int(
-                                                            IntWidth::I8,
-                                                        ))),
+                                                    copy_array_result_to_fixed_dest(
+                                                        b, &info, src_desc,
                                                     );
                                                 }
                                                 let stat = b.alloca(IrType::Int(IntWidth::I32));
@@ -677,23 +660,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                     );
                                                 }
                                             } else {
-                                                let n = array_total_elems_value(b, &info);
-                                                let elem_bytes =
-                                                    b.const_i64(ir_scalar_byte_size(&info.ty));
-                                                let byte_count = b.imul(n, elem_bytes);
-                                                let src_base = b.load_typed(
-                                                    src_desc,
-                                                    IrType::Ptr(Box::new(IrType::Int(
-                                                        IntWidth::I8,
-                                                    ))),
-                                                );
-                                                b.call(
-                                                    FuncRef::External("memcpy".into()),
-                                                    vec![info.addr, src_base, byte_count],
-                                                    IrType::Ptr(Box::new(IrType::Int(
-                                                        IntWidth::I8,
-                                                    ))),
-                                                );
+                                                copy_array_result_to_fixed_dest(b, &info, src_desc);
                                             }
                                             let stat = b.alloca(IrType::Int(IntWidth::I32));
                                             let zero32 = b.const_i32(0);
