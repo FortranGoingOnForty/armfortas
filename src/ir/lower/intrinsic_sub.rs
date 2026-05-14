@@ -120,6 +120,45 @@ pub(crate) fn lower_intrinsic_subroutine(
         (b.const_i64(0), None)
     }
 
+    /// Helper: adapt an intrinsic out-arg to a runtime ABI that writes
+    /// through an f64 slot. Non-f64 destinations get a temporary f64
+    /// alloca followed by an explicit writeback after the runtime call.
+    fn nth_arg_f64_out(
+        b: &mut FuncBuilder,
+        ctx: &LowerCtx,
+        args: &[Option<crate::ast::expr::Argument>],
+        n: usize,
+    ) -> (ValueId, Option<RuntimeOutWriteback>) {
+        if let Some(Some(arg)) = args.get(n) {
+            if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
+                let dest_ptr = lower_arg_by_ref_ctx(b, ctx, e);
+                let semantic_dest_ty =
+                    generic_actual_expr_type_info(e, &ctx.locals, ctx.st, Some(ctx.type_layouts))
+                        .map(|ti| type_info_to_ir_type(&ti));
+                let pointer_dest_ty = match b.func().value_type(dest_ptr) {
+                    Some(IrType::Ptr(inner)) => Some((*inner).clone()),
+                    _ => None,
+                };
+                if let Some(dest_ty) = semantic_dest_ty.or(pointer_dest_ty) {
+                    if dest_ty == IrType::Float(FloatWidth::F64) {
+                        return (dest_ptr, None);
+                    }
+                    let tmp_ptr = b.alloca(IrType::Float(FloatWidth::F64));
+                    return (
+                        tmp_ptr,
+                        Some(RuntimeOutWriteback {
+                            dest_ptr,
+                            dest_ty,
+                            tmp_ptr,
+                        }),
+                    );
+                }
+                return (dest_ptr, None);
+            }
+        }
+        (b.const_i64(0), None)
+    }
+
     let arg_slots = reorder_args_by_keyword_slots(args, name, ctx.st);
     let args = arg_slots.as_slice();
 
@@ -246,12 +285,17 @@ pub(crate) fn lower_intrinsic_subroutine(
             true
         }
         "cpu_time" => {
-            let time = nth_arg_ref(b, ctx, args, 0);
+            let (time, writeback) = nth_arg_f64_out(b, ctx, args, 0);
             b.call(
                 FuncRef::External("afs_cpu_time".into()),
                 vec![time],
                 IrType::Void,
             );
+            if let Some(writeback) = writeback {
+                let raw = b.load(writeback.tmp_ptr);
+                let coerced = coerce_to_type(b, raw, &writeback.dest_ty);
+                b.store(coerced, writeback.dest_ptr);
+            }
             true
         }
         "date_and_time" => {

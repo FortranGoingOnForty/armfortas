@@ -16623,7 +16623,10 @@ pub(super) fn build_host_ref_params(
         let uses_string_descriptor = arg_uses_string_descriptor_from_decls(hname, host_decls);
         let alloc = decl_is_allocatable(hname, host_decls);
         let ptr_is_pointer = decl_is_pointer(hname, host_decls);
-        let descriptor_arg = (uses_desc || alloc) && !uses_string_descriptor;
+        let dims = arg_dims_from_decls(hname, host_decls, &host_visible, st);
+        let large_explicit_shape = host_ref_explicit_array_uses_descriptor(&dims, &elem_ty);
+        let descriptor_arg =
+            (uses_desc || alloc || large_explicit_shape) && !uses_string_descriptor;
         let derived_type = arg_derived_type_name(hname, host_decls);
         let ptr_ty = by_ref_storage_ir_type(
             &elem_ty,
@@ -16660,7 +16663,7 @@ pub(super) fn build_host_ref_params(
             name: hname.clone(),
             id: pid,
             elem_ty,
-            dims: arg_dims_from_decls(hname, host_decls, &host_visible, st),
+            dims,
             char_kind: arg_char_kind_from_decls(hname, host_decls, st),
             derived_type,
             descriptor_arg,
@@ -16671,6 +16674,22 @@ pub(super) fn build_host_ref_params(
         });
     }
     infos
+}
+
+fn host_ref_explicit_array_uses_descriptor(dims: &[(i64, i64)], elem_ty: &IrType) -> bool {
+    if dims.is_empty() {
+        return false;
+    }
+    let Some(total_elems) = dims
+        .iter()
+        .try_fold(1_i64, |acc, (_, extent)| acc.checked_mul((*extent).max(0)))
+    else {
+        return true;
+    };
+    let Some(total_bytes) = total_elems.checked_mul(ir_scalar_byte_size(elem_ty)) else {
+        return true;
+    };
+    total_bytes >= 64 * 1024
 }
 
 /// Append trailing pointer args to `arg_vals` matching the callee's

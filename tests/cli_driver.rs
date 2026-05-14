@@ -22204,6 +22204,76 @@ fn system_clock_component_writeback_uses_component_width() {
 }
 
 #[test]
+fn cpu_time_default_real_uses_runtime_f64_writeback() {
+    let src = write_program(
+        "program p\n  implicit none\n  real :: t32\n  real(8) :: t64\n  call cpu_time(t32)\n  call cpu_time(t64)\n  if (t32 < 0.0) error stop 1\n  if (t64 < 0.0_8) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("cpu_time_default_real_writeback", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("cpu_time writeback compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "cpu_time writeback should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "cpu_time writeback should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected cpu_time writeback output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn host_associated_large_explicit_array_sections_pass_descriptor() {
+    let src = write_program(
+        "program p\n  implicit none\n  integer, parameter :: n = 70000\n  integer(1) :: values(n)\n  values = 0_1\n  values(1) = 11_1\n  values(n) = 22_1\n  call inner()\ncontains\n  subroutine inner()\n    if (first(values(1:1)) /= 11) error stop 1\n    if (first(values(n:n)) /= 22) error stop 2\n    print *, 'ok'\n  end subroutine\n  integer function first(x) result(y)\n    integer(1), intent(in) :: x(:)\n    y = x(1)\n  end function\nend program\n",
+        "f90",
+    );
+    let out = unique_path("host_large_explicit_array_section", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("host large explicit array section compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "host large explicit array section should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "host large explicit array section should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected host large explicit array section output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn saved_derived_global_after_small_globals_keeps_descriptor_alignment() {
     let src = write_program(
         "module m\n  implicit none\n  logical, save :: flag1 = .false.\n  logical, save :: flag2 = .false.\n  logical, save :: flag3 = .false.\n  type :: history_t\n    character(len=16), allocatable :: lines(:)\n    integer :: count = 0\n    integer :: current = 0\n    logical :: initialized = .false.\n  end type\n  type(history_t), save :: history\ncontains\n  subroutine init_history()\n    if (.not. history%initialized) then\n      allocate(history%lines(4))\n      history%lines = ''\n      history%count = 1\n      history%initialized = .true.\n    end if\n    print *, history%count, size(history%lines)\n  end subroutine\nend module\nprogram p\n  use m\n  call init_history()\nend program\n",
