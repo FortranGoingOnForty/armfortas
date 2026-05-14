@@ -12998,8 +12998,10 @@ pub(super) fn emit_resolved_operator_call(
     let ret_ty = if hidden_result.is_some() {
         IrType::Void
     } else {
-        first_procedure_lookup(&abi_lookup_keys, |k| callee_return_ir_type(st, k))
-            .unwrap_or(IrType::Int(IntWidth::I32))
+        first_procedure_lookup(&abi_lookup_keys, |k| {
+            callee_return_ir_type_for_caller(st, k, internal_funcs)
+        })
+        .unwrap_or(IrType::Int(IntWidth::I32))
     };
     let call_result = b.call(func_ref, call_args, ret_ty);
 
@@ -17253,19 +17255,32 @@ pub(super) fn callee_return_stabilized_derived_type_name(
     }
 }
 
-pub(super) fn callee_return_ir_type(st: &SymbolTable, callee_name: &str) -> Option<IrType> {
-    let key = canonical_procedure_abi_key(st, callee_name);
-    if let Some(sym) = st.scopes.iter().find_map(|scope| scope.symbols.get(&key)) {
-        if let Some(type_info) = sym.type_info.as_ref() {
-            let mut ir_ty = type_info_to_ir_type(type_info);
-            if sym.attrs.pointer && !ir_ty.is_ptr() {
-                ir_ty = IrType::Ptr(Box::new(ir_ty));
+fn callee_symbol_ir_type(sym: &crate::sema::symtab::Symbol) -> Option<IrType> {
+    let type_info = sym.type_info.as_ref()?;
+    let mut ir_ty = type_info_to_ir_type(type_info);
+    if sym.attrs.pointer && !ir_ty.is_ptr() {
+        ir_ty = IrType::Ptr(Box::new(ir_ty));
+    }
+    Some(ir_ty)
+}
+
+fn callee_return_ir_type_from_scope(
+    st: &SymbolTable,
+    scope_id: crate::sema::symtab::ScopeId,
+) -> Option<IrType> {
+    let callee_scope = st.scope(scope_id);
+    let proc_name = match &callee_scope.kind {
+        crate::sema::symtab::ScopeKind::Function(name) => name.to_lowercase(),
+        _ => return None,
+    };
+
+    if let Some(parent_id) = callee_scope.parent {
+        if let Some(sym) = st.scope(parent_id).symbols.get(&proc_name) {
+            if let Some(ir_ty) = callee_symbol_ir_type(sym) {
+                return Some(ir_ty);
             }
-            return Some(ir_ty);
         }
     }
-
-    let callee_scope = callee_scope_for_lookup(st, callee_name)?;
 
     let mut result_type = None;
     for sym in callee_scope.symbols.values() {
@@ -17276,18 +17291,45 @@ pub(super) fn callee_return_ir_type(st: &SymbolTable, callee_name: &str) -> Opti
         {
             continue;
         }
-        if let Some(type_info) = sym.type_info.as_ref() {
+        if let Some(ir_ty) = callee_symbol_ir_type(sym) {
             if result_type.is_some() {
                 return None;
-            }
-            let mut ir_ty = type_info_to_ir_type(type_info);
-            if sym.attrs.pointer && !ir_ty.is_ptr() {
-                ir_ty = IrType::Ptr(Box::new(ir_ty));
             }
             result_type = Some(ir_ty);
         }
     }
     result_type
+}
+
+pub(super) fn callee_return_ir_type(st: &SymbolTable, callee_name: &str) -> Option<IrType> {
+    let key = canonical_procedure_abi_key(st, callee_name);
+    if let Some(ir_ty) = st
+        .scopes
+        .iter()
+        .find_map(|scope| scope.symbols.get(&key).and_then(callee_symbol_ir_type))
+    {
+        return Some(ir_ty);
+    }
+
+    let callee_scope_id = callee_scope_id_for_lookup(st, callee_name)?;
+    callee_return_ir_type_from_scope(st, callee_scope_id)
+}
+
+pub(super) fn callee_return_ir_type_for_caller(
+    st: &SymbolTable,
+    callee_name: &str,
+    internal_funcs: Option<&HashMap<String, u32>>,
+) -> Option<IrType> {
+    let key = callee_name.to_lowercase();
+    if internal_funcs.is_some_and(|funcs| funcs.contains_key(&key)) {
+        let caller_scope = current_proc_scope();
+        if let Some(scope_id) = find_procedure_scope_id_for_caller(st, &key, caller_scope) {
+            if let Some(ir_ty) = callee_return_ir_type_from_scope(st, scope_id) {
+                return Some(ir_ty);
+            }
+        }
+    }
+    callee_return_ir_type(st, callee_name)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -28511,8 +28553,10 @@ pub(super) fn array_function_result_elem_type(
                 return None;
             }
 
-            first_procedure_lookup(&abi_lookup_keys, |k| callee_return_ir_type(st, k))
-                .or(Some(IrType::Int(IntWidth::I32)))
+            first_procedure_lookup(&abi_lookup_keys, |k| {
+                callee_return_ir_type_for_caller(st, k, internal_funcs)
+            })
+            .or(Some(IrType::Int(IntWidth::I32)))
         }
         Expr::ComponentAccess { base, component } => {
             let tl = type_layouts?;
