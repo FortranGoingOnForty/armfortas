@@ -33319,6 +33319,76 @@ fn elemental_character_array_swap_and_constructor_equality_runs() {
 }
 
 #[test]
+fn elemental_derived_string_array_swap_uses_defined_assignment_and_operator() {
+    // Stdlib's `test_swap_stt` initializes string_type arrays from
+    // character constructors, swaps them through an elemental generic
+    // subroutine, and validates with ALL(array == character-constructor).
+    // Each stage must scalarize through the user-defined assignment/operator
+    // surfaces instead of treating the character literal as a raw derived
+    // object or swapping only the first element.
+    let src = write_program(
+        "module string_m\n  implicit none\n  type :: string_type\n    character(len=:), allocatable :: raw\n  end type\n  interface assignment(=)\n    module procedure assign_string_char\n  end interface\n  interface operator(==)\n    module procedure eq_string_char\n  end interface\ncontains\n  elemental subroutine assign_string_char(lhs, rhs)\n    type(string_type), intent(inout) :: lhs\n    character(len=*), intent(in) :: rhs\n    lhs%raw = rhs\n  end subroutine\n  elemental logical function eq_string_char(lhs, rhs) result(ok)\n    type(string_type), intent(in) :: lhs\n    character(len=*), intent(in) :: rhs\n    if (allocated(lhs%raw)) then\n      ok = lhs%raw == rhs\n    else\n      ok = len(rhs) == 0\n    end if\n  end function\nend module\nmodule math_m\n  use string_m, only: string_type\n  implicit none\n  interface swap\n    module procedure swap_stt\n  end interface\ncontains\n  elemental subroutine swap_stt(lhs, rhs)\n    type(string_type), intent(inout) :: lhs, rhs\n    type(string_type) :: temp\n    temp = lhs\n    lhs = rhs\n    rhs = temp\n  end subroutine\nend module\nprogram p\n  use string_m, only: string_type, assignment(=), operator(==)\n  use math_m, only: swap\n  implicit none\n  type(string_type) :: x(2), y(2)\n  x = ['abcde', 'fghij']\n  y = ['fghij', 'abcde']\n  call swap(x, y)\n  if (.not. all(x == ['fghij', 'abcde'])) error stop 1\n  if (.not. all(y == ['abcde', 'fghij'])) error stop 2\n  call swap(x, x)\n  if (.not. all(x == ['fghij', 'abcde'])) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("elemental_derived_string_swap", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("elemental derived string swap compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "elemental derived string swap compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("elemental derived string swap run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "elemental derived string swap run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn stdlib_style_string_array_swap_routes_nested_defined_gt() {
+    // stdlib_string_type's `operator(==)` is written in terms of its
+    // user-defined `operator(>)` overloads. Lowering must resolve those nested
+    // derived/character comparisons before the intrinsic character shortcut,
+    // otherwise the string_type storage is compared as a zero-length character.
+    let src = write_program(
+        "module string_m\n  implicit none\n  type :: string_type\n    sequence\n    private\n    character(len=:), allocatable :: raw\n  end type string_type\n  interface assignment(=)\n    module procedure assign_string_char\n  end interface\n  interface operator(>)\n    module procedure gt_string_char\n    module procedure gt_char_string\n  end interface\n  interface operator(==)\n    module procedure eq_string_char\n  end interface\ncontains\n  elemental subroutine assign_string_char(lhs, rhs)\n    type(string_type), intent(inout) :: lhs\n    character(len=*), intent(in) :: rhs\n    lhs%raw = rhs\n  end subroutine\n  elemental logical function gt_string_char(lhs, rhs) result(is_gt)\n    type(string_type), intent(in) :: lhs\n    character(len=*), intent(in) :: rhs\n    if (allocated(lhs%raw)) then\n      is_gt = lhs%raw > rhs\n    else\n      is_gt = '' > rhs\n    end if\n  end function\n  elemental logical function gt_char_string(lhs, rhs) result(is_gt)\n    character(len=*), intent(in) :: lhs\n    type(string_type), intent(in) :: rhs\n    if (allocated(rhs%raw)) then\n      is_gt = lhs > rhs%raw\n    else\n      is_gt = lhs > ''\n    end if\n  end function\n  elemental logical function eq_string_char(lhs, rhs) result(is_eq)\n    type(string_type), intent(in) :: lhs\n    character(len=*), intent(in) :: rhs\n    is_eq = .not.(lhs > rhs)\n    if (is_eq) then\n      is_eq = .not.(rhs > lhs)\n    end if\n  end function\nend module\nmodule math_m\n  use string_m, only: string_type\n  implicit none\n  interface swap\n    module procedure swap_stt\n  end interface\ncontains\n  elemental subroutine swap_stt(lhs, rhs)\n    type(string_type), intent(inout) :: lhs, rhs\n    type(string_type) :: temp\n    temp = lhs\n    lhs = rhs\n    rhs = temp\n  end subroutine\nend module\nprogram p\n  use string_m, only: string_type, assignment(=), operator(==)\n  use math_m, only: swap\n  implicit none\n  type(string_type) :: x(2), y(2)\n  x = ['abcde', 'fghij']\n  y = ['fghij', 'abcde']\n  call swap(x, y)\n  if (.not. all(x == ['fghij', 'abcde'])) error stop 1\n  if (.not. all(y == ['abcde', 'fghij'])) error stop 2\n  call swap(x, x)\n  if (.not. all(x == ['fghij', 'abcde'])) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("stdlib_style_string_swap", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("stdlib-style string swap compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "stdlib-style string swap compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("stdlib-style string swap run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "stdlib-style string swap run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn complex_array_power_loads_exponent_elements_not_descriptor() {
     // Surfaced by stdlib_math's logspace_1_cdp_n_rbase:
     //   res = base ** exponents

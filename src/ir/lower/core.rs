@@ -8166,6 +8166,125 @@ fn lower_logical_reduction_char_array_ctor_compare(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn lower_logical_reduction_defined_array_ctor_compare(
+    b: &mut FuncBuilder,
+    name: &str,
+    op: &crate::ast::expr::BinaryOp,
+    array_expr: &crate::ast::expr::SpannedExpr,
+    ctor_values: &[crate::ast::expr::AcValue],
+    array_on_left: bool,
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) -> Option<ValueId> {
+    let iface_name = binary_op_interface_name(op)?;
+    let candidates = named_interface_specific_candidates(st, &iface_name)?;
+    let array_ti = operator_expr_type_info(array_expr, Some(locals), st, type_layouts)?;
+    let ctor_ti = first_array_constructor_type_info(ctor_values, Some(locals), st, type_layouts)?;
+    if !matches!(ctor_ti, crate::sema::symtab::TypeInfo::Character { .. }) {
+        return None;
+    }
+    let (left_ti, right_ti) = if array_on_left {
+        (array_ti, ctor_ti)
+    } else {
+        (ctor_ti, array_ti)
+    };
+
+    let candidate = candidates.iter().find(|candidate| {
+        if !specific_candidate_is_elemental(st, candidate) {
+            return false;
+        }
+        let Some(scope) = procedure_scope_for_candidate(st, candidate) else {
+            return false;
+        };
+        let declared_args = declared_args_for_scope(scope);
+        if declared_args.len() != 2 {
+            return false;
+        }
+        if formal_declared_rank(declared_args[0]) != Some(0)
+            || formal_declared_rank(declared_args[1]) != Some(0)
+        {
+            return false;
+        }
+        let Some(left_decl) = declared_args.first().and_then(|sym| sym.type_info.as_ref()) else {
+            return false;
+        };
+        let Some(right_decl) = declared_args.get(1).and_then(|sym| sym.type_info.as_ref()) else {
+            return false;
+        };
+        operator_arg_semantic_match(left_decl, Some(&left_ti))
+            && operator_arg_semantic_match(right_decl, Some(&right_ti))
+    })?;
+
+    let (array_desc, elem_ty) = lower_array_expr_descriptor(
+        b,
+        locals,
+        array_expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    )?;
+
+    let mut acc = init_logical_reduction_acc(b, name);
+    for (i, value) in ctor_values.iter().enumerate() {
+        let crate::ast::expr::AcValue::Expr(ctor_expr) = value else {
+            return None;
+        };
+        let idx = b.const_i64(i as i64);
+        let array_ptr = rank1_array_desc_elem_ptr(b, array_desc, &elem_ty, idx);
+        let (ctor_ptr, _) = lower_string_expr_full(
+            b,
+            locals,
+            ctor_expr,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        );
+        let pred = if array_on_left {
+            emit_resolved_operator_call(
+                b,
+                locals,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+                &candidate.name,
+                array_expr,
+                ctor_expr,
+                array_ptr,
+                ctor_ptr,
+            )
+        } else {
+            emit_resolved_operator_call(
+                b,
+                locals,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+                &candidate.name,
+                ctor_expr,
+                array_expr,
+                ctor_ptr,
+                array_ptr,
+            )
+        };
+        let pred = coerce_to_type(b, pred, &IrType::Bool);
+        acc = step_logical_reduction_acc(b, name, acc, pred);
+    }
+    Some(acc)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) fn lower_logical_reduction_predicate(
     b: &mut FuncBuilder,
     expr: &crate::ast::expr::SpannedExpr,
@@ -8576,6 +8695,22 @@ pub(super) fn lower_logical_reduction_intrinsic_ast(
             }
             match (&left.node, &right.node) {
                 (_, Expr::ArrayConstructor { values, .. }) => {
+                    if let Some(acc) = lower_logical_reduction_defined_array_ctor_compare(
+                        b,
+                        name,
+                        op,
+                        left,
+                        values,
+                        true,
+                        locals,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
+                    ) {
+                        return Some(acc);
+                    }
                     if let Some(acc) = lower_logical_reduction_char_array_ctor_compare(
                         b,
                         name,
@@ -8594,6 +8729,22 @@ pub(super) fn lower_logical_reduction_intrinsic_ast(
                     }
                 }
                 (Expr::ArrayConstructor { values, .. }, _) => {
+                    if let Some(acc) = lower_logical_reduction_defined_array_ctor_compare(
+                        b,
+                        name,
+                        op,
+                        right,
+                        values,
+                        false,
+                        locals,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
+                    ) {
+                        return Some(acc);
+                    }
                     if let Some(acc) = lower_logical_reduction_char_array_ctor_compare(
                         b,
                         name,
@@ -10320,6 +10471,11 @@ pub(super) fn assignment_expr_type_info(
 
     match &expr.node {
         Expr::Name { name } => lookup(name).and_then(|sym| sym.type_info.clone()),
+        Expr::ArrayConstructor { values, type_spec } => {
+            array_constructor_type_spec_info(type_spec.as_deref(), st)
+                .or_else(|| first_array_constructor_type_info(values, None, st, None))
+                .or_else(|| fortran_type_to_type_info(&crate::sema::types::expr_type(expr, st)))
+        }
         Expr::FunctionCall { callee, .. } => {
             if let Expr::Name { name } = &callee.node {
                 let sym = lookup(name)?;
@@ -11230,6 +11386,63 @@ pub(super) fn defined_binary_operator_result_type_info(
     None
 }
 
+pub(super) fn resolve_defined_binary_operator_specific_by_semantics(
+    st: &SymbolTable,
+    locals: Option<&HashMap<String, LocalInfo>>,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    op: &BinaryOp,
+    left_expr: &crate::ast::expr::SpannedExpr,
+    right_expr: &crate::ast::expr::SpannedExpr,
+) -> Option<String> {
+    let iface_name = binary_op_interface_name(op)?;
+    let specifics = named_interface_specific_candidates(st, &iface_name)?;
+    let left_ti = operator_expr_type_info(left_expr, locals, st, type_layouts);
+    let right_ti = operator_expr_type_info(right_expr, locals, st, type_layouts);
+    if operator_builtin_intrinsic_operand(left_ti.as_ref())
+        && operator_builtin_intrinsic_operand(right_ti.as_ref())
+    {
+        return None;
+    }
+    let left_actual_rank =
+        locals.and_then(|locals| actual_expr_rank(left_expr, locals, st, type_layouts));
+    let right_actual_rank =
+        locals.and_then(|locals| actual_expr_rank(right_expr, locals, st, type_layouts));
+
+    for candidate in &specifics {
+        let Some(scope) = procedure_scope_for_candidate(st, candidate) else {
+            continue;
+        };
+        let declared_args = declared_args_for_scope(scope);
+        if declared_args.len() != 2 {
+            continue;
+        }
+        let Some(left_decl) = declared_args.first().and_then(|arg| arg.type_info.as_ref()) else {
+            continue;
+        };
+        let Some(right_decl) = declared_args.get(1).and_then(|arg| arg.type_info.as_ref()) else {
+            continue;
+        };
+        if !operator_arg_semantic_match(left_decl, left_ti.as_ref()) {
+            continue;
+        }
+        if !operator_arg_semantic_match(right_decl, right_ti.as_ref()) {
+            continue;
+        }
+        if !specific_candidate_is_elemental(st, candidate) {
+            let left_formal_rank = formal_declared_rank(declared_args[0]);
+            let right_formal_rank = formal_declared_rank(declared_args[1]);
+            if !formal_rank_matches_actual(left_formal_rank, left_actual_rank)
+                || !formal_rank_matches_actual(right_formal_rank, right_actual_rank)
+            {
+                continue;
+            }
+        }
+        return Some(candidate.name.clone());
+    }
+
+    None
+}
+
 pub(super) fn local_intrinsic_call_type_info(
     expr: &crate::ast::expr::SpannedExpr,
     locals: Option<&HashMap<String, LocalInfo>>,
@@ -11786,6 +11999,179 @@ pub(super) fn array_expr_elem_type_only(
     }
 }
 
+fn specific_name_is_elemental(st: &SymbolTable, name: &str) -> bool {
+    use crate::sema::symtab::SymbolKind;
+
+    let key = name.to_ascii_lowercase();
+    st.all_scopes().iter().any(|scope| {
+        scope.symbols.get(&key).is_some_and(|sym| {
+            sym.attrs.elemental
+                && matches!(
+                    sym.kind,
+                    SymbolKind::Function
+                        | SymbolKind::Subroutine
+                        | SymbolKind::ExternalProc
+                        | SymbolKind::IntrinsicProc
+                        | SymbolKind::ProcedurePointer
+                )
+        })
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_defined_assignment_array_constructor_values(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    dest_base: ValueId,
+    off_slot: ValueId,
+    step_bytes: ValueId,
+    func_ref: FuncRef,
+    mask: Option<Vec<bool>>,
+    values: &[crate::ast::expr::AcValue],
+) -> bool {
+    for value in values {
+        match value {
+            crate::ast::expr::AcValue::Expr(expr) => {
+                if let Expr::ArrayConstructor { values: inner, .. } = &expr.node {
+                    if !lower_defined_assignment_array_constructor_values(
+                        b,
+                        ctx,
+                        dest_base,
+                        off_slot,
+                        step_bytes,
+                        func_ref.clone(),
+                        mask.clone(),
+                        inner,
+                    ) {
+                        return false;
+                    }
+                    continue;
+                }
+
+                let cur_off = b.load(off_slot);
+                let dest_ptr = b.gep(dest_base, vec![cur_off], IrType::Int(IntWidth::I8));
+                let rhs_for_call = lower_char_arg_by_ref(
+                    b,
+                    &ctx.locals,
+                    expr,
+                    ctx.st,
+                    Some(ctx.type_layouts),
+                    Some(ctx.internal_funcs),
+                    Some(ctx.contained_host_refs),
+                    Some(ctx.descriptor_params),
+                )
+                .unwrap_or_else(|| {
+                    let raw = super::expr::lower_expr_ctx_tl(b, ctx, expr);
+                    if b.func().value_type(raw).is_some_and(|ty| ty.is_ptr()) {
+                        raw
+                    } else {
+                        let ty = b
+                            .func()
+                            .value_type(raw)
+                            .unwrap_or(IrType::Int(IntWidth::I32));
+                        let slot = b.alloca(ty);
+                        b.store(raw, slot);
+                        slot
+                    }
+                });
+
+                let mut call_args = vec![dest_ptr, rhs_for_call];
+                if let Some(flags) = mask.as_ref() {
+                    if flags.first().copied().unwrap_or(false) {
+                        call_args.push(b.const_i64(0));
+                    }
+                    if flags.get(1).copied().unwrap_or(false) {
+                        let len = actual_char_arg_runtime_len(
+                            b,
+                            &ctx.locals,
+                            Some(&ctx.optional_locals),
+                            expr,
+                            ctx.st,
+                            Some(ctx.type_layouts),
+                            Some(ctx.internal_funcs),
+                            Some(ctx.contained_host_refs),
+                            Some(ctx.descriptor_params),
+                        )
+                        .unwrap_or_else(|| b.const_i64(0));
+                        call_args.push(len);
+                    }
+                }
+                b.call(func_ref.clone(), call_args, IrType::Void);
+
+                let next = b.iadd(cur_off, step_bytes);
+                b.store(next, off_slot);
+            }
+            crate::ast::expr::AcValue::ImpliedDo(_) => return false,
+        }
+    }
+    true
+}
+
+fn try_defined_array_constructor_assignment(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    lhs_info: &LocalInfo,
+    semantic_candidates: &[String],
+    values: &[crate::ast::expr::AcValue],
+) -> bool {
+    if !local_is_array_like(lhs_info) {
+        return false;
+    }
+
+    let Some(resolved) = semantic_candidates.iter().find(|specific| {
+        if !specific_name_is_elemental(ctx.st, specific) {
+            return false;
+        }
+        let Some(scope) = procedure_scope_by_name(ctx.st, specific) else {
+            return false;
+        };
+        let declared_args = declared_args_for_scope(scope);
+        if declared_args.len() != 2 {
+            return false;
+        }
+        if formal_declared_rank(declared_args[0]) != Some(0)
+            || formal_declared_rank(declared_args[1]) != Some(0)
+        {
+            return false;
+        }
+        matches!(
+            declared_args.get(1).and_then(|sym| sym.type_info.as_ref()),
+            Some(crate::sema::symtab::TypeInfo::Character { .. })
+        )
+    }) else {
+        return false;
+    };
+
+    let rk = resolved.to_lowercase();
+    let mask = cached_param_mask_for_lookup(ctx.st, ctx.char_len_star_params, &rk);
+    if !mask
+        .as_ref()
+        .and_then(|m| m.get(1).copied())
+        .unwrap_or(false)
+    {
+        return false;
+    }
+
+    let (call_name, _) = resolved_symbol_call_target(ctx.st, &rk, resolved);
+    let func_ref = same_unit_func_ref(
+        ctx.st,
+        b.func().name.as_str(),
+        Some(ctx.internal_funcs),
+        &[&rk],
+        call_name,
+    );
+    let dest_base_typed = array_base_addr(b, lhs_info);
+    let zero = b.const_i64(0);
+    let dest_base = b.gep(dest_base_typed, vec![zero], IrType::Int(IntWidth::I8));
+    let off_slot = b.alloca(IrType::Int(IntWidth::I64));
+    b.store(zero, off_slot);
+    let step_bytes = b.const_i64(ir_scalar_byte_size(&lhs_info.ty));
+
+    lower_defined_assignment_array_constructor_values(
+        b, ctx, dest_base, off_slot, step_bytes, func_ref, mask, values,
+    )
+}
+
 /// Try to lower an assignment through a user-defined `INTERFACE
 /// ASSIGNMENT(=)`. Returns true when a specific subroutine matches
 /// the (LHS info, RHS expression) type pair and the call was emitted.
@@ -11865,6 +12251,13 @@ pub(super) fn try_defined_assignment(
         .collect();
     if semantic_candidates.is_empty() {
         return false;
+    }
+
+    if let Expr::ArrayConstructor { values, .. } = &rhs.node {
+        if try_defined_array_constructor_assignment(b, ctx, &lhs_info, &semantic_candidates, values)
+        {
+            return true;
+        }
     }
 
     // Lower the RHS to an SSA value so resolve_generic_call can see
@@ -28420,6 +28813,7 @@ pub(super) fn try_lower_elemental_subroutine_call(
             desc: ValueId,
             elem_ty: IrType,
             char_len: Option<i64>,
+            derived_type: Option<String>,
         },
     }
     let mut classes: Vec<Class> = Vec::with_capacity(args.len());
@@ -28443,10 +28837,22 @@ pub(super) fn try_lower_elemental_subroutine_call(
             // character elements copied byte-for-byte through the same
             // descriptor element pointers.
             let char_len = fixed_char_expr_len(b, e, &ctx.locals, ctx.st, Some(ctx.type_layouts));
+            let derived_type =
+                match operator_expr_type_info(e, Some(&ctx.locals), ctx.st, Some(ctx.type_layouts))
+                {
+                    Some(crate::sema::symtab::TypeInfo::Derived(name))
+                    | Some(crate::sema::symtab::TypeInfo::Class(name))
+                        if ctx.type_layouts.get(&name).is_some() =>
+                    {
+                        Some(name)
+                    }
+                    _ => None,
+                };
             let supported = matches!(&elem_ty, IrType::Int(_) | IrType::Float(_))
                 || matches!(&elem_ty,
                     IrType::Array(inner, 2) if matches!(inner.as_ref(), IrType::Float(_)))
-                || char_len.is_some();
+                || char_len.is_some()
+                || derived_type.is_some();
             if !supported {
                 return false;
             }
@@ -28457,6 +28863,7 @@ pub(super) fn try_lower_elemental_subroutine_call(
                 desc,
                 elem_ty,
                 char_len,
+                derived_type,
             });
         } else {
             classes.push(Class::Scalar);
@@ -28475,11 +28882,25 @@ pub(super) fn try_lower_elemental_subroutine_call(
     let mut temp_names_to_clean: Vec<String> = Vec::new();
     for (i, class) in classes.iter().enumerate() {
         if let Class::Array {
-            elem_ty, char_len, ..
+            elem_ty,
+            char_len,
+            derived_type,
+            ..
         } = class
         {
             let temp_name = fresh_elemental_temp_name(&ctx.locals, "afs_elem_sub_arg", i);
             let temp_addr = b.alloca(elem_ty.clone());
+            if let Some(type_name) = derived_type {
+                if let Some(layout) = ctx.type_layouts.get(type_name) {
+                    let zero = b.const_i32(0);
+                    let bytes = b.const_i64(layout.size as i64);
+                    b.call(
+                        FuncRef::External("memset".into()),
+                        vec![temp_addr, zero, bytes],
+                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                    );
+                }
+            }
             let char_kind = char_len.map(CharKind::Fixed).unwrap_or(CharKind::None);
             ctx.locals.insert(
                 temp_name.clone(),
@@ -28491,7 +28912,7 @@ pub(super) fn try_lower_elemental_subroutine_call(
                     descriptor_arg: false,
                     by_ref: false,
                     char_kind,
-                    derived_type: None,
+                    derived_type: derived_type.clone(),
                     inline_const: None,
                     is_pointer: false,
                     runtime_dim_upper: vec![],
@@ -28555,6 +28976,7 @@ pub(super) fn try_lower_elemental_subroutine_call(
                 desc,
                 elem_ty,
                 char_len,
+                derived_type,
             },
             Some((_, addr, _)),
         ) = (class, slot)
@@ -28567,6 +28989,9 @@ pub(super) fn try_lower_elemental_subroutine_call(
                     vec![*addr, src_ptr, bytes],
                     IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
                 );
+            } else if let Some(type_name) = derived_type {
+                let src_ptr = rank1_array_desc_elem_ptr(b, *desc, elem_ty, cur_idx);
+                emit_derived_value_copy(b, ctx.type_layouts, type_name, *addr, src_ptr);
             } else if is_complex_ty(elem_ty) {
                 let src_ptr = rank1_array_desc_elem_ptr(b, *desc, elem_ty, cur_idx);
                 let bytes = b.const_i64(ir_scalar_byte_size(elem_ty));
@@ -28610,6 +29035,7 @@ pub(super) fn try_lower_elemental_subroutine_call(
                 desc,
                 elem_ty,
                 char_len,
+                derived_type,
             },
             Some((_, addr, _)),
         ) = (class, slot)
@@ -28622,6 +29048,9 @@ pub(super) fn try_lower_elemental_subroutine_call(
                     vec![dest_ptr, *addr, bytes],
                     IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
                 );
+            } else if let Some(type_name) = derived_type {
+                let dest_ptr = rank1_array_desc_elem_ptr(b, *desc, elem_ty, cur_idx);
+                emit_derived_value_copy(b, ctx.type_layouts, type_name, dest_ptr, *addr);
             } else if is_complex_ty(elem_ty) {
                 let dest_ptr = rank1_array_desc_elem_ptr(b, *desc, elem_ty, cur_idx);
                 let bytes = b.const_i64(ir_scalar_byte_size(elem_ty));
