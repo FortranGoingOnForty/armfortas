@@ -259,35 +259,40 @@ fn fma_fuse_block(mf: &mut MachineFunction, mb_idx: usize) {
                     m,
                     a: src1,
                 });
-            }
-            // fsub(c, fmul(a,b)) → FMSUB(a, b, c)  [result = c - a*b]
-            // src0=c, src1=fmul_result
-            let try_fuse_sub1 = fmul_defs
-                .get(&src1)
-                .filter(|_| use_count.get(&src1).copied().unwrap_or(0) == 1);
-            if let Some(&(mul_idx, _)) = try_fuse_sub1 {
-                let mul_inst = &block.insts[mul_idx];
-                let n = match &mul_inst.operands[1] {
-                    MachineOperand::VReg(v) => *v,
-                    _ => continue,
-                };
-                let m = match &mul_inst.operands[2] {
-                    MachineOperand::VReg(v) => *v,
-                    _ => continue,
-                };
-                let opcode = if prec_s {
-                    ArmOpcode::FmsubS
-                } else {
-                    ArmOpcode::FmsubD
-                };
-                plans.push(FusionPlan {
-                    add_idx: i,
-                    mul_idx,
-                    new_opcode: opcode,
-                    n,
-                    m,
-                    a: src0,
-                });
+            } else {
+                // fsub(c, fmul(a,b)) → FMSUB(a, b, c)  [result = c - a*b]
+                // src0=c, src1=fmul_result. If src0 is itself a fmul,
+                // the FNMSUB plan above keeps src1 as the accumulator and
+                // consumes only src0. Planning both fusions for one FSub
+                // would remove both multiplies even though the surviving
+                // fused instruction still needs one of them as input.
+                let try_fuse_sub1 = fmul_defs
+                    .get(&src1)
+                    .filter(|_| use_count.get(&src1).copied().unwrap_or(0) == 1);
+                if let Some(&(mul_idx, _)) = try_fuse_sub1 {
+                    let mul_inst = &block.insts[mul_idx];
+                    let n = match &mul_inst.operands[1] {
+                        MachineOperand::VReg(v) => *v,
+                        _ => continue,
+                    };
+                    let m = match &mul_inst.operands[2] {
+                        MachineOperand::VReg(v) => *v,
+                        _ => continue,
+                    };
+                    let opcode = if prec_s {
+                        ArmOpcode::FmsubS
+                    } else {
+                        ArmOpcode::FmsubD
+                    };
+                    plans.push(FusionPlan {
+                        add_idx: i,
+                        mul_idx,
+                        new_opcode: opcode,
+                        n,
+                        m,
+                        a: src0,
+                    });
+                }
             }
         }
     }
@@ -1157,6 +1162,37 @@ mod tests {
         let block = &mf.blocks[0];
         assert_eq!(block.insts.len(), 1);
         assert_eq!(block.insts[0].opcode, ArmOpcode::FnmsubD);
+    }
+
+    /// fsub(fmul(a,b), fmul(c,d)) can fuse one multiply but must keep the
+    /// other multiply live as the fused instruction's accumulator.
+    #[test]
+    fn fsub_two_fmuls_keeps_accumulator_multiply() {
+        let fmul_lhs = MachineInst {
+            opcode: ArmOpcode::FmulD,
+            operands: vec![vreg(0), vreg(1), vreg(2)],
+            def: Some(vid(0)),
+        };
+        let fmul_rhs = MachineInst {
+            opcode: ArmOpcode::FmulD,
+            operands: vec![vreg(3), vreg(4), vreg(5)],
+            def: Some(vid(3)),
+        };
+        let fsub = MachineInst {
+            opcode: ArmOpcode::FsubD,
+            operands: vec![vreg(6), vreg(0), vreg(3)],
+            def: Some(vid(6)),
+        };
+        let mut mf = mf_with_insts(vec![fmul_lhs, fmul_rhs, fsub]);
+
+        fma_fusion(&mut mf);
+
+        let block = &mf.blocks[0];
+        assert_eq!(block.insts.len(), 2);
+        assert_eq!(block.insts[0].opcode, ArmOpcode::FmulD);
+        assert_eq!(block.insts[0].def, Some(vid(3)));
+        assert_eq!(block.insts[1].opcode, ArmOpcode::FnmsubD);
+        assert_eq!(block.insts[1].operands[3], vreg(3));
     }
 
     fn vreg_gp(v: u32) -> MachineOperand {

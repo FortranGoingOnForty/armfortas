@@ -29082,6 +29082,257 @@ pub(super) fn try_lower_elemental_subroutine_call(
     true
 }
 
+fn load_cmplx_array_numeric_lane(
+    b: &mut FuncBuilder,
+    array: Option<&(ValueId, IrType)>,
+    scalar: Option<ValueId>,
+    idx: ValueId,
+    lane_ty: &IrType,
+    use_imag_lane_for_complex: bool,
+) -> Option<ValueId> {
+    if let Some((desc, elem_ty)) = array {
+        if is_complex_ty(elem_ty) {
+            let fw = complex_float_width(elem_ty);
+            let side_lane_ty = IrType::Float(fw);
+            let lane_bytes = b.const_i64(if fw == FloatWidth::F64 { 8 } else { 4 });
+            let zero = b.const_i64(0);
+            let offset = if use_imag_lane_for_complex {
+                lane_bytes
+            } else {
+                zero
+            };
+            let elem_ptr = rank1_array_desc_elem_ptr(b, *desc, elem_ty, idx);
+            let lane_ptr = b.gep(elem_ptr, vec![offset], IrType::Int(IntWidth::I8));
+            let raw = b.load_typed(lane_ptr, side_lane_ty);
+            return Some(coerce_to_type(b, raw, lane_ty));
+        }
+        let raw = load_rank1_array_desc_elem(b, *desc, elem_ty, idx);
+        return Some(coerce_to_type(b, raw, lane_ty));
+    }
+
+    let raw = scalar?;
+    let raw_ty = b
+        .func()
+        .value_type(raw)
+        .unwrap_or(IrType::Int(IntWidth::I32));
+    if is_complex_ty(&raw_ty) {
+        let fw = complex_float_width(&raw_ty);
+        let side_lane_ty = IrType::Float(fw);
+        let lane_bytes = b.const_i64(if fw == FloatWidth::F64 { 8 } else { 4 });
+        let zero = b.const_i64(0);
+        let offset = if use_imag_lane_for_complex {
+            lane_bytes
+        } else {
+            zero
+        };
+        let buf = materialize_complex_operand(b, raw, fw);
+        let lane_ptr = b.gep(buf, vec![offset], IrType::Int(IntWidth::I8));
+        let raw_lane = b.load_typed(lane_ptr, side_lane_ty);
+        return Some(coerce_to_type(b, raw_lane, lane_ty));
+    }
+
+    Some(coerce_to_type(b, raw, lane_ty))
+}
+
+fn cmplx_source_lane_bytes(ty: &IrType) -> i64 {
+    if is_complex_ty(ty) {
+        if complex_float_width(ty) == FloatWidth::F64 {
+            8
+        } else {
+            4
+        }
+    } else if matches!(ty, IrType::Float(FloatWidth::F64)) {
+        8
+    } else {
+        4
+    }
+}
+
+fn lower_cmplx_array_expr_descriptor(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    args: &[crate::ast::expr::Argument],
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) -> Option<(ValueId, IrType)> {
+    let mut re_expr: Option<&crate::ast::expr::SpannedExpr> = None;
+    let mut im_expr: Option<&crate::ast::expr::SpannedExpr> = None;
+    let mut kind_expr: Option<&crate::ast::expr::SpannedExpr> = None;
+    let mut positional_idx = 0usize;
+
+    for arg in args {
+        let crate::ast::expr::SectionSubscript::Element(expr) = &arg.value else {
+            continue;
+        };
+        match arg.keyword.as_deref().map(str::to_ascii_lowercase) {
+            Some(ref kw) if kw == "x" => re_expr = Some(expr),
+            Some(ref kw) if kw == "y" => im_expr = Some(expr),
+            Some(ref kw) if kw == "kind" => kind_expr = Some(expr),
+            Some(_) => {}
+            None => {
+                match positional_idx {
+                    0 => re_expr = Some(expr),
+                    1 => im_expr = Some(expr),
+                    2 => kind_expr = Some(expr),
+                    _ => {}
+                }
+                positional_idx += 1;
+            }
+        }
+    }
+
+    let re_expr = re_expr?;
+    let re_pair = lower_array_expr_descriptor(
+        b,
+        locals,
+        re_expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    );
+    let im_pair = im_expr.and_then(|expr| {
+        lower_array_expr_descriptor(
+            b,
+            locals,
+            expr,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        )
+    });
+
+    if re_pair.is_none() && im_pair.is_none() {
+        return None;
+    }
+
+    let control_desc = re_pair
+        .as_ref()
+        .map(|(desc, _)| *desc)
+        .or_else(|| im_pair.as_ref().map(|(desc, _)| *desc))?;
+    let re_scalar = if re_pair.is_none() {
+        Some(super::expr::lower_expr_full(
+            b,
+            locals,
+            re_expr,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        ))
+    } else {
+        None
+    };
+    let im_scalar = if im_expr.is_some() && im_pair.is_none() {
+        im_expr.map(|expr| {
+            super::expr::lower_expr_full(
+                b,
+                locals,
+                expr,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            )
+        })
+    } else {
+        None
+    };
+    let re_scalar_ty = re_scalar.and_then(|value| b.func().value_type(value));
+    let im_scalar_ty = im_scalar.and_then(|value| b.func().value_type(value));
+
+    let source_lane_bytes = re_pair
+        .as_ref()
+        .map(|(_, ty)| cmplx_source_lane_bytes(ty))
+        .or_else(|| re_scalar_ty.as_ref().map(cmplx_source_lane_bytes))
+        .or_else(|| im_pair.as_ref().map(|(_, ty)| cmplx_source_lane_bytes(ty)))
+        .or_else(|| im_scalar_ty.as_ref().map(cmplx_source_lane_bytes))
+        .unwrap_or(4);
+    let kind_lane_bytes = kind_expr.and_then(|expr| {
+        let kind_val = super::expr::lower_expr_full(
+            b,
+            locals,
+            expr,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        );
+        extract_const_int_from_value(b, kind_val)
+    });
+    let out_lane_bytes = kind_lane_bytes.unwrap_or(source_lane_bytes);
+    let out_fw = if out_lane_bytes == 8 {
+        FloatWidth::F64
+    } else {
+        FloatWidth::F32
+    };
+    let lane_ty = IrType::Float(out_fw);
+    let elem_ty = IrType::Array(Box::new(lane_ty.clone()), 2);
+    let result_desc = allocate_like_array_temp_descriptor_with_elem_type(b, control_desc, &elem_ty);
+    let n = b.call(
+        FuncRef::External("afs_array_size".into()),
+        vec![control_desc],
+        IrType::Int(IntWidth::I64),
+    );
+    let idx_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let zero = b.const_i64(0);
+    b.store(zero, idx_addr);
+
+    let re_is_complex = re_pair.as_ref().is_some_and(|(_, ty)| is_complex_ty(ty))
+        || re_scalar_ty.as_ref().is_some_and(is_complex_ty);
+
+    let bb_check = b.create_block("cmplx_array_check");
+    let bb_body = b.create_block("cmplx_array_body");
+    let bb_exit = b.create_block("cmplx_array_exit");
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let idx = b.load(idx_addr);
+    let done = b.icmp(CmpOp::Ge, idx, n);
+    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+    b.set_block(bb_body);
+    let cur_idx = b.load(idx_addr);
+    let real_val =
+        load_cmplx_array_numeric_lane(b, re_pair.as_ref(), re_scalar, cur_idx, &lane_ty, false)?;
+    let imag_val = if im_expr.is_some() {
+        load_cmplx_array_numeric_lane(b, im_pair.as_ref(), im_scalar, cur_idx, &lane_ty, false)?
+    } else if re_is_complex {
+        load_cmplx_array_numeric_lane(b, re_pair.as_ref(), re_scalar, cur_idx, &lane_ty, true)?
+    } else {
+        match out_fw {
+            FloatWidth::F64 => b.const_f64(0.0),
+            FloatWidth::F32 => b.const_f32(0.0),
+        }
+    };
+
+    let tmp = b.alloca(elem_ty.clone());
+    let zero_off = b.const_i64(0);
+    let imag_off = b.const_i64(out_lane_bytes);
+    let real_ptr = b.gep(tmp, vec![zero_off], IrType::Int(IntWidth::I8));
+    b.store(real_val, real_ptr);
+    let imag_ptr = b.gep(tmp, vec![imag_off], IrType::Int(IntWidth::I8));
+    b.store(imag_val, imag_ptr);
+    store_rank1_array_desc_elem(b, result_desc, &elem_ty, cur_idx, tmp);
+
+    let one = b.const_i64(1);
+    let next = b.iadd(cur_idx, one);
+    b.store(next, idx_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
+    Some((result_desc, elem_ty))
+}
+
 pub(super) fn lower_rank1_elemental_call_descriptor(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -30996,133 +31247,17 @@ pub(super) fn lower_array_expr_descriptor(
                 // Ptr(Array(F32),2) → Array(F64,2)" warning at the
                 // assignment.
                 if name.eq_ignore_ascii_case("cmplx") {
-                    let re_arg = args.first().and_then(|a| match &a.value {
-                        crate::ast::expr::SectionSubscript::Element(e) => Some(e),
-                        _ => None,
-                    });
-                    if let Some(re_expr) = re_arg {
-                        if let Some((re_desc, re_elem_ty)) = lower_array_expr_descriptor(
-                            b,
-                            locals,
-                            re_expr,
-                            st,
-                            type_layouts,
-                            internal_funcs,
-                            contained_host_refs,
-                            descriptor_params,
-                        ) {
-                            if let Some(re_kind_tag) = numeric_kind_tag_for_ir_type(&re_elem_ty) {
-                                let src_lane_bytes: i64 =
-                                    if complex_float_width(&re_elem_ty) == FloatWidth::F64 {
-                                        8
-                                    } else if matches!(re_elem_ty, IrType::Float(FloatWidth::F64)) {
-                                        8
-                                    } else {
-                                        4
-                                    };
-                                // Walk the actual args; identify im (positional
-                                // arg 1 with no keyword, OR keyword `y=`) and
-                                // kind (keyword `kind=` OR positional arg 2).
-                                let mut im_expr: Option<&crate::ast::expr::SpannedExpr> = None;
-                                let mut kind_expr: Option<&crate::ast::expr::SpannedExpr> = None;
-                                let mut positional_idx: usize = 0;
-                                for a in args.iter() {
-                                    let crate::ast::expr::SectionSubscript::Element(e) = &a.value
-                                    else {
-                                        continue;
-                                    };
-                                    match a.keyword.as_deref().map(str::to_ascii_lowercase) {
-                                        Some(ref kw) if kw == "x" => { /* re — already handled */
-                                        }
-                                        Some(ref kw) if kw == "y" => im_expr = Some(e),
-                                        Some(ref kw) if kw == "kind" => kind_expr = Some(e),
-                                        Some(_) => {}
-                                        None => {
-                                            match positional_idx {
-                                                0 => { /* re */ }
-                                                1 => im_expr = Some(e),
-                                                2 => kind_expr = Some(e),
-                                                _ => {}
-                                            }
-                                            positional_idx += 1;
-                                        }
-                                    }
-                                }
-                                let im_pair = im_expr.and_then(|e| {
-                                    lower_array_expr_descriptor(
-                                        b,
-                                        locals,
-                                        e,
-                                        st,
-                                        type_layouts,
-                                        internal_funcs,
-                                        contained_host_refs,
-                                        descriptor_params,
-                                    )
-                                });
-                                let (im_desc, im_kind_tag) = if let Some((d, ty)) = im_pair {
-                                    if let Some(tag) = numeric_kind_tag_for_ir_type(&ty) {
-                                        (d, tag)
-                                    } else {
-                                        (b.const_i64(0), -1)
-                                    }
-                                } else {
-                                    (b.const_i64(0), -1)
-                                };
-                                // Default out kind = source kind. If a kind
-                                // arg is present, lower it and try to
-                                // const-extract.
-                                let mut out_lane_bytes: i64 = src_lane_bytes;
-                                if let Some(kind_e) = kind_expr {
-                                    let kv = super::expr::lower_expr_full(
-                                        b,
-                                        locals,
-                                        kind_e,
-                                        st,
-                                        type_layouts,
-                                        internal_funcs,
-                                        contained_host_refs,
-                                        descriptor_params,
-                                    );
-                                    if let Some(k) = extract_const_int_from_value(b, kv) {
-                                        out_lane_bytes = k;
-                                    }
-                                }
-                                let out_lane_v = b.const_i32(out_lane_bytes as i32);
-                                let result_desc = b.alloca(IrType::Array(
-                                    Box::new(IrType::Int(IntWidth::I8)),
-                                    384,
-                                ));
-                                let zero_b = b.const_i32(0);
-                                let sz384 = b.const_i64(384);
-                                b.call(
-                                    FuncRef::External("memset".into()),
-                                    vec![result_desc, zero_b, sz384],
-                                    IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                                );
-                                let re_kind_v = b.const_i32(re_kind_tag);
-                                let im_kind_v = b.const_i32(im_kind_tag);
-                                b.call(
-                                    FuncRef::External("afs_array_cmplx".into()),
-                                    vec![
-                                        re_desc,
-                                        im_desc,
-                                        out_lane_v,
-                                        result_desc,
-                                        re_kind_v,
-                                        im_kind_v,
-                                    ],
-                                    IrType::Void,
-                                );
-                                let out_fw = if out_lane_bytes == 8 {
-                                    FloatWidth::F64
-                                } else {
-                                    FloatWidth::F32
-                                };
-                                let elem_ty = IrType::Array(Box::new(IrType::Float(out_fw)), 2);
-                                return Some((result_desc, elem_ty));
-                            }
-                        }
+                    if let Some(result) = lower_cmplx_array_expr_descriptor(
+                        b,
+                        locals,
+                        args,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
+                    ) {
+                        return Some(result);
                     }
                 }
                 // F2018 §16.9.207: SHAPE returns a fresh rank-1 integer
