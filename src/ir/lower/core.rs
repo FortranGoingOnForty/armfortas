@@ -25422,12 +25422,14 @@ pub(super) fn materialize_array_descriptor_for_info(
     // and other per-dim consumers compute byte_off = Σ coord_k * stride_k,
     // so all-1 strides made distinct (i,j,k) tuples collide on the same
     // byte offset — only `Σ extents - rank + 1` unique cells got written.
-    let mut running_stride: i64 = 1;
+    let mut running_stride_static: i64 = 1;
+    let mut running_stride_dynamic: Option<ValueId> = None;
     for (i, (lower, extent)) in info.dims.iter().copied().enumerate() {
         let base_offset = 24 + (i as i64) * 24;
         let lower_val = b.const_i64(lower);
         store_byte_aggregate_field(b, desc, base_offset, IrType::Int(IntWidth::I64), lower_val);
-        let upper_val = b.const_i64(lower + extent - 1);
+        let runtime_upper = info.runtime_dim_upper.get(i).and_then(|u| *u);
+        let upper_val = runtime_upper.unwrap_or_else(|| b.const_i64(lower + extent - 1));
         store_byte_aggregate_field(
             b,
             desc,
@@ -25435,7 +25437,8 @@ pub(super) fn materialize_array_descriptor_for_info(
             IrType::Int(IntWidth::I64),
             upper_val,
         );
-        let stride_val = b.const_i64(running_stride);
+        let stride_val =
+            running_stride_dynamic.unwrap_or_else(|| b.const_i64(running_stride_static));
         store_byte_aggregate_field(
             b,
             desc,
@@ -25443,7 +25446,31 @@ pub(super) fn materialize_array_descriptor_for_info(
             IrType::Int(IntWidth::I64),
             stride_val,
         );
-        running_stride = running_stride.saturating_mul(extent.max(1));
+        match runtime_upper {
+            Some(up) => {
+                let span = b.isub(up, lower_val);
+                let one64 = b.const_i64(1);
+                let runtime_extent = b.iadd(span, one64);
+                let next = match running_stride_dynamic {
+                    Some(prev) => b.imul(prev, runtime_extent),
+                    None if running_stride_static == 1 => runtime_extent,
+                    None => {
+                        let prev = b.const_i64(running_stride_static);
+                        b.imul(prev, runtime_extent)
+                    }
+                };
+                running_stride_dynamic = Some(next);
+                running_stride_static = 1;
+            }
+            None => {
+                if let Some(prev) = running_stride_dynamic {
+                    let ext = b.const_i64(extent.max(1));
+                    running_stride_dynamic = Some(b.imul(prev, ext));
+                } else {
+                    running_stride_static = running_stride_static.saturating_mul(extent.max(1));
+                }
+            }
+        }
     }
 
     desc
