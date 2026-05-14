@@ -3357,6 +3357,143 @@ pub extern "C" fn afs_array_sum_int(desc: *const ArrayDescriptor) -> i64 {
     sum
 }
 
+fn for_each_element_byte_offset<F: FnMut(usize)>(desc: &ArrayDescriptor, mut f: F) {
+    let rank = desc.rank as usize;
+    if rank == 0 {
+        return;
+    }
+    let mut extents: [i64; 15] = [0; 15];
+    let mut strides: [i64; 15] = [0; 15];
+    let mut total = 1i64;
+    for i in 0..rank {
+        extents[i] = desc.dims[i].extent();
+        if extents[i] <= 0 {
+            return;
+        }
+        strides[i] = desc.dims[i].stride.max(1);
+        total *= extents[i];
+    }
+
+    let mut idx: [i64; 15] = [0; 15];
+    for _ in 0..total {
+        let mut byte_off = 0i64;
+        for d in 0..rank {
+            byte_off += idx[d] * strides[d] * desc.elem_size;
+        }
+        f(byte_off as usize);
+
+        for d in 0..rank {
+            idx[d] += 1;
+            if idx[d] < extents[d] {
+                break;
+            }
+            idx[d] = 0;
+        }
+    }
+}
+
+fn for_each_element_byte_offset_with_mask<F: FnMut(usize)>(
+    desc: &ArrayDescriptor,
+    mask: &ArrayDescriptor,
+    mut f: F,
+) {
+    let rank = desc.rank as usize;
+    if rank == 0 {
+        return;
+    }
+    let mut extents: [i64; 15] = [0; 15];
+    let mut s_strides: [i64; 15] = [0; 15];
+    let mut m_strides: [i64; 15] = [0; 15];
+    let mut total = 1i64;
+    for i in 0..rank {
+        extents[i] = desc.dims[i].extent();
+        if extents[i] <= 0 {
+            return;
+        }
+        s_strides[i] = desc.dims[i].stride.max(1);
+        m_strides[i] = if (i as i32) < mask.rank {
+            mask.dims[i].stride.max(1)
+        } else {
+            1
+        };
+        total *= extents[i];
+    }
+
+    let mut idx: [i64; 15] = [0; 15];
+    let mask_elem = mask.elem_size.max(1);
+    for _ in 0..total {
+        let mut s_byte_off = 0i64;
+        let mut m_byte_off = 0i64;
+        for d in 0..rank {
+            s_byte_off += idx[d] * s_strides[d] * desc.elem_size;
+            m_byte_off += idx[d] * m_strides[d] * mask_elem;
+        }
+        if unsafe { mask_byte_is_true(mask, m_byte_off as usize) } {
+            f(s_byte_off as usize);
+        }
+
+        for d in 0..rank {
+            idx[d] += 1;
+            if idx[d] < extents[d] {
+                break;
+            }
+            idx[d] = 0;
+        }
+    }
+}
+
+/// SUM(array) for complex(4). The result is written to `out` as
+/// `[real, imag]`.
+#[no_mangle]
+pub extern "C" fn afs_array_sum_complex4(out: *mut f32, desc: *const ArrayDescriptor) {
+    if out.is_null() {
+        return;
+    }
+    unsafe {
+        *out.add(0) = 0.0;
+        *out.add(1) = 0.0;
+    }
+    if desc.is_null() {
+        return;
+    }
+    let d = unsafe { &*desc };
+    if d.base_addr.is_null() {
+        return;
+    }
+    let src = d.base_addr as *const u8;
+    for_each_element_byte_offset(d, |byte_off| unsafe {
+        let p = src.add(byte_off) as *const f32;
+        *out.add(0) += *p.add(0);
+        *out.add(1) += *p.add(1);
+    });
+}
+
+/// SUM(array) for complex(8). The result is written to `out` as
+/// `[real, imag]`.
+#[no_mangle]
+pub extern "C" fn afs_array_sum_complex8(out: *mut f64, desc: *const ArrayDescriptor) {
+    if out.is_null() {
+        return;
+    }
+    unsafe {
+        *out.add(0) = 0.0;
+        *out.add(1) = 0.0;
+    }
+    if desc.is_null() {
+        return;
+    }
+    let d = unsafe { &*desc };
+    if d.base_addr.is_null() {
+        return;
+    }
+    let src = d.base_addr as *const u8;
+    for_each_element_byte_offset(d, |byte_off| unsafe {
+        let p = src.add(byte_off) as *const f64;
+        *out.add(0) += *p.add(0);
+        *out.add(1) += *p.add(1);
+    });
+}
+
 /// Read one logical element from `mask` at logical index `i` (zero-based)
 /// honoring `mask.elem_size` (kind 1, 4, or any bit-width). Fortran maps
 /// `.true.` to a non-zero stored value; we treat any non-zero byte as true.
@@ -3447,6 +3584,66 @@ pub extern "C" fn afs_array_sum_int_mask(
         _ => sum_kind!(i32),
     }
     sum
+}
+
+/// SUM(array, mask=mask) for complex(4).
+#[no_mangle]
+pub extern "C" fn afs_array_sum_complex4_mask(
+    out: *mut f32,
+    desc: *const ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+) {
+    if out.is_null() {
+        return;
+    }
+    unsafe {
+        *out.add(0) = 0.0;
+        *out.add(1) = 0.0;
+    }
+    if desc.is_null() || mask.is_null() {
+        return;
+    }
+    let d = unsafe { &*desc };
+    let m = unsafe { &*mask };
+    if d.base_addr.is_null() || m.base_addr.is_null() {
+        return;
+    }
+    let src = d.base_addr as *const u8;
+    for_each_element_byte_offset_with_mask(d, m, |byte_off| unsafe {
+        let p = src.add(byte_off) as *const f32;
+        *out.add(0) += *p.add(0);
+        *out.add(1) += *p.add(1);
+    });
+}
+
+/// SUM(array, mask=mask) for complex(8).
+#[no_mangle]
+pub extern "C" fn afs_array_sum_complex8_mask(
+    out: *mut f64,
+    desc: *const ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+) {
+    if out.is_null() {
+        return;
+    }
+    unsafe {
+        *out.add(0) = 0.0;
+        *out.add(1) = 0.0;
+    }
+    if desc.is_null() || mask.is_null() {
+        return;
+    }
+    let d = unsafe { &*desc };
+    let m = unsafe { &*mask };
+    if d.base_addr.is_null() || m.base_addr.is_null() {
+        return;
+    }
+    let src = d.base_addr as *const u8;
+    for_each_element_byte_offset_with_mask(d, m, |byte_off| unsafe {
+        let p = src.add(byte_off) as *const f64;
+        *out.add(0) += *p.add(0);
+        *out.add(1) += *p.add(1);
+    });
 }
 
 /// PRODUCT(array) — product of all elements (real version).

@@ -18612,6 +18612,18 @@ pub(super) fn is_complex_ty(ty: &IrType) -> bool {
     }
 }
 
+/// True when `ty` is an address-valued complex buffer. Bare `[fN x 2]`
+/// values are complex aggregates, but they are not valid memcpy source
+/// pointers until materialized into a temporary buffer.
+pub(super) fn is_complex_ptr_ty(ty: &IrType) -> bool {
+    matches!(
+        ty,
+        IrType::Ptr(inner)
+            if matches!(inner.as_ref(), IrType::Array(elem, 2)
+                if matches!(elem.as_ref(), IrType::Float(_)))
+    )
+}
+
 /// Float width of a complex type, whether `[f32/f64 x 2]` or `ptr<[f32/f64 x 2]>`.
 pub(super) fn complex_float_width(ty: &IrType) -> FloatWidth {
     let elem = match ty {
@@ -35227,6 +35239,22 @@ pub(super) fn lower_array_intrinsic(
                 )
                 .map(|(d, _)| d)
             });
+            if is_complex_ty(&elem_ty) {
+                let fw = complex_float_width(&elem_ty);
+                let out = b.alloca(IrType::Array(Box::new(IrType::Float(fw)), 2));
+                let func = match (fw, mask_desc) {
+                    (FloatWidth::F64, Some(_)) => "afs_array_sum_complex8_mask",
+                    (FloatWidth::F64, None) => "afs_array_sum_complex8",
+                    (FloatWidth::F32, Some(_)) => "afs_array_sum_complex4_mask",
+                    (FloatWidth::F32, None) => "afs_array_sum_complex4",
+                };
+                let mut call_args = vec![out, desc];
+                if let Some(mask) = mask_desc {
+                    call_args.push(mask);
+                }
+                b.call(FuncRef::External(func.into()), call_args, IrType::Void);
+                return Some(out);
+            }
             let is_real = elem_ty.is_float();
             if is_real {
                 let (func, args_vec): (&str, Vec<ValueId>) = match mask_desc {
