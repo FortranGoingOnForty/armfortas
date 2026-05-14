@@ -704,7 +704,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     // SEGV-ing on this exact path).
                                     let raw = super::expr::lower_expr_ctx_tl(b, ctx, value);
                                     let src_ty = b.func().value_type(raw);
-                                    let src = if matches!(&src_ty, Some(t) if is_complex_ty(t)) {
+                                    let src = if matches!(&src_ty, Some(t) if is_complex_ptr_ty(t))
+                                    {
                                         raw
                                     } else {
                                         let fw = complex_float_width(&info.ty);
@@ -1406,7 +1407,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     let raw = super::expr::lower_expr_ctx_tl(b, ctx, value);
                                     let field_ir_ty = type_info_to_ir_type(&field.type_info);
                                     let src_ty = b.func().value_type(raw);
-                                    let src = if matches!(&src_ty, Some(t) if is_complex_ty(t)) {
+                                    let src = if matches!(&src_ty, Some(t) if is_complex_ptr_ty(t))
+                                    {
                                         raw
                                     } else {
                                         let fw = complex_float_width(&field_ir_ty);

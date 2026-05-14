@@ -17225,6 +17225,41 @@ fn array_sum_and_maxval_over_real_kind4_array_uses_correct_element_width() {
 }
 
 #[test]
+fn complex_sum_uses_complex_runtime_result_buffer() {
+    // stdlib's complex Kahan checks compare masked Kahan sums against
+    // the intrinsic SUM. Plain SUM(complex_array) was routed through
+    // the integer reducer, then coerced into a by-value complex aggregate
+    // and used as a memcpy pointer by assignment lowering.
+    let src = write_program(
+        "program t\n  implicit none\n  integer :: i\n  complex :: x(4), total, masked\n  logical :: m(4)\n  x = [(cmplx(real(i), -real(i)), i=1,4)]\n  m = [.true., .false., .true., .false.]\n  total = sum(x)\n  masked = sum(x, mask=m)\n  if (abs(real(total) - 10.0) > 1.0e-6) error stop 1\n  if (abs(aimag(total) + 10.0) > 1.0e-6) error stop 2\n  if (abs(real(masked) - 4.0) > 1.0e-6) error stop 3\n  if (abs(aimag(masked) + 4.0) > 1.0e-6) error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("complex_sum_runtime", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("complex sum compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "complex sum should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("complex sum run failed");
+    assert!(
+        run.status.success(),
+        "complex sum should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn parameter_const_with_math_intrinsic_initializer_folds_in_smp_body() {
     // F2018 §16.9: math intrinsics (sqrt, exp, log, sin/cos/...) are
     // permitted in initialization expressions for PARAMETERs.  Without
