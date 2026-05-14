@@ -412,6 +412,52 @@ fn lower_cmplx_intrinsic_expr(
     Some(buf)
 }
 
+fn complex_literal_float_width(
+    real: &crate::ast::expr::SpannedExpr,
+    imag: &crate::ast::expr::SpannedExpr,
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> FloatWidth {
+    fn part_width(
+        part: &crate::ast::expr::SpannedExpr,
+        locals: &HashMap<String, LocalInfo>,
+        st: &SymbolTable,
+        type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    ) -> Option<FloatWidth> {
+        match operator_expr_type_info(part, Some(locals), st, type_layouts) {
+            Some(crate::sema::symtab::TypeInfo::Real { kind: Some(8) })
+            | Some(crate::sema::symtab::TypeInfo::DoublePrecision)
+            | Some(crate::sema::symtab::TypeInfo::Complex { kind: Some(8) }) => {
+                return Some(FloatWidth::F64);
+            }
+            Some(crate::sema::symtab::TypeInfo::Real { .. })
+            | Some(crate::sema::symtab::TypeInfo::Complex { .. }) => {
+                return Some(FloatWidth::F32);
+            }
+            _ => {}
+        }
+        if let Expr::RealLiteral { text, .. } = &part.node {
+            if text.to_lowercase().contains('d') {
+                return Some(FloatWidth::F64);
+            }
+        }
+        None
+    }
+
+    if matches!(
+        part_width(real, locals, st, type_layouts),
+        Some(FloatWidth::F64)
+    ) || matches!(
+        part_width(imag, locals, st, type_layouts),
+        Some(FloatWidth::F64)
+    ) {
+        FloatWidth::F64
+    } else {
+        FloatWidth::F32
+    }
+}
+
 pub(crate) fn lower_expr_full(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -2999,20 +3045,8 @@ pub(crate) fn lower_expr_full(
 
         Expr::ComplexLiteral { real, imag } => {
             // Complex numbers are stored as a 2-element float array on the stack.
-            // Determine float width from the literal parts: if either uses a 'd'/'D'
-            // exponent it's double precision (f64), otherwise single (f32).
-            let is_double = |e: &crate::ast::expr::SpannedExpr| -> bool {
-                if let Expr::RealLiteral { text, .. } = &e.node {
-                    text.to_lowercase().contains('d')
-                } else {
-                    false
-                }
-            };
-            let fw = if is_double(real) || is_double(imag) {
-                FloatWidth::F64
-            } else {
-                FloatWidth::F32
-            };
+            // Honor both d-exponents and kind-suffixed literal parts.
+            let fw = complex_literal_float_width(real, imag, locals, st, type_layouts);
             let elem_ty = IrType::Float(fw);
             let elem_bytes = b.const_i64(if fw == FloatWidth::F64 { 8 } else { 4 });
             let arr_ty = IrType::Array(Box::new(elem_ty.clone()), 2);

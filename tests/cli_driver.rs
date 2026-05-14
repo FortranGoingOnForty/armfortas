@@ -33244,6 +33244,78 @@ fn cmplx_whole_array_with_kind_keyword_returns_correct_kind_descriptor() {
 }
 
 #[test]
+fn stdlib_style_complex_arg_preserves_literal_and_array_kinds() {
+    // Stdlib's arg/argd/argpi implementations combine two edge cases:
+    // `(0.0_dp, 0.5_dp)` must lower as complex(dp), and
+    // `exp(cmplx(0.0_kind, theta(:), kind=kind))` must materialize the
+    // CMPLX result element-wise even though only the imaginary actual is
+    // array-shaped.
+    let src = write_program(
+        r#"program p
+  implicit none
+  integer, parameter :: sp = kind(1.0)
+  integer, parameter :: dp = kind(1.0d0)
+  real(sp), parameter :: pi_sp = acos(-1.0_sp)
+  real(dp), parameter :: pi_dp = acos(-1.0_dp)
+  real(sp), parameter :: tol_sp = sqrt(epsilon(1.0_sp))
+  real(dp), parameter :: tol_dp = sqrt(epsilon(1.0_dp))
+  real(sp) :: theta_sp(3), got_sp(3), expect_sp(3)
+  real(dp) :: theta_dp(3), got_dp(3), expect_dp(3)
+
+  if (abs(arg_dp(2.0_dp * exp((0.0_dp, 0.5_dp))) - 0.5_dp) >= tol_dp) error stop 1
+
+  theta_sp = [-179.0_sp, 0.0_sp, 179.0_sp]
+  got_sp = arg_sp(exp(cmplx(0.0_sp, theta_sp / 180.0_sp * pi_sp, kind=sp)))
+  expect_sp = theta_sp / 180.0_sp * pi_sp
+  if (.not. all(abs(got_sp - expect_sp) < tol_sp)) error stop 2
+
+  theta_dp = [-179.0_dp, 0.0_dp, 179.0_dp]
+  got_dp = arg_dp(exp(cmplx(0.0_dp, theta_dp / 180.0_dp * pi_dp, kind=dp)))
+  expect_dp = theta_dp / 180.0_dp * pi_dp
+  if (.not. all(abs(got_dp - expect_dp) < tol_dp)) error stop 3
+
+  print *, 'ok'
+contains
+  elemental function arg_sp(z) result(result)
+    complex(sp), intent(in) :: z
+    real(sp) :: result
+    result = merge(0.0_sp, atan2(z%im, z%re), z == (0.0_sp, 0.0_sp))
+  end function
+
+  elemental function arg_dp(z) result(result)
+    complex(dp), intent(in) :: z
+    real(dp) :: result
+    result = merge(0.0_dp, atan2(z%im, z%re), z == (0.0_dp, 0.0_dp))
+  end function
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("stdlib_arg_complex_kinds", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("stdlib-style complex arg compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "stdlib-style complex arg compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("stdlib-style complex arg run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "stdlib-style complex arg run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn default_cmplx_array_assignment_converts_lanes_to_complex_dp() {
     // Stdlib's `test_swap_cdp` initializes complex(dp) arrays from
     // default-kind CMPLX array expressions before calling the generic
