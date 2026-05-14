@@ -3109,6 +3109,7 @@ pub(super) fn collect_module_globals(
     let param_consts = collect_decl_param_consts_with_scope(decls, &HashMap::new(), st);
     let param_char_consts = collect_decl_param_char_consts(decls, &param_consts, type_layouts);
     let mut param_array_consts: HashMap<String, Vec<ConstScalar>> = HashMap::new();
+    let mut param_array_elem_tys: HashMap<String, IrType> = HashMap::new();
     let mut parameter_inits: HashMap<String, &crate::ast::expr::SpannedExpr> = HashMap::new();
     for decl in decls {
         if let Decl::ParameterStmt { pairs } = &decl.node {
@@ -3276,18 +3277,21 @@ pub(super) fn collect_module_globals(
                             &ir_ty,
                             &param_consts,
                             &param_array_consts,
+                            &param_array_elem_tys,
                         ) {
-                            if (scalars.len() as i64) > total {
+                            let storage_total =
+                                const_array_storage_scalar_count(&ir_ty, total).unwrap_or(total);
+                            if (scalars.len() as i64) > storage_total {
                                 eprintln!(
                                     "armfortas: error: {}:{}: initializer for '{}' has \
-                                     {} elements but its declared shape requires \
+                                     {} storage scalars but its declared shape requires \
                                      {} (audit MAJOR-3 — initializer shape \
                                      mismatch)",
                                     init_e.span.start.line,
                                     init_e.span.start.col,
                                     entity.name,
                                     scalars.len(),
-                                    total,
+                                    storage_total,
                                 );
                                 let _ = std::io::stderr().flush();
                                 std::process::exit(1);
@@ -3322,6 +3326,7 @@ pub(super) fn collect_module_globals(
                                     total,
                                     &param_consts,
                                     &param_array_consts,
+                                    &param_array_elem_tys,
                                 )
                             }
                         })
@@ -3336,18 +3341,31 @@ pub(super) fn collect_module_globals(
                                 &ir_ty,
                                 &param_consts,
                                 &param_array_consts,
+                                &param_array_elem_tys,
                             )
-                            .or_else(|| eval_const_scalar(init_e, &param_consts).map(|s| vec![s]))
-                            {
-                                if (scalars.len() as i64) <= total {
-                                    if scalars.len() == 1 && total > 1 {
-                                        scalars.resize(total as usize, scalars[0]);
+                            .or_else(|| {
+                                eval_const_scalar(init_e, &param_consts)
+                                    .map(|s| coerce_scalar_to_array_lanes(s, &ir_ty))
+                            }) {
+                                let storage_total = const_array_storage_scalar_count(&ir_ty, total)
+                                    .unwrap_or(total);
+                                if (scalars.len() as i64) <= storage_total {
+                                    let lanes_per_element =
+                                        const_array_storage_scalar_count(&ir_ty, 1).unwrap_or(1)
+                                            as usize;
+                                    if scalars.len() == lanes_per_element && total > 1 {
+                                        let element = scalars.clone();
+                                        scalars.clear();
+                                        for _ in 0..total {
+                                            scalars.extend_from_slice(&element);
+                                        }
                                     } else {
-                                        while (scalars.len() as i64) < total {
-                                            scalars.push(ConstScalar::Int(0));
+                                        while (scalars.len() as i64) < storage_total {
+                                            scalars.push(zero_const_for_array_lane(&ir_ty));
                                         }
                                     }
                                     param_array_consts.insert(key.clone(), scalars);
+                                    param_array_elem_tys.insert(key.clone(), ir_ty.clone());
                                 }
                             }
                         }
@@ -3548,10 +3566,11 @@ pub(super) fn collect_module_globals(
 ///   2. `[(expr, i = lo, hi[, step])]` implied-do iterator
 ///   3. `reshape(constructor, shape)` reshape of (1) or (2)
 ///
-/// Each path produces a flat list of `i128` (for integer types)
-/// or `f64` (for float types) of length `total`. Shorter lists
-/// are zero-padded; longer lists return `None` (a future Maj-3
-/// fix will add a proper diagnostic for shape-mismatch errors).
+/// Each path produces a flat list of storage scalars: `i128` for
+/// integer/logical data, `f64` for real data, and interleaved
+/// real/imag `f64` lanes for complex data. Shorter lists are
+/// zero-padded; longer lists return `None` (a future Maj-3 fix will
+/// add a proper diagnostic for shape-mismatch errors).
 ///
 /// Audit MAJOR-2.
 pub(super) fn eval_const_array_init(
@@ -3560,29 +3579,44 @@ pub(super) fn eval_const_array_init(
     total: i64,
     param_consts: &HashMap<String, ConstScalar>,
     param_array_consts: &HashMap<String, Vec<ConstScalar>>,
+    param_array_elem_tys: &HashMap<String, IrType>,
 ) -> Option<GlobalInit> {
     // F2018 §7.4.4: a scalar initializer for an array PARAMETER is
     // broadcast to every element. Try the array-shaped collector
     // first; if that fails, fall back to scalar broadcast.
-    let scalars = match collect_const_array_scalars(expr, elem_ty, param_consts, param_array_consts)
-    {
+    let storage_total = const_array_storage_scalar_count(elem_ty, total)?;
+    let lanes_per_element = const_array_storage_scalar_count(elem_ty, 1)? as usize;
+    let mut scalars = match collect_const_array_scalars(
+        expr,
+        elem_ty,
+        param_consts,
+        param_array_consts,
+        param_array_elem_tys,
+    ) {
         Some(s) => s,
         None => {
             let scalar = eval_const_scalar(expr, param_consts)?;
-            vec![scalar; total as usize]
+            coerce_scalar_to_array_lanes(scalar, elem_ty)
         }
     };
-    if (scalars.len() as i64) > total {
+    if (scalars.len() as i64) > storage_total {
         // Shape mismatch — too many elements. Return None so the
         // caller falls back to zero-init. A proper diagnostic is
         // tracked under audit MAJOR-3.
         return None;
     }
+    if scalars.len() == lanes_per_element && total > 1 {
+        let element = scalars.clone();
+        scalars.clear();
+        for _ in 0..total {
+            scalars.extend_from_slice(&element);
+        }
+    }
 
-    let is_float = matches!(elem_ty, IrType::Float(_));
+    let is_float = matches!(elem_ty, IrType::Float(_)) || complex_component_ty(elem_ty).is_some();
     if is_float {
         let mut out: Vec<f64> = scalars.iter().map(|s| s.to_float()).collect();
-        while (out.len() as i64) < total {
+        while (out.len() as i64) < storage_total {
             out.push(0.0);
         }
         Some(GlobalInit::FloatArray(out))
@@ -3594,11 +3628,81 @@ pub(super) fn eval_const_array_init(
                 ConstScalar::Float(f) => *f as i128,
             })
             .collect();
-        while (out.len() as i64) < total {
+        while (out.len() as i64) < storage_total {
             out.push(0);
         }
         Some(GlobalInit::IntArray(out))
     }
+}
+
+fn complex_component_ty(elem_ty: &IrType) -> Option<&IrType> {
+    match elem_ty {
+        IrType::Array(inner, 2) if matches!(inner.as_ref(), IrType::Float(_)) => {
+            Some(inner.as_ref())
+        }
+        _ => None,
+    }
+}
+
+fn const_array_storage_scalar_count(elem_ty: &IrType, total: i64) -> Option<i64> {
+    let lanes = if complex_component_ty(elem_ty).is_some() {
+        2
+    } else {
+        1
+    };
+    total.checked_mul(lanes)
+}
+
+fn zero_const_for_array_lane(elem_ty: &IrType) -> ConstScalar {
+    if matches!(elem_ty, IrType::Float(_)) || complex_component_ty(elem_ty).is_some() {
+        ConstScalar::Float(0.0)
+    } else {
+        ConstScalar::Int(0)
+    }
+}
+
+fn coerce_scalar_to_array_lanes(raw: ConstScalar, elem_ty: &IrType) -> Vec<ConstScalar> {
+    if complex_component_ty(elem_ty).is_some() {
+        vec![ConstScalar::Float(raw.to_float()), ConstScalar::Float(0.0)]
+    } else if matches!(elem_ty, IrType::Float(_)) {
+        vec![ConstScalar::Float(raw.to_float())]
+    } else {
+        vec![raw]
+    }
+}
+
+fn coerce_param_array_values(
+    values: &[ConstScalar],
+    source_elem_ty: Option<&IrType>,
+    target_elem_ty: &IrType,
+) -> Option<Vec<ConstScalar>> {
+    let source_is_complex = source_elem_ty.and_then(complex_component_ty).is_some();
+    let target_is_complex = complex_component_ty(target_elem_ty).is_some();
+    match (source_is_complex, target_is_complex) {
+        (true, true) => Some(values.to_vec()),
+        (false, true) => {
+            let mut out = Vec::with_capacity(values.len() * 2);
+            for value in values {
+                out.push(ConstScalar::Float(value.to_float()));
+                out.push(ConstScalar::Float(0.0));
+            }
+            Some(out)
+        }
+        (true, false) => None,
+        (false, false) => Some(values.to_vec()),
+    }
+}
+
+fn collect_const_complex_lanes(
+    real: &crate::ast::expr::SpannedExpr,
+    imag: &crate::ast::expr::SpannedExpr,
+    elem_ty: &IrType,
+    param_consts: &HashMap<String, ConstScalar>,
+) -> Option<Vec<ConstScalar>> {
+    complex_component_ty(elem_ty)?;
+    let re = eval_const_scalar(real, param_consts)?.to_float();
+    let im = eval_const_scalar(imag, param_consts)?.to_float();
+    Some(vec![ConstScalar::Float(re), ConstScalar::Float(im)])
 }
 
 /// Recursively collect the scalar elements of a constructor
@@ -3606,27 +3710,46 @@ pub(super) fn eval_const_array_init(
 /// support nested implied-do, reshape, and parameter references
 /// uniformly.
 ///
-/// reshape(source, shape) just produces source's elements in
-/// declared order — Fortran's reshape is column-major and
-/// reorders dimensions, but for the FLAT linearization the
-/// element ordering is identical to source's. We don't yet
-/// honor non-trivial shape arguments (only reshape passes that
-/// match the source length get folded).
+/// reshape(source, shape[, pad]) produces source's elements in
+/// declared order and then trims or PAD-fills to the result storage
+/// extent. Fortran's reshape is column-major and reorders dimensions,
+/// but for this flat linearization the element ordering is identical
+/// to source's.
 pub(super) fn collect_const_array_scalars(
     expr: &crate::ast::expr::SpannedExpr,
     elem_ty: &IrType,
     param_consts: &HashMap<String, ConstScalar>,
     param_array_consts: &HashMap<String, Vec<ConstScalar>>,
+    param_array_elem_tys: &HashMap<String, IrType>,
 ) -> Option<Vec<ConstScalar>> {
     match &expr.node {
-        Expr::Name { name } => param_array_consts.get(&name.to_lowercase()).cloned(),
-        Expr::ParenExpr { inner } => {
-            collect_const_array_scalars(inner, elem_ty, param_consts, param_array_consts)
+        Expr::Name { name } => {
+            let key = name.to_lowercase();
+            let values = param_array_consts.get(&key)?;
+            let source_elem_ty = param_array_elem_tys.get(&key);
+            coerce_param_array_values(values, source_elem_ty, elem_ty)
+        }
+        Expr::ParenExpr { inner } => collect_const_array_scalars(
+            inner,
+            elem_ty,
+            param_consts,
+            param_array_consts,
+            param_array_elem_tys,
+        ),
+        Expr::ComplexLiteral { real, imag } => {
+            collect_const_complex_lanes(real, imag, elem_ty, param_consts)
         }
         Expr::ArrayConstructor { values, .. } => {
             let mut out: Vec<ConstScalar> = Vec::new();
             for v in values {
-                collect_ac_value(v, elem_ty, param_consts, param_array_consts, &mut out)?;
+                collect_ac_value(
+                    v,
+                    elem_ty,
+                    param_consts,
+                    param_array_consts,
+                    param_array_elem_tys,
+                    &mut out,
+                )?;
             }
             Some(out)
         }
@@ -3642,12 +3765,18 @@ pub(super) fn collect_const_array_scalars(
                             elem_ty,
                             param_consts,
                             param_array_consts,
+                            param_array_elem_tys,
                         )?;
-                        if let Some(total) =
-                            const_reshape_total(args.get(1), param_consts, param_array_consts)
-                        {
-                            values.truncate(total);
-                            if values.len() < total {
+                        if let Some(total) = const_reshape_total(
+                            args.get(1),
+                            param_consts,
+                            param_array_consts,
+                            param_array_elem_tys,
+                        ) {
+                            let storage_total =
+                                const_array_storage_scalar_count(elem_ty, total as i64)? as usize;
+                            values.truncate(storage_total);
+                            if values.len() < storage_total {
                                 let pad_values =
                                     args.get(2)
                                         .and_then(|arg| {
@@ -3660,10 +3789,16 @@ pub(super) fn collect_const_array_scalars(
                                                     elem_ty,
                                                     param_consts,
                                                     param_array_consts,
+                                                    param_array_elem_tys,
                                                 )
                                                 .or_else(|| {
-                                                    eval_const_scalar(pad, param_consts)
-                                                        .map(|scalar| vec![scalar])
+                                                    eval_const_scalar(pad, param_consts).map(
+                                                        |scalar| {
+                                                            coerce_scalar_to_array_lanes(
+                                                                scalar, elem_ty,
+                                                            )
+                                                        },
+                                                    )
                                                 })
                                             } else {
                                                 None
@@ -3671,7 +3806,7 @@ pub(super) fn collect_const_array_scalars(
                                         })
                                         .filter(|pad| !pad.is_empty())?;
                                 let mut idx = 0usize;
-                                while values.len() < total {
+                                while values.len() < storage_total {
                                     values.push(pad_values[idx % pad_values.len()]);
                                     idx += 1;
                                 }
@@ -3691,6 +3826,7 @@ fn const_reshape_total(
     shape_arg: Option<&crate::ast::expr::Argument>,
     param_consts: &HashMap<String, ConstScalar>,
     param_array_consts: &HashMap<String, Vec<ConstScalar>>,
+    param_array_elem_tys: &HashMap<String, IrType>,
 ) -> Option<usize> {
     let crate::ast::expr::SectionSubscript::Element(shape_expr) = &shape_arg?.value else {
         return None;
@@ -3700,6 +3836,7 @@ fn const_reshape_total(
         &IrType::Int(IntWidth::I32),
         param_consts,
         param_array_consts,
+        param_array_elem_tys,
     )?;
     let mut total = 1usize;
     for value in shape_values {
@@ -3721,18 +3858,27 @@ pub(super) fn collect_ac_value(
     elem_ty: &IrType,
     param_consts: &HashMap<String, ConstScalar>,
     param_array_consts: &HashMap<String, Vec<ConstScalar>>,
+    param_array_elem_tys: &HashMap<String, IrType>,
     out: &mut Vec<ConstScalar>,
 ) -> Option<()> {
     use crate::ast::expr::AcValue;
     match v {
         AcValue::Expr(e) => {
-            if let Some(values) =
-                collect_const_array_scalars(e, elem_ty, param_consts, param_array_consts)
-            {
+            if let Some(values) = collect_const_array_scalars(
+                e,
+                elem_ty,
+                param_consts,
+                param_array_consts,
+                param_array_elem_tys,
+            ) {
                 out.extend(values);
                 return Some(());
             }
             let raw = eval_const_scalar(e, param_consts)?;
+            if complex_component_ty(elem_ty).is_some() {
+                out.extend(coerce_scalar_to_array_lanes(raw, elem_ty));
+                return Some(());
+            }
             // Coerce int → float when the destination is float.
             let coerced = if matches!(elem_ty, IrType::Float(_)) {
                 ConstScalar::Float(raw.to_float())
@@ -3781,7 +3927,14 @@ pub(super) fn collect_ac_value(
                 }
                 local_consts.insert(var_key.clone(), ConstScalar::Int(i));
                 for inner in values {
-                    collect_ac_value(inner, elem_ty, &local_consts, param_array_consts, out)?;
+                    collect_ac_value(
+                        inner,
+                        elem_ty,
+                        &local_consts,
+                        param_array_consts,
+                        param_array_elem_tys,
+                        out,
+                    )?;
                 }
                 i = i.wrapping_add(stp);
             }
