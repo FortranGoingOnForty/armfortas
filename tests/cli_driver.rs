@@ -17349,6 +17349,44 @@ fn cross_module_elemental_through_generic_interface_scalarizes_on_array_actual()
 }
 
 #[test]
+fn generic_elemental_subroutine_with_logical_array_actual_scalarizes_all_lanes() {
+    // stdlib_sum_kahan calls the generic elemental subroutine
+    // `kahan_kernel(a_section, s_section, c_section, mask_section)`.
+    // The subroutine scalarizer already handled numeric array actuals,
+    // but a logical array actual made it reject the elemental path and
+    // emit one scalar call using only the first lane of each section.
+    let src = write_program(
+        "module m\n  implicit none\n  interface kernel\n    module procedure kernel4\n  end interface\ncontains\n  elemental subroutine kernel4(a, s, c, m)\n    real, intent(in) :: a\n    real, intent(inout) :: s\n    real, intent(inout) :: c\n    logical, intent(in) :: m\n    if (m) s = s + a\n    c = c + 1.0\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  real :: a(5), s(5), c(5)\n  logical :: mask(5)\n  a = [1.0, 2.0, 3.0, 4.0, 5.0]\n  s = 10.0\n  c = 0.0\n  mask = [.true., .false., .true., .false., .true.]\n  call kernel(a, s, c, mask)\n  if (abs(s(1) - 11.0) > 1.0e-6) error stop 1\n  if (abs(s(2) - 10.0) > 1.0e-6) error stop 2\n  if (abs(s(3) - 13.0) > 1.0e-6) error stop 3\n  if (abs(s(4) - 10.0) > 1.0e-6) error stop 4\n  if (abs(s(5) - 15.0) > 1.0e-6) error stop 5\n  if (any(abs(c - 1.0) > 1.0e-6)) error stop 6\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("generic_elemental_sub_logical", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("generic elemental subroutine compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "generic elemental subroutine should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("generic elemental subroutine run failed");
+    assert!(
+        run.status.success(),
+        "generic elemental subroutine should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn imported_generic_array_function_assignment_keeps_whole_array_actual() {
     let dir = unique_dir("imported_generic_array_assign");
     let mod_src = write_program_in(
