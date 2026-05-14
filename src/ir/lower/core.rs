@@ -28920,7 +28920,7 @@ pub(super) fn try_lower_elemental_subroutine_call(
             _ => b.const_i32(0),
         })
         .collect();
-    let resolved_name = resolve_generic_call_actuals(
+    let resolved_candidate = resolve_generic_call_actuals(
         ctx.st,
         b,
         Some(&ctx.locals),
@@ -28928,19 +28928,39 @@ pub(super) fn try_lower_elemental_subroutine_call(
         args,
         &actual_vals,
         Some(ctx.type_layouts),
-    )
-    .map(|c| c.name)
-    .unwrap_or_else(|| callee_name.to_string());
+    );
+    let resolved_name = resolved_candidate
+        .as_ref()
+        .map(|c| c.name.clone())
+        .unwrap_or_else(|| callee_name.to_string());
     let resolved_key = resolved_name.to_lowercase();
 
     // Check elemental.
-    let is_elemental = ctx
-        .st
-        .find_symbol_any_scope(&resolved_key)
-        .map(|s| s.attrs.elemental)
-        .unwrap_or(false)
+    let is_elemental = resolved_candidate
+        .as_ref()
+        .is_some_and(|c| specific_candidate_is_elemental(ctx.st, c))
+        || ctx
+            .st
+            .find_symbol_any_scope(&resolved_key)
+            .map(|s| s.attrs.elemental)
+            .unwrap_or(false)
         || ctx.elemental_funcs.contains(&resolved_key)
-        || ctx.elemental_funcs.contains(callee_key);
+        || ctx.elemental_funcs.contains(callee_key)
+        || resolve_generic_call_by_semantics(
+            ctx.st,
+            Some(&ctx.locals),
+            callee_name,
+            args,
+            Some(ctx.type_layouts),
+        )
+        .is_some_and(|c| specific_candidate_is_elemental(ctx.st, &c))
+        || generic_interface_has_elemental_candidate_for_actuals(
+            ctx.st,
+            &ctx.locals,
+            callee_name,
+            args,
+            Some(ctx.type_layouts),
+        );
     if !is_elemental {
         return false;
     }
@@ -28988,7 +29008,7 @@ pub(super) fn try_lower_elemental_subroutine_call(
                     }
                     _ => None,
                 };
-            let supported = matches!(&elem_ty, IrType::Int(_) | IrType::Float(_))
+            let supported = matches!(&elem_ty, IrType::Int(_) | IrType::Float(_) | IrType::Bool)
                 || matches!(&elem_ty,
                     IrType::Array(inner, 2) if matches!(inner.as_ref(), IrType::Float(_)))
                 || char_len.is_some()
