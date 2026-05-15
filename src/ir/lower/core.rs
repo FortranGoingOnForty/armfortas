@@ -10909,6 +10909,27 @@ fn type_bound_call_result_type_info(
     bound_proc_result_type_info(st, layout, bp)
 }
 
+fn component_field_call_type_info(
+    callee: &crate::ast::expr::SpannedExpr,
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> Option<crate::sema::symtab::TypeInfo> {
+    let crate::ast::expr::Expr::ComponentAccess { base, component } = &callee.node else {
+        return None;
+    };
+    let tl = type_layouts?;
+    let base_ti = operator_expr_type_info(base, Some(locals), st, Some(tl))?;
+    let type_name = match base_ti {
+        crate::sema::symtab::TypeInfo::Derived(name)
+        | crate::sema::symtab::TypeInfo::Class(name) => name,
+        _ => return None,
+    };
+    tl.get(&type_name)
+        .and_then(|layout| layout.field(component))
+        .map(|field| field.type_info.clone())
+}
+
 fn resolve_bound_proc_by_semantics<'a>(
     st: &SymbolTable,
     locals: &HashMap<String, LocalInfo>,
@@ -11258,8 +11279,10 @@ pub(super) fn same_intrinsic_semantic_type(
 
 pub(super) fn assignment_expr_type_info(
     expr: &crate::ast::expr::SpannedExpr,
+    locals: Option<&HashMap<String, LocalInfo>>,
     st: &SymbolTable,
     proc_scope_id: Option<crate::sema::symtab::ScopeId>,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
 ) -> Option<crate::sema::symtab::TypeInfo> {
     use crate::ast::expr::Expr;
 
@@ -11279,10 +11302,19 @@ pub(super) fn assignment_expr_type_info(
         Expr::Name { name } => lookup(name).and_then(|sym| sym.type_info.clone()),
         Expr::ArrayConstructor { values, type_spec } => {
             array_constructor_type_spec_info(type_spec.as_deref(), st)
-                .or_else(|| first_array_constructor_type_info(values, None, st, None))
+                .or_else(|| first_array_constructor_type_info(values, locals, st, type_layouts))
                 .or_else(|| fortran_type_to_type_info(&crate::sema::types::expr_type(expr, st)))
         }
-        Expr::FunctionCall { callee, .. } => {
+        Expr::FunctionCall { callee, args } => {
+            let array_info = match &callee.node {
+                Expr::Name { name } => locals.and_then(|locals| locals.get(&name.to_lowercase())),
+                _ => None,
+            };
+            if let Some(info) = array_info {
+                if local_is_array_like(info) {
+                    return local_semantic_type_info(info);
+                }
+            }
             if let Expr::Name { name } = &callee.node {
                 let sym = lookup(name)?;
                 // F2008 §4.5.10: a structure constructor `T(...)` is a
@@ -11346,11 +11378,17 @@ pub(super) fn assignment_expr_type_info(
                     return common;
                 }
                 sym.type_info.clone()
+            } else if let Some(locals) = locals {
+                type_bound_call_result_type_info(callee, args, locals, st, type_layouts)
+                    .or_else(|| component_field_call_type_info(callee, locals, st, type_layouts))
             } else {
                 None
             }
         }
-        _ => None,
+        Expr::ComponentAccess { .. } | Expr::ParenExpr { .. } => {
+            operator_expr_type_info(expr, locals, st, type_layouts)
+        }
+        _ => literal_expr_type_info_in_context(expr, locals, st, type_layouts),
     }
 }
 
@@ -11961,6 +11999,7 @@ pub(super) fn operator_expr_type_info(
                     .or_else(|| fortran_type_to_type_info(&crate::sema::types::expr_type(expr, st)))
             } else if let Some(locals) = locals {
                 type_bound_call_result_type_info(callee, args, locals, st, type_layouts)
+                    .or_else(|| component_field_call_type_info(callee, locals, st, type_layouts))
             } else {
                 None
             }
@@ -13021,7 +13060,13 @@ pub(super) fn try_defined_assignment(
         .proc_scope_id
         .and_then(|sid| ctx.st.lookup_in(sid, lhs_key))
         .and_then(|sym| sym.type_info.clone());
-    let rhs_semantic_ti = assignment_expr_type_info(rhs, ctx.st, ctx.proc_scope_id);
+    let rhs_semantic_ti = assignment_expr_type_info(
+        rhs,
+        Some(&ctx.locals),
+        ctx.st,
+        ctx.proc_scope_id,
+        Some(ctx.type_layouts),
+    );
 
     let semantic_candidates: Vec<String> = sym
         .arg_names
@@ -13350,21 +13395,27 @@ pub(super) fn resolve_operator_overload(
         return None;
     }
     let iface_name = binary_op_interface_name(op)?;
-    let sym = st.find_symbol_any_scope(&iface_name)?;
-    if sym.kind != crate::sema::symtab::SymbolKind::NamedInterface {
-        return None;
+    let mut all_candidates = named_interface_specific_candidates(st, &iface_name)?;
+    let mut seen_candidates: HashSet<(String, crate::sema::symtab::ScopeId)> = all_candidates
+        .iter()
+        .map(|candidate| (candidate.name.to_ascii_lowercase(), candidate.owner_scope))
+        .collect();
+    for sym in active_block_use_named_interface_symbols(st, &iface_name.to_ascii_lowercase()) {
+        append_named_interface_specific_candidates(sym, &mut all_candidates, &mut seen_candidates);
     }
-    if sym.arg_names.is_empty() {
+    for sym in use_associated_named_interface_symbols(st, &iface_name.to_ascii_lowercase()) {
+        append_named_interface_specific_candidates(sym, &mut all_candidates, &mut seen_candidates);
+    }
+    if all_candidates.is_empty() {
         return None;
     }
 
     let left_semantic_ti = operator_expr_type_info(left_expr, Some(locals), st, type_layouts);
     let right_semantic_ti = operator_expr_type_info(right_expr, Some(locals), st, type_layouts);
-    let semantic_candidates: Vec<String> = sym
-        .arg_names
+    let semantic_candidates: Vec<SpecificProcCandidate> = all_candidates
         .iter()
-        .filter_map(|specific| {
-            let scope = procedure_scope_by_name(st, specific)?;
+        .filter_map(|candidate| {
+            let scope = procedure_scope_for_candidate(st, candidate)?;
             let declared_args = declared_args_for_scope(scope);
             if declared_args.len() != 2 {
                 return None;
@@ -13377,7 +13428,7 @@ pub(super) fn resolve_operator_overload(
             if !operator_arg_semantic_match(right_decl, right_semantic_ti.as_ref()) {
                 return None;
             }
-            Some(specific.clone())
+            Some(candidate.clone())
         })
         .collect();
     if semantic_candidates.is_empty()
@@ -13405,13 +13456,13 @@ pub(super) fn resolve_operator_overload(
     // arithmetic; tightening the fallback would turn previously-found
     // matches into None and expose a separate intrinsic-lowering bug
     // (float op on descriptor pointer in the sparse_spmv build path).
-    let semantic_filtered_by_rank: Vec<String> = if !semantic_candidates.is_empty() {
+    let semantic_filtered_by_rank: Vec<SpecificProcCandidate> = if !semantic_candidates.is_empty() {
         let left_actual_rank = actual_expr_rank(left_expr, locals, st, type_layouts);
         let right_actual_rank = actual_expr_rank(right_expr, locals, st, type_layouts);
         semantic_candidates
             .iter()
-            .filter(|specific| {
-                let Some(scope) = procedure_scope_by_name(st, specific) else {
+            .filter(|candidate| {
+                let Some(scope) = procedure_scope_for_candidate(st, candidate) else {
                     return false;
                 };
                 let declared_args = declared_args_for_scope(scope);
@@ -13440,11 +13491,12 @@ pub(super) fn resolve_operator_overload(
     } else {
         let left_is_char = expr_is_character_expr(b, locals, left_expr, st, type_layouts);
         let right_is_char = expr_is_character_expr(b, locals, right_expr, st, type_layouts);
-        let char_position_candidates: Vec<String> = if left_is_char != right_is_char {
-            sym.arg_names
+        let char_position_candidates: Vec<SpecificProcCandidate> = if left_is_char != right_is_char
+        {
+            all_candidates
                 .iter()
-                .filter_map(|specific| {
-                    let scope = procedure_scope_by_name(st, specific)?;
+                .filter_map(|candidate| {
+                    let scope = procedure_scope_for_candidate(st, candidate)?;
                     let declared_args = declared_args_for_scope(scope);
                     if declared_args.len() != 2 {
                         return None;
@@ -13458,7 +13510,7 @@ pub(super) fn resolve_operator_overload(
                         Some(crate::sema::symtab::TypeInfo::Character { .. })
                     );
                     (left_decl_char == left_is_char && right_decl_char == right_is_char)
-                        .then(|| specific.clone())
+                        .then(|| candidate.clone())
                 })
                 .collect()
         } else {
@@ -13466,7 +13518,7 @@ pub(super) fn resolve_operator_overload(
         };
 
         if char_position_candidates.is_empty() {
-            sym.arg_names.clone()
+            all_candidates.clone()
         } else {
             char_position_candidates
         }
@@ -13484,13 +13536,13 @@ pub(super) fn resolve_operator_overload(
     };
     let arg_vals = vec![Some(lhs_probe), Some(rhs_probe)];
     let supplied = arg_vals.len();
-    for specific in &specifics {
-        let Some(scope) = procedure_scope_by_name(st, specific) else {
+    for candidate in &specifics {
+        let Some(scope) = procedure_scope_for_candidate(st, candidate) else {
             continue;
         };
         let declared_args = declared_args_for_scope(scope);
         if generic_candidate_matches_slots(b, &declared_args, &arg_vals, supplied) {
-            return Some(specific.clone());
+            return Some(candidate.name.clone());
         }
     }
     None
