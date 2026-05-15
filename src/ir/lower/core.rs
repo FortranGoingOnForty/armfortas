@@ -17290,6 +17290,9 @@ pub(super) fn append_host_closure_args_raw(
         // id IS the address.
         let mut forwarded_len: Option<ValueId> = None;
         let addr = if info.by_ref {
+            if let CharKind::AssumedLen { len_addr } = &info.char_kind {
+                forwarded_len = Some(b.load(*len_addr));
+            }
             b.load(info.addr)
         } else if info.dims.is_empty()
             && !info.descriptor_arg

@@ -3124,6 +3124,25 @@ fn defined_assignment_logical_kind_allocatable_fixture_passes_at_o0() {
 }
 
 #[test]
+fn host_assumed_len_closure_forward_fixture_passes_at_o0() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("host_assumed_len_closure_forward.f90");
+    assert!(
+        source.exists(),
+        "host_assumed_len_closure_forward.f90 missing"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "host_assumed_len_closure_forward.f90 should pass at -O0, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
 fn opt_eq_annotations_allow_hello_cross_opt_invariant() {
     let compiler = find_compiler();
     let test_dir = find_test_programs();
