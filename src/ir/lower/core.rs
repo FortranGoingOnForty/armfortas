@@ -15594,7 +15594,32 @@ pub(super) fn arg_matches_declared(
     // element type (Bool). Without peeling, `lv2 = set` rejected
     // `logint32_assign_64` and the assignment fell into a scalar
     // broadcast path that crashed dereferencing the descriptor.
+    // At this point defined assignment has already passed the
+    // kind-aware semantic filter. A descriptor carrier's IR element
+    // type is just i8 bytes, so do not re-reject logical/integer kind
+    // variants like logical(2), allocatable :: lhs(:).
+    if descriptor_carrier_ir_type(actual_ir)
+        && matches!(
+            decl_ti,
+            crate::sema::symtab::TypeInfo::Integer { .. }
+                | crate::sema::symtab::TypeInfo::Real { .. }
+                | crate::sema::symtab::TypeInfo::DoublePrecision
+                | crate::sema::symtab::TypeInfo::Complex { .. }
+                | crate::sema::symtab::TypeInfo::Logical { .. }
+        )
+    {
+        return true;
+    }
+
     arg_matches_declared_elemental(decl_ti, actual_ir, arg_val, b, true)
+}
+
+fn descriptor_carrier_ir_type(actual_ir: &IrType) -> bool {
+    match actual_ir {
+        IrType::Ptr(inner) => descriptor_carrier_ir_type(inner),
+        IrType::Array(inner, 384) => matches!(inner.as_ref(), IrType::Int(IntWidth::I8)),
+        _ => false,
+    }
 }
 
 pub(super) fn arg_matches_declared_elemental(
