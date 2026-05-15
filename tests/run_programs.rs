@@ -3359,6 +3359,44 @@ fn assumed_size_param_constructor_pack_fixture_passes_at_o0() {
 }
 
 #[test]
+fn fixed_char_alloc_array_constructor_len_fixture_passes_at_o0() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("fixed_char_alloc_array_constructor_len.f90");
+    assert!(
+        source.exists(),
+        "fixed_char_alloc_array_constructor_len.f90 missing"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "fixed_char_alloc_array_constructor_len.f90 should pass at -O0, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn defined_operator_char_array_element_actual_fixture_passes_at_o0() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("defined_operator_char_array_element_actual.f90");
+    assert!(
+        source.exists(),
+        "defined_operator_char_array_element_actual.f90 missing"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "defined_operator_char_array_element_actual.f90 should pass at -O0, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
 fn opt_eq_annotations_allow_hello_cross_opt_invariant() {
     let compiler = find_compiler();
     let test_dir = find_test_programs();

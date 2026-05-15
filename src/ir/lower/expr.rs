@@ -1257,6 +1257,20 @@ pub(crate) fn lower_expr_full(
                         if has_range {
                             return lower_array_section(b, locals, info, args, st, type_layouts);
                         }
+                        if info.char_kind != CharKind::None
+                            || descriptor_backed_runtime_char_array(info)
+                        {
+                            if let Some((ptr, _len)) = char_array_element_ptr_and_len(
+                                b,
+                                locals,
+                                info,
+                                args,
+                                st,
+                                type_layouts,
+                            ) {
+                                return ptr;
+                            }
+                        }
                         return lower_array_element(b, locals, info, args, st, type_layouts);
                     }
                 }
