@@ -17990,6 +17990,44 @@ fn rank_reducing_section_arithmetic_uses_strided_descriptor() {
 }
 
 #[test]
+fn rank3_middle_section_arithmetic_uses_strided_descriptor() {
+    // A rank-reducing section with a scalar subscript in the middle dimension
+    // is rank 2 but non-contiguous: x(:, i, :) has memory strides (1, 12)
+    // for x(4,3,3). Array-expression lowering must decompose the flat loop
+    // index into per-dim coordinates; using only dim[0].stride walks the
+    // wrong retained planes. This surfaced in stdlib_stats moment_3_*.
+    let src = write_program(
+        "program p\n  implicit none\n  real :: x(4,3,3), center(4,3), res(4,3), expected(4,3), d(4,3)\n  integer :: a, b, c, i\n  d(:,1) = [1.0, 3.0, 5.0, 7.0]\n  d(:,2) = [2.0, 4.0, 6.0, 8.0]\n  d(:,3) = [9.0, 10.0, 11.0, 12.0]\n  do c = 1, 3\n    do b = 1, 3\n      do a = 1, 4\n        x(a,b,c) = d(a,b) * real(2 ** (c - 1))\n      end do\n    end do\n  end do\n  do c = 1, 3\n    do a = 1, 4\n      center(a,c) = sum(x(a,:,c)) / 3.0\n    end do\n  end do\n  do i = 1, 3\n    do c = 1, 3\n      do a = 1, 4\n        expected(a,c) = x(a,i,c) - center(a,c)\n      end do\n    end do\n    res = x(:, i, :) - center\n    if (maxval(abs(res - expected)) > 1.0e-6) error stop i\n  end do\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("rank3_middle_section_arith", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("rank3 middle-section arith compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "rank3 middle-section arith should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("rank3 middle-section arith run failed");
+    assert!(
+        run.status.success(),
+        "rank3 middle-section arith should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn all_compare_mixed_kind_generic_rank2_returns_descriptors() {
     // F2018 §10.1.5 + §16.9.5: `all(eye(4) == diag([1,1,1,1]))` from
     // stdlib's example_eye2. Reproduces three issues at once: generic-

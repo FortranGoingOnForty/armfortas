@@ -30593,6 +30593,85 @@ pub(super) fn load_rank1_array_desc_elem(
     b.load_typed(ptr, elem_ty.clone())
 }
 
+pub(super) fn array_desc_elem_ptr_rank(
+    b: &mut FuncBuilder,
+    desc: ValueId,
+    elem_ty: &IrType,
+    index: ValueId,
+    rank: usize,
+) -> ValueId {
+    if rank <= 1 {
+        return rank1_array_desc_elem_ptr(b, desc, elem_ty, index);
+    }
+
+    let base = b.load_typed(desc, IrType::Ptr(Box::new(elem_ty.clone())));
+    let elem_size = b.const_i64(ir_scalar_byte_size(elem_ty));
+    let one = b.const_i64(1);
+    let mut rem = index;
+    let mut byte_off = b.const_i64(0);
+
+    for k in 0..rank {
+        let dim_off = 24 + (k as i64) * 24;
+        let lo = load_array_desc_i64_field(b, desc, dim_off);
+        let up = load_array_desc_i64_field(b, desc, dim_off + 8);
+        let stride = load_array_desc_i64_field(b, desc, dim_off + 16);
+        let span = b.isub(up, lo);
+        let extent = b.iadd(span, one);
+        let coord = if k + 1 < rank {
+            let c = b.imod(rem, extent);
+            rem = b.idiv(rem, extent);
+            c
+        } else {
+            rem
+        };
+        let stride_elems = b.imul(coord, stride);
+        let stride_bytes = b.imul(stride_elems, elem_size);
+        byte_off = b.iadd(byte_off, stride_bytes);
+    }
+
+    b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8))
+}
+
+pub(super) fn load_array_desc_elem_rank(
+    b: &mut FuncBuilder,
+    desc: ValueId,
+    elem_ty: &IrType,
+    index: ValueId,
+    rank: usize,
+) -> ValueId {
+    let ptr = array_desc_elem_ptr_rank(b, desc, elem_ty, index, rank);
+    b.load_typed(ptr, elem_ty.clone())
+}
+
+pub(super) fn store_array_desc_elem_rank(
+    b: &mut FuncBuilder,
+    desc: ValueId,
+    elem_ty: &IrType,
+    index: ValueId,
+    rank: usize,
+    value: ValueId,
+) {
+    let ptr = array_desc_elem_ptr_rank(b, desc, elem_ty, index, rank);
+    if is_complex_ty(elem_ty) {
+        let elem_size = b.const_i64(ir_scalar_byte_size(elem_ty));
+        let src_ptr = match b.func().value_type(value) {
+            Some(IrType::Ptr(inner)) if inner.as_ref() == elem_ty => value,
+            _ => {
+                let fw = complex_float_width(elem_ty);
+                materialize_complex_operand(b, value, fw)
+            }
+        };
+        b.call(
+            FuncRef::External("memcpy".into()),
+            vec![ptr, src_ptr, elem_size],
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        );
+        return;
+    }
+    let stored = coerce_to_type(b, value, elem_ty);
+    b.store(stored, ptr);
+}
+
 pub(super) fn store_rank1_array_desc_elem(
     b: &mut FuncBuilder,
     desc: ValueId,
@@ -30763,6 +30842,9 @@ pub(super) fn lower_rank1_array_compare_descriptor(
     right: &crate::ast::expr::SpannedExpr,
     lhs_desc: Option<ValueId>,
     rhs_desc: Option<ValueId>,
+    lhs_rank: Option<usize>,
+    rhs_rank: Option<usize>,
+    result_rank: usize,
     lhs_elem_ty: &IrType,
     rhs_elem_ty: &IrType,
     st: &SymbolTable,
@@ -30851,12 +30933,16 @@ pub(super) fn lower_rank1_array_compare_descriptor(
 
     b.set_block(bb_body);
     let idx = b.load(i_addr);
+    let lhs_elem_rank = lhs_rank.unwrap_or(result_rank).max(1);
+    let rhs_elem_rank = rhs_rank.unwrap_or(result_rank).max(1);
+    let result_elem_rank = result_rank.max(1);
     if complex_compare {
         let lane_ty = IrType::Float(complex_fw);
         let lane_bytes = b.const_i64(if complex_fw == FloatWidth::F64 { 8 } else { 4 });
         let load_lanes = |b: &mut FuncBuilder,
                           desc: Option<ValueId>,
                           elem_ty: &IrType,
+                          rank: usize,
                           expr: &crate::ast::expr::SpannedExpr|
          -> (ValueId, ValueId) {
             if let Some(d) = desc {
@@ -30865,7 +30951,7 @@ pub(super) fn lower_rank1_array_compare_descriptor(
                     let side_lane_ty = IrType::Float(side_fw);
                     let side_lane_bytes =
                         b.const_i64(if side_fw == FloatWidth::F64 { 8 } else { 4 });
-                    let elem_ptr = rank1_array_desc_elem_ptr(b, d, elem_ty, idx);
+                    let elem_ptr = array_desc_elem_ptr_rank(b, d, elem_ty, idx, rank);
                     let re_ptr = b.gep(elem_ptr, vec![zero64], IrType::Int(IntWidth::I8));
                     let im_ptr = b.gep(elem_ptr, vec![side_lane_bytes], IrType::Int(IntWidth::I8));
                     let raw_re = b.load_typed(re_ptr, side_lane_ty.clone());
@@ -30875,7 +30961,7 @@ pub(super) fn lower_rank1_array_compare_descriptor(
                         coerce_to_type(b, raw_im, &lane_ty),
                     )
                 } else {
-                    let raw = load_rank1_array_desc_elem(b, d, elem_ty, idx);
+                    let raw = load_array_desc_elem_rank(b, d, elem_ty, idx, rank);
                     let imag_zero = match complex_fw {
                         FloatWidth::F64 => b.const_f64(0.0),
                         FloatWidth::F32 => b.const_f32(0.0),
@@ -30902,8 +30988,8 @@ pub(super) fn lower_rank1_array_compare_descriptor(
                 )
             }
         };
-        let (lhs_re, lhs_im) = load_lanes(b, lhs_desc, lhs_elem_ty, left);
-        let (rhs_re, rhs_im) = load_lanes(b, rhs_desc, rhs_elem_ty, right);
+        let (lhs_re, lhs_im) = load_lanes(b, lhs_desc, lhs_elem_ty, lhs_elem_rank, left);
+        let (rhs_re, rhs_im) = load_lanes(b, rhs_desc, rhs_elem_ty, rhs_elem_rank, right);
         let re_eq = b.fcmp(CmpOp::Eq, lhs_re, rhs_re);
         let im_eq = b.fcmp(CmpOp::Eq, lhs_im, rhs_im);
         let eq = b.and(re_eq, im_eq);
@@ -30912,7 +30998,7 @@ pub(super) fn lower_rank1_array_compare_descriptor(
         } else {
             eq
         };
-        store_rank1_array_desc_elem(b, result_desc, &IrType::Bool, idx, cmp);
+        store_array_desc_elem_rank(b, result_desc, &IrType::Bool, idx, result_elem_rank, cmp);
         let next = b.iadd(idx, one64);
         b.store(next, i_addr);
         b.branch(bb_check, vec![]);
@@ -30921,7 +31007,7 @@ pub(super) fn lower_rank1_array_compare_descriptor(
     }
 
     let lhs_val = if let Some(d) = lhs_desc {
-        let raw = load_rank1_array_desc_elem(b, d, lhs_elem_ty, idx);
+        let raw = load_array_desc_elem_rank(b, d, lhs_elem_ty, idx, lhs_elem_rank);
         coerce_to_type(b, raw, operand_ty)
     } else {
         let scalar = super::expr::lower_expr_full(
@@ -30937,7 +31023,7 @@ pub(super) fn lower_rank1_array_compare_descriptor(
         coerce_to_type(b, scalar, operand_ty)
     };
     let rhs_val = if let Some(d) = rhs_desc {
-        let raw = load_rank1_array_desc_elem(b, d, rhs_elem_ty, idx);
+        let raw = load_array_desc_elem_rank(b, d, rhs_elem_ty, idx, rhs_elem_rank);
         coerce_to_type(b, raw, operand_ty)
     } else {
         let scalar = super::expr::lower_expr_full(
@@ -30968,7 +31054,7 @@ pub(super) fn lower_rank1_array_compare_descriptor(
         (IrType::Float(_), BinaryOp::Ge) => b.fcmp(CmpOp::Ge, lhs_val, rhs_val),
         _ => return None,
     };
-    store_rank1_array_desc_elem(b, result_desc, &IrType::Bool, idx, cmp);
+    store_array_desc_elem_rank(b, result_desc, &IrType::Bool, idx, result_elem_rank, cmp);
 
     let next = b.iadd(idx, one64);
     b.store(next, i_addr);
@@ -31062,6 +31148,13 @@ pub(super) fn lower_rank1_numeric_array_binary_descriptor(
     if lhs.is_none() && rhs.is_none() {
         return None;
     }
+    let lhs_rank = lhs
+        .as_ref()
+        .and_then(|_| actual_expr_rank(left, locals, st, type_layouts));
+    let rhs_rank = rhs
+        .as_ref()
+        .and_then(|_| actual_expr_rank(right, locals, st, type_layouts));
+    let source_rank = lhs_rank.or(rhs_rank).unwrap_or(1).max(1);
     // The previous guard rejected the binary expression whenever a
     // scalar-evaluated side merely *referenced* an array (e.g. the
     // `A(m1, n1)` element access in `A(m1, n1) * B(:,:)`), which is
@@ -31160,6 +31253,9 @@ pub(super) fn lower_rank1_numeric_array_binary_descriptor(
                 right,
                 lhs.as_ref().map(|(d, _)| *d),
                 rhs.as_ref().map(|(d, _)| *d),
+                lhs_rank,
+                rhs_rank,
+                source_rank,
                 &lhs_elem,
                 &rhs_elem,
                 st,
@@ -31235,6 +31331,7 @@ pub(super) fn lower_rank1_numeric_array_binary_descriptor(
 
         let load_lanes = |b: &mut FuncBuilder,
                           side: Option<&(ValueId, IrType)>,
+                          side_rank: usize,
                           side_expr: &crate::ast::expr::SpannedExpr|
          -> (ValueId, ValueId) {
             if let Some((desc, side_elem_ty)) = side {
@@ -31243,7 +31340,7 @@ pub(super) fn lower_rank1_numeric_array_binary_descriptor(
                     let side_lane_ty = IrType::Float(side_fw);
                     let side_lane_bytes =
                         b.const_i64(if side_fw == FloatWidth::F64 { 8 } else { 4 });
-                    let elem_ptr = rank1_array_desc_elem_ptr(b, *desc, side_elem_ty, idx);
+                    let elem_ptr = array_desc_elem_ptr_rank(b, *desc, side_elem_ty, idx, side_rank);
                     let re_ptr = b.gep(elem_ptr, vec![zero], IrType::Int(IntWidth::I8));
                     let im_ptr = b.gep(elem_ptr, vec![side_lane_bytes], IrType::Int(IntWidth::I8));
                     let raw_re = b.load_typed(re_ptr, side_lane_ty.clone());
@@ -31253,7 +31350,7 @@ pub(super) fn lower_rank1_numeric_array_binary_descriptor(
                         coerce_to_type(b, raw_im, &lane_ty),
                     )
                 } else {
-                    let raw = load_rank1_array_desc_elem(b, *desc, side_elem_ty, idx);
+                    let raw = load_array_desc_elem_rank(b, *desc, side_elem_ty, idx, side_rank);
                     let imag_zero = match fw {
                         FloatWidth::F64 => b.const_f64(0.0),
                         FloatWidth::F32 => b.const_f32(0.0),
@@ -31281,7 +31378,9 @@ pub(super) fn lower_rank1_numeric_array_binary_descriptor(
             }
         };
 
-        let (re_l, im_l) = load_lanes(b, lhs.as_ref(), left);
+        let lhs_elem_rank = lhs_rank.unwrap_or(source_rank).max(1);
+        let rhs_elem_rank = rhs_rank.unwrap_or(source_rank).max(1);
+        let (re_l, im_l) = load_lanes(b, lhs.as_ref(), lhs_elem_rank, left);
         let (re_res, im_res) = if matches!(op, BinaryOp::Pow) {
             let rhs_is_integer_scalar = rhs.is_none()
                 && matches!(
@@ -31363,11 +31462,11 @@ pub(super) fn lower_rank1_numeric_array_binary_descriptor(
                 b.set_block(bb_pow_exit);
                 (b.load(res_re_addr), b.load(res_im_addr))
             } else {
-                let (re_r, im_r) = load_lanes(b, rhs.as_ref(), right);
+                let (re_r, im_r) = load_lanes(b, rhs.as_ref(), rhs_elem_rank, right);
                 lower_complex_pow_lanes(b, fw, re_l, im_l, re_r, im_r)
             }
         } else {
-            let (re_r, im_r) = load_lanes(b, rhs.as_ref(), right);
+            let (re_r, im_r) = load_lanes(b, rhs.as_ref(), rhs_elem_rank, right);
             match op {
                 BinaryOp::Add => (b.fadd(re_l, re_r), b.fadd(im_l, im_r)),
                 BinaryOp::Sub => (b.fsub(re_l, re_r), b.fsub(im_l, im_r)),
@@ -31394,14 +31493,15 @@ pub(super) fn lower_rank1_numeric_array_binary_descriptor(
             }
         };
 
-        let dst_elem_ptr = rank1_array_desc_elem_ptr(b, result_desc, &elem_ty, idx);
+        let dst_elem_ptr = array_desc_elem_ptr_rank(b, result_desc, &elem_ty, idx, source_rank);
         let dst_re = b.gep(dst_elem_ptr, vec![zero], IrType::Int(IntWidth::I8));
         let dst_im = b.gep(dst_elem_ptr, vec![lane_bytes], IrType::Int(IntWidth::I8));
         b.store(re_res, dst_re);
         b.store(im_res, dst_im);
     } else {
         let lhs_val = if let Some((desc, _)) = lhs.as_ref() {
-            load_rank1_array_desc_elem(b, *desc, &elem_ty, idx)
+            let rank = lhs_rank.unwrap_or(source_rank).max(1);
+            load_array_desc_elem_rank(b, *desc, &elem_ty, idx, rank)
         } else {
             let scalar = super::expr::lower_expr_full(
                 b,
@@ -31416,7 +31516,8 @@ pub(super) fn lower_rank1_numeric_array_binary_descriptor(
             coerce_to_type(b, scalar, &elem_ty)
         };
         let rhs_val = if let Some((desc, _)) = rhs.as_ref() {
-            load_rank1_array_desc_elem(b, *desc, &elem_ty, idx)
+            let rank = rhs_rank.unwrap_or(source_rank).max(1);
+            load_array_desc_elem_rank(b, *desc, &elem_ty, idx, rank)
         } else {
             let scalar = super::expr::lower_expr_full(
                 b,
@@ -31471,7 +31572,7 @@ pub(super) fn lower_rank1_numeric_array_binary_descriptor(
             }
             _ => unreachable!("unsupported array op should have returned before block creation"),
         };
-        store_rank1_array_desc_elem(b, result_desc, &elem_ty, idx, result);
+        store_array_desc_elem_rank(b, result_desc, &elem_ty, idx, source_rank, result);
     }
 
     let one = b.const_i64(1);
