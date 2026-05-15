@@ -11404,9 +11404,10 @@ pub(super) fn assignment_expr_type_info(
                 None
             }
         }
-        Expr::ComponentAccess { .. } | Expr::ParenExpr { .. } => {
-            operator_expr_type_info(expr, locals, st, type_layouts)
-        }
+        Expr::UnaryOp { .. }
+        | Expr::BinaryOp { .. }
+        | Expr::ComponentAccess { .. }
+        | Expr::ParenExpr { .. } => operator_expr_type_info(expr, locals, st, type_layouts),
         _ => literal_expr_type_info_in_context(expr, locals, st, type_layouts),
     }
 }
