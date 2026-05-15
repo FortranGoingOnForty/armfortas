@@ -27704,6 +27704,30 @@ pub(super) fn lower_array_merge_descriptor(
         contained_host_refs,
         descriptor_params,
     );
+    let t_rank = t_desc
+        .as_ref()
+        .map(|_| {
+            actual_expr_rank(t_expr, locals, st, type_layouts)
+                .unwrap_or(1)
+                .max(1)
+        })
+        .unwrap_or(1);
+    let f_rank = f_desc
+        .as_ref()
+        .map(|_| {
+            actual_expr_rank(f_expr, locals, st, type_layouts)
+                .unwrap_or(1)
+                .max(1)
+        })
+        .unwrap_or(1);
+    let m_rank = m_desc
+        .as_ref()
+        .map(|_| {
+            actual_expr_rank(m_expr, locals, st, type_layouts)
+                .unwrap_or(1)
+                .max(1)
+        })
+        .unwrap_or(1);
 
     // Pick the result element type from the first array tsource/fsource.
     let elem_ty = t_desc
@@ -27718,11 +27742,15 @@ pub(super) fn lower_array_merge_descriptor(
 
     // Pick a control descriptor: any of the three array operands. F2018 says
     // the conformable shapes are required, so any of them gives the size.
-    let control_desc = t_desc
-        .as_ref()
-        .map(|(d, _)| *d)
-        .or_else(|| f_desc.as_ref().map(|(d, _)| *d))
-        .or_else(|| m_desc.as_ref().map(|(d, _)| *d))?;
+    let (control_desc, control_rank) = if let Some((desc, _)) = t_desc.as_ref() {
+        (*desc, t_rank)
+    } else if let Some((desc, _)) = f_desc.as_ref() {
+        (*desc, f_rank)
+    } else if let Some((desc, _)) = m_desc.as_ref() {
+        (*desc, m_rank)
+    } else {
+        return None;
+    };
 
     let result_desc = allocate_like_array_temp_descriptor(b, control_desc);
     let n = b.call(
@@ -27749,7 +27777,7 @@ pub(super) fn lower_array_merge_descriptor(
     let cur_idx = b.load(i_addr);
 
     let t_val = if let Some((desc, ty)) = t_desc.as_ref() {
-        load_rank1_array_desc_elem(b, *desc, ty, cur_idx)
+        load_array_desc_elem_rank(b, *desc, ty, cur_idx, t_rank)
     } else {
         let scalar = super::expr::lower_expr_full(
             b,
@@ -27764,7 +27792,7 @@ pub(super) fn lower_array_merge_descriptor(
         coerce_to_type(b, scalar, &elem_ty)
     };
     let f_val = if let Some((desc, ty)) = f_desc.as_ref() {
-        load_rank1_array_desc_elem(b, *desc, ty, cur_idx)
+        load_array_desc_elem_rank(b, *desc, ty, cur_idx, f_rank)
     } else {
         let scalar = super::expr::lower_expr_full(
             b,
@@ -27779,7 +27807,7 @@ pub(super) fn lower_array_merge_descriptor(
         coerce_to_type(b, scalar, &elem_ty)
     };
     let mask_val = if let Some((desc, mask_ty)) = m_desc.as_ref() {
-        let raw = load_rank1_array_desc_elem(b, *desc, mask_ty, cur_idx);
+        let raw = load_array_desc_elem_rank(b, *desc, mask_ty, cur_idx, m_rank);
         coerce_to_type(b, raw, &IrType::Bool)
     } else {
         let scalar = super::expr::lower_expr_full(
@@ -27802,6 +27830,7 @@ pub(super) fn lower_array_merge_descriptor(
         let zero = b.const_i64(0);
         let load_complex_lanes = |b: &mut FuncBuilder,
                                   side: Option<&(ValueId, IrType)>,
+                                  side_rank: usize,
                                   side_expr: &crate::ast::expr::SpannedExpr|
          -> (ValueId, ValueId) {
             if let Some((desc, side_elem_ty)) = side {
@@ -27810,7 +27839,8 @@ pub(super) fn lower_array_merge_descriptor(
                     let side_lane_ty = IrType::Float(side_fw);
                     let side_lane_bytes =
                         b.const_i64(if side_fw == FloatWidth::F64 { 8 } else { 4 });
-                    let elem_ptr = rank1_array_desc_elem_ptr(b, *desc, side_elem_ty, cur_idx);
+                    let elem_ptr =
+                        array_desc_elem_ptr_rank(b, *desc, side_elem_ty, cur_idx, side_rank);
                     let re_ptr = b.gep(elem_ptr, vec![zero], IrType::Int(IntWidth::I8));
                     let im_ptr = b.gep(elem_ptr, vec![side_lane_bytes], IrType::Int(IntWidth::I8));
                     let raw_re = b.load_typed(re_ptr, side_lane_ty.clone());
@@ -27820,7 +27850,7 @@ pub(super) fn lower_array_merge_descriptor(
                         coerce_to_type(b, raw_im, &lane_ty),
                     )
                 } else {
-                    let raw = load_rank1_array_desc_elem(b, *desc, side_elem_ty, cur_idx);
+                    let raw = load_array_desc_elem_rank(b, *desc, side_elem_ty, cur_idx, side_rank);
                     let imag_zero = match fw {
                         FloatWidth::F64 => b.const_f64(0.0),
                         FloatWidth::F32 => b.const_f32(0.0),
@@ -27848,11 +27878,11 @@ pub(super) fn lower_array_merge_descriptor(
             }
         };
 
-        let (t_re, t_im) = load_complex_lanes(b, t_desc.as_ref(), t_expr);
-        let (f_re, f_im) = load_complex_lanes(b, f_desc.as_ref(), f_expr);
+        let (t_re, t_im) = load_complex_lanes(b, t_desc.as_ref(), t_rank, t_expr);
+        let (f_re, f_im) = load_complex_lanes(b, f_desc.as_ref(), f_rank, f_expr);
         let re = b.select(mask_val, t_re, f_re);
         let im = b.select(mask_val, t_im, f_im);
-        let dst_elem = rank1_array_desc_elem_ptr(b, result_desc, &elem_ty, cur_idx);
+        let dst_elem = array_desc_elem_ptr_rank(b, result_desc, &elem_ty, cur_idx, control_rank);
         let dst_re = b.gep(dst_elem, vec![zero], IrType::Int(IntWidth::I8));
         let dst_im = b.gep(dst_elem, vec![lane_bytes], IrType::Int(IntWidth::I8));
         b.store(re, dst_re);
@@ -27861,7 +27891,7 @@ pub(super) fn lower_array_merge_descriptor(
         let t_coerced = coerce_to_type(b, t_val, &elem_ty);
         let f_coerced = coerce_to_type(b, f_val, &elem_ty);
         let result = b.select(mask_val, t_coerced, f_coerced);
-        store_rank1_array_desc_elem(b, result_desc, &elem_ty, cur_idx, result);
+        store_array_desc_elem_rank(b, result_desc, &elem_ty, cur_idx, control_rank, result);
     }
 
     let one = b.const_i64(1);

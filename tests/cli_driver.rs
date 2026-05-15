@@ -18064,6 +18064,42 @@ fn rank3_middle_section_real_conversion_uses_strided_descriptor() {
 }
 
 #[test]
+fn rank3_middle_section_merge_mask_uses_strided_descriptor() {
+    // MERGE has its own descriptor helper. The tsource and logical mask can
+    // both be non-contiguous rank-reducing sections, so flat rank-1 indexing
+    // reads the wrong mask element and leaks masked-off contributions.
+    let src = write_program(
+        "program p\n  implicit none\n  real(8) :: x(4,3,3), center(4,3), res(4,3), expected(4,3), n(4,3), expected_n(4,3)\n  real(8) :: d(4,3)\n  logical :: mask(4,3,3)\n  integer :: a, b, c, i\n  d(:,1) = [1._8, 3._8, 5._8, 7._8]\n  d(:,2) = [2._8, 4._8, 6._8, 8._8]\n  d(:,3) = [9._8, 10._8, 11._8, 12._8]\n  do c = 1, 3\n    do b = 1, 3\n      do a = 1, 4\n        x(a,b,c) = d(a,b) * real(2 ** (c - 1), 8)\n      end do\n    end do\n  end do\n  mask = x < 45._8\n  center = 0._8\n  expected_n = 0._8\n  do c = 1, 3\n    do a = 1, 4\n      do b = 1, 3\n        if (mask(a,b,c)) then\n          center(a,c) = center(a,c) + x(a,b,c)\n          expected_n(a,c) = expected_n(a,c) + 1._8\n        end if\n      end do\n      center(a,c) = center(a,c) / expected_n(a,c)\n    end do\n  end do\n  n = real(count(mask, 2), 8)\n  if (maxval(abs(n - expected_n)) > 1.0e-10_8) error stop 1\n  res = 0._8\n  expected = 0._8\n  do i = 1, 3\n    res = res + merge((x(:, i, :) - center)**2, 0._8, mask(:, i, :))\n    do c = 1, 3\n      do a = 1, 4\n        if (mask(a,i,c)) expected(a,c) = expected(a,c) + (x(a,i,c) - center(a,c))**2\n      end do\n    end do\n  end do\n  res = res / n\n  expected = expected / expected_n\n  if (maxval(abs(res - expected)) > 1.0e-10_8) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("rank3_middle_section_merge_mask", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("rank3 middle-section merge mask compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "rank3 middle-section merge mask should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("rank3 middle-section merge mask run failed");
+    assert!(
+        run.status.success(),
+        "rank3 middle-section merge mask should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn all_compare_mixed_kind_generic_rank2_returns_descriptors() {
     // F2018 §10.1.5 + §16.9.5: `all(eye(4) == diag([1,1,1,1]))` from
     // stdlib's example_eye2. Reproduces three issues at once: generic-
