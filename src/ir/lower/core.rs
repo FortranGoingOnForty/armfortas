@@ -27754,11 +27754,18 @@ pub(super) fn lower_array_merge_descriptor(
         })
         .unwrap_or(1);
 
-    // Pick the result element type from the first array tsource/fsource.
+    // Pick the result element type from tsource/fsource. If only MASK is an
+    // array, MERGE still returns an array, but its element type comes from the
+    // scalar value operands rather than the logical mask.
     let elem_ty = t_desc
         .as_ref()
         .map(|(_, t)| t.clone())
-        .or_else(|| f_desc.as_ref().map(|(_, t)| t.clone()))?;
+        .or_else(|| f_desc.as_ref().map(|(_, t)| t.clone()))
+        .or_else(|| {
+            operator_expr_type_info(t_expr, Some(locals), st, type_layouts)
+                .or_else(|| operator_expr_type_info(f_expr, Some(locals), st, type_layouts))
+                .map(|ti| type_info_to_ir_type(&ti))
+        })?;
     let is_complex_elem =
         matches!(&elem_ty, IrType::Array(inner, 2) if matches!(inner.as_ref(), IrType::Float(_)));
     if !matches!(&elem_ty, IrType::Int(_) | IrType::Float(_) | IrType::Bool) && !is_complex_elem {
@@ -27777,7 +27784,11 @@ pub(super) fn lower_array_merge_descriptor(
         return None;
     };
 
-    let result_desc = allocate_like_array_temp_descriptor(b, control_desc);
+    let result_desc = if t_desc.is_none() && f_desc.is_none() {
+        allocate_like_array_temp_descriptor_with_elem_type(b, control_desc, &elem_ty)
+    } else {
+        allocate_like_array_temp_descriptor(b, control_desc)
+    };
     let n = b.call(
         FuncRef::External("afs_array_size".into()),
         vec![control_desc],
