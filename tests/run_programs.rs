@@ -3162,6 +3162,22 @@ fn merge_scalar_sources_array_mask_fixture_passes_at_o0() {
 }
 
 #[test]
+fn complex_merge_element_zero_fixture_passes_at_o0() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("complex_merge_element_zero.f90");
+    assert!(source.exists(), "complex_merge_element_zero.f90 missing");
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "complex_merge_element_zero.f90 should pass at -O0, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
 fn complex_abs_array_scalar_compare_fixture_passes_at_o0() {
     let compiler = find_compiler();
     let test_dir = find_test_programs();

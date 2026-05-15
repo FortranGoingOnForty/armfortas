@@ -94,15 +94,31 @@ pub(crate) fn lower_intrinsic(
         }
         "merge" => {
             if args.len() >= 3 {
-                let mut ty = b
+                let t_ty = b
                     .func()
                     .value_type(args[0])
                     .unwrap_or(IrType::Int(IntWidth::I32));
+                let f_ty = b
+                    .func()
+                    .value_type(args[1])
+                    .unwrap_or(IrType::Int(IntWidth::I32));
+                if is_complex_ty(&t_ty) || is_complex_ty(&f_ty) {
+                    let fw = if [t_ty.clone(), f_ty.clone()]
+                        .iter()
+                        .any(|ty| is_complex_ty(ty) && complex_float_width(ty) == FloatWidth::F64)
+                    {
+                        FloatWidth::F64
+                    } else {
+                        FloatWidth::F32
+                    };
+                    let true_val = materialize_complex_operand(b, args[0], fw);
+                    let false_val = materialize_complex_operand(b, args[1], fw);
+                    let mask = coerce_to_type(b, args[2], &IrType::Bool);
+                    return Some(b.select(mask, true_val, false_val));
+                }
+                let mut ty = t_ty;
                 if ty.is_float() {
-                    if matches!(
-                        b.func().value_type(args[1]),
-                        Some(IrType::Float(FloatWidth::F64))
-                    ) {
+                    if matches!(f_ty, IrType::Float(FloatWidth::F64)) {
                         ty = IrType::Float(FloatWidth::F64);
                     }
                 } else if ty.is_int() {
