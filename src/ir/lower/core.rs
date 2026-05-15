@@ -9446,29 +9446,29 @@ pub(super) fn find_named_interface_symbol<'a>(
 ) -> Option<&'a crate::sema::symtab::Symbol> {
     let key = name.to_ascii_lowercase();
     if let Some(sym) = st.lookup(&key) {
-        return is_named_interface_like(sym).then_some(sym);
+        if is_named_interface_like(sym) {
+            return Some(sym);
+        }
     }
+
+    if let Some(sym) = use_associated_named_interface_symbols(st, &key)
+        .into_iter()
+        .next()
+    {
+        return Some(sym);
+    }
+
     // F2018 §11.2.2: a named interface from another module shadows an
-    // intrinsic only when it is actually use-associated into the
-    // current TU. all_scopes() also exposes modules that the unit
-    // merely loads for type-info (e.g. `use stdlib_string_type, only:
-    // string_type` brings the whole module scope along but does not
-    // import its trim/adjustl/len named interfaces); without the gate,
-    // parse_mode's `trim(adjustl(mode))` silently re-routed through
-    // trim_string and parse_mode kept its 'r t' default, breaking
-    // open() for every savetxt/loadtxt/loadnpy. The gate applies only
-    // to Module/Submodule scopes — in-TU Program/Function/Subroutine
-    // scopes always feed dispatch (sema's st.current can be stale
-    // during IR lowering, so a generic declared in the program scope
-    // only resurfaces via the all-scope walk).
+    // intrinsic only when it is actually use-associated into the current
+    // TU. The symbol table's current scope can be stale during lowering,
+    // so a non-interface returned by `st.lookup()` above must not block a
+    // later USE-associated generic with the same local name. Conversely,
+    // scanning every loaded module would reintroduce unrelated generics
+    // from modules loaded only for type info.
     use crate::sema::symtab::ScopeKind;
-    let key_is_use_associated = st
-        .all_scopes()
-        .iter()
-        .any(|scope| scope.use_associations.iter().any(|a| a.local_name == key));
     for scope in st.all_scopes() {
         let in_tu = !matches!(scope.kind, ScopeKind::Module(_) | ScopeKind::Submodule(_));
-        if !in_tu && !key_is_use_associated {
+        if !in_tu {
             continue;
         }
         if let Some(sym) = scope.symbols.get(&key) {
@@ -9477,13 +9477,38 @@ pub(super) fn find_named_interface_symbol<'a>(
             }
         }
     }
-    if !key_is_use_associated {
-        return None;
+
+    None
+}
+
+fn use_associated_named_interface_symbols<'a>(
+    st: &'a SymbolTable,
+    key: &str,
+) -> Vec<&'a crate::sema::symtab::Symbol> {
+    use crate::sema::symtab::ScopeKind;
+
+    let mut symbols = Vec::new();
+    let mut seen = HashSet::new();
+    for scope in st.all_scopes() {
+        if matches!(scope.kind, ScopeKind::Submodule(_)) {
+            continue;
+        }
+        for assoc in &scope.use_associations {
+            if assoc.local_name != key {
+                continue;
+            }
+            if let Some(sym) = st
+                .lookup_in(assoc.source_scope, &assoc.original_name)
+                .filter(|sym| is_named_interface_like(sym))
+            {
+                let sym_key = (sym.name.to_ascii_lowercase(), sym.scope);
+                if seen.insert(sym_key) {
+                    symbols.push(sym);
+                }
+            }
+        }
     }
-    match st.find_symbol_any_scope(&key) {
-        Some(sym) if is_named_interface_like(sym) => Some(sym),
-        _ => None,
-    }
+    symbols
 }
 
 pub(super) fn user_callable_shadows_intrinsic(st: &SymbolTable, name: &str) -> bool {
@@ -9578,11 +9603,16 @@ pub(super) fn named_interface_specific_candidates(
     let mut seen = HashSet::new();
 
     if let Some(sym) = st.lookup(&key) {
-        if !is_named_interface_like(sym) {
-            return None;
+        if is_named_interface_like(sym) {
+            append_named_interface_specific_candidates(sym, &mut specifics, &mut seen);
         }
+    }
+
+    for sym in use_associated_named_interface_symbols(st, &key) {
         append_named_interface_specific_candidates(sym, &mut specifics, &mut seen);
-        return (!specifics.is_empty()).then_some(specifics);
+    }
+    if !specifics.is_empty() {
+        return Some(specifics);
     }
 
     // When a same-named Function/Subroutine exists anywhere in the
@@ -9595,6 +9625,14 @@ pub(super) fn named_interface_specific_candidates(
     // contaminates the dispatch.
     let mut function_exists = false;
     for scope in st.all_scopes() {
+        let in_tu = !matches!(
+            scope.kind,
+            crate::sema::symtab::ScopeKind::Module(_)
+                | crate::sema::symtab::ScopeKind::Submodule(_)
+        );
+        if !in_tu {
+            continue;
+        }
         if let Some(sym) = scope.symbols.get(&key) {
             if matches!(
                 sym.kind,
@@ -9609,10 +9647,14 @@ pub(super) fn named_interface_specific_candidates(
     if function_exists {
         return None;
     }
-
     if specifics.is_empty() {
-        if let Some(sym) = st.find_symbol_any_scope(&key) {
-            append_named_interface_specific_candidates(sym, &mut specifics, &mut seen);
+        for scope in st.all_scopes() {
+            if !matches!(scope.kind, crate::sema::symtab::ScopeKind::Submodule(_)) {
+                continue;
+            }
+            if let Some(sym) = scope.symbols.get(&key) {
+                append_named_interface_specific_candidates(sym, &mut specifics, &mut seen);
+            }
         }
     }
 
@@ -29546,15 +29588,31 @@ pub(super) fn try_lower_elemental_subroutine_call(
             _ => b.const_i32(0),
         })
         .collect();
-    let resolved_candidate = resolve_generic_call_actuals(
-        ctx.st,
-        b,
-        Some(&ctx.locals),
-        callee_name,
-        args,
-        &actual_vals,
-        Some(ctx.type_layouts),
-    );
+    let caller_scope_id = callee_scope_id_for_lookup(ctx.st, b.func().name.as_str());
+    let scoped_specifics = caller_scope_id
+        .and_then(|scope_id| ctx.st.lookup_in(scope_id, callee_key))
+        .and_then(named_interface_specific_candidates_from_symbol);
+    let resolved_candidate = if let Some(specifics) = scoped_specifics.as_deref() {
+        resolve_generic_call_actuals_from_specifics(
+            ctx.st,
+            b,
+            Some(&ctx.locals),
+            args,
+            &actual_vals,
+            Some(ctx.type_layouts),
+            specifics,
+        )
+    } else {
+        resolve_generic_call_actuals(
+            ctx.st,
+            b,
+            Some(&ctx.locals),
+            callee_name,
+            args,
+            &actual_vals,
+            Some(ctx.type_layouts),
+        )
+    };
     let resolved_name = resolved_candidate
         .as_ref()
         .map(|c| c.name.clone())
@@ -29572,6 +29630,20 @@ pub(super) fn try_lower_elemental_subroutine_call(
             .unwrap_or(false)
         || ctx.elemental_funcs.contains(&resolved_key)
         || ctx.elemental_funcs.contains(callee_key)
+        || scoped_specifics
+            .as_deref()
+            .and_then(|specifics| {
+                resolve_generic_call_actuals_from_specifics(
+                    ctx.st,
+                    b,
+                    Some(&ctx.locals),
+                    args,
+                    &actual_vals,
+                    Some(ctx.type_layouts),
+                    specifics,
+                )
+            })
+            .is_some_and(|c| specific_candidate_is_elemental(ctx.st, &c))
         || resolve_generic_call_by_semantics(
             ctx.st,
             Some(&ctx.locals),
@@ -37588,6 +37660,9 @@ pub(super) fn expr_is_character_expr(
         Expr::FunctionCall { callee, args } => {
             if let Expr::Name { name } = &callee.node {
                 let key = name.to_lowercase();
+                if let Some(ti) = operator_expr_type_info(expr, Some(locals), st, type_layouts) {
+                    return matches!(ti, crate::sema::symtab::TypeInfo::Character { .. });
+                }
                 matches!(
                     key.as_str(),
                     "trim"

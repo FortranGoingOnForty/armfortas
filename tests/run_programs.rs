@@ -3210,6 +3210,44 @@ fn formatted_write_g0_iostat_fixture_passes_at_o0() {
 }
 
 #[test]
+fn generic_private_rename_derived_result_fixture_passes_at_o0() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("generic_private_rename_derived_result.f90");
+    assert!(
+        source.exists(),
+        "generic_private_rename_derived_result.f90 missing"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "generic_private_rename_derived_result.f90 should pass at -O0, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn elemental_generic_array_expr_actual_fixture_passes_at_o0() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("elemental_generic_array_expr_actual.f90");
+    assert!(
+        source.exists(),
+        "elemental_generic_array_expr_actual.f90 missing"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "elemental_generic_array_expr_actual.f90 should pass at -O0, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
 fn list_directed_real_implicit_exponent_fixture_passes_at_o0() {
     let compiler = find_compiler();
     let test_dir = find_test_programs();

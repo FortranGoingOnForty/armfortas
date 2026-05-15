@@ -250,6 +250,48 @@ fn generic_interface_transitive_use() {
 }
 
 #[test]
+fn generic_interface_beats_private_renamed_import() {
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let dep_f90 = dir.join("dep.f90");
+    let wrapper_f90 = dir.join("wrapper.f90");
+    let main_f90 = dir.join("main.f90");
+    let dep_o = dir.join("dep.o");
+    let wrapper_o = dir.join("wrapper.o");
+    let main_o = dir.join("main.o");
+    let binary = dir.join("test_bin");
+
+    std::fs::write(
+        &dep_f90,
+        "module dep\n  implicit none\ncontains\n  integer function pick(x)\n    integer, intent(in) :: x\n    pick = -1\n  end function\nend module\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &wrapper_f90,
+        "module wrapper\n  use dep, only: pick_dep => pick\n  implicit none\n  private\n  public :: box, pick\n  type :: box\n    integer :: v\n  end type\n  interface pick\n    module procedure pick_box\n  end interface\ncontains\n  integer function pick_box(x)\n    type(box), intent(in) :: x\n    pick_box = x%v\n  end function\nend module\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &main_f90,
+        "program p\n  use wrapper, only: box, pick\n  implicit none\n  type(box) :: b\n  b%v = 42\n  print *, pick(b)\nend program\n",
+    )
+    .unwrap();
+
+    compile_file(&compiler, &dep_f90, &dep_o, None);
+    compile_file(&compiler, &wrapper_f90, &wrapper_o, Some(&dir));
+    compile_file(&compiler, &main_f90, &main_o, Some(&dir));
+    link_files(&[&main_o, &wrapper_o, &dep_o], &binary);
+    let output = run_binary(&binary);
+    assert!(
+        output.contains("42"),
+        "expected wrapper generic to dispatch to pick_box, got:\n{}",
+        output
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn module_private_default() {
     // F2008 §12.2.3.2: submodules of a module see *all* parent entities,
     // including the privates. The .amod must therefore round-trip private
