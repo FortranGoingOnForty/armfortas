@@ -297,6 +297,59 @@ impl Unit {
     }
 }
 
+fn normalize_fortran_real_input(token: &str, strip_commas: bool) -> String {
+    let mut normalized = String::with_capacity(token.len() + 1);
+    for ch in token.trim().chars() {
+        if strip_commas && ch == ',' {
+            continue;
+        }
+        match ch {
+            'd' => normalized.push('e'),
+            'D' => normalized.push('E'),
+            _ => normalized.push(ch),
+        }
+    }
+
+    if normalized.bytes().any(|b| matches!(b, b'e' | b'E')) {
+        return normalized;
+    }
+
+    let bytes = normalized.as_bytes();
+    for idx in 1..bytes.len() {
+        let b = bytes[idx];
+        if !matches!(b, b'+' | b'-') {
+            continue;
+        }
+        if idx + 1 >= bytes.len() || !bytes[idx + 1].is_ascii_digit() {
+            continue;
+        }
+        if !mantissa_allows_implicit_exponent(&bytes[..idx]) {
+            continue;
+        }
+
+        let mut with_exp = String::with_capacity(normalized.len() + 1);
+        with_exp.push_str(&normalized[..idx]);
+        with_exp.push('e');
+        with_exp.push_str(&normalized[idx..]);
+        return with_exp;
+    }
+
+    normalized
+}
+
+fn mantissa_allows_implicit_exponent(prefix: &[u8]) -> bool {
+    let mut saw_digit = false;
+    for (idx, b) in prefix.iter().copied().enumerate() {
+        match b {
+            b'+' | b'-' if idx == 0 => {}
+            b'.' => {}
+            b'0'..=b'9' => saw_digit = true,
+            _ => return false,
+        }
+    }
+    saw_digit
+}
+
 // ---- I/O State ----
 
 struct IoState {
@@ -1463,8 +1516,7 @@ pub extern "C" fn afs_read_real(unit: i32, val: *mut f32, iostat: *mut i32) {
         }
         match u.next_read_token() {
             Ok(Some(token)) => {
-                // Handle Fortran D-exponent: replace D with E for parsing.
-                let normalized = token.replace('d', "e").replace('D', "E");
+                let normalized = normalize_fortran_real_input(&token, false);
                 match normalized.parse::<f32>() {
                     Ok(v) => {
                         write_f32_ptr(val, v);
@@ -1532,7 +1584,7 @@ pub extern "C" fn afs_read_real64(unit: i32, val: *mut f64, iostat: *mut i32) {
         }
         match u.next_read_token() {
             Ok(Some(token)) => {
-                let normalized = token.replace('d', "e").replace('D', "E");
+                let normalized = normalize_fortran_real_input(&token, false);
                 match normalized.parse::<f64>() {
                     Ok(v) => {
                         write_f64_ptr(val, v);
@@ -2398,7 +2450,7 @@ fn namelist_assign_value(
             }
             1 => {
                 // real
-                let normalized = val_str.replace('d', "e").replace('D', "E");
+                let normalized = normalize_fortran_real_input(val_str, false);
                 if let Ok(v) = normalized.parse::<f64>() {
                     unsafe {
                         *(ptr as *mut f64) = v;
@@ -2686,7 +2738,7 @@ pub extern "C" fn afs_read_internal_real(
     iostat: *mut i32,
 ) {
     if let Some(token) = next_internal_token(buf, buf_len, pos) {
-        let normalized = token.replace('d', "e").replace('D', "E").replace(',', "");
+        let normalized = normalize_fortran_real_input(&token, true);
         match normalized.parse::<f64>() {
             Ok(v) => {
                 write_f64_ptr(val, v);
@@ -4018,11 +4070,7 @@ pub extern "C" fn afs_fmt_read_real(
         | Ok((FormatDesc::RealEX { .. }, field))
         | Ok((FormatDesc::RealD { .. }, field))
         | Ok((FormatDesc::RealG { .. }, field)) => {
-            let normalized = field
-                .trim()
-                .replace('d', "e")
-                .replace('D', "E")
-                .replace(',', "");
+            let normalized = normalize_fortran_real_input(&field, true);
             match normalized.parse::<f64>() {
                 Ok(v) => {
                     write_f64_ptr(val, v);
@@ -4261,11 +4309,7 @@ pub extern "C" fn afs_fmt_read_real_internal(
         | Ok((FormatDesc::RealEX { .. }, field))
         | Ok((FormatDesc::RealD { .. }, field))
         | Ok((FormatDesc::RealG { .. }, field)) => {
-            let normalized = field
-                .trim()
-                .replace('d', "e")
-                .replace('D', "E")
-                .replace(',', "");
+            let normalized = normalize_fortran_real_input(&field, true);
             match normalized.parse::<f64>() {
                 Ok(v) => {
                     write_f64_ptr(val, v);
@@ -4304,6 +4348,67 @@ pub extern "C" fn afs_fmt_read_real_internal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_real_input_accepts_implicit_signed_exponents() {
+        assert_eq!(normalize_fortran_real_input("1.-3", false), "1.e-3");
+        assert_eq!(normalize_fortran_real_input("1.+3", false), "1.e+3");
+        assert_eq!(
+            normalize_fortran_real_input("1234567890-9", false),
+            "1234567890e-9"
+        );
+        assert_eq!(
+            normalize_fortran_real_input("-123456.789+2", false),
+            "-123456.789e+2"
+        );
+    }
+
+    #[test]
+    fn normalize_real_input_preserves_explicit_exponents() {
+        assert_eq!(normalize_fortran_real_input("1.0d-3", false), "1.0e-3");
+        assert_eq!(normalize_fortran_real_input("1.0D+3", false), "1.0E+3");
+        assert_eq!(normalize_fortran_real_input("-Inf", false), "-Inf");
+        assert_eq!(normalize_fortran_real_input("NaN", false), "NaN");
+    }
+
+    #[test]
+    fn internal_real_read_accepts_implicit_signed_exponents() {
+        let buf = b"1.-3 1.+3 1234567890-9";
+        let mut pos = 0i64;
+        let mut first = 0.0f64;
+        let mut second = 0.0f64;
+        let mut third = 0.0f64;
+        let mut iostat = -99i32;
+
+        afs_read_internal_real(
+            buf.as_ptr(),
+            buf.len() as i64,
+            &mut pos,
+            &mut first,
+            &mut iostat,
+        );
+        assert_eq!(iostat, 0, "expected first internal real read to succeed");
+        afs_read_internal_real(
+            buf.as_ptr(),
+            buf.len() as i64,
+            &mut pos,
+            &mut second,
+            &mut iostat,
+        );
+        assert_eq!(iostat, 0, "expected second internal real read to succeed");
+        afs_read_internal_real(
+            buf.as_ptr(),
+            buf.len() as i64,
+            &mut pos,
+            &mut third,
+            &mut iostat,
+        );
+        assert_eq!(iostat, 0, "expected third internal real read to succeed");
+
+        assert!((first - 1.0e-3).abs() < 1.0e-15, "first={first}");
+        assert!((second - 1.0e3).abs() < 1.0e-12, "second={second}");
+        assert!((third - 1.234567890).abs() < 1.0e-12, "third={third}");
+    }
 
     #[test]
     fn preconnected_units() {
