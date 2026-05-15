@@ -32771,11 +32771,19 @@ pub(super) fn lower_vector_subscript_section_assign(
         Some(ctx.contained_host_refs),
         Some(ctx.descriptor_params),
     );
-    let scalar_value = if src_desc.is_none() {
+    let (scalar_value, scalar_complex_src) = if src_desc.is_none() {
         let raw = super::expr::lower_expr_ctx_tl(b, ctx, value);
-        Some(coerce_to_type(b, raw, &elem_ty))
+        if is_complex_ty(&elem_ty) {
+            let src = match b.func().value_type(raw) {
+                Some(IrType::Ptr(inner)) if inner.as_ref() == &elem_ty => raw,
+                _ => materialize_complex_operand(b, raw, complex_float_width(&elem_ty)),
+            };
+            (None, Some(src))
+        } else {
+            (Some(coerce_to_type(b, raw, &elem_ty)), None)
+        }
     } else {
-        None
+        (None, None)
     };
 
     let mut dest_los = Vec::with_capacity(dest_args.len());
@@ -32848,7 +32856,7 @@ pub(super) fn lower_vector_subscript_section_assign(
     }
     let dest_ptr = b.gep(dest_base, vec![dest_off], IrType::Int(IntWidth::I8));
 
-    let stored = if let Some((sd, src_ty)) = src_desc.as_ref() {
+    let (stored, complex_src_ptr) = if let Some((sd, src_ty)) = src_desc.as_ref() {
         let src_base = b.load_typed(*sd, IrType::Ptr(Box::new(src_ty.clone())));
         let src_elem_size = b.const_i64(ir_scalar_byte_size(src_ty));
         let mut src_off = b.const_i64(0);
@@ -32860,12 +32868,31 @@ pub(super) fn lower_vector_subscript_section_assign(
             src_off = b.iadd(src_off, stride_bytes);
         }
         let src_ptr = b.gep(src_base, vec![src_off], IrType::Int(IntWidth::I8));
-        let raw = b.load_typed(src_ptr, src_ty.clone());
-        coerce_to_type(b, raw, &elem_ty)
+        if is_complex_ty(&elem_ty) && is_complex_ty(src_ty) {
+            let src_ptr = if complex_float_width(src_ty) == complex_float_width(&elem_ty) {
+                src_ptr
+            } else {
+                let raw = b.load_typed(src_ptr, src_ty.clone());
+                materialize_complex_operand(b, raw, complex_float_width(&elem_ty))
+            };
+            (None, Some(src_ptr))
+        } else {
+            let raw = b.load_typed(src_ptr, src_ty.clone());
+            (Some(coerce_to_type(b, raw, &elem_ty)), None)
+        }
     } else {
-        scalar_value.expect("vector subscript section assign: scalar RHS")
+        (scalar_value, scalar_complex_src)
     };
-    b.store(stored, dest_ptr);
+    if let Some(src_ptr) = complex_src_ptr {
+        b.call(
+            FuncRef::External("memcpy".into()),
+            vec![dest_ptr, src_ptr, elem_bytes_v],
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        );
+    } else {
+        let stored = stored.expect("vector subscript section assign: scalar RHS");
+        b.store(stored, dest_ptr);
+    }
 
     let next = b.iadd(i, one64);
     b.store(next, i_addr);
@@ -32956,11 +32983,19 @@ pub(super) fn lower_multi_d_section_assign(
         total = b.imul(total, ext);
     }
 
-    let scalar_value = if src_desc.is_none() {
+    let (scalar_value, scalar_complex_src) = if src_desc.is_none() {
         let raw = super::expr::lower_expr_ctx_tl(b, ctx, value);
-        Some(coerce_to_type(b, raw, &elem_ty))
+        if is_complex_ty(&elem_ty) {
+            let src = match b.func().value_type(raw) {
+                Some(IrType::Ptr(inner)) if inner.as_ref() == &elem_ty => raw,
+                _ => materialize_complex_operand(b, raw, complex_float_width(&elem_ty)),
+            };
+            (None, Some(src))
+        } else {
+            (Some(coerce_to_type(b, raw, &elem_ty)), None)
+        }
     } else {
-        None
+        (None, None)
     };
 
     let i_addr = b.alloca(IrType::Int(IntWidth::I64));
@@ -32997,7 +33032,7 @@ pub(super) fn lower_multi_d_section_assign(
     }
     let dest_ptr = b.gep(dest_base, vec![dest_off], IrType::Int(IntWidth::I8));
 
-    let stored = if let Some((sd, src_ty)) = src_desc.as_ref() {
+    let (stored, complex_src_ptr) = if let Some((sd, src_ty)) = src_desc.as_ref() {
         let src_base = b.load_typed(*sd, IrType::Ptr(Box::new(src_ty.clone())));
         // Re-decompose the same flat i for the source descriptor (its
         // strides may differ from the destination's).
@@ -33019,12 +33054,31 @@ pub(super) fn lower_multi_d_section_assign(
             src_off = b.iadd(src_off, stride_bytes);
         }
         let src_ptr = b.gep(src_base, vec![src_off], IrType::Int(IntWidth::I8));
-        let raw = b.load_typed(src_ptr, src_ty.clone());
-        coerce_to_type(b, raw, &elem_ty)
+        if is_complex_ty(&elem_ty) && is_complex_ty(src_ty) {
+            let src_ptr = if complex_float_width(src_ty) == complex_float_width(&elem_ty) {
+                src_ptr
+            } else {
+                let raw = b.load_typed(src_ptr, src_ty.clone());
+                materialize_complex_operand(b, raw, complex_float_width(&elem_ty))
+            };
+            (None, Some(src_ptr))
+        } else {
+            let raw = b.load_typed(src_ptr, src_ty.clone());
+            (Some(coerce_to_type(b, raw, &elem_ty)), None)
+        }
     } else {
-        scalar_value.expect("multi-d section assign: scalar value for non-array RHS")
+        (scalar_value, scalar_complex_src)
     };
-    b.store(stored, dest_ptr);
+    if let Some(src_ptr) = complex_src_ptr {
+        b.call(
+            FuncRef::External("memcpy".into()),
+            vec![dest_ptr, src_ptr, elem_size_v],
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        );
+    } else {
+        let stored = stored.expect("multi-d section assign: scalar value for non-array RHS");
+        b.store(stored, dest_ptr);
+    }
 
     let one = b.const_i64(1);
     let next = b.iadd(i, one);
