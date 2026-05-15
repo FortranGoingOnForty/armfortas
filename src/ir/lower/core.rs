@@ -9597,6 +9597,22 @@ fn active_block_use_named_interface_symbols<'a>(
     symbols
 }
 
+fn scope_is_lexical_ancestor_or_self(
+    st: &SymbolTable,
+    mut scope_id: crate::sema::symtab::ScopeId,
+    target_scope: crate::sema::symtab::ScopeId,
+) -> bool {
+    loop {
+        if scope_id == target_scope {
+            return true;
+        }
+        let Some(parent) = st.scope(scope_id).parent else {
+            return false;
+        };
+        scope_id = parent;
+    }
+}
+
 pub(super) fn user_callable_shadows_intrinsic(st: &SymbolTable, name: &str) -> bool {
     use crate::sema::symtab::SymbolKind;
 
@@ -9687,8 +9703,10 @@ pub(super) fn named_interface_specific_candidates(
     let key = name.to_ascii_lowercase();
     if let Some(scope_id) = current_proc_scope() {
         if let Some(sym) = st.lookup_in(scope_id, &key) {
-            if let Some(specifics) = named_interface_specific_candidates_from_symbol(sym) {
-                return Some(specifics);
+            if scope_is_lexical_ancestor_or_self(st, scope_id, sym.scope) {
+                if let Some(specifics) = named_interface_specific_candidates_from_symbol(sym) {
+                    return Some(specifics);
+                }
             }
         }
     }
@@ -14080,37 +14098,39 @@ pub(super) fn resolve_subroutine_call_name(
     }
     if let Some(scope_id) = caller_scope_id {
         if let Some(sym) = st.lookup_in(scope_id, key) {
-            if let Some(specifics) = named_interface_specific_candidates_from_symbol(sym) {
-                match resolve_generic_call_actuals_from_specifics(
-                    st,
-                    b,
-                    locals,
-                    args,
-                    actual_vals,
-                    type_layouts,
-                    &specifics,
-                ) {
-                    Some(resolved) => {
-                        let rk = resolved.name.to_lowercase();
-                        let (call_name, _) =
-                            resolved_symbol_call_target_for_candidate(st, &resolved);
-                        return (call_name, rk);
-                    }
-                    None => {
-                        let candidate_names = specifics
-                            .iter()
-                            .map(|candidate| candidate.name.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        eprintln!(
-                            "armfortas: error: {}:{}: no specific procedure of generic '{}' matches the actual arguments; candidates: [{}]",
-                            span.start.line,
-                            span.start.col,
-                            orig_name,
-                            candidate_names,
-                        );
-                        let _ = std::io::stderr().flush();
-                        std::process::exit(1);
+            if scope_is_lexical_ancestor_or_self(st, scope_id, sym.scope) {
+                if let Some(specifics) = named_interface_specific_candidates_from_symbol(sym) {
+                    match resolve_generic_call_actuals_from_specifics(
+                        st,
+                        b,
+                        locals,
+                        args,
+                        actual_vals,
+                        type_layouts,
+                        &specifics,
+                    ) {
+                        Some(resolved) => {
+                            let rk = resolved.name.to_lowercase();
+                            let (call_name, _) =
+                                resolved_symbol_call_target_for_candidate(st, &resolved);
+                            return (call_name, rk);
+                        }
+                        None => {
+                            let candidate_names = specifics
+                                .iter()
+                                .map(|candidate| candidate.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            eprintln!(
+                                "armfortas: error: {}:{}: no specific procedure of generic '{}' matches the actual arguments; candidates: [{}]",
+                                span.start.line,
+                                span.start.col,
+                                orig_name,
+                                candidate_names,
+                            );
+                            let _ = std::io::stderr().flush();
+                            std::process::exit(1);
+                        }
                     }
                 }
             }
