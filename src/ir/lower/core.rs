@@ -30048,8 +30048,10 @@ pub(super) fn lower_rank1_elemental_call_descriptor(
 
     let mut mapped_args = Vec::with_capacity(args.len());
     let mut loop_locals = locals.clone();
-    let mut array_actuals: Vec<(String, ValueId, IrType, Option<CharKind>, bool)> = Vec::new();
+    let mut array_actuals: Vec<(String, ValueId, IrType, usize, Option<CharKind>, bool)> =
+        Vec::new();
     let mut control_desc = None;
+    let mut control_rank = None;
 
     for (idx, arg) in args.iter().enumerate() {
         let crate::ast::expr::SectionSubscript::Element(actual_expr) = &arg.value else {
@@ -30065,12 +30067,16 @@ pub(super) fn lower_rank1_elemental_call_descriptor(
             contained_host_refs,
             descriptor_params,
         ) {
+            let actual_rank = actual_expr_rank(actual_expr, locals, st, type_layouts)
+                .unwrap_or(1)
+                .max(1);
             let actual_type = operator_expr_type_info(actual_expr, Some(locals), st, type_layouts);
             let actual_is_character =
                 expr_is_character_expr(b, locals, actual_expr, st, type_layouts);
             let pass_optional_element_by_ref =
                 !actual_is_character && elemental_actual_may_be_absent(actual_expr, locals, st);
             control_desc.get_or_insert(actual_desc);
+            control_rank.get_or_insert(actual_rank);
             let temp_name = fresh_elemental_temp_name(&loop_locals, "afs_elem_arg", idx);
             let mut char_kind = CharKind::None;
             let temp_addr = if pass_optional_element_by_ref {
@@ -30209,6 +30215,7 @@ pub(super) fn lower_rank1_elemental_call_descriptor(
                 temp_name.clone(),
                 actual_desc,
                 actual_elem_ty,
+                actual_rank,
                 (char_kind != CharKind::None).then_some(char_kind),
                 pass_optional_element_by_ref,
             ));
@@ -30229,6 +30236,7 @@ pub(super) fn lower_rank1_elemental_call_descriptor(
     }
 
     let control_desc = control_desc?;
+    let control_rank = control_rank.unwrap_or(1).max(1);
     let result_type = operator_expr_type_info(expr, Some(locals), st, type_layouts)?;
     let (result_elem_ty, result_char_len) = match result_type {
         crate::sema::symtab::TypeInfo::Character { len: Some(len), .. } => {
@@ -30285,12 +30293,21 @@ pub(super) fn lower_rank1_elemental_call_descriptor(
 
     b.set_block(bb_body);
     let cur_idx = b.load(idx_addr);
-    for (temp_name, actual_desc, actual_elem_ty, char_kind, optional_by_ref) in &array_actuals {
+    for (temp_name, actual_desc, actual_elem_ty, actual_rank, char_kind, optional_by_ref) in
+        &array_actuals
+    {
         let temp_info = loop_locals
             .get(temp_name)
             .expect("elemental temp local must exist");
         if *optional_by_ref {
-            store_optional_element_actual_ptr(b, temp_info, *actual_desc, actual_elem_ty, cur_idx);
+            store_optional_element_actual_ptr(
+                b,
+                temp_info,
+                *actual_desc,
+                actual_elem_ty,
+                cur_idx,
+                *actual_rank,
+            );
         } else if temp_info.derived_type.is_some() || is_complex_ty(actual_elem_ty) {
             // Derived/class actual: memcpy elem_size bytes from the
             // i-th array element into the per-iteration temp slot.
@@ -30298,7 +30315,8 @@ pub(super) fn lower_rank1_elemental_call_descriptor(
             // load that codegen can't materialize cleanly.
             // Complex values have the same aggregate-register hazard,
             // especially complex(real64), so copy their storage bytes too.
-            let src_ptr = rank1_array_desc_elem_ptr(b, *actual_desc, actual_elem_ty, cur_idx);
+            let src_ptr =
+                array_desc_elem_ptr_rank(b, *actual_desc, actual_elem_ty, cur_idx, *actual_rank);
             let elem_bytes = b.const_i64(ir_scalar_byte_size(actual_elem_ty));
             b.call(
                 FuncRef::External("memcpy".into()),
@@ -30333,7 +30351,8 @@ pub(super) fn lower_rank1_elemental_call_descriptor(
                 IrType::Void,
             );
         } else {
-            let elem = load_rank1_array_desc_elem(b, *actual_desc, actual_elem_ty, cur_idx);
+            let elem =
+                load_array_desc_elem_rank(b, *actual_desc, actual_elem_ty, cur_idx, *actual_rank);
             b.store(elem, temp_info.addr);
         }
     }
@@ -30374,7 +30393,14 @@ pub(super) fn lower_rank1_elemental_call_descriptor(
             contained_host_refs,
             descriptor_params,
         );
-        store_rank1_array_desc_elem(b, result_desc, &result_elem_ty, cur_idx, scalar);
+        store_array_desc_elem_rank(
+            b,
+            result_desc,
+            &result_elem_ty,
+            cur_idx,
+            control_rank,
+            scalar,
+        );
     }
 
     let one = b.const_i64(1);
@@ -30415,6 +30441,7 @@ fn store_optional_element_actual_ptr(
     actual_desc: ValueId,
     actual_elem_ty: &IrType,
     cur_idx: ValueId,
+    actual_rank: usize,
 ) {
     let base = b.load_typed(actual_desc, IrType::Ptr(Box::new(actual_elem_ty.clone())));
     let base_addr = b.ptr_to_int(base);
@@ -30427,7 +30454,8 @@ fn store_optional_element_actual_ptr(
     b.cond_branch(present, bb_present, vec![], bb_absent, vec![]);
 
     b.set_block(bb_present);
-    let elem_byte_ptr = rank1_array_desc_elem_ptr(b, actual_desc, actual_elem_ty, cur_idx);
+    let elem_byte_ptr =
+        array_desc_elem_ptr_rank(b, actual_desc, actual_elem_ty, cur_idx, actual_rank);
     let elem_addr = b.ptr_to_int(elem_byte_ptr);
     let elem_ptr = b.int_to_ptr(elem_addr, actual_elem_ty.clone());
     b.store(elem_ptr, temp_info.addr);

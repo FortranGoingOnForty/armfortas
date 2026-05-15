@@ -18028,6 +18028,42 @@ fn rank3_middle_section_arithmetic_uses_strided_descriptor() {
 }
 
 #[test]
+fn rank3_middle_section_real_conversion_uses_strided_descriptor() {
+    // Elemental array calls also materialize descriptor-backed temporaries.
+    // REAL(x(:, i, :), 8) over an integer rank-3 middle section must walk the
+    // non-contiguous source descriptor with per-dim strides, not dim[0] only.
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: x(4,3,3), d(4,3)\n  real(8) :: center(4,3), res(4,3), expected(4,3)\n  integer :: a, b, c, i\n  d(:,1) = [1, 3, 5, 7]\n  d(:,2) = [2, 4, 6, 8]\n  d(:,3) = [9, 10, 11, 12]\n  do c = 1, 3\n    do b = 1, 3\n      do a = 1, 4\n        x(a,b,c) = d(a,b) * (2 ** (c - 1))\n      end do\n    end do\n  end do\n  do c = 1, 3\n    do a = 1, 4\n      center(a,c) = real(sum(x(a,:,c)), 8) / 3.0_8\n    end do\n  end do\n  do i = 1, 3\n    do c = 1, 3\n      do a = 1, 4\n        expected(a,c) = real(x(a,i,c), 8) - center(a,c)\n      end do\n    end do\n    res = real(x(:, i, :), 8) - center\n    if (maxval(abs(res - expected)) > 1.0e-10_8) error stop i\n  end do\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("rank3_middle_section_real_conv", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("rank3 middle-section real conversion compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "rank3 middle-section real conversion should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("rank3 middle-section real conversion run failed");
+    assert!(
+        run.status.success(),
+        "rank3 middle-section real conversion should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn all_compare_mixed_kind_generic_rank2_returns_descriptors() {
     // F2018 §10.1.5 + §16.9.5: `all(eye(4) == diag([1,1,1,1]))` from
     // stdlib's example_eye2. Reproduces three issues at once: generic-
