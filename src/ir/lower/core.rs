@@ -27562,6 +27562,7 @@ pub(super) fn emit_bulk_array_plan(
     match plan {
         BulkArrayPlan::Fill { kernel, scalar } => {
             let scalar = super::expr::lower_expr_ctx_tl(b, ctx, &scalar);
+            let scalar = coerce_to_type(b, scalar, &dest_info.ty);
             b.call(
                 FuncRef::External(kernel.into()),
                 vec![dest_base, n, scalar],
@@ -27584,6 +27585,7 @@ pub(super) fn emit_bulk_array_plan(
         } => {
             let array_base = array_base_addr(b, &array);
             let scalar = super::expr::lower_expr_ctx_tl(b, ctx, &scalar);
+            let scalar = coerce_to_type(b, scalar, &dest_info.ty);
             b.call(
                 FuncRef::External(kernel.into()),
                 vec![dest_base, array_base, scalar, n],
@@ -27596,6 +27598,7 @@ pub(super) fn emit_bulk_array_plan(
             array,
         } => {
             let scalar = super::expr::lower_expr_ctx_tl(b, ctx, &scalar);
+            let scalar = coerce_to_type(b, scalar, &dest_info.ty);
             let array_base = array_base_addr(b, &array);
             b.call(
                 FuncRef::External(kernel.into()),
