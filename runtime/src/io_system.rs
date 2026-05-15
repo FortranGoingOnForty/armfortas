@@ -3434,7 +3434,7 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
         if let Some(c) = context {
             let descriptors = parse_format(&c.format_str);
             let mut engine = FormatEngine::new(descriptors);
-            let output = engine.format_values(&c.values);
+            let formatted = engine.format_values_checked(&c.values);
 
             // Track success across the sink branches. List-directed and
             // scalar formatted writes both leave `iostat` untouched on
@@ -3446,25 +3446,31 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
             let mut io_status: i32 = 0;
             let mut io_msg: Option<&'static str> = None;
 
-            match c.sink {
-                FmtSink::Unit(unit) => {
-                    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(u) = state.get_unit(unit) {
-                        if u.write_str(&output).is_err() {
+            match formatted {
+                Ok(output) => match c.sink {
+                    FmtSink::Unit(unit) => {
+                        let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(u) = state.get_unit(unit) {
+                            if u.write_str(&output).is_err() {
+                                io_status = 1;
+                                io_msg = Some("write failed");
+                            }
+                            if io_status == 0 && advance != 0 && u.write_str("\n").is_err() {
+                                io_status = 1;
+                                io_msg = Some("write failed");
+                            }
+                        } else {
                             io_status = 1;
-                            io_msg = Some("write failed");
+                            io_msg = Some("unit not connected");
                         }
-                        if io_status == 0 && advance != 0 && u.write_str("\n").is_err() {
-                            io_status = 1;
-                            io_msg = Some("write failed");
-                        }
-                    } else {
-                        io_status = 1;
-                        io_msg = Some("unit not connected");
                     }
-                }
-                FmtSink::Internal { buf, buf_len } => {
-                    write_to_buffer(buf, buf_len, 0, output.as_bytes(), std::ptr::null_mut());
+                    FmtSink::Internal { buf, buf_len } => {
+                        write_to_buffer(buf, buf_len, 0, output.as_bytes(), std::ptr::null_mut());
+                    }
+                },
+                Err(_) => {
+                    io_status = 1;
+                    io_msg = Some("format error");
                 }
             }
 
