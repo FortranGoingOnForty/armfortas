@@ -3143,6 +3143,22 @@ fn host_assumed_len_closure_forward_fixture_passes_at_o0() {
 }
 
 #[test]
+fn merge_scalar_sources_array_mask_fixture_passes_at_o0() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("merge_scalar_sources_array_mask.f90");
+    assert!(source.exists(), "merge_scalar_sources_array_mask.f90 missing");
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "merge_scalar_sources_array_mask.f90 should pass at -O0, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
 fn opt_eq_annotations_allow_hello_cross_opt_invariant() {
     let compiler = find_compiler();
     let test_dir = find_test_programs();
