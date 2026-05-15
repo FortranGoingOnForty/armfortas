@@ -33126,6 +33126,15 @@ pub(super) fn lower_vector_subscript_section_assign(
     {
         return false;
     }
+    let has_vector_subscript = dest_args.iter().any(|arg| {
+        matches!(
+            &arg.value,
+            SectionSubscript::Element(e) if expr_returns_array(e, &ctx.locals, ctx.st)
+        )
+    });
+    if !has_vector_subscript {
+        return false;
+    }
 
     enum DimKind {
         Range {
