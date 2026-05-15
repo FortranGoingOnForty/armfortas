@@ -25,8 +25,8 @@ use super::const_scalar::{
     ConstScalar,
 };
 use super::ctx::{
-    current_proc_scope, current_smp_extra_host, AmbiguousUseWarnings, CharKind, HiddenResultAbi,
-    LocalInfo, LowerCtx,
+    active_block_uses, current_proc_scope, current_smp_extra_host, AmbiguousUseWarnings, CharKind,
+    HiddenResultAbi, LocalInfo, LowerCtx,
 };
 use super::helpers::{
     clamp_nonnegative_i64, coerce_to_type, const_range_for_ir_type, widen_to_i64,
@@ -9445,6 +9445,21 @@ pub(super) fn find_named_interface_symbol<'a>(
     name: &str,
 ) -> Option<&'a crate::sema::symtab::Symbol> {
     let key = name.to_ascii_lowercase();
+    if let Some(scope_id) = current_proc_scope() {
+        if let Some(sym) = st.lookup_in(scope_id, &key) {
+            if is_named_interface_like(sym) {
+                return Some(sym);
+            }
+        }
+    }
+
+    if let Some(sym) = active_block_use_named_interface_symbols(st, &key)
+        .into_iter()
+        .next()
+    {
+        return Some(sym);
+    }
+
     if let Some(sym) = st.lookup(&key) {
         if is_named_interface_like(sym) {
             return Some(sym);
@@ -9506,6 +9521,77 @@ fn use_associated_named_interface_symbols<'a>(
                     symbols.push(sym);
                 }
             }
+        }
+    }
+    symbols
+}
+
+fn active_block_use_named_interface_symbols<'a>(
+    st: &'a SymbolTable,
+    key: &str,
+) -> Vec<&'a crate::sema::symtab::Symbol> {
+    use crate::ast::decl::{Decl, OnlyItem};
+
+    let mut symbols = Vec::new();
+    let mut seen = HashSet::new();
+    for uses in active_block_uses().iter().rev() {
+        for use_decl in uses {
+            let Decl::UseStmt {
+                module,
+                renames,
+                only,
+                ..
+            } = &use_decl.node
+            else {
+                continue;
+            };
+            let Some(source_scope) = st.find_module_scope(module) else {
+                continue;
+            };
+            let mut original_names = Vec::new();
+            if let Some(only_items) = only {
+                for item in only_items {
+                    match item {
+                        OnlyItem::Name(name) | OnlyItem::Generic(name)
+                            if name.eq_ignore_ascii_case(key) =>
+                        {
+                            original_names.push(name.to_ascii_lowercase());
+                        }
+                        OnlyItem::Rename(rename) if rename.local.eq_ignore_ascii_case(key) => {
+                            original_names.push(rename.remote.to_ascii_lowercase());
+                        }
+                        _ => {}
+                    }
+                }
+            } else {
+                let mut renamed = false;
+                for rename in renames {
+                    if rename.local.eq_ignore_ascii_case(key) {
+                        original_names.push(rename.remote.to_ascii_lowercase());
+                        renamed = true;
+                    }
+                }
+                if !renamed {
+                    original_names.push(key.to_string());
+                }
+            }
+            for original_name in original_names {
+                if !st.scope_exports_name(source_scope, &original_name) {
+                    continue;
+                }
+                if let Some(sym) = st
+                    .lookup_in(source_scope, &original_name)
+                    .filter(|sym| is_named_interface_like(sym))
+                {
+                    let sym_key = (sym.name.to_ascii_lowercase(), sym.scope);
+                    if seen.insert(sym_key) {
+                        symbols.push(sym);
+                    }
+                }
+            }
+        }
+        if !symbols.is_empty() {
+            return symbols;
         }
     }
     symbols
@@ -9599,8 +9685,23 @@ pub(super) fn named_interface_specific_candidates(
     name: &str,
 ) -> Option<Vec<SpecificProcCandidate>> {
     let key = name.to_ascii_lowercase();
+    if let Some(scope_id) = current_proc_scope() {
+        if let Some(sym) = st.lookup_in(scope_id, &key) {
+            if let Some(specifics) = named_interface_specific_candidates_from_symbol(sym) {
+                return Some(specifics);
+            }
+        }
+    }
+
     let mut specifics = Vec::new();
     let mut seen = HashSet::new();
+
+    for sym in active_block_use_named_interface_symbols(st, &key) {
+        append_named_interface_specific_candidates(sym, &mut specifics, &mut seen);
+    }
+    if !specifics.is_empty() {
+        return Some(specifics);
+    }
 
     if let Some(sym) = st.lookup(&key) {
         if is_named_interface_like(sym) {
@@ -38467,6 +38568,7 @@ pub(super) fn ensure_hidden_string_result_local(
     return_type: Option<&TypeSpec>,
     visible_param_consts: &HashMap<String, ConstScalar>,
     st: &SymbolTable,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
 ) {
     if locals.contains_key(result_name) {
         return;
@@ -38557,7 +38659,13 @@ pub(super) fn ensure_hidden_string_result_local(
         Some(crate::ast::decl::LenSpec::Expr(expr)) => Some(expr),
         _ => None,
     }) {
-        let raw_len = super::expr::lower_expr(b, locals, len_expr, st);
+        let raw_len = super::expr::lower_expr_with_optional_layouts(
+            b,
+            locals,
+            len_expr,
+            st,
+            Some(type_layouts),
+        );
         let len_val = clamp_nonnegative_i64(b, raw_len);
         let len_addr = b.alloca(IrType::Int(IntWidth::I64));
         b.store(len_val, len_addr);

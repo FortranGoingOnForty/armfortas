@@ -3248,6 +3248,60 @@ fn elemental_generic_array_expr_actual_fixture_passes_at_o0() {
 }
 
 #[test]
+fn submodule_use_generic_sqrt_diag_fixture_passes_at_o0() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("submodule_use_generic_sqrt_diag.f90");
+    assert!(
+        source.exists(),
+        "submodule_use_generic_sqrt_diag.f90 missing"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "submodule_use_generic_sqrt_diag.f90 should pass at -O0, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn block_use_generic_string_function_fixture_passes_at_o0() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("block_use_generic_string_function.f90");
+    assert!(
+        source.exists(),
+        "block_use_generic_string_function.f90 missing"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "block_use_generic_string_function.f90 should pass at -O0, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn generic_len_result_character_fixture_passes_at_o0() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("generic_len_result_character.f90");
+    assert!(source.exists(), "generic_len_result_character.f90 missing");
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "generic_len_result_character.f90 should pass at -O0, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
 fn list_directed_real_implicit_exponent_fixture_passes_at_o0() {
     let compiler = find_compiler();
     let test_dir = find_test_programs();
