@@ -705,6 +705,9 @@ impl FormatEngine {
 
             // ---- Real ----
             (FormatDesc::RealF { width, decimals }, IoValue::Real(v)) => {
+                if let Some(s) = self.format_nonfinite(*v) {
+                    return self.apply_decimal_sep(&format!("{:>width$}", s, width = *width));
+                }
                 // kP scale factor: F format multiplies value by 10^k.
                 let scaled = *v * 10f64.powi(self.scale_factor);
                 let rounded = self.apply_rounding(scaled, *decimals);
@@ -719,6 +722,9 @@ impl FormatEngine {
                 },
                 IoValue::Real(v),
             ) => {
+                if let Some(s) = self.format_nonfinite(*v) {
+                    return self.apply_decimal_sep(&format!("{:>width$}", s, width = *width));
+                }
                 let s = self.format_e_style(*v, *decimals, *exp_width, 'E');
                 self.apply_decimal_sep(&format!("{:>width$}", s, width = *width))
             }
@@ -730,6 +736,9 @@ impl FormatEngine {
                 },
                 IoValue::Real(v),
             ) => {
+                if let Some(s) = self.format_nonfinite(*v) {
+                    return self.apply_decimal_sep(&format!("{:>width$}", s, width = *width));
+                }
                 // Scientific: mantissa in [1.0, 10.0). Equivalent to 1P,E.
                 let s = self.format_es_style(*v, *decimals, *exp_width);
                 self.apply_decimal_sep(&format!("{:>width$}", s, width = *width))
@@ -740,6 +749,9 @@ impl FormatEngine {
                 },
                 IoValue::Real(v),
             ) => {
+                if let Some(s) = self.format_nonfinite(*v) {
+                    return self.apply_decimal_sep(&format!("{:>width$}", s, width = *width));
+                }
                 // Engineering: exponent is multiple of 3.
                 let (mantissa, exp) = to_engineering(*v);
                 let rounded = self.apply_rounding(mantissa, *decimals);
@@ -747,6 +759,9 @@ impl FormatEngine {
                 self.apply_decimal_sep(&format!("{:>width$}", s, width = *width))
             }
             (FormatDesc::RealD { width, decimals }, IoValue::Real(v)) => {
+                if let Some(s) = self.format_nonfinite(*v) {
+                    return self.apply_decimal_sep(&format!("{:>width$}", s, width = *width));
+                }
                 let s = self.format_e_style(*v, *decimals, None, 'D');
                 self.apply_decimal_sep(&format!("{:>width$}", s, width = *width))
             }
@@ -758,6 +773,9 @@ impl FormatEngine {
                 },
                 IoValue::Real(v),
             ) => {
+                if let Some(s) = self.format_nonfinite(*v) {
+                    return self.apply_decimal_sep(&format!("{:>width$}", s, width = *width));
+                }
                 // G format: use F if magnitude fits, else E.
                 let abs_v = v.abs();
                 if abs_v == 0.0 || (abs_v >= 0.1 && abs_v < 10f64.powi(*decimals as i32)) {
@@ -775,6 +793,9 @@ impl FormatEngine {
                 },
                 IoValue::Real(v),
             ) => {
+                if let Some(s) = self.format_nonfinite(*v) {
+                    return self.apply_decimal_sep(&format!("{:>width$}", s, width = *width));
+                }
                 // Hex-significand: use %a-like format. Rust doesn't have this natively.
                 let s = format!("{:.*E}", *decimals, v); // fallback to E format
                 self.apply_decimal_sep(&format!("{:>width$}", s, width = *width))
@@ -855,6 +876,23 @@ impl FormatEngine {
     /// Format a fixed-point number (for F and G-as-F).
     fn format_fixed(&self, v: f64, decimals: usize) -> String {
         format!("{:.*}", decimals, v)
+    }
+
+    fn format_nonfinite(&self, v: f64) -> Option<String> {
+        if v.is_nan() {
+            Some("NaN".to_string())
+        } else if v.is_infinite() {
+            let sign = if v.is_sign_negative() {
+                "-"
+            } else if matches!(self.sign_mode, SignMode::Plus) {
+                "+"
+            } else {
+                ""
+            };
+            Some(format!("{}Inf", sign))
+        } else {
+            None
+        }
     }
 
     /// Format in E/D style with scale factor applied.
@@ -1347,6 +1385,31 @@ mod tests {
         let out = engine.format_values(&[IoValue::Real(1.5)]);
         // 1.5 * 100 = 150.00
         assert_eq!(out.trim(), "150.00");
+    }
+
+    #[test]
+    fn format_g0_nonfinite_reals() {
+        let descs = parse_format("(G0, 1X, G0, 1X, G0)");
+        let mut engine = FormatEngine::new(descs);
+        let out = engine.format_values(&[
+            IoValue::Real(f64::INFINITY),
+            IoValue::Real(f64::NEG_INFINITY),
+            IoValue::Real(f64::NAN),
+        ]);
+        assert_eq!(out, "Inf -Inf NaN");
+    }
+
+    #[test]
+    fn format_exponential_nonfinite_reals() {
+        let descs = parse_format("(E8.1, 1X, ES8.1, 1X, EN8.1, 1X, D8.1)");
+        let mut engine = FormatEngine::new(descs);
+        let out = engine.format_values(&[
+            IoValue::Real(f64::INFINITY),
+            IoValue::Real(f64::INFINITY),
+            IoValue::Real(f64::INFINITY),
+            IoValue::Real(f64::INFINITY),
+        ]);
+        assert_eq!(out.split_whitespace().collect::<Vec<_>>(), vec!["Inf"; 4]);
     }
 
     #[test]
