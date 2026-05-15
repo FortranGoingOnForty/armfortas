@@ -9597,13 +9597,21 @@ fn active_block_use_named_interface_symbols<'a>(
     symbols
 }
 
-fn scope_is_lexical_ancestor_or_self(
+fn scope_is_host_associated_or_self(
     st: &SymbolTable,
     mut scope_id: crate::sema::symtab::ScopeId,
     target_scope: crate::sema::symtab::ScopeId,
 ) -> bool {
     loop {
         if scope_id == target_scope {
+            return true;
+        }
+        if st
+            .scope(scope_id)
+            .use_associations
+            .iter()
+            .any(|assoc| assoc.is_submodule_access && assoc.source_scope == target_scope)
+        {
             return true;
         }
         let Some(parent) = st.scope(scope_id).parent else {
@@ -9703,7 +9711,7 @@ pub(super) fn named_interface_specific_candidates(
     let key = name.to_ascii_lowercase();
     if let Some(scope_id) = current_proc_scope() {
         if let Some(sym) = st.lookup_in(scope_id, &key) {
-            if scope_is_lexical_ancestor_or_self(st, scope_id, sym.scope) {
+            if scope_is_host_associated_or_self(st, scope_id, sym.scope) {
                 if let Some(specifics) = named_interface_specific_candidates_from_symbol(sym) {
                     return Some(specifics);
                 }
@@ -14098,7 +14106,7 @@ pub(super) fn resolve_subroutine_call_name(
     }
     if let Some(scope_id) = caller_scope_id {
         if let Some(sym) = st.lookup_in(scope_id, key) {
-            if scope_is_lexical_ancestor_or_self(st, scope_id, sym.scope) {
+            if scope_is_host_associated_or_self(st, scope_id, sym.scope) {
                 if let Some(specifics) = named_interface_specific_candidates_from_symbol(sym) {
                     match resolve_generic_call_actuals_from_specifics(
                         st,
