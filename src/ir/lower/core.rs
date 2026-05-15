@@ -8575,7 +8575,7 @@ fn lower_logical_reduction_defined_array_ctor_compare(
     descriptor_params: Option<&HashMap<String, Vec<bool>>>,
 ) -> Option<ValueId> {
     let iface_name = binary_op_interface_name(op)?;
-    let candidates = named_interface_specific_candidates(st, &iface_name)?;
+    let candidates = operator_interface_specific_candidates(st, &iface_name)?;
     let array_ti = operator_expr_type_info(array_expr, Some(locals), st, type_layouts)?;
     let ctor_ti = first_array_constructor_type_info(ctor_values, Some(locals), st, type_layouts)?;
     if !matches!(ctor_ti, crate::sema::symtab::TypeInfo::Character { .. }) {
@@ -9772,6 +9772,25 @@ pub(super) fn named_interface_specifics(st: &SymbolTable, name: &str) -> Option<
         }
     }
     Some(specifics)
+}
+
+fn operator_interface_specific_candidates(
+    st: &SymbolTable,
+    iface_name: &str,
+) -> Option<Vec<SpecificProcCandidate>> {
+    let mut all_candidates = named_interface_specific_candidates(st, iface_name)?;
+    let mut seen_candidates: HashSet<(String, crate::sema::symtab::ScopeId)> = all_candidates
+        .iter()
+        .map(|candidate| (candidate.name.to_ascii_lowercase(), candidate.owner_scope))
+        .collect();
+    let iface_key = iface_name.to_ascii_lowercase();
+    for sym in active_block_use_named_interface_symbols(st, &iface_key) {
+        append_named_interface_specific_candidates(sym, &mut all_candidates, &mut seen_candidates);
+    }
+    for sym in use_associated_named_interface_symbols(st, &iface_key) {
+        append_named_interface_specific_candidates(sym, &mut all_candidates, &mut seen_candidates);
+    }
+    (!all_candidates.is_empty()).then_some(all_candidates)
 }
 
 pub(super) fn resolve_generic_call_slots(
@@ -12194,7 +12213,7 @@ pub(super) fn defined_binary_operator_result_type_info(
     right_ti: Option<&crate::sema::symtab::TypeInfo>,
 ) -> Option<crate::sema::symtab::TypeInfo> {
     let iface_name = binary_op_interface_name(op)?;
-    let specifics = named_interface_specific_candidates(st, &iface_name)?;
+    let specifics = operator_interface_specific_candidates(st, &iface_name)?;
     let left_actual_rank =
         locals.and_then(|locals| actual_expr_rank(left_expr, locals, st, type_layouts));
     let right_actual_rank =
@@ -12247,7 +12266,7 @@ pub(super) fn resolve_defined_binary_operator_specific_by_semantics(
     right_expr: &crate::ast::expr::SpannedExpr,
 ) -> Option<String> {
     let iface_name = binary_op_interface_name(op)?;
-    let specifics = named_interface_specific_candidates(st, &iface_name)?;
+    let specifics = operator_interface_specific_candidates(st, &iface_name)?;
     let left_ti = operator_expr_type_info(left_expr, locals, st, type_layouts);
     let right_ti = operator_expr_type_info(right_expr, locals, st, type_layouts);
     if operator_builtin_intrinsic_operand(left_ti.as_ref())
@@ -13395,20 +13414,7 @@ pub(super) fn resolve_operator_overload(
         return None;
     }
     let iface_name = binary_op_interface_name(op)?;
-    let mut all_candidates = named_interface_specific_candidates(st, &iface_name)?;
-    let mut seen_candidates: HashSet<(String, crate::sema::symtab::ScopeId)> = all_candidates
-        .iter()
-        .map(|candidate| (candidate.name.to_ascii_lowercase(), candidate.owner_scope))
-        .collect();
-    for sym in active_block_use_named_interface_symbols(st, &iface_name.to_ascii_lowercase()) {
-        append_named_interface_specific_candidates(sym, &mut all_candidates, &mut seen_candidates);
-    }
-    for sym in use_associated_named_interface_symbols(st, &iface_name.to_ascii_lowercase()) {
-        append_named_interface_specific_candidates(sym, &mut all_candidates, &mut seen_candidates);
-    }
-    if all_candidates.is_empty() {
-        return None;
-    }
+    let all_candidates = operator_interface_specific_candidates(st, &iface_name)?;
 
     let left_semantic_ti = operator_expr_type_info(left_expr, Some(locals), st, type_layouts);
     let right_semantic_ti = operator_expr_type_info(right_expr, Some(locals), st, type_layouts);
@@ -34036,6 +34042,114 @@ pub(super) fn lower_forall_nested(
     }
 }
 
+fn fixed_char_allocatable_array_elem_len(b: &mut FuncBuilder, info: &LocalInfo) -> Option<ValueId> {
+    match info.char_kind {
+        CharKind::Fixed(len) => Some(b.const_i64(len)),
+        CharKind::FixedRuntime { len_addr } | CharKind::AssumedLen { len_addr } => {
+            Some(b.load(len_addr))
+        }
+        _ => None,
+    }
+}
+
+fn try_lower_fixed_char_allocatable_constructor_assign(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    dest_info: &LocalInfo,
+    value: &crate::ast::expr::SpannedExpr,
+) -> bool {
+    let Expr::ArrayConstructor { values, .. } = &value.node else {
+        return false;
+    };
+    if array_constructor_contains_whole_array_expr(&ctx.locals, values) {
+        return false;
+    }
+    let Some(dest_elem_len) = fixed_char_allocatable_array_elem_len(b, dest_info) else {
+        return false;
+    };
+    let Some((src_desc, _)) = lower_array_expr_descriptor(
+        b,
+        &ctx.locals,
+        value,
+        ctx.st,
+        Some(ctx.type_layouts),
+        Some(ctx.internal_funcs),
+        Some(ctx.contained_host_refs),
+        Some(ctx.descriptor_params),
+    ) else {
+        return false;
+    };
+
+    let dest_desc = array_descriptor_addr(b, dest_info);
+    let stat = b.alloca(IrType::Int(IntWidth::I32));
+    let zero32 = b.const_i32(0);
+    b.store(zero32, stat);
+    b.call(
+        FuncRef::External("afs_deallocate_array".into()),
+        vec![dest_desc, stat],
+        IrType::Void,
+    );
+    b.store(zero32, stat);
+    b.call(
+        FuncRef::External("afs_allocate_like_with_elem_size".into()),
+        vec![dest_desc, src_desc, dest_elem_len, stat],
+        IrType::Void,
+    );
+
+    let dest_base = b.load_typed(dest_desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    let src_base = b.load_typed(src_desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    let dest_n = b.call(
+        FuncRef::External("afs_array_size".into()),
+        vec![dest_desc],
+        IrType::Int(IntWidth::I64),
+    );
+    let src_n = b.call(
+        FuncRef::External("afs_array_size".into()),
+        vec![src_desc],
+        IrType::Int(IntWidth::I64),
+    );
+    let dest_stride = load_array_desc_i64_field(b, dest_desc, 24 + 16);
+    let src_stride = load_array_desc_i64_field(b, src_desc, 24 + 16);
+    let src_elem_len = descriptor_elem_size(b, src_desc);
+
+    let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let zero64 = b.const_i64(0);
+    b.store(zero64, i_addr);
+
+    let bb_check = b.create_block("fixed_char_alloc_ctor_check");
+    let bb_body = b.create_block("fixed_char_alloc_ctor_body");
+    let bb_exit = b.create_block("fixed_char_alloc_ctor_exit");
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let i = b.load(i_addr);
+    let dest_done = b.icmp(CmpOp::Ge, i, dest_n);
+    let src_done = b.icmp(CmpOp::Ge, i, src_n);
+    let done = b.or(dest_done, src_done);
+    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+    b.set_block(bb_body);
+    let i_val = b.load(i_addr);
+    let dest_index = b.imul(i_val, dest_stride);
+    let dest_off = b.imul(dest_index, dest_elem_len);
+    let dest_ptr = b.gep(dest_base, vec![dest_off], IrType::Int(IntWidth::I8));
+    let src_index = b.imul(i_val, src_stride);
+    let src_off = b.imul(src_index, src_elem_len);
+    let src_ptr = b.gep(src_base, vec![src_off], IrType::Int(IntWidth::I8));
+    b.call(
+        FuncRef::External("afs_assign_char_fixed".into()),
+        vec![dest_ptr, dest_elem_len, src_ptr, src_elem_len],
+        IrType::Void,
+    );
+    let one64 = b.const_i64(1);
+    let next_i = b.iadd(i_val, one64);
+    b.store(next_i, i_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
+    true
+}
+
 /// Lower whole-array assignment: a = b (element-wise copy) or a = scalar (broadcast).
 pub(super) fn lower_array_assign(
     b: &mut FuncBuilder,
@@ -34250,6 +34364,10 @@ pub(super) fn lower_array_assign(
                     return;
                 }
             }
+        }
+
+        if try_lower_fixed_char_allocatable_constructor_assign(b, ctx, dest_info, value) {
+            return;
         }
 
         if let Some((src_desc, src_elem_ty)) = lower_array_expr_descriptor(
