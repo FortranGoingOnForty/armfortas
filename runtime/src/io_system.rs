@@ -2658,6 +2658,44 @@ pub extern "C" fn afs_read_internal_int(
     }
 }
 
+/// Read a list-directed character token from a character buffer (internal I/O).
+#[no_mangle]
+pub extern "C" fn afs_read_internal_string(
+    buf: *const u8,
+    buf_len: i64,
+    pos: *mut i64,
+    dest: *mut u8,
+    dest_len: i64,
+    iostat: *mut i32,
+) {
+    if dest.is_null() || dest_len <= 0 {
+        if !iostat.is_null() {
+            unsafe {
+                *iostat = 1;
+            }
+        }
+        return;
+    }
+
+    let dest_slice = unsafe { std::slice::from_raw_parts_mut(dest, dest_len as usize) };
+    dest_slice.fill(b' ');
+
+    if let Some(token) = next_internal_token(buf, buf_len, pos) {
+        let bytes = token.as_bytes();
+        let n = bytes.len().min(dest_slice.len());
+        dest_slice[..n].copy_from_slice(&bytes[..n]);
+        if !iostat.is_null() {
+            unsafe {
+                *iostat = 0;
+            }
+        }
+    } else if !iostat.is_null() {
+        unsafe {
+            *iostat = -1;
+        }
+    }
+}
+
 /// Read an i64 from a character buffer (internal I/O).
 #[no_mangle]
 pub extern "C" fn afs_read_internal_int64(

@@ -22147,6 +22147,37 @@ fn list_directed_read_unit_real_returns_correct_f32_value() {
 }
 
 #[test]
+fn internal_list_read_mixed_integer_and_character_token_runs() {
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=64) :: line\n  character(len=16) :: command\n  integer :: pid, ios\n  line = '12345 fortsh'\n  pid = -1\n  command = ''\n  read(line, *, iostat=ios) pid, command\n  if (ios /= 0) error stop 1\n  if (pid /= 12345) error stop 2\n  if (trim(command) /= 'fortsh') error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("internal_list_read_char", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("internal mixed read compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "internal mixed read should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "internal mixed read should run cleanly: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok in output: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn list_directed_read_with_no_items_advances_one_record_and_sets_eof_iostat() {
     // Regression: `read(unit, *, iostat=ios)` with no items used to be
     // a silent no-op — neither the file position nor iostat was
