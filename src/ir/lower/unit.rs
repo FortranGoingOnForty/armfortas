@@ -108,6 +108,7 @@ pub(crate) fn lower_unit(
 
             {
                 let mut b = FuncBuilder::new(&mut func);
+                let _setup_proc_scope_guard = ProcScopeGuard::enter(ctx.proc_scope_id);
                 install_common_locals(&mut b, &mut ctx.locals, decls);
                 install_equivalence_locals(
                     &mut b,
@@ -408,6 +409,7 @@ pub(crate) fn lower_unit(
 
             {
                 let mut b = FuncBuilder::new(&mut func);
+                let _setup_proc_scope_guard = ProcScopeGuard::enter(ctx.proc_scope_id);
 
                 // Set up hidden-length locals for assumed-len char dummies.
                 let mut hidden_len_addrs: HashMap<String, ValueId> = HashMap::new();
@@ -897,6 +899,7 @@ pub(crate) fn lower_unit(
 
             {
                 let mut b = FuncBuilder::new(&mut func);
+                let _setup_proc_scope_guard = ProcScopeGuard::enter(ctx.proc_scope_id);
 
                 let mut hidden_len_addrs: HashMap<String, ValueId> = HashMap::new();
                 for (hname, hid) in &hidden_len_params {
@@ -1251,6 +1254,7 @@ pub(crate) fn lower_unit(
                     st,
                 );
                 if hidden_result_abi == HiddenResultAbi::StringDescriptor {
+                    let _proc_scope_guard = ProcScopeGuard::enter(ctx.proc_scope_id);
                     ensure_hidden_string_result_local(
                         &mut b,
                         &mut ctx.locals,
@@ -1258,6 +1262,7 @@ pub(crate) fn lower_unit(
                         return_type.as_ref(),
                         &visible_param_consts,
                         st,
+                        type_layouts,
                     );
                 }
                 install_host_param_consts(&mut b, &mut ctx.locals, host_param_consts, st);

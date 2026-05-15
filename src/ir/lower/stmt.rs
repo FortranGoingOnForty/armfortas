@@ -14,7 +14,7 @@ use crate::ir::inst::*;
 use crate::ir::types::*;
 
 use super::core::*;
-use super::ctx::{CharKind, HiddenResultAbi, LocalInfo, LowerCtx};
+use super::ctx::{BlockUseGuard, CharKind, HiddenResultAbi, LocalInfo, LowerCtx};
 use super::helpers::coerce_to_type;
 
 pub(crate) fn lower_stmts(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmts: &[SpannedStmt]) {
@@ -4050,6 +4050,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             body,
             ..
         } => {
+            let _block_use_guard = BlockUseGuard::enter(uses);
             // F2008 BLOCK: declarations are scoped to the body.
             // Save any locals that the BLOCK's decls shadow, run
             // the body, then restore the originals.  F2018 §11.1.4

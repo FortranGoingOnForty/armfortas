@@ -37,6 +37,14 @@ thread_local! {
     /// can pull in the submodule's locally-declared parameters
     /// (mangled under the submodule name post-d770b77).
     static SMP_EXTRA_HOST: RefCell<Option<String>> = const { RefCell::new(None) };
+
+    /// Active F2008 BLOCK-local USE declarations while lowering nested
+    /// statements. Sema preloads these modules but the immutable symbol
+    /// table does not enter a block scope during lowering, so generic
+    /// dispatch needs this side channel to see names imported only inside
+    /// the current BLOCK.
+    static ACTIVE_BLOCK_USES: RefCell<Vec<Vec<crate::ast::decl::SpannedDecl>>> =
+        const { RefCell::new(Vec::new()) };
 }
 
 pub(super) fn current_proc_scope() -> Option<crate::sema::symtab::ScopeId> {
@@ -45,6 +53,10 @@ pub(super) fn current_proc_scope() -> Option<crate::sema::symtab::ScopeId> {
 
 pub(super) fn current_smp_extra_host() -> Option<String> {
     SMP_EXTRA_HOST.with(|c| c.borrow().clone())
+}
+
+pub(super) fn active_block_uses() -> Vec<Vec<crate::ast::decl::SpannedDecl>> {
+    ACTIVE_BLOCK_USES.with(|uses| uses.borrow().clone())
 }
 
 /// RAII guard: install `scope` as the current procedure scope until
@@ -79,6 +91,23 @@ impl Drop for SmpExtraHostGuard {
     fn drop(&mut self) {
         let prev = self.0.take();
         SMP_EXTRA_HOST.with(|c| *c.borrow_mut() = prev);
+    }
+}
+
+pub(super) struct BlockUseGuard;
+
+impl BlockUseGuard {
+    pub(super) fn enter(uses: &[crate::ast::decl::SpannedDecl]) -> Self {
+        ACTIVE_BLOCK_USES.with(|active| active.borrow_mut().push(uses.to_vec()));
+        BlockUseGuard
+    }
+}
+
+impl Drop for BlockUseGuard {
+    fn drop(&mut self) {
+        ACTIVE_BLOCK_USES.with(|active| {
+            active.borrow_mut().pop();
+        });
     }
 }
 
