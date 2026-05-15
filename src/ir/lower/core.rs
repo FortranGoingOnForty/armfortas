@@ -14134,8 +14134,8 @@ pub(super) fn resolve_subroutine_call_name(
                     }
                 }
             }
-            if is_linkable_callable_symbol(sym) || sym.attrs.binding_label.is_some() {
-                return (symbol_link_name(st, sym), key.to_string());
+            if let Some(linkable) = find_linkable_symbol_from_scope(st, key, scope_id) {
+                return (symbol_link_name(st, linkable), key.to_string());
             }
         }
     }
@@ -14518,12 +14518,44 @@ fn is_linkable_callable_symbol(sym: &crate::sema::symtab::Symbol) -> bool {
     )
 }
 
+fn unique_concrete_procedure_symbol_any_scope<'a>(
+    st: &'a SymbolTable,
+    key: &str,
+) -> Option<&'a crate::sema::symtab::Symbol> {
+    use crate::sema::symtab::SymbolKind;
+
+    let mut found = None;
+    for scope in st.all_scopes() {
+        let Some(sym) = scope.symbols.get(key) else {
+            continue;
+        };
+        if sym.attrs.external {
+            continue;
+        }
+        if matches!(sym.kind, SymbolKind::Function | SymbolKind::Subroutine) {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(sym);
+        }
+    }
+    found
+}
+
 fn find_linkable_symbol_from_scope<'a>(
     st: &'a SymbolTable,
     key: &str,
     scope_id: crate::sema::symtab::ScopeId,
 ) -> Option<&'a crate::sema::symtab::Symbol> {
     let sym = st.lookup_in(scope_id, key)?;
+    if sym.attrs.binding_label.is_some() {
+        return Some(sym);
+    }
+    if sym.attrs.external {
+        if let Some(concrete) = unique_concrete_procedure_symbol_any_scope(st, key) {
+            return Some(concrete);
+        }
+    }
     (sym.attrs.binding_label.is_some() || is_linkable_callable_symbol(sym)).then_some(sym)
 }
 
