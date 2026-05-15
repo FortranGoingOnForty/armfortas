@@ -6049,7 +6049,9 @@ pub(super) fn extract_array_dims_with_init(
     };
 
     let init_len = init_expr.and_then(|expr| match &expr.node {
-        Expr::ArrayConstructor { values, .. } => const_array_constructor_len(values),
+        Expr::ArrayConstructor { values, .. } => {
+            const_array_constructor_len_in_scope(values, param_consts, st)
+        }
         _ => None,
     });
     let Some(init_len) = init_len else {
@@ -8001,11 +8003,23 @@ pub(super) fn first_array_constructor_type_info(
         .or_else(|| fortran_type_to_type_info(&crate::sema::types::expr_type(first, st)))
 }
 
-pub(super) fn const_array_constructor_len(values: &[crate::ast::expr::AcValue]) -> Option<i64> {
-    fn const_implied_do_trip_count(ido: &crate::ast::expr::ImpliedDoLoop) -> Option<i64> {
-        let start = eval_const_int(&ido.start)?;
-        let end = eval_const_int(&ido.end)?;
-        let step = ido.step.as_ref().and_then(eval_const_int).unwrap_or(1);
+fn const_array_constructor_len_with_eval<F>(
+    values: &[crate::ast::expr::AcValue],
+    eval_int: &F,
+) -> Option<i64>
+where
+    F: Fn(&crate::ast::expr::SpannedExpr) -> Option<i64>,
+{
+    fn const_implied_do_trip_count<F>(
+        ido: &crate::ast::expr::ImpliedDoLoop,
+        eval_int: &F,
+    ) -> Option<i64>
+    where
+        F: Fn(&crate::ast::expr::SpannedExpr) -> Option<i64>,
+    {
+        let start = eval_int(&ido.start)?;
+        let end = eval_int(&ido.end)?;
+        let step = ido.step.as_ref().and_then(eval_int).unwrap_or(1);
         if step == 0 {
             return None;
         }
@@ -8035,18 +8049,34 @@ pub(super) fn const_array_constructor_len(values: &[crate::ast::expr::AcValue]) 
                 // the first inner constructor's first slot read garbage
                 // or tripped a bounds check.
                 if let Expr::ArrayConstructor { values: inner, .. } = &e.node {
-                    total += const_array_constructor_len(inner)?;
+                    total += const_array_constructor_len_with_eval(inner, eval_int)?;
                 } else {
                     total += 1;
                 }
             }
             crate::ast::expr::AcValue::ImpliedDo(ido) => {
-                let inner = const_array_constructor_len(&ido.values)?;
-                total += inner * const_implied_do_trip_count(ido)?;
+                let inner = const_array_constructor_len_with_eval(&ido.values, eval_int)?;
+                total += inner * const_implied_do_trip_count(ido, eval_int)?;
             }
         }
     }
     Some(total)
+}
+
+pub(super) fn const_array_constructor_len(values: &[crate::ast::expr::AcValue]) -> Option<i64> {
+    const_array_constructor_len_with_eval(values, &eval_const_int)
+}
+
+pub(super) fn const_array_constructor_len_in_scope(
+    values: &[crate::ast::expr::AcValue],
+    param_consts: &HashMap<String, ConstScalar>,
+    st: Option<&SymbolTable>,
+) -> Option<i64> {
+    const_array_constructor_len_with_eval(values, &|expr| {
+        st.and_then(|st| eval_const_int_in_scope_or_any_scope(expr, param_consts, st))
+            .or_else(|| eval_const_int_in_scope(expr, param_consts))
+            .or_else(|| eval_const_int(expr))
+    })
 }
 
 /// Lower character intrinsic functions (LEN, LEN_TRIM, ICHAR, CHAR, INDEX, SCAN, VERIFY,

@@ -3147,7 +3147,10 @@ fn merge_scalar_sources_array_mask_fixture_passes_at_o0() {
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("merge_scalar_sources_array_mask.f90");
-    assert!(source.exists(), "merge_scalar_sources_array_mask.f90 missing");
+    assert!(
+        source.exists(),
+        "merge_scalar_sources_array_mask.f90 missing"
+    );
 
     match run_test(&compiler, &source, "-O0") {
         TestOutcome::Pass => {}
@@ -3172,6 +3175,25 @@ fn complex_abs_array_scalar_compare_fixture_passes_at_o0() {
         TestOutcome::Pass => {}
         other => panic!(
             "complex_abs_array_scalar_compare.f90 should pass at -O0, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn assumed_size_param_constructor_pack_fixture_passes_at_o0() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("assumed_size_param_constructor_pack.f90");
+    assert!(
+        source.exists(),
+        "assumed_size_param_constructor_pack.f90 missing"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "assumed_size_param_constructor_pack.f90 should pass at -O0, got {:?}",
             other
         ),
     }
