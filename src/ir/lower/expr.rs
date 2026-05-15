@@ -599,6 +599,13 @@ pub(crate) fn lower_expr_full(
                             info.addr
                         }
                     }
+                } else if local_uses_array_descriptor(info) && info.dims.is_empty() {
+                    let base = array_base_addr(b, info);
+                    if is_complex_ty(&info.ty) {
+                        base
+                    } else {
+                        b.load_typed(base, info.ty.clone())
+                    }
                 } else if is_complex_ty(&info.ty) {
                     if info.by_ref {
                         // by-ref complex: info.addr holds ptr-to-ptr-to-buffer.
