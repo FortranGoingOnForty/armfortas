@@ -1469,7 +1469,7 @@ pub(crate) fn lower_expr_full(
 
                 // abs(z) for complex: sqrt(re² + im²).
                 // Must be handled before generic intrinsic lowering because
-                // complex values are pointers to [f32/f64 x 2] buffers.
+                // complex values may be pointer-backed or aggregate pairs.
                 if (key == "abs" || key == "cabs" || key == "cdabs" || key == "zabs")
                     && args.len() == 1
                 {
@@ -1494,8 +1494,9 @@ pub(crate) fn lower_expr_full(
                                 let elem = IrType::Float(fw);
                                 let esz = b.const_i64(if fw == FloatWidth::F64 { 8 } else { 4 });
                                 let zero = b.const_i64(0);
-                                let re_ptr = b.gep(val, vec![zero], IrType::Int(IntWidth::I8));
-                                let im_ptr = b.gep(val, vec![esz], IrType::Int(IntWidth::I8));
+                                let src = materialize_complex_operand(b, val, fw);
+                                let re_ptr = b.gep(src, vec![zero], IrType::Int(IntWidth::I8));
+                                let im_ptr = b.gep(src, vec![esz], IrType::Int(IntWidth::I8));
                                 let re = b.load_typed(re_ptr, elem.clone());
                                 let im = b.load_typed(im_ptr, elem);
                                 let re2 = b.fmul(re, re);
