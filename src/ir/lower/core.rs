@@ -37487,6 +37487,7 @@ pub(super) fn expr_is_character_expr(
 ) -> bool {
     match &expr.node {
         Expr::StringLiteral { .. } => true,
+        Expr::ParenExpr { inner } => expr_is_character_expr(b, locals, inner, st, type_layouts),
         Expr::BinaryOp {
             op: BinaryOp::Concat,
             ..

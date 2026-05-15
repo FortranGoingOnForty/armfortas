@@ -3086,6 +3086,25 @@ fn procedure_dummy_interface_scope_hidden_lengths_fixture_passes_at_o0() {
 }
 
 #[test]
+fn parenthesized_concat_char_actual_fixture_passes_at_o0() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("parenthesized_concat_char_actual.f90");
+    assert!(
+        source.exists(),
+        "parenthesized_concat_char_actual.f90 missing"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "parenthesized_concat_char_actual.f90 should pass at -O0, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
 fn opt_eq_annotations_allow_hello_cross_opt_invariant() {
     let compiler = find_compiler();
     let test_dir = find_test_programs();
