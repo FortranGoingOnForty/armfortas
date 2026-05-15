@@ -22924,6 +22924,9 @@ pub(super) fn lower_internal_read_items(
         if lower_array_read_item(b, ctx, item, mode) {
             continue;
         }
+        if lower_internal_char_read_item(b, ctx, item, buf_ptr, buf_len, pos, iostat) {
+            continue;
+        }
         let Some((addr, ty)) = lower_read_target_addr(b, ctx, item) else {
             continue;
         };
@@ -23556,6 +23559,35 @@ pub(super) fn lower_list_char_read_item(
     b.call(
         FuncRef::External("afs_read_string".into()),
         vec![unit, dest_ptr, dest_len, iostat],
+        IrType::Void,
+    );
+    true
+}
+
+pub(super) fn lower_internal_char_read_item(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    item: &crate::ast::expr::SpannedExpr,
+    buf_ptr: ValueId,
+    buf_len: ValueId,
+    pos: ValueId,
+    iostat: ValueId,
+) -> bool {
+    if !expr_is_character_expr(b, &ctx.locals, item, ctx.st, Some(ctx.type_layouts)) {
+        return false;
+    }
+
+    let (dest_ptr, dest_len) = if let Some((ptr, len)) =
+        char_addr_and_substring_bound_len(b, item, &ctx.locals, ctx.st, Some(ctx.type_layouts))
+    {
+        (ptr, len)
+    } else {
+        lower_string_expr_ctx(b, ctx, item)
+    };
+
+    b.call(
+        FuncRef::External("afs_read_internal_string".into()),
+        vec![buf_ptr, buf_len, pos, dest_ptr, dest_len, iostat],
         IrType::Void,
     );
     true
