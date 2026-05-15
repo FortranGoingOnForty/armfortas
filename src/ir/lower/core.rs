@@ -15507,7 +15507,7 @@ pub(super) fn lower_alloc_return_call_into_desc(
 }
 
 pub(super) fn procedure_pointer_signature_key(st: &SymbolTable, key: &str) -> Option<String> {
-    let sym = st.find_symbol_any_scope(key)?;
+    let sym = st.lookup_local_then_any(current_proc_scope(), key)?;
     if sym.kind != crate::sema::symtab::SymbolKind::ProcedurePointer
         && !(sym.attrs.external && sym.attrs.procedure_iface.is_some())
     {
