@@ -10820,6 +10820,186 @@ pub(super) fn bound_proc_scope<'a>(
         .or_else(|| procedure_scope_by_name(st, &bp.abi_name))
 }
 
+fn function_symbol_result_type_info(
+    sym: &crate::sema::symtab::Symbol,
+) -> Option<crate::sema::symtab::TypeInfo> {
+    use crate::sema::symtab::SymbolKind;
+
+    matches!(
+        sym.kind,
+        SymbolKind::Function
+            | SymbolKind::ExternalProc
+            | SymbolKind::IntrinsicProc
+            | SymbolKind::ProcedurePointer
+    )
+    .then(|| sym.type_info.clone())
+    .flatten()
+}
+
+fn function_scope_result_type_info(
+    st: &SymbolTable,
+    scope: &crate::sema::symtab::Scope,
+) -> Option<crate::sema::symtab::TypeInfo> {
+    use crate::sema::symtab::{ScopeKind, SymbolKind};
+
+    let ScopeKind::Function(function_name) = &scope.kind else {
+        return None;
+    };
+    let arg_set: HashSet<String> = scope
+        .arg_order
+        .iter()
+        .map(|arg| arg.to_lowercase())
+        .collect();
+    for (key, sym) in &scope.symbols {
+        if arg_set.contains(key) {
+            continue;
+        }
+        if matches!(sym.kind, SymbolKind::Variable | SymbolKind::Parameter) {
+            if let Some(ti) = sym.type_info.clone() {
+                return Some(ti);
+            }
+        }
+    }
+
+    let key = function_name.to_ascii_lowercase();
+    scope
+        .symbols
+        .get(&key)
+        .and_then(function_symbol_result_type_info)
+        .or_else(|| {
+            scope.parent.and_then(|parent| {
+                st.scope(parent)
+                    .symbols
+                    .get(&key)
+                    .and_then(function_symbol_result_type_info)
+            })
+        })
+}
+
+fn bound_proc_result_type_info(
+    st: &SymbolTable,
+    layout: &crate::sema::type_layout::TypeLayout,
+    bp: &crate::sema::type_layout::BoundProc,
+) -> Option<crate::sema::symtab::TypeInfo> {
+    bound_proc_scope(st, layout, bp)
+        .and_then(|scope| function_scope_result_type_info(st, scope))
+        .or_else(|| {
+            let key = abi_key_for_link_name(st, &bp.target_name)
+                .unwrap_or_else(|| bp.abi_name.to_ascii_lowercase());
+            find_linkable_symbol_any_scope(st, &key).and_then(function_symbol_result_type_info)
+        })
+}
+
+fn type_bound_call_result_type_info(
+    callee: &crate::ast::expr::SpannedExpr,
+    args: &[crate::ast::expr::Argument],
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> Option<crate::sema::symtab::TypeInfo> {
+    let crate::ast::expr::Expr::ComponentAccess { base, component } = &callee.node else {
+        return None;
+    };
+    let tl = type_layouts?;
+    let type_name = match method_base_kind_for_call(base, locals, st, tl)? {
+        MethodBaseKind::Derived(name) | MethodBaseKind::PolymorphicClass(name) => name,
+    };
+    let layout = tl.get(&type_name)?;
+    let bp = resolve_bound_proc_by_semantics(st, locals, layout, component, args, type_layouts)?;
+    bound_proc_result_type_info(st, layout, bp)
+}
+
+fn resolve_bound_proc_by_semantics<'a>(
+    st: &SymbolTable,
+    locals: &HashMap<String, LocalInfo>,
+    layout: &'a crate::sema::type_layout::TypeLayout,
+    component: &str,
+    args: &[crate::ast::expr::Argument],
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> Option<&'a crate::sema::type_layout::BoundProc> {
+    let candidates = layout.bound_proc_candidates(component);
+    if candidates.is_empty() {
+        return None;
+    }
+    if candidates.len() == 1 {
+        return Some(candidates[0]);
+    }
+
+    let actual_type_infos: Vec<Option<crate::sema::symtab::TypeInfo>> = args
+        .iter()
+        .map(|arg| match &arg.value {
+            crate::ast::expr::SectionSubscript::Element(expr) => {
+                generic_actual_expr_type_info(expr, locals, st, type_layouts)
+            }
+            _ => None,
+        })
+        .collect();
+    let actual_ranks: Vec<Option<usize>> = args
+        .iter()
+        .map(|arg| match &arg.value {
+            crate::ast::expr::SectionSubscript::Element(expr) => {
+                actual_expr_rank(expr, locals, st, type_layouts)
+            }
+            _ => None,
+        })
+        .collect();
+
+    for bp in candidates {
+        let Some(scope) = bound_proc_scope(st, layout, bp) else {
+            continue;
+        };
+        let declared_args = declared_args_for_scope(scope);
+        let formal_skip = if bp.nopass { 0 } else { 1 };
+        let required = declared_args
+            .iter()
+            .enumerate()
+            .filter(|(idx, sym)| *idx >= formal_skip && !sym.attrs.optional)
+            .count();
+        if args.len() < required || args.len() + formal_skip > declared_args.len() {
+            continue;
+        }
+        let Some(semantic_slots) = reorder_semantic_type_slots_by_formal_skip(
+            args,
+            &actual_type_infos,
+            &scope.arg_order,
+            formal_skip,
+        ) else {
+            continue;
+        };
+        let semantic_match = declared_args
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| *idx >= formal_skip)
+            .all(|(idx, declared_arg)| {
+                let Some(declared_type) = declared_arg.type_info.as_ref() else {
+                    return true;
+                };
+                let actual = semantic_slots.get(idx).and_then(|slot| slot.as_ref());
+                actual.is_some()
+                    && generic_declared_semantic_match(declared_type, actual, type_layouts)
+            });
+        if !semantic_match {
+            continue;
+        }
+        let rank_slots =
+            reorder_actual_ranks_by_formal_skip(args, &actual_ranks, &scope.arg_order, formal_skip);
+        let rank_match = declared_args
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| *idx >= formal_skip)
+            .all(|(idx, declared_arg)| {
+                let formal_rank = formal_declared_rank(declared_arg);
+                let actual_rank = rank_slots.get(idx).copied().flatten();
+                formal_rank_matches_actual(formal_rank, actual_rank)
+            });
+        if rank_match {
+            return Some(bp);
+        }
+    }
+
+    None
+}
+
 pub(super) fn resolve_bound_proc_actuals<'a>(
     st: &SymbolTable,
     b: &FuncBuilder,
@@ -11779,6 +11959,8 @@ pub(super) fn operator_expr_type_info(
                         None
                     })
                     .or_else(|| fortran_type_to_type_info(&crate::sema::types::expr_type(expr, st)))
+            } else if let Some(locals) = locals {
+                type_bound_call_result_type_info(callee, args, locals, st, type_layouts)
             } else {
                 None
             }
