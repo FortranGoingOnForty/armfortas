@@ -9709,29 +9709,24 @@ pub(super) fn named_interface_specific_candidates(
     name: &str,
 ) -> Option<Vec<SpecificProcCandidate>> {
     let key = name.to_ascii_lowercase();
-    if let Some(scope_id) = current_proc_scope() {
-        if let Some(sym) = st.lookup_in(scope_id, &key) {
-            if scope_is_host_associated_or_self(st, scope_id, sym.scope) {
-                if let Some(specifics) = named_interface_specific_candidates_from_symbol(sym) {
-                    return Some(specifics);
-                }
-            }
-        }
-    }
-
     let mut specifics = Vec::new();
     let mut seen = HashSet::new();
+
+    if let Some(scope_id) = current_proc_scope() {
+        if let Some(sym) = st.lookup_in(scope_id, &key) {
+            append_named_interface_specific_candidates(sym, &mut specifics, &mut seen);
+        }
+    }
 
     for sym in active_block_use_named_interface_symbols(st, &key) {
         append_named_interface_specific_candidates(sym, &mut specifics, &mut seen);
     }
-    if !specifics.is_empty() {
-        return Some(specifics);
-    }
 
-    if let Some(sym) = st.lookup(&key) {
-        if is_named_interface_like(sym) {
-            append_named_interface_specific_candidates(sym, &mut specifics, &mut seen);
+    if specifics.is_empty() {
+        if let Some(sym) = st.lookup(&key) {
+            if is_named_interface_like(sym) {
+                append_named_interface_specific_candidates(sym, &mut specifics, &mut seen);
+            }
         }
     }
 
