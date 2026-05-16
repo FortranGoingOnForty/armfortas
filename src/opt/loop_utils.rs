@@ -225,6 +225,31 @@ mod tests {
             use_inst.kind,
         );
     }
+
+    #[test]
+    fn remap_inst_kind_remaps_indirect_call_target() {
+        let old_target = ValueId(10);
+        let new_target = ValueId(110);
+        let old_arg = ValueId(20);
+        let new_arg = ValueId(120);
+        let mut map = HashMap::new();
+        map.insert(old_target, new_target);
+        map.insert(old_arg, new_arg);
+
+        let remapped = remap_inst_kind(
+            &InstKind::Call(FuncRef::Indirect(old_target), vec![old_arg]),
+            &map,
+        );
+
+        assert!(
+            matches!(
+                remapped,
+                InstKind::Call(FuncRef::Indirect(target), ref args)
+                    if target == new_target && args.as_slice() == [new_arg]
+            ),
+            "indirect call target and args should both be remapped, got {remapped:?}",
+        );
+    }
 }
 
 /// Build a value map from original loop blocks → cloned loop blocks.
@@ -257,6 +282,10 @@ pub fn build_value_map(
 /// are left unchanged (they're defined outside the cloned region).
 pub fn remap_inst_kind(kind: &InstKind, map: &HashMap<ValueId, ValueId>) -> InstKind {
     let r = |v: &ValueId| *map.get(v).unwrap_or(v);
+    let rf = |f: &FuncRef| match f {
+        FuncRef::Indirect(v) => FuncRef::Indirect(r(v)),
+        _ => f.clone(),
+    };
     match kind {
         InstKind::ConstInt(v, w) => InstKind::ConstInt(*v, *w),
         InstKind::ConstFloat(v, w) => InstKind::ConstFloat(*v, *w),
@@ -308,7 +337,7 @@ pub fn remap_inst_kind(kind: &InstKind, map: &HashMap<ValueId, ValueId>) -> Inst
         InstKind::GetElementPtr(base, idxs) => {
             InstKind::GetElementPtr(r(base), idxs.iter().map(&r).collect())
         }
-        InstKind::Call(f, args) => InstKind::Call(f.clone(), args.iter().map(&r).collect()),
+        InstKind::Call(f, args) => InstKind::Call(rf(f), args.iter().map(&r).collect()),
         InstKind::RuntimeCall(f, args) => {
             InstKind::RuntimeCall(f.clone(), args.iter().map(&r).collect())
         }
