@@ -5,8 +5,9 @@
 //!  * The result `ValueId` is unused by any other instruction or
 //!    terminator in the function.
 //!  * The instruction has no side effects of its own (a `Store`,
-//!    `Call`, or `RuntimeCall` is always live, even if its return is
-//!    unused, because it can write memory or perform I/O).
+//!    impure `Call`, hidden-result `Call`, or `RuntimeCall` is always
+//!    live, even if its return is unused, because it can write memory
+//!    or perform I/O).
 //!
 //! The pass uses mark-and-sweep:
 //!
@@ -38,11 +39,18 @@
 use super::pass::Pass;
 use super::util::{inst_uses, prune_unreachable, terminator_uses};
 use crate::ir::inst::*;
+use crate::ir::types::IrType;
 use std::collections::{HashMap, HashSet};
+
+#[derive(Clone, Copy, Debug)]
+struct InternalCallDceInfo {
+    is_pure: bool,
+    returns_void: bool,
+}
 
 /// True if the instruction has any side effect that prevents removal,
 /// regardless of whether its result is used.
-fn has_side_effect(kind: &InstKind, pure_internal_calls: &[bool]) -> bool {
+fn has_side_effect(kind: &InstKind, internal_calls: &[InternalCallDceInfo]) -> bool {
     matches!(
         kind,
         InstKind::Store(..)
@@ -59,10 +67,10 @@ fn has_side_effect(kind: &InstKind, pure_internal_calls: &[bool]) -> bool {
             // future store/call). Treat as side-effecting for safety.
             | InstKind::Alloca(..)
     ) || match kind {
-        InstKind::Call(FuncRef::Internal(idx), _) => !pure_internal_calls
-            .get(*idx as usize)
-            .copied()
-            .unwrap_or(false),
+        InstKind::Call(FuncRef::Internal(idx), _) => match internal_calls.get(*idx as usize) {
+            Some(info) => !info.is_pure || info.returns_void,
+            None => true,
+        },
         InstKind::Call(..) => true,
         _ => false,
     }
@@ -103,7 +111,7 @@ fn collect_live_uses(func: &Function) -> HashSet<ValueId> {
 ///    corresponding slot. Removing an arg can free its defining
 ///    instruction, so we re-run the inner loop afterwards. Audit
 ///    finding Med-5 / C-1.
-fn dce_function(func: &mut Function, pure_internal_calls: &[bool]) -> bool {
+fn dce_function(func: &mut Function, internal_calls: &[InternalCallDceInfo]) -> bool {
     let mut any_change = false;
     let mut outer_changed = true;
     while outer_changed {
@@ -117,7 +125,7 @@ fn dce_function(func: &mut Function, pure_internal_calls: &[bool]) -> bool {
             for block in &mut func.blocks {
                 let before = block.insts.len();
                 block.insts.retain(|inst| {
-                    if has_side_effect(&inst.kind, pure_internal_calls) {
+                    if has_side_effect(&inst.kind, internal_calls) {
                         return true;
                     }
                     if live.contains(&inst.id) {
@@ -277,11 +285,17 @@ impl Pass for Dce {
         "dce"
     }
     fn run(&self, module: &mut Module) -> bool {
-        let pure_internal_calls: Vec<bool> =
-            module.functions.iter().map(|func| func.is_pure).collect();
+        let internal_calls: Vec<InternalCallDceInfo> = module
+            .functions
+            .iter()
+            .map(|func| InternalCallDceInfo {
+                is_pure: func.is_pure,
+                returns_void: matches!(func.return_type, IrType::Void),
+            })
+            .collect();
         let mut changed = false;
         for func in &mut module.functions {
-            if dce_function(func, &pure_internal_calls) {
+            if dce_function(func, &internal_calls) {
                 changed = true;
             }
         }
@@ -449,6 +463,34 @@ mod tests {
         assert!(
             m.functions[1].blocks[0].insts.is_empty(),
             "unused PURE call should be removed"
+        );
+    }
+
+    #[test]
+    fn keeps_unused_internal_pure_void_call() {
+        let mut m = Module::new("t".into());
+
+        let mut callee = Function::new("pure_hidden_result_fn".into(), vec![], IrType::Void);
+        callee.is_pure = true;
+        let callee_entry = callee.entry;
+        callee.block_mut(callee_entry).terminator = Some(Terminator::Return(None));
+        m.add_function(callee);
+
+        let mut caller = Function::new("caller".into(), vec![], IrType::Void);
+        push(
+            &mut caller,
+            InstKind::Call(FuncRef::Internal(0), vec![]),
+            IrType::Void,
+        );
+        let caller_entry = caller.entry;
+        caller.block_mut(caller_entry).terminator = Some(Terminator::Return(None));
+        m.add_function(caller);
+
+        assert!(!Dce.run(&mut m));
+        assert_eq!(
+            m.functions[1].blocks[0].insts.len(),
+            1,
+            "PURE void calls write hidden-result or intent-out storage and must stay live"
         );
     }
 
