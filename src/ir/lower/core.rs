@@ -29807,6 +29807,9 @@ fn lower_complex_part_array_descriptor(
         vec![src_desc],
         IrType::Int(IntWidth::I64),
     );
+    let src_rank = actual_expr_rank(base, locals, st, type_layouts)
+        .unwrap_or(1)
+        .max(1);
     let i_addr = b.alloca(IrType::Int(IntWidth::I64));
     let zero64 = b.const_i64(0);
     b.store(zero64, i_addr);
@@ -29823,16 +29826,14 @@ fn lower_complex_part_array_descriptor(
 
     b.set_block(bb_body);
     let idx = b.load(i_addr);
-    let complex_val = load_rank1_array_desc_elem(b, src_desc, &elem_ty, idx);
-    let complex_slot = b.alloca(elem_ty.clone());
-    b.store(complex_val, complex_slot);
     let lane_offset = if lc_component == "im" {
         ir_scalar_byte_size(&lane_ty)
     } else {
         0
     };
+    let complex_elem = array_desc_elem_ptr_rank(b, src_desc, &elem_ty, idx, src_rank);
     let off = b.const_i64(lane_offset);
-    let lane_ptr = b.gep(complex_slot, vec![off], IrType::Int(IntWidth::I8));
+    let lane_ptr = b.gep(complex_elem, vec![off], IrType::Int(IntWidth::I8));
     let lane = b.load_typed(lane_ptr, lane_ty.clone());
     store_rank1_array_desc_elem(b, result_desc, &lane_ty, idx, lane);
     let one = b.const_i64(1);
@@ -29842,6 +29843,164 @@ fn lower_complex_part_array_descriptor(
 
     b.set_block(bb_exit);
     Some((result_desc, lane_ty))
+}
+
+fn complex_part_array_base_local_info(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    base: &crate::ast::expr::SpannedExpr,
+) -> Option<LocalInfo> {
+    match &base.node {
+        Expr::Name { name } => ctx
+            .locals
+            .get(&name.to_lowercase())
+            .filter(|info| local_is_array_like(info) && is_complex_ty(&info.ty))
+            .cloned(),
+        Expr::ComponentAccess { .. } => {
+            component_intrinsic_local_info(b, &ctx.locals, base, ctx.st, ctx.type_layouts)
+                .filter(|info| local_is_array_like(info) && is_complex_ty(&info.ty))
+        }
+        _ => None,
+    }
+}
+
+fn lower_complex_part_array_assignment(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    dest_info: &LocalInfo,
+    value: &crate::ast::expr::SpannedExpr,
+    lane_ty: IrType,
+    lane_offset: i64,
+) {
+    let dest_desc =
+        local_uses_array_descriptor(dest_info).then(|| array_descriptor_addr(b, dest_info));
+    let dest_base = dest_desc.is_none().then(|| array_base_addr(b, dest_info));
+    let dest_rank = local_declared_rank(dest_info).max(1);
+    let dest_n = array_total_elems_value(b, dest_info);
+    let src_desc = lower_array_expr_descriptor(
+        b,
+        &ctx.locals,
+        value,
+        ctx.st,
+        Some(ctx.type_layouts),
+        Some(ctx.internal_funcs),
+        Some(ctx.contained_host_refs),
+        Some(ctx.descriptor_params),
+    );
+    let src_rank = actual_expr_rank(value, &ctx.locals, ctx.st, Some(ctx.type_layouts))
+        .unwrap_or(1)
+        .max(1);
+    let src_n = src_desc.as_ref().map(|(desc, _)| {
+        b.call(
+            FuncRef::External("afs_array_size".into()),
+            vec![*desc],
+            IrType::Int(IntWidth::I64),
+        )
+    });
+    let scalar = if src_desc.is_none() {
+        let raw = super::expr::lower_expr_ctx_tl(b, ctx, value);
+        Some(coerce_to_type(b, raw, &lane_ty))
+    } else {
+        None
+    };
+
+    let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let zero = b.const_i64(0);
+    b.store(zero, i_addr);
+
+    let bb_check = b.create_block("complex_part_assign_check");
+    let bb_body = b.create_block("complex_part_assign_body");
+    let bb_exit = b.create_block("complex_part_assign_exit");
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let i = b.load(i_addr);
+    let mut done = b.icmp(CmpOp::Ge, i, dest_n);
+    if let Some(src_len) = src_n {
+        let src_done = b.icmp(CmpOp::Ge, i, src_len);
+        done = b.or(done, src_done);
+    }
+    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+    b.set_block(bb_body);
+    let i_val = b.load(i_addr);
+    let elem_ptr = if let Some(desc) = dest_desc {
+        array_desc_elem_ptr_rank(b, desc, &dest_info.ty, i_val, dest_rank)
+    } else {
+        b.gep(
+            dest_base.expect("fixed complex part assignment needs a base"),
+            vec![i_val],
+            dest_info.ty.clone(),
+        )
+    };
+    let lane_off = b.const_i64(lane_offset);
+    let lane_ptr = b.gep(elem_ptr, vec![lane_off], IrType::Int(IntWidth::I8));
+    let stored = if let Some((src_desc, src_elem_ty)) = src_desc.as_ref() {
+        let raw = load_array_desc_elem_rank(b, *src_desc, src_elem_ty, i_val, src_rank);
+        coerce_to_type(b, raw, &lane_ty)
+    } else {
+        scalar.expect("complex part assignment should have scalar RHS")
+    };
+    b.store(stored, lane_ptr);
+
+    let one = b.const_i64(1);
+    let next = b.iadd(i_val, one);
+    b.store(next, i_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
+}
+
+pub(super) fn try_lower_complex_part_assignment(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    base: &crate::ast::expr::SpannedExpr,
+    component: &str,
+    value: &crate::ast::expr::SpannedExpr,
+) -> bool {
+    let lc_component = component.to_ascii_lowercase();
+    if !matches!(lc_component.as_str(), "re" | "im") {
+        return false;
+    }
+    let Some(crate::sema::symtab::TypeInfo::Complex { kind }) =
+        operator_expr_type_info(base, Some(&ctx.locals), ctx.st, Some(ctx.type_layouts))
+    else {
+        return false;
+    };
+
+    let kind_bytes = kind.unwrap_or(4) as i64;
+    let lane_ty = if kind_bytes == 8 {
+        IrType::Float(FloatWidth::F64)
+    } else {
+        IrType::Float(FloatWidth::F32)
+    };
+    let lane_offset = if lc_component == "im" { kind_bytes } else { 0 };
+
+    if let Some(dest_info) = complex_part_array_base_local_info(b, ctx, base) {
+        lower_complex_part_array_assignment(b, ctx, &dest_info, value, lane_ty, lane_offset);
+        return true;
+    }
+
+    if actual_expr_rank(base, &ctx.locals, ctx.st, Some(ctx.type_layouts)).unwrap_or(0) > 0 {
+        return false;
+    }
+
+    let base_addr = super::expr::lower_expr_full(
+        b,
+        &ctx.locals,
+        base,
+        ctx.st,
+        Some(ctx.type_layouts),
+        Some(ctx.internal_funcs),
+        Some(ctx.contained_host_refs),
+        Some(ctx.descriptor_params),
+    );
+    let lane_off = b.const_i64(lane_offset);
+    let lane_ptr = b.gep(base_addr, vec![lane_off], IrType::Int(IntWidth::I8));
+    let raw = super::expr::lower_expr_ctx_tl(b, ctx, value);
+    let stored = coerce_to_type(b, raw, &lane_ty);
+    b.store(stored, lane_ptr);
+    true
 }
 
 pub(super) fn allocate_rank1_array_descriptor_with_runtime_bounds(

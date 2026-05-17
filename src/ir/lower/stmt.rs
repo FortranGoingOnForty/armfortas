@@ -1250,6 +1250,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     }
                 }
                 Expr::ComponentAccess { base, component } => {
+                    if try_lower_complex_part_assignment(b, ctx, base, component, value) {
+                        return;
+                    }
                     // x%field = val (supports chained: x%a%b = val).
                     if let Some(info) = component_intrinsic_local_info(
                         b,
