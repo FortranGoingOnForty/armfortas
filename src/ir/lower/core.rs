@@ -33921,14 +33921,31 @@ pub(super) fn lower_1d_section_assign(
     } else {
         let dest_base = b.load_typed(dest_desc, IrType::Ptr(Box::new(dest_info.ty.clone())));
         let elem_bytes = b.const_i64(ir_scalar_byte_size(&dest_info.ty));
-        let scalar = if let Some((_, mapped)) = scalarized_value.as_ref() {
+        let dest_is_complex = is_complex_ty(&dest_info.ty);
+        let (scalar, scalar_complex_src) = if let Some((_, mapped)) = scalarized_value.as_ref() {
             let raw = super::expr::lower_expr_ctx_tl(b, ctx, mapped);
-            Some(coerce_to_type(b, raw, &dest_info.ty))
+            if dest_is_complex {
+                let src = match b.func().value_type(raw) {
+                    Some(IrType::Ptr(inner)) if inner.as_ref() == &dest_info.ty => raw,
+                    _ => materialize_complex_operand(b, raw, complex_float_width(&dest_info.ty)),
+                };
+                (None, Some(src))
+            } else {
+                (Some(coerce_to_type(b, raw, &dest_info.ty)), None)
+            }
         } else if src_desc.is_none() {
             let raw = super::expr::lower_expr_ctx_tl(b, ctx, value);
-            Some(coerce_to_type(b, raw, &dest_info.ty))
+            if dest_is_complex {
+                let src = match b.func().value_type(raw) {
+                    Some(IrType::Ptr(inner)) if inner.as_ref() == &dest_info.ty => raw,
+                    _ => materialize_complex_operand(b, raw, complex_float_width(&dest_info.ty)),
+                };
+                (None, Some(src))
+            } else {
+                (Some(coerce_to_type(b, raw, &dest_info.ty)), None)
+            }
         } else {
-            None
+            (None, None)
         };
         let (src_base, src_stride, src_ty) = if let Some((desc, ty)) = src_desc.as_ref() {
             (
@@ -33943,18 +33960,44 @@ pub(super) fn lower_1d_section_assign(
         let dest_index = b.imul(i_val, dest_stride);
         let dest_off = b.imul(dest_index, elem_bytes);
         let dest_ptr = b.gep(dest_base, vec![dest_off], IrType::Int(IntWidth::I8));
-        let stored = if let (Some(src_base), Some(src_stride), Some(src_ty)) =
-            (src_base, src_stride, src_ty)
-        {
-            let src_index = b.imul(i_val, src_stride);
-            let src_off = b.imul(src_index, elem_bytes);
-            let src_ptr = b.gep(src_base, vec![src_off], IrType::Int(IntWidth::I8));
-            let raw = b.load_typed(src_ptr, src_ty);
-            coerce_to_type(b, raw, &dest_info.ty)
+        if dest_is_complex {
+            let src_ptr = if let (Some(src_base), Some(src_stride), Some(src_ty)) =
+                (src_base, src_stride, src_ty)
+            {
+                let src_index = b.imul(i_val, src_stride);
+                let src_elem_bytes = b.const_i64(ir_scalar_byte_size(&src_ty));
+                let src_off = b.imul(src_index, src_elem_bytes);
+                let src_ptr = b.gep(src_base, vec![src_off], IrType::Int(IntWidth::I8));
+                if is_complex_ty(&src_ty)
+                    && complex_float_width(&src_ty) == complex_float_width(&dest_info.ty)
+                {
+                    src_ptr
+                } else {
+                    let raw = b.load_typed(src_ptr, src_ty);
+                    materialize_complex_operand(b, raw, complex_float_width(&dest_info.ty))
+                }
+            } else {
+                scalar_complex_src.expect("complex slice assignment should have complex source")
+            };
+            b.call(
+                FuncRef::External("memcpy".into()),
+                vec![dest_ptr, src_ptr, elem_bytes],
+                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+            );
         } else {
-            scalar.expect("scalar slice assignment should have scalar RHS")
-        };
-        b.store(stored, dest_ptr);
+            let stored = if let (Some(src_base), Some(src_stride), Some(src_ty)) =
+                (src_base, src_stride, src_ty)
+            {
+                let src_index = b.imul(i_val, src_stride);
+                let src_off = b.imul(src_index, elem_bytes);
+                let src_ptr = b.gep(src_base, vec![src_off], IrType::Int(IntWidth::I8));
+                let raw = b.load_typed(src_ptr, src_ty);
+                coerce_to_type(b, raw, &dest_info.ty)
+            } else {
+                scalar.expect("scalar slice assignment should have scalar RHS")
+            };
+            b.store(stored, dest_ptr);
+        }
     }
 
     let one = b.const_i64(1);
