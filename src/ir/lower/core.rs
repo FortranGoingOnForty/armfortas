@@ -13911,6 +13911,17 @@ pub(super) fn lowered_operator_char_actual_view(
     }
 }
 
+pub(super) fn value_is_string_descriptor_ptr(b: &FuncBuilder, value: ValueId) -> bool {
+    matches!(
+        b.func().value_type(value),
+        Some(IrType::Ptr(inner))
+            if matches!(
+                inner.as_ref(),
+                IrType::Array(elem, 32) if matches!(elem.as_ref(), IrType::Int(IntWidth::I8))
+            )
+    )
+}
+
 pub(super) fn emit_resolved_operator_call(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -14000,6 +14011,11 @@ pub(super) fn emit_resolved_operator_call(
             .as_ref()
             .map(|mask| mask.get(i).copied().unwrap_or(false))
             .unwrap_or(false);
+        let expects_char_len_star = callee_char_len_star_args
+            .as_ref()
+            .map(|mask| mask.get(i).copied().unwrap_or(false))
+            .unwrap_or(false);
+        let actual_is_string_descriptor = value_is_string_descriptor_ptr(b, actual);
 
         let lowered = if is_value && wants_bind_c_char {
             lower_bind_c_char_value_arg(
@@ -14052,7 +14068,9 @@ pub(super) fn emit_resolved_operator_call(
             )
             .unwrap_or_else(|| lower_operator_actual_by_ref(b, actual))
         } else {
-            if expr_is_character_expr(b, locals, expr, st, type_layouts) {
+            if expr_is_character_expr(b, locals, expr, st, type_layouts)
+                || (expects_char_len_star && actual_is_string_descriptor)
+            {
                 let (char_ptr, char_len) = lowered_operator_char_actual_view(
                     b,
                     locals,
@@ -19799,6 +19817,28 @@ pub(super) fn lower_string_expr_full(
                 IrType::Void,
             );
             (result_buf, total_len)
+        }
+        Expr::BinaryOp { .. } => {
+            let val = super::expr::lower_expr_full(
+                b,
+                locals,
+                expr,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
+            let expr_returns_character =
+                operator_expr_type_info(expr, Some(locals), st, type_layouts).is_some_and(|ti| {
+                    matches!(ti, crate::sema::symtab::TypeInfo::Character { .. })
+                });
+            if expr_returns_character && value_is_string_descriptor_ptr(b, val) {
+                load_string_descriptor_view(b, val)
+            } else {
+                let len = string_expr_fixed_len_const(b, expr, locals, st, type_layouts);
+                (val, len)
+            }
         }
         _ => {
             // For other expressions, evaluate as value and use literal length if available.
@@ -39196,22 +39236,23 @@ pub(super) fn expr_is_character_expr(
     match &expr.node {
         Expr::StringLiteral { .. } => true,
         Expr::ParenExpr { inner } => expr_is_character_expr(b, locals, inner, st, type_layouts),
-        Expr::BinaryOp {
-            op: BinaryOp::Concat,
-            left,
-            right,
-        } => defined_binary_operator_result_type_info(
-            st,
-            Some(locals),
-            type_layouts,
-            &BinaryOp::Concat,
-            left,
-            right,
-            operator_expr_type_info(left, Some(locals), st, type_layouts).as_ref(),
-            operator_expr_type_info(right, Some(locals), st, type_layouts).as_ref(),
-        )
-        .map(|ti| matches!(ti, crate::sema::symtab::TypeInfo::Character { .. }))
-        .unwrap_or(true),
+        Expr::BinaryOp { op, left, right } => {
+            let left_ti = operator_expr_type_info(left, Some(locals), st, type_layouts);
+            let right_ti = operator_expr_type_info(right, Some(locals), st, type_layouts);
+            if let Some(result_ti) = defined_binary_operator_result_type_info(
+                st,
+                Some(locals),
+                type_layouts,
+                op,
+                left,
+                right,
+                left_ti.as_ref(),
+                right_ti.as_ref(),
+            ) {
+                return matches!(result_ti, crate::sema::symtab::TypeInfo::Character { .. });
+            }
+            matches!(op, BinaryOp::Concat)
+        }
         Expr::Name { name } => locals
             .get(&name.to_lowercase())
             .map(|info| {
