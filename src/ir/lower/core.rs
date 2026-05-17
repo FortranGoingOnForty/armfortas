@@ -12087,11 +12087,23 @@ pub(super) fn operator_expr_type_info(
                 .or_else(|| fortran_type_to_type_info(&crate::sema::types::expr_type(expr, st)))
         }
         Expr::UnaryOp { op, operand } => {
-            let operand_fty = operator_expr_type_info(operand, locals, st, type_layouts)
+            let operand_ti = operator_expr_type_info(operand, locals, st, type_layouts);
+            let operand_fty = operand_ti
+                .clone()
                 .map(|ti| crate::sema::types::type_info_to_fortran_type(&ti))
                 .unwrap_or_else(|| crate::sema::types::expr_type(operand, st));
             crate::sema::types::unary_op_result_type(op, &operand_fty)
                 .and_then(|fty| fortran_type_to_type_info(&fty))
+                .or_else(|| {
+                    defined_unary_operator_result_type_info(
+                        st,
+                        locals,
+                        type_layouts,
+                        op,
+                        operand,
+                        operand_ti.as_ref(),
+                    )
+                })
                 .or_else(|| fortran_type_to_type_info(&crate::sema::types::expr_type(expr, st)))
         }
         Expr::BinaryOp { op, left, right } => {
@@ -12438,6 +12450,91 @@ pub(super) fn defined_binary_operator_result_type_info(
         if let Some(result_ti) = specific_candidate_result_type_info(st, candidate) {
             return Some(result_ti);
         }
+    }
+
+    None
+}
+
+pub(super) fn defined_unary_operator_result_type_info(
+    st: &SymbolTable,
+    locals: Option<&HashMap<String, LocalInfo>>,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    op: &UnaryOp,
+    operand_expr: &crate::ast::expr::SpannedExpr,
+    operand_ti: Option<&crate::sema::symtab::TypeInfo>,
+) -> Option<crate::sema::symtab::TypeInfo> {
+    let iface_name = unary_op_interface_name(op)?;
+    let specifics = operator_interface_specific_candidates(st, &iface_name)?;
+    let operand_actual_rank =
+        locals.and_then(|locals| actual_expr_rank(operand_expr, locals, st, type_layouts));
+
+    for candidate in &specifics {
+        let Some(scope) = procedure_scope_for_candidate(st, candidate) else {
+            continue;
+        };
+        let candidate_is_elemental = specific_candidate_is_elemental(st, candidate);
+        let declared_args = declared_args_for_scope(scope);
+        if declared_args.len() != 1 {
+            continue;
+        }
+        let Some(decl) = declared_args.first().and_then(|arg| arg.type_info.as_ref()) else {
+            continue;
+        };
+        if !operator_arg_semantic_match(decl, operand_ti) {
+            continue;
+        }
+        if !candidate_is_elemental {
+            let formal_rank = formal_declared_rank(declared_args[0]);
+            if !formal_rank_matches_actual(formal_rank, operand_actual_rank) {
+                continue;
+            }
+        }
+        if let Some(result_ti) = specific_candidate_result_type_info(st, candidate) {
+            return Some(result_ti);
+        }
+    }
+
+    None
+}
+
+pub(super) fn resolve_defined_unary_operator_specific_by_semantics(
+    st: &SymbolTable,
+    locals: Option<&HashMap<String, LocalInfo>>,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    op: &UnaryOp,
+    operand_expr: &crate::ast::expr::SpannedExpr,
+) -> Option<String> {
+    let iface_name = unary_op_interface_name(op)?;
+    let specifics = operator_interface_specific_candidates(st, &iface_name)?;
+    let operand_ti = operator_expr_type_info(operand_expr, locals, st, type_layouts);
+    if !matches!(op, UnaryOp::Defined(_)) && operator_builtin_intrinsic_operand(operand_ti.as_ref())
+    {
+        return None;
+    }
+    let operand_actual_rank =
+        locals.and_then(|locals| actual_expr_rank(operand_expr, locals, st, type_layouts));
+
+    for candidate in &specifics {
+        let Some(scope) = procedure_scope_for_candidate(st, candidate) else {
+            continue;
+        };
+        let declared_args = declared_args_for_scope(scope);
+        if declared_args.len() != 1 {
+            continue;
+        }
+        let Some(decl) = declared_args.first().and_then(|arg| arg.type_info.as_ref()) else {
+            continue;
+        };
+        if !operator_arg_semantic_match(decl, operand_ti.as_ref()) {
+            continue;
+        }
+        if !specific_candidate_is_elemental(st, candidate) {
+            let formal_rank = formal_declared_rank(declared_args[0]);
+            if !formal_rank_matches_actual(formal_rank, operand_actual_rank) {
+                continue;
+            }
+        }
+        return Some(candidate.name.clone());
     }
 
     None
@@ -13670,6 +13767,15 @@ pub(super) fn binary_op_interface_name(op: &BinaryOp) -> Option<String> {
         BinaryOp::Eqv => "operator(.eqv.)".into(),
         BinaryOp::Neqv => "operator(.neqv.)".into(),
         BinaryOp::Defined(name) => format!("operator(.{}.)", name.to_lowercase()),
+    })
+}
+
+pub(super) fn unary_op_interface_name(op: &UnaryOp) -> Option<String> {
+    Some(match op {
+        UnaryOp::Plus => "operator(+)".into(),
+        UnaryOp::Minus => "operator(-)".into(),
+        UnaryOp::Not => "operator(.not.)".into(),
+        UnaryOp::Defined(name) => format!("operator(.{}.)", name.to_lowercase()),
     })
 }
 
