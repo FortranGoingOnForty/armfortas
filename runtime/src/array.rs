@@ -1466,6 +1466,21 @@ pub extern "C" fn afs_assign_allocatable(
         (0..dest.rank as usize).all(|i| dest.dims[i].extent() == source.dims[i].extent())
     };
 
+    let source_snapshot = if source_base_points_into_dest_storage(dest, source) {
+        let bytes = source.total_bytes();
+        if bytes > 0 {
+            let mut buf = vec![0u8; bytes as usize];
+            unsafe {
+                copy_same_type_payload_to_contiguous(source, buf.as_mut_ptr());
+            }
+            Some(buf)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     if !shapes_match || !dest.is_allocated() {
         // Deallocate dest if allocated.
         if dest.is_allocated() && !dest.base_addr.is_null() {
@@ -1515,63 +1530,92 @@ pub extern "C" fn afs_assign_allocatable(
     // non-contiguous and walk every multi-index column-major.
     //
     // We only treat the source as non-contiguous when at least one
-    // dim's stride is *strictly greater* than its canonical
-    // column-major step. Strides smaller than canonical (e.g.
-    // afs_matmul's 2x2 result emitted with stride=(1,1) instead of
-    // (1,2)) describe an internally inconsistent descriptor whose
-    // base_addr still points at a flat contiguous buffer; walking
-    // those would re-read the same byte offset twice and drop the
-    // last element. The conservative choice is the flat copy that
-    // mirrors total_bytes — which the previous unconditional ptr::copy
-    // did silently for both kinds of source.
+    // dim's stride is negative or *strictly greater* than its
+    // canonical column-major step. Positive strides smaller than
+    // canonical (e.g. afs_matmul's 2x2 result emitted with
+    // stride=(1,1) instead of (1,2)) describe an internally
+    // inconsistent descriptor whose base_addr still points at a flat
+    // contiguous buffer; walking those would re-read the same byte
+    // offset twice and drop the last element. The conservative choice
+    // is the flat copy that mirrors total_bytes — which the previous
+    // unconditional ptr::copy did silently for both kinds of source.
     let bytes = source.total_bytes();
     if bytes > 0 && !source.base_addr.is_null() && !dest.base_addr.is_null() {
-        let elem_size = source.elem_size;
-        let mut canonical: i64 = 1;
-        let mut strided = false;
-        for i in 0..source.rank as usize {
-            if source.dims[i].stride > canonical {
-                strided = true;
-                break;
-            }
-            canonical = canonical.saturating_mul(source.dims[i].extent().max(1));
-        }
-        if !strided {
+        if let Some(buf) = source_snapshot.as_ref() {
+            let copy_bytes = bytes.min(dest.total_bytes()) as usize;
             unsafe {
-                ptr::copy(source.base_addr, dest.base_addr, bytes as usize);
+                ptr::copy_nonoverlapping(buf.as_ptr(), dest.base_addr, copy_bytes);
             }
         } else {
-            let rank = source.rank as usize;
-            let extents: Vec<i64> = (0..rank).map(|i| source.dims[i].extent()).collect();
-            let strides: Vec<i64> = (0..rank).map(|i| source.dims[i].stride).collect();
-            let mut idx = vec![0i64; rank];
-            let total = source.total_elements();
-            for k in 0..total {
-                let mut src_off: i64 = 0;
-                for d in 0..rank {
-                    src_off += idx[d] * strides[d];
-                }
-                src_off *= elem_size;
-                let dst_off = k * elem_size;
-                unsafe {
-                    ptr::copy_nonoverlapping(
-                        source.base_addr.offset(src_off as isize),
-                        dest.base_addr.offset(dst_off as isize),
-                        elem_size as usize,
-                    );
-                }
-                for d in 0..rank {
-                    idx[d] += 1;
-                    if idx[d] < extents[d] {
-                        break;
-                    }
-                    idx[d] = 0;
-                }
+            unsafe {
+                copy_same_type_payload_to_contiguous(source, dest.base_addr);
             }
         }
     }
     dest.set_scalar_type_tag(source.scalar_type_tag());
     dest.set_scalar_tbp_lookup_ptr(source.scalar_tbp_lookup_ptr());
+}
+
+fn source_base_points_into_dest_storage(dest: &ArrayDescriptor, source: &ArrayDescriptor) -> bool {
+    if !dest.is_allocated() || dest.base_addr.is_null() || source.base_addr.is_null() {
+        return false;
+    }
+    let dest_bytes = dest.total_bytes();
+    if dest_bytes <= 0 {
+        return false;
+    }
+    let dest_start = dest.base_addr as usize;
+    let dest_end = dest_start.saturating_add(dest_bytes as usize);
+    let source_start = source.base_addr as usize;
+    source_start >= dest_start && source_start < dest_end
+}
+
+unsafe fn copy_same_type_payload_to_contiguous(source: &ArrayDescriptor, dest_base: *mut u8) {
+    let bytes = source.total_bytes();
+    if bytes <= 0 || source.base_addr.is_null() || dest_base.is_null() {
+        return;
+    }
+
+    let elem_size = source.elem_size;
+    let mut canonical: i64 = 1;
+    let mut strided = false;
+    for i in 0..source.rank as usize {
+        if source.dims[i].stride < 0 || source.dims[i].stride > canonical {
+            strided = true;
+            break;
+        }
+        canonical = canonical.saturating_mul(source.dims[i].extent().max(1));
+    }
+    if !strided {
+        ptr::copy(source.base_addr, dest_base, bytes as usize);
+        return;
+    }
+
+    let rank = source.rank as usize;
+    let extents: Vec<i64> = (0..rank).map(|i| source.dims[i].extent()).collect();
+    let strides: Vec<i64> = (0..rank).map(|i| source.dims[i].stride).collect();
+    let mut idx = vec![0i64; rank];
+    let total = source.total_elements();
+    for k in 0..total {
+        let mut src_off: i64 = 0;
+        for d in 0..rank {
+            src_off += idx[d] * strides[d];
+        }
+        src_off *= elem_size;
+        let dst_off = k * elem_size;
+        ptr::copy_nonoverlapping(
+            source.base_addr.offset(src_off as isize),
+            dest_base.offset(dst_off as isize),
+            elem_size as usize,
+        );
+        for d in 0..rank {
+            idx[d] += 1;
+            if idx[d] < extents[d] {
+                break;
+            }
+            idx[d] = 0;
+        }
+    }
 }
 
 /// Element-converting allocatable assignment.
@@ -1676,12 +1720,12 @@ pub extern "C" fn afs_assign_allocatable_convert(
     // Source may be non-contiguous (e.g. transpose result, section).
     // Walk each multi-index column-major and apply per-dim strides.
     // Mirror the same-class detection used in afs_assign_allocatable
-    // and afs_copy_array_data: only apply per-dim strides when at
-    // least one stride is *strictly greater* than its canonical
-    // column-major step. A stride below canonical describes a
-    // malformed descriptor (e.g. a 2x2 matmul result with stride=(1,1)
-    // instead of (1,2)) whose underlying buffer is still flat
-    // contiguous; walking those re-reads the same offset twice.
+    // and afs_copy_array_data: apply per-dim strides when at least
+    // one stride is negative or *strictly greater* than its canonical
+    // column-major step. A positive stride below canonical describes
+    // a malformed descriptor (e.g. a 2x2 matmul result with
+    // stride=(1,1) instead of (1,2)) whose underlying buffer is still
+    // flat contiguous; walking those re-reads the same offset twice.
     let rank = source_ref.rank as usize;
     let extents: Vec<i64> = (0..rank).map(|i| source_ref.dims[i].extent()).collect();
     let raw_strides: Vec<i64> = (0..rank).map(|i| source_ref.dims[i].stride).collect();
@@ -1690,7 +1734,7 @@ pub extern "C" fn afs_assign_allocatable_convert(
     let mut strided = false;
     for d in 0..rank {
         canonical.push(canonical_step);
-        if raw_strides[d] > canonical_step {
+        if raw_strides[d] < 0 || raw_strides[d] > canonical_step {
             strided = true;
         }
         canonical_step = canonical_step.saturating_mul(extents[d].max(1));
@@ -2211,6 +2255,73 @@ mod tests {
 
         afs_deallocate_array(&mut backing, ptr::null_mut());
         afs_deallocate_array(&mut dest, ptr::null_mut());
+    }
+
+    #[test]
+    fn assign_allocatable_self_section_snapshots_before_reallocate() {
+        let mut desc = ArrayDescriptor::zeroed();
+        let mut section = ArrayDescriptor::zeroed();
+
+        afs_allocate_1d(&mut desc, 4, 4);
+        unsafe {
+            let data = desc.base_addr as *mut i32;
+            *data.add(0) = 10;
+            *data.add(1) = 20;
+            *data.add(2) = 30;
+            *data.add(3) = 40;
+        }
+
+        let spec = SectionSpec {
+            start: 2,
+            end: 4,
+            stride: 1,
+        };
+        afs_create_section(&desc, &mut section, &spec, 1);
+
+        afs_assign_allocatable(&mut desc, &section);
+        assert!(desc.is_allocated());
+        assert_eq!(desc.total_elements(), 3);
+        unsafe {
+            let data = desc.base_addr as *const i32;
+            assert_eq!(*data.add(0), 20);
+            assert_eq!(*data.add(1), 30);
+            assert_eq!(*data.add(2), 40);
+        }
+
+        afs_deallocate_array(&mut desc, ptr::null_mut());
+    }
+
+    #[test]
+    fn assign_allocatable_negative_self_section_walks_stride() {
+        let mut desc = ArrayDescriptor::zeroed();
+        let mut section = ArrayDescriptor::zeroed();
+
+        afs_allocate_1d(&mut desc, 4, 4);
+        unsafe {
+            let data = desc.base_addr as *mut i32;
+            *data.add(0) = 10;
+            *data.add(1) = 20;
+            *data.add(2) = 30;
+            *data.add(3) = 40;
+        }
+
+        let spec = SectionSpec {
+            start: 4,
+            end: 1,
+            stride: -3,
+        };
+        afs_create_section(&desc, &mut section, &spec, 1);
+
+        afs_assign_allocatable(&mut desc, &section);
+        assert!(desc.is_allocated());
+        assert_eq!(desc.total_elements(), 2);
+        unsafe {
+            let data = desc.base_addr as *const i32;
+            assert_eq!(*data.add(0), 40);
+            assert_eq!(*data.add(1), 10);
+        }
+
+        afs_deallocate_array(&mut desc, ptr::null_mut());
     }
 
     #[test]

@@ -18821,6 +18821,22 @@ pub(super) fn lower_string_expr_full(
                 }
             }
             if let Expr::Name { name } = &callee.node {
+                if name.eq_ignore_ascii_case("transfer") && args.len() >= 2 {
+                    if let Some(result) = lower_transfer_to_character_expr(
+                        b,
+                        locals,
+                        args,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
+                    ) {
+                        return result;
+                    }
+                }
+            }
+            if let Expr::Name { name } = &callee.node {
                 let key = name.to_lowercase();
                 let first_char_arg = args.first().and_then(|a| {
                     if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
@@ -41413,8 +41429,20 @@ pub(super) fn try_lower_transfer_into_array(
         Some(crate::sema::symtab::TypeInfo::Integer { kind }) => kind.unwrap_or(4) as i64,
         Some(crate::sema::symtab::TypeInfo::Real { kind }) => kind.unwrap_or(4) as i64,
         Some(crate::sema::symtab::TypeInfo::Logical { kind }) => kind.unwrap_or(4) as i64,
+        Some(crate::sema::symtab::TypeInfo::Character { len: Some(len), .. }) => len,
+        Some(crate::sema::symtab::TypeInfo::Character { .. }) => {
+            let Some(len) =
+                fixed_char_expr_len(b, mold_expr, &ctx.locals, ctx.st, Some(ctx.type_layouts))
+            else {
+                return false;
+            };
+            len
+        }
         _ => return false,
     };
+    if scalar_size <= 0 {
+        return false;
+    }
 
     // Resolve the SIZE arg.  Constant size is the common case and lets
     // us emit constant-folded memset/memcpy/allocate.  But hashmap-style
@@ -41439,79 +41467,94 @@ pub(super) fn try_lower_transfer_into_array(
             return false;
         }
         (b.const_i64(size), b.const_i64(total_bytes))
-    } else if descriptor_dest {
-        if let Some(size_expr) = size_expr_opt {
-            // Lower SIZE at runtime so we can honor `transfer(src, mold,
-            // bytes_char * len(value))`.  Multiply by scalar_size in IR.
-            let size_val = super::expr::lower_expr_ctx_tl(b, ctx, size_expr);
-            let size_i64 = coerce_to_type(b, size_val, &IrType::Int(IntWidth::I64));
-            let elem_v = b.const_i64(scalar_size);
-            let total = b.imul(size_i64, elem_v);
-            (size_i64, total)
-        } else {
-            // 2-arg transfer.  SIZE defaults to
-            // `ceil(SRC_bytes / MOLD_elem_size)`.  We need SRC's
-            // total byte count: total_elems(SRC) * src_elem_size.
-            // For a whole-array Name we read from the runtime
-            // descriptor; for an inline array constructor we know
-            // both the element count (constructor length) and the
-            // element size (semantic type) at compile time.
-            let (total_v, scalar_total): (ValueId, Option<i64>) = if let Some(src_info) =
-                whole_array_expr_local_info(b, &ctx.locals, src_expr, ctx.st, ctx.type_layouts)
-            {
-                let src_total_elems = array_total_elems_value(b, &src_info);
-                let src_elem_size_const = descriptor_element_size_bytes(&src_info);
-                if src_elem_size_const <= 0 {
-                    return false;
-                }
-                let src_elem_v = b.const_i64(src_elem_size_const);
-                let total = b.imul(src_total_elems, src_elem_v);
-                (total, None)
-            } else if let Expr::ArrayConstructor { values, .. } = &src_expr.node {
-                // Element count from constructor length.  Elem size
-                // from the constructor's first value's semantic type
-                // (constructors are mono-typed by F2018 §7.8).
-                let n_elems = match const_array_constructor_len(values) {
-                    Some(n) if n > 0 => n,
-                    _ => return false,
-                };
-                let elem_ti = values.first().and_then(|v| {
-                    let crate::ast::expr::AcValue::Expr(expr) = v else {
-                        return None;
-                    };
-                    operator_expr_type_info(expr, Some(&ctx.locals), ctx.st, Some(ctx.type_layouts))
-                });
-                let src_elem_size: i64 = match elem_ti {
-                    Some(crate::sema::symtab::TypeInfo::Integer { kind }) => {
-                        kind.unwrap_or(4) as i64
-                    }
-                    Some(crate::sema::symtab::TypeInfo::Real { kind }) => kind.unwrap_or(4) as i64,
-                    Some(crate::sema::symtab::TypeInfo::Logical { kind }) => {
-                        kind.unwrap_or(4) as i64
-                    }
-                    _ => return false,
-                };
-                let total_bytes = n_elems * src_elem_size;
-                (b.const_i64(total_bytes), Some(total_bytes))
-            } else {
-                return false;
-            };
-            // ceil(total / scalar_size) for the mold extent.
-            let result_size = if scalar_size == 1 {
-                total_v
-            } else if let Some(total) = scalar_total {
-                let r = (total + scalar_size - 1) / scalar_size;
-                b.const_i64(r)
-            } else {
-                let denom = b.const_i64(scalar_size);
-                let denom_minus_one = b.const_i64(scalar_size - 1);
-                let num = b.iadd(total_v, denom_minus_one);
-                b.idiv(num, denom)
-            };
-            (result_size, total_v)
+    } else if let Some(size_expr) = size_expr_opt {
+        if !descriptor_dest {
+            return false;
         }
+        // Lower SIZE at runtime so we can honor `transfer(src, mold,
+        // bytes_char * len(value))`.  Multiply by scalar_size in IR.
+        let size_val = super::expr::lower_expr_ctx_tl(b, ctx, size_expr);
+        let size_i64 = coerce_to_type(b, size_val, &IrType::Int(IntWidth::I64));
+        let elem_v = b.const_i64(scalar_size);
+        let total = b.imul(size_i64, elem_v);
+        (size_i64, total)
     } else {
-        return false;
+        // 2-arg transfer.  SIZE defaults to
+        // `ceil(SRC_bytes / MOLD_elem_size)`.  We need SRC's
+        // total byte count: total_elems(SRC) * src_elem_size.
+        // For a whole-array Name we read from the runtime
+        // descriptor; for an inline array constructor we know
+        // both the element count (constructor length) and the
+        // element size (semantic type) at compile time.
+        let char_src_len = actual_char_arg_runtime_len(
+            b,
+            &ctx.locals,
+            None,
+            src_expr,
+            ctx.st,
+            Some(ctx.type_layouts),
+            Some(ctx.internal_funcs),
+            Some(ctx.contained_host_refs),
+            Some(ctx.descriptor_params),
+        );
+        let const_char_src_len =
+            fixed_char_expr_len(b, src_expr, &ctx.locals, ctx.st, Some(ctx.type_layouts));
+        let (total_v, scalar_total): (ValueId, Option<i64>) = if let Some(len_v) = char_src_len {
+            (len_v, const_char_src_len)
+        } else if let Some(len) = const_char_src_len {
+            (b.const_i64(len), Some(len))
+        } else if let Some(src_info) =
+            whole_array_expr_local_info(b, &ctx.locals, src_expr, ctx.st, ctx.type_layouts)
+        {
+            let src_total_elems = array_total_elems_value(b, &src_info);
+            let src_elem_size_const = descriptor_element_size_bytes(&src_info);
+            if src_elem_size_const <= 0 {
+                return false;
+            }
+            let src_elem_v = b.const_i64(src_elem_size_const);
+            let total = b.imul(src_total_elems, src_elem_v);
+            (total, None)
+        } else if let Expr::ArrayConstructor { values, .. } = &src_expr.node {
+            // Element count from constructor length.  Elem size
+            // from the constructor's first value's semantic type
+            // (constructors are mono-typed by F2018 §7.8).
+            let n_elems = match const_array_constructor_len(values) {
+                Some(n) if n > 0 => n,
+                _ => return false,
+            };
+            let elem_ti = values.first().and_then(|v| {
+                let crate::ast::expr::AcValue::Expr(expr) = v else {
+                    return None;
+                };
+                operator_expr_type_info(expr, Some(&ctx.locals), ctx.st, Some(ctx.type_layouts))
+            });
+            let src_elem_size: i64 = match elem_ti {
+                Some(crate::sema::symtab::TypeInfo::Integer { kind }) => kind.unwrap_or(4) as i64,
+                Some(crate::sema::symtab::TypeInfo::Real { kind }) => kind.unwrap_or(4) as i64,
+                Some(crate::sema::symtab::TypeInfo::Logical { kind }) => kind.unwrap_or(4) as i64,
+                _ => return false,
+            };
+            let total_bytes = n_elems * src_elem_size;
+            (b.const_i64(total_bytes), Some(total_bytes))
+        } else {
+            return false;
+        };
+        // ceil(total / scalar_size) for the mold extent.
+        if !descriptor_dest && scalar_total.is_none() {
+            return false;
+        }
+        let result_size = if scalar_size == 1 {
+            total_v
+        } else if let Some(total) = scalar_total {
+            let r = (total + scalar_size - 1) / scalar_size;
+            b.const_i64(r)
+        } else {
+            let denom = b.const_i64(scalar_size);
+            let denom_minus_one = b.const_i64(scalar_size - 1);
+            let num = b.iadd(total_v, denom_minus_one);
+            b.idiv(num, denom)
+        };
+        (result_size, total_v)
     };
 
     // For descriptor-backed allocatable destinations, the descriptor
@@ -41587,7 +41630,10 @@ pub(super) fn try_lower_transfer_into_array(
     let char_name_src_addr: Option<ValueId> = if let Expr::Name { name } = &src_expr.node {
         let key = name.to_lowercase();
         ctx.locals.get(&key).cloned().and_then(|info| {
-            if info.char_kind != CharKind::None {
+            if info.char_kind != CharKind::None
+                && info.dims.is_empty()
+                && !local_uses_array_descriptor(&info)
+            {
                 // Use the canonical (ptr, len) helper so each
                 // CharKind shape resolves to its real data pointer:
                 // Fixed → stack buffer, FixedRuntime → heap buffer
@@ -41660,6 +41706,144 @@ pub(super) fn try_lower_transfer_into_array(
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
     );
     true
+}
+
+fn lower_transfer_to_character_expr(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    args: &[crate::ast::expr::Argument],
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) -> Option<(ValueId, ValueId)> {
+    use crate::ast::expr::SectionSubscript;
+
+    if args.get(2).is_some() {
+        return None;
+    }
+    let crate::ast::expr::Argument {
+        value: SectionSubscript::Element(source_expr),
+        ..
+    } = &args[0]
+    else {
+        return None;
+    };
+    let crate::ast::expr::Argument {
+        value: SectionSubscript::Element(mold_expr),
+        ..
+    } = &args[1]
+    else {
+        return None;
+    };
+
+    let mold_ti = operator_expr_type_info(mold_expr, Some(locals), st, type_layouts)?;
+    if !matches!(mold_ti, crate::sema::symtab::TypeInfo::Character { .. }) {
+        return None;
+    }
+    let result_len = actual_char_arg_runtime_len(
+        b,
+        locals,
+        None,
+        mold_expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    )
+    .or_else(|| {
+        fixed_char_expr_len(b, mold_expr, locals, st, type_layouts).map(|n| b.const_i64(n))
+    })?;
+
+    let buf = b.runtime_call(
+        RuntimeFunc::Allocate,
+        vec![result_len],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+    let zero = b.const_i32(0);
+    b.call(
+        FuncRef::External("memset".into()),
+        vec![buf, zero, result_len],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+
+    let char_name_src_addr: Option<ValueId> = if let Expr::Name { name } = &source_expr.node {
+        let key = name.to_lowercase();
+        locals.get(&key).and_then(|info| {
+            if info.char_kind != CharKind::None
+                && info.dims.is_empty()
+                && !local_uses_array_descriptor(info)
+            {
+                local_char_ptr_and_len(b, info).map(|(ptr, _len)| ptr)
+            } else {
+                None
+            }
+        })
+    } else {
+        None
+    };
+    let src_addr = if let Some(addr) = char_name_src_addr {
+        addr
+    } else if let Some((src_desc, _src_elem_ty)) = lower_array_expr_descriptor(
+        b,
+        locals,
+        source_expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    ) {
+        b.load_typed(src_desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
+    } else if expr_is_character_expr(b, locals, source_expr, st, type_layouts) {
+        let (ptr, _len) = lower_string_expr_full(
+            b,
+            locals,
+            source_expr,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        );
+        ptr
+    } else {
+        let v = super::expr::lower_expr_full(
+            b,
+            locals,
+            source_expr,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        );
+        let vty = b.func().value_type(v).unwrap_or(IrType::Int(IntWidth::I32));
+        match &vty {
+            IrType::Ptr(_) => v,
+            IrType::Int(_) | IrType::Float(_) | IrType::Bool => {
+                let sz = ir_scalar_byte_size(&vty);
+                let tmp = b.alloca(IrType::Array(
+                    Box::new(IrType::Int(IntWidth::I8)),
+                    sz as u64,
+                ));
+                let zero_off = b.const_i64(0);
+                let dst = b.gep(tmp, vec![zero_off], IrType::Int(IntWidth::I8));
+                b.store(v, dst);
+                tmp
+            }
+            _ => return None,
+        }
+    };
+
+    b.call(
+        FuncRef::External("memcpy".into()),
+        vec![buf, src_addr, result_len],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+    Some((buf, result_len))
 }
 
 pub(super) fn lower_transfer_intrinsic(
