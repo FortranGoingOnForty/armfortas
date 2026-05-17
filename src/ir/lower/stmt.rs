@@ -1580,19 +1580,20 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     .map(|k| k.eq_ignore_ascii_case("iomsg"))
                     .unwrap_or(false)
             });
-            let iostat_ptr = iostat_ctrl
-                .map(|c| lower_arg_by_ref_ctx(b, ctx, &c.value))
-                .unwrap_or(null_i8_ptr);
-            let (iomsg_ptr, iomsg_len) = if let Some(c) = iomsg_ctrl {
-                lower_string_expr_with_layouts(
+            let iostat_arg_ptr = iostat_ctrl.map(|c| lower_arg_by_ref_ctx(b, ctx, &c.value));
+            let iostat_ptr = iostat_arg_ptr.unwrap_or(null_i8_ptr);
+            let (iomsg_arg_ptr, iomsg_ptr, iomsg_len) = if let Some(c) = iomsg_ctrl {
+                let arg_ptr = lower_arg_by_ref_ctx(b, ctx, &c.value);
+                let (ptr, len) = lower_string_expr_with_layouts(
                     b,
                     &ctx.locals,
                     &c.value,
                     ctx.st,
                     Some(ctx.type_layouts),
-                )
+                );
+                (arg_ptr, ptr, len)
             } else {
-                (null_i8_ptr, zero_i64)
+                (null_char_slot_arg(b), null_i8_ptr, zero_i64)
             };
 
             if let Some(ctrl) = controls.first() {
@@ -1640,6 +1641,26 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             } else {
                 b.const_i32(6)
             };
+
+            let defined_iotype = match fmt_control {
+                Some(ctrl) if matches!(&ctrl.value.node, Expr::Name { name } if name == "*") => {
+                    Some("LISTDIRECTED")
+                }
+                Some(_) => Some("DT"),
+                None => None,
+            };
+            if try_lower_defined_io_write_items(
+                b,
+                ctx,
+                items,
+                unit,
+                defined_iotype,
+                iostat_arg_ptr,
+                iomsg_arg_ptr,
+                iomsg_len,
+            ) {
+                return;
+            }
 
             if is_list_directed {
                 // Wrap the per-item writes in begin/end so the runtime
@@ -4790,6 +4811,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 })
                 .map(|c| lower_arg_by_ref_ctx(b, ctx, &c.value));
 
+            let has_dtio_iostat_addr = explicit_iostat_addr.is_some() || err_label.is_some();
             let iostat_addr = match (err_label, explicit_iostat_addr) {
                 (_, Some(addr)) => addr,
                 (Some(_), None) => {
@@ -4800,6 +4822,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 }
                 (None, None) => b.const_i64(0),
             };
+            let dtio_iostat_addr = has_dtio_iostat_addr.then_some(iostat_addr);
 
             let size_addr = controls
                 .iter()
@@ -4811,6 +4834,30 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 })
                 .map(|c| lower_arg_by_ref_ctx(b, ctx, &c.value))
                 .unwrap_or_else(|| b.const_i64(0));
+            let iomsg_ctrl = controls.iter().find(|c| {
+                c.keyword
+                    .as_deref()
+                    .map(|k| k.eq_ignore_ascii_case("iomsg"))
+                    .unwrap_or(false)
+            });
+            let null_iomsg_data = {
+                let z = b.const_i64(0);
+                b.int_to_ptr(z, IrType::Int(IntWidth::I8))
+            };
+            let zero_iomsg_len = b.const_i64(0);
+            let (iomsg_arg_ptr, read_iomsg_ptr, read_iomsg_len) = if let Some(c) = iomsg_ctrl {
+                let arg_ptr = lower_arg_by_ref_ctx(b, ctx, &c.value);
+                let (ptr, len) = lower_string_expr_with_layouts(
+                    b,
+                    &ctx.locals,
+                    &c.value,
+                    ctx.st,
+                    Some(ctx.type_layouts),
+                );
+                (arg_ptr, ptr, len)
+            } else {
+                (null_char_slot_arg(b), null_iomsg_data, zero_iomsg_len)
+            };
 
             if let Some(ctrl) = controls.first() {
                 if let Some((buf_ptr, buf_len)) = internal_io_buffer(b, ctx, ctrl) {
@@ -4851,27 +4898,41 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             } else {
                 b.const_i32(5) // default stdin
             };
+            let defined_iotype = match fmt_control {
+                Some(ctrl) if matches!(&ctrl.value.node, Expr::Name { name } if name == "*") => {
+                    Some("LISTDIRECTED")
+                }
+                Some(_) => Some("DT"),
+                None => None,
+            };
+            if try_lower_defined_io_read_items(
+                b,
+                ctx,
+                items,
+                unit,
+                defined_iotype,
+                dtio_iostat_addr,
+                iomsg_arg_ptr,
+                read_iomsg_len,
+            ) {
+                lower_read_err_branch(b, ctx, err_label, iostat_addr);
+                return;
+            }
             if is_list_directed {
                 // Wrap the per-item reads in begin/end so the runtime
                 // can slurp a sequential-unformatted record up front
                 // and let the typed helpers consume binary bytes.
                 // Formatted units pass through (begin only resets
-                // iostat). iomsg= isn't yet plumbed on the read side;
-                // stick a null pointer for now.
-                let null_iomsg = {
-                    let z = b.const_i64(0);
-                    b.int_to_ptr(z, IrType::Int(IntWidth::I8))
-                };
-                let zero_len = b.const_i64(0);
+                // iostat).
                 b.call(
                     FuncRef::External("afs_list_read_begin".into()),
-                    vec![unit, iostat_addr, null_iomsg, zero_len],
+                    vec![unit, iostat_addr, read_iomsg_ptr, read_iomsg_len],
                     IrType::Void,
                 );
                 lower_list_read_items(b, ctx, items, unit, iostat_addr);
                 b.call(
                     FuncRef::External("afs_list_read_end".into()),
-                    vec![unit, iostat_addr, null_iomsg, zero_len],
+                    vec![unit, iostat_addr, read_iomsg_ptr, read_iomsg_len],
                     IrType::Void,
                 );
             } else {

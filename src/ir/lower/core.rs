@@ -23214,6 +23214,340 @@ pub(super) fn lower_internal_write_items(
     }
 }
 
+fn resolve_defined_io_item_specific(
+    ctx: &LowerCtx,
+    interface_name: &str,
+    item: &crate::ast::expr::SpannedExpr,
+) -> Option<SpecificProcCandidate> {
+    use crate::sema::symtab::TypeInfo;
+
+    if actual_expr_rank(item, &ctx.locals, ctx.st, Some(ctx.type_layouts))
+        .is_some_and(|rank| rank != 0)
+    {
+        return None;
+    }
+
+    let actual_type =
+        generic_actual_expr_type_info(item, &ctx.locals, ctx.st, Some(ctx.type_layouts))?;
+    if !matches!(actual_type, TypeInfo::Derived(_) | TypeInfo::Class(_)) {
+        return None;
+    }
+
+    let candidates = named_interface_specific_candidates(ctx.st, interface_name)?;
+    candidates.into_iter().find(|candidate| {
+        let Some(scope) = procedure_scope_for_candidate(ctx.st, candidate) else {
+            return false;
+        };
+        let declared_args = declared_args_for_scope(scope);
+        let Some(first_arg) = declared_args.first() else {
+            return false;
+        };
+        let Some(declared_type) = first_arg.type_info.as_ref() else {
+            return false;
+        };
+        generic_declared_semantic_match(declared_type, Some(&actual_type), Some(ctx.type_layouts))
+    })
+}
+
+pub(super) fn null_char_slot_arg(b: &mut FuncBuilder) -> ValueId {
+    let zero = b.const_i64(0);
+    b.int_to_ptr(zero, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
+}
+
+fn const_char_slot_arg(b: &mut FuncBuilder, value: &str) -> (ValueId, ValueId) {
+    let ptr = b.const_string(value.as_bytes());
+    let slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    b.store(ptr, slot);
+    (slot, b.const_i64(value.len() as i64))
+}
+
+fn materialize_empty_i32_rank1_descriptor(b: &mut FuncBuilder) -> ValueId {
+    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let zero32 = b.const_i32(0);
+    let size384 = b.const_i64(384);
+    b.call(
+        FuncRef::External("memset".into()),
+        vec![desc, zero32, size384],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+
+    let null_base = {
+        let zero = b.const_i64(0);
+        b.int_to_ptr(zero, IrType::Int(IntWidth::I32))
+    };
+    store_byte_aggregate_field(
+        b,
+        desc,
+        0,
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+        null_base,
+    );
+    let elem_bytes = b.const_i64(4);
+    let rank = b.const_i32(1);
+    let flags = b.const_i32(2);
+    let one = b.const_i64(1);
+    let zero = b.const_i64(0);
+    store_byte_aggregate_field(b, desc, 8, IrType::Int(IntWidth::I64), elem_bytes);
+    store_byte_aggregate_field(b, desc, 16, IrType::Int(IntWidth::I32), rank);
+    store_byte_aggregate_field(b, desc, 20, IrType::Int(IntWidth::I32), flags);
+    store_byte_aggregate_field(b, desc, 24, IrType::Int(IntWidth::I64), one);
+    store_byte_aggregate_field(b, desc, 32, IrType::Int(IntWidth::I64), zero);
+    store_byte_aggregate_field(b, desc, 40, IrType::Int(IntWidth::I64), one);
+    desc
+}
+
+fn dtio_iostat_arg(b: &mut FuncBuilder, iostat: Option<ValueId>) -> ValueId {
+    iostat.unwrap_or_else(|| {
+        let tmp = b.alloca(IrType::Int(IntWidth::I32));
+        let zero = b.const_i32(0);
+        b.store(zero, tmp);
+        tmp
+    })
+}
+
+fn dtio_descriptor_mask_fallback(
+    ctx: &LowerCtx,
+    candidate: &SpecificProcCandidate,
+) -> Option<Vec<bool>> {
+    use crate::sema::symtab::TypeInfo;
+
+    let scope = procedure_scope_for_candidate(ctx.st, candidate)?;
+    let declared_args = declared_args_for_scope(scope);
+    Some(
+        declared_args
+            .iter()
+            .map(|sym| {
+                formal_declared_rank(sym).is_some_and(|rank| rank > 0)
+                    || matches!(
+                        sym.type_info,
+                        Some(TypeInfo::Class(_)) | Some(TypeInfo::ClassStar)
+                    )
+            })
+            .collect(),
+    )
+}
+
+fn emit_defined_io_call(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    candidate: &SpecificProcCandidate,
+    item: &crate::ast::expr::SpannedExpr,
+    unit: ValueId,
+    formatted_iotype: Option<&str>,
+    iostat: Option<ValueId>,
+    iomsg_arg: ValueId,
+    iomsg_len: ValueId,
+) {
+    let (call_name, specific_key) = resolved_symbol_call_target_for_candidate(ctx.st, candidate);
+    let abi_lookup_keys =
+        procedure_abi_lookup_keys_for_call_target(ctx.st, call_name.as_str(), &[&specific_key]);
+    let descriptor_mask = first_procedure_lookup(&abi_lookup_keys, |key| {
+        cached_param_mask_for_lookup(ctx.st, ctx.descriptor_params, key)
+    })
+    .or_else(|| dtio_descriptor_mask_fallback(ctx, candidate));
+    let class_mask =
+        first_procedure_lookup(&abi_lookup_keys, |key| callee_class_arg_mask(ctx.st, key));
+    let string_desc_mask = first_procedure_lookup(&abi_lookup_keys, |key| {
+        callee_string_descriptor_arg_mask(ctx.st, key)
+    });
+    let pointer_mask =
+        first_procedure_lookup(&abi_lookup_keys, |key| callee_pointer_arg_mask(ctx.st, key));
+
+    let wants_descriptor = descriptor_mask
+        .as_ref()
+        .map(|mask| mask.first().copied().unwrap_or(false))
+        .unwrap_or(false);
+    let wants_polymorphic_descriptor = wants_descriptor
+        && class_mask
+            .as_ref()
+            .map(|mask| mask.first().copied().unwrap_or(false))
+            .unwrap_or(false);
+    let wants_string_descriptor = string_desc_mask
+        .as_ref()
+        .map(|mask| mask.first().copied().unwrap_or(false))
+        .unwrap_or(false);
+    let wants_pointer = pointer_mask
+        .as_ref()
+        .map(|mask| mask.first().copied().unwrap_or(false))
+        .unwrap_or(false);
+
+    let item_arg = if wants_descriptor {
+        lower_arg_descriptor_full(
+            b,
+            &ctx.locals,
+            item,
+            ctx.st,
+            Some(ctx.type_layouts),
+            Some(ctx.internal_funcs),
+            Some(ctx.contained_host_refs),
+            Some(ctx.descriptor_params),
+            wants_polymorphic_descriptor,
+        )
+    } else if wants_string_descriptor {
+        lower_arg_string_descriptor(b, &ctx.locals, item, ctx.st, Some(ctx.type_layouts))
+    } else if wants_pointer {
+        lower_pointer_dummy_actual(
+            b,
+            &ctx.locals,
+            item,
+            ctx.st,
+            Some(ctx.type_layouts),
+            Some(ctx.internal_funcs),
+            Some(ctx.contained_host_refs),
+            Some(ctx.descriptor_params),
+        )
+        .unwrap_or_else(|| lower_arg_by_ref_ctx(b, ctx, item))
+    } else {
+        lower_arg_by_ref_ctx(b, ctx, item)
+    };
+
+    let unit_slot = b.alloca(IrType::Int(IntWidth::I32));
+    let unit_i32 = coerce_to_type(b, unit, &IrType::Int(IntWidth::I32));
+    b.store(unit_i32, unit_slot);
+
+    let iostat_arg = dtio_iostat_arg(b, iostat);
+    let mut call_args = if let Some(iotype) = formatted_iotype {
+        let (iotype_arg, _iotype_len) = const_char_slot_arg(b, iotype);
+        vec![
+            item_arg,
+            unit_slot,
+            iotype_arg,
+            materialize_empty_i32_rank1_descriptor(b),
+            iostat_arg,
+            iomsg_arg,
+        ]
+    } else {
+        vec![item_arg, unit_slot, iostat_arg, iomsg_arg]
+    };
+
+    let default_char_len_mask = if formatted_iotype.is_some() {
+        vec![false, false, true, false, false, true]
+    } else {
+        vec![false, false, false, true]
+    };
+    let char_len_mask = first_procedure_lookup(&abi_lookup_keys, |key| {
+        cached_param_mask_for_lookup(ctx.st, ctx.char_len_star_params, key)
+            .or_else(|| callee_char_len_star_mask(ctx.st, key))
+    })
+    .unwrap_or(default_char_len_mask);
+    let iotype_len = formatted_iotype.map(|s| s.len() as i64).unwrap_or(0);
+    for (idx, flag) in char_len_mask.iter().enumerate() {
+        if !*flag {
+            continue;
+        }
+        let len = if formatted_iotype.is_some() && idx == 2 {
+            b.const_i64(iotype_len)
+        } else if (formatted_iotype.is_some() && idx == 5)
+            || (formatted_iotype.is_none() && idx == 3)
+        {
+            iomsg_len
+        } else {
+            b.const_i64(0)
+        };
+        call_args.push(len);
+    }
+
+    append_host_closure_args_raw(
+        b,
+        &ctx.locals,
+        Some(ctx.contained_host_refs),
+        &specific_key,
+        &mut call_args,
+    );
+    let func_ref = same_unit_func_ref(
+        ctx.st,
+        b.func().name.as_str(),
+        Some(ctx.internal_funcs),
+        &[specific_key.as_str()],
+        call_name,
+    );
+    b.call(func_ref, call_args, IrType::Void);
+}
+
+pub(super) fn try_lower_defined_io_write_items(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    items: &[crate::ast::expr::SpannedExpr],
+    unit: ValueId,
+    formatted_iotype: Option<&str>,
+    iostat: Option<ValueId>,
+    iomsg_arg: ValueId,
+    iomsg_len: ValueId,
+) -> bool {
+    if items.is_empty() {
+        return false;
+    }
+    let interface_name = if formatted_iotype.is_some() {
+        "write(formatted)"
+    } else {
+        "write(unformatted)"
+    };
+    let Some(candidates) = items
+        .iter()
+        .map(|item| resolve_defined_io_item_specific(ctx, interface_name, item))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+
+    for (item, candidate) in items.iter().zip(candidates.iter()) {
+        emit_defined_io_call(
+            b,
+            ctx,
+            candidate,
+            item,
+            unit,
+            formatted_iotype,
+            iostat,
+            iomsg_arg,
+            iomsg_len,
+        );
+    }
+    true
+}
+
+pub(super) fn try_lower_defined_io_read_items(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    items: &[crate::ast::expr::SpannedExpr],
+    unit: ValueId,
+    formatted_iotype: Option<&str>,
+    iostat: Option<ValueId>,
+    iomsg_arg: ValueId,
+    iomsg_len: ValueId,
+) -> bool {
+    if items.is_empty() {
+        return false;
+    }
+    let interface_name = if formatted_iotype.is_some() {
+        "read(formatted)"
+    } else {
+        "read(unformatted)"
+    };
+    let Some(candidates) = items
+        .iter()
+        .map(|item| resolve_defined_io_item_specific(ctx, interface_name, item))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+
+    for (item, candidate) in items.iter().zip(candidates.iter()) {
+        emit_defined_io_call(
+            b,
+            ctx,
+            candidate,
+            item,
+            unit,
+            formatted_iotype,
+            iostat,
+            iomsg_arg,
+            iomsg_len,
+        );
+    }
+    true
+}
+
 pub(super) fn lower_list_read_items(
     b: &mut FuncBuilder,
     ctx: &mut LowerCtx,
