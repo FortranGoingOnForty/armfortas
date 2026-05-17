@@ -4582,6 +4582,13 @@ pub(super) fn encode_const_scalar_bytes(value: i128, size: usize) -> Option<Vec<
     Some(bytes)
 }
 
+fn encode_const_float_bytes(value: f64, width: FloatWidth) -> Vec<u8> {
+    match width {
+        FloatWidth::F32 => (value as f32).to_le_bytes().to_vec(),
+        FloatWidth::F64 => value.to_le_bytes().to_vec(),
+    }
+}
+
 pub(super) fn apply_derived_const_default_bytes(
     bytes: &mut [u8],
     base_offset: usize,
@@ -4771,6 +4778,24 @@ pub(super) fn apply_const_expr_to_derived_field_bytes(
             };
             let field_size = crate::sema::type_layout::size_of_type(&field.type_info).0;
             let encoded = encode_const_scalar_bytes(if value { 1 } else { 0 }, field_size)?;
+            let end = field_offset + encoded.len();
+            if end > bytes.len() {
+                return None;
+            }
+            bytes[field_offset..end].copy_from_slice(&encoded);
+            Some(true)
+        }
+        crate::sema::symtab::TypeInfo::Real { .. }
+        | crate::sema::symtab::TypeInfo::DoublePrecision => {
+            let raw = eval_const_scalar_with_any_scope(expr, param_consts, st)?;
+            let ir_ty = type_info_to_ir_type(&field.type_info);
+            let ConstScalar::Float(value) = clamp_const_to_type(raw, &ir_ty) else {
+                return None;
+            };
+            let IrType::Float(width) = ir_ty else {
+                return None;
+            };
+            let encoded = encode_const_float_bytes(value, width);
             let end = field_offset + encoded.len();
             if end > bytes.len() {
                 return None;
