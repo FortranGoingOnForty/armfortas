@@ -10966,6 +10966,44 @@ fn function_symbol_result_type_info(
     .flatten()
 }
 
+fn direct_function_result_type_info(
+    st: &SymbolTable,
+    key: &str,
+) -> Option<crate::sema::symtab::TypeInfo> {
+    st.lookup(key)
+        .and_then(function_symbol_result_type_info)
+        .or_else(|| {
+            find_linkable_symbol_any_scope(st, key).and_then(function_symbol_result_type_info)
+        })
+        .or_else(|| {
+            st.all_scopes().iter().find_map(|scope| {
+                if scope_matches_procedure_name(scope, key) {
+                    function_scope_result_type_info(st, scope)
+                } else {
+                    None
+                }
+            })
+        })
+}
+
+fn generic_call_has_unknown_actual_type_info(
+    args: &[crate::ast::expr::Argument],
+    locals: Option<&HashMap<String, LocalInfo>>,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> bool {
+    args.iter().any(|arg| match &arg.value {
+        crate::ast::expr::SectionSubscript::Element(expr) => {
+            if let Some(locals) = locals {
+                generic_actual_expr_type_info(expr, locals, st, type_layouts).is_none()
+            } else {
+                operator_expr_type_info(expr, None, st, type_layouts).is_none()
+            }
+        }
+        crate::ast::expr::SectionSubscript::Range { .. } => true,
+    })
+}
+
 fn function_scope_result_type_info(
     st: &SymbolTable,
     scope: &crate::sema::symtab::Scope,
@@ -11454,6 +11492,15 @@ pub(super) fn assignment_expr_type_info(
                 if matches!(sym.kind, crate::sema::symtab::SymbolKind::DerivedType) {
                     return Some(crate::sema::symtab::TypeInfo::Derived(sym.name.clone()));
                 }
+                if matches!(sym.kind, crate::sema::symtab::SymbolKind::NamedInterface)
+                    && !sym.arg_names.is_empty()
+                {
+                    if let Some(ti) =
+                        generic_function_call_type_info(expr, locals, st, type_layouts)
+                    {
+                        return Some(ti);
+                    }
+                }
                 // F2008 §12.5.1: a generic function call resolves to
                 // one of its specifics by argument matching. The
                 // NamedInterface symbol itself has `type_info: None`,
@@ -11476,6 +11523,7 @@ pub(super) fn assignment_expr_type_info(
                 // behaviour.
                 if matches!(sym.kind, crate::sema::symtab::SymbolKind::NamedInterface)
                     && !sym.arg_names.is_empty()
+                    && generic_call_has_unknown_actual_type_info(args, locals, st, type_layouts)
                 {
                     let mut common: Option<crate::sema::symtab::TypeInfo> = None;
                     for specific in &sym.arg_names {
@@ -12113,6 +12161,7 @@ pub(super) fn operator_expr_type_info(
                     .or(intrinsic_type_info)
                     .or_else(|| st.lookup(&key).and_then(callable_type_info))
                     .or_else(|| local_intrinsic_call_type_info(expr, locals, st, type_layouts))
+                    .or_else(|| direct_function_result_type_info(st, &key))
                     .or_else(|| derived_constructor_type_info(name, st))
                     .or_else(|| {
                         // Broad same-name data symbols from unrelated scopes
@@ -13149,6 +13198,91 @@ fn try_defined_array_constructor_assignment(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+fn lower_elemental_defined_assignment_array_broadcast(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    lhs_info: &LocalInfo,
+    rhs: &crate::ast::expr::SpannedExpr,
+    func_ref: FuncRef,
+    mask: Option<Vec<bool>>,
+    rhs_for_call: ValueId,
+) {
+    let dest_base_typed = array_base_addr(b, lhs_info);
+    let zero = b.const_i64(0);
+    let dest_base = b.gep(dest_base_typed, vec![zero], IrType::Int(IntWidth::I8));
+    let dest_n = array_total_elems_value(b, lhs_info);
+    let dest_stride = if local_uses_array_descriptor(lhs_info) {
+        let desc = array_descriptor_addr(b, lhs_info);
+        load_array_desc_i64_field(b, desc, 24 + 16)
+    } else {
+        b.const_i64(1)
+    };
+    let elem_bytes = b.const_i64(ir_scalar_byte_size(&lhs_info.ty));
+    let rhs_len = mask.as_ref().and_then(|flags| {
+        flags.get(1).copied().unwrap_or(false).then(|| {
+            actual_char_arg_runtime_len(
+                b,
+                &ctx.locals,
+                Some(&ctx.optional_locals),
+                rhs,
+                ctx.st,
+                Some(ctx.type_layouts),
+                Some(ctx.internal_funcs),
+                Some(ctx.contained_host_refs),
+                Some(ctx.descriptor_params),
+            )
+            .unwrap_or_else(|| b.const_i64(0))
+        })
+    });
+
+    let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+    b.store(zero, i_addr);
+
+    let bb_check = b.create_block("defined_assign_broadcast_check");
+    let bb_body = b.create_block("defined_assign_broadcast_body");
+    let bb_exit = b.create_block("defined_assign_broadcast_exit");
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let i = b.load(i_addr);
+    let done = b.icmp(CmpOp::Ge, i, dest_n);
+    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+    b.set_block(bb_body);
+    let i_val = b.load(i_addr);
+    let logical_idx = b.imul(i_val, dest_stride);
+    let byte_off = b.imul(logical_idx, elem_bytes);
+    let dest_ptr = b.gep(dest_base, vec![byte_off], IrType::Int(IntWidth::I8));
+    let mut call_args = vec![dest_ptr, rhs_for_call];
+    if let Some(flags) = mask.as_ref() {
+        if flags.first().copied().unwrap_or(false) {
+            call_args.push(b.const_i64(0));
+        }
+        if let Some(len) = rhs_len {
+            call_args.push(len);
+        }
+    }
+    b.call(func_ref, call_args, IrType::Void);
+
+    let one = b.const_i64(1);
+    let next = b.iadd(i_val, one);
+    b.store(next, i_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
+}
+
+fn defined_assignment_specific_has_scalar_formals(st: &SymbolTable, specific: &str) -> bool {
+    let Some(scope) = procedure_scope_by_name(st, specific) else {
+        return false;
+    };
+    let declared_args = declared_args_for_scope(scope);
+    declared_args.len() == 2
+        && formal_declared_rank(declared_args[0]) == Some(0)
+        && formal_declared_rank(declared_args[1]) == Some(0)
+}
+
 /// Try to lower an assignment through a user-defined `INTERFACE
 /// ASSIGNMENT(=)`. Returns true when a specific subroutine matches
 /// the (LHS info, RHS expression) type pair and the call was emitted.
@@ -13430,7 +13564,7 @@ pub(super) fn try_defined_assignment(
         .and_then(|m| m.get(1).copied())
         .unwrap_or(false);
     let rhs_for_call_final = if rhs_is_char_star {
-        lower_char_arg_by_ref(
+        Some(lower_arg_by_ref_full(
             b,
             &ctx.locals,
             rhs,
@@ -13439,11 +13573,27 @@ pub(super) fn try_defined_assignment(
             Some(ctx.internal_funcs),
             Some(ctx.contained_host_refs),
             Some(ctx.descriptor_params),
-        )
+        ))
         .unwrap_or(rhs_for_call)
     } else {
         rhs_for_call
     };
+    if local_is_array_like(&lhs_info)
+        && specific_name_is_elemental(ctx.st, &rk)
+        && defined_assignment_specific_has_scalar_formals(ctx.st, &rk)
+        && actual_expr_rank(rhs, &ctx.locals, ctx.st, Some(ctx.type_layouts)) == Some(0)
+    {
+        lower_elemental_defined_assignment_array_broadcast(
+            b,
+            ctx,
+            &lhs_info,
+            rhs,
+            func_ref,
+            mask,
+            rhs_for_call_final,
+        );
+        return true;
+    }
     let mut call_args = vec![lhs_val, rhs_for_call_final];
     if let Some(flags) = mask {
         if flags.first().copied().unwrap_or(false) {
@@ -36300,8 +36450,8 @@ pub(super) fn lower_pointer_intrinsic(
     if name != "associated" {
         return None;
     }
-    // We handle the one-argument form: ASSOCIATED(p).  The
-    // two-argument form ASSOCIATED(p, target) is deferred.
+    // We handle ASSOCIATED(p) and ASSOCIATED(p, target) for scalar
+    // pointer/target names.
     let first = args.first()?;
     let crate::ast::expr::SectionSubscript::Element(expr) = &first.value else {
         return None;
@@ -36349,8 +36499,9 @@ pub(super) fn lower_pointer_intrinsic(
         };
         // Get the target's address as i64 for comparison.
         // For a pointer: load the stored address from its slot.
-        // For a plain variable: write info.addr into a scratch
-        // i64 slot and read it back (effectlvely ptrtoint).
+        // For a by-ref dummy target: load the caller's target address
+        // from the local slot. For a plain local variable: use its
+        // storage address directly.
         let tgt_addr = if tgt_info.is_pointer {
             let off = b.const_i64(0);
             let ptr_slot = if tgt_info.by_ref {
@@ -36361,8 +36512,13 @@ pub(super) fn lower_pointer_intrinsic(
             let tgt_slot = b.gep(ptr_slot, vec![off], IrType::Int(IntWidth::I64));
             b.load_typed(tgt_slot, IrType::Int(IntWidth::I64))
         } else {
+            let target_ptr = if tgt_info.by_ref {
+                b.load(tgt_info.addr)
+            } else {
+                tgt_info.addr
+            };
             let scratch = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
-            b.store(tgt_info.addr, scratch);
+            b.store(target_ptr, scratch);
             b.load_typed(scratch, IrType::Int(IntWidth::I64))
         };
         return Some(b.icmp(CmpOp::Eq, raw, tgt_addr));
@@ -38689,8 +38845,20 @@ pub(super) fn expr_is_character_expr(
         Expr::ParenExpr { inner } => expr_is_character_expr(b, locals, inner, st, type_layouts),
         Expr::BinaryOp {
             op: BinaryOp::Concat,
-            ..
-        } => true,
+            left,
+            right,
+        } => defined_binary_operator_result_type_info(
+            st,
+            Some(locals),
+            type_layouts,
+            &BinaryOp::Concat,
+            left,
+            right,
+            operator_expr_type_info(left, Some(locals), st, type_layouts).as_ref(),
+            operator_expr_type_info(right, Some(locals), st, type_layouts).as_ref(),
+        )
+        .map(|ti| matches!(ti, crate::sema::symtab::TypeInfo::Character { .. }))
+        .unwrap_or(true),
         Expr::Name { name } => locals
             .get(&name.to_lowercase())
             .map(|info| {
