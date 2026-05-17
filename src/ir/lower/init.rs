@@ -126,6 +126,22 @@ pub(crate) fn init_decls(
                                 None,
                                 None,
                             );
+                        } else if let Some(values) =
+                            super::core::extract_transpose_reshape_source_ac(&init_expr.node, st)
+                        {
+                            store_ac_values_into(
+                                b,
+                                locals,
+                                info.addr,
+                                &info.ty,
+                                info.derived_type.as_deref(),
+                                &values,
+                                st,
+                                type_layouts,
+                                None,
+                                None,
+                                None,
+                            );
                         } else if matches!(
                             &init_expr.node,
                             Expr::IntegerLiteral { .. }
