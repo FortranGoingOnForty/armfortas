@@ -3907,6 +3907,19 @@ pub(super) fn collect_const_array_scalars(
                         return Some(values);
                     }
                 }
+                if name.eq_ignore_ascii_case("transpose") && !args.is_empty() {
+                    if let crate::ast::expr::SectionSubscript::Element(src) = &args[0].value {
+                        if let Some(values) = collect_const_transpose_scalars(
+                            src,
+                            elem_ty,
+                            param_consts,
+                            param_array_consts,
+                            param_array_elem_tys,
+                        ) {
+                            return Some(values);
+                        }
+                    }
+                }
             }
             None
         }
@@ -3914,12 +3927,70 @@ pub(super) fn collect_const_array_scalars(
     }
 }
 
-fn const_reshape_total(
+fn collect_const_transpose_scalars(
+    src: &crate::ast::expr::SpannedExpr,
+    elem_ty: &IrType,
+    param_consts: &HashMap<String, ConstScalar>,
+    param_array_consts: &HashMap<String, Vec<ConstScalar>>,
+    param_array_elem_tys: &HashMap<String, IrType>,
+) -> Option<Vec<ConstScalar>> {
+    let Expr::FunctionCall { callee, args } = &src.node else {
+        return None;
+    };
+    let Expr::Name { name } = &callee.node else {
+        return None;
+    };
+    if !name.eq_ignore_ascii_case("reshape") || args.len() < 2 {
+        return None;
+    }
+
+    let extents = const_shape_extents(
+        args.get(1),
+        param_consts,
+        param_array_consts,
+        param_array_elem_tys,
+    )?;
+    if extents.len() != 2 {
+        return None;
+    }
+    let rows = extents[0];
+    let cols = extents[1];
+    let lanes_per_element = const_array_storage_scalar_count(elem_ty, 1)? as usize;
+    let expected_storage = rows.checked_mul(cols)?.checked_mul(lanes_per_element)?;
+    let mut source = collect_const_array_scalars(
+        src,
+        elem_ty,
+        param_consts,
+        param_array_consts,
+        param_array_elem_tys,
+    )?;
+    if source.len() < expected_storage {
+        source.resize(expected_storage, zero_const_for_array_lane(elem_ty));
+    }
+    if source.len() > expected_storage {
+        source.truncate(expected_storage);
+    }
+
+    let mut out = Vec::with_capacity(expected_storage);
+    for result_col in 0..rows {
+        for result_row in 0..cols {
+            let source_row = result_col;
+            let source_col = result_row;
+            let source_elem = source_row + source_col * rows;
+            let start = source_elem * lanes_per_element;
+            let end = start + lanes_per_element;
+            out.extend_from_slice(&source[start..end]);
+        }
+    }
+    Some(out)
+}
+
+fn const_shape_extents(
     shape_arg: Option<&crate::ast::expr::Argument>,
     param_consts: &HashMap<String, ConstScalar>,
     param_array_consts: &HashMap<String, Vec<ConstScalar>>,
     param_array_elem_tys: &HashMap<String, IrType>,
-) -> Option<usize> {
+) -> Option<Vec<usize>> {
     let crate::ast::expr::SectionSubscript::Element(shape_expr) = &shape_arg?.value else {
         return None;
     };
@@ -3930,7 +4001,7 @@ fn const_reshape_total(
         param_array_consts,
         param_array_elem_tys,
     )?;
-    let mut total = 1usize;
+    let mut extents = Vec::with_capacity(shape_values.len());
     for value in shape_values {
         let ConstScalar::Int(extent) = value else {
             return None;
@@ -3938,7 +4009,26 @@ fn const_reshape_total(
         if extent < 0 {
             return None;
         }
-        total = total.checked_mul(extent as usize)?;
+        extents.push(extent as usize);
+    }
+    Some(extents)
+}
+
+fn const_reshape_total(
+    shape_arg: Option<&crate::ast::expr::Argument>,
+    param_consts: &HashMap<String, ConstScalar>,
+    param_array_consts: &HashMap<String, Vec<ConstScalar>>,
+    param_array_elem_tys: &HashMap<String, IrType>,
+) -> Option<usize> {
+    let shape_values = const_shape_extents(
+        shape_arg,
+        param_consts,
+        param_array_consts,
+        param_array_elem_tys,
+    )?;
+    let mut total = 1usize;
+    for extent in shape_values {
+        total = total.checked_mul(extent)?;
     }
     Some(total)
 }
@@ -21701,6 +21791,104 @@ pub(super) fn extract_reshape_source_ac(
         return None;
     };
     Some(values.as_slice())
+}
+
+/// Recognise `transpose(reshape(SOURCE, SHAPE))` where SOURCE is a
+/// flat array constructor and return SOURCE values in the transposed
+/// column-major order. This covers fixed-shape declared initializers
+/// such as `logical, parameter :: t(15,12) =
+/// transpose(reshape([...], [12,15]))`.
+pub(super) fn extract_transpose_reshape_source_ac(
+    expr: &crate::ast::expr::Expr,
+    st: &SymbolTable,
+) -> Option<Vec<crate::ast::expr::AcValue>> {
+    use crate::ast::expr::{Expr, SectionSubscript};
+
+    let Expr::FunctionCall { callee, args } = expr else {
+        return None;
+    };
+    let Expr::Name { name } = &callee.node else {
+        return None;
+    };
+    if !name.eq_ignore_ascii_case("transpose") || args.len() != 1 {
+        return None;
+    }
+    let SectionSubscript::Element(src_expr) = &args[0].value else {
+        return None;
+    };
+
+    let Expr::FunctionCall {
+        callee: reshape_callee,
+        args: reshape_args,
+    } = &src_expr.node
+    else {
+        return None;
+    };
+    let Expr::Name { name: reshape_name } = &reshape_callee.node else {
+        return None;
+    };
+    if !reshape_name.eq_ignore_ascii_case("reshape") || reshape_args.len() < 2 {
+        return None;
+    }
+
+    for a in reshape_args.iter().skip(2) {
+        if let Some(k) = &a.keyword {
+            let k = k.to_ascii_lowercase();
+            if k != "shape" {
+                return None;
+            }
+        }
+    }
+
+    let source_arg = if let Some(named) = reshape_args
+        .iter()
+        .find(|a| a.keyword.as_deref().map(str::to_ascii_lowercase) == Some("source".into()))
+    {
+        named
+    } else if reshape_args[0].keyword.is_none() {
+        &reshape_args[0]
+    } else {
+        return None;
+    };
+    let shape_arg = if let Some(named) = reshape_args
+        .iter()
+        .find(|a| a.keyword.as_deref().map(str::to_ascii_lowercase) == Some("shape".into()))
+    {
+        named
+    } else if reshape_args.len() > 1 && reshape_args[1].keyword.is_none() {
+        &reshape_args[1]
+    } else {
+        return None;
+    };
+
+    let SectionSubscript::Element(source_expr) = &source_arg.value else {
+        return None;
+    };
+    let Expr::ArrayConstructor { values, .. } = &source_expr.node else {
+        return None;
+    };
+    let SectionSubscript::Element(shape_expr) = &shape_arg.value else {
+        return None;
+    };
+    let extents = reshape_shape_extents(shape_expr, st)?;
+    if extents.len() != 2 {
+        return None;
+    }
+    let rows = usize::try_from(extents[0]).ok()?;
+    let cols = usize::try_from(extents[1]).ok()?;
+    let total = rows.checked_mul(cols)?;
+    if values.len() < total {
+        return None;
+    }
+
+    let mut out = Vec::with_capacity(total);
+    for result_col in 0..rows {
+        for result_row in 0..cols {
+            let source_idx = result_col + result_row * rows;
+            out.push(values[source_idx].clone());
+        }
+    }
+    Some(out)
 }
 
 /// happened to be there (the comment lied about allocas being
