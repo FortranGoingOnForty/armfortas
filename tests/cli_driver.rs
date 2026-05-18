@@ -619,6 +619,43 @@ fn stream_unformatted_narrow_integer_io_preserves_raw_widths() {
 }
 
 #[test]
+fn sequential_unformatted_array_sections_round_trip_allocatables_and_components() {
+    let src = write_program(
+        "program p\n  implicit none\n  type :: box_t\n    integer(kind=8), allocatable :: blocks(:)\n  end type\n  integer :: unit_num, ios\n  integer(kind=8), allocatable :: a(:), b(:)\n  type(box_t) :: source_box, dest_box\n  allocate(a(2), b(2), source_box%blocks(2), dest_box%blocks(2))\n  a = [123456789_8, -77_8]\n  b = -1_8\n  source_box%blocks = [987654321_8, -33_8]\n  dest_box%blocks = -1_8\n  open(newunit=unit_num, form='unformatted', status='scratch', action='readwrite', iostat=ios)\n  if (ios /= 0) error stop 1\n  write(unit_num, iostat=ios) a(:)\n  if (ios /= 0) error stop 2\n  write(unit_num, iostat=ios) source_box%blocks(:)\n  if (ios /= 0) error stop 3\n  rewind(unit_num)\n  read(unit_num, iostat=ios) b(:)\n  if (ios /= 0) error stop 4\n  read(unit_num, iostat=ios) dest_box%blocks(:)\n  if (ios /= 0) error stop 5\n  close(unit_num)\n  if (any(b /= a)) error stop 6\n  if (any(dest_box%blocks /= source_box%blocks)) error stop 7\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("sequential_unformatted_array_section_io", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("sequential unformatted array section compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "sequential unformatted array section compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("sequential unformatted array section run failed");
+    assert!(
+        run.status.success(),
+        "sequential unformatted array section run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected ok output, got: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn stream_unformatted_char_array_section_read_preserves_byte_count() {
     let input = unique_path("stream_unformatted_char_array_section_read", "bin");
     std::fs::write(&input, [118u8, 0, b'{', b'd', b'e', b's'])
