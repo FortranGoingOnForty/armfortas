@@ -24535,6 +24535,20 @@ pub(super) fn lower_read_into_addr(
             }
             true
         }
+        IrType::Array(inner, 2) if matches!(inner.as_ref(), IrType::Float(_)) => {
+            let lane_ty = inner.as_ref().clone();
+            let lane_bytes = match lane_ty {
+                IrType::Float(FloatWidth::F64) => 8,
+                _ => 4,
+            };
+            let real_off = b.const_i64(0);
+            let imag_off = b.const_i64(lane_bytes);
+            let real_addr = b.gep(addr, vec![real_off], IrType::Int(IntWidth::I8));
+            let imag_addr = b.gep(addr, vec![imag_off], IrType::Int(IntWidth::I8));
+            let _ = lower_read_into_addr(b, mode, &lane_ty, real_addr);
+            let _ = lower_read_into_addr(b, mode, &lane_ty, imag_addr);
+            true
+        }
         _ => false,
     }
 }

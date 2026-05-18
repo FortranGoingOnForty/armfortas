@@ -759,7 +759,7 @@ impl FormatEngine {
                 }
                 // kP scale factor: F format multiplies value by 10^k.
                 let scaled = *v * 10f64.powi(self.scale_factor);
-                let rounded = self.apply_rounding(scaled, *decimals);
+                let rounded = self.apply_explicit_rounding(scaled, *decimals);
                 let s = self.format_fixed(rounded, *decimals);
                 Ok(self.apply_decimal_sep(&fit_field(&s, *width)))
             }
@@ -803,7 +803,7 @@ impl FormatEngine {
                 }
                 // Engineering: exponent is multiple of 3.
                 let (mantissa, exp) = to_engineering(v.abs());
-                let rounded = self.apply_rounding(mantissa, *decimals);
+                let rounded = self.apply_explicit_rounding(mantissa, *decimals);
                 let s = format!(
                     "{}{:.*}E{:+03}",
                     self.real_sign(*v),
@@ -837,7 +837,7 @@ impl FormatEngine {
                 // G format: use F if magnitude fits, else E.
                 let abs_v = v.abs();
                 if abs_v == 0.0 || (abs_v >= 0.1 && abs_v < 10f64.powi(*decimals as i32)) {
-                    let rounded = self.apply_rounding(*v, *decimals);
+                    let rounded = self.apply_explicit_rounding(*v, *decimals);
                     let s = self.format_fixed(rounded, *decimals);
                     Ok(self.apply_decimal_sep(&fit_field(&s, *width)))
                 } else {
@@ -907,6 +907,16 @@ impl FormatEngine {
             }
         } else {
             format!("-{}", abs_str)
+        }
+    }
+
+    /// Apply non-default rounding modes before decimal formatting. The default
+    /// paths leave rounding to Rust's formatter to avoid double rounding values
+    /// that need to round-trip through text.
+    fn apply_explicit_rounding(&self, v: f64, decimals: usize) -> f64 {
+        match self.round_mode {
+            RoundMode::Compatible | RoundMode::ProcessorDefined => v,
+            _ => self.apply_rounding(v, decimals),
         }
     }
 
@@ -1020,7 +1030,7 @@ impl FormatEngine {
         // Fortran default (0P): mantissa in [0.1, 1.0), so exponent = base_exp + 1.
         let fort_exp = base_exp + 1 - self.scale_factor;
         let mantissa = abs_v / 10f64.powi(base_exp + 1 - self.scale_factor);
-        let rounded = self.apply_rounding(mantissa, decimals);
+        let rounded = self.apply_explicit_rounding(mantissa, decimals);
 
         let ew = exp_width.unwrap_or(2);
         let sign = if v < 0.0 {
@@ -1043,6 +1053,18 @@ impl FormatEngine {
 
     /// Format in ES style (scientific): mantissa in [1.0, 10.0).
     fn format_es_style(&self, v: f64, decimals: usize, exp_width: Option<usize>) -> String {
+        if matches!(
+            self.round_mode,
+            RoundMode::Compatible | RoundMode::ProcessorDefined
+        ) {
+            let raw = if v.is_sign_positive() && matches!(self.sign_mode, SignMode::Plus) {
+                format!("{:+.*E}", decimals, v)
+            } else {
+                format!("{:.*E}", decimals, v)
+            };
+            return pad_exponent_width(&raw, exp_width, 'E');
+        }
+
         if v == 0.0 {
             let ew = exp_width.unwrap_or(2);
             return format!("0.{:0>d$}E{:+0ew$}", "", 0, d = decimals, ew = ew + 1);
@@ -1051,7 +1073,7 @@ impl FormatEngine {
         let abs_v = v.abs();
         let base_exp = abs_v.log10().floor() as i32;
         let mantissa = abs_v / 10f64.powi(base_exp);
-        let rounded = self.apply_rounding(mantissa, decimals);
+        let rounded = self.apply_explicit_rounding(mantissa, decimals);
 
         let ew = exp_width.unwrap_or(2);
         let sign = if v < 0.0 {
@@ -1128,6 +1150,23 @@ fn compact_exponential_leading_zero(s: &str) -> Option<String> {
     } else {
         s.strip_prefix("+0.").map(|rest| format!("+.{rest}"))
     }
+}
+
+fn pad_exponent_width(raw: &str, exp_width: Option<usize>, exp_char: char) -> String {
+    let Some(pos) = raw.find(['E', 'e']) else {
+        return raw.to_string();
+    };
+    let mantissa = &raw[..pos];
+    let exponent = &raw[pos + 1..];
+    let (sign, digits) = match exponent.as_bytes().first().copied() {
+        Some(b'-') => ('-', &exponent[1..]),
+        Some(b'+') => ('+', &exponent[1..]),
+        _ => ('+', exponent),
+    };
+    let digits = digits.trim_start_matches('0');
+    let digits = if digits.is_empty() { "0" } else { digits };
+    let width = exp_width.unwrap_or(2);
+    format!("{mantissa}{exp_char}{sign}{digits:0>width$}", width = width)
 }
 
 fn format_has_data_descriptor(descs: &[FormatDesc]) -> bool {
@@ -1629,6 +1668,15 @@ mod tests {
             ])
             .unwrap();
         assert_eq!(out, " 1  2\n 3  4");
+    }
+
+    #[test]
+    fn format_es_dp_precision_roundtrips() {
+        let value = -1.9972267279387788e-1f64;
+        let descs = parse_format("(ES24.16E3)");
+        let mut engine = FormatEngine::new(descs);
+        let out = engine.format_values(&[IoValue::Real(value)]);
+        assert_eq!(out.trim().parse::<f64>().unwrap(), value);
     }
 
     #[test]
