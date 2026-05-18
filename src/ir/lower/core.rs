@@ -13413,6 +13413,221 @@ fn defined_assignment_specific_has_scalar_formals(st: &SymbolTable, specific: &s
         && formal_declared_rank(declared_args[1]) == Some(0)
 }
 
+pub(super) fn try_defined_assignment_for_array_element(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    lhs_key: &str,
+    lhs_info: &LocalInfo,
+    args: &[crate::ast::expr::Argument],
+    rhs: &crate::ast::expr::SpannedExpr,
+) -> bool {
+    let sym = match ctx
+        .st
+        .lookup_local_then_any(ctx.proc_scope_id, "assignment(=)")
+    {
+        Some(s) if s.kind == crate::sema::symtab::SymbolKind::NamedInterface => s,
+        _ => return false,
+    };
+    if sym.arg_names.is_empty() {
+        return false;
+    }
+
+    let lhs_semantic_ti = ctx
+        .proc_scope_id
+        .and_then(|sid| ctx.st.lookup_in(sid, lhs_key))
+        .and_then(|sym| sym.type_info.clone())
+        .or_else(|| local_semantic_type_info(lhs_info));
+    let rhs_semantic_ti = assignment_expr_type_info(
+        rhs,
+        Some(&ctx.locals),
+        ctx.st,
+        ctx.proc_scope_id,
+        Some(ctx.type_layouts),
+    );
+
+    let semantic_candidates: Vec<String> = sym
+        .arg_names
+        .iter()
+        .filter_map(|specific| {
+            let scope = ctx.st.all_scopes().iter().find(|s| match &s.kind {
+                crate::sema::symtab::ScopeKind::Function(n)
+                | crate::sema::symtab::ScopeKind::Subroutine(n) => n.eq_ignore_ascii_case(specific),
+                _ => false,
+            })?;
+
+            let declared_args: Vec<&crate::sema::symtab::Symbol> = scope
+                .arg_order
+                .iter()
+                .filter_map(|n| scope.symbols.get(n))
+                .collect();
+            if declared_args.len() != 2 {
+                return None;
+            }
+
+            if let Some(ti) = declared_args.first().and_then(|sym| sym.type_info.as_ref()) {
+                if !defined_assignment_arg_semantic_match(ti, lhs_semantic_ti.as_ref()) {
+                    return None;
+                }
+            }
+            if let Some(ti) = declared_args.get(1).and_then(|sym| sym.type_info.as_ref()) {
+                if !defined_assignment_arg_semantic_match(ti, rhs_semantic_ti.as_ref()) {
+                    return None;
+                }
+            }
+
+            Some(specific.clone())
+        })
+        .collect();
+    if semantic_candidates.is_empty() {
+        return false;
+    }
+
+    let rhs_val = super::expr::lower_expr_ctx_tl(b, ctx, rhs);
+    let rhs_ty = b.func().value_type(rhs_val);
+    let lhs_val = lower_array_element_addr(
+        b,
+        &ctx.locals,
+        lhs_info,
+        args,
+        ctx.st,
+        Some(ctx.type_layouts),
+    );
+
+    let arg_vals = [lhs_val, rhs_val];
+    let actual_types: Vec<Option<IrType>> =
+        arg_vals.iter().map(|v| b.func().value_type(*v)).collect();
+    let resolved = semantic_candidates.iter().find_map(|specific| {
+        let scope = ctx.st.all_scopes().iter().find(|s| match &s.kind {
+            crate::sema::symtab::ScopeKind::Function(n)
+            | crate::sema::symtab::ScopeKind::Subroutine(n) => n.eq_ignore_ascii_case(specific),
+            _ => false,
+        })?;
+
+        let declared_args: Vec<&crate::sema::symtab::Symbol> = scope
+            .arg_order
+            .iter()
+            .filter_map(|n| scope.symbols.get(n))
+            .collect();
+        if declared_args.len() != actual_types.len() {
+            return None;
+        }
+
+        let mut type_match = true;
+        for ((decl_sym, actual_ty), arg_val) in declared_args
+            .iter()
+            .zip(actual_types.iter())
+            .zip(arg_vals.iter())
+        {
+            let Some(ti) = decl_sym.type_info.as_ref() else {
+                type_match = false;
+                break;
+            };
+            let Some(at) = actual_ty.as_ref() else {
+                type_match = false;
+                break;
+            };
+            if !arg_matches_declared(ti, at, *arg_val, b) {
+                type_match = false;
+                break;
+            }
+        }
+
+        type_match.then(|| specific.clone())
+    });
+    let Some(resolved) = resolved else {
+        return false;
+    };
+
+    let rk = resolved.to_lowercase();
+    let (call_name, _) = resolved_symbol_call_target(ctx.st, &rk, &resolved);
+    let func_ref = same_unit_func_ref(
+        ctx.st,
+        b.func().name.as_str(),
+        Some(ctx.internal_funcs),
+        &[&rk],
+        call_name,
+    );
+
+    let rhs_for_call = if let Expr::Name { name } = &rhs.node {
+        let key = name.to_lowercase();
+        if let Some(info) = ctx.locals.get(&key) {
+            if !info.dims.is_empty() || local_uses_array_descriptor(info) {
+                if local_uses_array_descriptor(info) {
+                    array_descriptor_addr(b, info)
+                } else {
+                    materialize_array_descriptor_for_info(b, info)
+                }
+            } else if rhs_ty.as_ref().map(|t| !t.is_ptr()).unwrap_or(true) {
+                let ty = rhs_ty.clone().unwrap_or(IrType::Int(IntWidth::I32));
+                let slot = b.alloca(ty);
+                b.store(rhs_val, slot);
+                slot
+            } else {
+                rhs_val
+            }
+        } else if rhs_ty.as_ref().map(|t| !t.is_ptr()).unwrap_or(true) {
+            let ty = rhs_ty.clone().unwrap_or(IrType::Int(IntWidth::I32));
+            let slot = b.alloca(ty);
+            b.store(rhs_val, slot);
+            slot
+        } else {
+            rhs_val
+        }
+    } else if rhs_ty.as_ref().map(|t| !t.is_ptr()).unwrap_or(true) {
+        let ty = rhs_ty.clone().unwrap_or(IrType::Int(IntWidth::I32));
+        let slot = b.alloca(ty);
+        b.store(rhs_val, slot);
+        slot
+    } else {
+        rhs_val
+    };
+
+    let mask = cached_param_mask_for_lookup(ctx.st, ctx.char_len_star_params, &rk);
+    let rhs_is_char_star = mask
+        .as_ref()
+        .and_then(|m| m.get(1).copied())
+        .unwrap_or(false);
+    let rhs_for_call_final = if rhs_is_char_star {
+        Some(lower_arg_by_ref_full(
+            b,
+            &ctx.locals,
+            rhs,
+            ctx.st,
+            Some(ctx.type_layouts),
+            Some(ctx.internal_funcs),
+            Some(ctx.contained_host_refs),
+            Some(ctx.descriptor_params),
+        ))
+        .unwrap_or(rhs_for_call)
+    } else {
+        rhs_for_call
+    };
+
+    let mut call_args = vec![lhs_val, rhs_for_call_final];
+    if let Some(flags) = mask {
+        if flags.first().copied().unwrap_or(false) {
+            call_args.push(b.const_i64(0));
+        }
+        if flags.get(1).copied().unwrap_or(false) {
+            let len = actual_char_arg_runtime_len(
+                b,
+                &ctx.locals,
+                Some(&ctx.optional_locals),
+                rhs,
+                ctx.st,
+                Some(ctx.type_layouts),
+                Some(ctx.internal_funcs),
+                Some(ctx.contained_host_refs),
+                Some(ctx.descriptor_params),
+            )
+            .unwrap_or_else(|| b.const_i64(0));
+            call_args.push(len);
+        }
+    }
+    b.call(func_ref, call_args, IrType::Void);
+    true
+}
+
 /// Try to lower an assignment through a user-defined `INTERFACE
 /// ASSIGNMENT(=)`. Returns true when a specific subroutine matches
 /// the (LHS info, RHS expression) type pair and the call was emitted.
