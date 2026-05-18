@@ -23247,15 +23247,15 @@ pub(super) fn lower_write_items_adv(
                                 matches!(a.value, crate::ast::expr::SectionSubscript::Range { .. })
                             });
                             if has_range {
-                                if args.len() == 1 {
-                                    lower_1d_slice_write(b, ctx, &info, &args[0], unit);
-                                } else if local_uses_array_descriptor(&info) {
+                                if local_uses_array_descriptor(&info) {
                                     // Assumed-shape / allocatable: read
                                     // bounds and strides from the runtime
                                     // descriptor instead of info.dims
                                     // (empty for assumed-shape and would
                                     // emit zero iterations).
                                     lower_alloc_section_write_nd(b, ctx, &info, args, unit);
+                                } else if args.len() == 1 {
+                                    lower_1d_slice_write(b, ctx, &info, &args[0], unit);
                                 } else {
                                     // Audit CRITICAL-3: multi-dim
                                     // slice prints used to fall
@@ -24585,6 +24585,33 @@ pub(super) fn lower_array_read_item(
             true
         }
         Expr::FunctionCall { callee, args } => {
+            let has_range = args
+                .iter()
+                .any(|arg| matches!(arg.value, crate::ast::expr::SectionSubscript::Range { .. }));
+
+            if let Expr::ComponentAccess { .. } = &callee.node {
+                let Some(info) = component_intrinsic_local_info(
+                    b,
+                    &ctx.locals,
+                    callee,
+                    ctx.st,
+                    ctx.type_layouts,
+                ) else {
+                    return false;
+                };
+                if !local_is_array_like(&info) || !has_range {
+                    return false;
+                }
+                if local_uses_array_descriptor(&info) {
+                    lower_alloc_section_read(b, ctx, &info, args, mode);
+                } else if args.len() == 1 {
+                    lower_1d_slice_read(b, ctx, &info, &args[0], mode);
+                } else {
+                    lower_section_read_nd(b, ctx, &info, args, mode);
+                }
+                return true;
+            }
+
             let Expr::Name { name } = &callee.node else {
                 return false;
             };
@@ -24595,9 +24622,6 @@ pub(super) fn lower_array_read_item(
             if !local_is_array_like(&info) {
                 return false;
             }
-            let has_range = args
-                .iter()
-                .any(|arg| matches!(arg.value, crate::ast::expr::SectionSubscript::Range { .. }));
             // Route through the descriptor-driven section reader whenever the
             // local is descriptor-backed (allocatable OR assumed-shape dummy).
             // info.dims is empty for assumed-shape, so the fixed-bound iterator
@@ -25024,10 +25048,10 @@ pub(super) fn lower_fmt_push(
                             matches!(a.value, crate::ast::expr::SectionSubscript::Range { .. })
                         });
                         if has_range {
-                            if args.len() == 1 {
-                                fmt_push_1d_slice(b, ctx, &info, &args[0]);
-                            } else if local_uses_array_descriptor(&info) {
+                            if local_uses_array_descriptor(&info) {
                                 fmt_push_alloc_section_nd(b, ctx, &info, args);
+                            } else if args.len() == 1 {
+                                fmt_push_1d_slice(b, ctx, &info, &args[0]);
                             } else {
                                 fmt_push_section_nd(b, ctx, &info, args);
                             }
