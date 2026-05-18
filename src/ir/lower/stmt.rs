@@ -940,6 +940,19 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         Some(ctx.type_layouts),
                                     );
                                 } else {
+                                    if info.derived_type.is_some()
+                                        && args.iter().all(|arg| {
+                                            matches!(
+                                                arg.value,
+                                                crate::ast::expr::SectionSubscript::Element(_)
+                                            )
+                                        })
+                                        && try_defined_assignment_for_array_element(
+                                            b, ctx, &akey, &info, args, value,
+                                        )
+                                    {
+                                        return;
+                                    }
                                     let arr_val = super::expr::lower_expr_ctx(b, ctx, value);
                                     if matches!(
                                         b.func().value_type(arr_val),
