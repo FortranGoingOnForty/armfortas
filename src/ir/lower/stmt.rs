@@ -44,6 +44,35 @@ fn copy_array_result_to_fixed_dest(b: &mut FuncBuilder, info: &LocalInfo, src_de
     );
 }
 
+fn io_control_by_keyword<'a>(controls: &'a [IoControl], needle: &str) -> Option<&'a IoControl> {
+    controls.iter().find(|c| {
+        c.keyword
+            .as_deref()
+            .map(|k| k.eq_ignore_ascii_case(needle))
+            .unwrap_or(false)
+    })
+}
+
+fn lower_external_io_pos_seek(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    controls: &[IoControl],
+    unit: ValueId,
+    iostat_ptr: ValueId,
+) {
+    let Some(pos_ctrl) = io_control_by_keyword(controls, "pos") else {
+        return;
+    };
+    let raw_pos = super::expr::lower_expr_ctx(b, ctx, &pos_ctrl.value);
+    let pos = coerce_to_type(b, raw_pos, &IrType::Int(IntWidth::I64));
+    let unit_i32 = coerce_to_type(b, unit, &IrType::Int(IntWidth::I32));
+    b.call(
+        FuncRef::External("afs_seek_stream".into()),
+        vec![unit_i32, pos, iostat_ptr],
+        IrType::Void,
+    );
+}
+
 /// Lower a single statement.
 pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
     match &stmt.node {
@@ -1654,6 +1683,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             } else {
                 b.const_i32(6)
             };
+
+            lower_external_io_pos_seek(b, ctx, controls, unit, iostat_ptr);
 
             let defined_iotype = match fmt_control {
                 Some(ctrl) if matches!(&ctrl.value.node, Expr::Name { name } if name == "*") => {
@@ -4911,6 +4942,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             } else {
                 b.const_i32(5) // default stdin
             };
+            lower_external_io_pos_seek(b, ctx, controls, unit, iostat_addr);
             let defined_iotype = match fmt_control {
                 Some(ctrl) if matches!(&ctrl.value.node, Expr::Name { name } if name == "*") => {
                     Some("LISTDIRECTED")

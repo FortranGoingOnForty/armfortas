@@ -685,7 +685,13 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
                 "" => existing_unit
                     .as_ref()
                     .map(|(_, _, form, _, _)| form.clone())
-                    .unwrap_or(Form::Formatted),
+                    .unwrap_or_else(|| {
+                        if file_access == Access::Stream {
+                            Form::Unformatted
+                        } else {
+                            Form::Formatted
+                        }
+                    }),
                 _ => Form::Formatted,
             };
 
@@ -2221,10 +2227,19 @@ pub extern "C" fn afs_write_stream(unit: i32, data: *const u8, data_len: i64, io
 /// Seek to an absolute byte position in a stream unit.
 #[no_mangle]
 pub extern "C" fn afs_seek_stream(unit: i32, pos: i64, iostat: *mut i32) {
+    if pos < 1 {
+        if !iostat.is_null() {
+            unsafe {
+                *iostat = 1;
+            }
+        }
+        return;
+    }
+    let offset = (pos - 1) as u64;
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
         match &mut u.stream {
-            UnitStream::FileRaw(f) => match f.seek(SeekFrom::Start(pos as u64)) {
+            UnitStream::FileRaw(f) => match f.seek(SeekFrom::Start(offset)) {
                 Ok(_) => {
                     if !iostat.is_null() {
                         unsafe {
@@ -2247,6 +2262,10 @@ pub extern "C" fn afs_seek_stream(unit: i32, pos: i64, iostat: *mut i32) {
                     }
                 }
             }
+        }
+    } else if !iostat.is_null() {
+        unsafe {
+            *iostat = 1;
         }
     }
 }
@@ -4570,6 +4589,115 @@ mod tests {
 
         let content = std::fs::read(path).unwrap();
         assert_eq!(content, b"alpha", "expected exact stream bytes");
+    }
+
+    #[test]
+    fn stream_seek_uses_fortran_one_based_position() {
+        let path = format!(
+            "/tmp/afs_stream_seek_one_based_{}_{}.dat",
+            std::process::id(),
+            line!()
+        );
+        let _ = std::fs::remove_file(&path);
+        let mut iostat = -99i32;
+
+        let write_cb = OpenControlBlock {
+            unit: 784,
+            filename: path.as_ptr(),
+            filename_len: path.len() as i64,
+            status: "replace".as_ptr(),
+            status_len: 7,
+            action: "write".as_ptr(),
+            action_len: 5,
+            access: "stream".as_ptr(),
+            access_len: 6,
+            form: "unformatted".as_ptr(),
+            form_len: 11,
+            recl: 0,
+            iostat: &mut iostat,
+            newunit: std::ptr::null_mut(),
+            position: std::ptr::null(),
+            position_len: 0,
+        };
+        afs_open(&write_cb);
+        assert_eq!(iostat, 0, "expected stream OPEN for writing to succeed");
+
+        afs_write_string(784, "Hello".as_ptr(), 5);
+        afs_close(784, &mut iostat);
+        assert_eq!(iostat, 0, "expected stream write close to succeed");
+
+        iostat = -99;
+        let read_cb = OpenControlBlock {
+            unit: 785,
+            action: "read".as_ptr(),
+            action_len: 4,
+            status: "old".as_ptr(),
+            status_len: 3,
+            iostat: &mut iostat,
+            ..write_cb
+        };
+        afs_open(&read_cb);
+        assert_eq!(iostat, 0, "expected stream OPEN for reading to succeed");
+
+        afs_seek_stream(785, 5, &mut iostat);
+        assert_eq!(iostat, 0, "expected POS=5 seek to succeed");
+        let mut tail = [0u8; 1];
+        afs_read_string(785, tail.as_mut_ptr(), tail.len() as i64, &mut iostat);
+        assert_eq!(iostat, 0, "expected tail character read to succeed");
+        assert_eq!(&tail, b"o");
+
+        afs_seek_stream(785, 1, &mut iostat);
+        assert_eq!(iostat, 0, "expected POS=1 seek to succeed");
+        let mut text = [0u8; 5];
+        afs_read_string(785, text.as_mut_ptr(), text.len() as i64, &mut iostat);
+        assert_eq!(iostat, 0, "expected rewind read to succeed");
+        assert_eq!(&text, b"Hello");
+
+        afs_seek_stream(785, 0, &mut iostat);
+        assert_ne!(iostat, 0, "POS=0 is invalid in Fortran stream I/O");
+
+        afs_close_ex(785, "delete".as_ptr(), 6, &mut iostat);
+        assert_eq!(iostat, 0, "expected stream close/delete to succeed");
+    }
+
+    #[test]
+    fn stream_open_defaults_to_unformatted() {
+        let path = format!(
+            "/tmp/afs_stream_default_unformatted_{}_{}.dat",
+            std::process::id(),
+            line!()
+        );
+        let _ = std::fs::remove_file(&path);
+        let mut iostat = -99i32;
+        let cb = OpenControlBlock {
+            unit: 786,
+            filename: path.as_ptr(),
+            filename_len: path.len() as i64,
+            status: "replace".as_ptr(),
+            status_len: 7,
+            action: "write".as_ptr(),
+            action_len: 5,
+            access: "stream".as_ptr(),
+            access_len: 6,
+            form: std::ptr::null(),
+            form_len: 0,
+            recl: 0,
+            iostat: &mut iostat,
+            newunit: std::ptr::null_mut(),
+            position: std::ptr::null(),
+            position_len: 0,
+        };
+
+        afs_open(&cb);
+        assert_eq!(iostat, 0, "expected default stream OPEN to succeed");
+        afs_write_string(786, "alpha".as_ptr(), 5);
+        afs_write_newline(786);
+        afs_close(786, &mut iostat);
+        assert_eq!(iostat, 0, "expected stream close to succeed");
+
+        let content = std::fs::read(&path).unwrap();
+        assert_eq!(content, b"alpha", "stream default must be unformatted");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
