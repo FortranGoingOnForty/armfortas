@@ -599,6 +599,39 @@ impl FormatEngine {
         Ok(output)
     }
 
+    /// Format output records using Fortran format reversion. When the I/O list
+    /// outlives one complete scan of the format, the next scan starts a new
+    /// external record.
+    pub fn format_values_reverting_checked(
+        &mut self,
+        values: &[IoValue],
+    ) -> Result<String, FormatError> {
+        let mut output = String::new();
+        let mut val_idx = 0;
+        let descriptors = self.descriptors.clone();
+        if !values.is_empty() && !format_has_data_descriptor(&descriptors) {
+            return Err(FormatError::InvalidFormat);
+        }
+        if values.is_empty() {
+            self.apply_descriptors(&descriptors, values, &mut val_idx, &mut output)?;
+            return Ok(output);
+        }
+
+        let mut first_record = true;
+        while val_idx < values.len() {
+            if !first_record {
+                output.push('\n');
+            }
+            let before = val_idx;
+            self.apply_descriptors(&descriptors, values, &mut val_idx, &mut output)?;
+            if val_idx == before {
+                return Err(FormatError::InvalidFormat);
+            }
+            first_record = false;
+        }
+        Ok(output)
+    }
+
     fn apply_descriptors(
         &mut self,
         descs: &[FormatDesc],
@@ -1567,6 +1600,35 @@ mod tests {
             engine.format_values_checked(&[IoValue::Logical(false)]),
             Err(FormatError::InvalidFormat)
         );
+    }
+
+    #[test]
+    fn format_reversion_starts_new_records() {
+        let descs = parse_format("(A)");
+        let mut engine = FormatEngine::new(descs);
+        let out = engine
+            .format_values_reverting_checked(&[
+                IoValue::Character(b"abc".to_vec()),
+                IoValue::Character(b"def".to_vec()),
+                IoValue::Character(b"ghi".to_vec()),
+            ])
+            .unwrap();
+        assert_eq!(out, "abc\ndef\nghi");
+    }
+
+    #[test]
+    fn format_reversion_reuses_multi_descriptor_format() {
+        let descs = parse_format("(I2,1X,I2)");
+        let mut engine = FormatEngine::new(descs);
+        let out = engine
+            .format_values_reverting_checked(&[
+                IoValue::Integer(1),
+                IoValue::Integer(2),
+                IoValue::Integer(3),
+                IoValue::Integer(4),
+            ])
+            .unwrap();
+        assert_eq!(out, " 1  2\n 3  4");
     }
 
     #[test]

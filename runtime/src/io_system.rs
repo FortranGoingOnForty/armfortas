@@ -3496,7 +3496,6 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
         if let Some(c) = context {
             let descriptors = parse_format(&c.format_str);
             let mut engine = FormatEngine::new(descriptors);
-            let formatted = engine.format_values_checked(&c.values);
 
             // Track success across the sink branches. List-directed and
             // scalar formatted writes both leave `iostat` untouched on
@@ -3508,9 +3507,9 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
             let mut io_status: i32 = 0;
             let mut io_msg: Option<&'static str> = None;
 
-            match formatted {
-                Ok(output) => match c.sink {
-                    FmtSink::Unit(unit) => {
+            match c.sink {
+                FmtSink::Unit(unit) => match engine.format_values_reverting_checked(&c.values) {
+                    Ok(output) => {
                         let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
                         if let Some(u) = state.get_unit(unit) {
                             if u.write_str(&output).is_err() {
@@ -3526,13 +3525,27 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                             io_msg = Some("unit not connected");
                         }
                     }
-                    FmtSink::Internal { buf, buf_len } => {
-                        write_to_buffer(buf, buf_len, 0, output.as_bytes(), std::ptr::null_mut());
+                    Err(_) => {
+                        io_status = 1;
+                        io_msg = Some("format error");
                     }
                 },
-                Err(_) => {
-                    io_status = 1;
-                    io_msg = Some("format error");
+                FmtSink::Internal { buf, buf_len } => {
+                    match engine.format_values_checked(&c.values) {
+                        Ok(output) => {
+                            write_to_buffer(
+                                buf,
+                                buf_len,
+                                0,
+                                output.as_bytes(),
+                                std::ptr::null_mut(),
+                            );
+                        }
+                        Err(_) => {
+                            io_status = 1;
+                            io_msg = Some("format error");
+                        }
+                    }
                 }
             }
 
@@ -3945,7 +3958,17 @@ pub extern "C" fn afs_fmt_read_string_noadvance(
     match extract_nth_formatted_field(&descs, &input, &mut cursor, &mut remaining) {
         Some((FormatDesc::Character { .. }, field)) => {
             store_formatted_char_result(&field, dest, dest_len, size_out, iostat);
-            u.formatted_read_cursor = cursor;
+            if cursor >= input.len() {
+                if !iostat.is_null() {
+                    unsafe {
+                        *iostat = IOSTAT_EOR;
+                    }
+                }
+                u.formatted_read_record = None;
+                u.formatted_read_cursor = 0;
+            } else {
+                u.formatted_read_cursor = cursor;
+            }
         }
         Some(_) => {
             store_formatted_char_error(dest, dest_len, size_out, 1);
@@ -4832,6 +4855,31 @@ mod tests {
     }
 
     #[test]
+    fn formatted_unit_write_reverts_format_across_records() {
+        let path = "/tmp/afs_fmt_reversion_test.dat";
+        afs_open_simple(
+            88,
+            path.as_ptr(),
+            path.len() as i64,
+            "replace".as_ptr(),
+            7,
+            std::ptr::null(),
+            0,
+        );
+
+        afs_fmt_begin(88, "(A)".as_ptr(), 3);
+        afs_fmt_push_string("abc".as_ptr(), 3);
+        afs_fmt_push_string("def".as_ptr(), 3);
+        afs_fmt_push_string("ghi".as_ptr(), 3);
+        afs_fmt_end(1);
+
+        afs_close(88, std::ptr::null_mut());
+
+        let content = std::fs::read_to_string(path).unwrap();
+        assert_eq!(content, "abc\ndef\nghi\n");
+    }
+
+    #[test]
     fn formatted_write_integer16_to_file() {
         let path = "/tmp/afs_fmt_i128_test.dat";
         let wide = 170141183460469231731687303715884105727i128;
@@ -5109,6 +5157,56 @@ mod tests {
         );
         assert_eq!(first, 170141183460469231731687303715884105727i128);
         assert_eq!(second, -170141183460469231731687303715884105727i128);
+    }
+
+    #[test]
+    fn formatted_noadvance_read_returns_eor_with_final_chunk() {
+        let path = "/tmp/afs_fmt_noadvance_read_records_test.dat";
+        std::fs::write(path, "abc\nwxyz\n").unwrap();
+
+        afs_open_simple(
+            91,
+            path.as_ptr(),
+            path.len() as i64,
+            "old".as_ptr(),
+            3,
+            "read".as_ptr(),
+            4,
+        );
+
+        let mut first = [b' '; 8];
+        let mut second = [b' '; 8];
+        let mut first_size = -99i32;
+        let mut second_size = -99i32;
+        let mut iostat = -99i32;
+
+        afs_fmt_read_string_noadvance(
+            91,
+            "(a)".as_ptr(),
+            3,
+            first.as_mut_ptr(),
+            first.len() as i64,
+            &mut first_size,
+            &mut iostat,
+        );
+        assert_eq!(iostat, IOSTAT_EOR);
+        assert_eq!(first_size, 3);
+        assert_eq!(&first[..3], b"abc");
+
+        afs_fmt_read_string_noadvance(
+            91,
+            "(a)".as_ptr(),
+            3,
+            second.as_mut_ptr(),
+            second.len() as i64,
+            &mut second_size,
+            &mut iostat,
+        );
+        afs_close(91, std::ptr::null_mut());
+
+        assert_eq!(iostat, IOSTAT_EOR);
+        assert_eq!(second_size, 4);
+        assert_eq!(&second[..4], b"wxyz");
     }
 
     #[test]
