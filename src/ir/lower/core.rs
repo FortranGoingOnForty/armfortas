@@ -6271,6 +6271,14 @@ pub(super) fn eval_const_scalar_with_any_scope(
                     .and_then(|e| eval_const_scalar_with_any_scope(e, param_consts, st))?;
                 return Some(ConstScalar::Float(value.to_float()));
             }
+            if key == "not" {
+                let value = const_call_arg_expr(args.first()?)
+                    .and_then(|e| eval_const_scalar_with_any_scope(e, param_consts, st))?;
+                return match value {
+                    ConstScalar::Int(i) => Some(ConstScalar::Int(!i)),
+                    ConstScalar::Float(_) => None,
+                };
+            }
             if key == "int" {
                 let value = const_call_arg_expr(args.first()?)
                     .and_then(|e| eval_const_scalar_with_any_scope(e, param_consts, st))?;

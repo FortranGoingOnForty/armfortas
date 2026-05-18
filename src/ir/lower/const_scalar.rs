@@ -178,6 +178,10 @@ pub(super) fn eval_const_scalar(
                     }
                 });
                 match key.as_str() {
+                    "not" => match first_arg? {
+                        ConstScalar::Int(i) => Some(ConstScalar::Int(!i)),
+                        ConstScalar::Float(_) => None,
+                    },
                     "selected_int_kind" => {
                         if let Some(ConstScalar::Int(r)) = first_arg {
                             let r = r as i64;
