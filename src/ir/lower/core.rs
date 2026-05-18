@@ -39023,7 +39023,7 @@ pub(super) fn clear_derived_storage_for_intent_out(
         }
     }
 
-    zero_fill_bytes(b, base_addr, layout.size as i64);
+    initialize_derived_storage(b, base_addr, layout, registry);
 }
 
 pub(super) fn apply_derived_field_default_inits(

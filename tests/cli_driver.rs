@@ -13629,6 +13629,73 @@ fn procedure_pointer_component_default_init_resolves_renamed_target() {
 }
 
 #[test]
+fn intent_out_reapplies_inherited_procedure_pointer_component_defaults() {
+    let src = write_program(
+        "module m\n\
+           implicit none\n\
+           abstract interface\n\
+             function ifn(x) result(r)\n\
+               integer, intent(in) :: x\n\
+               integer :: r\n\
+             end function\n\
+           end interface\n\
+           type, abstract :: parent_t\n\
+             procedure(ifn), pointer, nopass :: fn => default_fn\n\
+           end type\n\
+           type, extends(parent_t) :: child_t\n\
+             integer :: marker = 0\n\
+           end type\n\
+         contains\n\
+           function default_fn(x) result(r)\n\
+             integer, intent(in) :: x\n\
+             integer :: r\n\
+             r = x * 3\n\
+           end function\n\
+           subroutine init_child(self)\n\
+             class(child_t), intent(out) :: self\n\
+             self%marker = 7\n\
+           end subroutine\n\
+         end module\n\
+         program p\n\
+           use m\n\
+           implicit none\n\
+           type(child_t) :: child\n\
+           integer :: got\n\
+           call init_child(child)\n\
+           if (.not. associated(child%fn)) error stop 1\n\
+           got = child%fn(5)\n\
+           if (got /= 15) error stop 2\n\
+           if (child%marker /= 7) error stop 3\n\
+           print *, 'ok'\n\
+         end program\n",
+        "f90",
+    );
+    let out = unique_path("intent_out_proc_ptr_parent_default", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "expected inherited procedure-pointer default after intent(out): status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn two_arg_transfer_into_allocatable_handles_array_constructor_source() {
     // F2018 §16.9.193: TRANSFER(SOURCE, MOLD) without SIZE produces
     // a rank-1 result of `ceil(bytes(SOURCE) / sizeof(MOLD_elem))`
