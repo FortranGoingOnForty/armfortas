@@ -505,7 +505,8 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
     let unit = cb.unit;
     let fname = unsafe_str(cb.filename, cb.filename_len);
     let status_str = unsafe_str(cb.status, cb.status_len).to_lowercase();
-    let is_scratch = status_str.trim() == "scratch";
+    let status = status_str.trim();
+    let is_scratch = status == "scratch";
     let action_str = unsafe_str(cb.action, cb.action_len).to_lowercase();
     let access_str = unsafe_str(cb.access, cb.access_len).to_lowercase();
     let form_str = unsafe_str(cb.form, cb.form_len).to_lowercase();
@@ -554,7 +555,7 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
 
     let update_existing_in_place = missing_filename
         && existing_unit.is_some()
-        && status_str.trim().is_empty()
+        && status.is_empty()
         && action_str.trim().is_empty()
         && access_str.trim().is_empty()
         && form_str.trim().is_empty()
@@ -600,7 +601,7 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
 
     // Build OpenOptions based on status/action.
     let mut opts = OpenOptions::new();
-    match status_str.trim() {
+    match status {
         "old" => {
             opts.read(true);
         }
@@ -631,7 +632,7 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
                 Action::Write => "write",
                 Action::ReadWrite => "readwrite",
             })
-            .unwrap_or_else(|| match status_str.trim() {
+            .unwrap_or_else(|| match status {
                 "old" => "read",
                 "new" | "replace" => "write",
                 _ => "readwrite",
@@ -644,10 +645,16 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
             opts.read(true);
         }
         "write" => {
-            opts.write(true).create(true);
+            opts.write(true);
+            if status != "old" {
+                opts.create(true);
+            }
         }
         _ => {
-            opts.read(true).write(true).create(true);
+            opts.read(true).write(true);
+            if status != "old" {
+                opts.create(true);
+            }
         }
     }
 
@@ -4471,6 +4478,57 @@ mod tests {
         let u2 = state.alloc_newunit();
         assert!(u1 < 0); // negative unit numbers
         assert_ne!(u1, u2);
+    }
+
+    #[test]
+    fn status_old_missing_file_reports_iostat_without_creating() {
+        let path = format!(
+            "/tmp/afs_open_status_old_missing_{}_{}.dat",
+            std::process::id(),
+            line!()
+        );
+        let _ = std::fs::remove_file(&path);
+
+        let mut iostat = -99i32;
+        let cb = OpenControlBlock {
+            unit: 781,
+            filename: path.as_ptr(),
+            filename_len: path.len() as i64,
+            status: "old".as_ptr(),
+            status_len: 3,
+            action: "write".as_ptr(),
+            action_len: 5,
+            access: std::ptr::null(),
+            access_len: 0,
+            form: std::ptr::null(),
+            form_len: 0,
+            recl: 0,
+            iostat: &mut iostat,
+            newunit: std::ptr::null_mut(),
+            position: "append".as_ptr(),
+            position_len: 6,
+        };
+
+        afs_open(&cb);
+        assert_ne!(iostat, 0, "STATUS='old' must fail for missing files");
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "STATUS='old' OPEN must not create the missing file"
+        );
+
+        iostat = -99;
+        let cb = OpenControlBlock {
+            unit: 782,
+            action: "read".as_ptr(),
+            action_len: 4,
+            position: "asis".as_ptr(),
+            position_len: 4,
+            iostat: &mut iostat,
+            ..cb
+        };
+
+        afs_open(&cb);
+        assert_ne!(iostat, 0, "STATUS='old' read must fail for missing files");
     }
 
     #[test]
