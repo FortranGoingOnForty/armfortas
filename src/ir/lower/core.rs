@@ -17898,7 +17898,7 @@ pub(super) fn clear_intent_out_derived_params(
         };
         if info.is_pointer
             || info.allocatable
-            || local_uses_array_descriptor(info)
+            || (local_uses_array_descriptor(info) && !info.is_class)
             || !info.dims.is_empty()
         {
             continue;
@@ -17941,6 +17941,67 @@ pub(super) fn clear_intent_out_derived_params(
 
         let storage = derived_storage_addr(b, info);
         clear_derived_storage_for_intent_out(b, storage, layout, type_layouts, stat);
+    }
+}
+
+pub(super) fn clear_intent_out_allocatable_array_params(
+    b: &mut FuncBuilder,
+    param_info: &[(String, ValueId, IrType, bool)],
+    locals: &HashMap<String, LocalInfo>,
+    decls: &[crate::ast::decl::SpannedDecl],
+) {
+    let mut stat_addr: Option<ValueId> = None;
+
+    for (pname, _, _, is_value) in param_info {
+        if *is_value || !decl_has_intent_out(pname, decls) || !decl_is_allocatable(pname, decls) {
+            continue;
+        }
+
+        let Some(info) = locals.get(pname) else {
+            continue;
+        };
+        if info.is_class || !local_uses_array_descriptor(info) {
+            continue;
+        }
+
+        let stat = match stat_addr {
+            Some(addr) => addr,
+            None => {
+                let addr = b.alloca(IrType::Int(IntWidth::I32));
+                let zero = b.const_i32(0);
+                b.store(zero, addr);
+                stat_addr = Some(addr);
+                addr
+            }
+        };
+
+        if decl_is_optional(pname, decls) && info.by_ref {
+            let ptr_val = b.load(info.addr);
+            let zero = b.const_i64(0);
+            let present = b.icmp(CmpOp::Ne, ptr_val, zero);
+            let bb_clear = b.create_block("intent_out_alloc_clear_present");
+            let bb_skip = b.create_block("intent_out_alloc_clear_skip");
+            b.cond_branch(present, bb_clear, vec![], bb_skip, vec![]);
+
+            b.set_block(bb_clear);
+            let desc = array_descriptor_addr(b, info);
+            b.call(
+                FuncRef::External("afs_deallocate_array".into()),
+                vec![desc, stat],
+                IrType::Void,
+            );
+            b.branch(bb_skip, vec![]);
+
+            b.set_block(bb_skip);
+            continue;
+        }
+
+        let desc = array_descriptor_addr(b, info);
+        b.call(
+            FuncRef::External("afs_deallocate_array".into()),
+            vec![desc, stat],
+            IrType::Void,
+        );
     }
 }
 
