@@ -617,13 +617,23 @@ pub(crate) fn lower_intrinsic_subroutine(
                 return true;
             };
             let to_ptr = lower_arg_by_ref_ctx(b, ctx, to_expr);
-            let to_width = match b.func().value_type(to_ptr) {
-                Some(IrType::Ptr(inner)) => match inner.as_ref() {
-                    IrType::Int(w) => *w,
+            let to_width_from_expr =
+                operator_expr_type_info(to_expr, Some(&ctx.locals), ctx.st, Some(ctx.type_layouts))
+                    .or_else(|| {
+                        fortran_type_to_type_info(&crate::sema::types::expr_type(to_expr, ctx.st))
+                    })
+                    .and_then(|ti| match type_info_to_ir_type(&ti) {
+                        IrType::Int(width) => Some(width),
+                        _ => None,
+                    });
+            let to_width =
+                to_width_from_expr.unwrap_or_else(|| match b.func().value_type(to_ptr) {
+                    Some(IrType::Ptr(inner)) => match inner.as_ref() {
+                        IrType::Int(w) => *w,
+                        _ => IntWidth::I32,
+                    },
                     _ => IntWidth::I32,
-                },
-                _ => IntWidth::I32,
-            };
+                });
             let from_val = nth_arg_val(b, ctx, args, 0, 0);
             let from = coerce_int_like_to_width(b, from_val, to_width);
             let frompos_val = nth_arg_val(b, ctx, args, 1, 0);

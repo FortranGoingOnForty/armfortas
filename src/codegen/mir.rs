@@ -512,6 +512,7 @@ pub struct MachineFunction {
     pub vregs: Vec<VReg>,
     pub const_pool: Vec<ConstPoolEntry>,
     pub internal_only: bool,
+    pub entry_arg_receipts: Vec<VRegId>,
     next_vreg: u32,
     next_block: u32,
 }
@@ -526,6 +527,7 @@ impl MachineFunction {
             vregs: Vec::new(),
             const_pool: Vec::new(),
             internal_only: false,
+            entry_arg_receipts: Vec::new(),
             next_vreg: 0,
             next_block: 1,
         }

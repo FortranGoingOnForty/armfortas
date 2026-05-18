@@ -142,6 +142,7 @@ pub fn select_function(func: &Function) -> MachineFunction {
                 );
             }
             IncomingParam::Narrow(vreg, RegClass::Fp64, AbiArgLoc::Fp(reg), _) => {
+                mf.entry_arg_receipts.push(*vreg);
                 mf.block_mut(MBlockId(0)).insts.push(MachineInst {
                     opcode: ArmOpcode::FmovReg,
                     operands: vec![
@@ -152,6 +153,7 @@ pub fn select_function(func: &Function) -> MachineFunction {
                 });
             }
             IncomingParam::Narrow(vreg, RegClass::Fp32, AbiArgLoc::Fp32(reg), _) => {
+                mf.entry_arg_receipts.push(*vreg);
                 mf.block_mut(MBlockId(0)).insts.push(MachineInst {
                     opcode: ArmOpcode::FmovReg,
                     operands: vec![
@@ -162,6 +164,7 @@ pub fn select_function(func: &Function) -> MachineFunction {
                 });
             }
             IncomingParam::Narrow(vreg, RegClass::Gp32, AbiArgLoc::Gp32(reg), _) => {
+                mf.entry_arg_receipts.push(*vreg);
                 mf.block_mut(MBlockId(0)).insts.push(MachineInst {
                     opcode: ArmOpcode::MovReg,
                     operands: vec![
@@ -172,6 +175,7 @@ pub fn select_function(func: &Function) -> MachineFunction {
                 });
             }
             IncomingParam::Narrow(vreg, _, AbiArgLoc::Gp(reg), _) => {
+                mf.entry_arg_receipts.push(*vreg);
                 mf.block_mut(MBlockId(0)).insts.push(MachineInst {
                     opcode: ArmOpcode::MovReg,
                     operands: vec![
