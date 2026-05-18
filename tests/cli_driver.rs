@@ -12965,6 +12965,123 @@ fn module_parameter_bit_size_with_named_kind_suffix_folds_to_correct_value() {
 }
 
 #[test]
+fn module_parameter_bit_size_with_imported_renamed_kind_folds_to_correct_value() {
+    let dir = unique_dir("bit_size_imported_renamed_kind");
+    let kinds_src = write_program_in(
+        &dir,
+        "stdlib_kinds_like.f90",
+        "module stdlib_kinds_like\n  implicit none\n  integer, parameter :: int32 = selected_int_kind(9)\n  integer, parameter :: int64 = selected_int_kind(18)\nend module stdlib_kinds_like\n",
+    );
+    let bitsets_src = write_program_in(
+        &dir,
+        "bitsets_like.f90",
+        "module bitsets_like\n  use stdlib_kinds_like, only : bits_kind => int32, block_kind => int64\n  implicit none\n  integer(bits_kind), parameter :: block_size = bit_size(0_block_kind)\ncontains\n  function get_block_size() result(v)\n    integer(bits_kind) :: v\n    v = block_size\n  end function get_block_size\nend module bitsets_like\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use bitsets_like, only : block_size, get_block_size\n  implicit none\n  if (block_size /= 64) error stop 1\n  if (get_block_size() /= 64) error stop 2\n  print *, block_size\n  print *, 'ok'\nend program p\n",
+    );
+
+    let kinds_obj = dir.join("stdlib_kinds_like.o");
+    let compile_kinds = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            kinds_src.to_str().unwrap(),
+            "-o",
+            kinds_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("stdlib_kinds_like compile failed to spawn");
+    assert!(
+        compile_kinds.status.success(),
+        "stdlib_kinds_like should compile: {}",
+        String::from_utf8_lossy(&compile_kinds.stderr)
+    );
+
+    let bitsets_obj = dir.join("bitsets_like.o");
+    let compile_bitsets = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            bitsets_src.to_str().unwrap(),
+            "-o",
+            bitsets_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("bitsets_like compile failed to spawn");
+    assert!(
+        compile_bitsets.status.success(),
+        "bitsets_like should compile: {}",
+        String::from_utf8_lossy(&compile_bitsets.stderr)
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_main = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            main_src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("main compile failed to spawn");
+    assert!(
+        compile_main.status.success(),
+        "main should compile: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let exe = dir.join("bit_size_imported_renamed_kind.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            kinds_obj.to_str().unwrap(),
+            bitsets_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link failed to spawn");
+    assert!(
+        link.status.success(),
+        "objects should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "bit_size imported renamed kind should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("64"),
+        "expected block_size=64, got: {}",
+        stdout
+    );
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn logical_int8_array_scalar_broadcast_init_fills_every_element() {
     // F2018 §7.6.6: a scalar initializer in an array declaration is
     // broadcast to every element. Previously the compiler treated

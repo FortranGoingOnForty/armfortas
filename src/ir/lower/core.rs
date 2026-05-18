@@ -6255,6 +6255,7 @@ pub(super) fn eval_const_scalar_with_any_scope(
                     | "precision"
                     | "range"
                     | "digits"
+                    | "bit_size"
                     | "radix"
                     | "maxexponent"
                     | "minexponent"
@@ -6867,6 +6868,17 @@ fn const_inquiry_for_ir_type(key: &str, ty: &IrType) -> Option<ConstScalar> {
             };
             Some(ConstScalar::Int(digits))
         }
+        "bit_size" => {
+            let bits = match ty {
+                IrType::Int(IntWidth::I8) => 8,
+                IrType::Int(IntWidth::I16) => 16,
+                IrType::Int(IntWidth::I32) => 32,
+                IrType::Int(IntWidth::I64) => 64,
+                IrType::Int(IntWidth::I128) => 128,
+                _ => return None,
+            };
+            Some(ConstScalar::Int(bits))
+        }
         "radix" => Some(ConstScalar::Int(2)),
         "maxexponent" => match ty {
             IrType::Float(FloatWidth::F64) => Some(ConstScalar::Int(1024)),
@@ -7053,7 +7065,7 @@ pub(super) fn eval_const_scalar_with_decl_scope(
             let key = name.to_ascii_lowercase();
             match key.as_str() {
                 "huge" | "tiny" | "epsilon" | "precision" | "range" | "digits" | "radix"
-                | "maxexponent" | "minexponent" => {
+                | "bit_size" | "maxexponent" | "minexponent" => {
                     let arg = args.first()?;
                     let arg_expr = const_call_arg_expr(arg)?;
                     let ty = decl_scope_const_ir_type(arg_expr, decls, param_consts, st)?;
