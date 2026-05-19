@@ -15979,6 +15979,80 @@ fn pack_intrinsic_into_allocatable_routes_through_array_descriptor_path() {
 }
 
 #[test]
+fn pack_zero_size_mask_expression_returns_zero_size_allocatable() {
+    // stdlib `median(d0, d0 > 0)` reaches PACK with allocated zero-size
+    // source and mask descriptors. Those descriptors legitimately carry a
+    // null base pointer; the runtime still must allocate a rank-1 zero-size
+    // result instead of leaving the allocatable RHS descriptor unallocated.
+    let src = write_program(
+        "program t\n  use iso_fortran_env, only: int8\n  implicit none\n  integer(int8), allocatable :: d0(:)\n  integer(int8), allocatable :: packed(:)\n  allocate(d0(0))\n  packed = pack(d0, d0 > 0_int8)\n  if (size(packed) /= 0) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("pack_zero_mask", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("pack_zero_mask compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "zero-size PACK mask expression should compile + link: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("pack_zero_mask run failed");
+    assert!(
+        run.status.success(),
+        "zero-size PACK mask expression should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn pack_strided_row_section_uses_descriptor_strides() {
+    // stdlib median DIM+MASK paths call PACK on row sections like
+    // `pack(x(j1, :), mask(j1, :))`. In column-major storage those sections
+    // are strided descriptors, so PACK must use descriptor strides rather
+    // than reading contiguous bytes from the first row element.
+    let src = write_program(
+        "program t\n  use iso_fortran_env, only: int8\n  implicit none\n  integer(int8) :: a(3,4)\n  integer(int8), allocatable :: packed(:)\n  a = reshape([integer(int8) :: 10, 2, -3, -4, 6, -6, 7, -8, 9, 0, 1, 20], [3,4])\n  packed = pack(a(1, :), a(1, :) > 0_int8)\n  if (size(packed) /= 2) error stop 1\n  if (packed(1) /= 10_int8) error stop 2\n  if (packed(2) /= 7_int8) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("pack_row_section", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("pack_row_section compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "strided row-section PACK should compile + link: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("pack_row_section run failed");
+    assert!(
+        run.status.success(),
+        "strided row-section PACK should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn all_over_int8_pack_compare_lowers_descriptor() {
     // stdlib_linalg compares byte-sized integer arrays against PACK
     // results inside ALL, e.g. `all(diag(a) == pack(a, mask))`. The

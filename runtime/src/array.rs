@@ -2391,6 +2391,91 @@ mod tests {
     }
 
     #[test]
+    fn pack_zero_size_allocated_arrays_returns_zero_size_result() {
+        let mut src = ArrayDescriptor::zeroed();
+        let mut mask = ArrayDescriptor::zeroed();
+        let mut result = ArrayDescriptor::zeroed();
+
+        afs_allocate_1d(&mut src, 1, 0);
+        afs_allocate_1d(&mut mask, 1, 0);
+        afs_array_pack(&src, &mask, ptr::null(), &mut result);
+
+        assert!(result.is_allocated());
+        assert_eq!(result.rank, 1);
+        assert_eq!(result.total_elements(), 0);
+        assert!(result.base_addr.is_null());
+
+        afs_deallocate_array(&mut src, ptr::null_mut());
+        afs_deallocate_array(&mut mask, ptr::null_mut());
+        afs_deallocate_array(&mut result, ptr::null_mut());
+    }
+
+    #[test]
+    fn pack_strided_row_section_respects_descriptor_strides() {
+        let mut src = ArrayDescriptor::zeroed();
+        let mut mask = ArrayDescriptor::zeroed();
+        let mut src_row = ArrayDescriptor::zeroed();
+        let mut mask_row = ArrayDescriptor::zeroed();
+        let mut result = ArrayDescriptor::zeroed();
+        let dims = [
+            DimDescriptor {
+                lower_bound: 1,
+                upper_bound: 3,
+                stride: 1,
+            },
+            DimDescriptor {
+                lower_bound: 1,
+                upper_bound: 4,
+                stride: 1,
+            },
+        ];
+        afs_allocate_array(&mut src, 1, 2, dims.as_ptr(), ptr::null_mut());
+        afs_allocate_array(&mut mask, 1, 2, dims.as_ptr(), ptr::null_mut());
+
+        let values = [10_i8, 2, -3, -4, 6, -6, 7, -8, 9, 0, 1, 20];
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                values.as_ptr() as *const u8,
+                src.base_addr,
+                values.len(),
+            );
+            let mask_buf = mask.base_addr;
+            for (i, value) in values.iter().enumerate() {
+                *mask_buf.add(i) = u8::from(*value > 0);
+            }
+        }
+
+        let specs = [
+            SectionSpec {
+                start: 1,
+                end: 1,
+                stride: 0,
+            },
+            SectionSpec {
+                start: 1,
+                end: 4,
+                stride: 1,
+            },
+        ];
+        afs_create_section(&src, &mut src_row, specs.as_ptr(), 2);
+        afs_create_section(&mask, &mut mask_row, specs.as_ptr(), 2);
+        afs_array_pack(&src_row, &mask_row, ptr::null(), &mut result);
+
+        assert!(result.is_allocated());
+        assert_eq!(result.rank, 1);
+        assert_eq!(result.total_elements(), 2);
+        unsafe {
+            let data = result.base_addr as *const i8;
+            assert_eq!(*data.add(0), 10);
+            assert_eq!(*data.add(1), 7);
+        }
+
+        afs_deallocate_array(&mut src, ptr::null_mut());
+        afs_deallocate_array(&mut mask, ptr::null_mut());
+        afs_deallocate_array(&mut result, ptr::null_mut());
+    }
+
+    #[test]
     fn fill_i32_bulk_kernel() {
         let mut data = [0_i32; 8];
         afs_fill_i32(data.as_mut_ptr(), data.len() as i64, 7);
@@ -3761,6 +3846,22 @@ unsafe fn mask_byte_is_true(mask: &ArrayDescriptor, byte_off: usize) -> bool {
         8 => *(p as *const u64) != 0,
         _ => *p != 0,
     }
+}
+
+fn descriptor_linear_byte_offset(desc: &ArrayDescriptor, mut linear: usize) -> usize {
+    let rank = desc.rank.max(0) as usize;
+    if rank == 0 {
+        return 0;
+    }
+    let elem_size = desc.elem_size.max(1);
+    let mut byte_off = 0i64;
+    for d in 0..rank {
+        let extent = desc.dims[d].extent().max(1) as usize;
+        let idx = (linear % extent) as i64;
+        linear /= extent;
+        byte_off += idx * desc.dims[d].stride.max(1) * elem_size;
+    }
+    byte_off as usize
 }
 
 /// SUM(array, DIM=k, MASK=mask) — real version. Auto-allocates `dst`
@@ -5797,14 +5898,17 @@ pub extern "C" fn afs_array_pack(
     }
     let src = unsafe { &*source };
     let msk = unsafe { &*mask };
-    if src.base_addr.is_null() || msk.base_addr.is_null() {
-        return;
-    }
     let elem_size = src.elem_size.max(1) as usize;
     let total = src.total_elements() as usize;
     let mask_total = msk.total_elements() as usize;
-    let pairs = total.min(mask_total);
-    let mask_elem = msk.elem_size.max(1) as usize;
+    let pairs = if msk.rank == 0 {
+        total
+    } else {
+        total.min(mask_total)
+    };
+    if pairs > 0 && (src.base_addr.is_null() || msk.base_addr.is_null()) {
+        return;
+    }
 
     // First pass: count true values in the mask. Dispatch on the
     // mask's elem_size — a `logical :: m(:)` now reaches us with
@@ -5812,7 +5916,12 @@ pub extern "C" fn afs_array_pack(
     // misaligned every iteration.
     let mut true_count: i64 = 0;
     for i in 0..pairs {
-        if unsafe { mask_byte_is_true(msk, i * mask_elem) } {
+        let mask_off = if msk.rank == 0 {
+            0
+        } else {
+            descriptor_linear_byte_offset(msk, i)
+        };
+        if unsafe { mask_byte_is_true(msk, mask_off) } {
             true_count += 1;
         }
     }
@@ -5841,10 +5950,16 @@ pub extern "C" fn afs_array_pack(
     // Second pass: emit masked-true source elements into result.
     let mut out_idx: usize = 0;
     for i in 0..pairs {
-        if unsafe { mask_byte_is_true(msk, i * mask_elem) } {
+        let mask_off = if msk.rank == 0 {
+            0
+        } else {
+            descriptor_linear_byte_offset(msk, i)
+        };
+        if unsafe { mask_byte_is_true(msk, mask_off) } {
+            let src_off = descriptor_linear_byte_offset(src, i);
             unsafe {
                 core::ptr::copy_nonoverlapping(
-                    sp.add(i * elem_size),
+                    sp.add(src_off),
                     rp.add(out_idx * elem_size),
                     elem_size,
                 );
@@ -5861,9 +5976,10 @@ pub extern "C" fn afs_array_pack(
             let tail_start = out_idx;
             let tail_end = result_n as usize;
             for j in tail_start..tail_end {
+                let vec_off = descriptor_linear_byte_offset(vec, j);
                 unsafe {
                     core::ptr::copy_nonoverlapping(
-                        vp.add(j * elem_size),
+                        vp.add(vec_off),
                         rp.add(j * elem_size),
                         elem_size,
                     );
