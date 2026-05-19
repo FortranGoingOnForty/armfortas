@@ -3519,6 +3519,24 @@ fn array_constructor_whole_array_exprs_fixture_passes_all_opts() {
 }
 
 #[test]
+fn mixed_numeric_array_binary_exprs_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("mixed_numeric_array_binary_exprs.f90");
+    assert!(source.exists(), "mixed_numeric_array_binary_exprs.f90 missing");
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "mixed_numeric_array_binary_exprs.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
 fn phase_triangulation_allows_function_call_pipeline_surfaces() {
     let compiler = find_compiler();
     let test_dir = find_test_programs();

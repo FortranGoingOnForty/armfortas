@@ -33787,7 +33787,29 @@ pub(super) fn lower_rank1_numeric_array_binary_descriptor(
             .and_then(|fty| fortran_type_to_type_info(&fty))
             .map(|ti| type_info_to_ir_type(&ti))
     };
-    let elem_ty = semantic_elem_ty.unwrap_or(array_elem_ty);
+    let inferred_elem_ty = semantic_elem_ty.unwrap_or(array_elem_ty);
+    let complex_operand_width = if !is_compare_op {
+        lhs.as_ref()
+            .map(|(_, ty)| ty)
+            .into_iter()
+            .chain(rhs.as_ref().map(|(_, ty)| ty))
+            .filter(|ty| is_complex_ty(ty))
+            .fold(None, |acc, ty| {
+                let fw = complex_float_width(ty);
+                Some(if acc == Some(FloatWidth::F64) || fw == FloatWidth::F64 {
+                    FloatWidth::F64
+                } else {
+                    FloatWidth::F32
+                })
+            })
+    } else {
+        None
+    };
+    let elem_ty = if let Some(fw) = complex_operand_width {
+        IrType::Array(Box::new(IrType::Float(fw)), 2)
+    } else {
+        inferred_elem_ty
+    };
     let is_complex_elem =
         matches!(&elem_ty, IrType::Array(inner, 2) if matches!(inner.as_ref(), IrType::Float(_)));
     match &elem_ty {
@@ -34099,9 +34121,10 @@ pub(super) fn lower_rank1_numeric_array_binary_descriptor(
         b.store(re_res, dst_re);
         b.store(im_res, dst_im);
     } else {
-        let lhs_val = if let Some((desc, _)) = lhs.as_ref() {
+        let lhs_val = if let Some((desc, side_elem_ty)) = lhs.as_ref() {
             let rank = lhs_rank.unwrap_or(source_rank).max(1);
-            load_array_desc_elem_rank(b, *desc, &elem_ty, idx, rank)
+            let raw = load_array_desc_elem_rank(b, *desc, side_elem_ty, idx, rank);
+            coerce_to_type(b, raw, &elem_ty)
         } else {
             let scalar = super::expr::lower_expr_full(
                 b,
@@ -34115,9 +34138,10 @@ pub(super) fn lower_rank1_numeric_array_binary_descriptor(
             );
             coerce_to_type(b, scalar, &elem_ty)
         };
-        let rhs_val = if let Some((desc, _)) = rhs.as_ref() {
+        let rhs_val = if let Some((desc, side_elem_ty)) = rhs.as_ref() {
             let rank = rhs_rank.unwrap_or(source_rank).max(1);
-            load_array_desc_elem_rank(b, *desc, &elem_ty, idx, rank)
+            let raw = load_array_desc_elem_rank(b, *desc, side_elem_ty, idx, rank);
+            coerce_to_type(b, raw, &elem_ty)
         } else {
             let scalar = super::expr::lower_expr_full(
                 b,

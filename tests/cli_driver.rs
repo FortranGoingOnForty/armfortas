@@ -33100,6 +33100,47 @@ fn array_constructor_whole_array_expressions_flatten_full_size() {
 }
 
 #[test]
+fn mixed_numeric_array_binary_exprs_coerce_array_lanes() {
+    // Stdlib var_mask computes `res / (n - merge(1, 0, mask))`,
+    // where `n` is real(:) and MERGE yields integer(:). Elemental
+    // array arithmetic must load each operand with its own element
+    // type before coercing to the common real result type.
+    let src = write_program(
+        include_str!("../test_programs/mixed_numeric_array_binary_exprs.f90"),
+        "f90",
+    );
+    let out = unique_path("mixed_numeric_array_binary_exprs", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("mixed numeric array binary compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "mixed numeric array binary compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("mixed numeric array binary run failed");
+    assert!(
+        run.status.success(),
+        "mixed numeric array binary run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected mixed numeric array binary output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn f77_statement_function_in_subroutine_inlines_per_scope() {
     // Statement function defined inside a CONTAINS subroutine. The
     // sub-scope's `cabs1` must not escape into a homonymous
