@@ -8102,7 +8102,7 @@ pub(super) fn actual_char_arg_runtime_len(
         ),
         Expr::FunctionCall { callee, args }
             if args.len() == 1
-                && expr_is_character_expr(b, locals, callee, st, type_layouts)
+                && expr_is_character_substring_base(b, locals, callee, st, type_layouts)
                 && !expr_is_array_designator(b, locals, callee, st, type_layouts)
                 && !expr_is_callable_character_callee(b, locals, callee, st, type_layouts) =>
         {
@@ -19681,7 +19681,7 @@ pub(super) fn lower_string_expr_full(
         }
         Expr::FunctionCall { callee, args } => {
             if args.len() == 1
-                && expr_is_character_expr(b, locals, callee, st, type_layouts)
+                && expr_is_character_substring_base(b, locals, callee, st, type_layouts)
                 && !expr_is_array_designator(b, locals, callee, st, type_layouts)
                 && !expr_is_callable_character_callee(b, locals, callee, st, type_layouts)
             {
@@ -40333,6 +40333,37 @@ pub(super) fn expr_is_array_designator(
         Expr::ComponentAccess { .. } => type_layouts
             .and_then(|tl| component_intrinsic_local_info(b, locals, expr, st, tl))
             .is_some(),
+        _ => false,
+    }
+}
+
+pub(super) fn expr_is_character_substring_base(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> bool {
+    match &expr.node {
+        Expr::StringLiteral { .. } => true,
+        Expr::ParenExpr { inner } => {
+            expr_is_character_substring_base(b, locals, inner, st, type_layouts)
+        }
+        Expr::Name { name } => locals.get(&name.to_lowercase()).is_some_and(|info| {
+            info.char_kind != CharKind::None
+                || descriptor_backed_runtime_char_array(info)
+                || local_fixed_char_allocatable_scalar_len(info).is_some()
+        }),
+        Expr::ComponentAccess { .. } => type_layouts
+            .and_then(|tl| resolve_component_field_access(b, locals, expr, st, tl))
+            .map(|(_, field)| {
+                matches!(
+                    field.type_info,
+                    crate::sema::symtab::TypeInfo::Character { .. }
+                )
+            })
+            .unwrap_or(false),
+        Expr::FunctionCall { .. } => expr_is_character_expr(b, locals, expr, st, type_layouts),
         _ => false,
     }
 }

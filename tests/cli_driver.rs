@@ -33931,6 +33931,39 @@ fn substring_write_with_inline_ichar_of_same_component_substring() {
 }
 
 #[test]
+fn char_intrinsic_not_captured_by_unrelated_character_dummy() {
+    // `char(1)` in character context parses with the same AST shape as
+    // `some_string(1)`. A wrong-scope character dummy named `char`
+    // must not make substring lowering steal the intrinsic call.
+    let src = write_program(
+        "module m\n  implicit none\ncontains\n  integer function find_outside_quotes(str, char) result(pos)\n    character(len=*), intent(in) :: str, char\n    pos = 0\n    if (len_trim(str) > 0 .and. len_trim(char) > 0) pos = 1\n  end function\n\n  subroutine copy_skip_sentinel(token, out)\n    character(len=*), intent(in) :: token\n    character(len=:), allocatable, intent(out) :: out\n    character(len=len(token)) :: result\n    integer :: i, j\n\n    result = ''\n    i = 1\n    j = 1\n    do while (i <= len(token))\n      if (token(i:i) == char(1)) then\n        i = i + 1\n      else\n        result(j:j) = token(i:i)\n        i = i + 1\n        j = j + 1\n      end if\n    end do\n    out = result(:j-1)\n  end subroutine\nend module\n\nprogram p\n  use m\n  implicit none\n  character(len=:), allocatable :: out\n\n  call copy_skip_sentinel('a b', out)\n  if (len(out) /= 3) error stop 1\n  if (out /= 'a b') error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("char_intrinsic_shadow", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("char-intrinsic-shadow compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "char-intrinsic-shadow compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("char-intrinsic-shadow run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "char-intrinsic-shadow: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn ishft_negative_shift_on_negative_int16_returns_logical_shift() {
     // F2018 §16.9.95: ISHFT does a *logical* shift on the bit
     // representation of the integer. For a negative int8/int16 value
