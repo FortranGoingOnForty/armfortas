@@ -33058,6 +33058,48 @@ fn nested_array_constructor_reshape_lowers_through_descriptor_path() {
 }
 
 #[test]
+fn array_constructor_whole_array_expressions_flatten_full_size() {
+    // F2018 §7.8: array-valued ac-values flatten into the parent
+    // constructor. Stdlib_stats builds rank-3 fixtures with
+    // `reshape([s, s * 2, s * 4], shape(s3))`; previously only `s`
+    // was copied as an array while `s * 2` and `s * 4` fell through the
+    // scalar path, leaving the tail of the reshaped source uninitialized.
+    let src = write_program(
+        include_str!("../test_programs/array_constructor_whole_array_exprs.f90"),
+        "f90",
+    );
+    let out = unique_path("array_ctor_whole_exprs", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("array constructor whole-array expr compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "array constructor whole-array expr compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("array constructor whole-array expr run failed");
+    assert!(
+        run.status.success(),
+        "array constructor whole-array expr run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected array constructor whole-array expr output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn f77_statement_function_in_subroutine_inlines_per_scope() {
     // Statement function defined inside a CONTAINS subroutine. The
     // sub-scope's `cabs1` must not escape into a homonymous

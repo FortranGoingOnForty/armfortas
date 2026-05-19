@@ -3787,6 +3787,179 @@ fn collect_const_complex_lanes(
     Some(vec![ConstScalar::Float(re), ConstScalar::Float(im)])
 }
 
+fn const_array_binary_scalar(
+    op: &BinaryOp,
+    array: Vec<ConstScalar>,
+    scalar: ConstScalar,
+    elem_ty: &IrType,
+    scalar_on_left: bool,
+) -> Option<Vec<ConstScalar>> {
+    let lanes_per_element = const_array_storage_scalar_count(elem_ty, 1)? as usize;
+    let complex = complex_component_ty(elem_ty).is_some();
+    let scalar_f = scalar.to_float();
+    let mut out = Vec::with_capacity(array.len());
+
+    if complex {
+        let mut chunks = array.chunks_exact(lanes_per_element);
+        for lanes in &mut chunks {
+            if lanes.len() != 2 {
+                return None;
+            }
+            let re = lanes[0].to_float();
+            let im = lanes[1].to_float();
+            let (new_re, new_im) = match (op, scalar_on_left) {
+                (BinaryOp::Mul, _) => (re * scalar_f, im * scalar_f),
+                (BinaryOp::Div, false) => (re / scalar_f, im / scalar_f),
+                (BinaryOp::Add, _) => (re + scalar_f, im),
+                (BinaryOp::Sub, false) => (re - scalar_f, im),
+                (BinaryOp::Sub, true) => (scalar_f - re, -im),
+                _ => return None,
+            };
+            out.push(ConstScalar::Float(new_re));
+            out.push(ConstScalar::Float(new_im));
+        }
+        if !chunks.remainder().is_empty() {
+            return None;
+        }
+        return Some(out);
+    }
+
+    for value in array {
+        out.push(const_scalar_binary(op, value, scalar, scalar_on_left)?);
+    }
+    Some(out)
+}
+
+fn const_scalar_binary(
+    op: &BinaryOp,
+    left_or_array: ConstScalar,
+    scalar: ConstScalar,
+    scalar_on_left: bool,
+) -> Option<ConstScalar> {
+    let (left, right) = if scalar_on_left {
+        (scalar, left_or_array)
+    } else {
+        (left_or_array, scalar)
+    };
+    let floaty = matches!(left, ConstScalar::Float(_)) || matches!(right, ConstScalar::Float(_));
+    if floaty {
+        let l = left.to_float();
+        let r = right.to_float();
+        let value = match op {
+            BinaryOp::Add => l + r,
+            BinaryOp::Sub => l - r,
+            BinaryOp::Mul => l * r,
+            BinaryOp::Div => l / r,
+            BinaryOp::Pow => l.powf(r),
+            _ => return None,
+        };
+        return Some(ConstScalar::Float(value));
+    }
+
+    let ConstScalar::Int(l) = left else {
+        return None;
+    };
+    let ConstScalar::Int(r) = right else {
+        return None;
+    };
+    let value = match op {
+        BinaryOp::Add => l.checked_add(r)?,
+        BinaryOp::Sub => l.checked_sub(r)?,
+        BinaryOp::Mul => l.checked_mul(r)?,
+        BinaryOp::Div => {
+            if r == 0 {
+                return None;
+            }
+            l / r
+        }
+        BinaryOp::Pow => {
+            if r < 0 || r > u32::MAX as i128 {
+                return None;
+            }
+            l.checked_pow(r as u32)?
+        }
+        _ => return None,
+    };
+    Some(ConstScalar::Int(value))
+}
+
+fn collect_const_array_binary_op(
+    op: &BinaryOp,
+    left: &crate::ast::expr::SpannedExpr,
+    right: &crate::ast::expr::SpannedExpr,
+    elem_ty: &IrType,
+    param_consts: &HashMap<String, ConstScalar>,
+    param_array_consts: &HashMap<String, Vec<ConstScalar>>,
+    param_array_elem_tys: &HashMap<String, IrType>,
+) -> Option<Vec<ConstScalar>> {
+    let left_array = collect_const_array_scalars(
+        left,
+        elem_ty,
+        param_consts,
+        param_array_consts,
+        param_array_elem_tys,
+    );
+    let right_array = collect_const_array_scalars(
+        right,
+        elem_ty,
+        param_consts,
+        param_array_consts,
+        param_array_elem_tys,
+    );
+
+    match (left_array, right_array) {
+        (Some(left_values), Some(right_values)) => {
+            if left_values.len() != right_values.len() {
+                return None;
+            }
+            left_values
+                .into_iter()
+                .zip(right_values)
+                .map(|(l, r)| const_scalar_binary(op, l, r, false))
+                .collect()
+        }
+        (Some(values), None) => {
+            let scalar = eval_const_scalar(right, param_consts)?;
+            const_array_binary_scalar(op, values, scalar, elem_ty, false)
+        }
+        (None, Some(values)) => {
+            let scalar = eval_const_scalar(left, param_consts)?;
+            const_array_binary_scalar(op, values, scalar, elem_ty, true)
+        }
+        (None, None) => None,
+    }
+}
+
+fn collect_const_array_unary_op(
+    op: &UnaryOp,
+    operand: &crate::ast::expr::SpannedExpr,
+    elem_ty: &IrType,
+    param_consts: &HashMap<String, ConstScalar>,
+    param_array_consts: &HashMap<String, Vec<ConstScalar>>,
+    param_array_elem_tys: &HashMap<String, IrType>,
+) -> Option<Vec<ConstScalar>> {
+    let mut values = collect_const_array_scalars(
+        operand,
+        elem_ty,
+        param_consts,
+        param_array_consts,
+        param_array_elem_tys,
+    )?;
+    match op {
+        UnaryOp::Plus => Some(values),
+        UnaryOp::Minus => {
+            for value in &mut values {
+                *value = match *value {
+                    ConstScalar::Int(i) => ConstScalar::Int(i.checked_neg()?),
+                    ConstScalar::Float(f) => ConstScalar::Float(-f),
+                };
+            }
+            Some(values)
+        }
+        _ => None,
+    }
+}
+
 /// Recursively collect the scalar elements of a constructor
 /// expression into a flat Vec. Used by eval_const_array_init to
 /// support nested implied-do, reshape, and parameter references
@@ -3813,6 +3986,23 @@ pub(super) fn collect_const_array_scalars(
         }
         Expr::ParenExpr { inner } => collect_const_array_scalars(
             inner,
+            elem_ty,
+            param_consts,
+            param_array_consts,
+            param_array_elem_tys,
+        ),
+        Expr::UnaryOp { op, operand } => collect_const_array_unary_op(
+            op,
+            operand,
+            elem_ty,
+            param_consts,
+            param_array_consts,
+            param_array_elem_tys,
+        ),
+        Expr::BinaryOp { op, left, right } => collect_const_array_binary_op(
+            op,
+            left,
+            right,
             elem_ty,
             param_consts,
             param_array_consts,
@@ -22103,6 +22293,211 @@ pub(super) fn transformational_intrinsic_call_descriptor(
     .map(|(desc, _)| desc)
 }
 
+fn constructor_intrinsic_materializes_array(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "pack"
+            | "reshape"
+            | "transpose"
+            | "matmul"
+            | "spread"
+            | "unpack"
+            | "shape"
+            | "transfer"
+            | "norm2"
+            | "sum"
+            | "count"
+            | "maxval"
+            | "minval"
+            | "merge"
+            | "cmplx"
+            | "conjg"
+            | "aimag"
+            | "dimag"
+            | "abs"
+            | "real"
+    )
+}
+
+fn array_constructor_expr_is_array(
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> bool {
+    actual_expr_rank(expr, locals, st, type_layouts).is_some_and(|rank| rank > 0)
+        || whole_array_expr_info(locals, expr).is_some()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn array_constructor_expr_size_descriptor(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) -> Option<ValueId> {
+    if let Some(desc) = transformational_intrinsic_call_descriptor(
+        b,
+        locals,
+        expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    ) {
+        return Some(desc);
+    }
+    if let Some((desc, _)) = whole_array_expr_descriptor(b, locals, expr, st, type_layouts) {
+        return Some(desc);
+    }
+
+    match &expr.node {
+        Expr::ParenExpr { inner } => array_constructor_expr_size_descriptor(
+            b,
+            locals,
+            inner,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        ),
+        Expr::UnaryOp { operand, .. } => array_constructor_expr_size_descriptor(
+            b,
+            locals,
+            operand,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        ),
+        Expr::BinaryOp { left, right, .. } => {
+            if array_constructor_expr_is_array(locals, left, st, type_layouts) {
+                if let Some(desc) = array_constructor_expr_size_descriptor(
+                    b,
+                    locals,
+                    left,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                ) {
+                    return Some(desc);
+                }
+            }
+            if array_constructor_expr_is_array(locals, right, st, type_layouts) {
+                return array_constructor_expr_size_descriptor(
+                    b,
+                    locals,
+                    right,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                );
+            }
+            None
+        }
+        Expr::FunctionCall { callee, .. } => {
+            let Expr::Name { name } = &callee.node else {
+                return None;
+            };
+            if !constructor_intrinsic_materializes_array(name) {
+                return None;
+            }
+            lower_array_expr_descriptor(
+                b,
+                locals,
+                expr,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            )
+            .map(|(desc, _)| desc)
+        }
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn array_constructor_expr_descriptor(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) -> Option<ValueId> {
+    if let Some(desc) = transformational_intrinsic_call_descriptor(
+        b,
+        locals,
+        expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    ) {
+        return Some(desc);
+    }
+    if let Some((desc, _)) = whole_array_expr_descriptor(b, locals, expr, st, type_layouts) {
+        return Some(desc);
+    }
+
+    let descriptor_candidate = match &expr.node {
+        Expr::ParenExpr { inner } => {
+            return array_constructor_expr_descriptor(
+                b,
+                locals,
+                inner,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
+        }
+        Expr::UnaryOp { .. } | Expr::BinaryOp { .. } => {
+            array_constructor_expr_is_array(locals, expr, st, type_layouts)
+        }
+        Expr::FunctionCall { callee, .. } => {
+            let Expr::Name { name } = &callee.node else {
+                return None;
+            };
+            constructor_intrinsic_materializes_array(name)
+                && array_constructor_expr_is_array(locals, expr, st, type_layouts)
+        }
+        _ => false,
+    };
+
+    if !descriptor_candidate {
+        return None;
+    }
+    lower_array_expr_descriptor(
+        b,
+        locals,
+        expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    )
+    .map(|(desc, _)| desc)
+}
+
 pub(super) fn whole_array_expr_descriptor(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -22120,14 +22515,22 @@ pub(super) fn whole_array_expr_descriptor(
     Some((desc, info))
 }
 
-pub(super) fn array_constructor_contains_whole_array_expr(
+pub(super) fn array_constructor_contains_array_expr(
     locals: &HashMap<String, LocalInfo>,
     values: &[crate::ast::expr::AcValue],
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
 ) -> bool {
     values.iter().any(|value| match value {
-        crate::ast::expr::AcValue::Expr(expr) => whole_array_expr_info(locals, expr).is_some(),
+        crate::ast::expr::AcValue::Expr(expr) => {
+            if let Expr::ArrayConstructor { values: inner, .. } = &expr.node {
+                array_constructor_contains_array_expr(locals, inner, st, type_layouts)
+            } else {
+                array_constructor_expr_is_array(locals, expr, st, type_layouts)
+            }
+        }
         crate::ast::expr::AcValue::ImpliedDo(ido) => {
-            array_constructor_contains_whole_array_expr(locals, &ido.values)
+            array_constructor_contains_array_expr(locals, &ido.values, st, type_layouts)
         }
     })
 }
@@ -22258,7 +22661,7 @@ pub(super) fn lower_runtime_array_constructor_len(
                         contained_host_refs,
                         descriptor_params,
                     )?
-                } else if let Some(desc) = transformational_intrinsic_call_descriptor(
+                } else if let Some(desc) = array_constructor_expr_size_descriptor(
                     b,
                     locals,
                     expr,
@@ -22268,14 +22671,6 @@ pub(super) fn lower_runtime_array_constructor_len(
                     contained_host_refs,
                     descriptor_params,
                 ) {
-                    b.call(
-                        FuncRef::External("afs_array_size".into()),
-                        vec![desc],
-                        IrType::Int(IntWidth::I64),
-                    )
-                } else if let Some((desc, _)) =
-                    whole_array_expr_descriptor(b, locals, expr, st, type_layouts)
-                {
                     b.call(
                         FuncRef::External("afs_array_size".into()),
                         vec![desc],
@@ -22637,44 +23032,20 @@ pub(super) fn store_ac_values_at_off(
                     );
                     continue;
                 }
-                // Check for transformational intrinsics like PACK/RESHAPE
-                // that materialize a fresh array descriptor. These are
-                // *whole-array sub-expressions* that flatten into the
-                // constructor (F2018 §7.8) but `whole_array_expr_descriptor`
-                // only recognizes Names/ComponentAccess. Route them through
-                // the array expression descriptor path explicitly.
-                let intrinsic_desc = if let Expr::FunctionCall { callee, .. } = &e.node {
-                    if let Expr::Name { name } = &callee.node {
-                        if matches!(
-                            name.to_ascii_lowercase().as_str(),
-                            "pack" | "reshape" | "transpose" | "matmul" | "spread" | "unpack"
-                        ) {
-                            lower_array_expr_descriptor(
-                                b,
-                                locals,
-                                e,
-                                st,
-                                type_layouts,
-                                internal_funcs,
-                                contained_host_refs,
-                                descriptor_params,
-                            )
-                            .map(|(d, _)| d)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
-                let src_desc_opt = intrinsic_desc.or_else(|| {
-                    whole_array_expr_descriptor(b, locals, e, st, type_layouts).map(|(d, _)| d)
-                });
-
-                if let Some(src_desc) = src_desc_opt {
+                // Array-valued constructor elements flatten into the parent
+                // constructor (F2018 §7.8). This includes plain whole arrays
+                // (`[s]`), transformational intrinsics (`[pack(...)]`), and
+                // elemental expressions over arrays (`[s * 2]`).
+                if let Some(src_desc) = array_constructor_expr_descriptor(
+                    b,
+                    locals,
+                    e,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                ) {
                     let src_n = b.call(
                         FuncRef::External("afs_array_size".into()),
                         vec![src_desc],
@@ -34589,6 +34960,21 @@ pub(super) fn lower_array_expr_descriptor(
                 | Some(crate::sema::symtab::TypeInfo::Class(name)) => Some(name.as_str()),
                 _ => None,
             };
+            if array_constructor_contains_array_expr(locals, values, st, type_layouts) {
+                let desc = lower_runtime_array_constructor_descriptor(
+                    b,
+                    locals,
+                    &elem_ty,
+                    derived_type,
+                    values,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                )?;
+                return Some((desc, elem_ty));
+            }
             let Some(n) = const_array_constructor_len(values) else {
                 let desc = lower_runtime_array_constructor_descriptor(
                     b,
@@ -35862,7 +36248,7 @@ fn try_lower_fixed_char_allocatable_constructor_assign(
     let Expr::ArrayConstructor { values, .. } = &value.node else {
         return false;
     };
-    if array_constructor_contains_whole_array_expr(&ctx.locals, values) {
+    if array_constructor_contains_array_expr(&ctx.locals, values, ctx.st, Some(ctx.type_layouts)) {
         return false;
     }
     let Some(dest_elem_len) = fixed_char_allocatable_array_elem_len(b, dest_info) else {
@@ -35992,7 +36378,12 @@ pub(super) fn lower_array_assign(
     {
         let dest_desc = array_descriptor_addr(b, dest_info);
         if let Expr::ArrayConstructor { values, .. } = &value.node {
-            if array_constructor_contains_whole_array_expr(&ctx.locals, values) {
+            if array_constructor_contains_array_expr(
+                &ctx.locals,
+                values,
+                ctx.st,
+                Some(ctx.type_layouts),
+            ) {
                 if let Some(src_desc) = lower_runtime_array_constructor_descriptor(
                     b,
                     &ctx.locals,

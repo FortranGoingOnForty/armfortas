@@ -3018,14 +3018,31 @@ pub(crate) fn lower_expr_full(
                     })
                     .unwrap_or(IrType::Int(IntWidth::I32)),
             };
-            let n = const_array_constructor_len(values).unwrap_or(values.len() as i64) as u64;
-            let arr_ty = IrType::Array(Box::new(elem_ty.clone()), n.max(1));
-            let buf = b.alloca(arr_ty);
             let derived_type = first_ti.as_ref().and_then(|ti| match ti {
                 crate::sema::symtab::TypeInfo::Derived(name)
                 | crate::sema::symtab::TypeInfo::Class(name) => Some(name.as_str()),
                 _ => None,
             });
+            if array_constructor_contains_array_expr(locals, values, st, type_layouts) {
+                if let Some(desc) = lower_runtime_array_constructor_descriptor(
+                    b,
+                    locals,
+                    &elem_ty,
+                    derived_type,
+                    values,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                ) {
+                    return b.load_typed(desc, IrType::Ptr(Box::new(elem_ty)));
+                }
+            }
+
+            let n = const_array_constructor_len(values).unwrap_or(values.len() as i64) as u64;
+            let arr_ty = IrType::Array(Box::new(elem_ty.clone()), n.max(1));
+            let buf = b.alloca(arr_ty);
             if derived_type.is_some() {
                 let zero32 = b.const_i32(0);
                 let total_bytes = b.const_i64(ir_scalar_byte_size(&elem_ty) * n.max(1) as i64);
