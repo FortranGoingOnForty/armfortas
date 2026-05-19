@@ -33,6 +33,11 @@ starting the full Sprint 29 audit:
   scratch control at `/private/tmp/fortsh-gfortran-sprint29.edpvJT/bin/fortsh`
   executes the same basic `-c` path. A quick LLDB run reports
   `malloc: pointer being freed was not allocated` followed by `SIGABRT`, with
-  many malformed-DWARF warnings. Rebuild fortsh with current `compiler-edges`
-  before classifying this as a current compiler regression versus stale scratch
-  provenance, then drill the invalid-free path if it reproduces.
+  many malformed-DWARF warnings. Fresh detached rebuild of tracked fortsh HEAD
+  `ae2924b` with current `compiler-edges` (`b6a2c83`) does not reproduce the
+  abort, but still misbehaves on the `-c` path: `-c false` exits 0,
+  `-c 'echo ok; false'` emits no stdout and exits 0, and `echo ok > file`
+  fails with `fortsh: : No such file or directory`; the gfortran scratch control
+  prints `ok`, preserves exit 1 for `false`, and writes the redirected file.
+  Drill current `-c` execution/exit-status behavior before returning to fortsh
+  as a compiler acceptance target.
