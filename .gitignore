@@ -35,3 +35,20 @@ AGENTS.md
 /example*.npy
 /test.bin
 /test.txt
+
+# Scratch reductions and transient outputs from stdlib drill runs.
+/scratch_*.f90
+/*_log.txt
+/*_log_file.txt
+/c_*_array.bin
+/key_array.bin
+/does_not_exist.error
+/io_open.dat
+/io_open.stream
+/tmp_test_*.dat
+/test_chaining_maps.txt
+/test_open_maps.txt
+/test_dp*.txt
+/test_sp*.txt
+/test_int32.txt
+/stdlib_intrinsics_sum.ast
