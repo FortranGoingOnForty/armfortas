@@ -5936,7 +5936,7 @@ pub(super) fn install_globals_as_locals_in(
                 pending.push((var.clone(), (mod_key.clone(), var.clone())));
             }
             if let Some(mod_scope_id) = st.find_module_scope(&mod_key) {
-                for ((_, var), _) in globals {
+                for (_, var) in globals.keys() {
                     if rename_targets.contains(var) {
                         continue;
                     }
@@ -12294,10 +12294,7 @@ pub(super) fn generic_function_call_type_info(
         return None;
     };
 
-    let Some(candidate) = resolve_generic_call_by_semantics(st, locals, name, args, type_layouts)
-    else {
-        return None;
-    };
+    let candidate = resolve_generic_call_by_semantics(st, locals, name, args, type_layouts)?;
     let key = candidate.name.to_ascii_lowercase();
 
     find_linkable_symbol_in_owner_scope(st, &key, candidate.owner_scope)
@@ -13071,13 +13068,11 @@ pub(super) fn array_expr_elem_type_only(
                     "aimag" | "dimag" => {
                         if let Some(arg) = args.first() {
                             if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
-                                if let Some(elem_ty) =
+                                if let Some(IrType::Array(inner, 2)) =
                                     array_expr_elem_type_only(locals, e, st, type_layouts)
                                 {
-                                    if let IrType::Array(inner, 2) = &elem_ty {
-                                        if let IrType::Float(fw) = inner.as_ref() {
-                                            return Some(IrType::Float(*fw));
-                                        }
+                                    if let IrType::Float(fw) = inner.as_ref() {
+                                        return Some(IrType::Float(*fw));
                                     }
                                 }
                             }
@@ -13600,7 +13595,7 @@ pub(super) fn try_defined_assignment_for_array_element(
         .and_then(|m| m.get(1).copied())
         .unwrap_or(false);
     let rhs_for_call_final = if rhs_is_char_star {
-        Some(lower_arg_by_ref_full(
+        lower_arg_by_ref_full(
             b,
             &ctx.locals,
             rhs,
@@ -13609,8 +13604,7 @@ pub(super) fn try_defined_assignment_for_array_element(
             Some(ctx.internal_funcs),
             Some(ctx.contained_host_refs),
             Some(ctx.descriptor_params),
-        ))
-        .unwrap_or(rhs_for_call)
+        )
     } else {
         rhs_for_call
     };
@@ -13921,7 +13915,7 @@ pub(super) fn try_defined_assignment(
         .and_then(|m| m.get(1).copied())
         .unwrap_or(false);
     let rhs_for_call_final = if rhs_is_char_star {
-        Some(lower_arg_by_ref_full(
+        lower_arg_by_ref_full(
             b,
             &ctx.locals,
             rhs,
@@ -13930,8 +13924,7 @@ pub(super) fn try_defined_assignment(
             Some(ctx.internal_funcs),
             Some(ctx.contained_host_refs),
             Some(ctx.descriptor_params),
-        ))
-        .unwrap_or(rhs_for_call)
+        )
     } else {
         rhs_for_call
     };
