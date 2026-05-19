@@ -14570,6 +14570,76 @@ fn rank_remap_pointer_assignment_builds_2d_descriptor() {
 }
 
 #[test]
+fn rank_remap_strided_sections_copy_in_to_explicit_shape_dummies() {
+    // Surfaced in stdlib_linalg_norms: norm(a(::stride), 2) forwards an
+    // assumed-shape section to an explicit-shape internal kernel. Rank-remap
+    // pointer descriptors must carry column-major memory strides, descriptor
+    // element loads must use those stored strides, and intent(in)
+    // explicit-shape dummies need a contiguous copy-in when the actual is a
+    // descriptor-backed section.
+    let src = write_program(
+        include_str!("../test_programs/rank_remap_strided_section_copyin.f90"),
+        "f90",
+    );
+    let ir = unique_path("rank_remap_strided_copyin", "ir");
+    let emit_ir = Command::new(compiler("armfortas"))
+        .args([
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("rank-remap strided copy-in IR compile failed to spawn");
+    assert!(
+        emit_ir.status.success(),
+        "rank-remap strided copy-in IR compile failed: {}",
+        String::from_utf8_lossy(&emit_ir.stderr)
+    );
+    let ir_text = fs::read_to_string(&ir).expect("cannot read rank-remap copy-in IR");
+    assert!(
+        ir_text.contains("call @afs_create_section"),
+        "rank-remap strided copy-in IR should create sections:\n{}",
+        ir_text
+    );
+    assert!(
+        ir_text.contains("call @afs_allocate_like_with_elem_size"),
+        "rank-remap strided copy-in IR should allocate contiguous copy-in temp:\n{}",
+        ir_text
+    );
+    assert!(
+        ir_text.contains("call @afs_copy_array_data"),
+        "rank-remap strided copy-in IR should copy section data into temp:\n{}",
+        ir_text
+    );
+
+    let out = unique_path("rank_remap_strided_copyin", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("rank-remap strided copy-in compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "rank-remap strided copy-in compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("rank-remap strided copy-in run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "rank-remap strided copy-in run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&ir);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn assumed_size_dummy_skips_bounds_check_on_last_dim() {
     // F2018 §8.5.8.5: an explicit-shape dummy with `*` last dim
     // (e.g. `a(lda, *)`) carries no upper bound on the last dim —

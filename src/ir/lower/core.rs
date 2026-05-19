@@ -15386,6 +15386,8 @@ pub(super) fn emit_named_function_call(
     let callee_class_args =
         first_procedure_lookup(&abi_lookup_keys, |k| callee_class_arg_mask(st, k));
     let opt_flags = first_procedure_lookup(&abi_lookup_keys, |k| callee_optional_arg_mask(st, k));
+    let callee_intent_in_array_args =
+        first_procedure_lookup(&abi_lookup_keys, |k| callee_intent_in_array_arg_mask(st, k));
 
     let mut call_args = Vec::new();
     if let Some(desc) = hidden_result {
@@ -15420,6 +15422,10 @@ pub(super) fn emit_named_function_call(
             .map(|mask| i < mask.len() && mask[i])
             .unwrap_or(false);
         let is_optional = opt_flags
+            .as_ref()
+            .map(|mask| mask.get(i).copied().unwrap_or(false))
+            .unwrap_or(false);
+        let wants_intent_in_array = callee_intent_in_array_args
             .as_ref()
             .map(|mask| mask.get(i).copied().unwrap_or(false))
             .unwrap_or(false);
@@ -15502,6 +15508,33 @@ pub(super) fn emit_named_function_call(
                     )
                 } else if wants_pointer {
                     lower_pointer_dummy_actual(
+                        b,
+                        locals,
+                        e,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
+                    )
+                    .unwrap_or_else(|| {
+                        if full_ref_context {
+                            lower_arg_by_ref_full(
+                                b,
+                                locals,
+                                e,
+                                st,
+                                type_layouts,
+                                internal_funcs,
+                                contained_host_refs,
+                                descriptor_params,
+                            )
+                        } else {
+                            lower_arg_by_ref(b, locals, e, st)
+                        }
+                    })
+                } else if wants_intent_in_array {
+                    lower_contiguous_intent_in_array_actual(
                         b,
                         locals,
                         e,
@@ -18654,6 +18687,32 @@ pub(super) fn callee_optional_arg_mask(st: &SymbolTable, callee_name: &str) -> O
     Some(mask)
 }
 
+pub(super) fn callee_intent_in_array_arg_mask(
+    st: &SymbolTable,
+    callee_name: &str,
+) -> Option<Vec<bool>> {
+    use crate::sema::symtab::Intent;
+
+    let callee_scope = callee_scope_for_lookup(st, callee_name)?;
+    let mask: Vec<bool> = callee_scope
+        .arg_order
+        .iter()
+        .map(|arg_name| {
+            callee_scope
+                .symbols
+                .get(arg_name)
+                .map(|sym| {
+                    matches!(sym.attrs.intent, Some(Intent::In))
+                        && !sym.attrs.array_spec.is_empty()
+                        && !sym.attrs.allocatable
+                        && !sym.attrs.pointer
+                })
+                .unwrap_or(false)
+        })
+        .collect();
+    Some(mask)
+}
+
 pub(super) fn callee_pointer_arg_mask(st: &SymbolTable, callee_name: &str) -> Option<Vec<bool>> {
     let callee_scope = callee_scope_for_lookup(st, callee_name)?;
     let mask: Vec<bool> = callee_scope
@@ -21641,11 +21700,9 @@ pub(super) fn compute_flat_elem_offset(
         // starting at descriptor offset 24:
         //   +0  lower_bound : i64
         //   +8  upper_bound : i64
-        //   +16 stride      : i64 (we use 1)
+        //   +16 stride      : i64 (memory step in elements)
         let desc = array_descriptor_addr(b, info);
         let mut flat: Option<ValueId> = None;
-        let mut cum_stride: Option<ValueId> = None; // i64
-        let one64 = b.const_i64(1);
         let last_arg_idx = args.len().saturating_sub(1);
         for (dim_idx, arg) in args.iter().enumerate() {
             let sub_raw = match &arg.value {
@@ -21677,22 +21734,11 @@ pub(super) fn compute_flat_elem_offset(
             }
 
             let adjusted = b.isub(sub, lo);
-
-            let dim_offset = match cum_stride {
-                None => adjusted, // first dim has cumulative stride 1
-                Some(s) => b.imul(adjusted, s),
-            };
+            let stride = load_array_desc_i64_field(b, desc, 24 + (dim_idx as i64) * 24 + 16);
+            let dim_offset = b.imul(adjusted, stride);
             flat = Some(match flat {
                 Some(prev) => b.iadd(prev, dim_offset),
                 None => dim_offset,
-            });
-
-            // cum_stride *= (upper - lower + 1)
-            let span = b.isub(up, lo);
-            let extent = b.iadd(span, one64);
-            cum_stride = Some(match cum_stride {
-                None => extent,
-                Some(prev) => b.imul(prev, extent),
             });
         }
         return flat.unwrap_or_else(|| b.const_i64(0));
@@ -27599,11 +27645,21 @@ pub(super) fn lower_rank_remap_pointer_assignment(
     store_byte_aggregate_field(b, desc, 20, IrType::Int(IntWidth::I32), flags);
 
     let one = b.const_i64(1);
+    let mut cumulative_stride = one;
     for (i, (lo, hi)) in bounds.iter().enumerate() {
         let dim_off = 24 + (i as i64) * 24;
         store_byte_aggregate_field(b, desc, dim_off, IrType::Int(IntWidth::I64), *lo);
         store_byte_aggregate_field(b, desc, dim_off + 8, IrType::Int(IntWidth::I64), *hi);
-        store_byte_aggregate_field(b, desc, dim_off + 16, IrType::Int(IntWidth::I64), one);
+        store_byte_aggregate_field(
+            b,
+            desc,
+            dim_off + 16,
+            IrType::Int(IntWidth::I64),
+            cumulative_stride,
+        );
+        let hi_minus_lo = b.isub(*hi, *lo);
+        let extent = b.iadd(hi_minus_lo, one);
+        cumulative_stride = b.imul(cumulative_stride, extent);
     }
     true
 }
@@ -41919,6 +41975,63 @@ pub(super) fn lower_arg_string_descriptor(
         }
         _ => b.const_i64(0),
     }
+}
+
+pub(super) fn lower_contiguous_intent_in_array_actual(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) -> Option<ValueId> {
+    let needs_copy_candidate = match &expr.node {
+        Expr::Name { .. } => actual_is_descriptor_array(locals, expr),
+        Expr::FunctionCall { callee, args } => {
+            let section_designator = matches!(&callee.node, Expr::Name { name } if {
+                locals
+                    .get(&name.to_lowercase())
+                    .is_some_and(|info| !info.dims.is_empty() || local_uses_array_descriptor(info))
+            });
+            !section_designator
+                || args.iter().any(|arg| {
+                    matches!(arg.value, crate::ast::expr::SectionSubscript::Range { .. })
+                })
+        }
+        _ => true,
+    };
+    if !needs_copy_candidate {
+        return None;
+    }
+
+    let (source_desc, elem_ty) = lower_array_expr_descriptor(
+        b,
+        locals,
+        expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    )?;
+    let supported_elem = matches!(elem_ty, IrType::Int(_) | IrType::Float(_) | IrType::Bool)
+        || is_complex_ty(&elem_ty);
+    if !supported_elem {
+        return None;
+    }
+
+    let tmp_desc = allocate_like_array_temp_descriptor_with_elem_type(b, source_desc, &elem_ty);
+    let stat = b.alloca(IrType::Int(IntWidth::I32));
+    let zero = b.const_i32(0);
+    b.store(zero, stat);
+    b.call(
+        FuncRef::External("afs_copy_array_data".into()),
+        vec![tmp_desc, source_desc, stat],
+        IrType::Void,
+    );
+    Some(b.load_typed(tmp_desc, IrType::Ptr(Box::new(elem_ty))))
 }
 
 pub(super) fn lower_arg_by_ref_full(

@@ -2156,6 +2156,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         cached_param_mask_for_lookup(ctx.st, ctx.optional_params, k)
                             .or_else(|| callee_optional_arg_mask(ctx.st, k))
                     });
+                    let intent_in_array_mask = first_procedure_lookup(&abi_lookup_keys, |k| {
+                        callee_intent_in_array_arg_mask(ctx.st, k)
+                    });
                     let mut arg_vals: Vec<ValueId> = Vec::with_capacity(arg_slots.len());
                     for (i, slot) in arg_slots.iter().enumerate() {
                         let is_value = value_mask
@@ -2189,6 +2192,10 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 .map(|mask| mask.get(i).copied().unwrap_or(false))
                                 .unwrap_or(false);
                         let wants_string_descriptor = wants_string_descriptor && !wants_bind_c_char;
+                        let wants_intent_in_array = intent_in_array_mask
+                            .as_ref()
+                            .map(|mask| mask.get(i).copied().unwrap_or(false))
+                            .unwrap_or(false);
                         let value = match slot {
                             Some(arg) => match &arg.value {
                                 crate::ast::expr::SectionSubscript::Element(e) => {
@@ -2245,6 +2252,18 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         )
                                     } else if wants_pointer {
                                         lower_pointer_dummy_actual(
+                                            b,
+                                            &ctx.locals,
+                                            e,
+                                            ctx.st,
+                                            Some(ctx.type_layouts),
+                                            Some(ctx.internal_funcs),
+                                            Some(ctx.contained_host_refs),
+                                            Some(ctx.descriptor_params),
+                                        )
+                                        .unwrap_or_else(|| lower_arg_by_ref_ctx(b, ctx, e))
+                                    } else if wants_intent_in_array {
+                                        lower_contiguous_intent_in_array_actual(
                                             b,
                                             &ctx.locals,
                                             e,

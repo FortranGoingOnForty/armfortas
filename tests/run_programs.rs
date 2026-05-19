@@ -3456,6 +3456,27 @@ fn vector_subscript_array_rhs_scatter_fixture_passes_all_opts() {
 }
 
 #[test]
+fn rank_remap_strided_section_copyin_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("rank_remap_strided_section_copyin.f90");
+    assert!(
+        source.exists(),
+        "rank_remap_strided_section_copyin.f90 missing"
+    );
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "rank_remap_strided_section_copyin.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
 fn phase_triangulation_allows_function_call_pipeline_surfaces() {
     let compiler = find_compiler();
     let test_dir = find_test_programs();
