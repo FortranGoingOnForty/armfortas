@@ -3771,6 +3771,14 @@ fn store_formatted_char_error(dest: *mut u8, dest_len: i64, size_out: *mut i32, 
     }
 }
 
+fn nonadvancing_char_field_hit_eor(desc: &FormatDesc, field: &str, dest_len: i64) -> bool {
+    match desc {
+        FormatDesc::Character { width: Some(width) } => field.len() < *width,
+        FormatDesc::Character { width: None } => field.len() < dest_len.max(0) as usize,
+        _ => true,
+    }
+}
+
 fn parse_formatted_integer_field(desc: &FormatDesc, field: &str) -> Option<i128> {
     let trimmed = field.trim().replace(',', "");
     if trimmed.is_empty() {
@@ -3958,16 +3966,20 @@ pub extern "C" fn afs_fmt_read_string_noadvance(
     let mut remaining = 0usize;
 
     match extract_nth_formatted_field(&descs, &input, &mut cursor, &mut remaining) {
-        Some((FormatDesc::Character { .. }, field)) => {
+        Some((desc @ FormatDesc::Character { .. }, field)) => {
             store_formatted_char_result(&field, dest, dest_len, size_out, iostat);
             if cursor >= input.len() {
-                if !iostat.is_null() {
-                    unsafe {
-                        *iostat = IOSTAT_EOR;
+                if nonadvancing_char_field_hit_eor(&desc, &field, dest_len) {
+                    if !iostat.is_null() {
+                        unsafe {
+                            *iostat = IOSTAT_EOR;
+                        }
                     }
+                    u.formatted_read_record = None;
+                    u.formatted_read_cursor = 0;
+                } else {
+                    u.formatted_read_cursor = cursor;
                 }
-                u.formatted_read_record = None;
-                u.formatted_read_cursor = 0;
             } else {
                 u.formatted_read_cursor = cursor;
             }
@@ -5209,6 +5221,54 @@ mod tests {
         assert_eq!(iostat, IOSTAT_EOR);
         assert_eq!(second_size, 4);
         assert_eq!(&second[..4], b"wxyz");
+    }
+
+    #[test]
+    fn formatted_noadvance_a1_returns_exact_final_byte_before_eor() {
+        let path = "/tmp/afs_fmt_noadvance_a1_nul_test.dat";
+        std::fs::write(path, b"A\0B\n").unwrap();
+
+        afs_open_simple(
+            90,
+            path.as_ptr(),
+            path.len() as i64,
+            "old".as_ptr(),
+            3,
+            "read".as_ptr(),
+            4,
+        );
+
+        let mut ch = [b' '; 1];
+        let mut size = -99i32;
+        let mut iostat = -99i32;
+        for expected in [b'A', 0, b'B'] {
+            afs_fmt_read_string_noadvance(
+                90,
+                "(A1)".as_ptr(),
+                4,
+                ch.as_mut_ptr(),
+                ch.len() as i64,
+                &mut size,
+                &mut iostat,
+            );
+            assert_eq!(iostat, 0);
+            assert_eq!(size, 1);
+            assert_eq!(ch[0], expected);
+        }
+
+        afs_fmt_read_string_noadvance(
+            90,
+            "(A1)".as_ptr(),
+            4,
+            ch.as_mut_ptr(),
+            ch.len() as i64,
+            &mut size,
+            &mut iostat,
+        );
+        afs_close(90, std::ptr::null_mut());
+
+        assert_eq!(iostat, IOSTAT_EOR);
+        assert_eq!(size, 0);
     }
 
     #[test]
