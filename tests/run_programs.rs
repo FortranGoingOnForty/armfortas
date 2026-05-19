@@ -3523,7 +3523,10 @@ fn mixed_numeric_array_binary_exprs_fixture_passes_all_opts() {
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("mixed_numeric_array_binary_exprs.f90");
-    assert!(source.exists(), "mixed_numeric_array_binary_exprs.f90 missing");
+    assert!(
+        source.exists(),
+        "mixed_numeric_array_binary_exprs.f90 missing"
+    );
 
     for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
         match run_test(&compiler, &source, opt_flag) {
@@ -3551,6 +3554,27 @@ fn complex_module_param_reshape_exprs_fixture_passes_all_opts() {
             TestOutcome::Pass => {}
             other => panic!(
                 "complex_module_param_reshape_exprs.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
+fn pointer_result_forward_no_stack_copy_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("pointer_result_forward_no_stack_copy.f90");
+    assert!(
+        source.exists(),
+        "pointer_result_forward_no_stack_copy.f90 missing"
+    );
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "pointer_result_forward_no_stack_copy.f90 should pass at {}, got {:?}",
                 opt_flag, other
             ),
         }

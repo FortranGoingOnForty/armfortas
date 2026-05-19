@@ -33383,6 +33383,127 @@ fn f2008_submodule_explicit_iface_smp_body_split_file_runtime_shape_result() {
 }
 
 #[test]
+fn amod_result_name_prefers_header_result_over_same_typed_locals() {
+    // Fortsh's expansion module has an allocatable character function
+    // `expand_braces(...) result(expanded)` plus local allocatable
+    // character scratch variables such as `start_str`. The .amod writer
+    // must preserve the header result name, not a same-typed local, or
+    // separate consumers import the wrong function interface and pass
+    // hidden character lengths in the wrong ABI slots.
+    let dir = unique_dir("amod_result_name_header_result");
+    let provider = write_program_in(
+        &dir,
+        "provider.f90",
+        "module provider\n  implicit none\ncontains\n  function keep_word(word) result(expanded)\n    character(*), intent(in) :: word\n    character(len=:), allocatable :: expanded\n    character(len=:), allocatable :: start_str\n    integer :: pos\n    expanded = word\n    start_str = 'scratch'\n    pos = 1\n    do while (pos <= len_trim(word))\n      if (word(pos:pos) == '{') return\n      pos = pos + 1\n    end do\n    if (pos > len_trim(word)) return\n  end function\nend module\n",
+    );
+    let consumer = write_program_in(
+        &dir,
+        "consumer.f90",
+        "module consumer\n  use provider, only : keep_word\n  use shadow, only : shadow_marker\n  implicit none\ncontains\n  subroutine expand_one(token, out, was_quoted)\n    character(*), intent(in) :: token\n    character(len=:), allocatable, intent(out) :: out\n    logical, intent(in), optional :: was_quoted\n    if (shadow_marker /= 1) error stop 3\n    if (present(was_quoted)) then\n      out = keep_word(token)\n    else\n      out = keep_word(token)\n    end if\n  end subroutine\nend module\nprogram p\n  use consumer\n  implicit none\n  character(len=4096) :: token\n  character(len=:), allocatable :: expanded\n  token = 'echo'\n  call expand_one(token, expanded, .false.)\n  if (len_trim(expanded) /= 4) error stop 1\n  if (trim(expanded) /= 'echo') error stop 2\n  print *, 'ok'\nend program\n",
+    );
+    let shadow = write_program_in(
+        &dir,
+        "shadow.f90",
+        "module shadow\n  implicit none\n  integer, parameter :: shadow_marker = 1\ncontains\n  subroutine keep_word(input, expanded_list, count)\n    character(*), intent(in) :: input\n    character(len=256), intent(out) :: expanded_list(100)\n    integer, intent(out) :: count\n    count = 1\n    expanded_list(1) = input\n  end subroutine\nend module\n",
+    );
+    let provider_o = dir.join("provider.o");
+    let shadow_o = dir.join("shadow.o");
+    let consumer_o = dir.join("consumer.o");
+    let bin = dir.join("p");
+
+    let compile_provider = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            provider.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-o",
+            provider_o.to_str().unwrap(),
+        ])
+        .output()
+        .expect("provider compile failed to spawn");
+    assert!(
+        compile_provider.status.success(),
+        "provider compile failed: {}",
+        String::from_utf8_lossy(&compile_provider.stderr)
+    );
+
+    let amod = std::fs::read_to_string(dir.join("provider.amod")).expect("missing provider.amod");
+    assert!(
+        amod.contains("result_name=expanded"),
+        "explicit result name should be preserved in .amod: {}",
+        amod
+    );
+    assert!(
+        !amod.contains("result_name=start_str"),
+        "same-typed local must not be exported as result_name: {}",
+        amod
+    );
+
+    let compile_shadow = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            shadow.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-o",
+            shadow_o.to_str().unwrap(),
+        ])
+        .output()
+        .expect("shadow compile failed to spawn");
+    assert!(
+        compile_shadow.status.success(),
+        "shadow compile failed: {}",
+        String::from_utf8_lossy(&compile_shadow.stderr)
+    );
+
+    let compile_consumer = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            consumer.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-o",
+            consumer_o.to_str().unwrap(),
+        ])
+        .output()
+        .expect("consumer compile failed to spawn");
+    assert!(
+        compile_consumer.status.success(),
+        "consumer compile failed: {}",
+        String::from_utf8_lossy(&compile_consumer.stderr)
+    );
+
+    let link = Command::new(compiler("armfortas"))
+        .args([
+            provider_o.to_str().unwrap(),
+            shadow_o.to_str().unwrap(),
+            consumer_o.to_str().unwrap(),
+            "-o",
+            bin.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link failed to spawn");
+    assert!(
+        link.status.success(),
+        "link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&bin).output().expect("run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "split result-name run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn f2008_submodule_explicit_iface_smp_body_with_runtime_shape_result() {
     // Stdlib pattern (logspace, linspace, lapack/blas wrappers): parent
     // module has an `interface ... end interface` declaring a function

@@ -699,22 +699,17 @@ fn emit_procedure(
             .and_then(|pscope| {
                 let arg_set: std::collections::HashSet<String> =
                     pscope.arg_order.iter().map(|n| n.to_lowercase()).collect();
-                // The result variable's type matches the function's return
-                // type. HashMap iteration order is non-deterministic, so
-                // picking the first non-arg variable would non-reproducibly
-                // promote ANY local (e.g. `logical :: lfirst(3)` in
-                // stdlib_io's parse_mode) to the result name. Match on
-                // type_info so the chosen symbol is actually the one
-                // standing in for the function result. Surfaced when
-                // stdlib's `open(filename, "w")` returned 'r t' from
-                // parse_mode — the .amod recorded `result_name=lfirst`,
-                // and the function body's writes to `mode_` never reached
-                // the result slot.
+                // The result variable is defined from the function header
+                // before body declarations are processed. Locals can share
+                // the same type (for example allocatable character scratch
+                // strings in fortsh's expand_braces), so type matching alone
+                // is not enough and HashMap iteration order would otherwise
+                // pick a random local as result_name.
                 let ret_ti = sym.type_info.as_ref();
-                pscope
+                let mut typed_candidates: Vec<_> = pscope
                     .symbols
                     .iter()
-                    .find(|(key, candidate)| {
+                    .filter(|(key, candidate)| {
                         !arg_set.contains(*key)
                             && matches!(
                                 candidate.kind,
@@ -725,15 +720,36 @@ fn emit_procedure(
                                 _ => true,
                             }
                     })
-                    .or_else(|| {
-                        pscope.symbols.iter().find(|(key, candidate)| {
-                            !arg_set.contains(*key)
-                                && matches!(
-                                    candidate.kind,
-                                    SymbolKind::Variable | SymbolKind::Parameter
-                                )
-                        })
+                    .collect();
+                typed_candidates.sort_by(|(ak, a), (bk, b)| {
+                    (a.defined_at.start.line, a.defined_at.start.col, ak.as_str()).cmp(&(
+                        b.defined_at.start.line,
+                        b.defined_at.start.col,
+                        bk.as_str(),
+                    ))
+                });
+                let mut fallback_candidates: Vec<_> = pscope
+                    .symbols
+                    .iter()
+                    .filter(|(key, candidate)| {
+                        !arg_set.contains(*key)
+                            && matches!(
+                                candidate.kind,
+                                SymbolKind::Variable | SymbolKind::Parameter
+                            )
                     })
+                    .collect();
+                fallback_candidates.sort_by(|(ak, a), (bk, b)| {
+                    (a.defined_at.start.line, a.defined_at.start.col, ak.as_str()).cmp(&(
+                        b.defined_at.start.line,
+                        b.defined_at.start.col,
+                        bk.as_str(),
+                    ))
+                });
+                typed_candidates
+                    .into_iter()
+                    .next()
+                    .or_else(|| fallback_candidates.into_iter().next())
                     .map(|(_, sym)| sym.name.clone())
             });
         if let Some(result_var_name) = result_var_name {

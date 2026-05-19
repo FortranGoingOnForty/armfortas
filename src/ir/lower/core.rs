@@ -3805,7 +3805,12 @@ fn const_cmplx_arg_exprs(
     let mut y_arg = None;
     for arg in args {
         let expr = const_arg_element(arg)?;
-        match arg.keyword.as_deref().map(str::to_ascii_lowercase).as_deref() {
+        match arg
+            .keyword
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
             Some("x") => x_arg = Some(expr),
             Some("y") => y_arg = Some(expr),
             Some("kind") => {}
@@ -15613,16 +15618,16 @@ pub(super) fn emit_named_function_call(
             resolved_symbol_call_target(st, &resolved_key, &resolved_name)
         }
     };
-    let arg_slots = resolved_generic
-        .as_ref()
-        .and_then(|candidate| reorder_args_for_specific_candidate(st, candidate, args))
-        .unwrap_or_else(|| reorder_args_by_keyword_slots(args, &callee_key, st));
     let abi_lookup_keys =
         procedure_abi_lookup_keys_for_call_target(st, call_name.as_str(), &[&callee_key, &key]);
     let abi_primary_key = abi_lookup_keys
         .first()
         .map(String::as_str)
         .unwrap_or(callee_key.as_str());
+    let arg_slots = resolved_generic
+        .as_ref()
+        .and_then(|candidate| reorder_args_for_specific_candidate(st, candidate, args))
+        .unwrap_or_else(|| reorder_args_by_keyword_slots(args, abi_primary_key, st));
 
     let callee_value_args =
         first_procedure_lookup(&abi_lookup_keys, |k| callee_value_arg_mask(st, k));
@@ -19121,24 +19126,48 @@ pub(super) fn callee_return_derived_info(
     st: &SymbolTable,
     callee_name: &str,
 ) -> Option<(String, bool)> {
-    use crate::sema::symtab::TypeInfo;
+    use crate::sema::symtab::{SymbolKind, TypeInfo};
     let key = canonical_procedure_abi_key(st, callee_name);
     if let Some(sym) = st.scopes.iter().find_map(|scope| scope.symbols.get(&key)) {
         if let Some(TypeInfo::Derived(name)) = sym.type_info.as_ref() {
             return Some((name.clone(), sym.attrs.pointer));
         }
     }
-    let callee_scope = callee_scope_for_lookup(st, callee_name)?;
-    for sym in callee_scope.symbols.values() {
-        if callee_scope
-            .arg_order
-            .iter()
-            .any(|arg| arg == &sym.name.to_lowercase())
-        {
-            continue;
-        }
+
+    let callee_scope_id = callee_scope_id_for_lookup(st, callee_name)?;
+    let callee_scope = st.scope(callee_scope_id);
+    let proc_name = match &callee_scope.kind {
+        crate::sema::symtab::ScopeKind::Function(name) => name.to_lowercase(),
+        _ => return None,
+    };
+
+    let arg_set: HashSet<String> = callee_scope.arg_order.iter().cloned().collect();
+    let mut candidates: Vec<_> = callee_scope
+        .symbols
+        .iter()
+        .filter(|(key, sym)| {
+            !arg_set.contains(*key)
+                && matches!(sym.kind, SymbolKind::Variable | SymbolKind::Parameter)
+                && matches!(sym.type_info, Some(TypeInfo::Derived(_)))
+        })
+        .collect();
+    candidates.sort_by(|(ak, a), (bk, b)| {
+        (a.defined_at.start.line, a.defined_at.start.col, ak.as_str()).cmp(&(
+            b.defined_at.start.line,
+            b.defined_at.start.col,
+            bk.as_str(),
+        ))
+    });
+    if let Some((_, sym)) = candidates.into_iter().next() {
         if let Some(TypeInfo::Derived(name)) = sym.type_info.as_ref() {
             return Some((name.clone(), sym.attrs.pointer));
+        }
+    }
+    if let Some(parent_id) = callee_scope.parent {
+        if let Some(sym) = st.scope(parent_id).symbols.get(&proc_name) {
+            if let Some(TypeInfo::Derived(name)) = sym.type_info.as_ref() {
+                return Some((name.clone(), sym.attrs.pointer));
+            }
         }
     }
     None
