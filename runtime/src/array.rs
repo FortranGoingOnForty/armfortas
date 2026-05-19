@@ -1966,6 +1966,23 @@ unsafe fn libc_free(ptr: *mut u8) {
 mod tests {
     use super::*;
 
+    fn i32_descriptor(data: &mut [i32], extents: &[i64]) -> ArrayDescriptor {
+        let mut desc = ArrayDescriptor::zeroed();
+        desc.base_addr = data.as_mut_ptr() as *mut u8;
+        desc.elem_size = 4;
+        desc.rank = extents.len() as i32;
+        let mut stride = 1;
+        for (i, extent) in extents.iter().copied().enumerate() {
+            desc.dims[i] = DimDescriptor {
+                lower_bound: 1,
+                upper_bound: extent,
+                stride,
+            };
+            stride *= extent.max(0);
+        }
+        desc
+    }
+
     #[test]
     fn allocate_1d() {
         let mut desc = ArrayDescriptor::zeroed();
@@ -2139,6 +2156,46 @@ mod tests {
         assert_eq!(afs_allocated(&desc), 1);
         afs_deallocate_array(&mut desc, ptr::null_mut());
         assert_eq!(afs_allocated(&desc), 0);
+    }
+
+    #[test]
+    fn reshape_order_permutation_reorders_result_slots() {
+        let mut source_data = [1, 2, 3, 4, 5, 6];
+        let mut shape_data = [3, 2];
+        let mut order_data = [2, 1];
+        let source = i32_descriptor(&mut source_data, &[6]);
+        let shape = i32_descriptor(&mut shape_data, &[2]);
+        let order = i32_descriptor(&mut order_data, &[2]);
+        let mut result = ArrayDescriptor::zeroed();
+
+        afs_array_reshape(&source, &shape, &order, ptr::null(), &mut result);
+
+        assert_eq!(result.rank, 2);
+        assert_eq!(result.dims[0].extent(), 3);
+        assert_eq!(result.dims[1].extent(), 2);
+        let got =
+            unsafe { core::slice::from_raw_parts(result.base_addr as *const i32, 6).to_vec() };
+        assert_eq!(got, vec![1, 3, 5, 2, 4, 6]);
+        afs_deallocate_array(&mut result, ptr::null_mut());
+    }
+
+    #[test]
+    fn reshape_invalid_order_falls_back_to_identity() {
+        let mut source_data: [i32; 24] = core::array::from_fn(|i| (i + 1) as i32);
+        let mut shape_data = [3, 2, 4];
+        let mut order_data = [1_808_443_440, 1, 3];
+        let source = i32_descriptor(&mut source_data, &[24]);
+        let shape = i32_descriptor(&mut shape_data, &[3]);
+        let order = i32_descriptor(&mut order_data, &[3]);
+        let mut result = ArrayDescriptor::zeroed();
+
+        afs_array_reshape(&source, &shape, &order, ptr::null(), &mut result);
+
+        assert_eq!(result.rank, 3);
+        let got =
+            unsafe { core::slice::from_raw_parts(result.base_addr as *const i32, 6).to_vec() };
+        assert_eq!(got, vec![1, 2, 3, 4, 5, 6]);
+        afs_deallocate_array(&mut result, ptr::null_mut());
     }
 
     #[test]
@@ -5644,21 +5701,42 @@ pub extern "C" fn afs_array_reshape(
     let src_total = src.total_elements() as usize;
     let elem_size_usize = elem_size as usize;
 
-    // Read order (identity if absent).
+    // Read order (identity if absent or invalid). ORDER must be a
+    // permutation of 1..rank; never let malformed data index the fixed
+    // descriptor arrays.
     let mut order_perm: [usize; MAX_RANK] = [0; MAX_RANK];
+    for (i, slot) in order_perm.iter_mut().enumerate().take(rank) {
+        *slot = i;
+    }
     let order_present = !order.is_null() && unsafe { (*order).rank > 0 };
     if order_present {
         let ord = unsafe { &*order };
-        let ord_buf = ord.base_addr as *const u8;
-        let ord_elem = ord.elem_size.max(1) as usize;
-        let ord_count = ord.total_elements() as usize;
-        for (i, slot) in order_perm.iter_mut().enumerate().take(rank.min(ord_count)) {
-            // Convert from 1-based Fortran to 0-based.
-            *slot = (read_int_at(ord_buf, i, ord_elem) - 1).max(0) as usize;
-        }
-    } else {
-        for (i, slot) in order_perm.iter_mut().enumerate().take(rank) {
-            *slot = i;
+        if !ord.base_addr.is_null() {
+            let ord_buf = ord.base_addr as *const u8;
+            let ord_elem = ord.elem_size.max(1) as usize;
+            let ord_count = ord.total_elements() as usize;
+            let mut candidate: [usize; MAX_RANK] = [0; MAX_RANK];
+            let mut seen: [bool; MAX_RANK] = [false; MAX_RANK];
+            let mut valid = ord_count >= rank;
+            if valid {
+                for (i, slot) in candidate.iter_mut().enumerate().take(rank) {
+                    let raw = read_int_at(ord_buf, i, ord_elem);
+                    if raw < 1 || raw as usize > rank {
+                        valid = false;
+                        break;
+                    }
+                    let dim = (raw - 1) as usize;
+                    if seen[dim] {
+                        valid = false;
+                        break;
+                    }
+                    seen[dim] = true;
+                    *slot = dim;
+                }
+            }
+            if valid {
+                order_perm[..rank].copy_from_slice(&candidate[..rank]);
+            }
         }
     }
 
