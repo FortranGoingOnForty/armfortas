@@ -37,6 +37,14 @@ thread_local! {
     /// can pull in the submodule's locally-declared parameters
     /// (mangled under the submodule name post-d770b77).
     static SMP_EXTRA_HOST: RefCell<Option<String>> = const { RefCell::new(None) };
+
+    /// Active F2008 BLOCK-local USE declarations while lowering nested
+    /// statements. Sema preloads these modules but the immutable symbol
+    /// table does not enter a block scope during lowering, so generic
+    /// dispatch needs this side channel to see names imported only inside
+    /// the current BLOCK.
+    static ACTIVE_BLOCK_USES: RefCell<Vec<Vec<crate::ast::decl::SpannedDecl>>> =
+        const { RefCell::new(Vec::new()) };
 }
 
 pub(super) fn current_proc_scope() -> Option<crate::sema::symtab::ScopeId> {
@@ -45,6 +53,10 @@ pub(super) fn current_proc_scope() -> Option<crate::sema::symtab::ScopeId> {
 
 pub(super) fn current_smp_extra_host() -> Option<String> {
     SMP_EXTRA_HOST.with(|c| c.borrow().clone())
+}
+
+pub(super) fn active_block_uses() -> Vec<Vec<crate::ast::decl::SpannedDecl>> {
+    ACTIVE_BLOCK_USES.with(|uses| uses.borrow().clone())
 }
 
 /// RAII guard: install `scope` as the current procedure scope until
@@ -82,6 +94,23 @@ impl Drop for SmpExtraHostGuard {
     }
 }
 
+pub(super) struct BlockUseGuard;
+
+impl BlockUseGuard {
+    pub(super) fn enter(uses: &[crate::ast::decl::SpannedDecl]) -> Self {
+        ACTIVE_BLOCK_USES.with(|active| active.borrow_mut().push(uses.to_vec()));
+        BlockUseGuard
+    }
+}
+
+impl Drop for BlockUseGuard {
+    fn drop(&mut self) {
+        ACTIVE_BLOCK_USES.with(|active| {
+            active.borrow_mut().pop();
+        });
+    }
+}
+
 /// Maximum array rank (Fortran allows up to 15).
 #[allow(dead_code)]
 pub(super) const MAX_RANK: usize = 15;
@@ -91,6 +120,12 @@ pub(super) struct LoopScope {
     pub(super) name: Option<String>,
     pub(super) header: BlockId, // CYCLE target
     pub(super) exit: BlockId,   // EXIT target
+}
+
+/// Non-loop construct target for named EXIT statements.
+pub(super) struct ConstructExitScope {
+    pub(super) name: String,
+    pub(super) exit: BlockId,
 }
 
 /// Character variable kind: how string storage is managed.
@@ -201,6 +236,7 @@ pub(super) struct LowerCtx<'a> {
     /// character dummy as length zero instead of dereferencing its null slot.
     pub(super) optional_locals: HashSet<String>,
     pub(super) loops: Vec<LoopScope>,
+    pub(super) construct_exits: Vec<ConstructExitScope>,
     pub(super) st: &'a SymbolTable,
     /// Module-scoped globals visible by (lowercase module name,
     /// lowercase variable name). Populated by the lower_file
@@ -289,6 +325,7 @@ impl<'a> LowerCtx<'a> {
             locals: HashMap::new(),
             optional_locals: HashSet::new(),
             loops: Vec::new(),
+            construct_exits: Vec::new(),
             st,
             globals,
             type_layouts,
@@ -326,7 +363,7 @@ impl<'a> LowerCtx<'a> {
                 is_pointer: false,
                 runtime_dim_upper: vec![],
                 is_class: false,
-            logical_kind: None,
+                logical_kind: None,
                 last_dim_assumed_size: false,
             },
         );
@@ -348,7 +385,7 @@ impl<'a> LowerCtx<'a> {
                 is_pointer: false,
                 runtime_dim_upper: vec![],
                 is_class: false,
-            logical_kind: None,
+                logical_kind: None,
                 last_dim_assumed_size: false,
             },
         );
@@ -360,6 +397,21 @@ impl<'a> LowerCtx<'a> {
 
     pub(super) fn pop_loop(&mut self) {
         self.loops.pop();
+    }
+
+    pub(super) fn push_construct_exit(&mut self, name: Option<String>, exit: BlockId) {
+        if let Some(name) = name {
+            self.construct_exits.push(ConstructExitScope {
+                name: name.to_ascii_lowercase(),
+                exit,
+            });
+        }
+    }
+
+    pub(super) fn pop_construct_exit(&mut self, name: &Option<String>) {
+        if name.is_some() {
+            self.construct_exits.pop();
+        }
     }
 
     /// Look up an F77 statement function by name in the current
@@ -385,5 +437,14 @@ impl<'a> LowerCtx<'a> {
         } else {
             self.loops.last()
         }
+    }
+
+    pub(super) fn find_construct_exit(&self, name: &Option<String>) -> Option<BlockId> {
+        let name = name.as_ref()?;
+        self.construct_exits
+            .iter()
+            .rev()
+            .find(|scope| scope.name.eq_ignore_ascii_case(name))
+            .map(|scope| scope.exit)
     }
 }

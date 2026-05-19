@@ -372,6 +372,21 @@ pub fn write_amod(
             }
         }
     }
+    for layout in type_layouts.layouts.values() {
+        if layout
+            .owner_module
+            .as_ref()
+            .is_some_and(|owner| owner.eq_ignore_ascii_case(&mod_key))
+        {
+            for field in &layout.fields {
+                if field.procedure_pointer {
+                    if let TypeInfo::Derived(signature_name) = &field.type_info {
+                        proc_export_names.insert(signature_name.to_lowercase());
+                    }
+                }
+            }
+        }
+    }
     let mut procs: Vec<_> = scope
         .symbols
         .iter()
@@ -582,7 +597,11 @@ fn emit_parameter(
         type_info_to_string(sym.type_info.as_ref())
     };
     let is_private = sym.attrs.access == Access::Private;
-    if let Some(cv) = sym.const_value {
+    if let Some(cv) = sym
+        .const_value
+        .map(i128::from)
+        .or_else(|| global_info.and_then(|info| info.const_value))
+    {
         // Place `, private` after the value so parse_var's
         // rfind(" = ") inside type_str continues to work.
         let suf = if is_private { ", private" } else { "" };
@@ -1067,6 +1086,9 @@ fn emit_type(out: &mut String, name: &str, type_layouts: &TypeLayoutRegistry) {
             if field.pointer {
                 attrs.push_str(" @pointer");
             }
+            if field.procedure_pointer {
+                attrs.push_str(" @procptr");
+            }
             if field.target {
                 attrs.push_str(" @target");
             }
@@ -1398,7 +1420,9 @@ thread_local! {
 /// result is cached per-thread, keyed by canonical path + mtime.
 pub fn read_amod(path: &Path) -> Result<ModuleInterface, String> {
     let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let mtime = std::fs::metadata(&canonical).and_then(|m| m.modified()).ok();
+    let mtime = std::fs::metadata(&canonical)
+        .and_then(|m| m.modified())
+        .ok();
 
     if let Some(now) = mtime {
         let cached = AMOD_CACHE.with(|c| {
@@ -1984,11 +2008,13 @@ fn parse_type(
                 let mut pointer = false;
                 let mut target = false;
                 let mut declared_array = false;
+                let mut procedure_pointer = false;
                 let mut default_init = None;
                 for token in flag_tail.split_whitespace() {
                     match token {
                         "@allocatable" => allocatable = true,
                         "@pointer" => pointer = true,
+                        "@procptr" => procedure_pointer = true,
                         "@target" => target = true,
                         "@declared_array" => declared_array = true,
                         _ => {
@@ -2010,6 +2036,7 @@ fn parse_type(
                     allocatable,
                     pointer,
                     target,
+                    procedure_pointer,
                     default_init,
                 });
             }
@@ -2221,6 +2248,7 @@ pub fn extract_module_globals(
                         _ if var.deferred_char => crate::ir::lower::CharKind::Deferred,
                         _ => crate::ir::lower::CharKind::None,
                     },
+                    const_value: var.const_value.map(i128::from),
                     external: true,
                     private: var.access == Access::Private,
                 },

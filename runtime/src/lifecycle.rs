@@ -72,6 +72,10 @@ pub extern "C" fn afs_error_stop_msg(ptr: *const u8, len: i64) {
 pub extern "C" fn afs_error_stop_int(code: i64) {
     eprintln!("ERROR STOP {}", code);
     afs_program_finalize();
-    let exit_code = if code > 0 && code <= 255 { code as i32 } else { 1 };
+    let exit_code = if code > 0 && code <= 255 {
+        code as i32
+    } else {
+        1
+    };
     process::exit(exit_code);
 }

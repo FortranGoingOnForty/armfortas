@@ -44,9 +44,7 @@ fn o3_vectorizes_array_plus_invariant_scalar_loop() {
     // pattern was vectorized:
     //   * NeonVectorize: vbroadcast in preheader + vload/vadd/vstore in body.
     //   * Vectorize fallback: afs_array_add_scalar_i32 kernel call.
-    let neon = o3_ir.contains("vbroadcast")
-        && o3_ir.contains("vadd")
-        && o3_ir.contains("vstore");
+    let neon = o3_ir.contains("vbroadcast") && o3_ir.contains("vadd") && o3_ir.contains("vstore");
     let kernel = o3_ir.contains("call @afs_array_add_scalar_i32(");
     assert!(
         neon || kernel,

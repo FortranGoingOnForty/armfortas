@@ -410,13 +410,71 @@ impl<'a> Parser<'a> {
         }
 
         loop {
-            let arg = self.parse_argument()?;
-            args.push(arg);
+            if let Some(tuple_args) = self.try_parse_repeated_name_tuple_argument() {
+                args.extend(tuple_args);
+            } else {
+                let arg = self.parse_argument()?;
+                args.push(arg);
+            }
             if !self.eat(&TokenKind::Comma) {
                 break;
             }
         }
         Ok(args)
+    }
+
+    fn try_parse_repeated_name_tuple_argument(&mut self) -> Option<Vec<Argument>> {
+        let checkpoint = self.pos;
+        if !self.eat(&TokenKind::LParen) {
+            return None;
+        }
+
+        let first_tok = if self.peek() == &TokenKind::Identifier {
+            self.advance().clone()
+        } else {
+            self.pos = checkpoint;
+            return None;
+        };
+        let first_name = first_tok.text.clone();
+        let mut names = vec![first_tok];
+        let mut saw_comma = false;
+
+        while self.eat(&TokenKind::Comma) {
+            saw_comma = true;
+            let tok = if self.peek() == &TokenKind::Identifier {
+                self.advance().clone()
+            } else {
+                self.pos = checkpoint;
+                return None;
+            };
+            if !tok.text.eq_ignore_ascii_case(&first_name) {
+                self.pos = checkpoint;
+                return None;
+            }
+            names.push(tok);
+        }
+
+        if !saw_comma || !self.eat(&TokenKind::RParen) {
+            self.pos = checkpoint;
+            return None;
+        }
+        if !matches!(self.peek(), TokenKind::RParen | TokenKind::Comma) {
+            self.pos = checkpoint;
+            return None;
+        }
+
+        Some(
+            names
+                .into_iter()
+                .map(|tok| Argument {
+                    keyword: None,
+                    value: SectionSubscript::Element(Spanned::new(
+                        Expr::Name { name: tok.text },
+                        tok.span,
+                    )),
+                })
+                .collect(),
+        )
     }
 
     fn parse_argument(&mut self) -> Result<Argument, ParseError> {

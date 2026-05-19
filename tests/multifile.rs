@@ -250,6 +250,166 @@ fn generic_interface_transitive_use() {
 }
 
 #[test]
+fn generic_interface_beats_private_renamed_import() {
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let dep_f90 = dir.join("dep.f90");
+    let wrapper_f90 = dir.join("wrapper.f90");
+    let main_f90 = dir.join("main.f90");
+    let dep_o = dir.join("dep.o");
+    let wrapper_o = dir.join("wrapper.o");
+    let main_o = dir.join("main.o");
+    let binary = dir.join("test_bin");
+
+    std::fs::write(
+        &dep_f90,
+        "module dep\n  implicit none\ncontains\n  integer function pick(x)\n    integer, intent(in) :: x\n    pick = -1\n  end function\nend module\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &wrapper_f90,
+        "module wrapper\n  use dep, only: pick_dep => pick\n  implicit none\n  private\n  public :: box, pick\n  type :: box\n    integer :: v\n  end type\n  interface pick\n    module procedure pick_box\n  end interface\ncontains\n  integer function pick_box(x)\n    type(box), intent(in) :: x\n    pick_box = x%v\n  end function\nend module\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &main_f90,
+        "program p\n  use wrapper, only: box, pick\n  implicit none\n  type(box) :: b\n  b%v = 42\n  print *, pick(b)\nend program\n",
+    )
+    .unwrap();
+
+    compile_file(&compiler, &dep_f90, &dep_o, None);
+    compile_file(&compiler, &wrapper_f90, &wrapper_o, Some(&dir));
+    compile_file(&compiler, &main_f90, &main_o, Some(&dir));
+    link_files(&[&main_o, &wrapper_o, &dep_o], &binary);
+    let output = run_binary(&binary);
+    assert!(
+        output.contains("42"),
+        "expected wrapper generic to dispatch to pick_box, got:\n{}",
+        output
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn imported_type_bound_result_guides_operator_generic() {
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let string_f90 = dir.join("string_mod.f90");
+    let list_f90 = dir.join("list_mod.f90");
+    let main_f90 = dir.join("main.f90");
+    let string_o = dir.join("string_mod.o");
+    let list_o = dir.join("list_mod.o");
+    let main_o = dir.join("main.o");
+    let binary = dir.join("test_bin");
+
+    std::fs::write(
+        &string_f90,
+        r#"module string_mod
+  implicit none
+  private
+  public :: string_type, operator(==)
+
+  type :: string_type
+    character(len=:), allocatable :: raw
+  end type
+
+  interface string_type
+    module procedure new_string
+  end interface
+
+  interface operator(==)
+    module procedure eq_char_string
+    module procedure eq_string_char
+    module procedure eq_string_string
+  end interface
+
+contains
+  function new_string(raw) result(s)
+    character(len=*), intent(in) :: raw
+    type(string_type) :: s
+    s%raw = raw
+  end function
+
+  logical function eq_string_string(lhs, rhs)
+    type(string_type), intent(in) :: lhs
+    type(string_type), intent(in) :: rhs
+    eq_string_string = allocated(lhs%raw) .eqv. allocated(rhs%raw)
+    if (eq_string_string .and. allocated(lhs%raw)) eq_string_string = lhs%raw == rhs%raw
+  end function
+
+  logical function eq_string_char(lhs, rhs)
+    type(string_type), intent(in) :: lhs
+    character(len=*), intent(in) :: rhs
+    eq_string_char = allocated(lhs%raw)
+    if (eq_string_char) eq_string_char = lhs%raw == rhs
+  end function
+
+  logical function eq_char_string(lhs, rhs)
+    character(len=*), intent(in) :: lhs
+    type(string_type), intent(in) :: rhs
+    eq_char_string = allocated(rhs%raw)
+    if (eq_char_string) eq_char_string = lhs == rhs%raw
+  end function
+end module
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &list_f90,
+        r#"module list_mod
+  use string_mod, only: string_type
+  implicit none
+  private
+  public :: list_type
+
+  type :: list_type
+    type(string_type) :: value
+  contains
+    procedure :: get
+  end type
+
+contains
+  function get(list) result(value)
+    class(list_type), intent(in) :: list
+    type(string_type) :: value
+    value = list%value
+  end function
+end module
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &main_f90,
+        r#"program p
+  use string_mod, only: string_type, operator(==)
+  use list_mod, only: list_type
+  implicit none
+  type(list_type) :: list
+
+  list%value = string_type("ok")
+  if (.not. (list%get() == string_type("ok"))) error stop 1
+  print *, "ok"
+end program
+"#,
+    )
+    .unwrap();
+
+    compile_file(&compiler, &string_f90, &string_o, None);
+    compile_file(&compiler, &list_f90, &list_o, Some(&dir));
+    compile_file(&compiler, &main_f90, &main_o, Some(&dir));
+    link_files(&[&main_o, &list_o, &string_o], &binary);
+    let output = run_binary(&binary);
+    assert!(
+        output.contains("ok"),
+        "expected imported TBP result to dispatch eq_string_string, got:\n{}",
+        output
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn module_private_default() {
     // F2008 §12.2.3.2: submodules of a module see *all* parent entities,
     // including the privates. The .amod must therefore round-trip private

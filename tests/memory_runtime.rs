@@ -311,6 +311,42 @@ fn allocate_source_scalar_initializes_allocatable_scalar() {
 }
 
 #[test]
+fn scalar_allocatable_value_loads_from_allocated_payload() {
+    let dir = unique_dir("scalar_alloc_payload_load");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  implicit none\n  real :: x(5)\n  real, allocatable :: c\n  real :: acc\n  integer :: i\n  x(1) = 1.0\n  x(2) = 2.0\n  x(3) = 3.0\n  x(4) = 4.0\n  x(5) = 5.0\n  allocate(c, source=sum(x) / real(size(x)))\n  acc = 0.0\n  do i = 1, 5\n    acc = acc + (x(i) - c) * (x(i) - c)\n  end do\n  if (.not. allocated(c)) error stop 1\n  if (abs(c - 3.0) > 1.0e-5) error stop 2\n  if (abs(acc / 5.0 - 2.0) > 1.0e-5) error stop 3\n  print *, c, acc / 5.0\nend program\n",
+    );
+    let exe = dir.join("scalar_alloc_payload_load.bin");
+    let compile = compile_program(&src, &exe);
+    assert!(
+        compile.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("scalar allocatable payload load runtime failed");
+    assert!(
+        run.status.success(),
+        "scalar allocatable payload load runtime failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("3.0000000E0") && stdout.contains("2.0000000E0"),
+        "expected scalar allocatable payload values in output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn allocate_component_source_array_infers_shape_and_copies_values() {
     let dir = unique_dir("alloc_component_source_array");
     let src = write_program_in(

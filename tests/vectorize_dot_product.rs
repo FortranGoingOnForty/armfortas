@@ -49,9 +49,7 @@ fn o3_vectorizes_manual_dot_product_loop() {
         o3_ir
     );
     assert!(
-        o3_ir.contains("vmul")
-            && o3_ir.contains("vadd")
-            && o3_ir.contains("vreduce_sum"),
+        o3_ir.contains("vmul") && o3_ir.contains("vadd") && o3_ir.contains("vreduce_sum"),
         "expected dot-product shape (vmul + vadd + vreduce_sum):\n{}",
         o3_ir
     );

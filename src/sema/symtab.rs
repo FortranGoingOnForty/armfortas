@@ -242,20 +242,26 @@ impl SymbolTable {
             // original_name is followed, so unrelated names cannot leak.
             for assoc in &scope.use_associations {
                 if assoc.local_name == key {
-                    if let Some(sym) = self.scopes[assoc.source_scope]
-                        .symbols
-                        .get(&assoc.original_name)
-                    {
-                        if sym.attrs.access != Access::Private || assoc.is_submodule_access {
+                    if assoc.is_submodule_access {
+                        if let Some(sym) = self.scopes[assoc.source_scope]
+                            .symbols
+                            .get(&assoc.original_name)
+                        {
                             return Some(sym);
                         }
-                    }
-                    if let Some(sym) =
-                        self.lookup_in_guarded(assoc.source_scope, &assoc.original_name, visited)
-                    {
-                        if sym.attrs.access != Access::Private || assoc.is_submodule_access {
+                        if let Some(sym) = self.lookup_in_guarded(
+                            assoc.source_scope,
+                            &assoc.original_name,
+                            visited,
+                        ) {
                             return Some(sym);
                         }
+                    } else if let Some(sym) = self.lookup_exported_in_guarded(
+                        assoc.source_scope,
+                        &assoc.original_name,
+                        visited,
+                    ) {
+                        return Some(sym);
                     }
                 }
             }
@@ -279,10 +285,9 @@ impl SymbolTable {
                     continue;
                 }
                 seen_use_scopes.push(assoc.source_scope);
-                if let Some(sym) = self.lookup_in_guarded(assoc.source_scope, key, visited) {
-                    if sym.attrs.access != Access::Private {
-                        return Some(sym);
-                    }
+                if let Some(sym) = self.lookup_exported_in_guarded(assoc.source_scope, key, visited)
+                {
+                    return Some(sym);
                 }
             }
 
@@ -290,6 +295,103 @@ impl SymbolTable {
             if let Some(parent) = scope.parent {
                 if self.scopes[parent].kind != ScopeKind::Global {
                     return self.lookup_in_guarded(parent, key, visited);
+                }
+            }
+
+            None
+        })();
+
+        visited.pop();
+        result
+    }
+
+    pub fn scope_exports_name(&self, scope_id: ScopeId, name: &str) -> bool {
+        let key = ensure_ascii_lowercase(name);
+        self.scope_exports_key(scope_id, key.as_ref())
+    }
+
+    fn scope_exports_key(&self, scope_id: ScopeId, key: &str) -> bool {
+        let scope = &self.scopes[scope_id];
+        if let Some(sym) = scope.symbols.get(key) {
+            return match sym.attrs.access {
+                Access::Public => true,
+                Access::Private => false,
+                Access::Default => !matches!(scope.default_access, Access::Private),
+            };
+        }
+        match scope
+            .pending_access
+            .get(key)
+            .copied()
+            .unwrap_or(Access::Default)
+        {
+            Access::Public => true,
+            Access::Private => false,
+            Access::Default => !matches!(scope.default_access, Access::Private),
+        }
+    }
+
+    fn lookup_exported_in_guarded(
+        &self,
+        scope_id: ScopeId,
+        key: &str,
+        visited: &mut Vec<ScopeId>,
+    ) -> Option<&Symbol> {
+        if visited.contains(&scope_id) {
+            return None;
+        }
+        if !self.scope_exports_key(scope_id, key) {
+            return None;
+        }
+        visited.push(scope_id);
+
+        let scope = &self.scopes[scope_id];
+        let result = (|| {
+            if let Some(sym) = scope.symbols.get(key) {
+                return Some(sym);
+            }
+
+            for assoc in &scope.use_associations {
+                if assoc.local_name == key {
+                    if assoc.is_submodule_access {
+                        if let Some(sym) = self.scopes[assoc.source_scope]
+                            .symbols
+                            .get(&assoc.original_name)
+                        {
+                            return Some(sym);
+                        }
+                        if let Some(sym) = self.lookup_in_guarded(
+                            assoc.source_scope,
+                            &assoc.original_name,
+                            visited,
+                        ) {
+                            return Some(sym);
+                        }
+                    } else if let Some(sym) = self.lookup_exported_in_guarded(
+                        assoc.source_scope,
+                        &assoc.original_name,
+                        visited,
+                    ) {
+                        return Some(sym);
+                    }
+                }
+            }
+
+            let mut seen_use_scopes = Vec::new();
+            for assoc in &scope.use_associations {
+                if !assoc.from_bare_use {
+                    continue;
+                }
+                if assoc.local_name != assoc.original_name {
+                    continue;
+                }
+                if seen_use_scopes.contains(&assoc.source_scope) {
+                    continue;
+                }
+                seen_use_scopes.push(assoc.source_scope);
+                if let Some(sym) = self.lookup_exported_in_guarded(assoc.source_scope, key, visited)
+                {
+                    return Some(sym);
                 }
             }
 

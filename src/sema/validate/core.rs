@@ -16,13 +16,13 @@ use super::pure_elemental::{
     check_pure_expr_calls, reject_pure_nonlocal_definition, validate_elemental_args,
     validate_pure_call,
 };
-use crate::ast::decl::{Attribute, Decl, TypeAttr, TypeSpec};
+use crate::ast::decl::{Attribute, Decl, SpannedDecl, TypeAttr, TypeSpec};
 use crate::ast::expr::Expr;
 use crate::ast::stmt::*;
 use crate::ast::unit::*;
 use crate::lexer::Span;
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Fortran standard level for --std= conformance checking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -102,7 +102,8 @@ pub(super) struct Ctx<'a> {
     pub(super) type_layouts: Option<&'a crate::sema::type_layout::TypeLayoutRegistry>,
     /// Array names declared in each scope with allocatable/pointer storage.
     pub(super) allocatable_array_targets: HashSet<(ScopeId, String)>,
-    pub(super) lookup_cache: RefCell<std::collections::HashMap<(ScopeId, String), Option<&'a Symbol>>>,
+    pub(super) lookup_cache:
+        RefCell<std::collections::HashMap<(ScopeId, String), Option<&'a Symbol>>>,
     /// Stack of associate-name frames. Each frame is the lowercase set of
     /// associate-names introduced by an enclosing ASSOCIATE construct. Names
     /// in any active frame shadow same-named USE-imported or host-scope
@@ -110,8 +111,20 @@ pub(super) struct Ctx<'a> {
     /// selector, so parameter/intent attributes of a USE-imported symbol
     /// with the same name don't apply inside the body).
     pub(super) associate_frames: Vec<HashSet<String>>,
+    /// Stack of BLOCK-local declarations. BLOCK constructs are
+    /// scoping units, but the resolver does not currently materialize
+    /// statement-level block scopes in the symbol table. Validation
+    /// still needs those local declarations to shadow use/host names.
+    block_decl_frames: Vec<HashMap<String, BlockBindingAttrs>>,
     pub(super) warn_pedantic: bool,
     pub(super) warn_deprecated: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+struct BlockBindingAttrs {
+    intent_in: bool,
+    parameter: bool,
+    pointer: bool,
 }
 
 impl<'a> Ctx<'a> {
@@ -134,6 +147,7 @@ impl<'a> Ctx<'a> {
             allocatable_array_targets: HashSet::new(),
             lookup_cache: RefCell::new(std::collections::HashMap::new()),
             associate_frames: Vec::new(),
+            block_decl_frames: Vec::new(),
             warn_pedantic,
             warn_deprecated,
         }
@@ -172,6 +186,18 @@ impl<'a> Ctx<'a> {
         self.associate_frames
             .iter()
             .any(|frame| frame.contains(&key))
+    }
+
+    pub(super) fn is_block_local_name(&self, name: &str) -> bool {
+        self.block_binding_attrs(name).is_some()
+    }
+
+    fn block_binding_attrs(&self, name: &str) -> Option<BlockBindingAttrs> {
+        let key = name.to_lowercase();
+        self.block_decl_frames
+            .iter()
+            .rev()
+            .find_map(|frame| frame.get(&key).copied())
     }
 
     /// Look up a symbol in the current validation scope.
@@ -1485,7 +1511,10 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
             for iface in ifaces {
                 validate_unit(ctx, iface);
             }
+            let frame = block_binding_frame(decls);
+            ctx.block_decl_frames.push(frame);
             validate_stmts(ctx, body);
+            ctx.block_decl_frames.pop();
         }
         Stmt::Associate { assocs, body, .. } => {
             ctx.require_std(stmt.span, FortranStandard::F2003, "ASSOCIATE construct");
@@ -1666,16 +1695,20 @@ fn validate_assignment_target(ctx: &mut Ctx, target: &crate::ast::expr::SpannedE
         if ctx.is_associate_name(&name) {
             return;
         }
-        let (is_intent_in, is_parameter, is_pointer) = ctx
-            .lookup(&name)
-            .map(|sym| {
-                (
-                    matches!(sym.attrs.intent, Some(Intent::In)),
-                    sym.attrs.parameter,
-                    sym.attrs.pointer,
-                )
-            })
-            .unwrap_or((false, false, false));
+        let (is_intent_in, is_parameter, is_pointer) =
+            if let Some(attrs) = ctx.block_binding_attrs(&name) {
+                (attrs.intent_in, attrs.parameter, attrs.pointer)
+            } else {
+                ctx.lookup(&name)
+                    .map(|sym| {
+                        (
+                            matches!(sym.attrs.intent, Some(Intent::In)),
+                            sym.attrs.parameter,
+                            sym.attrs.pointer,
+                        )
+                    })
+                    .unwrap_or((false, false, false))
+            };
         let writes_through_pointer_target = is_pointer && !matches!(target.node, Expr::Name { .. });
         if is_intent_in && !writes_through_pointer_target {
             ctx.error(
@@ -1977,6 +2010,48 @@ fn validate_associate(
     ctx.associate_frames.push(frame);
     validate_stmts(ctx, body);
     ctx.associate_frames.pop();
+}
+
+fn block_binding_frame(decls: &[SpannedDecl]) -> HashMap<String, BlockBindingAttrs> {
+    let mut frame = HashMap::new();
+    for decl in decls {
+        match &decl.node {
+            Decl::TypeDecl {
+                attrs, entities, ..
+            } => {
+                let binding_attrs = block_attrs_from_decl(attrs.as_slice());
+                for entity in entities {
+                    frame.insert(entity.name.to_lowercase(), binding_attrs);
+                }
+            }
+            Decl::ParameterStmt { pairs } => {
+                for (name, _) in pairs {
+                    frame.insert(
+                        name.to_lowercase(),
+                        BlockBindingAttrs {
+                            parameter: true,
+                            ..BlockBindingAttrs::default()
+                        },
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    frame
+}
+
+fn block_attrs_from_decl(attrs: &[Attribute]) -> BlockBindingAttrs {
+    let mut out = BlockBindingAttrs::default();
+    for attr in attrs {
+        match attr {
+            Attribute::Parameter => out.parameter = true,
+            Attribute::Pointer => out.pointer = true,
+            Attribute::Intent(crate::ast::decl::Intent::In) => out.intent_in = true,
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Extract the base variable name from an expression (handling subscripts and components).
@@ -2511,7 +2586,7 @@ pub fn is_intrinsic_name(name: &str) -> bool {
         "len" | "len_trim" | "trim" | "adjustl" | "adjustr" |
         "index" | "scan" | "verify" | "repeat" | "lge" | "lgt" | "lle" | "llt" |
         "kind" | "selected_int_kind" | "selected_real_kind" |
-        "size" | "shape" | "lbound" | "ubound" | "allocated" | "associated" |
+        "size" | "shape" | "rank" | "lbound" | "ubound" | "allocated" | "associated" |
         "present" | "merge" | "pack" | "unpack" | "spread" | "reshape" |
         "sum" | "product" | "maxval" | "minval" | "maxloc" | "minloc" | "findloc" | "count" | "any" | "all" |
         "ieee_support_inf" | "ieee_support_nan" | "ieee_support_subnormal" |

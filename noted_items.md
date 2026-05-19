@@ -19,3 +19,10 @@ starting the full Sprint 29 audit:
   conservative source form instead of the typed constructor spelling.
 - Revisit ambitious array/vectorization-style `integer(16)` rewrites only after the
   scalar/runtime ABI surface is fully closed and audited.
+- Stdlib sweep provenance: `example_solve_custom` passed as the fpm-linked v47
+  binary, but previously aborted in one repacked/direct archive path. A fresh
+  v64b stdlib rebuild from current upstream exposed a SIGSEGV in
+  `example_solve_custom` and the related linalg iterative solver examples. The
+  v65b rebuild after routing indirect branch targets through IP1 clears the
+  solver SIGSEGV cluster; keep this note as provenance if the archive-order or
+  solver-path discrepancy returns.

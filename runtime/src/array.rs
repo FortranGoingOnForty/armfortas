@@ -1252,6 +1252,48 @@ pub extern "C" fn afs_copy_array_data(
     }
 }
 
+/// Copy an array descriptor result into a fixed-shape caller buffer.
+///
+/// Fixed-shape assignment from an allocatable function result cannot hand the
+/// callee the caller's raw stack buffer as the hidden result slot, so generated
+/// code receives a descriptor temp and then copies payload bytes back into the
+/// fixed destination. A valid zero-size result has `base_addr == NULL`; treat
+/// it as a zero-fill instead of forwarding a null source pointer to `memcpy`.
+#[no_mangle]
+pub extern "C" fn afs_copy_array_result_to_fixed(
+    dest: *mut u8,
+    source: *const ArrayDescriptor,
+    dest_bytes: i64,
+) {
+    if dest.is_null() || dest_bytes <= 0 {
+        return;
+    }
+
+    let dest_len = dest_bytes as usize;
+    unsafe {
+        ptr::write_bytes(dest, 0, dest_len);
+    }
+
+    if source.is_null() {
+        return;
+    }
+
+    let source = unsafe { &*source };
+    let source_bytes = source.total_bytes();
+    if source_bytes <= 0 || source.base_addr.is_null() {
+        return;
+    }
+
+    let copy_bytes = dest_bytes.min(source_bytes) as usize;
+    if copy_bytes == 0 {
+        return;
+    }
+
+    unsafe {
+        ptr::copy(source.base_addr, dest, copy_bytes);
+    }
+}
+
 /// Validate `ALLOCATE(..., SOURCE=...)` array conformance after the destination
 /// has already been allocated with its final shape.
 ///
@@ -1424,6 +1466,21 @@ pub extern "C" fn afs_assign_allocatable(
         (0..dest.rank as usize).all(|i| dest.dims[i].extent() == source.dims[i].extent())
     };
 
+    let source_snapshot = if source_base_points_into_dest_storage(dest, source) {
+        let bytes = source.total_bytes();
+        if bytes > 0 {
+            let mut buf = vec![0u8; bytes as usize];
+            unsafe {
+                copy_same_type_payload_to_contiguous(source, buf.as_mut_ptr());
+            }
+            Some(buf)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     if !shapes_match || !dest.is_allocated() {
         // Deallocate dest if allocated.
         if dest.is_allocated() && !dest.base_addr.is_null() {
@@ -1473,63 +1530,92 @@ pub extern "C" fn afs_assign_allocatable(
     // non-contiguous and walk every multi-index column-major.
     //
     // We only treat the source as non-contiguous when at least one
-    // dim's stride is *strictly greater* than its canonical
-    // column-major step. Strides smaller than canonical (e.g.
-    // afs_matmul's 2x2 result emitted with stride=(1,1) instead of
-    // (1,2)) describe an internally inconsistent descriptor whose
-    // base_addr still points at a flat contiguous buffer; walking
-    // those would re-read the same byte offset twice and drop the
-    // last element. The conservative choice is the flat copy that
-    // mirrors total_bytes — which the previous unconditional ptr::copy
-    // did silently for both kinds of source.
+    // dim's stride is negative or *strictly greater* than its
+    // canonical column-major step. Positive strides smaller than
+    // canonical (e.g. afs_matmul's 2x2 result emitted with
+    // stride=(1,1) instead of (1,2)) describe an internally
+    // inconsistent descriptor whose base_addr still points at a flat
+    // contiguous buffer; walking those would re-read the same byte
+    // offset twice and drop the last element. The conservative choice
+    // is the flat copy that mirrors total_bytes — which the previous
+    // unconditional ptr::copy did silently for both kinds of source.
     let bytes = source.total_bytes();
     if bytes > 0 && !source.base_addr.is_null() && !dest.base_addr.is_null() {
-        let elem_size = source.elem_size;
-        let mut canonical: i64 = 1;
-        let mut strided = false;
-        for i in 0..source.rank as usize {
-            if source.dims[i].stride > canonical {
-                strided = true;
-                break;
-            }
-            canonical = canonical.saturating_mul(source.dims[i].extent().max(1));
-        }
-        if !strided {
+        if let Some(buf) = source_snapshot.as_ref() {
+            let copy_bytes = bytes.min(dest.total_bytes()) as usize;
             unsafe {
-                ptr::copy(source.base_addr, dest.base_addr, bytes as usize);
+                ptr::copy_nonoverlapping(buf.as_ptr(), dest.base_addr, copy_bytes);
             }
         } else {
-            let rank = source.rank as usize;
-            let extents: Vec<i64> = (0..rank).map(|i| source.dims[i].extent()).collect();
-            let strides: Vec<i64> = (0..rank).map(|i| source.dims[i].stride).collect();
-            let mut idx = vec![0i64; rank];
-            let total = source.total_elements();
-            for k in 0..total {
-                let mut src_off: i64 = 0;
-                for d in 0..rank {
-                    src_off += idx[d] * strides[d];
-                }
-                src_off *= elem_size;
-                let dst_off = k * elem_size;
-                unsafe {
-                    ptr::copy_nonoverlapping(
-                        source.base_addr.offset(src_off as isize),
-                        dest.base_addr.offset(dst_off as isize),
-                        elem_size as usize,
-                    );
-                }
-                for d in 0..rank {
-                    idx[d] += 1;
-                    if idx[d] < extents[d] {
-                        break;
-                    }
-                    idx[d] = 0;
-                }
+            unsafe {
+                copy_same_type_payload_to_contiguous(source, dest.base_addr);
             }
         }
     }
     dest.set_scalar_type_tag(source.scalar_type_tag());
     dest.set_scalar_tbp_lookup_ptr(source.scalar_tbp_lookup_ptr());
+}
+
+fn source_base_points_into_dest_storage(dest: &ArrayDescriptor, source: &ArrayDescriptor) -> bool {
+    if !dest.is_allocated() || dest.base_addr.is_null() || source.base_addr.is_null() {
+        return false;
+    }
+    let dest_bytes = dest.total_bytes();
+    if dest_bytes <= 0 {
+        return false;
+    }
+    let dest_start = dest.base_addr as usize;
+    let dest_end = dest_start.saturating_add(dest_bytes as usize);
+    let source_start = source.base_addr as usize;
+    source_start >= dest_start && source_start < dest_end
+}
+
+unsafe fn copy_same_type_payload_to_contiguous(source: &ArrayDescriptor, dest_base: *mut u8) {
+    let bytes = source.total_bytes();
+    if bytes <= 0 || source.base_addr.is_null() || dest_base.is_null() {
+        return;
+    }
+
+    let elem_size = source.elem_size;
+    let mut canonical: i64 = 1;
+    let mut strided = false;
+    for i in 0..source.rank as usize {
+        if source.dims[i].stride < 0 || source.dims[i].stride > canonical {
+            strided = true;
+            break;
+        }
+        canonical = canonical.saturating_mul(source.dims[i].extent().max(1));
+    }
+    if !strided {
+        ptr::copy(source.base_addr, dest_base, bytes as usize);
+        return;
+    }
+
+    let rank = source.rank as usize;
+    let extents: Vec<i64> = (0..rank).map(|i| source.dims[i].extent()).collect();
+    let strides: Vec<i64> = (0..rank).map(|i| source.dims[i].stride).collect();
+    let mut idx = vec![0i64; rank];
+    let total = source.total_elements();
+    for k in 0..total {
+        let mut src_off: i64 = 0;
+        for d in 0..rank {
+            src_off += idx[d] * strides[d];
+        }
+        src_off *= elem_size;
+        let dst_off = k * elem_size;
+        ptr::copy_nonoverlapping(
+            source.base_addr.offset(src_off as isize),
+            dest_base.offset(dst_off as isize),
+            elem_size as usize,
+        );
+        for d in 0..rank {
+            idx[d] += 1;
+            if idx[d] < extents[d] {
+                break;
+            }
+            idx[d] = 0;
+        }
+    }
 }
 
 /// Element-converting allocatable assignment.
@@ -1572,6 +1658,8 @@ pub extern "C" fn afs_assign_allocatable_convert(
         1 => 2,
         2 | 4 => 4,
         3 | 5 => 8,
+        6 => 8,
+        7 => 16,
         _ => return,
     };
 
@@ -1597,8 +1685,7 @@ pub extern "C" fn afs_assign_allocatable_convert(
         for i in 0..source_ref.rank as usize {
             dest_ref.dims[i] = source_ref.dims[i];
             dest_ref.dims[i].stride = running_stride;
-            running_stride =
-                running_stride.saturating_mul(source_ref.dims[i].extent().max(1));
+            running_stride = running_stride.saturating_mul(source_ref.dims[i].extent().max(1));
         }
         let bytes = dest_ref.total_bytes();
         if bytes > 0 {
@@ -1626,17 +1713,19 @@ pub extern "C" fn afs_assign_allocatable_convert(
         1 => 2,
         2 | 4 => 4,
         3 | 5 => 8,
+        6 => 8,
+        7 => 16,
         _ => return,
     };
     // Source may be non-contiguous (e.g. transpose result, section).
     // Walk each multi-index column-major and apply per-dim strides.
     // Mirror the same-class detection used in afs_assign_allocatable
-    // and afs_copy_array_data: only apply per-dim strides when at
-    // least one stride is *strictly greater* than its canonical
-    // column-major step. A stride below canonical describes a
-    // malformed descriptor (e.g. a 2x2 matmul result with stride=(1,1)
-    // instead of (1,2)) whose underlying buffer is still flat
-    // contiguous; walking those re-reads the same offset twice.
+    // and afs_copy_array_data: apply per-dim strides when at least
+    // one stride is negative or *strictly greater* than its canonical
+    // column-major step. A positive stride below canonical describes
+    // a malformed descriptor (e.g. a 2x2 matmul result with
+    // stride=(1,1) instead of (1,2)) whose underlying buffer is still
+    // flat contiguous; walking those re-reads the same offset twice.
     let rank = source_ref.rank as usize;
     let extents: Vec<i64> = (0..rank).map(|i| source_ref.dims[i].extent()).collect();
     let raw_strides: Vec<i64> = (0..rank).map(|i| source_ref.dims[i].stride).collect();
@@ -1645,7 +1734,7 @@ pub extern "C" fn afs_assign_allocatable_convert(
     let mut strided = false;
     for d in 0..rank {
         canonical.push(canonical_step);
-        if raw_strides[d] > canonical_step {
+        if raw_strides[d] < 0 || raw_strides[d] > canonical_step {
             strided = true;
         }
         canonical_step = canonical_step.saturating_mul(extents[d].max(1));
@@ -1658,25 +1747,58 @@ pub extern "C" fn afs_assign_allocatable_convert(
             src_off_elems += idx[d] * strides[d];
         }
         let src_byte_off = src_off_elems * src_elem_size;
-        let src_val_f64: f64 = unsafe {
+        let (src_re_f64, src_im_f64): (f64, f64) = unsafe {
             match src_kind_tag {
-                0 => *(src_p.offset(src_byte_off as isize) as *const i8) as f64,
-                1 => *(src_p.offset(src_byte_off as isize) as *const i16) as f64,
-                2 => *(src_p.offset(src_byte_off as isize) as *const i32) as f64,
-                3 => *(src_p.offset(src_byte_off as isize) as *const i64) as f64,
-                4 => *(src_p.offset(src_byte_off as isize) as *const f32) as f64,
-                5 => *(src_p.offset(src_byte_off as isize) as *const f64),
+                0 => (
+                    *(src_p.offset(src_byte_off as isize) as *const i8) as f64,
+                    0.0,
+                ),
+                1 => (
+                    *(src_p.offset(src_byte_off as isize) as *const i16) as f64,
+                    0.0,
+                ),
+                2 => (
+                    *(src_p.offset(src_byte_off as isize) as *const i32) as f64,
+                    0.0,
+                ),
+                3 => (
+                    *(src_p.offset(src_byte_off as isize) as *const i64) as f64,
+                    0.0,
+                ),
+                4 => (
+                    *(src_p.offset(src_byte_off as isize) as *const f32) as f64,
+                    0.0,
+                ),
+                5 => (*(src_p.offset(src_byte_off as isize) as *const f64), 0.0),
+                6 => {
+                    let p = src_p.offset(src_byte_off as isize) as *const f32;
+                    ((*p) as f64, (*p.add(1)) as f64)
+                }
+                7 => {
+                    let p = src_p.offset(src_byte_off as isize) as *const f64;
+                    (*p, *p.add(1))
+                }
                 _ => return,
             }
         };
         unsafe {
             match dest_kind_tag {
-                0 => *(dst_p.add(k) as *mut i8) = src_val_f64 as i8,
-                1 => *(dst_p.add(2 * k) as *mut i16) = src_val_f64 as i16,
-                2 => *(dst_p.add(4 * k) as *mut i32) = src_val_f64 as i32,
-                3 => *(dst_p.add(8 * k) as *mut i64) = src_val_f64 as i64,
-                4 => *(dst_p.add(4 * k) as *mut f32) = src_val_f64 as f32,
-                5 => *(dst_p.add(8 * k) as *mut f64) = src_val_f64,
+                0 => *(dst_p.add(k) as *mut i8) = src_re_f64 as i8,
+                1 => *(dst_p.add(2 * k) as *mut i16) = src_re_f64 as i16,
+                2 => *(dst_p.add(4 * k) as *mut i32) = src_re_f64 as i32,
+                3 => *(dst_p.add(8 * k) as *mut i64) = src_re_f64 as i64,
+                4 => *(dst_p.add(4 * k) as *mut f32) = src_re_f64 as f32,
+                5 => *(dst_p.add(8 * k) as *mut f64) = src_re_f64,
+                6 => {
+                    let p = dst_p.add(8 * k) as *mut f32;
+                    *p = src_re_f64 as f32;
+                    *p.add(1) = src_im_f64 as f32;
+                }
+                7 => {
+                    let p = dst_p.add(16 * k) as *mut f64;
+                    *p = src_re_f64;
+                    *p.add(1) = src_im_f64;
+                }
                 _ => return,
             }
         }
@@ -1843,6 +1965,23 @@ unsafe fn libc_free(ptr: *mut u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn i32_descriptor(data: &mut [i32], extents: &[i64]) -> ArrayDescriptor {
+        let mut desc = ArrayDescriptor::zeroed();
+        desc.base_addr = data.as_mut_ptr() as *mut u8;
+        desc.elem_size = 4;
+        desc.rank = extents.len() as i32;
+        let mut stride = 1;
+        for (i, extent) in extents.iter().copied().enumerate() {
+            desc.dims[i] = DimDescriptor {
+                lower_bound: 1,
+                upper_bound: extent,
+                stride,
+            };
+            stride *= extent.max(0);
+        }
+        desc
+    }
 
     #[test]
     fn allocate_1d() {
@@ -2020,6 +2159,46 @@ mod tests {
     }
 
     #[test]
+    fn reshape_order_permutation_reorders_result_slots() {
+        let mut source_data = [1, 2, 3, 4, 5, 6];
+        let mut shape_data = [3, 2];
+        let mut order_data = [2, 1];
+        let source = i32_descriptor(&mut source_data, &[6]);
+        let shape = i32_descriptor(&mut shape_data, &[2]);
+        let order = i32_descriptor(&mut order_data, &[2]);
+        let mut result = ArrayDescriptor::zeroed();
+
+        afs_array_reshape(&source, &shape, &order, ptr::null(), &mut result);
+
+        assert_eq!(result.rank, 2);
+        assert_eq!(result.dims[0].extent(), 3);
+        assert_eq!(result.dims[1].extent(), 2);
+        let got =
+            unsafe { core::slice::from_raw_parts(result.base_addr as *const i32, 6).to_vec() };
+        assert_eq!(got, vec![1, 3, 5, 2, 4, 6]);
+        afs_deallocate_array(&mut result, ptr::null_mut());
+    }
+
+    #[test]
+    fn reshape_invalid_order_falls_back_to_identity() {
+        let mut source_data: [i32; 24] = core::array::from_fn(|i| (i + 1) as i32);
+        let mut shape_data = [3, 2, 4];
+        let mut order_data = [1_808_443_440, 1, 3];
+        let source = i32_descriptor(&mut source_data, &[24]);
+        let shape = i32_descriptor(&mut shape_data, &[3]);
+        let order = i32_descriptor(&mut order_data, &[3]);
+        let mut result = ArrayDescriptor::zeroed();
+
+        afs_array_reshape(&source, &shape, &order, ptr::null(), &mut result);
+
+        assert_eq!(result.rank, 3);
+        let got =
+            unsafe { core::slice::from_raw_parts(result.base_addr as *const i32, 6).to_vec() };
+        assert_eq!(got, vec![1, 2, 3, 4, 5, 6]);
+        afs_deallocate_array(&mut result, ptr::null_mut());
+    }
+
+    #[test]
     fn assign_allocatable() {
         let mut source = ArrayDescriptor::zeroed();
         let mut dest = ArrayDescriptor::zeroed();
@@ -2133,6 +2312,73 @@ mod tests {
 
         afs_deallocate_array(&mut backing, ptr::null_mut());
         afs_deallocate_array(&mut dest, ptr::null_mut());
+    }
+
+    #[test]
+    fn assign_allocatable_self_section_snapshots_before_reallocate() {
+        let mut desc = ArrayDescriptor::zeroed();
+        let mut section = ArrayDescriptor::zeroed();
+
+        afs_allocate_1d(&mut desc, 4, 4);
+        unsafe {
+            let data = desc.base_addr as *mut i32;
+            *data.add(0) = 10;
+            *data.add(1) = 20;
+            *data.add(2) = 30;
+            *data.add(3) = 40;
+        }
+
+        let spec = SectionSpec {
+            start: 2,
+            end: 4,
+            stride: 1,
+        };
+        afs_create_section(&desc, &mut section, &spec, 1);
+
+        afs_assign_allocatable(&mut desc, &section);
+        assert!(desc.is_allocated());
+        assert_eq!(desc.total_elements(), 3);
+        unsafe {
+            let data = desc.base_addr as *const i32;
+            assert_eq!(*data.add(0), 20);
+            assert_eq!(*data.add(1), 30);
+            assert_eq!(*data.add(2), 40);
+        }
+
+        afs_deallocate_array(&mut desc, ptr::null_mut());
+    }
+
+    #[test]
+    fn assign_allocatable_negative_self_section_walks_stride() {
+        let mut desc = ArrayDescriptor::zeroed();
+        let mut section = ArrayDescriptor::zeroed();
+
+        afs_allocate_1d(&mut desc, 4, 4);
+        unsafe {
+            let data = desc.base_addr as *mut i32;
+            *data.add(0) = 10;
+            *data.add(1) = 20;
+            *data.add(2) = 30;
+            *data.add(3) = 40;
+        }
+
+        let spec = SectionSpec {
+            start: 4,
+            end: 1,
+            stride: -3,
+        };
+        afs_create_section(&desc, &mut section, &spec, 1);
+
+        afs_assign_allocatable(&mut desc, &section);
+        assert!(desc.is_allocated());
+        assert_eq!(desc.total_elements(), 2);
+        unsafe {
+            let data = desc.base_addr as *const i32;
+            assert_eq!(*data.add(0), 40);
+            assert_eq!(*data.add(1), 10);
+        }
+
+        afs_deallocate_array(&mut desc, ptr::null_mut());
     }
 
     #[test]
@@ -2578,6 +2824,132 @@ pub extern "C" fn afs_array_norm2_real4(desc: *const ArrayDescriptor) -> f32 {
     acc.sqrt() as f32
 }
 
+#[no_mangle]
+pub extern "C" fn afs_array_norm2_real8_dim(
+    src: *const ArrayDescriptor,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+) {
+    if src.is_null() || dst.is_null() || dim < 1 {
+        return;
+    }
+    let s = unsafe { &*src };
+    if s.base_addr.is_null() || dim as usize > s.rank as usize {
+        return;
+    }
+    let d = unsafe { &mut *dst };
+    if !d.is_allocated() {
+        let new_rank = (s.rank - 1).max(0);
+        let mut dim_buf: [DimDescriptor; 15] = [DimDescriptor {
+            lower_bound: 0,
+            upper_bound: 0,
+            stride: 0,
+        }; 15];
+        let mut k = 0usize;
+        let mut acc: i64 = 1;
+        for i in 0..s.rank as usize {
+            if i + 1 == dim as usize {
+                continue;
+            }
+            let extent = s.dims[i].extent();
+            dim_buf[k].lower_bound = 1;
+            dim_buf[k].upper_bound = extent;
+            dim_buf[k].stride = acc;
+            acc *= extent;
+            k += 1;
+        }
+        let dim_ptr = if new_rank > 0 {
+            dim_buf.as_ptr()
+        } else {
+            ptr::null()
+        };
+        let mut stat: i32 = 0;
+        afs_allocate_array(dst, 8, new_rank, dim_ptr, &mut stat);
+        if stat != 0 || d.base_addr.is_null() {
+            return;
+        }
+    }
+    let dst_total = d.total_elements() as usize;
+    let buf = d.base_addr as *mut f64;
+    for i in 0..dst_total {
+        unsafe {
+            *buf.add(i) = 0.0;
+        }
+    }
+    let src_ptr = s.base_addr as *const u8;
+    for_each_reduce_along_dim(s, dim, |byte_off, dst_flat| {
+        let v = unsafe { *(src_ptr.add(byte_off) as *const f64) };
+        unsafe {
+            *buf.add(dst_flat) += v * v;
+        }
+    });
+    for i in 0..dst_total {
+        unsafe {
+            *buf.add(i) = (*buf.add(i)).sqrt();
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_array_norm2_real4_dim(
+    src: *const ArrayDescriptor,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+) {
+    if src.is_null() || dst.is_null() || dim < 1 {
+        return;
+    }
+    let s = unsafe { &*src };
+    if s.base_addr.is_null() || dim as usize > s.rank as usize {
+        return;
+    }
+    let d = unsafe { &mut *dst };
+    if !d.is_allocated() {
+        let new_rank = (s.rank - 1).max(0);
+        let mut dim_buf: [DimDescriptor; 15] = [DimDescriptor {
+            lower_bound: 0,
+            upper_bound: 0,
+            stride: 0,
+        }; 15];
+        let mut k = 0usize;
+        let mut acc: i64 = 1;
+        for i in 0..s.rank as usize {
+            if i + 1 == dim as usize {
+                continue;
+            }
+            let extent = s.dims[i].extent();
+            dim_buf[k].lower_bound = 1;
+            dim_buf[k].upper_bound = extent;
+            dim_buf[k].stride = acc;
+            acc *= extent;
+            k += 1;
+        }
+        let dim_ptr = if new_rank > 0 {
+            dim_buf.as_ptr()
+        } else {
+            ptr::null()
+        };
+        let mut stat: i32 = 0;
+        afs_allocate_array(dst, 4, new_rank, dim_ptr, &mut stat);
+        if stat != 0 || d.base_addr.is_null() {
+            return;
+        }
+    }
+    let dst_total = d.total_elements() as usize;
+    let mut acc = vec![0.0_f64; dst_total];
+    let src_ptr = s.base_addr as *const u8;
+    for_each_reduce_along_dim(s, dim, |byte_off, dst_flat| {
+        let v = unsafe { *(src_ptr.add(byte_off) as *const f32) } as f64;
+        acc[dst_flat] += v * v;
+    });
+    let buf = d.base_addr as *mut f32;
+    for (i, value) in acc.into_iter().enumerate() {
+        unsafe {
+            *buf.add(i) = value.sqrt() as f32;
+        }
+    }
+}
+
 /// SUM(array) — sum all elements (real version).
 /// Dispatches on `elem_size` so real(4) and real(8) arrays both sum
 /// correctly. Returns f64 (callers downcast for real(4) destinations).
@@ -2870,6 +3242,134 @@ pub extern "C" fn afs_array_sum_int_dim(
     }
 }
 
+/// SUM(array, DIM=k) for complex(4). Auto-allocates `dst` to rank N-1
+/// and writes interleaved real/imag f32 lanes.
+#[no_mangle]
+pub extern "C" fn afs_array_sum_complex4_dim(
+    src: *const ArrayDescriptor,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+) {
+    if src.is_null() || dst.is_null() {
+        return;
+    }
+    let s = unsafe { &*src };
+    let d = unsafe { &mut *dst };
+    if s.base_addr.is_null() {
+        return;
+    }
+    if !d.is_allocated() {
+        let new_rank = (s.rank - 1).max(0);
+        let mut dim_buf: [DimDescriptor; 15] = [DimDescriptor {
+            lower_bound: 0,
+            upper_bound: 0,
+            stride: 0,
+        }; 15];
+        let mut k = 0usize;
+        let mut acc: i64 = 1;
+        for i in 0..s.rank as usize {
+            if i + 1 == dim as usize {
+                continue;
+            }
+            let extent = s.dims[i].extent();
+            dim_buf[k].lower_bound = 1;
+            dim_buf[k].upper_bound = extent;
+            dim_buf[k].stride = acc;
+            acc *= extent;
+            k += 1;
+        }
+        let dim_ptr = if new_rank > 0 {
+            dim_buf.as_ptr()
+        } else {
+            ptr::null()
+        };
+        let mut stat: i32 = 0;
+        afs_allocate_array(dst, s.elem_size, new_rank, dim_ptr, &mut stat);
+        if stat != 0 || d.base_addr.is_null() {
+            return;
+        }
+    }
+    let dst_total = d.total_elements() as usize;
+    let buf = d.base_addr as *mut f32;
+    for i in 0..(dst_total * 2) {
+        unsafe {
+            *buf.add(i) = 0.0;
+        }
+    }
+    let src_ptr = s.base_addr as *const u8;
+    for_each_reduce_along_dim(s, dim, |byte_off, dst_flat| {
+        let p = unsafe { src_ptr.add(byte_off) as *const f32 };
+        unsafe {
+            *buf.add(dst_flat * 2) += *p.add(0);
+            *buf.add(dst_flat * 2 + 1) += *p.add(1);
+        }
+    });
+}
+
+/// SUM(array, DIM=k) for complex(8). Auto-allocates `dst` to rank N-1
+/// and writes interleaved real/imag f64 lanes.
+#[no_mangle]
+pub extern "C" fn afs_array_sum_complex8_dim(
+    src: *const ArrayDescriptor,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+) {
+    if src.is_null() || dst.is_null() {
+        return;
+    }
+    let s = unsafe { &*src };
+    let d = unsafe { &mut *dst };
+    if s.base_addr.is_null() {
+        return;
+    }
+    if !d.is_allocated() {
+        let new_rank = (s.rank - 1).max(0);
+        let mut dim_buf: [DimDescriptor; 15] = [DimDescriptor {
+            lower_bound: 0,
+            upper_bound: 0,
+            stride: 0,
+        }; 15];
+        let mut k = 0usize;
+        let mut acc: i64 = 1;
+        for i in 0..s.rank as usize {
+            if i + 1 == dim as usize {
+                continue;
+            }
+            let extent = s.dims[i].extent();
+            dim_buf[k].lower_bound = 1;
+            dim_buf[k].upper_bound = extent;
+            dim_buf[k].stride = acc;
+            acc *= extent;
+            k += 1;
+        }
+        let dim_ptr = if new_rank > 0 {
+            dim_buf.as_ptr()
+        } else {
+            ptr::null()
+        };
+        let mut stat: i32 = 0;
+        afs_allocate_array(dst, s.elem_size, new_rank, dim_ptr, &mut stat);
+        if stat != 0 || d.base_addr.is_null() {
+            return;
+        }
+    }
+    let dst_total = d.total_elements() as usize;
+    let buf = d.base_addr as *mut f64;
+    for i in 0..(dst_total * 2) {
+        unsafe {
+            *buf.add(i) = 0.0;
+        }
+    }
+    let src_ptr = s.base_addr as *const u8;
+    for_each_reduce_along_dim(s, dim, |byte_off, dst_flat| {
+        let p = unsafe { src_ptr.add(byte_off) as *const f64 };
+        unsafe {
+            *buf.add(dst_flat * 2) += *p.add(0);
+            *buf.add(dst_flat * 2 + 1) += *p.add(1);
+        }
+    });
+}
+
 /// Walk every source element along all dims (column-major), invoking
 /// `accum(src_byte_off, mask_byte_off, dst_flat)` so the caller can
 /// honor both the source's and the mask's per-dim strides without
@@ -3115,6 +3615,140 @@ pub extern "C" fn afs_array_sum_int_dim_mask(
     }
 }
 
+/// SUM(array, DIM=k, MASK=mask) for complex(4).
+#[no_mangle]
+pub extern "C" fn afs_array_sum_complex4_dim_mask(
+    src: *const ArrayDescriptor,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+) {
+    if src.is_null() || dst.is_null() || mask.is_null() {
+        return;
+    }
+    let s = unsafe { &*src };
+    let d = unsafe { &mut *dst };
+    let m = unsafe { &*mask };
+    if s.base_addr.is_null() || m.base_addr.is_null() {
+        return;
+    }
+    if !d.is_allocated() {
+        let new_rank = (s.rank - 1).max(0);
+        let mut dim_buf: [DimDescriptor; 15] = [DimDescriptor {
+            lower_bound: 0,
+            upper_bound: 0,
+            stride: 0,
+        }; 15];
+        let mut k = 0usize;
+        let mut acc: i64 = 1;
+        for i in 0..s.rank as usize {
+            if i + 1 == dim as usize {
+                continue;
+            }
+            let extent = s.dims[i].extent();
+            dim_buf[k].lower_bound = 1;
+            dim_buf[k].upper_bound = extent;
+            dim_buf[k].stride = acc;
+            acc *= extent;
+            k += 1;
+        }
+        let dim_ptr = if new_rank > 0 {
+            dim_buf.as_ptr()
+        } else {
+            ptr::null()
+        };
+        let mut stat: i32 = 0;
+        afs_allocate_array(dst, s.elem_size, new_rank, dim_ptr, &mut stat);
+        if stat != 0 || d.base_addr.is_null() {
+            return;
+        }
+    }
+    let dst_total = d.total_elements() as usize;
+    let buf = d.base_addr as *mut f32;
+    for i in 0..(dst_total * 2) {
+        unsafe {
+            *buf.add(i) = 0.0;
+        }
+    }
+    let src_ptr = s.base_addr as *const u8;
+    for_each_reduce_along_dim_with_mask(s, m, dim, |sb, mb, df| {
+        if unsafe { mask_byte_is_true(m, mb) } {
+            let p = unsafe { src_ptr.add(sb) as *const f32 };
+            unsafe {
+                *buf.add(df * 2) += *p.add(0);
+                *buf.add(df * 2 + 1) += *p.add(1);
+            }
+        }
+    });
+}
+
+/// SUM(array, DIM=k, MASK=mask) for complex(8).
+#[no_mangle]
+pub extern "C" fn afs_array_sum_complex8_dim_mask(
+    src: *const ArrayDescriptor,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+) {
+    if src.is_null() || dst.is_null() || mask.is_null() {
+        return;
+    }
+    let s = unsafe { &*src };
+    let d = unsafe { &mut *dst };
+    let m = unsafe { &*mask };
+    if s.base_addr.is_null() || m.base_addr.is_null() {
+        return;
+    }
+    if !d.is_allocated() {
+        let new_rank = (s.rank - 1).max(0);
+        let mut dim_buf: [DimDescriptor; 15] = [DimDescriptor {
+            lower_bound: 0,
+            upper_bound: 0,
+            stride: 0,
+        }; 15];
+        let mut k = 0usize;
+        let mut acc: i64 = 1;
+        for i in 0..s.rank as usize {
+            if i + 1 == dim as usize {
+                continue;
+            }
+            let extent = s.dims[i].extent();
+            dim_buf[k].lower_bound = 1;
+            dim_buf[k].upper_bound = extent;
+            dim_buf[k].stride = acc;
+            acc *= extent;
+            k += 1;
+        }
+        let dim_ptr = if new_rank > 0 {
+            dim_buf.as_ptr()
+        } else {
+            ptr::null()
+        };
+        let mut stat: i32 = 0;
+        afs_allocate_array(dst, s.elem_size, new_rank, dim_ptr, &mut stat);
+        if stat != 0 || d.base_addr.is_null() {
+            return;
+        }
+    }
+    let dst_total = d.total_elements() as usize;
+    let buf = d.base_addr as *mut f64;
+    for i in 0..(dst_total * 2) {
+        unsafe {
+            *buf.add(i) = 0.0;
+        }
+    }
+    let src_ptr = s.base_addr as *const u8;
+    for_each_reduce_along_dim_with_mask(s, m, dim, |sb, mb, df| {
+        if unsafe { mask_byte_is_true(m, mb) } {
+            let p = unsafe { src_ptr.add(sb) as *const f64 };
+            unsafe {
+                *buf.add(df * 2) += *p.add(0);
+                *buf.add(df * 2 + 1) += *p.add(1);
+            }
+        }
+    });
+}
+
 /// SUM(array) — sum all elements (integer version).
 /// Dispatches on `elem_size` so integer(1/2/4/8) arrays all sum correctly.
 /// Respects strides for non-contiguous sections.
@@ -3157,6 +3791,143 @@ pub extern "C" fn afs_array_sum_int(desc: *const ArrayDescriptor) -> i64 {
         }
     }
     sum
+}
+
+fn for_each_element_byte_offset<F: FnMut(usize)>(desc: &ArrayDescriptor, mut f: F) {
+    let rank = desc.rank as usize;
+    if rank == 0 {
+        return;
+    }
+    let mut extents: [i64; 15] = [0; 15];
+    let mut strides: [i64; 15] = [0; 15];
+    let mut total = 1i64;
+    for i in 0..rank {
+        extents[i] = desc.dims[i].extent();
+        if extents[i] <= 0 {
+            return;
+        }
+        strides[i] = desc.dims[i].stride.max(1);
+        total *= extents[i];
+    }
+
+    let mut idx: [i64; 15] = [0; 15];
+    for _ in 0..total {
+        let mut byte_off = 0i64;
+        for d in 0..rank {
+            byte_off += idx[d] * strides[d] * desc.elem_size;
+        }
+        f(byte_off as usize);
+
+        for d in 0..rank {
+            idx[d] += 1;
+            if idx[d] < extents[d] {
+                break;
+            }
+            idx[d] = 0;
+        }
+    }
+}
+
+fn for_each_element_byte_offset_with_mask<F: FnMut(usize)>(
+    desc: &ArrayDescriptor,
+    mask: &ArrayDescriptor,
+    mut f: F,
+) {
+    let rank = desc.rank as usize;
+    if rank == 0 {
+        return;
+    }
+    let mut extents: [i64; 15] = [0; 15];
+    let mut s_strides: [i64; 15] = [0; 15];
+    let mut m_strides: [i64; 15] = [0; 15];
+    let mut total = 1i64;
+    for i in 0..rank {
+        extents[i] = desc.dims[i].extent();
+        if extents[i] <= 0 {
+            return;
+        }
+        s_strides[i] = desc.dims[i].stride.max(1);
+        m_strides[i] = if (i as i32) < mask.rank {
+            mask.dims[i].stride.max(1)
+        } else {
+            1
+        };
+        total *= extents[i];
+    }
+
+    let mut idx: [i64; 15] = [0; 15];
+    let mask_elem = mask.elem_size.max(1);
+    for _ in 0..total {
+        let mut s_byte_off = 0i64;
+        let mut m_byte_off = 0i64;
+        for d in 0..rank {
+            s_byte_off += idx[d] * s_strides[d] * desc.elem_size;
+            m_byte_off += idx[d] * m_strides[d] * mask_elem;
+        }
+        if unsafe { mask_byte_is_true(mask, m_byte_off as usize) } {
+            f(s_byte_off as usize);
+        }
+
+        for d in 0..rank {
+            idx[d] += 1;
+            if idx[d] < extents[d] {
+                break;
+            }
+            idx[d] = 0;
+        }
+    }
+}
+
+/// SUM(array) for complex(4). The result is written to `out` as
+/// `[real, imag]`.
+#[no_mangle]
+pub extern "C" fn afs_array_sum_complex4(out: *mut f32, desc: *const ArrayDescriptor) {
+    if out.is_null() {
+        return;
+    }
+    unsafe {
+        *out.add(0) = 0.0;
+        *out.add(1) = 0.0;
+    }
+    if desc.is_null() {
+        return;
+    }
+    let d = unsafe { &*desc };
+    if d.base_addr.is_null() {
+        return;
+    }
+    let src = d.base_addr as *const u8;
+    for_each_element_byte_offset(d, |byte_off| unsafe {
+        let p = src.add(byte_off) as *const f32;
+        *out.add(0) += *p.add(0);
+        *out.add(1) += *p.add(1);
+    });
+}
+
+/// SUM(array) for complex(8). The result is written to `out` as
+/// `[real, imag]`.
+#[no_mangle]
+pub extern "C" fn afs_array_sum_complex8(out: *mut f64, desc: *const ArrayDescriptor) {
+    if out.is_null() {
+        return;
+    }
+    unsafe {
+        *out.add(0) = 0.0;
+        *out.add(1) = 0.0;
+    }
+    if desc.is_null() {
+        return;
+    }
+    let d = unsafe { &*desc };
+    if d.base_addr.is_null() {
+        return;
+    }
+    let src = d.base_addr as *const u8;
+    for_each_element_byte_offset(d, |byte_off| unsafe {
+        let p = src.add(byte_off) as *const f64;
+        *out.add(0) += *p.add(0);
+        *out.add(1) += *p.add(1);
+    });
 }
 
 /// Read one logical element from `mask` at logical index `i` (zero-based)
@@ -3249,6 +4020,66 @@ pub extern "C" fn afs_array_sum_int_mask(
         _ => sum_kind!(i32),
     }
     sum
+}
+
+/// SUM(array, mask=mask) for complex(4).
+#[no_mangle]
+pub extern "C" fn afs_array_sum_complex4_mask(
+    out: *mut f32,
+    desc: *const ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+) {
+    if out.is_null() {
+        return;
+    }
+    unsafe {
+        *out.add(0) = 0.0;
+        *out.add(1) = 0.0;
+    }
+    if desc.is_null() || mask.is_null() {
+        return;
+    }
+    let d = unsafe { &*desc };
+    let m = unsafe { &*mask };
+    if d.base_addr.is_null() || m.base_addr.is_null() {
+        return;
+    }
+    let src = d.base_addr as *const u8;
+    for_each_element_byte_offset_with_mask(d, m, |byte_off| unsafe {
+        let p = src.add(byte_off) as *const f32;
+        *out.add(0) += *p.add(0);
+        *out.add(1) += *p.add(1);
+    });
+}
+
+/// SUM(array, mask=mask) for complex(8).
+#[no_mangle]
+pub extern "C" fn afs_array_sum_complex8_mask(
+    out: *mut f64,
+    desc: *const ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+) {
+    if out.is_null() {
+        return;
+    }
+    unsafe {
+        *out.add(0) = 0.0;
+        *out.add(1) = 0.0;
+    }
+    if desc.is_null() || mask.is_null() {
+        return;
+    }
+    let d = unsafe { &*desc };
+    let m = unsafe { &*mask };
+    if d.base_addr.is_null() || m.base_addr.is_null() {
+        return;
+    }
+    let src = d.base_addr as *const u8;
+    for_each_element_byte_offset_with_mask(d, m, |byte_off| unsafe {
+        let p = src.add(byte_off) as *const f64;
+        *out.add(0) += *p.add(0);
+        *out.add(1) += *p.add(1);
+    });
 }
 
 /// PRODUCT(array) — product of all elements (real version).
@@ -4502,13 +5333,16 @@ pub extern "C" fn afs_array_abs_complex(
 /// inputs (real(sp) ↔ real(dp)) by reading the per-side elem_size.
 ///
 /// `out_lane_bytes` is 4 (single) or 8 (double); result elem_size is
-/// `2 * out_lane_bytes`.
+/// `2 * out_lane_bytes`. Kind tags match afs_assign_allocatable_convert:
+/// 0=i8, 1=i16, 2=i32, 3=i64, 4=f32, 5=f64, 6=complex(f32), 7=complex(f64).
 #[no_mangle]
 pub extern "C" fn afs_array_cmplx(
     re_source: *const ArrayDescriptor,
     im_source: *const ArrayDescriptor,
     out_lane_bytes: i32,
     result: *mut ArrayDescriptor,
+    re_kind_tag: i32,
+    im_kind_tag: i32,
 ) {
     if re_source.is_null() || result.is_null() {
         return;
@@ -4546,31 +5380,64 @@ pub extern "C" fn afs_array_cmplx(
 
     let res = unsafe { &mut *result };
     let total = re.total_elements() as usize;
-    let re_elem = re.elem_size.max(1) as usize;
-    let im_elem = im_opt.map(|im| im.elem_size.max(1) as usize).unwrap_or(0);
+    let kind_elem_size = |tag: i32, fallback: i64| -> usize {
+        match tag {
+            0 => 1,
+            1 => 2,
+            2 | 4 => 4,
+            3 | 5 => 8,
+            6 => 8,
+            7 => 16,
+            _ => fallback.max(1) as usize,
+        }
+    };
+    let re_elem = kind_elem_size(re_kind_tag, re.elem_size);
+    let im_elem = im_opt
+        .map(|im| kind_elem_size(im_kind_tag, im.elem_size))
+        .unwrap_or(0);
     let re_buf = re.base_addr as *const u8;
     let im_buf = im_opt
         .map(|im| im.base_addr as *const u8)
         .unwrap_or(ptr::null());
     let rp_buf = res.base_addr;
+    let read_numeric_lane = |buf: *const u8, off: usize, tag: i32, elem: usize| -> f64 {
+        unsafe {
+            match tag {
+                0 => *(buf.add(off) as *const i8) as f64,
+                1 => *(buf.add(off) as *const i16) as f64,
+                2 => *(buf.add(off) as *const i32) as f64,
+                3 => *(buf.add(off) as *const i64) as f64,
+                4 => *(buf.add(off) as *const f32) as f64,
+                5 => *(buf.add(off) as *const f64),
+                6 => *(buf.add(off) as *const f32) as f64,
+                7 => *(buf.add(off) as *const f64),
+                _ => match elem {
+                    4 => *(buf.add(off) as *const f32) as f64,
+                    8 => *(buf.add(off) as *const f64),
+                    _ => 0.0,
+                },
+            }
+        }
+    };
+    let read_complex_imag_lane = |buf: *const u8, off: usize, tag: i32| -> f64 {
+        unsafe {
+            match tag {
+                6 => *(buf.add(off + 4) as *const f32) as f64,
+                7 => *(buf.add(off + 8) as *const f64),
+                _ => 0.0,
+            }
+        }
+    };
     for i in 0..total {
         let dst_off = i * elem_size;
         unsafe {
-            // Read real lane as f64 from source kind.
-            let r_val: f64 = match re_elem {
-                4 => *(re_buf.add(i * 4) as *const f32) as f64,
-                8 => *(re_buf.add(i * 8) as *const f64),
-                _ => 0.0,
-            };
+            let re_off = i * re_elem;
+            let r_val = read_numeric_lane(re_buf, re_off, re_kind_tag, re_elem);
             // Read imag lane (zero when source absent).
             let i_val: f64 = if im_buf.is_null() {
-                0.0
+                read_complex_imag_lane(re_buf, re_off, re_kind_tag)
             } else {
-                match im_elem {
-                    4 => *(im_buf.add(i * 4) as *const f32) as f64,
-                    8 => *(im_buf.add(i * 8) as *const f64),
-                    _ => 0.0,
-                }
+                read_numeric_lane(im_buf, i * im_elem, im_kind_tag, im_elem)
             };
             // Write per result kind.
             match lane {
@@ -4694,6 +5561,75 @@ pub extern "C" fn afs_array_pack(
     }
 }
 
+/// F2018 §16.9.194 UNPACK(VECTOR, MASK, FIELD).
+///
+/// Allocates `result` with MASK's shape and VECTOR's element size.
+/// Elements whose mask is true are copied from VECTOR in order; false
+/// elements are copied from FIELD at the same flat array position.
+#[no_mangle]
+pub extern "C" fn afs_array_unpack(
+    vector: *const ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+    field: *const ArrayDescriptor,
+    result: *mut ArrayDescriptor,
+) {
+    if vector.is_null() || mask.is_null() || field.is_null() || result.is_null() {
+        return;
+    }
+    let vec = unsafe { &*vector };
+    let msk = unsafe { &*mask };
+    let fld = unsafe { &*field };
+    if vec.base_addr.is_null() || msk.base_addr.is_null() || fld.base_addr.is_null() {
+        return;
+    }
+
+    let elem_size = vec.elem_size.max(1) as usize;
+    let mut stat = 0i32;
+    afs_allocate_like_with_elem_size(result, mask, elem_size as i64, &mut stat as *mut i32);
+    if stat != 0 {
+        return;
+    }
+    let res = unsafe { &mut *result };
+    if res.base_addr.is_null() {
+        return;
+    }
+
+    let total = msk.total_elements().max(0) as usize;
+    let vec_total = vec.total_elements().max(0) as usize;
+    let field_total = fld.total_elements().max(0) as usize;
+    let mask_elem = msk.elem_size.max(1) as usize;
+    let field_elem = fld.elem_size.max(1) as usize;
+    let vp = vec.base_addr as *const u8;
+    let fp = fld.base_addr as *const u8;
+    let rp = res.base_addr;
+    let mut vec_idx = 0usize;
+
+    for i in 0..total {
+        let dest = unsafe { rp.add(i * elem_size) };
+        let take_vector = unsafe { mask_byte_is_true(msk, i * mask_elem) };
+        if take_vector {
+            if vec_idx < vec_total {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(vp.add(vec_idx * elem_size), dest, elem_size);
+                }
+            } else {
+                unsafe {
+                    core::ptr::write_bytes(dest, 0, elem_size);
+                }
+            }
+            vec_idx += 1;
+        } else if i < field_total {
+            unsafe {
+                core::ptr::copy_nonoverlapping(fp.add(i * field_elem), dest, elem_size);
+            }
+        } else {
+            unsafe {
+                core::ptr::write_bytes(dest, 0, elem_size);
+            }
+        }
+    }
+}
+
 /// F2018 §16.9.163: RESHAPE(SOURCE, SHAPE [, PAD, ORDER]).
 ///
 /// Allocates a fresh result descriptor of rank = size(shape) and
@@ -4771,21 +5707,42 @@ pub extern "C" fn afs_array_reshape(
     let src_total = src.total_elements() as usize;
     let elem_size_usize = elem_size as usize;
 
-    // Read order (identity if absent).
+    // Read order (identity if absent or invalid). ORDER must be a
+    // permutation of 1..rank; never let malformed data index the fixed
+    // descriptor arrays.
     let mut order_perm: [usize; MAX_RANK] = [0; MAX_RANK];
+    for (i, slot) in order_perm.iter_mut().enumerate().take(rank) {
+        *slot = i;
+    }
     let order_present = !order.is_null() && unsafe { (*order).rank > 0 };
     if order_present {
         let ord = unsafe { &*order };
-        let ord_buf = ord.base_addr as *const u8;
-        let ord_elem = ord.elem_size.max(1) as usize;
-        let ord_count = ord.total_elements() as usize;
-        for (i, slot) in order_perm.iter_mut().enumerate().take(rank.min(ord_count)) {
-            // Convert from 1-based Fortran to 0-based.
-            *slot = (read_int_at(ord_buf, i, ord_elem) - 1).max(0) as usize;
-        }
-    } else {
-        for (i, slot) in order_perm.iter_mut().enumerate().take(rank) {
-            *slot = i;
+        if !ord.base_addr.is_null() {
+            let ord_buf = ord.base_addr as *const u8;
+            let ord_elem = ord.elem_size.max(1) as usize;
+            let ord_count = ord.total_elements() as usize;
+            let mut candidate: [usize; MAX_RANK] = [0; MAX_RANK];
+            let mut seen: [bool; MAX_RANK] = [false; MAX_RANK];
+            let mut valid = ord_count >= rank;
+            if valid {
+                for (i, slot) in candidate.iter_mut().enumerate().take(rank) {
+                    let raw = read_int_at(ord_buf, i, ord_elem);
+                    if raw < 1 || raw as usize > rank {
+                        valid = false;
+                        break;
+                    }
+                    let dim = (raw - 1) as usize;
+                    if seen[dim] {
+                        valid = false;
+                        break;
+                    }
+                    seen[dim] = true;
+                    *slot = dim;
+                }
+            }
+            if valid {
+                order_perm[..rank].copy_from_slice(&candidate[..rank]);
+            }
         }
     }
 
@@ -4901,6 +5858,98 @@ pub extern "C" fn afs_dot_product_real4(
         dot += unsafe { *pa.add(i * stride_a) * *pb.add(i * stride_b) };
     }
     dot
+}
+
+/// DOT_PRODUCT(a, b) — vector dot product (complex(real32) version).
+/// Fortran conjugates the first complex vector argument.
+#[no_mangle]
+pub extern "C" fn afs_dot_product_complex4(
+    a: *const ArrayDescriptor,
+    b: *const ArrayDescriptor,
+    out: *mut f32,
+) {
+    if out.is_null() {
+        return;
+    }
+    unsafe {
+        *out = 0.0;
+        *out.add(1) = 0.0;
+    }
+    if a.is_null() || b.is_null() {
+        return;
+    }
+    let da = unsafe { &*a };
+    let db = unsafe { &*b };
+    if da.base_addr.is_null() || db.base_addr.is_null() {
+        return;
+    }
+    let n = da.dims[0].extent().min(db.dims[0].extent()) as usize;
+    let stride_a = da.dims[0].stride.max(1) as usize;
+    let stride_b = db.dims[0].stride.max(1) as usize;
+    let elem_a = da.elem_size.max(8) as usize;
+    let elem_b = db.elem_size.max(8) as usize;
+    let mut re = 0.0f32;
+    let mut im = 0.0f32;
+    for i in 0..n {
+        let pa = unsafe { da.base_addr.add(i * stride_a * elem_a) as *const f32 };
+        let pb = unsafe { db.base_addr.add(i * stride_b * elem_b) as *const f32 };
+        let ar = unsafe { *pa };
+        let ai = unsafe { *pa.add(1) };
+        let br = unsafe { *pb };
+        let bi = unsafe { *pb.add(1) };
+        re += ar * br + ai * bi;
+        im += ar * bi - ai * br;
+    }
+    unsafe {
+        *out = re;
+        *out.add(1) = im;
+    }
+}
+
+/// DOT_PRODUCT(a, b) — vector dot product (complex(real64) version).
+/// Fortran conjugates the first complex vector argument.
+#[no_mangle]
+pub extern "C" fn afs_dot_product_complex8(
+    a: *const ArrayDescriptor,
+    b: *const ArrayDescriptor,
+    out: *mut f64,
+) {
+    if out.is_null() {
+        return;
+    }
+    unsafe {
+        *out = 0.0;
+        *out.add(1) = 0.0;
+    }
+    if a.is_null() || b.is_null() {
+        return;
+    }
+    let da = unsafe { &*a };
+    let db = unsafe { &*b };
+    if da.base_addr.is_null() || db.base_addr.is_null() {
+        return;
+    }
+    let n = da.dims[0].extent().min(db.dims[0].extent()) as usize;
+    let stride_a = da.dims[0].stride.max(1) as usize;
+    let stride_b = db.dims[0].stride.max(1) as usize;
+    let elem_a = da.elem_size.max(16) as usize;
+    let elem_b = db.elem_size.max(16) as usize;
+    let mut re = 0.0f64;
+    let mut im = 0.0f64;
+    for i in 0..n {
+        let pa = unsafe { da.base_addr.add(i * stride_a * elem_a) as *const f64 };
+        let pb = unsafe { db.base_addr.add(i * stride_b * elem_b) as *const f64 };
+        let ar = unsafe { *pa };
+        let ai = unsafe { *pa.add(1) };
+        let br = unsafe { *pb };
+        let bi = unsafe { *pb.add(1) };
+        re += ar * br + ai * bi;
+        im += ar * bi - ai * br;
+    }
+    unsafe {
+        *out = re;
+        *out.add(1) = im;
+    }
 }
 
 /// DOT_PRODUCT(a, b) — vector dot product (integer(4) version).

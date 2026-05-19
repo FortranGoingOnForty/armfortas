@@ -75,6 +75,18 @@ pub(super) fn process_uses(
                     }
                 } else {
                     // USE without ONLY: import all public symbols.
+                    //
+                    // Keep a bare module edge even when the producer has no
+                    // local symbols. Empty façade modules such as
+                    // stdlib_sparse re-export through their USE chain; without
+                    // this edge the consumer has no source scope to walk.
+                    st.add_use_association(UseAssociation {
+                        local_name: String::new(),
+                        original_name: String::new(),
+                        source_scope: mod_scope,
+                        is_submodule_access: false,
+                        from_bare_use: true,
+                    });
                     let mod_symbols: Vec<(String, String)> = st
                         .scope(mod_scope)
                         .symbols
@@ -214,7 +226,6 @@ pub(super) fn preload_stmt_uses(
     }
 }
 
-
 /// Try to load a module interface from an .amod file on the search path.
 /// Creates a synthetic module scope in the symbol table and returns its ID.
 pub(super) fn load_external_module(
@@ -264,6 +275,13 @@ pub(super) fn load_external_module(
             .or_else(|| load_external_module(st, dep, search_paths, type_layouts));
         if let Some(dep_scope) = dep_scope {
             st.enter_scope(scope_id);
+            st.add_use_association(crate::sema::symtab::UseAssociation {
+                local_name: String::new(),
+                original_name: String::new(),
+                source_scope: dep_scope,
+                is_submodule_access: false,
+                from_bare_use: true,
+            });
             // Re-export every public symbol of the dep by name, like
             // a bare `use <dep>` in source. The transitive lookup in
             // SymbolTable::lookup_in_guarded handles onward chaining.
@@ -295,9 +313,9 @@ pub(super) fn load_external_module(
     // :: dummy` falls back to default kind=4 and silently truncates a
     // 64-bit local to 32 bits.
     for rename in &iface.renames {
-        let src_scope = st
-            .find_module_scope(&rename.source_module)
-            .or_else(|| load_external_module(st, &rename.source_module, search_paths, type_layouts));
+        let src_scope = st.find_module_scope(&rename.source_module).or_else(|| {
+            load_external_module(st, &rename.source_module, search_paths, type_layouts)
+        });
         let Some(src_scope) = src_scope else {
             continue;
         };
@@ -466,9 +484,7 @@ pub(super) fn load_external_module(
         // and reject `allocate(result(...))`. Use a doubly-underscored
         // synth name so SMP-body synthesis can find it (via the body
         // scope after sema injection) but no user code can collide.
-        if matches!(proc.kind, crate::sema::symtab::SymbolKind::Function)
-            && proc.result_rank > 0
-        {
+        if matches!(proc.kind, crate::sema::symtab::SymbolKind::Function) && proc.result_rank > 0 {
             let synth_name = format!(
                 "__amod_result_{}",
                 proc.result_name.as_deref().unwrap_or(&proc.name)

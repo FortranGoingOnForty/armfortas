@@ -3029,6 +3029,393 @@ fn repro_checks_allow_hello_stage_repro() {
 }
 
 #[test]
+fn scalar_real_array_integer_bulk_fill_fixture_passes_at_o0() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("scalar_real_array_integer_bulk_fill.f90");
+    assert!(
+        source.exists(),
+        "scalar_real_array_integer_bulk_fill.f90 missing"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "scalar_real_array_integer_bulk_fill.f90 should pass at -O0, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn complex_section_assign_preserves_imag_fixture_passes_at_o0() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("complex_section_assign_preserves_imag.f90");
+    assert!(
+        source.exists(),
+        "complex_section_assign_preserves_imag.f90 missing"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "complex_section_assign_preserves_imag.f90 should pass at -O0, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn procedure_dummy_interface_scope_hidden_lengths_fixture_passes_at_o0() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("procedure_dummy_interface_scope_hidden_lengths.f90");
+    assert!(
+        source.exists(),
+        "procedure_dummy_interface_scope_hidden_lengths.f90 missing"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "procedure_dummy_interface_scope_hidden_lengths.f90 should pass at -O0, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn parenthesized_concat_char_actual_fixture_passes_at_o0() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("parenthesized_concat_char_actual.f90");
+    assert!(
+        source.exists(),
+        "parenthesized_concat_char_actual.f90 missing"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "parenthesized_concat_char_actual.f90 should pass at -O0, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn defined_assignment_logical_kind_allocatable_fixture_passes_at_o0() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("defined_assignment_logical_kind_allocatable.f90");
+    assert!(
+        source.exists(),
+        "defined_assignment_logical_kind_allocatable.f90 missing"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "defined_assignment_logical_kind_allocatable.f90 should pass at -O0, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn host_assumed_len_closure_forward_fixture_passes_at_o0() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("host_assumed_len_closure_forward.f90");
+    assert!(
+        source.exists(),
+        "host_assumed_len_closure_forward.f90 missing"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "host_assumed_len_closure_forward.f90 should pass at -O0, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn merge_scalar_sources_array_mask_fixture_passes_at_o0() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("merge_scalar_sources_array_mask.f90");
+    assert!(
+        source.exists(),
+        "merge_scalar_sources_array_mask.f90 missing"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "merge_scalar_sources_array_mask.f90 should pass at -O0, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn complex_merge_element_zero_fixture_passes_at_o0() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("complex_merge_element_zero.f90");
+    assert!(source.exists(), "complex_merge_element_zero.f90 missing");
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "complex_merge_element_zero.f90 should pass at -O0, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn format_g0_nonfinite_fixture_passes_at_o0() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("format_g0_nonfinite.f90");
+    assert!(source.exists(), "format_g0_nonfinite.f90 missing");
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "format_g0_nonfinite.f90 should pass at -O0, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn formatted_write_g0_iostat_fixture_passes_at_o0() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("formatted_write_g0_iostat.f90");
+    assert!(source.exists(), "formatted_write_g0_iostat.f90 missing");
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "formatted_write_g0_iostat.f90 should pass at -O0, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn generic_private_rename_derived_result_fixture_passes_at_o0() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("generic_private_rename_derived_result.f90");
+    assert!(
+        source.exists(),
+        "generic_private_rename_derived_result.f90 missing"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "generic_private_rename_derived_result.f90 should pass at -O0, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn elemental_generic_array_expr_actual_fixture_passes_at_o0() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("elemental_generic_array_expr_actual.f90");
+    assert!(
+        source.exists(),
+        "elemental_generic_array_expr_actual.f90 missing"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "elemental_generic_array_expr_actual.f90 should pass at -O0, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn submodule_use_generic_sqrt_diag_fixture_passes_at_o0() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("submodule_use_generic_sqrt_diag.f90");
+    assert!(
+        source.exists(),
+        "submodule_use_generic_sqrt_diag.f90 missing"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "submodule_use_generic_sqrt_diag.f90 should pass at -O0, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn block_use_generic_string_function_fixture_passes_at_o0() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("block_use_generic_string_function.f90");
+    assert!(
+        source.exists(),
+        "block_use_generic_string_function.f90 missing"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "block_use_generic_string_function.f90 should pass at -O0, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn generic_len_result_character_fixture_passes_at_o0() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("generic_len_result_character.f90");
+    assert!(source.exists(), "generic_len_result_character.f90 missing");
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "generic_len_result_character.f90 should pass at -O0, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn list_directed_real_implicit_exponent_fixture_passes_at_o0() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("list_directed_real_implicit_exponent.f90");
+    assert!(
+        source.exists(),
+        "list_directed_real_implicit_exponent.f90 missing"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "list_directed_real_implicit_exponent.f90 should pass at -O0, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn complex_abs_array_scalar_compare_fixture_passes_at_o0() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("complex_abs_array_scalar_compare.f90");
+    assert!(
+        source.exists(),
+        "complex_abs_array_scalar_compare.f90 missing"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "complex_abs_array_scalar_compare.f90 should pass at -O0, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn assumed_size_param_constructor_pack_fixture_passes_at_o0() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("assumed_size_param_constructor_pack.f90");
+    assert!(
+        source.exists(),
+        "assumed_size_param_constructor_pack.f90 missing"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "assumed_size_param_constructor_pack.f90 should pass at -O0, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn fixed_char_alloc_array_constructor_len_fixture_passes_at_o0() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("fixed_char_alloc_array_constructor_len.f90");
+    assert!(
+        source.exists(),
+        "fixed_char_alloc_array_constructor_len.f90 missing"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "fixed_char_alloc_array_constructor_len.f90 should pass at -O0, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn defined_operator_char_array_element_actual_fixture_passes_at_o0() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("defined_operator_char_array_element_actual.f90");
+    assert!(
+        source.exists(),
+        "defined_operator_char_array_element_actual.f90 missing"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "defined_operator_char_array_element_actual.f90 should pass at -O0, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn defined_assignment_derived_operator_result_fixture_passes_at_o0() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("defined_assignment_derived_operator_result.f90");
+    assert!(
+        source.exists(),
+        "defined_assignment_derived_operator_result.f90 missing"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "defined_assignment_derived_operator_result.f90 should pass at -O0, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
 fn opt_eq_annotations_allow_hello_cross_opt_invariant() {
     let compiler = find_compiler();
     let test_dir = find_test_programs();

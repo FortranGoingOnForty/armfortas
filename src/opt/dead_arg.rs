@@ -60,12 +60,25 @@ impl Pass for DeadArgElim {
             return false;
         }
 
+        let internal_only: Vec<bool> = module
+            .functions
+            .iter()
+            .map(|func| func.internal_only)
+            .collect();
+
         for func in &mut module.functions {
             for block in &mut func.blocks {
                 for inst in &mut block.insts {
                     let InstKind::Call(FuncRef::Internal(callee_idx), args) = &mut inst.kind else {
                         continue;
                     };
+                    if !internal_only
+                        .get(*callee_idx as usize)
+                        .copied()
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
                     let Some(keep) = live_masks.get(*callee_idx as usize) else {
                         continue;
                     };
@@ -216,9 +229,7 @@ fn inst_uses_param(kind: &InstKind, param_id: ValueId) -> bool {
         | InstKind::VBroadcast(..)
         | InstKind::VReduceSum(..)
         | InstKind::VReduceMin(..)
-        | InstKind::VReduceMax(..)) => {
-            crate::ir::walk::inst_uses(kind).contains(&param_id)
-        }
+        | InstKind::VReduceMax(..)) => crate::ir::walk::inst_uses(kind).contains(&param_id),
     }
 }
 
@@ -343,5 +354,93 @@ mod tests {
 
         assert!(!DeadArgElim.run(&mut module));
         assert_eq!(module.functions[0].params.len(), 2);
+    }
+
+    #[test]
+    fn preserves_non_internal_call_args_when_trimming_other_function() {
+        let mut module = Module::new("t".into());
+
+        let exported_params = vec![
+            Param {
+                name: "lhs".into(),
+                ty: IrType::Int(IntWidth::I32),
+                id: ValueId(0),
+                fortran_noalias: false,
+            },
+            Param {
+                name: "rhs".into(),
+                ty: IrType::Int(IntWidth::I32),
+                id: ValueId(1),
+                fortran_noalias: false,
+            },
+        ];
+        let mut exported = Function::new(
+            "module_proc".into(),
+            exported_params,
+            IrType::Int(IntWidth::I32),
+        );
+        let exported_entry = exported.entry;
+        exported.block_mut(exported_entry).terminator = Some(Terminator::Return(Some(ValueId(0))));
+        module.add_function(exported);
+
+        let helper_params = vec![Param {
+            name: "unused".into(),
+            ty: IrType::Int(IntWidth::I32),
+            id: ValueId(0),
+            fortran_noalias: false,
+        }];
+        let mut helper = Function::new("contained_helper".into(), helper_params, IrType::Void);
+        helper.internal_only = true;
+        let helper_entry = helper.entry;
+        helper.block_mut(helper_entry).terminator = Some(Terminator::Return(None));
+        module.add_function(helper);
+
+        let mut caller = Function::new("main".into(), vec![], IrType::Int(IntWidth::I32));
+        let lhs = push(
+            &mut caller,
+            InstKind::ConstInt(7, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        let rhs = push(
+            &mut caller,
+            InstKind::ConstInt(9, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        let exported_call = push(
+            &mut caller,
+            InstKind::Call(FuncRef::Internal(0), vec![lhs, rhs]),
+            IrType::Int(IntWidth::I32),
+        );
+        push(
+            &mut caller,
+            InstKind::Call(FuncRef::Internal(1), vec![rhs]),
+            IrType::Void,
+        );
+        let caller_entry = caller.entry;
+        caller.block_mut(caller_entry).terminator = Some(Terminator::Return(Some(exported_call)));
+        module.add_function(caller);
+
+        assert!(DeadArgElim.run(&mut module));
+        assert_eq!(module.functions[0].params.len(), 2);
+        assert_eq!(module.functions[1].params.len(), 0);
+
+        let exported_args = match &module.functions[2].blocks[0].insts[2].kind {
+            InstKind::Call(FuncRef::Internal(0), args) => args,
+            other => panic!(
+                "expected call to exported internal function, got {:?}",
+                other
+            ),
+        };
+        assert_eq!(
+            exported_args,
+            &vec![lhs, rhs],
+            "non-internal module-procedure call arguments are ABI, not dead-arg slots"
+        );
+
+        let helper_args = match &module.functions[2].blocks[0].insts[3].kind {
+            InstKind::Call(FuncRef::Internal(1), args) => args,
+            other => panic!("expected call to internal-only helper, got {:?}", other),
+        };
+        assert!(helper_args.is_empty());
     }
 }

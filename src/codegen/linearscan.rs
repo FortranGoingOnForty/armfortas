@@ -152,10 +152,8 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
         }
         (caller, callees)
     };
-    let (mut free_gp_caller, mut free_gp_callee) =
-        split_pool(&GP_ALLOC_ORDER, &GP_CALLEE_SAVED);
-    let (mut free_fp_caller, mut free_fp_callee) =
-        split_pool(&FP_ALLOC_ORDER, &FP_CALLEE_SAVED);
+    let (mut free_gp_caller, mut free_gp_callee) = split_pool(&GP_ALLOC_ORDER, &GP_CALLEE_SAVED);
+    let (mut free_fp_caller, mut free_fp_callee) = split_pool(&FP_ALLOC_ORDER, &FP_CALLEE_SAVED);
     let mut callee_saved_used: HashSet<PhysReg> = HashSet::new();
 
     // Hard-coded PhysReg writes inside instructions: positions
@@ -237,8 +235,7 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
     // at -O2+ exhibits this: V_iv defined in `if_end_1`, used in
     // `do_check_3`/`do_body_4`, but `if_then_2` carrying the
     // recursive call is lexically between if_end_1 and do_check_3.)
-    let mut vreg_def_blocks: HashMap<VRegId, std::collections::HashSet<usize>> =
-        HashMap::new();
+    let mut vreg_def_blocks: HashMap<VRegId, std::collections::HashSet<usize>> = HashMap::new();
     {
         let mut p: u32 = 0;
         for (block_idx, block) in mf.blocks.iter().enumerate() {
@@ -350,9 +347,7 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
             // predecessor must land in the same physreg as every
             // use, and splitting fundamentally breaks that.
             false
-        } else if let Some(&(real_start, real_end)) =
-            vreg_actual_range.get(&interval.vreg)
-        {
+        } else if let Some(&(real_start, real_end)) = vreg_actual_range.get(&interval.vreg) {
             interval.call_crossings.len() == 1
                 && interval.call_crossings[0] > real_start
                 && interval.call_crossings[0] < real_end
@@ -368,9 +363,9 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
         let safe_pre_phys = if !free_caller.is_empty() && interval.call_crossings.len() == 1 {
             let cp = interval.call_crossings[0];
             let pre_end = cp.saturating_sub(1);
-            free_caller.iter().rposition(|&r| {
-                !phys_written_in(r, is_fp, interval.start, pre_end)
-            })
+            free_caller
+                .iter()
+                .rposition(|&r| !phys_written_in(r, is_fp, interval.start, pre_end))
         } else {
             None
         };
@@ -638,7 +633,11 @@ pub fn apply_allocation(
         if let Some(p) = result.assignments.get(&vid) {
             Some(LogicalAssignment::Reg(*p))
         } else {
-            result.spills.get(&vid).copied().map(LogicalAssignment::Slot)
+            result
+                .spills
+                .get(&vid)
+                .copied()
+                .map(LogicalAssignment::Slot)
         }
     };
 
@@ -649,6 +648,8 @@ pub fn apply_allocation(
         for (inst_idx, inst) in insts.iter().enumerate() {
             let mut rewritten = inst.clone();
             let cur_pos = inst_pos.get(&(block_idx, inst_idx)).copied().unwrap_or(0);
+            let preserved_entry_arg_def =
+                inst.def.filter(|def| mf.entry_arg_receipts.contains(def));
 
             // Find GP registers NOT in use at this position. A
             // vreg's register is in use during its full live range
@@ -762,8 +763,7 @@ pub fn apply_allocation(
             let mut fp_temp_idx = 0usize;
             for (i, op) in inst.operands.iter().enumerate() {
                 if let MachineOperand::VReg(vid) = op {
-                    if let Some(LogicalAssignment::Slot(offset)) =
-                        logical_assignment(*vid, cur_pos)
+                    if let Some(LogicalAssignment::Slot(offset)) = logical_assignment(*vid, cur_pos)
                     {
                         let class = vreg_classes.get(vid).copied().unwrap_or(RegClass::Gp64);
                         let (temp_reg, load_op) = match class {
@@ -837,9 +837,7 @@ pub fn apply_allocation(
             // correct half.
             for op in &mut rewritten.operands {
                 if let MachineOperand::VReg(vid) = op {
-                    if let Some(LogicalAssignment::Reg(phys)) =
-                        logical_assignment(*vid, cur_pos)
-                    {
+                    if let Some(LogicalAssignment::Reg(phys)) = logical_assignment(*vid, cur_pos) {
                         *op = MachineOperand::PhysReg(phys);
                     }
                 }
@@ -848,8 +846,7 @@ pub fn apply_allocation(
             // Handle def — use a temp that doesn't alias any input temp.
             let def_temp_idx = gp_temp_idx.max(fp_temp_idx);
             let def_spill = if let Some(def_vid) = &inst.def {
-                if let Some(LogicalAssignment::Slot(offset)) =
-                    logical_assignment(*def_vid, cur_pos)
+                if let Some(LogicalAssignment::Slot(offset)) = logical_assignment(*def_vid, cur_pos)
                 {
                     let class = vreg_classes.get(def_vid).copied().unwrap_or(RegClass::Gp64);
                     let temp_reg = match class {
@@ -903,7 +900,7 @@ pub fn apply_allocation(
             // arg-setup mov sequence isn't fragmented by an
             // interposed store and the parallel-copy resolver can
             // see all the arg-setup movs as one block.
-            rewritten.def = None;
+            rewritten.def = preserved_entry_arg_def;
             new_insts.push(rewritten);
 
             // Store after def for spilled vregs.
@@ -928,12 +925,7 @@ pub fn apply_allocation(
 /// `(-256, 255)`. For wider frames we substitute
 /// `sub x8, x29, #|offset|; ldr/str rt, [x8, #0]`. Positive
 /// out-of-scaled-range offsets get the symmetric `add` treatment.
-fn emit_spill_access(
-    insts: &mut Vec<MachineInst>,
-    op: ArmOpcode,
-    rt: PhysReg,
-    offset: i64,
-) {
+fn emit_spill_access(insts: &mut Vec<MachineInst>, op: ArmOpcode, rt: PhysReg, offset: i64) {
     // Most spill ops encode comfortably with FP-relative immediates.
     // Only fall back to address materialization when out of LDUR
     // range. (Positive offsets up to 65520 step 16 are handled by
@@ -1275,7 +1267,7 @@ pub fn parallelize_entry_arg_moves(mf: &mut MachineFunction) {
     loop {
         match iter.peek() {
             None => break,
-            Some(inst) if is_arg_receipt_copy(inst) => {
+            Some(inst) if is_arg_receipt_copy(inst, &mf.entry_arg_receipts) => {
                 pending.push(iter.next().unwrap());
             }
             Some(inst) if is_transparent_to_arg_receipts(inst) => {
@@ -1436,7 +1428,13 @@ fn is_call_arg_copy(inst: &MachineInst) -> bool {
 
 /// Mirror of `is_call_arg_copy` for the function-entry direction:
 /// a phys-to-phys mov whose *source* is an incoming arg register.
-fn is_arg_receipt_copy(inst: &MachineInst) -> bool {
+fn is_arg_receipt_copy(inst: &MachineInst, entry_arg_receipts: &[VRegId]) -> bool {
+    if !inst
+        .def
+        .is_some_and(|def| entry_arg_receipts.contains(&def))
+    {
+        return false;
+    }
     matches!(inst.opcode, ArmOpcode::MovReg | ArmOpcode::FmovReg)
         && matches!(
             inst.operands.as_slice(),
@@ -1835,6 +1833,9 @@ mod tests {
     #[test]
     fn parallelize_entry_arg_moves_resolves_swap_in_receipts() {
         let mut mf = MachineFunction::new("test".into());
+        let recv_a = VRegId(100);
+        let recv_b = VRegId(101);
+        mf.entry_arg_receipts.extend([recv_a, recv_b]);
         // Frame setup.
         mf.blocks[0].insts.push(MachineInst {
             opcode: ArmOpcode::StpPre,
@@ -1855,7 +1856,7 @@ mod tests {
                 MachineOperand::PhysReg(PhysReg::Gp(4)),
                 MachineOperand::PhysReg(PhysReg::Gp(3)),
             ],
-            def: None,
+            def: Some(recv_a),
         });
         mf.blocks[0].insts.push(MachineInst {
             opcode: ArmOpcode::MovReg,
@@ -1863,7 +1864,7 @@ mod tests {
                 MachineOperand::PhysReg(PhysReg::Gp(3)),
                 MachineOperand::PhysReg(PhysReg::Gp(4)),
             ],
-            def: None,
+            def: Some(recv_b),
         });
         parallelize_entry_arg_moves(&mut mf);
         let body: Vec<&[MachineOperand]> = mf.blocks[0].insts[2..]
@@ -1883,8 +1884,169 @@ mod tests {
     }
 
     #[test]
+    fn apply_allocation_preserves_entry_receipts_for_parallelization() {
+        let mut mf = MachineFunction::new("test".into());
+        let total_ptr = mf.new_vreg(RegClass::Gp64);
+        let hits_ptr = mf.new_vreg(RegClass::Gp64);
+        mf.entry_arg_receipts.extend([total_ptr, hits_ptr]);
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::StpPre,
+            operands: vec![],
+            def: None,
+        });
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::AddImm,
+            operands: vec![],
+            def: None,
+        });
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::MovReg,
+            operands: vec![
+                MachineOperand::VReg(total_ptr),
+                MachineOperand::PhysReg(PhysReg::Gp(3)),
+            ],
+            def: Some(total_ptr),
+        });
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::MovReg,
+            operands: vec![
+                MachineOperand::VReg(hits_ptr),
+                MachineOperand::PhysReg(PhysReg::Gp(4)),
+            ],
+            def: Some(hits_ptr),
+        });
+
+        let result = AllocResult {
+            assignments: HashMap::from([(total_ptr, PhysReg::Gp(4)), (hits_ptr, PhysReg::Gp(3))]),
+            spills: HashMap::new(),
+            split_records: Vec::new(),
+            callee_saved_used: Vec::new(),
+        };
+        let liveness = crate::codegen::liveness::LivenessResult {
+            intervals: vec![
+                crate::codegen::liveness::LiveInterval {
+                    vreg: total_ptr,
+                    class: RegClass::Gp64,
+                    start: 4,
+                    end: 4,
+                    crosses_call: false,
+                    call_crossings: Vec::new(),
+                    hint: None,
+                },
+                crate::codegen::liveness::LiveInterval {
+                    vreg: hits_ptr,
+                    class: RegClass::Gp64,
+                    start: 6,
+                    end: 6,
+                    crosses_call: false,
+                    call_crossings: Vec::new(),
+                    hint: None,
+                },
+            ],
+            num_positions: 8,
+        };
+
+        apply_allocation(&mut mf, &result, &liveness);
+        parallelize_entry_arg_moves(&mut mf);
+
+        let body: Vec<&[MachineOperand]> = mf.blocks[0].insts[2..]
+            .iter()
+            .map(|i| i.operands.as_slice())
+            .collect();
+        assert_eq!(
+            body,
+            vec![
+                &[
+                    MachineOperand::PhysReg(PhysReg::Gp(9)),
+                    MachineOperand::PhysReg(PhysReg::Gp(3)),
+                ][..],
+                &[
+                    MachineOperand::PhysReg(PhysReg::Gp(3)),
+                    MachineOperand::PhysReg(PhysReg::Gp(4)),
+                ][..],
+                &[
+                    MachineOperand::PhysReg(PhysReg::Gp(4)),
+                    MachineOperand::PhysReg(PhysReg::Gp(9)),
+                ][..],
+            ],
+            "entry-receipt defs must survive allocation so swaps are cycle-broken"
+        );
+    }
+
+    #[test]
+    fn parallelize_entry_arg_moves_leaves_post_receipt_copy_chain_ordered() {
+        let mut mf = MachineFunction::new("test".into());
+        let param0 = VRegId(200);
+        let cast0 = VRegId(201);
+        let cast1 = VRegId(202);
+        mf.entry_arg_receipts.push(param0);
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::StpPre,
+            operands: vec![],
+            def: None,
+        });
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::AddImm,
+            operands: vec![],
+            def: None,
+        });
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::MovReg,
+            operands: vec![
+                MachineOperand::PhysReg(PhysReg::Gp(7)),
+                MachineOperand::PhysReg(PhysReg::Gp(0)),
+            ],
+            def: Some(param0),
+        });
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::MovReg,
+            operands: vec![
+                MachineOperand::PhysReg(PhysReg::Gp(4)),
+                MachineOperand::PhysReg(PhysReg::Gp(7)),
+            ],
+            def: Some(cast0),
+        });
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::MovReg,
+            operands: vec![
+                MachineOperand::PhysReg(PhysReg::Gp(3)),
+                MachineOperand::PhysReg(PhysReg::Gp(4)),
+            ],
+            def: Some(cast1),
+        });
+
+        parallelize_entry_arg_moves(&mut mf);
+        let body: Vec<&[MachineOperand]> = mf.blocks[0].insts[2..]
+            .iter()
+            .map(|i| i.operands.as_slice())
+            .collect();
+        assert_eq!(
+            body,
+            vec![
+                &[
+                    MachineOperand::PhysReg(PhysReg::Gp(7)),
+                    MachineOperand::PhysReg(PhysReg::Gp(0)),
+                ][..],
+                &[
+                    MachineOperand::PhysReg(PhysReg::Gp(4)),
+                    MachineOperand::PhysReg(PhysReg::Gp(7)),
+                ][..],
+                &[
+                    MachineOperand::PhysReg(PhysReg::Gp(3)),
+                    MachineOperand::PhysReg(PhysReg::Gp(4)),
+                ][..],
+            ],
+            "ordinary post-receipt copy chains must stay sequential"
+        );
+    }
+
+    #[test]
     fn parallelize_entry_arg_moves_tolerates_intervening_store() {
         let mut mf = MachineFunction::new("test".into());
+        let recv0 = VRegId(300);
+        let recv3 = VRegId(301);
+        let recv4 = VRegId(302);
+        mf.entry_arg_receipts.extend([recv0, recv3, recv4]);
         mf.blocks[0].insts.push(MachineInst {
             opcode: ArmOpcode::StpPre,
             operands: vec![],
@@ -1902,7 +2064,7 @@ mod tests {
                 MachineOperand::PhysReg(PhysReg::Gp(10)),
                 MachineOperand::PhysReg(PhysReg::Gp(0)),
             ],
-            def: None,
+            def: Some(recv0),
         });
         // str x10, [fp, #-56]  (store, transparent — reads x10)
         mf.blocks[0].insts.push(MachineInst {
@@ -1921,7 +2083,7 @@ mod tests {
                 MachineOperand::PhysReg(PhysReg::Gp(4)),
                 MachineOperand::PhysReg(PhysReg::Gp(3)),
             ],
-            def: None,
+            def: Some(recv4),
         });
         mf.blocks[0].insts.push(MachineInst {
             opcode: ArmOpcode::MovReg,
@@ -1929,7 +2091,7 @@ mod tests {
                 MachineOperand::PhysReg(PhysReg::Gp(3)),
                 MachineOperand::PhysReg(PhysReg::Gp(4)),
             ],
-            def: None,
+            def: Some(recv3),
         });
         parallelize_entry_arg_moves(&mut mf);
         // The store should still appear (kept in place); the swap
@@ -1991,10 +2153,7 @@ mod tests {
         );
         let blr = mf.blocks[0].insts.last().unwrap();
         assert_eq!(blr.opcode, ArmOpcode::Blr);
-        assert_eq!(
-            blr.operands,
-            vec![MachineOperand::PhysReg(PhysReg::Gp(10))]
-        );
+        assert_eq!(blr.operands, vec![MachineOperand::PhysReg(PhysReg::Gp(10))]);
     }
 
     #[test]

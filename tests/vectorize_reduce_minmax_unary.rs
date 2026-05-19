@@ -41,11 +41,7 @@ fn o3_vectorizes_minmax_with_unary_load() {
     );
     // Expect vabs lifted into the body, plus one vreduce_max and
     // one vreduce_min.
-    assert!(
-        o3_ir.contains("vabs"),
-        "expected vabs in IR:\n{}",
-        o3_ir
-    );
+    assert!(o3_ir.contains("vabs"), "expected vabs in IR:\n{}", o3_ir);
     assert_eq!(
         o3_ir.matches("vreduce_max").count(),
         1,

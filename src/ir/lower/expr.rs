@@ -14,9 +14,9 @@ use crate::ir::inst::*;
 use crate::ir::types::*;
 use crate::sema::symtab::SymbolTable;
 
+use super::const_scalar::{clamp_const_to_type, materialize_const_scalar, ConstScalar};
 use super::core::*;
 use super::ctx::{current_proc_scope, CharKind, HiddenResultAbi, LocalInfo, LowerCtx};
-use super::const_scalar::{clamp_const_to_type, materialize_const_scalar, ConstScalar};
 use super::helpers::coerce_to_type;
 use crate::ast::expr::{BinaryOp, UnaryOp};
 
@@ -239,11 +239,18 @@ pub(super) fn substitute_names_in_expr(
         match v {
             AcValue::Expr(e) => AcValue::Expr(substitute_names_in_expr(e, subst)),
             AcValue::ImpliedDo(ido) => AcValue::ImpliedDo(Box::new(ImpliedDoLoop {
-                values: ido.values.iter().map(|v| rewrite_acvalue(v, subst)).collect(),
+                values: ido
+                    .values
+                    .iter()
+                    .map(|v| rewrite_acvalue(v, subst))
+                    .collect(),
                 var: ido.var.clone(),
                 start: substitute_names_in_expr(&ido.start, subst),
                 end: substitute_names_in_expr(&ido.end, subst),
-                step: ido.step.as_ref().map(|e| substitute_names_in_expr(e, subst)),
+                step: ido
+                    .step
+                    .as_ref()
+                    .map(|e| substitute_names_in_expr(e, subst)),
             })),
         }
     }
@@ -298,6 +305,159 @@ pub(super) fn substitute_names_in_expr(
     }
 }
 
+fn lower_cmplx_intrinsic_expr(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    original_args: &[crate::ast::expr::Argument],
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) -> Option<ValueId> {
+    let arg_slots = reorder_args_by_keyword_slots(original_args, "cmplx", st);
+    let x_arg = arg_slots.first().and_then(|slot| slot.as_ref())?;
+    let y_arg = arg_slots.get(1).and_then(|slot| slot.as_ref());
+    let kind_arg = arg_slots.get(2).and_then(|slot| slot.as_ref());
+
+    let lower_element_arg =
+        |b: &mut FuncBuilder, arg: &crate::ast::expr::Argument| -> Option<ValueId> {
+            match &arg.value {
+                crate::ast::expr::SectionSubscript::Element(e) => Some(lower_expr_full(
+                    b,
+                    locals,
+                    e,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                )),
+                crate::ast::expr::SectionSubscript::Range { .. } => None,
+            }
+        };
+
+    let x_val = lower_element_arg(b, x_arg)?;
+    let y_val = y_arg.and_then(|arg| lower_element_arg(b, arg));
+    let kind_val = kind_arg.and_then(|arg| lower_element_arg(b, arg));
+
+    let fw = operator_expr_type_info(expr, Some(locals), st, type_layouts)
+        .map(|ti| type_info_to_ir_type(&ti))
+        .filter(is_complex_ty)
+        .map(|ty| complex_float_width(&ty))
+        .or_else(|| {
+            kind_val
+                .and_then(|kind| extract_const_int_from_value(b, kind))
+                .map(|kind| {
+                    if kind == 8 {
+                        FloatWidth::F64
+                    } else {
+                        FloatWidth::F32
+                    }
+                })
+        })
+        .unwrap_or_else(|| {
+            let x_ty = b.func().value_type(x_val);
+            let y_ty = y_val.and_then(|val| b.func().value_type(val));
+            if x_ty.as_ref().is_some_and(|ty| {
+                matches!(ty, IrType::Float(FloatWidth::F64))
+                    || (is_complex_ty(ty) && complex_float_width(ty) == FloatWidth::F64)
+            }) || y_ty
+                .as_ref()
+                .is_some_and(|ty| matches!(ty, IrType::Float(FloatWidth::F64)))
+            {
+                FloatWidth::F64
+            } else {
+                FloatWidth::F32
+            }
+        });
+
+    let elem_ty = IrType::Float(fw);
+    let zero = b.const_i64(0);
+    let imag_offset = b.const_i64(if fw == FloatWidth::F64 { 8 } else { 4 });
+    let zero_imag = match fw {
+        FloatWidth::F64 => b.const_f64(0.0),
+        FloatWidth::F32 => b.const_f32(0.0),
+    };
+
+    let x_ty = b
+        .func()
+        .value_type(x_val)
+        .unwrap_or(IrType::Int(IntWidth::I32));
+    let (real_val, default_imag_val) = if is_complex_ty(&x_ty) {
+        let src_fw = complex_float_width(&x_ty);
+        let x_buf = materialize_complex_operand(b, x_val, src_fw);
+        let src_imag_offset = b.const_i64(if src_fw == FloatWidth::F64 { 8 } else { 4 });
+        let real_ptr = b.gep(x_buf, vec![zero], IrType::Int(IntWidth::I8));
+        let imag_ptr = b.gep(x_buf, vec![src_imag_offset], IrType::Int(IntWidth::I8));
+        let real_lane = b.load_typed(real_ptr, IrType::Float(src_fw));
+        let imag_lane = b.load_typed(imag_ptr, IrType::Float(src_fw));
+        (
+            coerce_to_type(b, real_lane, &elem_ty),
+            coerce_to_type(b, imag_lane, &elem_ty),
+        )
+    } else {
+        (coerce_to_type(b, x_val, &elem_ty), zero_imag)
+    };
+    let imag_val = y_val
+        .map(|val| coerce_to_type(b, val, &elem_ty))
+        .unwrap_or(default_imag_val);
+
+    let buf = b.alloca(IrType::Array(Box::new(elem_ty), 2));
+    let real_ptr = b.gep(buf, vec![zero], IrType::Int(IntWidth::I8));
+    b.store(real_val, real_ptr);
+    let imag_ptr = b.gep(buf, vec![imag_offset], IrType::Int(IntWidth::I8));
+    b.store(imag_val, imag_ptr);
+    Some(buf)
+}
+
+fn complex_literal_float_width(
+    real: &crate::ast::expr::SpannedExpr,
+    imag: &crate::ast::expr::SpannedExpr,
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> FloatWidth {
+    fn part_width(
+        part: &crate::ast::expr::SpannedExpr,
+        locals: &HashMap<String, LocalInfo>,
+        st: &SymbolTable,
+        type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    ) -> Option<FloatWidth> {
+        match operator_expr_type_info(part, Some(locals), st, type_layouts) {
+            Some(crate::sema::symtab::TypeInfo::Real { kind: Some(8) })
+            | Some(crate::sema::symtab::TypeInfo::DoublePrecision)
+            | Some(crate::sema::symtab::TypeInfo::Complex { kind: Some(8) }) => {
+                return Some(FloatWidth::F64);
+            }
+            Some(crate::sema::symtab::TypeInfo::Real { .. })
+            | Some(crate::sema::symtab::TypeInfo::Complex { .. }) => {
+                return Some(FloatWidth::F32);
+            }
+            _ => {}
+        }
+        if let Expr::RealLiteral { text, .. } = &part.node {
+            if text.to_lowercase().contains('d') {
+                return Some(FloatWidth::F64);
+            }
+        }
+        None
+    }
+
+    if matches!(
+        part_width(real, locals, st, type_layouts),
+        Some(FloatWidth::F64)
+    ) || matches!(
+        part_width(imag, locals, st, type_layouts),
+        Some(FloatWidth::F64)
+    ) {
+        FloatWidth::F64
+    } else {
+        FloatWidth::F32
+    }
+}
+
 pub(crate) fn lower_expr_full(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -313,7 +473,9 @@ pub(crate) fn lower_expr_full(
             let clean = text.split('_').next().unwrap_or(text);
             let kind_width = kind
                 .as_deref()
-                .map(|kind_str| int_kind_to_width_in_context(kind_str, Some(locals), None, Some(st)))
+                .map(|kind_str| {
+                    int_kind_to_width_in_context(kind_str, Some(locals), None, Some(st))
+                })
                 .unwrap_or_else(crate::driver::defaults::default_int_kind);
             let val: i128 = clean.parse().unwrap_or(0);
             let width = match kind_width {
@@ -437,6 +599,13 @@ pub(crate) fn lower_expr_full(
                             info.addr
                         }
                     }
+                } else if local_uses_array_descriptor(info) && info.dims.is_empty() {
+                    let base = array_base_addr(b, info);
+                    if is_complex_ty(&info.ty) {
+                        base
+                    } else {
+                        b.load_typed(base, info.ty.clone())
+                    }
                 } else if is_complex_ty(&info.ty) {
                     if info.by_ref {
                         // by-ref complex: info.addr holds ptr-to-ptr-to-buffer.
@@ -496,6 +665,49 @@ pub(crate) fn lower_expr_full(
                     descriptor_params,
                 );
                 return ptr;
+            }
+            if let Some(specific) = resolve_defined_binary_operator_specific_by_semantics(
+                st,
+                Some(locals),
+                type_layouts,
+                op,
+                left,
+                right,
+            ) {
+                let lhs = lower_expr_full(
+                    b,
+                    locals,
+                    left,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                );
+                let rhs = lower_expr_full(
+                    b,
+                    locals,
+                    right,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                );
+                return emit_resolved_operator_call(
+                    b,
+                    locals,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                    &specific,
+                    left,
+                    right,
+                    lhs,
+                    rhs,
+                );
             }
             if matches!(
                 op,
@@ -686,6 +898,7 @@ pub(crate) fn lower_expr_full(
                         let imag_num = b.fsub(bc, ad);
                         (b.fdiv(real_num, denom), b.fdiv(imag_num, denom))
                     }
+                    BinaryOp::Pow => lower_complex_pow_lanes(b, fw, re_l, im_l, re_r, im_r),
                     _ => (re_l, im_l), // unsupported: return lhs unchanged
                 };
                 let dst_re = b.gep(buf, vec![zero], IrType::Int(IntWidth::I8));
@@ -802,70 +1015,42 @@ pub(crate) fn lower_expr_full(
         }
 
         Expr::UnaryOp { op, operand } => {
-            // F2018 §10.1.5: a defined unary operator `.op.X` is sugar
+            // F2018 §10.1.5: a defined unary operator `.op.X`, or a
+            // user-provided symbolic unary operator such as `-x`, is sugar
             // for a single-arg call to the matching specific procedure
-            // declared in `INTERFACE OPERATOR(.op.)`. Without this
-            // dispatch, `.det.matrix` falls through to the catch-all
-            // below and silently returns the operand value, so callers
-            // see the raw matrix instead of its determinant.
-            if let UnaryOp::Defined(name) = op {
-                let iface = format!("operator(.{}.)", name.to_lowercase());
-                if let Some(sym) = st.find_symbol_any_scope(&iface) {
-                    if sym.kind == crate::sema::symtab::SymbolKind::NamedInterface
-                        && !sym.arg_names.is_empty()
-                    {
-                        let operand_ti =
-                            operator_expr_type_info(operand, Some(locals), st, type_layouts);
-                        let chosen = sym
-                            .arg_names
-                            .iter()
-                            .find(|specific| {
-                                procedure_scope_by_name(st, specific)
-                                    .map(|scope| {
-                                        let declared = declared_args_for_scope(scope);
-                                        declared.len() == 1
-                                            && declared
-                                                .first()
-                                                .and_then(|f| f.type_info.as_ref())
-                                                .is_some_and(|decl| {
-                                                    operator_arg_semantic_match(
-                                                        decl,
-                                                        operand_ti.as_ref(),
-                                                    )
-                                                })
-                                    })
-                                    .unwrap_or(false)
-                            })
-                            .cloned();
-                        if let Some(specific) = chosen {
-                            let synth = crate::ast::Spanned::new(
-                                Expr::FunctionCall {
-                                    callee: Box::new(crate::ast::Spanned::new(
-                                        Expr::Name { name: specific },
-                                        operand.span,
-                                    )),
-                                    args: vec![crate::ast::expr::Argument {
-                                        keyword: None,
-                                        value: crate::ast::expr::SectionSubscript::Element(
-                                            (**operand).clone(),
-                                        ),
-                                    }],
-                                },
-                                expr.span,
-                            );
-                            return lower_expr_full(
-                                b,
-                                locals,
-                                &synth,
-                                st,
-                                type_layouts,
-                                internal_funcs,
-                                contained_host_refs,
-                                descriptor_params,
-                            );
-                        }
-                    }
-                }
+            // declared in `INTERFACE OPERATOR(...)`. Without this dispatch,
+            // `.det.matrix` and derived-type `-td` fall through to the
+            // catch-all below and silently return the operand value.
+            if let Some(specific) = resolve_defined_unary_operator_specific_by_semantics(
+                st,
+                Some(locals),
+                type_layouts,
+                op,
+                operand,
+            ) {
+                let synth = crate::ast::Spanned::new(
+                    Expr::FunctionCall {
+                        callee: Box::new(crate::ast::Spanned::new(
+                            Expr::Name { name: specific },
+                            operand.span,
+                        )),
+                        args: vec![crate::ast::expr::Argument {
+                            keyword: None,
+                            value: crate::ast::expr::SectionSubscript::Element((**operand).clone()),
+                        }],
+                    },
+                    expr.span,
+                );
+                return lower_expr_full(
+                    b,
+                    locals,
+                    &synth,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                );
             }
             let val = lower_expr_full(
                 b,
@@ -881,6 +1066,25 @@ pub(crate) fn lower_expr_full(
                 .func()
                 .value_type(val)
                 .unwrap_or(IrType::Int(IntWidth::I32));
+            if matches!(op, UnaryOp::Minus) && is_complex_ty(&ty) {
+                let fw = complex_float_width(&ty);
+                let elem_ty = IrType::Float(fw);
+                let src = materialize_complex_operand(b, val, fw);
+                let buf = b.alloca(IrType::Array(Box::new(elem_ty.clone()), 2));
+                let zero = b.const_i64(0);
+                let imag_offset = b.const_i64(if fw == FloatWidth::F64 { 8 } else { 4 });
+                let src_re = b.gep(src, vec![zero], IrType::Int(IntWidth::I8));
+                let src_im = b.gep(src, vec![imag_offset], IrType::Int(IntWidth::I8));
+                let re = b.load_typed(src_re, elem_ty.clone());
+                let im = b.load_typed(src_im, elem_ty.clone());
+                let dst_re = b.gep(buf, vec![zero], IrType::Int(IntWidth::I8));
+                let dst_im = b.gep(buf, vec![imag_offset], IrType::Int(IntWidth::I8));
+                let neg_re = b.fneg(re);
+                let neg_im = b.fneg(im);
+                b.store(neg_re, dst_re);
+                b.store(neg_im, dst_im);
+                return buf;
+            }
             match (op, &ty) {
                 (UnaryOp::Minus, IrType::Int(_)) => b.ineg(val),
                 (UnaryOp::Minus, IrType::Float(_)) => b.fneg(val),
@@ -946,8 +1150,14 @@ pub(crate) fn lower_expr_full(
             if let Expr::Name { name } = &callee.node {
                 if name.eq_ignore_ascii_case("transfer") && args.len() >= 2 {
                     if let Some(result) = lower_transfer_intrinsic(
-                        b, locals, args, st, type_layouts,
-                        internal_funcs, contained_host_refs, descriptor_params,
+                        b,
+                        locals,
+                        args,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
                     ) {
                         return result;
                     }
@@ -1019,8 +1229,36 @@ pub(crate) fn lower_expr_full(
                         if has_range {
                             return lower_array_section(b, locals, info, args, st, type_layouts);
                         }
+                        if info.char_kind != CharKind::None
+                            || descriptor_backed_runtime_char_array(info)
+                        {
+                            if let Some((ptr, _len)) = char_array_element_ptr_and_len(
+                                b,
+                                locals,
+                                info,
+                                args,
+                                st,
+                                type_layouts,
+                            ) {
+                                return ptr;
+                            }
+                        }
                         return lower_array_element(b, locals, info, args, st, type_layouts);
                     }
+                }
+
+                if let Some(result) = lower_logical_reduction_intrinsic_ast(
+                    b,
+                    &key,
+                    args,
+                    locals,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                ) {
+                    return result;
                 }
 
                 // Check for pointer intrinsics (ASSOCIATED) first —
@@ -1039,34 +1277,18 @@ pub(crate) fn lower_expr_full(
                         return result;
                     }
 
-                    if let Some(result) = lower_logical_reduction_intrinsic_ast(
+                    // Check for array intrinsics (SIZE, SUM, etc.) that need descriptor addresses.
+                    if let Some(result) = lower_array_intrinsic(
                         b,
+                        locals,
                         &key,
                         args,
-                        locals,
                         st,
                         type_layouts,
                         internal_funcs,
                         contained_host_refs,
                         descriptor_params,
                     ) {
-                        return result;
-                    }
-
-                    // Check for array intrinsics (SIZE, SUM, etc.) that need descriptor addresses.
-                    if let Some(result) =
-                            lower_array_intrinsic(
-                                b,
-                                locals,
-                                &key,
-                                args,
-                                st,
-                                type_layouts,
-                                internal_funcs,
-                                contained_host_refs,
-                                descriptor_params,
-                            )
-                    {
                         return result;
                     }
 
@@ -1233,7 +1455,7 @@ pub(crate) fn lower_expr_full(
 
                 // abs(z) for complex: sqrt(re² + im²).
                 // Must be handled before generic intrinsic lowering because
-                // complex values are pointers to [f32/f64 x 2] buffers.
+                // complex values may be pointer-backed or aggregate pairs.
                 if (key == "abs" || key == "cabs" || key == "cdabs" || key == "zabs")
                     && args.len() == 1
                 {
@@ -1258,14 +1480,80 @@ pub(crate) fn lower_expr_full(
                                 let elem = IrType::Float(fw);
                                 let esz = b.const_i64(if fw == FloatWidth::F64 { 8 } else { 4 });
                                 let zero = b.const_i64(0);
-                                let re_ptr = b.gep(val, vec![zero], IrType::Int(IntWidth::I8));
-                                let im_ptr = b.gep(val, vec![esz], IrType::Int(IntWidth::I8));
+                                let src = materialize_complex_operand(b, val, fw);
+                                let re_ptr = b.gep(src, vec![zero], IrType::Int(IntWidth::I8));
+                                let im_ptr = b.gep(src, vec![esz], IrType::Int(IntWidth::I8));
                                 let re = b.load_typed(re_ptr, elem.clone());
                                 let im = b.load_typed(im_ptr, elem);
                                 let re2 = b.fmul(re, re);
                                 let im2 = b.fmul(im, im);
                                 let sum = b.fadd(re2, im2);
                                 return b.fsqrt(sum);
+                            }
+                        }
+                    }
+                }
+
+                // exp(z) for complex: exp(a+bi) = exp(a) * (cos(b)+i*sin(b)).
+                // Keep this on the expression side of intrinsic lowering so
+                // the scalar libm path never sees the pointer-backed complex
+                // buffer as its argument.
+                if key == "exp" && args.len() == 1 {
+                    if let Some(arg0) = args.first() {
+                        if let crate::ast::expr::SectionSubscript::Element(e) = &arg0.value {
+                            let val = lower_expr_full(
+                                b,
+                                locals,
+                                e,
+                                st,
+                                type_layouts,
+                                internal_funcs,
+                                contained_host_refs,
+                                descriptor_params,
+                            );
+                            let ty = b
+                                .func()
+                                .value_type(val)
+                                .unwrap_or(IrType::Int(IntWidth::I32));
+                            if is_complex_ty(&ty) {
+                                let fw = complex_float_width(&ty);
+                                let elem = IrType::Float(fw);
+                                let lane_bytes =
+                                    b.const_i64(if fw == FloatWidth::F64 { 8 } else { 4 });
+                                let zero = b.const_i64(0);
+                                let src = materialize_complex_operand(b, val, fw);
+                                let re_ptr = b.gep(src, vec![zero], IrType::Int(IntWidth::I8));
+                                let im_ptr =
+                                    b.gep(src, vec![lane_bytes], IrType::Int(IntWidth::I8));
+                                let re_in = b.load_typed(re_ptr, elem.clone());
+                                let im_in = b.load_typed(im_ptr, elem.clone());
+
+                                let suffix = if fw == FloatWidth::F32 { "f" } else { "" };
+                                let exp_re = b.call(
+                                    FuncRef::External(format!("exp{}", suffix)),
+                                    vec![re_in],
+                                    elem.clone(),
+                                );
+                                let cos_im = b.call(
+                                    FuncRef::External(format!("cos{}", suffix)),
+                                    vec![im_in],
+                                    elem.clone(),
+                                );
+                                let sin_im = b.call(
+                                    FuncRef::External(format!("sin{}", suffix)),
+                                    vec![im_in],
+                                    elem.clone(),
+                                );
+                                let re_out = b.fmul(exp_re, cos_im);
+                                let im_out = b.fmul(exp_re, sin_im);
+
+                                let out = b.alloca(IrType::Array(Box::new(elem), 2));
+                                let out_re = b.gep(out, vec![zero], IrType::Int(IntWidth::I8));
+                                let out_im =
+                                    b.gep(out, vec![lane_bytes], IrType::Int(IntWidth::I8));
+                                b.store(re_out, out_re);
+                                b.store(im_out, out_im);
+                                return out;
                             }
                         }
                     }
@@ -1318,8 +1606,7 @@ pub(crate) fn lower_expr_full(
                                         tmp
                                     }
                                 };
-                                let re_ptr =
-                                    b.gep(buf, vec![zero_off], IrType::Int(IntWidth::I8));
+                                let re_ptr = b.gep(buf, vec![zero_off], IrType::Int(IntWidth::I8));
                                 let im_ptr =
                                     b.gep(buf, vec![lane_bytes], IrType::Int(IntWidth::I8));
                                 let re_in = b.load_typed(re_ptr, elem.clone());
@@ -1350,8 +1637,7 @@ pub(crate) fn lower_expr_full(
                                 let half_plus_pos = b.fcmp(CmpOp::Ge, half_plus, zero_f);
                                 let half_plus_safe = b.select(half_plus_pos, half_plus, zero_f);
                                 let half_minus_pos = b.fcmp(CmpOp::Ge, half_minus, zero_f);
-                                let half_minus_safe =
-                                    b.select(half_minus_pos, half_minus, zero_f);
+                                let half_minus_safe = b.select(half_minus_pos, half_minus, zero_f);
                                 let re_out = b.fsqrt(half_plus_safe);
                                 let im_mag = b.fsqrt(half_minus_safe);
                                 let im_neg = b.fneg(im_mag);
@@ -1359,8 +1645,7 @@ pub(crate) fn lower_expr_full(
                                 let im_out = b.select(b_nonneg, im_mag, im_neg);
 
                                 let out = b.alloca(arr_ty);
-                                let out_re =
-                                    b.gep(out, vec![zero_off], IrType::Int(IntWidth::I8));
+                                let out_re = b.gep(out, vec![zero_off], IrType::Int(IntWidth::I8));
                                 let out_im =
                                     b.gep(out, vec![lane_bytes], IrType::Int(IntWidth::I8));
                                 b.store(re_out, out_re);
@@ -1393,8 +1678,7 @@ pub(crate) fn lower_expr_full(
                 // call reference lowering fills ref_arg_vals).  Skip
                 // the resolution probe when no caller can use it.
                 let original_args = args;
-                let needs_generic_resolution =
-                    has_named_interface || procptr_target.is_some();
+                let needs_generic_resolution = has_named_interface || procptr_target.is_some();
                 let resolution_arg_vals: Vec<ValueId> = if needs_generic_resolution {
                     original_args
                         .iter()
@@ -1465,14 +1749,10 @@ pub(crate) fn lower_expr_full(
                 {
                     if let Some(arg) = args.first() {
                         if let crate::ast::expr::SectionSubscript::Element(arg_expr) = &arg.value {
-                            if let Some(elem_ty) = ast_arg_element_ir_type(
-                                arg_expr,
-                                locals,
-                                st,
-                                type_layouts,
-                            ) {
-                                if let Some(v) = lower_numeric_inquiry_constant(b, &key, &elem_ty)
-                                {
+                            if let Some(elem_ty) =
+                                ast_arg_element_ir_type(arg_expr, locals, st, type_layouts)
+                            {
+                                if let Some(v) = lower_numeric_inquiry_constant(b, &key, &elem_ty) {
                                     return v;
                                 }
                             }
@@ -1495,16 +1775,31 @@ pub(crate) fn lower_expr_full(
                 // user generic the explicit check earlier already routes
                 // to the structure ctor / generic-resolve path before
                 // we get here.
-                let intrinsic_result = if crate::sema::validate::is_intrinsic_name(&key) {
-                    let intrinsic_arg_slots =
-                        reorder_args_by_keyword_slots(original_args, &key, st);
-                    let intrinsic_args: Vec<crate::ast::expr::Argument> =
-                        intrinsic_arg_slots.iter().flatten().cloned().collect();
-                    let intrinsic_arg_vals: Vec<ValueId> = intrinsic_args
-                        .iter()
-                        .map(|a| match &a.value {
-                            crate::ast::expr::SectionSubscript::Element(e) => {
-                                generic_dispatch_probe_value(
+                if !has_named_interface && key == "cmplx" {
+                    if let Some(result) = lower_cmplx_intrinsic_expr(
+                        b,
+                        locals,
+                        expr,
+                        original_args,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
+                    ) {
+                        return result;
+                    }
+                }
+                let intrinsic_result =
+                    if !has_named_interface && crate::sema::validate::is_intrinsic_name(&key) {
+                        let intrinsic_arg_slots =
+                            reorder_args_by_keyword_slots(original_args, &key, st);
+                        let intrinsic_args: Vec<crate::ast::expr::Argument> =
+                            intrinsic_arg_slots.iter().flatten().cloned().collect();
+                        let intrinsic_arg_vals: Vec<ValueId> = intrinsic_args
+                            .iter()
+                            .map(|a| match &a.value {
+                                crate::ast::expr::SectionSubscript::Element(e) => lower_expr_full(
                                     b,
                                     locals,
                                     e,
@@ -1513,15 +1808,14 @@ pub(crate) fn lower_expr_full(
                                     internal_funcs,
                                     contained_host_refs,
                                     descriptor_params,
-                                )
-                            }
-                            _ => b.const_i32(0),
-                        })
-                        .collect();
-                    super::intrinsic::lower_intrinsic(b, &key, &intrinsic_arg_vals)
-                } else {
-                    None
-                };
+                                ),
+                                _ => b.const_i32(0),
+                            })
+                            .collect();
+                        super::intrinsic::lower_intrinsic(b, &key, &intrinsic_arg_vals)
+                    } else {
+                        None
+                    };
                 if !has_named_interface {
                     if let Some(result) = intrinsic_result {
                         let coerced = operator_expr_type_info(expr, Some(locals), st, type_layouts)
@@ -1642,6 +1936,18 @@ pub(crate) fn lower_expr_full(
                     if let Some(result) = intrinsic_result {
                         return result;
                     }
+                    if has_named_interface
+                        && original_args.len() == resolution_arg_vals.len()
+                        && (original_args.len() <= 1
+                            || original_args.iter().all(|arg| arg.keyword.is_none()))
+                        && crate::sema::validate::is_intrinsic_name(&key)
+                    {
+                        if let Some(result) =
+                            super::intrinsic::lower_intrinsic(b, &key, &resolution_arg_vals)
+                        {
+                            return result;
+                        }
+                    }
                     if let Some(specifics) = named_interface_specifics(st, &key) {
                         eprintln!(
                             "armfortas: error: {}:{}: no specific procedure of generic '{}' matches the actual arguments; candidates: [{}]",
@@ -1670,9 +1976,10 @@ pub(crate) fn lower_expr_full(
                 } else {
                     arg_slots
                 };
-                let abi_lookup_keys = procedure_abi_lookup_keys(
+                let abi_lookup_keys = procedure_abi_lookup_keys_for_call_target(
                     st,
-                    &[call_name.as_str(), &callee_key, &signature_key, &key],
+                    call_name.as_str(),
+                    &[&callee_key, &signature_key, &key],
                 );
                 let abi_primary_key = abi_lookup_keys
                     .first()
@@ -1784,10 +2091,14 @@ pub(crate) fn lower_expr_full(
                         .as_ref()
                         .map(|mask| mask.get(i).copied().unwrap_or(false))
                         .unwrap_or(false);
+                    let is_optional = opt_flags
+                        .as_ref()
+                        .map(|mask| mask.get(i).copied().unwrap_or(false))
+                        .unwrap_or(false);
                     let value = match slot {
                         Some(arg) => match &arg.value {
                             crate::ast::expr::SectionSubscript::Element(e) => {
-                                if is_value && wants_bind_c_char {
+                                let value = if is_value && wants_bind_c_char {
                                     lower_bind_c_char_value_arg(
                                         b,
                                         locals,
@@ -1811,12 +2122,15 @@ pub(crate) fn lower_expr_full(
                                     );
                                     coerce_value_call_arg(b, st, abi_primary_key, i, raw)
                                 } else if wants_descriptor {
-                                    lower_arg_descriptor(
+                                    lower_arg_descriptor_full(
                                         b,
                                         locals,
                                         e,
                                         st,
                                         type_layouts,
+                                        internal_funcs,
+                                        contained_host_refs,
+                                        descriptor_params,
                                         wants_polymorphic_descriptor,
                                     )
                                 } else if wants_string_descriptor {
@@ -1866,7 +2180,21 @@ pub(crate) fn lower_expr_full(
                                         contained_host_refs,
                                         descriptor_params,
                                     )
-                                }
+                                };
+                                optional_arg_absent_if_unallocated_allocatable_char(
+                                    b,
+                                    locals,
+                                    e,
+                                    st,
+                                    type_layouts,
+                                    is_optional
+                                        && !is_value
+                                        && !wants_descriptor
+                                        && !wants_string_descriptor
+                                        && !wants_bind_c_char
+                                        && !wants_pointer,
+                                    value,
+                                )
                             }
                             _ => b.const_i32(0),
                         },
@@ -1938,9 +2266,10 @@ pub(crate) fn lower_expr_full(
                 }
 
                 // Look up callee return type from symbol table.
-                let ret_ty =
-                    first_procedure_lookup(&abi_lookup_keys, |k| callee_return_ir_type(st, k))
-                        .unwrap_or(IrType::Int(IntWidth::I32));
+                let ret_ty = first_procedure_lookup(&abi_lookup_keys, |k| {
+                    callee_return_ir_type_for_caller(st, k, internal_funcs)
+                })
+                .unwrap_or(IrType::Int(IntWidth::I32));
                 let func_ref = if let Some((target, _)) = procptr_target {
                     FuncRef::Indirect(target)
                 } else {
@@ -2012,17 +2341,16 @@ pub(crate) fn lower_expr_full(
                             // stdlib_hashmaps where `map % hasher(key)`
                             // dispatches through a proc-pointer field.
                             if bp_opt.is_none() {
-                                if let Some((target_ptr, signature_key)) =
+                                if let Some((target_ptr, closure_args, signature_key)) =
                                     procedure_pointer_component_call_target(
                                         b, locals, callee, st, tl,
                                     )
                                 {
                                     let abi_lookup_keys =
                                         procedure_abi_lookup_keys(st, &[&signature_key]);
-                                    let ret_ty = first_procedure_lookup(
-                                        &abi_lookup_keys,
-                                        |k| callee_return_ir_type(st, k),
-                                    )
+                                    let ret_ty = first_procedure_lookup(&abi_lookup_keys, |k| {
+                                        callee_return_ir_type(st, k)
+                                    })
                                     .unwrap_or(IrType::Int(IntWidth::I32));
                                     // Honor the abstract-interface descriptor
                                     // mask when forwarding actuals.  When an
@@ -2045,15 +2373,14 @@ pub(crate) fn lower_expr_full(
                                     // f64 (1.0 = bits 0x3ff0...).
                                     let callee_descriptor_args =
                                         first_procedure_lookup(&abi_lookup_keys, |k| {
-                                            descriptor_params
-                                                .and_then(|m| cached_param_mask_for_lookup(st, m, k))
+                                            descriptor_params.and_then(|m| {
+                                                cached_param_mask_for_lookup(st, m, k)
+                                            })
                                         });
-                                    let mut arg_vals: Vec<ValueId> =
-                                        Vec::with_capacity(args.len());
+                                    let mut arg_vals: Vec<ValueId> = Vec::with_capacity(args.len());
                                     for (i, arg) in args.iter().enumerate() {
-                                        if let crate::ast::expr::SectionSubscript::Element(
-                                            e,
-                                        ) = &arg.value
+                                        if let crate::ast::expr::SectionSubscript::Element(e) =
+                                            &arg.value
                                         {
                                             let mask_says_descriptor = callee_descriptor_args
                                                 .as_ref()
@@ -2067,15 +2394,18 @@ pub(crate) fn lower_expr_full(
                                             // descriptor regardless.
                                             let actual_is_descriptor_backed =
                                                 actual_is_descriptor_array(locals, e);
-                                            let wants_descriptor = mask_says_descriptor
-                                                || actual_is_descriptor_backed;
+                                            let wants_descriptor =
+                                                mask_says_descriptor || actual_is_descriptor_backed;
                                             let v = if wants_descriptor {
-                                                lower_arg_descriptor(
+                                                lower_arg_descriptor_full(
                                                     b,
                                                     locals,
                                                     e,
                                                     st,
                                                     type_layouts,
+                                                    internal_funcs,
+                                                    contained_host_refs,
+                                                    descriptor_params,
                                                     false,
                                                 )
                                             } else {
@@ -2093,253 +2423,241 @@ pub(crate) fn lower_expr_full(
                                             arg_vals.push(v);
                                         }
                                     }
-                                    return b.call(
-                                        FuncRef::Indirect(target_ptr),
-                                        arg_vals,
-                                        ret_ty,
-                                    );
+                                    arg_vals.extend(closure_args);
+                                    return b.call(FuncRef::Indirect(target_ptr), arg_vals, ret_ty);
                                 }
                             }
                             let bp = bp_opt.unwrap_or_else(|| {
                                 fail_unmatched_bound_proc_resolution(callee.span, layout, component)
                             });
-                                let target = bp.target_name.clone();
-                                let target_key = abi_key_for_link_name(st, &target)
-                                    .unwrap_or_else(|| bp.abi_name.clone());
-                                let call_name = target.clone();
-                                let nopass = bp.nopass;
-                                let arg_slots = reorder_args_by_keyword_slots_with_formal_skip(
-                                    args,
-                                    &target_key,
+                            let target = bp.target_name.clone();
+                            let target_key = abi_key_for_link_name(st, &target)
+                                .unwrap_or_else(|| bp.abi_name.clone());
+                            let call_name = target.clone();
+                            let nopass = bp.nopass;
+                            let arg_slots = reorder_args_by_keyword_slots_with_formal_skip(
+                                args,
+                                &target_key,
+                                st,
+                                if nopass { 0 } else { 1 },
+                            );
+                            let abi_lookup_keys =
+                                procedure_abi_lookup_keys(st, &[call_name.as_str(), &target_key]);
+                            let abi_primary_key = abi_lookup_keys
+                                .first()
+                                .map(String::as_str)
+                                .unwrap_or(target_key.as_str());
+                            if let Some(hidden_abi) =
+                                first_procedure_lookup(&abi_lookup_keys, |k| {
+                                    callee_hidden_result_abi(st, k)
+                                })
+                            {
+                                if let Some(bytes) = hidden_result_temp_bytes_for_callee(
                                     st,
-                                    if nopass { 0 } else { 1 },
-                                );
-                                let abi_lookup_keys = procedure_abi_lookup_keys(
-                                    st,
-                                    &[call_name.as_str(), &target_key],
-                                );
-                                let abi_primary_key = abi_lookup_keys
-                                    .first()
-                                    .map(String::as_str)
-                                    .unwrap_or(target_key.as_str());
-                                if let Some(hidden_abi) =
-                                    first_procedure_lookup(&abi_lookup_keys, |k| {
-                                        callee_hidden_result_abi(st, k)
-                                    })
-                                {
-                                    if let Some(bytes) = hidden_result_temp_bytes_for_callee(
+                                    type_layouts,
+                                    &abi_lookup_keys,
+                                    hidden_abi,
+                                ) {
+                                    // Type ComplexBuffer ABI temps as
+                                    // [fN x 2] so downstream `is_complex_ty`
+                                    // checks recognize the result; same
+                                    // motivation as the Name-callee path.
+                                    let alloca_ty = if hidden_abi == HiddenResultAbi::ComplexBuffer
+                                    {
+                                        let fw = if bytes == 16 {
+                                            FloatWidth::F64
+                                        } else {
+                                            FloatWidth::F32
+                                        };
+                                        IrType::Array(Box::new(IrType::Float(fw)), 2)
+                                    } else {
+                                        IrType::Array(Box::new(IrType::Int(IntWidth::I8)), bytes)
+                                    };
+                                    let desc = b.alloca(alloca_ty);
+                                    let zero_i32 = b.const_i32(0);
+                                    let size = b.const_i64(bytes as i64);
+                                    b.call(
+                                        FuncRef::External("memset".into()),
+                                        vec![desc, zero_i32, size],
+                                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                                    );
+                                    emit_bound_function_call(
+                                        b,
+                                        locals,
                                         st,
                                         type_layouts,
-                                        &abi_lookup_keys,
-                                        hidden_abi,
-                                    ) {
-                                        // Type ComplexBuffer ABI temps as
-                                        // [fN x 2] so downstream `is_complex_ty`
-                                        // checks recognize the result; same
-                                        // motivation as the Name-callee path.
-                                        let alloca_ty = if hidden_abi
-                                            == HiddenResultAbi::ComplexBuffer
-                                        {
-                                            let fw = if bytes == 16 {
-                                                FloatWidth::F64
-                                            } else {
-                                                FloatWidth::F32
-                                            };
-                                            IrType::Array(Box::new(IrType::Float(fw)), 2)
-                                        } else {
-                                            IrType::Array(
-                                                Box::new(IrType::Int(IntWidth::I8)),
-                                                bytes,
-                                            )
-                                        };
-                                        let desc = b.alloca(alloca_ty);
-                                        let zero_i32 = b.const_i32(0);
-                                        let size = b.const_i64(bytes as i64);
-                                        b.call(
-                                            FuncRef::External("memset".into()),
-                                            vec![desc, zero_i32, size],
-                                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                                        );
-                                        emit_bound_function_call(
+                                        internal_funcs,
+                                        contained_host_refs,
+                                        descriptor_params,
+                                        callee.span,
+                                        base,
+                                        component,
+                                        args,
+                                        Some(desc),
+                                        IrType::Void,
+                                    );
+                                    return desc;
+                                }
+                            }
+                            let callee_value_args = first_procedure_lookup(&abi_lookup_keys, |k| {
+                                callee_value_arg_mask(st, k)
+                            });
+                            let callee_descriptor_args =
+                                first_procedure_lookup(&abi_lookup_keys, |k| {
+                                    descriptor_params
+                                        .and_then(|m| cached_param_mask_for_lookup(st, m, k))
+                                });
+                            let callee_string_descriptor_args =
+                                first_procedure_lookup(&abi_lookup_keys, |k| {
+                                    callee_string_descriptor_arg_mask(st, k)
+                                });
+                            let callee_bind_c_char_args =
+                                first_procedure_lookup(&abi_lookup_keys, |k| {
+                                    callee_bind_c_char_arg_mask(st, k)
+                                });
+                            let callee_pointer_args =
+                                first_procedure_lookup(&abi_lookup_keys, |k| {
+                                    callee_pointer_arg_mask(st, k)
+                                });
+                            let opt_flags = first_procedure_lookup(&abi_lookup_keys, |k| {
+                                callee_optional_arg_mask(st, k)
+                            });
+                            let callee_char_len_star_args =
+                                first_procedure_lookup(&abi_lookup_keys, |k| {
+                                    callee_char_len_star_mask(st, k)
+                                });
+
+                            let mut call_args = Vec::with_capacity(arg_slots.len() + 1);
+                            for (i, slot) in arg_slots.iter().enumerate() {
+                                if !nopass && i == 0 {
+                                    let wants_bind_c_char = callee_bind_c_char_args
+                                        .as_ref()
+                                        .map(|mask| mask.first().copied().unwrap_or(false))
+                                        .unwrap_or(false);
+                                    let wants_descriptor = callee_descriptor_args
+                                        .as_ref()
+                                        .map(|mask| mask.first().copied().unwrap_or(false))
+                                        .unwrap_or(false)
+                                        && !wants_bind_c_char;
+                                    call_args.push(if wants_descriptor {
+                                        lower_arg_descriptor_full(
                                             b,
                                             locals,
+                                            base,
                                             st,
                                             type_layouts,
                                             internal_funcs,
                                             contained_host_refs,
                                             descriptor_params,
-                                            callee.span,
-                                            base,
-                                            component,
-                                            args,
-                                            Some(desc),
-                                            IrType::Void,
-                                        );
-                                        return desc;
-                                    }
+                                            false,
+                                        )
+                                    } else {
+                                        obj_addr
+                                    });
+                                    continue;
                                 }
-                                let callee_value_args =
-                                    first_procedure_lookup(&abi_lookup_keys, |k| {
-                                        callee_value_arg_mask(st, k)
-                                    });
-                                let callee_descriptor_args =
-                                    first_procedure_lookup(&abi_lookup_keys, |k| {
-                                        descriptor_params
-                                            .and_then(|m| cached_param_mask_for_lookup(st, m, k))
-                                    });
-                                let callee_string_descriptor_args =
-                                    first_procedure_lookup(&abi_lookup_keys, |k| {
-                                        callee_string_descriptor_arg_mask(st, k)
-                                    });
-                                let callee_bind_c_char_args =
-                                    first_procedure_lookup(&abi_lookup_keys, |k| {
-                                        callee_bind_c_char_arg_mask(st, k)
-                                    });
-                                let callee_pointer_args =
-                                    first_procedure_lookup(&abi_lookup_keys, |k| {
-                                        callee_pointer_arg_mask(st, k)
-                                    });
-                                let opt_flags = first_procedure_lookup(&abi_lookup_keys, |k| {
-                                    callee_optional_arg_mask(st, k)
-                                });
-                                let callee_char_len_star_args =
-                                    first_procedure_lookup(&abi_lookup_keys, |k| {
-                                        callee_char_len_star_mask(st, k)
-                                    });
-
-                                let mut call_args = Vec::with_capacity(arg_slots.len() + 1);
-                                for (i, slot) in arg_slots.iter().enumerate() {
-                                    if !nopass && i == 0 {
-                                        let wants_bind_c_char = callee_bind_c_char_args
-                                            .as_ref()
-                                            .map(|mask| mask.first().copied().unwrap_or(false))
-                                            .unwrap_or(false);
-                                        let wants_descriptor = callee_descriptor_args
-                                            .as_ref()
-                                            .map(|mask| mask.first().copied().unwrap_or(false))
-                                            .unwrap_or(false)
-                                            && !wants_bind_c_char;
-                                        call_args.push(if wants_descriptor {
-                                            lower_arg_descriptor(
-                                                b,
-                                                locals,
-                                                base,
-                                                st,
-                                                type_layouts,
-                                                false,
-                                            )
-                                        } else {
-                                            obj_addr
-                                        });
-                                        continue;
-                                    }
-                                    let is_value = callee_value_args
-                                        .as_ref()
-                                        .map(|mask| mask.get(i).copied().unwrap_or(false))
-                                        .unwrap_or(false);
-                                    let wants_descriptor = callee_descriptor_args
-                                        .as_ref()
-                                        .map(|mask| mask.get(i).copied().unwrap_or(false))
-                                        .unwrap_or(false);
-                                    let wants_string_descriptor = callee_string_descriptor_args
-                                        .as_ref()
-                                        .map(|mask| mask.get(i).copied().unwrap_or(false))
-                                        .unwrap_or(false);
-                                    let wants_bind_c_char = callee_bind_c_char_args
-                                        .as_ref()
-                                        .map(|mask| mask.get(i).copied().unwrap_or(false))
-                                        .unwrap_or(false);
-                                    let wants_descriptor = wants_descriptor && !wants_bind_c_char;
-                                    let wants_string_descriptor =
-                                        wants_string_descriptor && !wants_bind_c_char;
-                                    let wants_pointer = callee_pointer_args
-                                        .as_ref()
-                                        .map(|mask| mask.get(i).copied().unwrap_or(false))
-                                        .unwrap_or(false);
-                                    let value = match slot {
-                                        Some(arg) => match &arg.value {
-                                            crate::ast::expr::SectionSubscript::Element(e) => {
-                                                if is_value && wants_bind_c_char {
-                                                    lower_bind_c_char_value_arg(
-                                                        b,
-                                                        locals,
-                                                        e,
-                                                        st,
-                                                        type_layouts,
-                                                        internal_funcs,
-                                                        contained_host_refs,
-                                                        descriptor_params,
-                                                    )
-                                                } else if is_value {
-                                                    let raw = lower_expr_full(
-                                                        b,
-                                                        locals,
-                                                        e,
-                                                        st,
-                                                        type_layouts,
-                                                        internal_funcs,
-                                                        contained_host_refs,
-                                                        descriptor_params,
-                                                    );
-                                                    coerce_value_call_arg(
-                                                        b,
-                                                        st,
-                                                        abi_primary_key,
-                                                        i,
-                                                        raw,
-                                                    )
-                                                } else if wants_descriptor {
-                                                    lower_arg_descriptor(
-                                                        b,
-                                                        locals,
-                                                        e,
-                                                        st,
-                                                        type_layouts,
-                                                        false,
-                                                    )
-                                                } else if wants_string_descriptor {
-                                                    lower_arg_string_descriptor(
-                                                        b,
-                                                        locals,
-                                                        e,
-                                                        st,
-                                                        type_layouts,
-                                                    )
-                                                } else if wants_bind_c_char {
-                                                    lower_bind_c_char_arg_raw(
-                                                        b,
-                                                        locals,
-                                                        e,
-                                                        st,
-                                                        type_layouts,
-                                                        internal_funcs,
-                                                        contained_host_refs,
-                                                        descriptor_params,
-                                                    )
-                                                } else if wants_pointer {
-                                                    lower_pointer_dummy_actual(
-                                                        b,
-                                                        locals,
-                                                        e,
-                                                        st,
-                                                        type_layouts,
-                                                        internal_funcs,
-                                                        contained_host_refs,
-                                                        descriptor_params,
-                                                    )
-                                                    .unwrap_or_else(|| {
-                                                        lower_arg_by_ref_full(
-                                                            b,
-                                                            locals,
-                                                            e,
-                                                            st,
-                                                            type_layouts,
-                                                            internal_funcs,
-                                                            contained_host_refs,
-                                                            descriptor_params,
-                                                        )
-                                                    })
-                                                } else {
+                                let is_value = callee_value_args
+                                    .as_ref()
+                                    .map(|mask| mask.get(i).copied().unwrap_or(false))
+                                    .unwrap_or(false);
+                                let wants_descriptor = callee_descriptor_args
+                                    .as_ref()
+                                    .map(|mask| mask.get(i).copied().unwrap_or(false))
+                                    .unwrap_or(false);
+                                let wants_string_descriptor = callee_string_descriptor_args
+                                    .as_ref()
+                                    .map(|mask| mask.get(i).copied().unwrap_or(false))
+                                    .unwrap_or(false);
+                                let wants_bind_c_char = callee_bind_c_char_args
+                                    .as_ref()
+                                    .map(|mask| mask.get(i).copied().unwrap_or(false))
+                                    .unwrap_or(false);
+                                let wants_descriptor = wants_descriptor && !wants_bind_c_char;
+                                let wants_string_descriptor =
+                                    wants_string_descriptor && !wants_bind_c_char;
+                                let wants_pointer = callee_pointer_args
+                                    .as_ref()
+                                    .map(|mask| mask.get(i).copied().unwrap_or(false))
+                                    .unwrap_or(false);
+                                let is_optional = opt_flags
+                                    .as_ref()
+                                    .map(|mask| mask.get(i).copied().unwrap_or(false))
+                                    .unwrap_or(false);
+                                let value = match slot {
+                                    Some(arg) => match &arg.value {
+                                        crate::ast::expr::SectionSubscript::Element(e) => {
+                                            let value = if is_value && wants_bind_c_char {
+                                                lower_bind_c_char_value_arg(
+                                                    b,
+                                                    locals,
+                                                    e,
+                                                    st,
+                                                    type_layouts,
+                                                    internal_funcs,
+                                                    contained_host_refs,
+                                                    descriptor_params,
+                                                )
+                                            } else if is_value {
+                                                let raw = lower_expr_full(
+                                                    b,
+                                                    locals,
+                                                    e,
+                                                    st,
+                                                    type_layouts,
+                                                    internal_funcs,
+                                                    contained_host_refs,
+                                                    descriptor_params,
+                                                );
+                                                coerce_value_call_arg(
+                                                    b,
+                                                    st,
+                                                    abi_primary_key,
+                                                    i,
+                                                    raw,
+                                                )
+                                            } else if wants_descriptor {
+                                                lower_arg_descriptor_full(
+                                                    b,
+                                                    locals,
+                                                    e,
+                                                    st,
+                                                    type_layouts,
+                                                    internal_funcs,
+                                                    contained_host_refs,
+                                                    descriptor_params,
+                                                    false,
+                                                )
+                                            } else if wants_string_descriptor {
+                                                lower_arg_string_descriptor(
+                                                    b,
+                                                    locals,
+                                                    e,
+                                                    st,
+                                                    type_layouts,
+                                                )
+                                            } else if wants_bind_c_char {
+                                                lower_bind_c_char_arg_raw(
+                                                    b,
+                                                    locals,
+                                                    e,
+                                                    st,
+                                                    type_layouts,
+                                                    internal_funcs,
+                                                    contained_host_refs,
+                                                    descriptor_params,
+                                                )
+                                            } else if wants_pointer {
+                                                lower_pointer_dummy_actual(
+                                                    b,
+                                                    locals,
+                                                    e,
+                                                    st,
+                                                    type_layouts,
+                                                    internal_funcs,
+                                                    contained_host_refs,
+                                                    descriptor_params,
+                                                )
+                                                .unwrap_or_else(|| {
                                                     lower_arg_by_ref_full(
                                                         b,
                                                         locals,
@@ -2350,78 +2668,104 @@ pub(crate) fn lower_expr_full(
                                                         contained_host_refs,
                                                         descriptor_params,
                                                     )
-                                                }
-                                            }
-                                            _ => b.const_i32(0),
-                                        },
-                                        None => missing_optional_call_arg(
-                                            b,
-                                            st,
-                                            abi_primary_key,
-                                            i,
-                                            is_value,
-                                        ),
-                                    };
-                                    call_args.push(value);
-                                }
-                                if let Some(opt_flags) = opt_flags {
-                                    for flag in opt_flags.iter().skip(call_args.len()) {
-                                        if *flag {
-                                            call_args.push(b.const_i64(0));
+                                                })
+                                            } else {
+                                                lower_arg_by_ref_full(
+                                                    b,
+                                                    locals,
+                                                    e,
+                                                    st,
+                                                    type_layouts,
+                                                    internal_funcs,
+                                                    contained_host_refs,
+                                                    descriptor_params,
+                                                )
+                                            };
+                                            optional_arg_absent_if_unallocated_allocatable_char(
+                                                b,
+                                                locals,
+                                                e,
+                                                st,
+                                                type_layouts,
+                                                is_optional
+                                                    && !is_value
+                                                    && !wants_descriptor
+                                                    && !wants_string_descriptor
+                                                    && !wants_bind_c_char
+                                                    && !wants_pointer,
+                                                value,
+                                            )
                                         }
+                                        _ => b.const_i32(0),
+                                    },
+                                    None => missing_optional_call_arg(
+                                        b,
+                                        st,
+                                        abi_primary_key,
+                                        i,
+                                        is_value,
+                                    ),
+                                };
+                                call_args.push(value);
+                            }
+                            if let Some(opt_flags) = opt_flags {
+                                for flag in opt_flags.iter().skip(call_args.len()) {
+                                    if *flag {
+                                        call_args.push(b.const_i64(0));
                                     }
                                 }
-                                if let Some(cls_flags) = &callee_char_len_star_args {
-                                    for (i, flag) in cls_flags.iter().enumerate() {
-                                        if !*flag || i >= arg_slots.len() {
-                                            continue;
-                                        }
-                                        if let Some(arg) = &arg_slots[i] {
-                                            if let crate::ast::expr::SectionSubscript::Element(e) =
-                                                &arg.value
-                                            {
-                                                call_args.push(
-                                                    actual_char_arg_runtime_len(
-                                                        b,
-                                                        locals,
-                                                        None,
-                                                        e,
-                                                        st,
-                                                        type_layouts,
-                                                        internal_funcs,
-                                                        contained_host_refs,
-                                                        descriptor_params,
-                                                    )
-                                                    .unwrap_or_else(|| b.const_i64(0)),
-                                                );
-                                            } else {
-                                                call_args.push(b.const_i64(0));
-                                            }
+                            }
+                            if let Some(cls_flags) = &callee_char_len_star_args {
+                                for (i, flag) in cls_flags.iter().enumerate() {
+                                    if !*flag || i >= arg_slots.len() {
+                                        continue;
+                                    }
+                                    if let Some(arg) = &arg_slots[i] {
+                                        if let crate::ast::expr::SectionSubscript::Element(e) =
+                                            &arg.value
+                                        {
+                                            call_args.push(
+                                                actual_char_arg_runtime_len(
+                                                    b,
+                                                    locals,
+                                                    None,
+                                                    e,
+                                                    st,
+                                                    type_layouts,
+                                                    internal_funcs,
+                                                    contained_host_refs,
+                                                    descriptor_params,
+                                                )
+                                                .unwrap_or_else(|| b.const_i64(0)),
+                                            );
                                         } else {
                                             call_args.push(b.const_i64(0));
                                         }
+                                    } else {
+                                        call_args.push(b.const_i64(0));
                                     }
                                 }
+                            }
 
-                                let ret_ty = first_procedure_lookup(&abi_lookup_keys, |k| {
-                                    callee_return_ir_type(st, k)
-                                })
-                                .unwrap_or(IrType::Int(IntWidth::I32));
-                                let call_result =
-                                    b.call(FuncRef::External(call_name), call_args, ret_ty);
-                                if let Some(tl) = type_layouts {
-                                    if let Some(type_name) =
-                                        callee_return_stabilized_derived_type_name(st, &target_key)
-                                    {
-                                        return stabilize_derived_call_result(
-                                            b,
-                                            tl,
-                                            &type_name,
-                                            call_result,
-                                        );
-                                    }
+                            let ret_ty = first_procedure_lookup(&abi_lookup_keys, |k| {
+                                callee_return_ir_type(st, k)
+                            })
+                            .unwrap_or(IrType::Int(IntWidth::I32));
+                            let call_result =
+                                b.call(FuncRef::External(call_name), call_args, ret_ty);
+                            if let Some(tl) = type_layouts {
+                                if let Some(type_name) =
+                                    callee_return_stabilized_derived_type_name(st, &target_key)
+                                {
+                                    return stabilize_derived_call_result(
+                                        b,
+                                        tl,
+                                        &type_name,
+                                        call_result,
+                                    );
                                 }
-                                return call_result;
+                            }
+                            return call_result;
                         }
                     }
                     reject_unsupported_polymorphic_component_method_base(
@@ -2465,11 +2809,7 @@ pub(crate) fn lower_expr_full(
                         contained_host_refs,
                         descriptor_params,
                     );
-                    let off = if lc_component == "re" {
-                        0
-                    } else {
-                        kind_bytes
-                    };
+                    let off = if lc_component == "re" { 0 } else { kind_bytes };
                     let off_v = b.const_i64(off);
                     let lane_ptr = b.gep(base_addr, vec![off_v], IrType::Int(IntWidth::I8));
                     return b.load_typed(lane_ptr, elem_ty);
@@ -2713,20 +3053,8 @@ pub(crate) fn lower_expr_full(
 
         Expr::ComplexLiteral { real, imag } => {
             // Complex numbers are stored as a 2-element float array on the stack.
-            // Determine float width from the literal parts: if either uses a 'd'/'D'
-            // exponent it's double precision (f64), otherwise single (f32).
-            let is_double = |e: &crate::ast::expr::SpannedExpr| -> bool {
-                if let Expr::RealLiteral { text, .. } = &e.node {
-                    text.to_lowercase().contains('d')
-                } else {
-                    false
-                }
-            };
-            let fw = if is_double(real) || is_double(imag) {
-                FloatWidth::F64
-            } else {
-                FloatWidth::F32
-            };
+            // Honor both d-exponents and kind-suffixed literal parts.
+            let fw = complex_literal_float_width(real, imag, locals, st, type_layouts);
             let elem_ty = IrType::Float(fw);
             let elem_bytes = b.const_i64(if fw == FloatWidth::F64 { 8 } else { 4 });
             let arr_ty = IrType::Array(Box::new(elem_ty.clone()), 2);

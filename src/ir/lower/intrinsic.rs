@@ -12,7 +12,11 @@ use super::helpers::{coerce_to_type, storage_size_bits_for_ir_type};
 
 /// Lower a Fortran intrinsic function call to IR instructions.
 /// Returns Some(ValueId) if recognized, None for external functions.
-pub(crate) fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId]) -> Option<ValueId> {
+pub(crate) fn lower_intrinsic(
+    b: &mut FuncBuilder,
+    name: &str,
+    args: &[ValueId],
+) -> Option<ValueId> {
     match name {
         "cmplx" => {
             if let Some(real_arg) = args.first() {
@@ -90,15 +94,31 @@ pub(crate) fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId])
         }
         "merge" => {
             if args.len() >= 3 {
-                let mut ty = b
+                let t_ty = b
                     .func()
                     .value_type(args[0])
                     .unwrap_or(IrType::Int(IntWidth::I32));
+                let f_ty = b
+                    .func()
+                    .value_type(args[1])
+                    .unwrap_or(IrType::Int(IntWidth::I32));
+                if is_complex_ty(&t_ty) || is_complex_ty(&f_ty) {
+                    let fw = if [t_ty.clone(), f_ty.clone()]
+                        .iter()
+                        .any(|ty| is_complex_ty(ty) && complex_float_width(ty) == FloatWidth::F64)
+                    {
+                        FloatWidth::F64
+                    } else {
+                        FloatWidth::F32
+                    };
+                    let true_val = materialize_complex_operand(b, args[0], fw);
+                    let false_val = materialize_complex_operand(b, args[1], fw);
+                    let mask = coerce_to_type(b, args[2], &IrType::Bool);
+                    return Some(b.select(mask, true_val, false_val));
+                }
+                let mut ty = t_ty;
                 if ty.is_float() {
-                    if matches!(
-                        b.func().value_type(args[1]),
-                        Some(IrType::Float(FloatWidth::F64))
-                    ) {
+                    if matches!(f_ty, IrType::Float(FloatWidth::F64)) {
                         ty = IrType::Float(FloatWidth::F64);
                     }
                 } else if ty.is_int() {
@@ -212,7 +232,14 @@ pub(crate) fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId])
                     .and_then(|kind| extract_const_int_from_value(b, *kind))
                     .and_then(int_width_from_kind_value)
                     .unwrap_or(IntWidth::I32);
-                if ty.is_float() {
+                if is_complex_ty(&ty) {
+                    let fw = complex_float_width(&ty);
+                    let buf = materialize_complex_operand(b, *arg, fw);
+                    let zero = b.const_i64(0);
+                    let re_ptr = b.gep(buf, vec![zero], IrType::Int(IntWidth::I8));
+                    let re = b.load_typed(re_ptr, IrType::Float(fw));
+                    Some(b.float_to_int(re, requested_width))
+                } else if ty.is_float() {
                     Some(b.float_to_int(*arg, requested_width))
                 } else {
                     Some(coerce_to_type(b, *arg, &IrType::Int(requested_width)))
@@ -613,7 +640,8 @@ pub(crate) fn lower_intrinsic(b: &mut FuncBuilder, name: &str, args: &[ValueId])
                 let pos_top = b.isub(bits, shift);
                 // Pre-fill: -1 if top bit of x is 1, else 0.
                 let one = int_const_for_width(b, value_width, 1);
-                let top_bit_pos = int_const_for_width(b, value_width, (value_width.bits() - 1) as i64);
+                let top_bit_pos =
+                    int_const_for_width(b, value_width, (value_width.bits() - 1) as i64);
                 let top_bit = b.lshr(args[0], top_bit_pos);
                 let sign = b.bit_and(top_bit, one);
                 let neg_one = int_const_for_width(b, value_width, -1);

@@ -736,6 +736,26 @@ pub fn expr_type(
                     let has_range = args.iter().any(|a| {
                         matches!(a.value, crate::ast::expr::SectionSubscript::Range { .. })
                     });
+                    if has_range
+                        && matches!(
+                            sym.kind,
+                            super::symtab::SymbolKind::Variable
+                                | super::symtab::SymbolKind::Parameter
+                        )
+                    {
+                        return match &sym.type_info {
+                            Some(super::symtab::TypeInfo::Character { .. })
+                                if sym.attrs.array_spec.is_empty() =>
+                            {
+                                FortranType::Character {
+                                    kind: 1,
+                                    len: CharLen::Unknown,
+                                }
+                            }
+                            Some(info) => type_info_to_fortran_type(info),
+                            None => FortranType::Unknown,
+                        };
+                    }
                     match disambiguate_call(&sym.kind, has_range) {
                         CallKind::ArrayElement => {
                             // Array element has the element type
@@ -967,9 +987,12 @@ pub fn intrinsic_result_type(name: &str, args: &[FortranType]) -> Option<Fortran
         // Integer-valued.
         "int" | "nint" | "floor" | "ceiling" => Some(FortranType::default_integer()),
         "len" | "len_trim" | "index" | "scan" | "verify" => Some(FortranType::default_integer()),
-        "size" | "lbound" | "ubound" | "shape" => Some(FortranType::default_integer()),
+        "size" | "lbound" | "ubound" | "shape" | "rank" => Some(FortranType::default_integer()),
         "kind" | "selected_int_kind" | "selected_real_kind" => Some(FortranType::default_integer()),
-        "iand" | "ior" | "ieor" | "ishft" | "ibits" => args.first().cloned(),
+        "iand" | "ior" | "ieor" | "not" | "ishft" | "ishftc" | "shiftl" | "shiftr" | "shifta"
+        | "ibits" | "ibset" | "ibclr" | "merge_bits" | "dshiftl" | "dshiftr" => {
+            args.first().cloned()
+        }
         "bit_size" | "leadz" | "trailz" | "popcount" | "popcnt" | "poppar" => {
             Some(FortranType::default_integer())
         }

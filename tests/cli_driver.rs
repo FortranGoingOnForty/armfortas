@@ -56,6 +56,29 @@ fn write_program_in(dir: &std::path::Path, name: &str, text: &str) -> PathBuf {
     path
 }
 
+fn run_binary_with_timeout(
+    path: &std::path::Path,
+    timeout: std::time::Duration,
+) -> Option<std::process::Output> {
+    let mut child = Command::new(path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("run failed to spawn");
+    let start = std::time::Instant::now();
+    loop {
+        if child.try_wait().expect("try_wait failed").is_some() {
+            return Some(child.wait_with_output().expect("wait_with_output failed"));
+        }
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 fn undefined_symbols(path: &std::path::Path) -> Vec<String> {
     let out = Command::new("nm")
         .args(["-u", "-j", path.to_str().unwrap()])
@@ -540,6 +563,192 @@ fn stream_unformatted_char_write_preserves_exact_bytes() {
 }
 
 #[test]
+fn stream_unformatted_narrow_integer_io_preserves_raw_widths() {
+    let input = unique_path("stream_unformatted_narrow_integer_read", "bin");
+    std::fs::write(&input, [0x32u8, 0x00, 0x09, 0xde, 0x34, 0x12, 0xfe, 0xff])
+        .expect("cannot seed narrow integer stream input");
+
+    let output_file = unique_path("stream_unformatted_narrow_integer_write", "bin");
+    let src = write_program(
+        &format!(
+            "program p\n  use iso_fortran_env, only: int8, int16\n  implicit none\n  integer :: unit_num, ios\n  integer(int8) :: bytes(4), got_bytes(4)\n  integer(int16) :: words(2), got_words(2)\n  bytes = [50_int8, 9_int8, 46_int8, -34_int8]\n  words = [4660_int16, -2_int16]\n  open(newunit=unit_num, file='{}', status='replace', action='write', access='stream', form='unformatted', iostat=ios)\n  if (ios /= 0) error stop 1\n  write(unit_num, iostat=ios) bytes\n  if (ios /= 0) error stop 2\n  write(unit_num, iostat=ios) words\n  if (ios /= 0) error stop 3\n  close(unit_num)\n  got_bytes = 0_int8\n  got_words = 0_int16\n  open(newunit=unit_num, file='{}', status='old', action='read', access='stream', form='unformatted', iostat=ios)\n  if (ios /= 0) error stop 4\n  read(unit_num, iostat=ios) got_bytes\n  if (ios /= 0) error stop 5\n  read(unit_num, iostat=ios) got_words\n  if (ios /= 0) error stop 6\n  close(unit_num)\n  if (got_bytes(1) /= 50_int8) error stop 7\n  if (got_bytes(2) /= 0_int8) error stop 8\n  if (got_bytes(3) /= 9_int8) error stop 9\n  if (got_bytes(4) /= -34_int8) error stop 10\n  if (got_words(1) /= 4660_int16) error stop 11\n  if (got_words(2) /= -2_int16) error stop 12\n  print *, 'ok'\nend program\n",
+            output_file.display(),
+            input.display()
+        ),
+        "stream_unformatted_narrow_integer_io.f90",
+    );
+    let out = unique_path("stream_unformatted_narrow_integer_io", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("stream unformatted narrow integer compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "stream unformatted narrow integer compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("stream unformatted narrow integer run failed");
+    assert!(
+        run.status.success(),
+        "stream unformatted narrow integer run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected ok output, got: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let bytes = std::fs::read(&output_file).expect("cannot read narrow integer stream output");
+    assert_eq!(
+        bytes,
+        vec![0x32, 0x09, 0x2e, 0xde, 0x34, 0x12, 0xfe, 0xff],
+        "expected exact int8/int16 stream bytes, got {:?}",
+        bytes
+    );
+
+    let _ = std::fs::remove_file(&input);
+    let _ = std::fs::remove_file(&output_file);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn sequential_unformatted_array_sections_round_trip_allocatables_and_components() {
+    let src = write_program(
+        "program p\n  implicit none\n  type :: box_t\n    integer(kind=8), allocatable :: blocks(:)\n  end type\n  integer :: unit_num, ios\n  integer(kind=8), allocatable :: a(:), b(:)\n  type(box_t) :: source_box, dest_box\n  allocate(a(2), b(2), source_box%blocks(2), dest_box%blocks(2))\n  a = [123456789_8, -77_8]\n  b = -1_8\n  source_box%blocks = [987654321_8, -33_8]\n  dest_box%blocks = -1_8\n  open(newunit=unit_num, form='unformatted', status='scratch', action='readwrite', iostat=ios)\n  if (ios /= 0) error stop 1\n  write(unit_num, iostat=ios) a(:)\n  if (ios /= 0) error stop 2\n  write(unit_num, iostat=ios) source_box%blocks(:)\n  if (ios /= 0) error stop 3\n  rewind(unit_num)\n  read(unit_num, iostat=ios) b(:)\n  if (ios /= 0) error stop 4\n  read(unit_num, iostat=ios) dest_box%blocks(:)\n  if (ios /= 0) error stop 5\n  close(unit_num)\n  if (any(b /= a)) error stop 6\n  if (any(dest_box%blocks /= source_box%blocks)) error stop 7\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("sequential_unformatted_array_section_io", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("sequential unformatted array section compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "sequential unformatted array section compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("sequential unformatted array section run failed");
+    assert!(
+        run.status.success(),
+        "sequential unformatted array section run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected ok output, got: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn stream_unformatted_char_array_section_read_preserves_byte_count() {
+    let input = unique_path("stream_unformatted_char_array_section_read", "bin");
+    std::fs::write(&input, [118u8, 0, b'{', b'd', b'e', b's'])
+        .expect("cannot seed stream char section input");
+
+    let src = write_program(
+        &format!(
+            "program p\n  implicit none\n  integer :: unit_num, ios\n  character :: buf(4)\n  character(len=1) :: next\n  buf = 'Z'\n  open(newunit=unit_num, file='{}', status='old', action='read', access='stream', form='unformatted', iostat=ios)\n  if (ios /= 0) error stop 1\n  read(unit_num, iostat=ios) buf(1:2)\n  if (ios /= 0) error stop 2\n  if (iachar(buf(1)) /= 118) error stop 3\n  if (iachar(buf(2)) /= 0) error stop 4\n  if (buf(3) /= 'Z') error stop 5\n  if (buf(4) /= 'Z') error stop 6\n  read(unit_num, iostat=ios) next\n  if (ios /= 0) error stop 7\n  if (next /= '{{') error stop 8\n  print *, 'ok'\n  close(unit_num)\nend program\n",
+            input.display()
+        ),
+        "stream_unformatted_char_array_section_read.f90",
+    );
+    let out = unique_path("stream_unformatted_char_array_section_read", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("stream unformatted char array section read compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "stream unformatted char array section read compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("stream unformatted char array section read run failed");
+    assert!(
+        run.status.success(),
+        "stream unformatted char array section read failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected ok output, got: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&input);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn stream_unformatted_real_array_read_preserves_raw_f32_bytes() {
+    let input = unique_path("stream_unformatted_real_array_read", "dat");
+    let mut bytes = Vec::new();
+    for value in [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0] {
+        bytes.extend_from_slice(&value.to_ne_bytes());
+    }
+    std::fs::write(&input, bytes).expect("cannot seed stream real array input");
+
+    let src = write_program(
+        &format!(
+            "program p\n  implicit none\n  integer :: unit_num, ios\n  real :: x(2, 3)\n  x = 0.0\n  open(newunit=unit_num, file='{}', status='old', action='read', access='stream', form='unformatted', iostat=ios)\n  if (ios /= 0) error stop 1\n  read(unit_num, iostat=ios) x\n  close(unit_num)\n  if (ios /= 0) error stop 2\n  if (abs(x(1,1) - 1.0) > 1.0e-6) error stop 3\n  if (abs(x(2,1) - 2.0) > 1.0e-6) error stop 4\n  if (abs(x(1,3) - 5.0) > 1.0e-6) error stop 5\n  if (abs(x(2,3) - 6.0) > 1.0e-6) error stop 6\n  print *, 'ok'\nend program\n",
+            input.display()
+        ),
+        "stream_unformatted_real_array_read.f90",
+    );
+    let out = unique_path("stream_unformatted_real_array_read", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("stream unformatted real array read compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "stream unformatted real array read compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("stream unformatted real array read run failed");
+    assert!(
+        run.status.success(),
+        "stream unformatted real array read failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected ok output, got: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&input);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn sequential_unformatted_write_emits_record_markers_and_clears_iostat() {
     let output_file = unique_path("seq_unformatted_iostat", "bin");
     let src = write_program(
@@ -588,9 +797,7 @@ fn sequential_unformatted_write_emits_record_markers_and_clears_iostat() {
     // + 4 bytes of trailing length = 12 bytes total.
     assert_eq!(
         bytes,
-        vec![
-            0x04, 0x00, 0x00, 0x00, 0x2a, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
-        ],
+        vec![0x04, 0x00, 0x00, 0x00, 0x2a, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,],
         "expected sequential-unformatted record framing, got {:?}",
         bytes
     );
@@ -727,9 +934,7 @@ fn advancing_a1_read_consumes_in_flight_noadvance_cursor() {
         String::from_utf8_lossy(&compile.stderr)
     );
 
-    let run = Command::new(&out)
-        .output()
-        .expect("a1 advance run failed");
+    let run = Command::new(&out).output().expect("a1 advance run failed");
     assert!(
         run.status.success(),
         "a1 advance run failed: status={:?} stderr={}",
@@ -807,7 +1012,9 @@ fn error_stop_with_allocatable_character_message_prints_user_text() {
         String::from_utf8_lossy(&compile.stderr)
     );
 
-    let run = Command::new(&out).output().expect("error stop alloc run failed");
+    let run = Command::new(&out)
+        .output()
+        .expect("error stop alloc run failed");
     assert_eq!(
         run.status.code(),
         Some(1),
@@ -2123,6 +2330,71 @@ fn bind_c_subroutine_value_arg_is_passed_by_value() {
 }
 
 #[test]
+fn bind_c_value_arg_uses_alias_abi_when_label_collides() {
+    let dir = unique_dir("bind_c_value_label_collision");
+    let c_src = write_program_in(
+        &dir,
+        "clash.c",
+        "#include <stdint.h>\n\nint32_t clash(int64_t value) {\n    return value == 1234567890123LL ? 77 : -1;\n}\n",
+    );
+    let c_obj = dir.join("clash.o");
+    compile_c_object(&c_src, &c_obj);
+
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "module m\n  use iso_c_binding, only: c_int, c_int64_t\n  implicit none\n  interface\n    integer(c_int) function c_check(value) bind(C, name='clash')\n      import :: c_int, c_int64_t\n      integer(c_int64_t), value :: value\n    end function c_check\n  end interface\n  type :: holder\n    integer(c_int64_t) :: value = 0_c_int64_t\n  end type holder\ncontains\n  subroutine clash(x, ok)\n    class(holder), intent(inout) :: x\n    logical, intent(out) :: ok\n    ok = x%value /= 0_c_int64_t\n  end subroutine clash\nend module m\n\nprogram p\n  use iso_c_binding, only: c_int64_t\n  use m\n  implicit none\n  type(holder) :: h\n  h%value = 1234567890123_c_int64_t\n  if (c_check(h%value) /= 77) error stop 1\n  print *, 'ok'\nend program\n",
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_obj = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("bind(c) value label collision object compile failed to spawn");
+    assert!(
+        compile_obj.status.success(),
+        "bind(c) value label collision should compile: {}",
+        String::from_utf8_lossy(&compile_obj.stderr)
+    );
+
+    let exe = dir.join("bind_c_value_label_collision.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            main_obj.to_str().unwrap(),
+            c_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("bind(c) value label collision link failed to spawn");
+    assert!(
+        link.status.success(),
+        "bind(c) value label collision should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("bind(c) value label collision run failed");
+    assert!(
+        run.status.success(),
+        "bind(c) value label collision should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn bind_c_interface_subroutine_value_survives_amod_import_and_runs() {
     let dir = unique_dir("bind_c_interface_value_amod");
     let c_src = write_program_in(
@@ -2909,6 +3181,43 @@ fn absent_optional_char_array_forwarding_uses_zero_hidden_length() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn unallocated_allocatable_char_actual_is_absent_for_optional_dummy() {
+    let src = write_program(
+        "module m\n  implicit none\n  type :: holder_t\n    character(:), allocatable :: missing\n    character(:), allocatable :: value\n  end type\ncontains\n  subroutine require_absent_and_value(missing, value)\n    character(len=*), intent(in), optional :: missing\n    character(len=*), intent(in), optional :: value\n    if (present(missing)) error stop 1\n    if (.not. present(value)) error stop 2\n    if (len(value) /= 0) error stop 3\n  end subroutine\n\n  integer function component_code(missing, value) result(code)\n    character(len=*), intent(in), optional :: missing\n    character(len=*), intent(in), optional :: value\n    code = 0\n    if (present(missing)) code = code + 10 + len(missing)\n    if (present(value)) code = code + 100 + len(value)\n  end function\n\n  subroutine run()\n    character(:), allocatable :: missing\n    character(:), allocatable :: value\n    type(holder_t) :: holder\n    value = ''\n    call require_absent_and_value(missing, value)\n    holder%value = ''\n    if (component_code(holder%missing, holder%value) /= 100) error stop 4\n  end subroutine\nend module\n\nprogram p\n  use m\n  implicit none\n  call run()\n  print *, 'ok'\nend program\n",
+        "optional_unallocated_allocatable_char.f90",
+    );
+    let out = unique_path("optional_unallocated_allocatable_char", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("optional allocatable char compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "optional allocatable char should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("optional allocatable char run failed");
+    assert!(
+        run.status.success(),
+        "optional allocatable char should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected optional allocatable char output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
 }
 
 #[test]
@@ -4383,6 +4692,62 @@ end program
     assert!(
         String::from_utf8_lossy(&run.stdout).contains("ok"),
         "expected 'ok': {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn scalarized_rank1_assignment_rewrites_full_slice_sections() {
+    let src = write_program(
+        r#"
+program test
+  implicit none
+  real :: x(2, 2)
+  x = reshape([1.0, 2.0, 3.0, 4.0], [2, 2])
+  call run(x)
+contains
+  subroutine run(x)
+    real, intent(in) :: x(:, :)
+    real :: aux(size(x, dim=1))
+    integer :: idx(2, 2)
+
+    aux = 2.0 * x(:, 2)
+    aux = aux + 0.5 * x(:, 1)
+    idx = reshape([1, 2, 2, 1], [2, 2])
+    aux = aux + x(idx(:, 2), 1)
+
+    if (abs(aux(1) - 8.5) > 1.0e-6) error stop 1
+    if (abs(aux(2) - 10.0) > 1.0e-6) error stop 2
+    print *, 'ok'
+  end subroutine
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("scalarized_full_slice", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("full-slice scalarization compile failed");
+    assert!(
+        compile.status.success(),
+        "rank-1 scalarized assignment should rewrite full-slice sections: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("full-slice scalarization run failed");
+    assert!(
+        run.status.success(),
+        "full-slice scalarization produced wrong values: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected full-slice scalarization output: {}",
         String::from_utf8_lossy(&run.stdout)
     );
     let _ = std::fs::remove_file(&out);
@@ -9250,6 +9615,41 @@ fn block_use_imports_module_values_and_procedures() {
 }
 
 #[test]
+fn block_local_variable_shadows_use_associated_parameter_for_assignment() {
+    let src = write_program(
+        "module constants\n  implicit none\n  real, parameter :: e = 2.7182818\nend module\nprogram p\n  use constants\n  implicit none\n  block\n    real :: E\n    E = 1.0\n    if (abs(E - 1.0) > 1.0e-6) error stop 1\n  end block\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("block_shadow_parameter", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("block parameter shadow compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "BLOCK local should shadow use-associated named constant: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("block parameter shadow run failed");
+    assert!(
+        run.status.success(),
+        "BLOCK parameter shadow binary failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected BLOCK parameter shadow output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn block_interface_declares_callable_under_implicit_none() {
     let src = write_program(
         "subroutine s(acc_status)\n  use iso_c_binding, only: c_char, c_int\n  implicit none\n  integer, intent(out) :: acc_status\n  character(kind=c_char), target :: c_path(2)\n  block\n    interface\n      function cache_access(pathname, mode) bind(C, name=\"access\")\n        import :: c_char, c_int\n        character(kind=c_char), intent(in) :: pathname(*)\n        integer(c_int), value :: mode\n        integer(c_int) :: cache_access\n      end function\n    end interface\n    acc_status = cache_access(c_path, int(1, c_int))\n  end block\nend subroutine\n",
@@ -9265,6 +9665,36 @@ fn block_interface_declares_callable_under_implicit_none() {
         result.status.success(),
         "BLOCK-local interface procedures should count as declared: {}",
         String::from_utf8_lossy(&result.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn named_block_exit_after_deferred_char_assignment_skips_remaining_body() {
+    let src = write_program(
+        "program p\n  implicit none\n  integer, allocatable :: vshape(:)\n  integer :: stat\n  character(len=:), allocatable :: msg\n\n  allocate(vshape(0))\n  stat = 0\n\n  catch: block\n    if (size(vshape) /= 2) then\n      stat = 1\n      msg = 'rank mismatch'\n      exit catch\n    end if\n    call allocator(vshape)\n  end block catch\n\n  if (stat /= 1) error stop 20\n  if (.not. allocated(msg)) error stop 21\ncontains\n  subroutine allocator(vshape)\n    integer, intent(in) :: vshape(:)\n    integer, allocatable :: array(:, :)\n    allocate(array(vshape(1), vshape(2)))\n  end subroutine allocator\nend program\n",
+        "f90",
+    );
+    let out = unique_path("block_exit_after_msg", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("named block EXIT compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "named block EXIT should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("named block EXIT run spawn failed");
+    assert!(
+        run.status.success(),
+        "named block EXIT should skip block tail: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
     );
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
@@ -11852,6 +12282,45 @@ fn rank1_runtime_shape_array_function_result_into_fixed_dest() {
 }
 
 #[test]
+fn zero_size_allocatable_function_result_into_fixed_dest_zero_fills() {
+    // stdlib_intrinsics calls `d = stdlib_matmul(a,b,c,err=linerr)` on an
+    // error path where the function result is `allocate(res(0,0))`. The caller
+    // lowered fixed-shape assignment by loading the result descriptor's
+    // base_addr and memcpying the destination's static byte count, so a valid
+    // zero-size result became `memcpy(dest, NULL, n)` and crashed in
+    // test_intrinsics before it could inspect `linerr`.
+    let src = write_program(
+        "module m\ncontains\n  function make(flag) result(r)\n    logical, intent(in) :: flag\n    real, allocatable :: r(:,:)\n    if (flag) then\n      allocate(r(0, 0))\n    else\n      allocate(r(2, 2))\n      r = reshape([1.0, 2.0, 3.0, 4.0], [2, 2])\n    end if\n  end function\nend module\n\nprogram t\n  use m\n  implicit none\n  real :: a(2, 2)\n  a = -1.0\n  a = make(.true.)\n  if (a(1,1) /= 0.0 .or. a(2,2) /= 0.0) error stop 1\n  a = make(.false.)\n  if (abs(a(1,1) - 1.0) > 1.0e-6) error stop 2\n  if (abs(a(2,2) - 4.0) > 1.0e-6) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("zero_size_result_fixed_dest", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("zero-size function result compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "zero-size function result should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("zero-size function result run failed");
+    assert!(
+        run.status.success(),
+        "zero-size function result should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn size_with_kind_keyword_arg_returns_total_size_not_size_along_dim() {
     // F2018 §16.9.193: SIZE(array [, dim] [, kind]). The KIND keyword
     // selects the integer kind of the result; it is *not* a DIM
@@ -12185,6 +12654,166 @@ fn module_complex_parameter_const_initializes_data_section_with_both_lanes() {
 }
 
 #[test]
+fn module_complex_parameter_array_from_real_parameter_interleaves_zero_imag_lanes() {
+    let src = write_program(
+        "module m\n  use, intrinsic :: iso_fortran_env, only: real32, real64\n  implicit none\n  real(real32), parameter :: r_sp(4) = [-10.0_real32, 2.0_real32, 3.0_real32, 4.0_real32]\n  real(real64), parameter :: r_dp(4) = [-10.0_real64, 2.0_real64, 3.0_real64, 4.0_real64]\n  complex(real32), parameter :: c_sp(4) = r_sp\n  complex(real64), parameter :: c_dp(4) = r_dp\n  complex(real32) :: d_sp(3,2) = reshape(c_sp, [3,2], [(7.0_real32, -1.0_real32)])\nend module\nprogram p\n  use, intrinsic :: iso_fortran_env, only: real32, real64\n  use m, only: c_sp, c_dp, d_sp\n  implicit none\n  if (.not. (abs(real(c_sp(1)) + 10.0_real32) < 1.0e-5_real32)) error stop 1\n  if (.not. (abs(aimag(c_sp(1))) < 1.0e-5_real32)) error stop 2\n  if (.not. (abs(real(c_dp(2)) - 2.0_real64) < 1.0e-10_real64)) error stop 3\n  if (.not. (abs(aimag(c_dp(2))) < 1.0e-10_real64)) error stop 4\n  if (.not. (abs(real(d_sp(2,2)) - 7.0_real32) < 1.0e-5_real32)) error stop 5\n  if (.not. (abs(aimag(d_sp(2,2)) + 1.0_real32) < 1.0e-5_real32)) error stop 6\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let ir = unique_path("module_complex_param_array_from_real", "ir");
+    let emit_ir = Command::new(compiler("armfortas"))
+        .args([
+            src.to_str().unwrap(),
+            "--emit-ir",
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("emit-ir failed");
+    assert!(
+        emit_ir.status.success(),
+        "emit-ir failed: {}",
+        String::from_utf8_lossy(&emit_ir.stderr)
+    );
+    let ir_text = std::fs::read_to_string(&ir).expect("read ir");
+    assert!(
+        ir_text.contains("global @afs_mod_m_c_sp: [[f32 x 2] x 4] = [-10, 0, 2, 0, 3, 0, 4, 0]"),
+        "complex(sp) real-source parameter array not lane-interleaved:\n{}",
+        ir_text
+    );
+    assert!(
+        ir_text.contains(
+            "global @afs_mod_m_d_sp: [[f32 x 2] x 6] = [-10, 0, 2, 0, 3, 0, 4, 0, 7, -1, 7, -1]"
+        ),
+        "complex reshape PAD not lane-interleaved:\n{}",
+        ir_text
+    );
+
+    let out = unique_path("module_complex_param_array_from_real", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&ir);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn complex_sum_with_dim_uses_complex_reduction_helpers() {
+    let src = write_program(
+        "program p\n  use, intrinsic :: iso_fortran_env, only: real32, real64\n  implicit none\n  complex(real32) :: xsp(2,2,2,2), ysp(2,2,2), ymsp(2,2,2)\n  complex(real64) :: xdp(2,2,2,2), ydp(2,2,2), ymdp(2,2,2)\n  xsp = (1.0_real32, -2.0_real32)\n  xdp = (1.0_real64, -2.0_real64)\n  ysp = sum(xsp, 4)\n  ymsp = sum(xsp, 4, xsp%re > 0.0_real32)\n  ydp = sum(xdp, 4)\n  ymdp = sum(xdp, 4, xdp%re > 0.0_real64)\n  if (.not. all(abs(ysp - (2.0_real32, -4.0_real32)) < 1.0e-5_real32)) error stop 1\n  if (.not. all(abs(ymsp - (2.0_real32, -4.0_real32)) < 1.0e-5_real32)) error stop 2\n  if (.not. all(abs(ydp - (2.0_real64, -4.0_real64)) < 1.0e-10_real64)) error stop 3\n  if (.not. all(abs(ymdp - (2.0_real64, -4.0_real64)) < 1.0e-10_real64)) error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let ir = unique_path("complex_sum_dim_helpers", "ir");
+    let emit_ir = Command::new(compiler("armfortas"))
+        .args([
+            src.to_str().unwrap(),
+            "--emit-ir",
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("emit-ir failed");
+    assert!(
+        emit_ir.status.success(),
+        "emit-ir failed: {}",
+        String::from_utf8_lossy(&emit_ir.stderr)
+    );
+    let ir_text = std::fs::read_to_string(&ir).expect("read ir");
+    assert!(ir_text.contains("call @afs_array_sum_complex4_dim("));
+    assert!(ir_text.contains("call @afs_array_sum_complex4_dim_mask("));
+    assert!(ir_text.contains("call @afs_array_sum_complex8_dim("));
+    assert!(ir_text.contains("call @afs_array_sum_complex8_dim_mask("));
+    assert!(!ir_text.contains("call @afs_array_sum_int_dim("));
+
+    let out = unique_path("complex_sum_dim_helpers", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&ir);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn module_array_global_reshape_from_parameter_array_initializes_data_section() {
+    // stdlib's stats tests declare rank-N module data as
+    // `d2 = reshape(d1, shape)` where `d1` is a named array
+    // PARAMETER. The constant array folder handled literal
+    // constructors and reshape, but not a reshape source that names
+    // an earlier parameter array, so the global was emitted as
+    // zeroinit and mask expressions like `d2 > 0` collapsed.
+    let src = write_program(
+        "module m\n  use, intrinsic :: iso_fortran_env, only: int8\n  implicit none\n  integer(int8), parameter :: d1(6) = [-1_int8, 2_int8, 3_int8, -4_int8, 5_int8, -6_int8]\n  integer(int8) :: d2(2,3) = reshape(d1, [2,3])\n  integer(int8) :: d3(2,4) = reshape(d1, [2,4], [7_int8])\nend module\nprogram p\n  use, intrinsic :: iso_fortran_env, only: int8, real64\n  use m, only: d2, d3\n  implicit none\n  if (d2(1,1) /= -1_int8) error stop 1\n  if (d2(2,1) /= 2_int8) error stop 2\n  if (d2(1,2) /= 3_int8) error stop 3\n  if (d2(2,2) /= -4_int8) error stop 4\n  if (d2(1,3) /= 5_int8) error stop 5\n  if (d2(2,3) /= -6_int8) error stop 6\n  if (d3(1,4) /= 7_int8) error stop 7\n  if (d3(2,4) /= 7_int8) error stop 8\n  if (count(d2 > 0_int8) /= 3) error stop 9\n  if (sum(d2, mask=d2 > 0_int8) /= 10_int8) error stop 10\n  if (abs(sum(real(d2, real64), d2 > 0_int8) - 10.0_real64) > 1.0e-10_real64) error stop 11\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("module_param_array_reshape", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("module parameter array reshape compile failed");
+    assert!(
+        compile.status.success(),
+        "module parameter array reshape should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("module parameter array reshape run failed");
+    assert!(
+        run.status.success(),
+        "module parameter array reshape should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn allocatable_assignment_converts_int_array_constructor_to_real_lhs() {
     // F2018 §10.2.1.3: numeric element type mismatch between an array RHS
     // and an allocatable LHS forces per-element conversion. Without the
@@ -12211,6 +12840,119 @@ fn allocatable_assignment_converts_int_array_constructor_to_real_lhs() {
     assert!(
         run.status.success(),
         "should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn allocatable_assignment_converts_complex_array_to_real_lhs() {
+    // F2018 §10.2.1.3: assigning a complex array expression to a real
+    // array converts each element to the real part. The allocatable
+    // runtime conversion tagger used to peel complex(sp) to plain f32,
+    // so `real(:) = complex(:)` copied raw interleaved complex storage
+    // and produced [re1, im1, re2, ...]. stdlib's real eigvals example
+    // hit this when assigning complex eigenvalues into a real vector.
+    let src = write_program(
+        "program t\n  implicit none\n  complex, allocatable :: z(:)\n  real, allocatable :: r(:)\n  z = [(1.0, 10.0), (2.0, 20.0), (3.0, 30.0)]\n  r = z\n  if (size(r) /= 3) error stop 1\n  if (abs(r(1) - 1.0) > 1.0e-6) error stop 2\n  if (abs(r(2) - 2.0) > 1.0e-6) error stop 3\n  if (abs(r(3) - 3.0) > 1.0e-6) error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("complex_array_real_alloc", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("complex array to real alloc compile failed");
+    assert!(
+        compile.status.success(),
+        "complex array to real alloc should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("complex array to real alloc run failed");
+    assert!(
+        run.status.success(),
+        "complex array to real alloc should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn allocatable_assignment_converts_alloc_return_complex_array_to_real_lhs() {
+    // Same conversion as `r = z`, but through the hidden allocatable
+    // result ABI. Returning directly into the real destination descriptor
+    // lets the complex callee allocate 8-byte elements for a descriptor
+    // the caller later reads as real(4), exposing interleaved imag lanes.
+    let src = write_program(
+        "module m\ncontains\n  function vals() result(z)\n    implicit none\n    complex, allocatable :: z(:)\n    z = [(1.0, 10.0), (2.0, 20.0), (3.0, 30.0)]\n  end function\nend module\n\nprogram t\n  use m, only: vals\n  implicit none\n  real, allocatable :: r(:)\n  r = vals()\n  if (size(r) /= 3) error stop 1\n  if (abs(r(1) - 1.0) > 1.0e-6) error stop 2\n  if (abs(r(2) - 2.0) > 1.0e-6) error stop 3\n  if (abs(r(3) - 3.0) > 1.0e-6) error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("complex_alloc_result_real_alloc", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("complex alloc result to real alloc compile failed");
+    assert!(
+        compile.status.success(),
+        "complex alloc result to real alloc should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("complex alloc result to real alloc run failed");
+    assert!(
+        run.status.success(),
+        "complex alloc result to real alloc should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn allocatable_assignment_converts_generic_alloc_return_complex_array_to_real_lhs() {
+    // Stdlib's `eigvals(A)` is a generic interface. The generic name
+    // itself is not in alloc_return_funcs, so statement lowering used to
+    // treat the specific's temp descriptor as same-typed and memcpy it
+    // into a real allocatable, exposing complex imaginary lanes.
+    let src = write_program(
+        "module m\n  interface vals\n    module procedure vals_c\n  end interface\ncontains\n  function vals_c() result(z)\n    implicit none\n    complex, allocatable :: z(:)\n    z = [(1.0, 10.0), (2.0, 20.0), (3.0, 30.0)]\n  end function\nend module\n\nprogram t\n  use m, only: vals\n  implicit none\n  real, allocatable :: r(:)\n  r = vals()\n  if (size(r) /= 3) error stop 1\n  if (abs(r(1) - 1.0) > 1.0e-6) error stop 2\n  if (abs(r(2) - 2.0) > 1.0e-6) error stop 3\n  if (abs(r(3) - 3.0) > 1.0e-6) error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("generic_complex_alloc_result_real_alloc", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("generic complex alloc result to real alloc compile failed");
+    assert!(
+        compile.status.success(),
+        "generic complex alloc result to real alloc should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("generic complex alloc result to real alloc run failed");
+    assert!(
+        run.status.success(),
+        "generic complex alloc result to real alloc should pass: status={:?} stdout={} stderr={}",
         run.status,
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr)
@@ -12257,6 +12999,123 @@ fn module_parameter_bit_size_with_named_kind_suffix_folds_to_correct_value() {
 
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn module_parameter_bit_size_with_imported_renamed_kind_folds_to_correct_value() {
+    let dir = unique_dir("bit_size_imported_renamed_kind");
+    let kinds_src = write_program_in(
+        &dir,
+        "stdlib_kinds_like.f90",
+        "module stdlib_kinds_like\n  implicit none\n  integer, parameter :: int32 = selected_int_kind(9)\n  integer, parameter :: int64 = selected_int_kind(18)\nend module stdlib_kinds_like\n",
+    );
+    let bitsets_src = write_program_in(
+        &dir,
+        "bitsets_like.f90",
+        "module bitsets_like\n  use stdlib_kinds_like, only : bits_kind => int32, block_kind => int64\n  implicit none\n  integer(bits_kind), parameter :: block_size = bit_size(0_block_kind)\ncontains\n  function get_block_size() result(v)\n    integer(bits_kind) :: v\n    v = block_size\n  end function get_block_size\nend module bitsets_like\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use bitsets_like, only : block_size, get_block_size\n  implicit none\n  if (block_size /= 64) error stop 1\n  if (get_block_size() /= 64) error stop 2\n  print *, block_size\n  print *, 'ok'\nend program p\n",
+    );
+
+    let kinds_obj = dir.join("stdlib_kinds_like.o");
+    let compile_kinds = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            kinds_src.to_str().unwrap(),
+            "-o",
+            kinds_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("stdlib_kinds_like compile failed to spawn");
+    assert!(
+        compile_kinds.status.success(),
+        "stdlib_kinds_like should compile: {}",
+        String::from_utf8_lossy(&compile_kinds.stderr)
+    );
+
+    let bitsets_obj = dir.join("bitsets_like.o");
+    let compile_bitsets = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            bitsets_src.to_str().unwrap(),
+            "-o",
+            bitsets_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("bitsets_like compile failed to spawn");
+    assert!(
+        compile_bitsets.status.success(),
+        "bitsets_like should compile: {}",
+        String::from_utf8_lossy(&compile_bitsets.stderr)
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_main = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            main_src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("main compile failed to spawn");
+    assert!(
+        compile_main.status.success(),
+        "main should compile: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let exe = dir.join("bit_size_imported_renamed_kind.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            kinds_obj.to_str().unwrap(),
+            bitsets_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link failed to spawn");
+    assert!(
+        link.status.success(),
+        "objects should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "bit_size imported renamed kind should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("64"),
+        "expected block_size=64, got: {}",
+        stdout
+    );
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -12770,6 +13629,73 @@ fn procedure_pointer_component_default_init_resolves_renamed_target() {
 }
 
 #[test]
+fn intent_out_reapplies_inherited_procedure_pointer_component_defaults() {
+    let src = write_program(
+        "module m\n\
+           implicit none\n\
+           abstract interface\n\
+             function ifn(x) result(r)\n\
+               integer, intent(in) :: x\n\
+               integer :: r\n\
+             end function\n\
+           end interface\n\
+           type, abstract :: parent_t\n\
+             procedure(ifn), pointer, nopass :: fn => default_fn\n\
+           end type\n\
+           type, extends(parent_t) :: child_t\n\
+             integer :: marker = 0\n\
+           end type\n\
+         contains\n\
+           function default_fn(x) result(r)\n\
+             integer, intent(in) :: x\n\
+             integer :: r\n\
+             r = x * 3\n\
+           end function\n\
+           subroutine init_child(self)\n\
+             class(child_t), intent(out) :: self\n\
+             self%marker = 7\n\
+           end subroutine\n\
+         end module\n\
+         program p\n\
+           use m\n\
+           implicit none\n\
+           type(child_t) :: child\n\
+           integer :: got\n\
+           call init_child(child)\n\
+           if (.not. associated(child%fn)) error stop 1\n\
+           got = child%fn(5)\n\
+           if (got /= 15) error stop 2\n\
+           if (child%marker /= 7) error stop 3\n\
+           print *, 'ok'\n\
+         end program\n",
+        "f90",
+    );
+    let out = unique_path("intent_out_proc_ptr_parent_default", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "expected inherited procedure-pointer default after intent(out): status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn two_arg_transfer_into_allocatable_handles_array_constructor_source() {
     // F2018 §16.9.193: TRANSFER(SOURCE, MOLD) without SIZE produces
     // a rank-1 result of `ceil(bytes(SOURCE) / sizeof(MOLD_elem))`
@@ -12926,6 +13852,151 @@ fn class_star_optional_argument_forwards_through_intermediate_subroutine() {
         "expected present path to print P: {}",
         stdout
     );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn class_star_scalar_payload_reaches_procedure_callback() {
+    let src = write_program(
+        "module m\n\
+           implicit none\n\
+           abstract interface\n\
+             subroutine cb_i(payload)\n\
+               class(*), optional, intent(inout) :: payload\n\
+             end subroutine\n\
+           end interface\n\
+         contains\n\
+           subroutine run(callback, payload)\n\
+             procedure(cb_i), optional :: callback\n\
+             class(*), optional, intent(inout), target :: payload\n\
+             if (present(callback)) call callback(payload)\n\
+           end subroutine\n\
+         end module\n\
+         program p\n\
+           use m\n\
+           implicit none\n\
+           integer, target :: n\n\
+           n = 0\n\
+           call run(callback=mark, payload=n)\n\
+           if (n /= 7) error stop 1\n\
+           call run(callback=mark)\n\
+           if (n /= 7) error stop 2\n\
+           print *, 'ok'\n\
+         contains\n\
+           subroutine mark(payload)\n\
+             class(*), optional, intent(inout) :: payload\n\
+             if (.not. present(payload)) return\n\
+             select type (payload)\n\
+             type is (integer)\n\
+               payload = 7\n\
+             class default\n\
+               error stop 3\n\
+             end select\n\
+           end subroutine\n\
+         end program\n",
+        "f90",
+    );
+    let out = unique_path("class_star_scalar_payload_cb", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "expected class(*) scalar payload callback to mutate n: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn class_star_pointer_component_payload_forwards_to_callback() {
+    let src = write_program(
+        "module m\n\
+           implicit none\n\
+           abstract interface\n\
+             subroutine cb_i(payload)\n\
+               class(*), optional, intent(inout) :: payload\n\
+             end subroutine\n\
+           end interface\n\
+           type :: holder_t\n\
+             procedure(cb_i), pointer, nopass :: callback => null()\n\
+             class(*), pointer :: payload => null()\n\
+           end type\n\
+         contains\n\
+           subroutine open(h, callback, payload)\n\
+             type(holder_t), intent(out) :: h\n\
+             procedure(cb_i), optional :: callback\n\
+             class(*), optional, intent(inout), target :: payload\n\
+             if (present(callback)) h%callback => callback\n\
+             if (present(payload)) h%payload => payload\n\
+           end subroutine\n\
+           subroutine finish(h)\n\
+             type(holder_t), intent(inout) :: h\n\
+             if (associated(h%callback)) call h%callback(h%payload)\n\
+           end subroutine\n\
+         end module\n\
+         program p\n\
+           use m\n\
+           implicit none\n\
+           type(holder_t) :: h\n\
+           integer, target :: n\n\
+           n = 0\n\
+           call open(h, mark, n)\n\
+           call finish(h)\n\
+           if (n /= 9) error stop 1\n\
+           call open(h, mark)\n\
+           call finish(h)\n\
+           if (n /= 9) error stop 2\n\
+           print *, 'ok'\n\
+         contains\n\
+           subroutine mark(payload)\n\
+             class(*), optional, intent(inout) :: payload\n\
+             if (.not. present(payload)) return\n\
+             select type (payload)\n\
+             type is (integer)\n\
+               payload = 9\n\
+             class default\n\
+               error stop 3\n\
+             end select\n\
+           end subroutine\n\
+         end program\n",
+        "f90",
+    );
+    let out = unique_path("class_star_component_payload_cb", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "expected class(*) pointer component payload to forward as descriptor: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker: {}", stdout);
 
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
@@ -13294,6 +14365,42 @@ fn sum_with_dim_and_mask_filters_per_column_using_descriptor_strides() {
 }
 
 #[test]
+fn count_with_dim_over_expression_mask_returns_per_column_counts() {
+    // COUNT(MASK, DIM) is a rank-reducing array result even when MASK
+    // is an expression such as `y > 0`. The descriptor path used to
+    // recognize only bare named masks, so expression masks lowered to
+    // scalar `afs_array_count_logical` and broadcast the total count
+    // into the result. stdlib's `mean(x, dim, mask)` divides the
+    // correct per-column sum by this count result.
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: y(3,4)\n  integer :: c(4)\n  y = reshape([-1,2,3, 4,-5,6, -7,8,9, 10,11,-12], [3,4])\n  c = count(y > 0, 1)\n  if (any(c /= [2,2,2,2])) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("count_dim_expr_mask", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "run failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected 'ok': {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn ieee_is_nan_over_rank_n_array_dispatches_elementally() {
     // F2018 §17.11: ieee_is_nan is elemental — applied to a rank-N
     // numeric array it must yield a same-shape logical array. Without
@@ -13621,6 +14728,96 @@ fn epsilon_tiny_huge_fold_at_compile_time_for_module_parameters() {
 
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn named_inquiry_parameter_constants_survive_cross_tu_import() {
+    // Mirrors stdlib_blas_constants_sp: named inquiry arguments like
+    // `epsilon(zero)` and nested `real(radix(zero), sp)` must be folded
+    // into the producing module global before consumers load the .amod.
+    let dir = unique_dir("named_inquiry_params");
+    let mod_src = write_program_in(
+        &dir,
+        "machine_constants.f90",
+        "module machine_constants\n  implicit none\n  integer, parameter :: sp = kind(0.0)\n  real(sp), parameter :: zero = 0.0_sp\n  real(sp), parameter :: half = 0.5_sp\n  integer, parameter :: maxexp = maxexponent(zero)\n  integer, parameter :: minexp = minexponent(zero)\n  real(sp), parameter :: rradix = real(radix(zero), sp)\n  real(sp), parameter :: ulp = epsilon(zero)\n  real(sp), parameter :: eps = ulp * half\n  real(sp), parameter :: safmin = rradix**max(minexp - 1, 1 - maxexp)\n  real(sp), parameter :: safmax = 1.0_sp / safmin\n  real(sp), parameter :: bignum = safmax * ulp\n  real(sp), parameter :: rtmin = sqrt(safmin / ulp)\n  real(sp), parameter :: tsml = rradix**ceiling((minexp - 1) * half)\n  real(sp), parameter :: ssml = rradix**(-floor((minexp - digits(zero)) * half))\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use machine_constants\n  implicit none\n  if (maxexp /= 128) error stop 1\n  if (minexp /= -125) error stop 2\n  if (rradix /= 2.0_sp) error stop 3\n  if (ulp <= 0.0_sp .or. ulp > 1.0e-6_sp) error stop 4\n  if (eps <= 0.0_sp .or. eps >= ulp) error stop 5\n  if (safmin <= 0.0_sp) error stop 6\n  if (safmax <= 1.0e37_sp) error stop 7\n  if (bignum <= 1.0e30_sp) error stop 8\n  if (rtmin <= 0.0_sp) error stop 9\n  if (tsml <= 0.0_sp) error stop 10\n  if (ssml <= 1.0e20_sp) error stop 11\n  print *, 'ok'\nend program\n",
+    );
+
+    let mod_obj = dir.join("machine_constants.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            mod_src.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("machine constants module compile failed to spawn");
+    assert!(
+        compile_mod.status.success(),
+        "machine constants module should compile: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_main = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            main_src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("machine constants consumer compile failed to spawn");
+    assert!(
+        compile_main.status.success(),
+        "machine constants consumer should compile: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let exe = dir.join("named_inquiry_params.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            mod_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("machine constants link failed to spawn");
+    assert!(
+        link.status.success(),
+        "machine constants objects should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("machine constants run failed to spawn");
+    assert!(
+        run.status.success(),
+        "machine constants binary should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok: {}", stdout);
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -14120,6 +15317,69 @@ fn merge_intrinsic_routes_array_operands_through_descriptor_path() {
 }
 
 #[test]
+fn complex_merge_array_operand_materializes_descriptor() {
+    let src = write_program(
+        "subroutine s(x, center, mask, out)\n  complex(4), intent(in) :: x(:), center(:)\n  logical, intent(in) :: mask(:)\n  complex(4), intent(out) :: out(:)\n  out = (0.0_4, 0.0_4)\n  out = out + merge((x - center)**2, cmplx(0.0_4, 0.0_4, kind=4), mask)\nend subroutine\nprogram p\n  complex(4) :: x(3), center(3), out(3)\n  logical :: mask(3)\n  x(1) = (2.0_4, 0.0_4)\n  x(2) = (3.0_4, 0.0_4)\n  x(3) = (4.0_4, 0.0_4)\n  center = (1.0_4, 0.0_4)\n  mask = [.true., .false., .true.]\n  call s(x, center, mask, out)\n  if (abs(real(out(1)) - 1.0_4) > 1.0e-5_4) error stop 1\n  if (abs(real(out(2))) > 1.0e-5_4) error stop 2\n  if (abs(real(out(3)) - 9.0_4) > 1.0e-5_4) error stop 3\n  if (abs(aimag(out(1))) > 1.0e-5_4) error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("complex_merge_array", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("complex merge array compile failed");
+    assert!(
+        compile.status.success(),
+        "complex merge array should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("complex merge array run failed");
+    assert!(
+        run.status.success(),
+        "complex merge array should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn generic_probe_for_aimag_array_mask_does_not_emit_external() {
+    let src = write_program(
+        "module m\n  implicit none\n  interface take\n    module procedure take_mask\n  end interface\ncontains\n  subroutine take_mask(mask)\n    logical, intent(in) :: mask(:)\n    if (.not. mask(1)) error stop 1\n    if (mask(2)) error stop 2\n    if (.not. mask(3)) error stop 3\n  end subroutine\nend module\nprogram p\n  use m, only: take\n  implicit none\n  complex(4) :: z(3)\n  z(1) = (1.0_4, 0.0_4)\n  z(2) = (2.0_4, 3.0_4)\n  z(3) = (4.0_4, 0.0_4)\n  call take(aimag(z) == 0.0_4)\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("aimag_array_probe", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("aimag array probe compile failed");
+    assert!(
+        compile.status.success(),
+        "aimag array probe should compile and link without _aimag: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("aimag array probe run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "aimag array probe should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn complex_scalar_assigned_from_integer_promotes_via_buffer_not_pointer_cast() {
     // F2018 §10.2.1.3: complex variables can be assigned a scalar of
     // numeric type — the right-hand side is promoted to complex with
@@ -14147,7 +15407,9 @@ fn complex_scalar_assigned_from_integer_promotes_via_buffer_not_pointer_cast() {
         "complex<-int should compile: {}",
         String::from_utf8_lossy(&compile.stderr)
     );
-    let run = Command::new(&out).output().expect("complex<-int run failed");
+    let run = Command::new(&out)
+        .output()
+        .expect("complex<-int run failed");
     assert!(
         run.status.success(),
         "complex<-int should pass: status={:?} stdout={} stderr={}",
@@ -14157,6 +15419,154 @@ fn complex_scalar_assigned_from_integer_promotes_via_buffer_not_pointer_cast() {
     );
     let stdout = String::from_utf8_lossy(&run.stdout);
     assert!(stdout.contains("ok"), "expected ok, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn int_intrinsic_of_complex_extracts_real_lane() {
+    // F2018 §16.9.109: INT(A) accepts complex A and converts its
+    // real part. The scalar intrinsic path used to coerce the
+    // ptr<[f32 x 2]> complex buffer directly to integer, so
+    // `int(work(1), ilp)` in LAPACK CGEEV interpreted the buffer
+    // address as a huge workspace size instead of returning 3.
+    let src = write_program(
+        "program t\n  use iso_fortran_env, only: int64\n  implicit none\n  complex :: z\n  integer :: i4\n  integer(int64) :: i8\n  z = (3.75, -9.0)\n  i4 = int(z)\n  i8 = int(z, int64)\n  if (i4 /= 3) error stop 1\n  if (i8 /= 3_int64) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("int_complex_real_lane", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("int(complex) compile failed");
+    assert!(
+        compile.status.success(),
+        "int(complex) should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("int(complex) run failed");
+    assert!(
+        run.status.success(),
+        "int(complex) should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn cmplx_kind_keyword_without_y_keeps_zero_or_source_imag_lane() {
+    // F2018 §16.9.49: CMPLX(X, KIND=K) has no Y actual, so a real
+    // X must get imag=0 and a complex X must preserve AIMAG(X).
+    // The intrinsic lowering flattened keyword slots and treated
+    // KIND as positional Y, so stdlib's `cmplx(one, kind=sp)` became
+    // (1.0, 4.0), corrupting LAPACK CLADIV/CLARFG.
+    let src = write_program(
+        "program t\n  implicit none\n  integer, parameter :: sp = kind(1.0)\n  integer, parameter :: dp = kind(1.0d0)\n  complex(sp) :: a\n  complex(dp) :: b, c\n  a = cmplx(1.0_sp, kind=sp)\n  if (abs(real(a) - 1.0_sp) > 1.0e-6_sp) error stop 1\n  if (abs(aimag(a)) > 1.0e-6_sp) error stop 2\n  b = cmplx(cmplx(3.0_sp, -4.0_sp, kind=sp), kind=dp)\n  if (abs(real(b, kind=dp) - 3.0_dp) > 1.0e-12_dp) error stop 3\n  if (abs(aimag(b) + 4.0_dp) > 1.0e-12_dp) error stop 4\n  c = cmplx(kind=dp, x=2.0_sp)\n  if (abs(real(c, kind=dp) - 2.0_dp) > 1.0e-12_dp) error stop 5\n  if (abs(aimag(c)) > 1.0e-12_dp) error stop 6\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("cmplx_kind_keyword_no_y", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("cmplx kind keyword compile failed");
+    assert!(
+        compile.status.success(),
+        "cmplx kind keyword should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("cmplx kind keyword run failed");
+    assert!(
+        run.status.success(),
+        "cmplx kind keyword should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn complex_dot_product_feeds_complex_sqrt_without_pointer_fsqrt() {
+    let src = write_program(
+        "program t\n  implicit none\n  complex :: a(2), z\n  a(1) = cmplx(1.0, 2.0)\n  a(2) = cmplx(3.0, -4.0)\n  z = dot_product(a, a) / sqrt(dot_product(a, a) * dot_product(a, a))\n  if (abs(real(z) - 1.0) > 1.0e-5) error stop 1\n  if (abs(aimag(z)) > 1.0e-5) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("complex_dot_product_sqrt", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("complex dot product sqrt compile failed");
+    assert!(
+        compile.status.success(),
+        "complex dot product sqrt should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("complex dot product sqrt run failed");
+    assert!(
+        run.status.success(),
+        "complex dot product sqrt should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn complex_unary_minus_negates_lanes_at_call_site() {
+    // F2018 §10.1.5: unary minus on a complex value negates both
+    // real and imaginary parts. The scalar unary path only handled
+    // integer/real values and returned complex operands unchanged,
+    // so LAPACK CLARF passed `tau` for an actual argument spelled
+    // `-tau` and CGERC applied the reflector update with the wrong
+    // sign.
+    let src = write_program(
+        "module m\ncontains\n  subroutine check_arg(z)\n    complex, intent(in) :: z\n    if (abs(real(z) + 1.25) > 1.0e-6) error stop 3\n    if (abs(aimag(z) - 2.5) > 1.0e-6) error stop 4\n  end subroutine\nend module\nprogram t\n  use m\n  implicit none\n  complex :: tau, z\n  tau = (1.25, -2.5)\n  z = -tau\n  if (abs(real(z) + 1.25) > 1.0e-6) error stop 1\n  if (abs(aimag(z) - 2.5) > 1.0e-6) error stop 2\n  call check_arg(-tau)\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("complex_unary_minus_call", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("complex unary minus compile failed");
+    assert!(
+        compile.status.success(),
+        "complex unary minus should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("complex unary minus run failed");
+    assert!(
+        run.status.success(),
+        "complex unary minus should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
 
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
@@ -14426,6 +15836,475 @@ fn pack_intrinsic_into_allocatable_routes_through_array_descriptor_path() {
 }
 
 #[test]
+fn all_over_int8_pack_compare_lowers_descriptor() {
+    // stdlib_linalg compares byte-sized integer arrays against PACK
+    // results inside ALL, e.g. `all(diag(a) == pack(a, mask))`. The
+    // descriptor compare path must not reject `integer(int8)` as if it
+    // were a character array, or scalar fallback emits raw `_pack`/`_all`.
+    let src = write_program(
+        "program p\n  use iso_fortran_env, only: int8\n  implicit none\n  integer(int8) :: a(3,3), d(3)\n  logical :: mask(3,3)\n  integer :: i, j\n  a = reshape([(int(i, int8), i=1,9)], [3,3])\n  mask = reshape([((i == j, i=1,3), j=1,3)], [3,3])\n  d = [1_int8, 5_int8, 9_int8]\n  if (.not. all(d == pack(a, mask))) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let obj = unique_path("all_int8_pack", "o");
+    let compile_obj = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", obj.to_str().unwrap()])
+        .output()
+        .expect("all int8 pack object compile failed to spawn");
+    assert!(
+        compile_obj.status.success(),
+        "all int8 pack object should compile: {}",
+        String::from_utf8_lossy(&compile_obj.stderr)
+    );
+    let undef = undefined_symbols(&obj);
+    assert!(
+        !undef.iter().any(|s| matches!(s.as_str(), "_all" | "_pack")),
+        "raw reduction/pack symbols should not remain: {:?}",
+        undef
+    );
+
+    let out = unique_path("all_int8_pack", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("all int8 pack compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "all int8 pack should compile + link: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("all int8 pack run failed");
+    assert!(
+        run.status.success(),
+        "all int8 pack should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected ok marker, got: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&obj);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn generic_logical_actual_with_all_array_expr_uses_probe_type_only() {
+    // Generic call resolution probes must classify ALL(...) as a scalar
+    // logical without lowering the reduction body. Lowering the probe
+    // used to recurse into the array expression and produce invalid IR
+    // like `3.0 * <array address>` before the real call was emitted.
+    let src = write_program(
+        "module m\n  implicit none\n  interface check\n    module procedure check_l\n  end interface\ncontains\n  subroutine check_l(ok)\n    logical, intent(in) :: ok\n    if (.not. ok) error stop 1\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  real :: v(3)\n  v = [1.0, 2.0, 3.0]\n  call check(all(3.0*v == v + v + v))\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let obj = unique_path("generic_all_probe", "o");
+    let compile_obj = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", obj.to_str().unwrap()])
+        .output()
+        .expect("generic ALL probe object compile failed to spawn");
+    assert!(
+        compile_obj.status.success(),
+        "generic ALL probe object should compile: {}",
+        String::from_utf8_lossy(&compile_obj.stderr)
+    );
+    let undef = undefined_symbols(&obj);
+    assert!(
+        !undef.iter().any(|s| s == "_all"),
+        "raw all symbol should not remain: {:?}",
+        undef
+    );
+
+    let out = unique_path("generic_all_probe", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("generic ALL probe compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "generic ALL probe should compile + link: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("generic ALL probe run failed");
+    assert!(
+        run.status.success(),
+        "generic ALL probe should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected ok marker, got: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&obj);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn imported_defined_eq_does_not_hijack_numeric_array_compare() {
+    // stdlib_linalg imports a derived-type `operator(==)` for its
+    // error-state type into the same test unit that compares numeric
+    // array expressions inside ALL, e.g. `all(diag(3*a) == 3*v)`.
+    // The defined operator resolver must only pick that specific when
+    // the operands semantically match its declared dummies; otherwise
+    // numeric arrays must stay on the intrinsic descriptor compare
+    // path. Pre-fix, the permissive fallback selected `state_eq_flag`
+    // for `real(:) == real(:)` and scalar-lowered `3.0 * v` as pointer
+    // arithmetic, tripping IR verification.
+    let dir = unique_dir("user_eq_numeric_array_compare");
+    let m = write_program_in(
+        &dir,
+        "state_mod.f90",
+        "module state_mod\n  implicit none\n  private\n  public :: state_t, operator(==)\n  type :: state_t\n    integer :: code = 0\n  end type\n  interface operator(==)\n    module procedure state_eq_flag\n  end interface\ncontains\n  logical function state_eq_flag(s, flag)\n    type(state_t), intent(in) :: s\n    integer, intent(in) :: flag\n    state_eq_flag = s%code == flag\n  end function\nend module\n",
+    );
+    let p = write_program_in(
+        &dir,
+        "p.f90",
+        "program p\n  use state_mod, only: operator(==)\n  implicit none\n  real :: v(3)\n  v = [1.0, 2.0, 3.0]\n  if (.not. all(3.0 * v == v + v + v)) error stop 1\n  print *, 'ok'\nend program\n",
+    );
+    let mo = dir.join("state_mod.o");
+    let po = dir.join("p.o");
+    let bin = dir.join("p");
+    for (src, obj) in [(&m, &mo), (&p, &po)] {
+        let r = Command::new(compiler("armfortas"))
+            .args([
+                "-c",
+                src.to_str().unwrap(),
+                "-I",
+                dir.to_str().unwrap(),
+                "-J",
+                dir.to_str().unwrap(),
+                "-o",
+                obj.to_str().unwrap(),
+            ])
+            .output()
+            .expect("compile failed");
+        assert!(
+            r.status.success(),
+            "compile {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&r.stderr)
+        );
+    }
+    let undef = undefined_symbols(&po);
+    assert!(
+        !undef
+            .iter()
+            .any(|s| s == "_all" || s.contains("state_eq_flag")),
+        "numeric array compare should not call raw ALL or state_eq_flag: {:?}",
+        undef
+    );
+
+    let link = Command::new(compiler("armfortas"))
+        .args([
+            mo.to_str().unwrap(),
+            po.to_str().unwrap(),
+            "-o",
+            bin.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link failed");
+    assert!(
+        link.status.success(),
+        "link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+    let run = Command::new(&bin).output().expect("run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "numeric array compare run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn imported_generic_all_does_not_block_intrinsic_reduction() {
+    // A USE-associated generic named `all` should not make the lowerer
+    // skip the intrinsic reduction when the actual is a logical array
+    // and no imported specific matches it. stdlib_linalg reaches this
+    // shape through modules that add broad named interfaces to the
+    // symbol table; pre-fix, `all(a == b)` fell through to a raw `_all`
+    // call after scalar-lowering the array comparison.
+    let dir = unique_dir("generic_all_intrinsic_reduction");
+    let m = write_program_in(
+        &dir,
+        "shadow_all.f90",
+        "module shadow_all\n  implicit none\n  public :: all\n  interface all\n    module procedure all_i\n  end interface\ncontains\n  logical function all_i(x)\n    integer, intent(in) :: x\n    all_i = x /= 0\n  end function\nend module\n",
+    );
+    let p = write_program_in(
+        &dir,
+        "p.f90",
+        "program p\n  use shadow_all, only: all\n  implicit none\n  real :: a(3), b(3)\n  a = [1.0, 2.0, 3.0]\n  b = a\n  if (.not. all(a == b)) error stop 1\n  b(2) = 9.0\n  if (all(a == b)) error stop 2\n  print *, 'ok'\nend program\n",
+    );
+    let mo = dir.join("shadow_all.o");
+    let po = dir.join("p.o");
+    let bin = dir.join("p");
+    for (src, obj) in [(&m, &mo), (&p, &po)] {
+        let r = Command::new(compiler("armfortas"))
+            .args([
+                "-c",
+                src.to_str().unwrap(),
+                "-I",
+                dir.to_str().unwrap(),
+                "-J",
+                dir.to_str().unwrap(),
+                "-o",
+                obj.to_str().unwrap(),
+            ])
+            .output()
+            .expect("compile failed");
+        assert!(
+            r.status.success(),
+            "compile {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&r.stderr)
+        );
+    }
+    let undef = undefined_symbols(&po);
+    assert!(
+        !undef.iter().any(|s| s == "_all" || s.contains("all_i")),
+        "intrinsic ALL should lower without raw _all or generic all_i: {:?}",
+        undef
+    );
+
+    let link = Command::new(compiler("armfortas"))
+        .args([
+            mo.to_str().unwrap(),
+            po.to_str().unwrap(),
+            "-o",
+            bin.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link failed");
+    assert!(
+        link.status.success(),
+        "link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+    let run = Command::new(&bin).output().expect("run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "generic-all intrinsic reduction run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn all_over_local_real_arrays_uses_descriptor_type_despite_name_collision() {
+    // The scalar semantic helper is intentionally broad and can find a
+    // same-named symbol in another procedure. Descriptor lowering has
+    // the concrete element type from the local array, so it must trust
+    // that IR element type instead of rejecting the compare because a
+    // sibling scope has derived-type locals named `a` and `b`.
+    let src = write_program(
+        "module m\n  implicit none\n  type :: poison_t\n    integer :: n\n  end type\ncontains\n  subroutine poison()\n    type(poison_t) :: a, b\n    a%n = 1\n    b%n = 2\n  end subroutine\n  subroutine run()\n    real :: a(3), b(3)\n    a = [1.0, 2.0, 3.0]\n    b = a\n    if (.not. all(a == b)) error stop 1\n    b(2) = 9.0\n    if (all(a == b)) error stop 2\n  end subroutine\nend module\nprogram p\n  use m, only: run\n  implicit none\n  call run()\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let obj = unique_path("all_real_arrays_collision", "o");
+    let compile_obj = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", obj.to_str().unwrap()])
+        .output()
+        .expect("all real arrays collision object compile failed to spawn");
+    assert!(
+        compile_obj.status.success(),
+        "all real arrays collision object should compile: {}",
+        String::from_utf8_lossy(&compile_obj.stderr)
+    );
+    let undef = undefined_symbols(&obj);
+    assert!(
+        !undef.iter().any(|s| s == "_all"),
+        "raw ALL should not remain for local real arrays: {:?}",
+        undef
+    );
+
+    let out = unique_path("all_real_arrays_collision", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("all real arrays collision binary compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "all real arrays collision should compile + link: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("all real arrays collision run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "all real arrays collision run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_file(&obj);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn repeated_name_tuple_subscript_flattens_for_generated_stdlib_tests() {
+    // stdlib_linalg_mnorm's fypp output indexes a rank-N result as
+    // `bnrm((l,l,l))`. Treat that repeated-name parenthesized tuple as
+    // the extension spelling `bnrm(l,l,l)` so generated tests parse
+    // without patching stdlib scratch output.
+    let src = write_program(
+        "program p\n  implicit none\n  real :: a(2,2,2), got\n  integer :: l\n  a = 0.0\n  l = 2\n  a(2,2,2) = 42.0\n  got = a((l,l,l))\n  if (abs(got - 42.0) > 1.0e-6) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("tuple_subscript_flatten", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("tuple subscript compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "tuple subscript extension should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("tuple subscript run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "tuple subscript run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn unpack_assignment_lowers_descriptor() {
+    // F2018 §16.9.194: UNPACK returns an array shaped like MASK. The
+    // stdlib_linalg integer diagonal tests assign UNPACK directly into
+    // fixed matrices, so lowering must materialize a descriptor instead
+    // of emitting a raw external `_unpack`.
+    let src = write_program(
+        "program p\n  use iso_fortran_env, only: int32\n  implicit none\n  integer(int32) :: a(3,3), field(3,3)\n  logical :: mask(3,3)\n  integer :: i, j\n  field = 0_int32\n  mask = reshape([((i == j + 1, i=1,3), j=1,3)], [3,3])\n  a = unpack([7_int32, 8_int32], mask, field)\n  if (a(2,1) /= 7_int32) error stop 1\n  if (a(3,2) /= 8_int32) error stop 2\n  if (sum(a) /= 15_int32) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let obj = unique_path("unpack_assign", "o");
+    let compile_obj = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", obj.to_str().unwrap()])
+        .output()
+        .expect("unpack assignment object compile failed to spawn");
+    assert!(
+        compile_obj.status.success(),
+        "unpack assignment object should compile: {}",
+        String::from_utf8_lossy(&compile_obj.stderr)
+    );
+    let undef = undefined_symbols(&obj);
+    assert!(
+        !undef.iter().any(|s| s == "_unpack"),
+        "raw unpack symbol should not remain: {:?}",
+        undef
+    );
+
+    let out = unique_path("unpack_assign", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("unpack assignment compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "unpack assignment should compile + link: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("unpack assignment run failed");
+    assert!(
+        run.status.success(),
+        "unpack assignment should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected ok marker, got: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&obj);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn scalar_spread_write_materializes_array_descriptor() {
+    // Stdlib `test_io/test_npy.f90` writes `spread(0.0_dp, 1, 40)` as an
+    // unformatted stream payload in its negative NPY-header tests. Without
+    // a descriptor path for scalar-source SPREAD, inline WRITE lowering
+    // falls through to a plain external call and the final link fails with
+    // `_spread` undefined.
+    let data = unique_path("spread_stream", "dat");
+    let src = write_program(
+        &format!(
+            "program p\n  implicit none\n  integer :: u\n  real(8) :: y(4)\n  open(newunit=u, file='{}', status='replace', access='stream', form='unformatted')\n  write(u) spread(2.5d0, 1, 4)\n  close(u)\n  open(newunit=u, file='{}', status='old', access='stream', form='unformatted')\n  read(u) y\n  close(u, status='delete')\n  if (any(abs(y - 2.5d0) > 1.0d-12)) error stop 1\n  print *, 'ok'\nend program\n",
+            data.display(),
+            data.display()
+        ),
+        "f90",
+    );
+    let out = unique_path("spread_write", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("spread_write compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "SPREAD write should compile + link: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&compile.stderr).contains("_spread"),
+        "stderr should not mention _spread: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("spread_write run failed");
+    assert!(
+        run.status.success(),
+        "SPREAD write should round-trip: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&data);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn submodule_dispatching_private_parent_generic_interface_resolves_via_amod() {
     // F2018 §11.2.3: a submodule has full access to its parent module's
     // PRIVATE entities by host association. Previously `write_amod` only
@@ -14539,6 +16418,45 @@ fn module_parameter_array_scalar_broadcast_init_keeps_array_global() {
     assert!(
         run.status.success(),
         "scalar broadcast should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn module_parameter_array_conversion_init_keeps_array_global() {
+    // stdlib_stats_moment declares module globals like
+    // `real(sp) :: x1(5) = real(d1, sp)` where d1 is a real(dp)
+    // PARAMETER array. The constant-array folder used to recognize only
+    // direct parameter-array names and constructors; wrapping the name in
+    // the elemental REAL intrinsic made the module global fall back to
+    // zeroinit.
+    let src = write_program(
+        "module m\n  use iso_fortran_env, only: real32, real64, int32\n  implicit none\n  real(real64), parameter :: d1(5) = [1.0_real64, 2.0_real64, 3.0_real64, 4.0_real64, 5.0_real64]\n  real(real32) :: x1(5) = real(d1, real32)\n  real(real64) :: dx1(5) = d1\n  integer(int32) :: ix1(5) = int(d1, int32)\ncontains\n  subroutine check\n    if (x1(1) /= 1.0_real32) error stop 1\n    if (x1(5) /= 5.0_real32) error stop 2\n    if (dx1(1) /= 1.0_real64) error stop 3\n    if (dx1(5) /= 5.0_real64) error stop 4\n    if (ix1(1) /= 1_int32) error stop 5\n    if (ix1(5) /= 5_int32) error stop 6\n  end subroutine\nend module\n\nprogram t\n  use m\n  call check\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("param_array_convert", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("parameter array conversion compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "parameter array conversion should compile + link: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("parameter array conversion run failed");
+    assert!(
+        run.status.success(),
+        "parameter array conversion should pass: status={:?} stdout={} stderr={}",
         run.status,
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr)
@@ -14849,6 +16767,763 @@ fn transfer_with_constant_size_into_array_dest_byte_copies_source() {
 }
 
 #[test]
+fn scalar_transfer_from_assumed_shape_section_copies_section_data() {
+    // stdlib_hash_32bit's nmh_readle16 receives an assumed-shape
+    // byte dummy and computes `transfer(p(1:2), 0_int16)`. The section
+    // source lowers to an array descriptor; scalar TRANSFER must memcpy
+    // from the descriptor's base_addr, not from the descriptor header.
+    let src = write_program(
+        "program p\n  use iso_fortran_env, only: int8, int16\n  implicit none\n  integer(int8) :: key(300)\n  integer :: i\n  do i = 1, 300\n    key(i) = int(iand(i, 255), int8)\n  end do\n  call probe(key(1:2))\ncontains\n  subroutine probe(key)\n    integer(int8), intent(in) :: key(0:)\n    integer(int16) :: got\n    got = readle16(key)\n    if (got /= int(z'0201', int16)) error stop 1\n    print *, 'ok'\n  contains\n    pure function readle16(p) result(v)\n      integer(int16) :: v\n      integer(int8), intent(in) :: p(:)\n      v = transfer(p(1:2), 0_int16)\n    end function\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("transfer_section_scalar", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("section scalar transfer compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "section scalar transfer should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("section scalar transfer run failed");
+    assert!(
+        run.status.success(),
+        "section scalar transfer should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn transfer_from_runtime_section_into_array_section_copies_source_data() {
+    // stdlib_hash_64bit_pengy uses:
+    //   b(0:3) = transfer(key(index:index+31), 0_int64, 4)
+    // where key is an assumed-shape byte dummy and index is runtime.
+    // The RHS must lower as an array descriptor over the section data.
+    // Previously the section assignment scalarized the TRANSFER result
+    // and stored the descriptor address into each int64 lane.
+    let src = write_program(
+        "program p\n  use iso_fortran_env, only: int8, int64\n  implicit none\n  integer(int8) :: key(64)\n  integer :: i\n  do i = 1, 64\n    key(i) = int(i, int8)\n  end do\n  call probe(key(1:32))\n  print *, 'ok'\ncontains\n  subroutine probe(x)\n    integer(int8), intent(in) :: x(0:)\n    integer(int64) :: whole(0:3), sliced(0:3)\n    integer(int64) :: index\n    whole = -1_int64\n    sliced = -1_int64\n    index = 0_int64\n    whole = transfer(x(0:31), 0_int64, 4)\n    sliced(0:3) = transfer(x(index:index+31), 0_int64, 4)\n    if (whole(0) /= int(z'0807060504030201', int64)) error stop 1\n    if (whole(1) /= int(z'100f0e0d0c0b0a09', int64)) error stop 2\n    if (whole(2) /= int(z'1817161514131211', int64)) error stop 3\n    if (whole(3) /= int(z'201f1e1d1c1b1a19', int64)) error stop 4\n    if (sliced(0) /= int(z'0807060504030201', int64)) error stop 5\n    if (sliced(1) /= int(z'100f0e0d0c0b0a09', int64)) error stop 6\n    if (sliced(2) /= int(z'1817161514131211', int64)) error stop 7\n    if (sliced(3) /= int(z'201f1e1d1c1b1a19', int64)) error stop 8\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("transfer_runtime_section_array_section", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("runtime section transfer compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "runtime section transfer should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("runtime section transfer run failed");
+    assert!(
+        run.status.success(),
+        "runtime section transfer should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn array_binary_uses_array_valued_transfer_operand_lanes() {
+    // stdlib_hash_32bit uses expressions like
+    // `vx16 = vx16 * transfer(m1, 0_int16, 2)`. TRANSFER with SIZE
+    // is an array result; if scalar lowering handles it, the first
+    // lane is broadcast and the second lane multiplies by the wrong
+    // halfword.
+    let src = write_program(
+        "program p\n  use iso_fortran_env, only: int16, int32\n  implicit none\n  integer(int16) :: lhs(2), got(2)\n  lhs = transfer(int(z'11223344', int32), 0_int16, 2)\n  got = lhs * transfer(int(z'01020304', int32), 0_int16, 2)\n  if (got(1) /= int(-26352, int16)) error stop 1\n  if (got(2) /= int(17476, int16)) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("transfer_array_binary_lanes", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("array transfer binary compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "array transfer binary should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("array transfer binary run failed");
+    assert!(
+        run.status.success(),
+        "array transfer binary should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn transfer_with_parameter_size_into_fixed_array_dest_byte_copies_source() {
+    // stdlib hash tests use `transfer(dummy, 0_int8, size_key_array)`,
+    // where SIZE is a module parameter rather than a literal. The
+    // TRANSFER-aware array assignment path must still take over; the
+    // scalar fallback materializes one byte, then treats that i8 as a
+    // descriptor pointer and fails IR verification.
+    let src = write_program(
+        "module m\n  use iso_fortran_env, only: int8, int32\n  implicit none\n  integer, parameter :: nbytes = 8\ncontains\n  subroutine fill(bytes)\n    integer(int8), intent(out) :: bytes(nbytes)\n    integer(int32) :: words(2)\n    words = [int(z'01020304', int32), int(z'05060708', int32)]\n    bytes = transfer(words, 0_int8, nbytes)\n  end subroutine\nend module\nprogram p\n  use iso_fortran_env, only: int8\n  use m, only: fill\n  implicit none\n  integer(int8) :: bytes(8)\n  call fill(bytes)\n  if (bytes(1) /= int(z'04', int8)) error stop 1\n  if (bytes(4) /= int(z'01', int8)) error stop 2\n  if (bytes(5) /= int(z'08', int8)) error stop 3\n  if (bytes(8) /= int(z'05', int8)) error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("transfer_param_size", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("transfer parameter SIZE compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "transfer parameter SIZE should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("transfer parameter SIZE run failed");
+    assert!(
+        run.status.success(),
+        "transfer parameter SIZE should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn transfer_named_int32_parameter_is_visible_in_contained_body() {
+    // stdlib_hash_64bit_spookyv2 builds:
+    //
+    //   integer(int32), parameter :: sc_constsub = int(z'deadbeef', int32)
+    //   integer(int64), parameter :: sc_const =
+    //       transfer([sc_constsub, sc_constsub], 0_int64)
+    //
+    // Scalar PARAMETERs are not closure-passed into contained procedures; they
+    // must be folded into the host parameter table. The width of sc_constsub
+    // matters here: using value-derived width reads 8 bytes per lane instead
+    // of the declared int32 representation.
+    let src = write_program(
+        r#"program p
+  use iso_fortran_env, only: int32, int64
+  implicit none
+  integer(int32), parameter :: sc_constsub = int(z'deadbeef', int32)
+  integer(int64), parameter :: sc_const = transfer([sc_constsub, sc_constsub], 0_int64)
+
+  call probe()
+  print *, 'ok'
+
+contains
+  subroutine probe()
+    if (sc_const /= -2401053088876216593_int64) error stop 1
+  end subroutine probe
+end program p
+"#,
+        "f90",
+    );
+    let out = unique_path("transfer_named_param_host", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("transfer named parameter host compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "transfer named parameter host should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("transfer named parameter host run failed");
+    assert!(
+        run.status.success(),
+        "transfer named parameter host should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn transfer_named_int32_parameter_survives_submodule_amod_boundary() {
+    let dir = unique_dir("transfer_named_param_submodule");
+    let mod_src = write_program_in(
+        &dir,
+        "spooky_const_mod.f90",
+        r#"module spooky_const_mod
+  use iso_fortran_env, only: int32, int64
+  implicit none
+  integer(int32), parameter :: sc_constsub = int(z'deadbeef', int32)
+  integer(int64), parameter :: sc_const = transfer([sc_constsub, sc_constsub], 0_int64)
+
+  interface
+    module subroutine get_spooky_const(x)
+      import :: int64
+      integer(int64), intent(out) :: x
+    end subroutine get_spooky_const
+  end interface
+end module spooky_const_mod
+"#,
+    );
+    let impl_src = write_program_in(
+        &dir,
+        "spooky_const_impl.f90",
+        r#"submodule(spooky_const_mod) spooky_const_impl
+  use iso_fortran_env, only: int64
+  implicit none
+contains
+  module subroutine get_spooky_const(x)
+    integer(int64), intent(out) :: x
+    x = sc_const
+  end subroutine get_spooky_const
+end submodule spooky_const_impl
+"#,
+    );
+    let use_src = write_program_in(
+        &dir,
+        "use_spooky_const.f90",
+        r#"program p
+  use iso_fortran_env, only: int64
+  use spooky_const_mod, only: get_spooky_const
+  implicit none
+  integer(int64) :: x
+  call get_spooky_const(x)
+  if (x /= -2401053088876216593_int64) error stop 1
+  print *, 'ok'
+end program p
+"#,
+    );
+    let mod_obj = dir.join("spooky_const_mod.o");
+    let impl_obj = dir.join("spooky_const_impl.o");
+    let use_obj = dir.join("use_spooky_const.o");
+    let out = dir.join("use_spooky_const");
+
+    let compile_mod = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            mod_src.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spooky const module compile failed to spawn");
+    assert!(
+        compile_mod.status.success(),
+        "spooky const module should compile: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let compile_impl = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            impl_src.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-o",
+            impl_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spooky const submodule compile failed to spawn");
+    assert!(
+        compile_impl.status.success(),
+        "spooky const submodule should compile: {}",
+        String::from_utf8_lossy(&compile_impl.stderr)
+    );
+
+    let compile_use = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            use_src.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            "-o",
+            use_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spooky const consumer compile failed to spawn");
+    assert!(
+        compile_use.status.success(),
+        "spooky const consumer should compile: {}",
+        String::from_utf8_lossy(&compile_use.stderr)
+    );
+
+    let link = Command::new(compiler("armfortas"))
+        .args([
+            mod_obj.to_str().unwrap(),
+            impl_obj.to_str().unwrap(),
+            use_obj.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spooky const repro link failed to spawn");
+    assert!(
+        link.status.success(),
+        "spooky const repro should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("spooky const repro run failed");
+    assert!(
+        run.status.success(),
+        "imported transfer parameter should keep its bits: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected ok marker, got: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn transfer_logical_parameter_survives_amod_boundary() {
+    // stdlib_hash_32bit exposes:
+    //   logical, parameter :: little_endian =
+    //       1 == transfer([1_int8, 0_int8], 0_int16)
+    //
+    // In the producer TU this nontrivial PARAMETER initializer was not
+    // const-folded for module global storage, so the .o exported a
+    // zero-initialized bool and consumers imported `.false.` from the
+    // .amod-backed global. On Apple Silicon that made stdlib's hash
+    // tests take the big-endian path.
+    let dir = unique_dir("transfer_logical_param_amod");
+    let mod_src = write_program_in(
+        &dir,
+        "endian_mod.f90",
+        "module endian_mod\n  use iso_fortran_env, only: int8, int16\n  implicit none\n  logical, parameter, public :: little_endian = (1 == transfer([1_int8, 0_int8], 0_int16))\nend module\n",
+    );
+    let use_src = write_program_in(
+        &dir,
+        "use_endian.f90",
+        "program p\n  use endian_mod, only: little_endian\n  implicit none\n  if (.not. little_endian) error stop 1\n  print *, 'ok'\nend program\n",
+    );
+    let mod_obj = dir.join("endian_mod.o");
+    let use_obj = dir.join("use_endian.o");
+    let out = dir.join("use_endian");
+
+    let compile_mod = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            mod_src.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("endian module compile failed to spawn");
+    assert!(
+        compile_mod.status.success(),
+        "endian module should compile: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let compile_use = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            use_src.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            "-o",
+            use_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("endian consumer compile failed to spawn");
+    assert!(
+        compile_use.status.success(),
+        "endian consumer should compile: {}",
+        String::from_utf8_lossy(&compile_use.stderr)
+    );
+
+    let link = Command::new(compiler("armfortas"))
+        .args([
+            mod_obj.to_str().unwrap(),
+            use_obj.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("endian repro link failed to spawn");
+    assert!(
+        link.status.success(),
+        "endian repro should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("endian repro run failed");
+    assert!(
+        run.status.success(),
+        "imported logical parameter should be true: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected ok marker, got: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn submodule_logical_parameter_hash_branch_is_constant() {
+    // stdlib's nmhash32x submodule selects the low 32-bit length lane with
+    // a parent-module logical PARAMETER:
+    //
+    //   if (little_endian) then
+    //     len_base = len32(0)
+    //
+    // When the parameter crossed the .amod boundary as a loadable global, the
+    // submodule emitted a real branch and the large hash kernel read an
+    // unstable len_base. The same code with `len_base = len32(0)` was correct.
+    let dir = unique_dir("submodule_logical_param_hash");
+    let mod_src = write_program_in(
+        &dir,
+        "nmhash_mod.f90",
+        r#"module nmhash_mod
+  use iso_fortran_env, only: int8, int16, int32
+  implicit none
+
+  private
+  public :: int8_nmhash32x
+  logical, parameter :: little_endian = (1 == transfer([1_int8, 0_int8], 0_int16))
+
+  interface
+    pure module function int8_nmhash32x(key, seed) result(hash)
+      integer(int32) :: hash
+      integer(int8), intent(in) :: key(0:)
+      integer(int32), intent(in) :: seed
+    end function int8_nmhash32x
+  end interface
+end module nmhash_mod
+"#,
+    );
+    let impl_src = write_program_in(
+        &dir,
+        "nmhash_impl.f90",
+        r#"submodule(nmhash_mod) nmhash_impl
+  use iso_fortran_env, only: int8, int32, int64
+  implicit none
+
+contains
+  pure function readle32(p) result(v)
+    integer(int32) :: v
+    integer(int8), intent(in) :: p(:)
+
+    v = transfer(p(1:4), 0_int32)
+  end function readle32
+
+  pure module function int8_nmhash32x(key, seed) result(hash)
+    integer(int32) :: hash
+    integer(int8), intent(in) :: key(0:)
+    integer(int32), intent(in) :: seed
+    integer(int64) :: len
+
+    len = size(key, kind=int64)
+    if (len < 256) then
+      hash = nmhash32x_9to255(key, seed)
+      return
+    end if
+    hash = 0
+  end function int8_nmhash32x
+
+  pure function nmhash32x_9to255(p, seed) result(x)
+    integer(int8), intent(in) :: p(0:)
+    integer(int32), intent(in) :: seed
+    integer(int32) :: x
+    integer(int64) :: len
+    integer(int32) :: len32(0:1), len_base
+    integer(int32) :: y
+    integer(int32) :: a, b
+    integer(int64) :: i, r
+
+    len = size(p, kind=int64)
+    len32 = transfer(len, 0_int32, 2)
+    if (little_endian) then
+      len_base = len32(0)
+    else
+      len_base = len32(1)
+    end if
+    x = int(z'C2B2AE3D', int32)
+    y = seed
+    a = int(z'27D4EB2F', int32)
+    b = seed
+    r = (len - 1)/16
+
+    do i=0, r-1
+      x = ieor(x, readle32(p(i*16 + 0:)))
+      y = ieor(y, readle32(p(i*16 + 4:)))
+      x = ieor(x, y)
+      x = x * int(z'11049A7D', int32)
+      x = ieor(x, ishft(x, -23))
+      x = x * int(z'BCCCDC7B', int32)
+      y = ishftc(y, 4)
+      x = ieor(x, y)
+      x = ieor(x, ishft(x, -12))
+      x = x * int(z'065E9DAD', int32)
+      x = ieor(x, ishft(x, -12))
+
+      a = ieor(a, readle32(p(i*16 + 8:)))
+      b = ieor(b, readle32(p(i*16 + 12:)))
+      a = ieor(a, b)
+      a = a * int(z'11049A7D', int32)
+      a = ieor(a, ishft(a, -23))
+      a = a * int(z'BCCCDC7B', int32)
+      b = ishftc(b, 3)
+      a = ieor(a, b)
+      a = ieor(a, ishft(a, -12))
+      a = a * int(z'065E9DAD', int32)
+      a = ieor(a, ishft(a, -12))
+    end do
+
+    if (iand(len_base-1_int32, 8_int32) /= 0) then
+      if (iand(len_base-1_int32, 4_int32) /= 0) then
+        a = ieor(a, readle32(p(r*16 + 0:)))
+        b = ieor(b, readle32(p(r*16 + 4:)))
+        a = ieor(a, b)
+        a = a * int(z'11049A7D', int32)
+        a = ieor(a, ishft(a, -23))
+        a = a * int(z'BCCCDC7B', int32)
+        a = ieor(a, ishftc(b, 4))
+        a = ieor(a, ishft(a, -12))
+        a = a * int(z'065E9DAD', int32)
+      else
+        a = ieor(a, readle32(p(r*16:)) + b)
+        a = ieor(a, ishft(a, -16))
+        a = a * int(z'A52FB2CD', int32)
+        a = ieor(a, ishft(a, -15))
+        a = a * int(z'551E4D49', int32)
+      end if
+      x = ieor(x, readle32(p(len - 8:)))
+      y = ieor(y, readle32(p(len - 4:)))
+      x = ieor(x, y)
+      x = x * int(z'11049A7D', int32)
+      x = ieor(x, ishft(x, -23))
+      x = x * int(z'BCCCDC7B', int32)
+      x = ieor(x, ishftc(y, 3))
+      x = ieor(x, ishft(x, -12))
+      x = x * int(z'065E9DAD', int32)
+    else
+      if (iand(len_base-1_int32, 4_int32) /= 0) then
+        a = ieor(a, readle32(p(r*16:)) + b)
+        a = ieor(a, ishft(a, -16))
+        a = a * int(z'A52FB2CD', int32)
+        a = ieor(a, ishft(a, -15))
+        a = a * int(z'551E4D49', int32)
+      end if
+      x = ieor(x, readle32(p(len - 4:)) + y)
+      x = ieor(x, ishft(x, -16))
+      x = x * int(z'A52FB2CD', int32)
+      x = ieor(x, ishft(x, -15))
+      x = x * int(z'551E4D49', int32)
+    end if
+
+    x = ieor(x, len_base)
+    x = ieor(x, ishftc(a, 27))
+    x = ieor(x, ishft(x, -14))
+    x = x * int(z'141CC535', int32)
+  end function nmhash32x_9to255
+end submodule nmhash_impl
+"#,
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        r#"program p
+  use iso_fortran_env, only: int8, int32
+  use nmhash_mod, only: int8_nmhash32x
+  implicit none
+
+  integer(int8) :: key(300)
+  integer :: i
+
+  do i = 1, 300
+    key(i) = int(iand(i, 255), int8)
+  end do
+
+  if (int8_nmhash32x(key(1:9), int(z'deadbeef', int32)) /= int(z'1A06128A', int32)) error stop 9
+  if (int8_nmhash32x(key(1:32), int(z'deadbeef', int32)) /= int(z'EABBF1B8', int32)) error stop 32
+  print *, 'ok'
+end program p
+"#,
+    );
+    let mod_obj = dir.join("nmhash_mod.o");
+    let impl_obj = dir.join("nmhash_impl.o");
+    let main_obj = dir.join("main.o");
+    let out = dir.join("nmhash_kat");
+
+    let compile_mod = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            mod_src.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("nmhash module compile failed to spawn");
+    assert!(
+        compile_mod.status.success(),
+        "nmhash module should compile: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let compile_impl = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            impl_src.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-o",
+            impl_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("nmhash submodule compile failed to spawn");
+    assert!(
+        compile_impl.status.success(),
+        "nmhash submodule should compile: {}",
+        String::from_utf8_lossy(&compile_impl.stderr)
+    );
+
+    let compile_main = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            main_src.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("nmhash main compile failed to spawn");
+    assert!(
+        compile_main.status.success(),
+        "nmhash main should compile: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let link = Command::new(compiler("armfortas"))
+        .args([
+            mod_obj.to_str().unwrap(),
+            impl_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("nmhash link failed to spawn");
+    assert!(
+        link.status.success(),
+        "nmhash repro should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    for _ in 0..3 {
+        let run = Command::new(&out).output().expect("nmhash run failed");
+        assert!(
+            run.status.success(),
+            "nmhash KAT should pass: status={:?} stdout={} stderr={}",
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&run.stdout).contains("ok"),
+            "expected ok marker, got: {}",
+            String::from_utf8_lossy(&run.stdout)
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pack_result_vector_subscript_assignment_lowers_intrinsic() {
+    // PACK is array-valued and can appear directly as a vector
+    // subscript. If that result is misclassified as scalar, lowering
+    // emits an unresolved external `_pack` from the array-element path
+    // instead of materializing the index descriptor.
+    let src = write_program(
+        "program p\n  implicit none\n  real, allocatable :: cvec(:)\n  integer :: i\n  allocate(cvec(4))\n  cvec = [-1.0, 2.0, 3.0, -4.0]\n  cvec(pack([(i, i=1, size(cvec))], cvec > 0.0)) = 0.0\n  if (cvec(1) /= -1.0) error stop 1\n  if (cvec(2) /= 0.0) error stop 2\n  if (cvec(3) /= 0.0) error stop 3\n  if (cvec(4) /= -4.0) error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("pack_vector_subscript", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("pack vector subscript compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "pack vector subscript should compile and link: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("pack vector subscript run failed");
+    assert!(
+        run.status.success(),
+        "pack vector subscript should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn complex_dp_implied_do_constructor_preserves_imaginary_lane_per_iteration() {
     // F2018 §7.8 implied-do array constructor with complex(dp) elements:
     // the inner-loop body in store_ac_implied_do had the same scalar-store
@@ -14927,6 +17602,43 @@ fn array_reductions_with_mask_keyword_apply_mask_instead_of_ignoring_it() {
 }
 
 #[test]
+fn sum_with_positional_logical_mask_applies_mask_instead_of_dim() {
+    // F2018 §16.9.231 permits SUM(ARRAY, MASK) when the second
+    // positional actual is logical. stdlib_intrinsics uses this form in
+    // its masked real sum accuracy checks; pre-fix the scalar reduction
+    // lowering only recognized `mask=` and reduced the full array.
+    let src = write_program(
+        "program t\n  implicit none\n  real :: a(5) = [1.0, 2.0, 3.0, 4.0, 5.0]\n  integer :: ai(5) = [1, 2, 3, 4, 5]\n  logical :: m(5) = [.true., .false., .true., .false., .true.]\n  if (abs(sum(a, m) - 9.0) > 1.0e-6) error stop 1\n  if (sum(ai, m) /= 9) error stop 2\n  if (abs(sum(a, .not. m) - 6.0) > 1.0e-6) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("sum_positional_mask", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("sum positional mask compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "sum positional mask should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("sum positional mask run failed");
+    assert!(
+        run.status.success(),
+        "sum positional mask should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn array_sum_and_maxval_over_real_kind4_array_uses_correct_element_width() {
     // The real array reductions (`afs_array_sum_real8`,
     // `afs_array_maxval_real8`, `afs_array_minval_real8`,
@@ -14957,6 +17669,41 @@ fn array_sum_and_maxval_over_real_kind4_array_uses_correct_element_width() {
     assert!(
         run.status.success(),
         "real-sp reductions should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn complex_sum_uses_complex_runtime_result_buffer() {
+    // stdlib's complex Kahan checks compare masked Kahan sums against
+    // the intrinsic SUM. Plain SUM(complex_array) was routed through
+    // the integer reducer, then coerced into a by-value complex aggregate
+    // and used as a memcpy pointer by assignment lowering.
+    let src = write_program(
+        "program t\n  implicit none\n  integer :: i\n  complex :: x(4), total, masked\n  logical :: m(4)\n  x = [(cmplx(real(i), -real(i)), i=1,4)]\n  m = [.true., .false., .true., .false.]\n  total = sum(x)\n  masked = sum(x, mask=m)\n  if (abs(real(total) - 10.0) > 1.0e-6) error stop 1\n  if (abs(aimag(total) + 10.0) > 1.0e-6) error stop 2\n  if (abs(real(masked) - 4.0) > 1.0e-6) error stop 3\n  if (abs(aimag(masked) + 4.0) > 1.0e-6) error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("complex_sum_runtime", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("complex sum compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "complex sum should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("complex sum run failed");
+    assert!(
+        run.status.success(),
+        "complex sum should pass: status={:?} stdout={} stderr={}",
         run.status,
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr)
@@ -15055,6 +17802,240 @@ fn cross_module_elemental_through_generic_interface_scalarizes_on_array_actual()
 
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn generic_elemental_subroutine_with_logical_array_actual_scalarizes_all_lanes() {
+    // stdlib_sum_kahan calls the generic elemental subroutine
+    // `kahan_kernel(a_section, s_section, c_section, mask_section)`.
+    // The subroutine scalarizer already handled numeric array actuals,
+    // but a logical array actual made it reject the elemental path and
+    // emit one scalar call using only the first lane of each section.
+    let src = write_program(
+        "module m\n  implicit none\n  interface kernel\n    module procedure kernel4\n  end interface\ncontains\n  elemental subroutine kernel4(a, s, c, m)\n    real, intent(in) :: a\n    real, intent(inout) :: s\n    real, intent(inout) :: c\n    logical, intent(in) :: m\n    if (m) s = s + a\n    c = c + 1.0\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  real :: a(5), s(5), c(5)\n  logical :: mask(5)\n  a = [1.0, 2.0, 3.0, 4.0, 5.0]\n  s = 10.0\n  c = 0.0\n  mask = [.true., .false., .true., .false., .true.]\n  call kernel(a, s, c, mask)\n  if (abs(s(1) - 11.0) > 1.0e-6) error stop 1\n  if (abs(s(2) - 10.0) > 1.0e-6) error stop 2\n  if (abs(s(3) - 13.0) > 1.0e-6) error stop 3\n  if (abs(s(4) - 10.0) > 1.0e-6) error stop 4\n  if (abs(s(5) - 15.0) > 1.0e-6) error stop 5\n  if (any(abs(c - 1.0) > 1.0e-6)) error stop 6\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("generic_elemental_sub_logical", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("generic elemental subroutine compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "generic elemental subroutine should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("generic elemental subroutine run failed");
+    assert!(
+        run.status.success(),
+        "generic elemental subroutine should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn explicit_shape_dummy_runtime_bound_materializes_descriptor_extent() {
+    // stdlib_sum_3d_sp recasts an assumed-shape rank-3 array to a
+    // contained rank-1 explicit-shape dummy (`real :: b(n)`) before
+    // summing. The dummy is passed as a raw pointer, so the callee must
+    // materialize a local descriptor using the runtime `n` bound; falling
+    // back to the static `(1,1)` placeholder sums only the first element.
+    let src = write_program(
+        "module m\ncontains\n  function outer(x) result(s)\n    real, intent(in) :: x(:,:,:)\n    real :: s\n    s = inner(x, size(x))\n  contains\n    real function inner(b, n)\n      integer, intent(in) :: n\n      real, intent(in) :: b(n)\n      inner = sum(b)\n    end function\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  real :: x(2,2,2)\n  x = 1.0\n  if (abs(outer(x) - 8.0) > 1.0e-6) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("explicit_shape_dummy_runtime_bound", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("explicit-shape runtime bound compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "explicit-shape runtime bound should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("explicit-shape runtime bound run failed");
+    assert!(
+        run.status.success(),
+        "explicit-shape runtime bound should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn same_name_contained_function_return_type_is_caller_relative() {
+    // stdlib_intrinsics_sum defines many contained helpers with the
+    // same bare name under different kind/rank wrappers. The call
+    // target was already caller-relative, but return-type lookup still
+    // scanned every scope and let an earlier integer helper type a later
+    // real helper call as i8.
+    let src = write_program(
+        "module m\ncontains\n  function first(a) result(s)\n    integer(1), intent(in) :: a(:)\n    integer(1) :: s\n    s = helper(a, size(a))\n  contains\n    integer(1) function helper(b, n)\n      integer, intent(in) :: n\n      integer(1), intent(in) :: b(n)\n      integer :: i\n      helper = 0_1\n      do i = 1, n\n        helper = helper + b(i)\n      end do\n    end function\n  end function\n\n  function second(x) result(s)\n    real, intent(in) :: x(:,:,:)\n    real :: s\n    s = helper(x, size(x))\n  contains\n    real function helper(b, n)\n      integer, intent(in) :: n\n      real, intent(in) :: b(n)\n      helper = sum(b)\n    end function\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  integer(1) :: a(2)\n  real :: x(2,2,2)\n  a = [1_1, 2_1]\n  if (first(a) /= 3_1) error stop 1\n  x = 1.0\n  if (abs(second(x) - 8.0) > 1.0e-6) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let ir = unique_path("same_name_contained_return", "ir");
+    let emit_ir = Command::new(compiler("armfortas"))
+        .args([
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("same-name contained return emit-ir failed to spawn");
+    assert!(
+        emit_ir.status.success(),
+        "same-name contained return should emit IR: {}",
+        String::from_utf8_lossy(&emit_ir.stderr)
+    );
+    let ir_text = fs::read_to_string(&ir).expect("cannot read same-name contained return IR");
+    let second_helper_calls: Vec<_> = ir_text
+        .lines()
+        .filter(|line| line.contains("call @afs_internal_afs_modproc_m_second"))
+        .collect();
+    assert!(
+        second_helper_calls
+            .iter()
+            .any(|line| line.contains(": f32")),
+        "second helper call should be typed f32, saw: {:?}",
+        second_helper_calls
+    );
+    assert!(
+        second_helper_calls
+            .iter()
+            .all(|line| !line.contains(": i8")),
+        "second helper call should not inherit first helper's i8 return type: {:?}",
+        second_helper_calls
+    );
+
+    let out = unique_path("same_name_contained_return", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("same-name contained return compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "same-name contained return should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("same-name contained return run failed");
+    assert!(
+        run.status.success(),
+        "same-name contained return should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&ir);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn imported_generic_array_function_assignment_keeps_whole_array_actual() {
+    let dir = unique_dir("imported_generic_array_assign");
+    let mod_src = write_program_in(
+        &dir,
+        "shuffle_like_m.f90",
+        "module shuffle_like_m\n  implicit none\n  interface shuffle_like\n    module procedure shuffle_i32\n  end interface\ncontains\n  function shuffle_i32(list) result(tmp)\n    integer, intent(in) :: list(:)\n    integer :: tmp(size(list))\n    integer :: i\n    do i = 1, size(list)\n      tmp(i) = list(size(list) - i + 1)\n    end do\n  end function\nend module\n",
+    );
+    let user_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use shuffle_like_m, only: shuffle_like\n  implicit none\n  integer :: n(4)\n  n = [1, 2, 3, 4]\n  n(:) = shuffle_like(n)\n  if (n(1) /= 4) error stop 1\n  if (n(2) /= 3) error stop 2\n  if (n(3) /= 2) error stop 3\n  if (n(4) /= 1) error stop 4\n  print *, 'ok'\nend program\n",
+    );
+
+    let mod_obj = dir.join("shuffle_like_m.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            mod_src.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("shuffle-like module compile spawn failed");
+    assert!(
+        compile_mod.status.success(),
+        "shuffle-like module should compile: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let user_obj = dir.join("main.o");
+    let compile_user = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            user_src.to_str().unwrap(),
+            "-o",
+            user_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("shuffle-like user compile spawn failed");
+    assert!(
+        compile_user.status.success(),
+        "whole-array actual should survive assignment scalarization: {}",
+        String::from_utf8_lossy(&compile_user.stderr)
+    );
+
+    let exe = dir.join("imported_generic_array_assign.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            mod_obj.to_str().unwrap(),
+            user_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("shuffle-like link spawn failed");
+    assert!(
+        link.status.success(),
+        "shuffle-like program should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "shuffle-like program should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -15218,6 +18199,116 @@ fn rank_reducing_section_arithmetic_uses_strided_descriptor() {
     assert!(
         run.status.success(),
         "rank-reducing section arith should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn rank3_middle_section_arithmetic_uses_strided_descriptor() {
+    // A rank-reducing section with a scalar subscript in the middle dimension
+    // is rank 2 but non-contiguous: x(:, i, :) has memory strides (1, 12)
+    // for x(4,3,3). Array-expression lowering must decompose the flat loop
+    // index into per-dim coordinates; using only dim[0].stride walks the
+    // wrong retained planes. This surfaced in stdlib_stats moment_3_*.
+    let src = write_program(
+        "program p\n  implicit none\n  real :: x(4,3,3), center(4,3), res(4,3), expected(4,3), d(4,3)\n  integer :: a, b, c, i\n  d(:,1) = [1.0, 3.0, 5.0, 7.0]\n  d(:,2) = [2.0, 4.0, 6.0, 8.0]\n  d(:,3) = [9.0, 10.0, 11.0, 12.0]\n  do c = 1, 3\n    do b = 1, 3\n      do a = 1, 4\n        x(a,b,c) = d(a,b) * real(2 ** (c - 1))\n      end do\n    end do\n  end do\n  do c = 1, 3\n    do a = 1, 4\n      center(a,c) = sum(x(a,:,c)) / 3.0\n    end do\n  end do\n  do i = 1, 3\n    do c = 1, 3\n      do a = 1, 4\n        expected(a,c) = x(a,i,c) - center(a,c)\n      end do\n    end do\n    res = x(:, i, :) - center\n    if (maxval(abs(res - expected)) > 1.0e-6) error stop i\n  end do\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("rank3_middle_section_arith", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("rank3 middle-section arith compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "rank3 middle-section arith should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("rank3 middle-section arith run failed");
+    assert!(
+        run.status.success(),
+        "rank3 middle-section arith should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn rank3_middle_section_real_conversion_uses_strided_descriptor() {
+    // Elemental array calls also materialize descriptor-backed temporaries.
+    // REAL(x(:, i, :), 8) over an integer rank-3 middle section must walk the
+    // non-contiguous source descriptor with per-dim strides, not dim[0] only.
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: x(4,3,3), d(4,3)\n  real(8) :: center(4,3), res(4,3), expected(4,3)\n  integer :: a, b, c, i\n  d(:,1) = [1, 3, 5, 7]\n  d(:,2) = [2, 4, 6, 8]\n  d(:,3) = [9, 10, 11, 12]\n  do c = 1, 3\n    do b = 1, 3\n      do a = 1, 4\n        x(a,b,c) = d(a,b) * (2 ** (c - 1))\n      end do\n    end do\n  end do\n  do c = 1, 3\n    do a = 1, 4\n      center(a,c) = real(sum(x(a,:,c)), 8) / 3.0_8\n    end do\n  end do\n  do i = 1, 3\n    do c = 1, 3\n      do a = 1, 4\n        expected(a,c) = real(x(a,i,c), 8) - center(a,c)\n      end do\n    end do\n    res = real(x(:, i, :), 8) - center\n    if (maxval(abs(res - expected)) > 1.0e-10_8) error stop i\n  end do\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("rank3_middle_section_real_conv", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("rank3 middle-section real conversion compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "rank3 middle-section real conversion should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("rank3 middle-section real conversion run failed");
+    assert!(
+        run.status.success(),
+        "rank3 middle-section real conversion should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn rank3_middle_section_merge_mask_uses_strided_descriptor() {
+    // MERGE has its own descriptor helper. The tsource and logical mask can
+    // both be non-contiguous rank-reducing sections, so flat rank-1 indexing
+    // reads the wrong mask element and leaks masked-off contributions.
+    let src = write_program(
+        "program p\n  implicit none\n  real(8) :: x(4,3,3), center(4,3), res(4,3), expected(4,3), n(4,3), expected_n(4,3)\n  real(8) :: d(4,3)\n  logical :: mask(4,3,3)\n  integer :: a, b, c, i\n  d(:,1) = [1._8, 3._8, 5._8, 7._8]\n  d(:,2) = [2._8, 4._8, 6._8, 8._8]\n  d(:,3) = [9._8, 10._8, 11._8, 12._8]\n  do c = 1, 3\n    do b = 1, 3\n      do a = 1, 4\n        x(a,b,c) = d(a,b) * real(2 ** (c - 1), 8)\n      end do\n    end do\n  end do\n  mask = x < 45._8\n  center = 0._8\n  expected_n = 0._8\n  do c = 1, 3\n    do a = 1, 4\n      do b = 1, 3\n        if (mask(a,b,c)) then\n          center(a,c) = center(a,c) + x(a,b,c)\n          expected_n(a,c) = expected_n(a,c) + 1._8\n        end if\n      end do\n      center(a,c) = center(a,c) / expected_n(a,c)\n    end do\n  end do\n  n = real(count(mask, 2), 8)\n  if (maxval(abs(n - expected_n)) > 1.0e-10_8) error stop 1\n  res = 0._8\n  expected = 0._8\n  do i = 1, 3\n    res = res + merge((x(:, i, :) - center)**2, 0._8, mask(:, i, :))\n    do c = 1, 3\n      do a = 1, 4\n        if (mask(a,i,c)) expected(a,c) = expected(a,c) + (x(a,i,c) - center(a,c))**2\n      end do\n    end do\n  end do\n  res = res / n\n  expected = expected / expected_n\n  if (maxval(abs(res - expected)) > 1.0e-10_8) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("rank3_middle_section_merge_mask", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("rank3 middle-section merge mask compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "rank3 middle-section merge mask should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("rank3 middle-section merge mask run failed");
+    assert!(
+        run.status.success(),
+        "rank3 middle-section merge mask should pass: status={:?} stdout={} stderr={}",
         run.status,
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr)
@@ -17365,6 +20456,119 @@ fn char_parameter_round_trips_through_amod_import() {
 }
 
 #[test]
+fn char_parameter_substrings_keep_fixed_len_through_amod_import() {
+    let dir = unique_dir("char_param_substring_amod");
+    let mod_src = write_program_in(
+        &dir,
+        "ascii_like.f90",
+        "module ascii_like\n  implicit none\n  character(len=*), parameter :: letters = 'ABCdef'\n  character(len=*), parameter :: uppercase = letters(1:3)\n  character(len=*), parameter :: lowercase = letters(4:)\n  character(len=*), parameter :: digits = '0123456789'\n  character(len=*), parameter :: octal_digits = digits(1:8)\nend module\n",
+    );
+    let user_src = write_program_in(
+        &dir,
+        "user.f90",
+        "program p\n  use ascii_like, only: lowercase, uppercase, octal_digits\n  implicit none\n  integer :: i, total\n  total = 0\n  do i = 1, len(lowercase)\n    total = total + iachar(lowercase(i:i))\n  end do\n  if (total /= 303) error stop 1\n  if (uppercase(2:2) /= 'B') error stop 2\n  if (octal_digits(8:8) /= '7') error stop 3\n  print *, 'ok'\nend program\n",
+    );
+    let mod_obj = dir.join("ascii_like.o");
+    let user_obj = dir.join("user.o");
+    let out = dir.join("user_bin");
+
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            mod_src.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("ascii-like module compile spawn failed");
+    assert!(
+        compile_mod.status.success(),
+        "ascii-like module compile failed: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let amod = std::fs::read_to_string(dir.join("ascii_like.amod")).expect("read ascii_like.amod");
+    assert!(
+        amod.contains("@param uppercase : character(len=3)"),
+        "uppercase parameter length should be fixed in .amod:\n{}",
+        amod
+    );
+    assert!(
+        amod.contains("@param lowercase : character(len=3)"),
+        "lowercase parameter length should be fixed in .amod:\n{}",
+        amod
+    );
+    assert!(
+        amod.contains("@param octal_digits : character(len=8)"),
+        "octal_digits parameter length should be fixed in .amod:\n{}",
+        amod
+    );
+
+    let compile_user = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            user_src.to_str().unwrap(),
+            "-o",
+            user_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("ascii-like user compile spawn failed");
+    assert!(
+        compile_user.status.success(),
+        "ascii-like user compile failed: {}",
+        String::from_utf8_lossy(&compile_user.stderr)
+    );
+    let undefined = undefined_symbols(&user_obj);
+    for raw in ["_lowercase", "_uppercase", "_octal_digits"] {
+        assert!(
+            !undefined.iter().any(|sym| sym == raw),
+            "imported character parameter substring lowered as raw call {}: {:?}",
+            raw,
+            undefined
+        );
+    }
+
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            mod_obj.to_str().unwrap(),
+            user_obj.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("ascii-like link spawn failed");
+    assert!(
+        link.status.success(),
+        "ascii-like link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "ascii-like runtime failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected ascii-like output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn char_parameter_concat_with_intrinsic_char_emits_runtime_bytes() {
     let src = write_program(
         "module colors\n  implicit none\n  character(len=*), parameter :: color_match = char(27) // '[01;31m'\n  character(len=*), parameter :: color_reset = char(27) // '[0m'\ncontains\n  subroutine check()\n    if (len(color_match) /= 8) error stop 1\n    if (iachar(color_match(1:1)) /= 27) error stop 2\n    if (color_match(2:8) /= '[01;31m') error stop 3\n    if (len(color_reset) /= 4) error stop 4\n    if (iachar(color_reset(1:1)) /= 27) error stop 5\n    if (color_reset(2:4) /= '[0m') error stop 6\n    write(*, '(a)') color_match // 'module' // color_reset\n  end subroutine\nend module\nprogram p\n  use colors\n  implicit none\n  call check()\nend program\n",
@@ -17486,6 +20690,95 @@ fn reexported_c_null_char_round_trips_through_amod_import() {
             && stdout.contains('0'),
         "unexpected reexported c_null_char runtime output: {}",
         stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn empty_facade_module_reexports_public_use_associated_params_through_amod() {
+    let dir = unique_dir("empty_facade_reexport_amod");
+    let constants_src = write_program_in(
+        &dir,
+        "sparse_constants_like.f90",
+        "module sparse_constants_like\n  implicit none\n  public\n  enum, bind(c)\n    enumerator :: sparse_full = 0\n    enumerator :: sparse_lower = 1\n    enumerator :: sparse_upper = 2\n  end enum\n  character(1), parameter :: sparse_op_transpose = 'T'\nend module\n",
+    );
+    let kinds_src = write_program_in(
+        &dir,
+        "sparse_kinds_like.f90",
+        "module sparse_kinds_like\n  use sparse_constants_like\n  implicit none\n  private\n  public :: sparse_full, sparse_lower, sparse_upper\n  public :: sparse_op_transpose\nend module\n",
+    );
+    let facade_src = write_program_in(
+        &dir,
+        "sparse_facade_like.f90",
+        "module sparse_facade_like\n  use sparse_kinds_like\nend module\n",
+    );
+    let user_src = write_program_in(
+        &dir,
+        "user.f90",
+        "program p\n  use sparse_facade_like\n  implicit none\n  if (sparse_lower /= 1) error stop 1\n  if (sparse_upper /= 2) error stop 2\n  if (sparse_op_transpose /= 'T') error stop 3\n  print *, 'ok'\nend program\n",
+    );
+
+    let constants_obj = dir.join("sparse_constants_like.o");
+    let kinds_obj = dir.join("sparse_kinds_like.o");
+    let facade_obj = dir.join("sparse_facade_like.o");
+    let user_obj = dir.join("user.o");
+    let bin = dir.join("user_bin");
+    for (src, obj) in [
+        (&constants_src, &constants_obj),
+        (&kinds_src, &kinds_obj),
+        (&facade_src, &facade_obj),
+        (&user_src, &user_obj),
+    ] {
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                "-c",
+                "-I",
+                dir.to_str().unwrap(),
+                "-J",
+                dir.to_str().unwrap(),
+                src.to_str().unwrap(),
+                "-o",
+                obj.to_str().unwrap(),
+            ])
+            .output()
+            .expect("empty facade reexport compile spawn failed");
+        assert!(
+            compile.status.success(),
+            "empty facade reexport compile failed for {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            constants_obj.to_str().unwrap(),
+            kinds_obj.to_str().unwrap(),
+            facade_obj.to_str().unwrap(),
+            user_obj.to_str().unwrap(),
+            "-o",
+            bin.to_str().unwrap(),
+        ])
+        .output()
+        .expect("empty facade reexport link spawn failed");
+    assert!(
+        link.status.success(),
+        "empty facade reexport link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&bin)
+        .output()
+        .expect("empty facade reexport run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "empty facade reexport runtime failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
     );
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -18854,8 +22147,8 @@ fn formatted_section_write_iterates_assumed_shape_dummy_section() {
         "expected DONE in output: {}",
         stdout
     );
-    let written = std::fs::read_to_string("/tmp/afs_section_dummy.dat")
-        .expect("output file should exist");
+    let written =
+        std::fs::read_to_string("/tmp/afs_section_dummy.dat").expect("output file should exist");
     assert!(
         written.contains("1.000E+00") && written.contains("6.000E+00"),
         "expected real elements in written file: {}",
@@ -18865,6 +22158,41 @@ fn formatted_section_write_iterates_assumed_shape_dummy_section() {
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
     let _ = std::fs::remove_file("/tmp/afs_section_dummy.dat");
+}
+
+#[test]
+fn formatted_1d_section_with_i64_bounds_compiles_and_runs() {
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: a(0:3)\n  integer(kind=8) :: i\n  a(0) = 10\n  a(1) = 20\n  a(2) = 30\n  a(3) = 40\n  i = 2\n  write(*, '(2(i0,1x))') a(i-1:i)\nend program\n",
+        "f90",
+    );
+    let out = unique_path("formatted_i64_section", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("formatted i64 section compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "formatted i64 section should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "formatted i64 section should run cleanly: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("20 30"),
+        "unexpected formatted i64 section output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
 }
 
 #[test]
@@ -19037,6 +22365,37 @@ fn list_directed_read_unit_real_returns_correct_f32_value() {
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
     let _ = std::fs::remove_file("/tmp/afs_real_read.txt");
+}
+
+#[test]
+fn internal_list_read_mixed_integer_and_character_token_runs() {
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=64) :: line\n  character(len=16) :: command\n  integer :: pid, ios\n  line = '12345 fortsh'\n  pid = -1\n  command = ''\n  read(line, *, iostat=ios) pid, command\n  if (ios /= 0) error stop 1\n  if (pid /= 12345) error stop 2\n  if (trim(command) /= 'fortsh') error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("internal_list_read_char", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("internal mixed read compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "internal mixed read should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "internal mixed read should run cleanly: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok in output: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
 }
 
 #[test]
@@ -19283,6 +22642,356 @@ fn optional_logical_present_guard_does_not_deref_absent_dummy() {
 }
 
 #[test]
+fn elemental_optional_array_actual_reaches_scalar_present_check() {
+    let src = write_program(
+        "module m\n  use iso_fortran_env, only: real32\n  implicit none\n  interface optval\n    module procedure optval_rsp\n  end interface\ncontains\n  pure elemental function optval_rsp(x, default) result(y)\n    real(real32), intent(in), optional :: x\n    real(real32), intent(in) :: default\n    real(real32) :: y\n    if (present(x)) then\n      y = x\n    else\n      y = default\n    end if\n  end function optval_rsp\n\n  function foo_sp_arr(x) result(z)\n    real(real32), dimension(2), intent(in), optional :: x\n    real(real32), dimension(2) :: z\n    z = optval(x, [2.0_real32, -2.0_real32])\n  end function foo_sp_arr\nend module m\n\nprogram p\n  use iso_fortran_env, only: real32\n  use m, only: foo_sp_arr\n  implicit none\n  real(real32) :: a(2)\n  a = foo_sp_arr([1.0_real32, -1.0_real32])\n  if (any(a /= [1.0_real32, -1.0_real32])) error stop 1\n  a = foo_sp_arr()\n  if (any(a /= [2.0_real32, -2.0_real32])) error stop 2\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("elemental_optional_array_actual", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("elemental optional array compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "elemental optional array should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "elemental optional array should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected elemental optional array output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn imported_elemental_generic_optional_array_uses_descriptor_wrapper() {
+    let dir = unique_dir("imported_elemental_optional_array");
+    let mod_src = write_program_in(
+        &dir,
+        "optval_m.f90",
+        r#"module optval_m
+  use iso_fortran_env, only: real32, real64
+  implicit none
+  private
+  public :: optval
+  interface optval
+    module procedure optval_rsp
+    module procedure optval_csp
+    module procedure optval_cdp
+    module procedure optval_character
+  end interface
+contains
+  pure elemental function optval_rsp(x, default) result(y)
+    real(real32), intent(in), optional :: x
+    real(real32), intent(in) :: default
+    real(real32) :: y
+    if (present(x)) then
+      y = x
+    else
+      y = default
+    end if
+  end function optval_rsp
+
+  pure elemental function optval_csp(x, default) result(y)
+    complex(real32), intent(in), optional :: x
+    complex(real32), intent(in) :: default
+    complex(real32) :: y
+    if (present(x)) then
+      y = x
+    else
+      y = default
+    end if
+  end function optval_csp
+
+  pure elemental function optval_cdp(x, default) result(y)
+    complex(real64), intent(in), optional :: x
+    complex(real64), intent(in) :: default
+    complex(real64) :: y
+    if (present(x)) then
+      y = x
+    else
+      y = default
+    end if
+  end function optval_cdp
+
+  pure function optval_character(x, default) result(y)
+    character(len=*), intent(in), optional :: x
+    character(len=*), intent(in) :: default
+    character(len=:), allocatable :: y
+    if (present(x)) then
+      y = x
+    else
+      y = default
+    end if
+  end function optval_character
+end module optval_m
+"#,
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        r#"module test_m
+  use iso_fortran_env, only: real32, real64
+  use optval_m, only: optval
+  implicit none
+contains
+  function foo_sp_arr(x) result(z)
+    real(real32), dimension(2), intent(in), optional :: x
+    real(real32), dimension(2) :: z
+    z = optval(x, [2.0_real32, -2.0_real32])
+  end function foo_sp_arr
+
+  function foo_csp_arr(x) result(z)
+    complex(real32), dimension(2), intent(in), optional :: x
+    complex(real32), dimension(2) :: z
+    z = optval(x, cmplx(2.0_real32, 2.0_real32, kind=real32) * [1.0_real32, -1.0_real32])
+  end function foo_csp_arr
+
+  function foo_cdp_arr(x) result(z)
+    complex(real64), dimension(2), intent(in), optional :: x
+    complex(real64), dimension(2) :: z
+    z = optval(x, cmplx(2.0_real64, 2.0_real64, kind=real64) * [1.0_real64, -1.0_real64])
+  end function foo_cdp_arr
+end module test_m
+
+program p
+  use iso_fortran_env, only: real32, real64
+  use test_m, only: foo_sp_arr, foo_csp_arr, foo_cdp_arr
+  implicit none
+  complex(real32), dimension(2) :: z1, z2
+  complex(real64), dimension(2) :: z3, z4
+
+  if (.not. all(foo_sp_arr([1.0_real32, -1.0_real32]) == [1.0_real32, -1.0_real32])) error stop 1
+  if (.not. all(foo_sp_arr() == [2.0_real32, -2.0_real32])) error stop 2
+
+  z1 = cmplx(1.0_real32, 2.0_real32, kind=real32) * [1.0_real32, -1.0_real32]
+  z2 = cmplx(2.0_real32, 2.0_real32, kind=real32) * [1.0_real32, -1.0_real32]
+  if (.not. all(foo_csp_arr(z1) == z1)) error stop 3
+  if (.not. all(foo_csp_arr() == z2)) error stop 4
+
+  z3 = cmplx(1.0_real64, 2.0_real64, kind=real64) * [1.0_real64, -1.0_real64]
+  z4 = cmplx(2.0_real64, 2.0_real64, kind=real64) * [1.0_real64, -1.0_real64]
+  if (.not. all(foo_cdp_arr(z3) == z3)) error stop 5
+  if (.not. all(foo_cdp_arr() == z4)) error stop 6
+  print *, 'ok'
+end program p
+"#,
+    );
+    let mod_obj = dir.join("optval_m.o");
+    let main_obj = dir.join("main.o");
+    let out = dir.join("imported_elemental_optional_array.bin");
+    let compiler = compiler("armfortas");
+
+    let compile_mod = Command::new(&compiler)
+        .args([
+            "-c",
+            mod_src.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("imported elemental module compile spawn failed");
+    assert!(
+        compile_mod.status.success(),
+        "imported elemental module should compile: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let compile_main = Command::new(&compiler)
+        .args([
+            "-c",
+            main_src.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("imported elemental main compile spawn failed");
+    assert!(
+        compile_main.status.success(),
+        "imported elemental main should compile: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let link = Command::new(&compiler)
+        .args([
+            main_obj.to_str().unwrap(),
+            mod_obj.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("imported elemental link spawn failed");
+    assert!(
+        link.status.success(),
+        "imported elemental binary should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "imported elemental optional array should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected imported elemental optional array output: {}",
+        stdout
+    );
+}
+
+#[test]
+fn type_bound_generic_prefers_int8_array_wrapper_over_derived_specific() {
+    let src = write_program(
+        r#"module m
+  use iso_fortran_env, only: int8, int32, int64
+  implicit none
+
+  type :: key_type
+    integer(int8), allocatable :: value(:)
+  end type key_type
+
+  abstract interface
+    function hasher_fun(key) result(hash_code)
+      import :: int32, key_type
+      type(key_type), intent(in) :: key
+      integer(int32) :: hash_code
+    end function hasher_fun
+
+    subroutine key_map_entry_ifc(map, key)
+      import :: hashmap_type, key_type
+      class(hashmap_type), intent(inout) :: map
+      type(key_type), intent(in) :: key
+    end subroutine key_map_entry_ifc
+  end interface
+
+  type, abstract :: hashmap_type
+    integer :: seen = 0
+    procedure(hasher_fun), pointer, nopass :: hasher => sum_key
+  contains
+    procedure(key_map_entry_ifc), deferred, pass(map) :: key_map_entry
+    procedure, non_overridable, pass(map) :: int8_map_entry
+    generic, public :: map_entry => key_map_entry, int8_map_entry
+  end type hashmap_type
+
+  type, extends(hashmap_type) :: chaining_hashmap_type
+  contains
+    procedure :: key_map_entry => map_chain_entry
+  end type chaining_hashmap_type
+contains
+  subroutine set_int8(key, value)
+    type(key_type), intent(out) :: key
+    integer(int8), intent(in) :: value(:)
+    key%value = value
+  end subroutine set_int8
+
+  subroutine int8_map_entry(map, value)
+    class(hashmap_type), intent(inout) :: map
+    integer(int8), intent(in) :: value(:)
+    type(key_type) :: key
+
+    call set_int8(key, value)
+    call map%key_map_entry(key)
+  end subroutine int8_map_entry
+
+  subroutine map_chain_entry(map, key)
+    class(chaining_hashmap_type), intent(inout) :: map
+    type(key_type), intent(in) :: key
+
+    map%seen = size(key%value)
+    if (map%hasher(key) < 0) error stop 10
+  end subroutine map_chain_entry
+
+  function sum_key(key) result(hash_code)
+    type(key_type), intent(in) :: key
+    integer(int32) :: hash_code
+    hash_code = int8_sum(key%value)
+  end function sum_key
+
+  function int8_sum(key) result(hash_code)
+    integer(int8), intent(in) :: key(:)
+    integer(int32) :: hash_code
+    integer(int64) :: i
+
+    hash_code = 0_int32
+    do i = 1_int64, size(key, kind=int64)
+      hash_code = hash_code + int(key(i), int32)
+    end do
+  end function int8_sum
+end module m
+
+program p
+  use iso_fortran_env, only: int8, int64
+  use m, only: chaining_hashmap_type
+  implicit none
+
+  type(chaining_hashmap_type) :: map
+
+  call map%map_entry([1_int8, 2_int8, 3_int8])
+  if (map%seen /= 3) error stop 1
+
+  call map%map_entry(transfer([1_int64, 2_int64, 3_int64], [0_int8]))
+  if (map%seen /= 24) error stop 2
+
+  print *, 'ok'
+end program p
+"#,
+        "f90",
+    );
+    let out = unique_path("type_bound_int8_array_dispatch", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("type-bound int8 array dispatch compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "type-bound int8 array dispatch should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "type-bound int8 array dispatch should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected type-bound int8 array dispatch output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn default_integer_system_clock_runs_without_runtime_abi_crash() {
     let src = write_program(
         "program p\n  implicit none\n  integer :: count, rate, max_count\n  call system_clock(count, rate, max_count)\n  if (rate == 0) error stop 1\n  if (max_count == 0) error stop 2\n  print *, 'ok'\nend program\n",
@@ -19310,6 +23019,146 @@ fn default_integer_system_clock_runs_without_runtime_abi_crash() {
     assert!(
         stdout.contains("ok"),
         "unexpected default integer system_clock output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn system_clock_component_writeback_uses_component_width() {
+    let src = write_program(
+        "program p\n  implicit none\n  type :: clock_state\n    integer(8) :: count = 0\n    real(8) :: rate = 0.0_8\n    integer(8) :: max_count = 0\n  end type\n  type(clock_state) :: state\n  call system_clock(state%count, state%rate, state%max_count)\n  if (state%count < 1000000_8) error stop 1\n  if (state%rate <= 0.0_8) error stop 2\n  if (state%max_count == 0_8) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("system_clock_component_writeback", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("system_clock component writeback compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "system_clock component writeback should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "system_clock component writeback should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected system_clock component writeback output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn cpu_time_default_real_uses_runtime_f64_writeback() {
+    let src = write_program(
+        "program p\n  implicit none\n  real :: t32\n  real(8) :: t64\n  call cpu_time(t32)\n  call cpu_time(t64)\n  if (t32 < 0.0) error stop 1\n  if (t64 < 0.0_8) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("cpu_time_default_real_writeback", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("cpu_time writeback compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "cpu_time writeback should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "cpu_time writeback should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected cpu_time writeback output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn host_associated_large_explicit_array_sections_pass_descriptor() {
+    let src = write_program(
+        "program p\n  implicit none\n  integer, parameter :: n = 70000\n  integer(1) :: values(n)\n  values = 0_1\n  values(1) = 11_1\n  values(n) = 22_1\n  call inner()\ncontains\n  subroutine inner()\n    if (first(values(1:1)) /= 11) error stop 1\n    if (first(values(n:n)) /= 22) error stop 2\n    print *, 'ok'\n  end subroutine\n  integer function first(x) result(y)\n    integer(1), intent(in) :: x(:)\n    y = x(1)\n  end function\nend program\n",
+        "f90",
+    );
+    let out = unique_path("host_large_explicit_array_section", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("host large explicit array section compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "host large explicit array section should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "host large explicit array section should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected host large explicit array section output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn use_only_generic_call_resolution_beats_private_reexport() {
+    let src = write_program(
+        "module hidden_error\n  implicit none\ncontains\n  subroutine check(condition, msg, code, warn)\n    logical, intent(in) :: condition\n    character(*), intent(in), optional :: msg\n    integer, intent(in), optional :: code\n    logical, intent(in), optional :: warn\n    if (.not. condition) error stop 1\n  end subroutine\nend module\nmodule private_carrier\n  use hidden_error, only: check\n  implicit none\n  private\nend module\nmodule local_testdrive\n  implicit none\n  type :: error_type\n    integer :: dummy = 0\n  end type\n  interface check\n    module procedure check_logical\n  end interface\ncontains\n  subroutine check_logical(error, expression, message)\n    type(error_type), allocatable, intent(out) :: error\n    logical, intent(in) :: expression\n    character(*), intent(in) :: message\n    if (.not. expression) allocate(error)\n  end subroutine\nend module\nprogram p\n  use local_testdrive, only: error_type, check\n  use private_carrier\n  implicit none\n  type(error_type), allocatable :: error\n  call check(error, .true., 'ok')\n  if (allocated(error)) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("use_only_generic_private_reexport", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("use-only generic resolution compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "use-only generic resolution should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "use-only generic resolution should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected use-only generic resolution output: {}",
         stdout
     );
 
@@ -19489,6 +23338,58 @@ fn allocatable_char_array_component_passes_descriptor_to_dummy() {
     );
 
     let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn contained_subroutine_uses_host_parameter_array_storage() {
+    let src = write_program(
+        "program p\n  implicit none\n  integer, parameter :: block_size(4) = [1, 2, 4, 8]\n  integer :: total\n  call worker(total)\n  if (total /= 19) error stop 1\n  print *, 'ok'\ncontains\n  subroutine worker(total)\n    integer, intent(out) :: total\n    integer :: k\n    total = size(block_size)\n    do k = 1, size(block_size)\n      total = total + block_size(k)\n    end do\n  end subroutine worker\nend program\n",
+        "f90",
+    );
+    let obj = unique_path("host_param_array_storage", "o");
+    let out = unique_path("host_param_array_storage", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", obj.to_str().unwrap()])
+        .output()
+        .expect("host parameter array object compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "host parameter array object should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let undefined = undefined_symbols(&obj);
+    for raw in ["_block_size", "_size"] {
+        assert!(
+            !undefined.iter().any(|sym| sym == raw),
+            "host parameter array reference lowered as raw call {}: {:?}",
+            raw,
+            undefined
+        );
+    }
+
+    let link = Command::new(compiler("armfortas"))
+        .args([obj.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("host parameter array link spawn failed");
+    assert!(
+        link.status.success(),
+        "host parameter array program should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("host parameter array run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "host parameter array should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&obj);
     let _ = std::fs::remove_file(&src);
 }
 
@@ -22973,6 +26874,1105 @@ fn logical_reduction_intrinsics_on_logical_sections_compile_and_run() {
 }
 
 #[test]
+fn complex_part_array_masks_keep_rank_for_reductions_and_dispatch() {
+    let src = write_program(
+        r#"
+module m
+  implicit none
+  interface classify
+    module procedure classify_scalar
+    module procedure classify_array
+  end interface
+contains
+  subroutine classify_scalar(mask, total)
+    logical, intent(in) :: mask
+    integer, intent(out) :: total
+    if (mask) then
+      total = -1
+    else
+      total = -2
+    end if
+  end subroutine
+
+  subroutine classify_array(mask, total)
+    logical, intent(in) :: mask(:)
+    integer, intent(out) :: total
+    total = count(mask)
+  end subroutine
+end module
+
+program p
+  use m
+  implicit none
+  complex, parameter :: z(4) = [(-1.0, 2.0), (3.0, -4.0), (-2.0, -1.0), (4.0, 3.0)]
+  integer :: total, from_generic
+
+  total = count(z%re > 0.0)
+  call classify(z%re > 0.0, from_generic)
+
+  if (total /= 2) error stop 1
+  if (from_generic /= 2) error stop 2
+  if (count(z%im < 0.0) /= 2) error stop 3
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("complex_part_array_masks", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("complex part array mask compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "complex part array mask compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("complex part array mask run failed");
+    assert!(
+        run.status.success(),
+        "complex part array mask run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected complex part array mask output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn all_over_integer_section_compared_to_array_function_result_lowers_descriptor() {
+    let src = write_program(
+        r#"
+module m
+  implicit none
+contains
+  function pair(n) result(out)
+    integer, intent(in) :: n
+    integer :: out(2)
+    out = [n, n + 1]
+  end function
+end module
+
+program p
+  use m
+  implicit none
+  integer :: vals(2, 3)
+  vals(:, 1) = [1, 2]
+  vals(:, 2) = [2, 3]
+  vals(:, 3) = [4, 5]
+  if (.not. all(vals(:, 2) == pair(2))) error stop 1
+  if (all(vals(:, 3) == pair(2))) error stop 2
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let obj = unique_path("all_section_array_result", "o");
+    let compile_obj = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", obj.to_str().unwrap()])
+        .output()
+        .expect("all section/result object compile failed to spawn");
+    assert!(
+        compile_obj.status.success(),
+        "object compile failed: {}",
+        String::from_utf8_lossy(&compile_obj.stderr)
+    );
+    let undefined = undefined_symbols(&obj);
+    assert!(
+        !undefined.iter().any(|sym| sym == "_all"),
+        "ALL over section/result comparison must not escape as raw _all: {:?}",
+        undefined
+    );
+
+    let out = unique_path("all_section_array_result", "bin");
+    let compile_bin = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("all section/result binary compile failed to spawn");
+    assert!(
+        compile_bin.status.success(),
+        "binary compile failed: {}",
+        String::from_utf8_lossy(&compile_bin.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("all section/result run failed");
+    assert!(
+        run.status.success(),
+        "all section/result run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected all section/result output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&obj);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn all_over_real_section_compared_to_scalar_lowers_descriptor() {
+    let src = write_program(
+        r#"
+program p
+  implicit none
+  real, parameter :: tolerance = 0.25
+  real :: err(3)
+  err = [0.1, 0.2, 0.3]
+  if (all(err(:) < tolerance)) error stop 1
+  err = [0.1, 0.2, 0.24]
+  if (.not. all(err(:) < tolerance)) error stop 2
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let obj = unique_path("all_real_section_scalar", "o");
+    let compile_obj = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", obj.to_str().unwrap()])
+        .output()
+        .expect("all real section/scalar object compile failed to spawn");
+    assert!(
+        compile_obj.status.success(),
+        "object compile failed: {}",
+        String::from_utf8_lossy(&compile_obj.stderr)
+    );
+    let undefined = undefined_symbols(&obj);
+    assert!(
+        !undefined.iter().any(|sym| sym == "_all"),
+        "ALL over real section/scalar comparison must not escape as raw _all: {:?}",
+        undefined
+    );
+
+    let out = unique_path("all_real_section_scalar", "bin");
+    let compile_bin = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("all real section/scalar binary compile failed to spawn");
+    assert!(
+        compile_bin.status.success(),
+        "binary compile failed: {}",
+        String::from_utf8_lossy(&compile_bin.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("all real section/scalar run failed");
+    assert!(
+        run.status.success(),
+        "all real section/scalar run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected all real section/scalar output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&obj);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn all_over_complex_array_compare_lowers_descriptor() {
+    let src = write_program(
+        r#"
+program p
+  implicit none
+  complex :: a(2), b(2)
+  a = [cmplx(1.0, 2.0), cmplx(3.0, 4.0)]
+  b = a
+  if (.not. all(a == b)) error stop 1
+  b(2) = cmplx(3.0, 5.0)
+  if (all(a == b)) error stop 2
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let obj = unique_path("all_complex_array_compare", "o");
+    let compile_obj = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", obj.to_str().unwrap()])
+        .output()
+        .expect("all complex array compare object compile failed to spawn");
+    assert!(
+        compile_obj.status.success(),
+        "object compile failed: {}",
+        String::from_utf8_lossy(&compile_obj.stderr)
+    );
+    let undefined = undefined_symbols(&obj);
+    assert!(
+        !undefined.iter().any(|sym| sym == "_all"),
+        "ALL over complex array comparison must not escape as raw _all: {:?}",
+        undefined
+    );
+
+    let out = unique_path("all_complex_array_compare", "bin");
+    let compile_bin = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("all complex array compare binary compile failed to spawn");
+    assert!(
+        compile_bin.status.success(),
+        "binary compile failed: {}",
+        String::from_utf8_lossy(&compile_bin.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("all complex array compare run failed");
+    assert!(
+        run.status.success(),
+        "all complex array compare run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected all complex array compare output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&obj);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn generic_rank_dispatch_uses_symbol_rank_for_block_parameter_arrays() {
+    let src = write_program(
+        r#"
+module m
+  implicit none
+  interface diag_like
+    module procedure diag_vec_k
+    module procedure diag_mat_k
+  end interface
+contains
+  function diag_vec_k(v, k) result(res)
+    real, intent(in) :: v(:)
+    integer, intent(in) :: k
+    real :: res(size(v) + abs(k), size(v) + abs(k))
+    res = -1.0
+  end function
+
+  function diag_mat_k(a, k) result(res)
+    real, intent(in) :: a(:,:)
+    integer, intent(in) :: k
+    real :: res(3)
+    res = [1.0, 2.0, 3.0]
+  end function
+end module
+
+program p
+  use m
+  implicit none
+  block
+    integer, parameter :: n = 4
+    real :: a(n, n)
+    real :: d(3)
+    a = 0.0
+    d = diag_like(a, -1)
+    if (any(d /= [1.0, 2.0, 3.0])) error stop 1
+  end block
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("generic_rank_block_param", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("generic block-parameter rank compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "block-parameter-shaped matrix actual should resolve rank-2 specific: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("generic block-parameter rank run failed");
+    assert!(
+        run.status.success(),
+        "generic block-parameter rank run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected generic block-parameter rank output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn nested_diag_generic_keeps_whole_array_actual_under_elementwise_compare() {
+    let src = write_program(
+        r#"
+module diag_scalarize_m
+  use iso_fortran_env, only: int8
+  implicit none
+  interface diag
+    module procedure diag_vec_i8
+    module procedure diag_mat_i8
+  end interface
+contains
+  function diag_vec_i8(v) result(res)
+    integer(int8), intent(in) :: v(:)
+    integer(int8) :: res(2,2)
+    res = 0_int8
+    res(1,1) = v(1)
+    res(2,2) = v(2)
+  end function
+
+  function diag_mat_i8(a) result(res)
+    integer(int8), intent(in) :: a(:,:)
+    integer(int8) :: res(2)
+    res = [a(1,1), a(2,2)]
+  end function
+end module
+
+program p
+  use iso_fortran_env, only: int8
+  use diag_scalarize_m, only: diag
+  implicit none
+  integer(int8) :: a(2,2), expected(2,2)
+
+  a = reshape([1_int8, 2_int8, 3_int8, 4_int8], [2,2])
+  expected = 0_int8
+  expected(1,1) = 1_int8
+  expected(2,2) = 4_int8
+  if (.not. all(diag(diag(a)) == expected)) error stop 1
+end program
+"#,
+        "f90",
+    );
+    let obj = unique_path("nested_diag_scalarize", "o");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", obj.to_str().unwrap()])
+        .output()
+        .expect("nested diag scalarization compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "diag must keep whole-array actuals when nested under elementwise compare: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let _ = std::fs::remove_file(&obj);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn rank_intrinsic_lowers_to_declared_rank() {
+    let src = write_program(
+        r#"
+program p
+  implicit none
+  real, allocatable :: x(:,:,:)
+  integer :: scalar
+  integer :: i, total
+
+  total = rank(scalar)
+  allocate(x(2, 3, 4))
+  do i = 1, rank(x)
+    total = total + i
+  end do
+  if (total /= 6) error stop 1
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("rank_intrinsic_declared_rank", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("rank intrinsic compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "rank intrinsic should lower without external _rank call: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("rank intrinsic run failed");
+    assert!(
+        run.status.success(),
+        "rank intrinsic program failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected rank intrinsic output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn imported_generic_complex_constructor_keeps_parameter_kind() {
+    let dir = unique_dir("generic_complex_constructor_kind");
+    let mod_src = write_program_in(
+        &dir,
+        "complex_diag_like_m.f90",
+        r#"
+module complex_diag_like_m
+  implicit none
+  integer, parameter :: sp = 4, dp = 8
+
+  interface diag_like
+    module procedure diag_csp_k
+    module procedure diag_cdp_k
+  end interface
+contains
+  function diag_csp_k(v, k) result(res)
+    complex(sp), intent(in) :: v(:)
+    integer, intent(in) :: k
+    complex(sp) :: res(1)
+    res = [v(1) + cmplx(4.0_sp, 0.0_sp, kind=sp)]
+  end function
+
+  function diag_cdp_k(v, k) result(res)
+    complex(dp), intent(in) :: v(:)
+    integer, intent(in) :: k
+    complex(dp) :: res(1)
+    res = [v(1) + cmplx(8.0_dp, 0.0_dp, kind=dp)]
+  end function
+end module
+"#,
+    );
+    let user_src = write_program_in(
+        &dir,
+        "main.f90",
+        r#"
+program p
+  use complex_diag_like_m, only: diag_like, dp
+  implicit none
+  complex(dp), parameter :: i_ = cmplx(0.0_dp, 1.0_dp, kind=dp)
+  complex(dp) :: got(1)
+
+  got = diag_like([i_], -2)
+  if (abs(real(got(1)) - 8.0_dp) > 0.001_dp) error stop 1
+  print *, 'ok'
+end program
+"#,
+    );
+
+    let mod_obj = dir.join("complex_diag_like_m.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            mod_src.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("complex diag-like module compile spawn failed");
+    assert!(
+        compile_mod.status.success(),
+        "complex diag-like module compile failed: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let user_obj = dir.join("main.o");
+    let compile_user = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            user_src.to_str().unwrap(),
+            "-o",
+            user_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("complex constructor generic user compile spawn failed");
+    assert!(
+        compile_user.status.success(),
+        "complex(dp) array constructor should dispatch to dp specific: {}",
+        String::from_utf8_lossy(&compile_user.stderr)
+    );
+
+    let out = dir.join("generic_complex_constructor_kind.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            mod_obj.to_str().unwrap(),
+            user_obj.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("complex constructor generic link spawn failed");
+    assert!(
+        link.status.success(),
+        "complex constructor generic program should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("complex constructor generic run failed");
+    assert!(
+        run.status.success(),
+        "complex constructor generic should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected complex constructor generic output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn imported_generic_rank_dispatch_uses_symbol_rank_for_allocatable_matrix() {
+    let dir = unique_dir("generic_alloc_matrix_rank");
+    let mod_src = write_program_in(
+        &dir,
+        "rank_pick_m.f90",
+        r#"
+module rank_pick_m
+  use iso_fortran_env, only: int8
+  implicit none
+  interface pick_rank
+    module procedure pick_vec_i8
+    module procedure pick_mat_i8
+  end interface
+contains
+  integer function pick_vec_i8(v)
+    integer(int8), intent(in) :: v(:)
+    pick_vec_i8 = 1
+  end function
+
+  integer function pick_mat_i8(a)
+    integer(int8), intent(in) :: a(:,:)
+    pick_mat_i8 = 2
+  end function
+end module
+"#,
+    );
+    let user_src = write_program_in(
+        &dir,
+        "main.f90",
+        r#"
+program p
+  use iso_fortran_env, only: int8
+  use rank_pick_m, only: pick_rank
+  implicit none
+  integer(int8), allocatable :: a(:,:)
+
+  allocate(a(2, 2))
+  a = 1_int8
+  if (pick_rank(a) /= 2) error stop 1
+  print *, 'ok'
+end program
+"#,
+    );
+
+    let mod_obj = dir.join("rank_pick_m.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            mod_src.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("rank-pick module compile spawn failed");
+    assert!(
+        compile_mod.status.success(),
+        "rank-pick module compile failed: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let user_obj = dir.join("main.o");
+    let compile_user = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            user_src.to_str().unwrap(),
+            "-o",
+            user_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("rank-pick user compile spawn failed");
+    assert!(
+        compile_user.status.success(),
+        "allocatable matrix actual should resolve rank-2 specific: {}",
+        String::from_utf8_lossy(&compile_user.stderr)
+    );
+
+    let out = dir.join("generic_alloc_matrix_rank.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            mod_obj.to_str().unwrap(),
+            user_obj.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("rank-pick link spawn failed");
+    assert!(
+        link.status.success(),
+        "rank-pick program should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("rank-pick run failed");
+    assert!(
+        run.status.success(),
+        "rank-pick program should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected rank-pick output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn imported_generic_rank_dispatch_uses_symbol_rank_for_module_allocatable_cube() {
+    let dir = unique_dir("generic_module_alloc_cube_rank");
+    let mod_src = write_program_in(
+        &dir,
+        "rank_pick_m.f90",
+        r#"
+module rank_pick_m
+  implicit none
+  interface pick_rank
+    module procedure pick_vec_i4
+    module procedure pick_cube_i4
+  end interface
+contains
+  integer function pick_vec_i4(v, order)
+    integer, intent(in) :: v(:)
+    integer, intent(in) :: order
+    pick_vec_i4 = 10 + order
+  end function
+
+  integer function pick_cube_i4(a, order)
+    integer, intent(in) :: a(:,:,:)
+    integer, intent(in) :: order
+    pick_cube_i4 = 30 + order
+  end function
+end module
+"#,
+    );
+    let user_src = write_program_in(
+        &dir,
+        "main.f90",
+        r#"
+module user_m
+  use rank_pick_m, only: pick_rank
+  implicit none
+  integer, allocatable :: a(:,:,:)
+contains
+  subroutine run
+    integer, parameter :: order = 2
+    allocate(a(2, 2, 2))
+    a = 1
+    if (pick_rank(a, order) /= 32) error stop 1
+  end subroutine
+end module
+
+program p
+  use user_m, only: run
+  implicit none
+  call run
+  print *, 'ok'
+end program
+"#,
+    );
+
+    let mod_obj = dir.join("rank_pick_m.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            mod_src.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("cube rank-pick module compile spawn failed");
+    assert!(
+        compile_mod.status.success(),
+        "cube rank-pick module compile failed: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let user_obj = dir.join("main.o");
+    let compile_user = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            user_src.to_str().unwrap(),
+            "-o",
+            user_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("cube rank-pick user compile spawn failed");
+    assert!(
+        compile_user.status.success(),
+        "module allocatable cube actual should resolve rank-3 specific: {}",
+        String::from_utf8_lossy(&compile_user.stderr)
+    );
+
+    let out = dir.join("generic_module_alloc_cube_rank.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            mod_obj.to_str().unwrap(),
+            user_obj.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("cube rank-pick link spawn failed");
+    assert!(
+        link.status.success(),
+        "cube rank-pick program should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("cube rank-pick run failed");
+    assert!(
+        run.status.success(),
+        "cube rank-pick program should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected cube rank-pick output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn imported_smp_generic_allocatable_array_literal_order_resolves_by_semantics() {
+    // stdlib_linalg's norm interface is declared in a parent module,
+    // implemented in a submodule, then consumed from a separate test
+    // unit. For calls like `norm(a, 2)`, the actual types and ranks
+    // are semantically known, but descriptor probe IR can be too lossy
+    // for allocatable arrays. A complete semantic+rank match is enough
+    // to select the imported specific.
+    let dir = unique_dir("smp_generic_alloc_lit_order");
+    let parent_src = write_program_in(
+        &dir,
+        "m.f90",
+        "module m\n  implicit none\n  interface g\n    module function g_1d(a, order) result(r)\n      real, intent(in) :: a(:)\n      integer, intent(in) :: order\n      real :: r\n    end function\n  end interface\nend module\n",
+    );
+    let sub_src = write_program_in(
+        &dir,
+        "s.f90",
+        "submodule (m) sm\ncontains\n  module procedure g_1d\n    r = 8.0\n  end procedure\nend submodule\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "p.f90",
+        "program p\n  use m, only: g\n  implicit none\n  real, allocatable :: a(:)\n  real :: got\n  allocate(a(3))\n  a = [1.0, 2.0, 3.0]\n  got = g(a, 2)\n  if (abs(got - 8.0) > 1.0e-6) error stop 1\n  print *, 'ok'\nend program\n",
+    );
+    let parent_o = dir.join("m.o");
+    let sub_o = dir.join("s.o");
+    let main_o = dir.join("p.o");
+    for (src, obj) in [
+        (&parent_src, &parent_o),
+        (&sub_src, &sub_o),
+        (&main_src, &main_o),
+    ] {
+        let r = Command::new(compiler("armfortas"))
+            .args([
+                "-c",
+                src.to_str().unwrap(),
+                "-I",
+                dir.to_str().unwrap(),
+                "-J",
+                dir.to_str().unwrap(),
+                "-o",
+                obj.to_str().unwrap(),
+            ])
+            .output()
+            .expect("compile failed");
+        assert!(
+            r.status.success(),
+            "compile {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&r.stderr)
+        );
+    }
+    let undef = undefined_symbols(&main_o);
+    assert!(
+        undef.iter().any(|s| s.contains("g_1d")),
+        "main object should call the imported g_1d specific: {:?}",
+        undef
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn imported_generic_scalar_local_rank_wins_over_wrong_scope_array_symbol() {
+    let dir = unique_dir("generic_scalar_rank_shadow");
+    let mod_src = write_program_in(
+        &dir,
+        "rank_shadow_m.f90",
+        r#"
+module rank_shadow_m
+  implicit none
+  integer :: dim(1)
+  interface pick
+    module procedure pick_matrix_dim
+  end interface
+contains
+  integer function pick_matrix_dim(a, order, dim)
+    real, intent(in) :: a(:,:)
+    integer, intent(in) :: order
+    integer, intent(in) :: dim
+    pick_matrix_dim = size(a, 1) + order + dim
+  end function
+end module
+"#,
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        r#"
+program p
+  use rank_shadow_m, only: pick
+  implicit none
+  real, allocatable :: a(:,:)
+  integer :: dim
+  allocate(a(2, 2))
+  dim = 3
+  if (pick(a, 2, dim) /= 7) error stop 1
+  print *, 'ok'
+end program
+"#,
+    );
+
+    let mod_obj = dir.join("rank_shadow_m.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            mod_src.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("rank-shadow module compile spawn failed");
+    assert!(
+        compile_mod.status.success(),
+        "rank-shadow module compile failed: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_main = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            main_src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("rank-shadow main compile spawn failed");
+    assert!(
+        compile_main.status.success(),
+        "scalar local dim should not inherit rank from wrong-scope dim(:): {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let out = dir.join("generic_scalar_rank_shadow.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            mod_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("rank-shadow link spawn failed");
+    assert!(
+        link.status.success(),
+        "rank-shadow program should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("rank-shadow run failed");
+    assert!(
+        run.status.success(),
+        "rank-shadow program should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected rank-shadow output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn nested_imported_generic_result_rank_dispatches_outer_call() {
+    let dir = unique_dir("nested_generic_result_rank");
+    let mod_src = write_program_in(
+        &dir,
+        "nested_rank_m.f90",
+        r#"
+module nested_rank_m
+  use iso_fortran_env, only: int8
+  implicit none
+  interface flip_rank
+    module procedure mat_to_vec_i8
+    module procedure vec_to_mat_i8
+  end interface
+contains
+  function mat_to_vec_i8(a) result(res)
+    integer(int8), intent(in) :: a(:,:)
+    integer(int8) :: res(2)
+    res = [a(1,1), a(2,2)]
+  end function
+
+  function vec_to_mat_i8(v) result(res)
+    integer(int8), intent(in) :: v(:)
+    integer(int8) :: res(2,2)
+    res = reshape([v(1), 0_int8, 0_int8, v(2)], [2,2])
+  end function
+end module
+"#,
+    );
+    let user_src = write_program_in(
+        &dir,
+        "main.f90",
+        r#"
+program p
+  use iso_fortran_env, only: int8
+  use nested_rank_m, only: flip_rank
+  implicit none
+  integer(int8), allocatable :: a(:,:)
+  integer(int8) :: b(2,2)
+
+  allocate(a(2, 2))
+  a = 1_int8
+  b = flip_rank(flip_rank(a))
+end program
+"#,
+    );
+
+    let mod_obj = dir.join("nested_rank_m.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            mod_src.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("nested rank module compile spawn failed");
+    assert!(
+        compile_mod.status.success(),
+        "nested rank module compile failed: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let user_obj = dir.join("main.o");
+    let compile_user = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            user_src.to_str().unwrap(),
+            "-o",
+            user_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("nested rank user compile spawn failed");
+    assert!(
+        compile_user.status.success(),
+        "outer generic should see the inner generic array result rank: {}",
+        String::from_utf8_lossy(&compile_user.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn logical_reduction_intrinsics_on_elemental_character_results_compile_and_run() {
     let src = write_program(
         "program p\n  implicit none\n  integer :: pos(2)\n  character(len=1) :: kind(2)\n\n  pos = [1, 2]\n  kind = ['a', 'b']\n\n  if (.not. all(peek('ab', pos) == kind)) error stop 1\n  if (.not. any(match('ab', pos, ['x', 'b']))) error stop 2\n\n  print *, 'ok'\ncontains\n  elemental function peek(src, idx) result(ch)\n    character(len=*), intent(in) :: src\n    integer, intent(in) :: idx\n    character(len=1) :: ch\n    ch = src(idx:idx)\n  end function\n\n  elemental logical function match(src, idx, want) result(ok)\n    character(len=*), intent(in) :: src\n    integer, intent(in) :: idx\n    character(len=1), intent(in) :: want\n    ok = src(idx:idx) == want\n  end function\nend program\n",
@@ -23257,6 +28257,54 @@ fn bit_manipulation_intrinsics_lower_inline() {
 }
 
 #[test]
+fn scalar_intrinsic_arguments_use_runtime_values_not_dispatch_probes() {
+    // stdlib random uses shapes like `iz = iand(dist_rand(1_int32), 127)`.
+    // A dispatch-probe value has the right type but a zero value; feeding
+    // that to scalar intrinsic lowering made bit intrinsics collapse to zero.
+    let src = write_program(
+        r#"program p
+  implicit none
+  integer :: iz, jz
+  jz = next_value()
+  iz = iand(jz, 127)
+  if (iz /= 45) error stop 1
+  iz = iand(next_value(), 127)
+  if (iz /= 45) error stop 2
+  iz = ieor(next_value(), 127)
+  if (iz /= 210) error stop 3
+  print *, 'ok'
+contains
+  integer function next_value()
+    next_value = 173
+  end function
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("scalar_intrinsic_runtime_args", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        compile.status.success(),
+        "scalar intrinsic argument repro should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("failed to run binary");
+    assert!(
+        run.status.success(),
+        "scalar intrinsic argument repro should run:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok output, got: {}", stdout);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn dispatch_optional_logical_int8_array_through_descriptor() {
     // F2018 §15.5.2: dispatch on a generic with a `logical(int8),
     // optional, dimension(:)` formal must accept a `logical(int8)`
@@ -23316,6 +28364,64 @@ fn norm2_handles_binary_array_expression() {
     assert!(
         run.status.success(),
         "norm2 binary array repro should run:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok output, got: {}", stdout);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn norm2_dim_returns_rank_one_descriptor() {
+    let src = write_program(
+        "program p\n  implicit none\n  real :: a(2,2)\n  real :: got(2)\n  a = reshape([3.0, 4.0, 5.0, 12.0], [2,2])\n  got = norm2(a, dim=1)\n  if (abs(got(1) - 5.0) > 1.0e-5) error stop 1\n  if (abs(got(2) - 13.0) > 1.0e-5) error stop 2\n  if (.not. all(abs(got - [5.0, 13.0]) < 1.0e-5)) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("norm2_dim_descriptor", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        compile.status.success(),
+        "norm2(dim=) should compile as array-valued: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("failed to run binary");
+    assert!(
+        run.status.success(),
+        "norm2(dim=) repro should run:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok output, got: {}", stdout);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn scalar_array_constructor_values_coerce_to_complex_elements() {
+    let src = write_program(
+        "program p\n  implicit none\n  complex :: zs(2)\n  complex(8) :: zd(2)\n  zs = [1, -1]\n  zd = [1, -1]\n  if (abs(real(zs(1)) - 1.0) > 1.0e-6 .or. abs(aimag(zs(1))) > 1.0e-6) error stop 1\n  if (abs(real(zs(2)) + 1.0) > 1.0e-6 .or. abs(aimag(zs(2))) > 1.0e-6) error stop 2\n  if (abs(real(zd(1)) - 1.0_8) > 1.0e-10_8 .or. abs(aimag(zd(1))) > 1.0e-10_8) error stop 3\n  if (abs(real(zd(2)) + 1.0_8) > 1.0e-10_8 .or. abs(aimag(zd(2))) > 1.0e-10_8) error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("complex_constructor_scalar_values", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        compile.status.success(),
+        "scalar constructor values should coerce into complex arrays: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("failed to run binary");
+    assert!(
+        run.status.success(),
+        "complex constructor scalar-value repro should run:\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr)
     );
@@ -23778,6 +28884,98 @@ fn imported_generic_subroutine_resolution_uses_specific_keyword_slots() {
     assert!(
         String::from_utf8_lossy(&run.stdout).contains("ok"),
         "unexpected output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn imported_array_function_actual_to_descriptor_dummy_keeps_nested_descriptor_abi() {
+    let dir = unique_dir("imported_array_fn_descriptor_actual");
+    let mod_src = write_program_in(
+        &dir,
+        "m.f90",
+        "module m\n  implicit none\n  interface diff\n    module procedure :: diff_2\n  end interface\ncontains\n  function diff_2(x, n, dim) result(y)\n    real, intent(in) :: x(:,:)\n    integer, intent(in), optional :: n, dim\n    real :: y(2,1)\n    y(1,1) = x(2,1) - x(1,1)\n    y(2,1) = x(3,1) - x(2,1)\n  end function\n\n  function same2(a, b) result(ok)\n    real, intent(in) :: a(:,:), b(:,:)\n    logical :: ok\n    ok = abs(a(1,1) - b(1,1)) < 1.0e-5 .and. abs(a(2,1) - b(2,1)) < 1.0e-5\n  end function\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use m, only : diff, same2\n  implicit none\n  real :: a(1,3)\n  a = reshape([1.0, 3.0, 5.0], [1,3])\n  if (.not. same2(diff(reshape(a, [3,1]), n=1, dim=1), reshape([2.0, 2.0], [2,1]))) error stop 1\n  print *, 'ok'\nend program\n",
+    );
+
+    let mod_obj = dir.join("m.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            mod_src.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("descriptor provider compile failed to spawn");
+    assert!(
+        compile_mod.status.success(),
+        "descriptor provider should compile: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_main = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            main_src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("descriptor consumer compile failed to spawn");
+    assert!(
+        compile_main.status.success(),
+        "descriptor consumer should compile: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+    let undef = undefined_symbols(&main_obj);
+    assert!(
+        !undef.iter().any(|sym| sym == "_reshape"),
+        "descriptor consumer emitted scalar reshape call: {undef:?}"
+    );
+
+    let out = dir.join("p");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            mod_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("descriptor link failed to spawn");
+    assert!(
+        link.status.success(),
+        "descriptor binary should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("descriptor run failed");
+    assert!(
+        run.status.success(),
+        "descriptor binary should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected descriptor output: {}",
         String::from_utf8_lossy(&run.stdout)
     );
 
@@ -24967,6 +30165,252 @@ fn procedure_pointer_component_call_updates_integer_argument() {
     assert!(
         String::from_utf8_lossy(&run.stdout).contains("ok"),
         "unexpected procptr component call output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn imported_procptr_component_call_passes_assumed_shape_descriptors() {
+    let dir = unique_dir("imported_procptr_component_descriptors");
+    let mod_src = write_program_in(
+        &dir,
+        "callbacks.f90",
+        "module callbacks\n  implicit none\n  abstract interface\n    subroutine cb(x, y, alpha, beta, op)\n      real(8), intent(in) :: x(:)\n      real(8), intent(inout) :: y(:)\n      real(8), intent(in) :: alpha, beta\n      character(1), intent(in) :: op\n    end subroutine\n  end interface\n  type :: holder_t\n    procedure(cb), pointer, nopass :: apply => null()\n  end type\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use callbacks\n  implicit none\n  type(holder_t) :: holder\n  real(8) :: x(3)\n  real(8), allocatable :: tmp(:,:)\n  x = [1.0_8, 2.0_8, 3.0_8]\n  allocate(tmp(3,2))\n  tmp = 10.0_8\n  holder%apply => scale\n  call kernel(holder, x, tmp)\n  if (abs(tmp(1,1) - 8.0_8) > 1.0e-12_8) error stop 10\n  if (abs(tmp(3,1) - 4.0_8) > 1.0e-12_8) error stop 11\n  if (abs(tmp(2,2) - 10.0_8) > 1.0e-12_8) error stop 12\n  print *, 'ok'\ncontains\n  subroutine kernel(holder, x, tmp)\n    class(holder_t), intent(in) :: holder\n    real(8), intent(in) :: x(:)\n    real(8), intent(inout) :: tmp(:,:)\n    associate (r => tmp(:,1))\n      call holder%apply(x, r, alpha=-2.0_8, beta=1.0_8, op='N')\n    end associate\n  end subroutine\n\n  subroutine scale(x, y, alpha, beta, op)\n    real(8), intent(in) :: x(:)\n    real(8), intent(inout) :: y(:)\n    real(8), intent(in) :: alpha, beta\n    character(1), intent(in) :: op\n    if (op /= 'N') error stop 20\n    if (size(x) /= 3) error stop 21\n    if (size(y) /= 3) error stop 22\n    y = beta * y + alpha * x\n  end subroutine\nend program\n",
+    );
+
+    let mod_obj = dir.join("callbacks.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            mod_src.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("callbacks compile failed to spawn");
+    assert!(
+        compile_mod.status.success(),
+        "callbacks module should compile: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_main = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            main_src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("main compile failed to spawn");
+    assert!(
+        compile_main.status.success(),
+        "main should compile with imported procptr holder: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let exe = dir.join("imported_procptr_component_descriptors.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            mod_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link spawn failed");
+    assert!(
+        link.status.success(),
+        "imported procptr descriptor objects should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("imported procptr descriptor run failed");
+    assert!(
+        run.status.success(),
+        "imported procptr descriptor run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected imported procptr descriptor output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+}
+
+#[test]
+fn imported_procptr_component_function_preserves_return_type() {
+    let dir = unique_dir("imported_procptr_component_function_return");
+    let mod_src = write_program_in(
+        &dir,
+        "callbacks.f90",
+        "module callbacks\n  implicit none\n  abstract interface\n    real(8) function reduce(x, y) result(r)\n      real(8), intent(in) :: x(:)\n      real(8), intent(in) :: y(:)\n    end function\n  end interface\n  type :: holder_t\n    procedure(reduce), pointer, nopass :: dot => null()\n  end type\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use callbacks\n  implicit none\n  type(holder_t) :: holder\n  real(8) :: x(3)\n  real(8) :: got\n  x = [1.0_8, 2.0_8, 3.0_8]\n  holder%dot => my_dot\n  call kernel(holder, x, got)\n  if (abs(got - 14.0_8) > 1.0e-12_8) error stop 10\n  print *, 'ok'\ncontains\n  subroutine kernel(holder, x, got)\n    class(holder_t), intent(in) :: holder\n    real(8), intent(in) :: x(:)\n    real(8), intent(out) :: got\n    got = holder%dot(x, x)\n  end subroutine\n\n  real(8) function my_dot(x, y) result(r)\n    real(8), intent(in) :: x(:)\n    real(8), intent(in) :: y(:)\n    r = dot_product(x, y)\n  end function\nend program\n",
+    );
+
+    let mod_obj = dir.join("callbacks.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            mod_src.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("callbacks compile failed to spawn");
+    assert!(
+        compile_mod.status.success(),
+        "callbacks module should compile: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_main = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            main_src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("main compile failed to spawn");
+    assert!(
+        compile_main.status.success(),
+        "main should compile with imported procptr function holder: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let exe = dir.join("imported_procptr_component_function_return.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            mod_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link spawn failed");
+    assert!(
+        link.status.success(),
+        "imported procptr function objects should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("imported procptr function run failed");
+    assert!(
+        run.status.success(),
+        "imported procptr function run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected imported procptr function output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+}
+
+#[test]
+fn contained_procptr_component_preserves_host_derived_dummy() {
+    let src = write_program(
+        "module m\n  implicit none\n  type :: matrix_t\n    integer :: n = 0\n    real(8), allocatable :: data(:)\n  end type\n  abstract interface\n    subroutine cb(x, y, alpha, beta, op)\n      real(8), intent(in) :: x(:)\n      real(8), intent(inout) :: y(:)\n      real(8), intent(in) :: alpha, beta\n      character(1), intent(in) :: op\n    end subroutine\n  end interface\n  type :: holder_t\n    procedure(cb), pointer, nopass :: apply => null()\n  end type\n  type :: workspace_t\n    real(8), allocatable :: tmp(:,:)\n  end type\ncontains\n  subroutine apply_matrix(matrix, x, y, alpha, beta, op)\n    type(matrix_t), intent(in) :: matrix\n    real(8), intent(in) :: x(:)\n    real(8), intent(inout) :: y(:)\n    real(8), intent(in) :: alpha, beta\n    character(1), intent(in) :: op\n    if (op /= 'N') error stop 9\n    if (matrix%n /= 5) error stop 10\n    if (size(matrix%data) /= 5) error stop 11\n    y(1) = beta * y(1) + alpha * matrix%data(1) * x(1)\n  end subroutine\n\n  subroutine kernel(holder, x, workspace)\n    class(holder_t), intent(in) :: holder\n    real(8), intent(in) :: x(:)\n    type(workspace_t), intent(inout) :: workspace\n    associate (r => workspace%tmp(:,1))\n      r = 10.0_8\n      call holder%apply(x, r, alpha=-1.0_8, beta=1.0_8, op='N')\n      if (abs(r(1) - 4.0_8) > 1.0e-12_8) error stop 12\n    end associate\n  end subroutine\n\n  subroutine solve(matrix, x)\n    type(matrix_t), intent(in) :: matrix\n    real(8), intent(in) :: x(:)\n    type(holder_t) :: holder\n    type(workspace_t) :: workspace\n    allocate(workspace%tmp(size(x), 4))\n    holder%apply => local_apply\n    call kernel(holder, x, workspace)\n  contains\n    subroutine local_apply(x, y, alpha, beta, op)\n      real(8), intent(in) :: x(:)\n      real(8), intent(inout) :: y(:)\n      real(8), intent(in) :: alpha, beta\n      character(1), intent(in) :: op\n      call apply_matrix(matrix, x, y, alpha, beta, op)\n    end subroutine\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(matrix_t) :: matrix\n  real(8) :: x(5)\n  matrix%n = 5\n  allocate(matrix%data(5))\n  matrix%data = [3.0_8, 0.0_8, 0.0_8, 0.0_8, 0.0_8]\n  x = [2.0_8, 3.0_8, 4.0_8, 5.0_8, 6.0_8]\n  call solve(matrix, x)\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("contained_procptr_host_derived", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("contained procptr host-derived compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "contained procptr host-derived compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("contained procptr host-derived run failed");
+    assert!(
+        run.status.success(),
+        "contained procptr host-derived run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected contained procptr host-derived output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn contained_proc_does_not_deallocate_host_allocatable_array() {
+    let src = write_program(
+        "program p\n  implicit none\n  real(8), allocatable :: scale(:)\n  real(8) :: x(3), y(3)\n  allocate(scale(3))\n  scale = [2.0_8, 3.0_8, 4.0_8]\n  x = [1.0_8, 2.0_8, 3.0_8]\n  y = 0.0_8\n  call apply(x, y)\n  if (abs(y(1) - 2.0_8) > 1.0e-12_8) error stop 1\n  if (abs(y(2) - 6.0_8) > 1.0e-12_8) error stop 2\n  if (abs(y(3) - 12.0_8) > 1.0e-12_8) error stop 3\n  if (.not. allocated(scale)) error stop 4\n  if (abs(scale(2) - 3.0_8) > 1.0e-12_8) error stop 5\n  print *, 'ok'\ncontains\n  subroutine apply(x, y)\n    real(8), intent(in) :: x(:)\n    real(8), intent(out) :: y(:)\n    y = scale * x\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("contained_host_allocatable_owner", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("contained host allocatable compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "contained host allocatable compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("contained host allocatable run failed");
+    assert!(
+        run.status.success(),
+        "contained host allocatable run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected contained host allocatable output: {}",
         String::from_utf8_lossy(&run.stdout)
     );
 
@@ -28763,6 +34207,261 @@ fn cmplx_whole_array_with_kind_keyword_returns_correct_kind_descriptor() {
 }
 
 #[test]
+fn stdlib_style_complex_arg_preserves_literal_and_array_kinds() {
+    // Stdlib's arg/argd/argpi implementations combine two edge cases:
+    // `(0.0_dp, 0.5_dp)` must lower as complex(dp), and
+    // `exp(cmplx(0.0_kind, theta(:), kind=kind))` must materialize the
+    // CMPLX result element-wise even though only the imaginary actual is
+    // array-shaped.
+    let src = write_program(
+        r#"program p
+  implicit none
+  integer, parameter :: sp = kind(1.0)
+  integer, parameter :: dp = kind(1.0d0)
+  real(sp), parameter :: pi_sp = acos(-1.0_sp)
+  real(dp), parameter :: pi_dp = acos(-1.0_dp)
+  real(sp), parameter :: tol_sp = sqrt(epsilon(1.0_sp))
+  real(dp), parameter :: tol_dp = sqrt(epsilon(1.0_dp))
+  real(sp) :: theta_sp(3), got_sp(3), expect_sp(3)
+  real(dp) :: theta_dp(3), got_dp(3), expect_dp(3)
+
+  if (abs(arg_dp(2.0_dp * exp((0.0_dp, 0.5_dp))) - 0.5_dp) >= tol_dp) error stop 1
+
+  theta_sp = [-179.0_sp, 0.0_sp, 179.0_sp]
+  got_sp = arg_sp(exp(cmplx(0.0_sp, theta_sp / 180.0_sp * pi_sp, kind=sp)))
+  expect_sp = theta_sp / 180.0_sp * pi_sp
+  if (.not. all(abs(got_sp - expect_sp) < tol_sp)) error stop 2
+
+  theta_dp = [-179.0_dp, 0.0_dp, 179.0_dp]
+  got_dp = arg_dp(exp(cmplx(0.0_dp, theta_dp / 180.0_dp * pi_dp, kind=dp)))
+  expect_dp = theta_dp / 180.0_dp * pi_dp
+  if (.not. all(abs(got_dp - expect_dp) < tol_dp)) error stop 3
+
+  print *, 'ok'
+contains
+  elemental function arg_sp(z) result(result)
+    complex(sp), intent(in) :: z
+    real(sp) :: result
+    result = merge(0.0_sp, atan2(z%im, z%re), z == (0.0_sp, 0.0_sp))
+  end function
+
+  elemental function arg_dp(z) result(result)
+    complex(dp), intent(in) :: z
+    real(dp) :: result
+    result = merge(0.0_dp, atan2(z%im, z%re), z == (0.0_dp, 0.0_dp))
+  end function
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("stdlib_arg_complex_kinds", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("stdlib-style complex arg compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "stdlib-style complex arg compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("stdlib-style complex arg run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "stdlib-style complex arg run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn default_cmplx_array_assignment_converts_lanes_to_complex_dp() {
+    // Stdlib's `test_swap_cdp` initializes complex(dp) arrays from
+    // default-kind CMPLX array expressions before calling the generic
+    // elemental `swap`. The descriptor assignment must widen each real
+    // and imaginary lane, not memcpy 16 bytes from an 8-byte complex(sp)
+    // element.
+    let src = write_program(
+        "module m\n  use iso_fortran_env, only: real32, real64\n  implicit none\n  interface swap\n    module procedure swap_csp\n    module procedure swap_cdp\n  end interface\ncontains\n  elemental subroutine swap_csp(lhs, rhs)\n    complex(real32), intent(inout) :: lhs, rhs\n    complex(real32) :: temp\n    temp = lhs\n    lhs = rhs\n    rhs = temp\n  end subroutine\n  elemental subroutine swap_cdp(lhs, rhs)\n    complex(real64), intent(inout) :: lhs, rhs\n    complex(real64) :: temp\n    temp = lhs\n    lhs = rhs\n    rhs = temp\n  end subroutine\nend module\nprogram p\n  use iso_fortran_env, only: real64\n  use m, only: swap\n  implicit none\n  complex(real64) :: x(3), y(3)\n  x = cmplx([1, 2, 3], [4, 5, 6])\n  y = cmplx([4, 5, 6], [1, 2, 3])\n  call swap(x, y)\n  if (.not. all(x == cmplx([4, 5, 6], [1, 2, 3]))) error stop 1\n  if (.not. all(y == cmplx([1, 2, 3], [4, 5, 6]))) error stop 2\n  call swap(x, x)\n  if (.not. all(x == cmplx([4, 5, 6], [1, 2, 3]))) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("cmplx_array_assign_widen", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("cmplx array assignment compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "cmplx array assignment compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&compile.stderr).is_empty(),
+        "cmplx array assignment should not warn: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("cmplx array assignment run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "cmplx array assignment run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn elemental_character_array_swap_and_constructor_equality_runs() {
+    // Stdlib's `test_swap_str` calls an elemental character(*) swap over
+    // character arrays, then checks the result with ALL(array == constructor).
+    // The elemental wrapper must copy fixed-length character elements through
+    // memory, not scalar registers, and the reduction must compare each array
+    // element against the matching constructor element.
+    let src = write_program(
+        "module m\n  implicit none\n  interface swap\n    module procedure swap_str\n  end interface\ncontains\n  elemental subroutine swap_str(lhs, rhs)\n    character(*), intent(inout) :: lhs, rhs\n    character(len=max(len(lhs), len(rhs))) :: temp\n    temp = lhs\n    lhs = rhs\n    rhs = temp\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  block\n    character(5) :: x(2), y(2)\n    x = ['abcde', 'fghij']\n    y = ['fghij', 'abcde']\n    call swap(x, y)\n    if (.not. all(x == ['fghij', 'abcde'])) error stop 1\n    if (.not. all(y == ['abcde', 'fghij'])) error stop 2\n    call swap(x, x)\n    if (.not. all(x == ['fghij', 'abcde'])) error stop 3\n  end block\n  block\n    character(4) :: x\n    character(6) :: y\n    x = 'abcd'\n    y = 'efghij'\n    call swap(x, y)\n    if (x /= 'efgh') error stop 4\n    if (y /= 'abcd  ') error stop 5\n    x = 'abcd'\n    y = 'efghij'\n    call swap(x, y(1:4))\n    if (x /= 'efgh') error stop 6\n    if (y /= 'abcdij') error stop 7\n  end block\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("elemental_character_swap", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("elemental character swap compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "elemental character swap compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("elemental character swap run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "elemental character swap run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn elemental_derived_string_array_swap_uses_defined_assignment_and_operator() {
+    // Stdlib's `test_swap_stt` initializes string_type arrays from
+    // character constructors, swaps them through an elemental generic
+    // subroutine, and validates with ALL(array == character-constructor).
+    // Each stage must scalarize through the user-defined assignment/operator
+    // surfaces instead of treating the character literal as a raw derived
+    // object or swapping only the first element.
+    let src = write_program(
+        "module string_m\n  implicit none\n  type :: string_type\n    character(len=:), allocatable :: raw\n  end type\n  interface assignment(=)\n    module procedure assign_string_char\n  end interface\n  interface operator(==)\n    module procedure eq_string_char\n  end interface\ncontains\n  elemental subroutine assign_string_char(lhs, rhs)\n    type(string_type), intent(inout) :: lhs\n    character(len=*), intent(in) :: rhs\n    lhs%raw = rhs\n  end subroutine\n  elemental logical function eq_string_char(lhs, rhs) result(ok)\n    type(string_type), intent(in) :: lhs\n    character(len=*), intent(in) :: rhs\n    if (allocated(lhs%raw)) then\n      ok = lhs%raw == rhs\n    else\n      ok = len(rhs) == 0\n    end if\n  end function\nend module\nmodule math_m\n  use string_m, only: string_type\n  implicit none\n  interface swap\n    module procedure swap_stt\n  end interface\ncontains\n  elemental subroutine swap_stt(lhs, rhs)\n    type(string_type), intent(inout) :: lhs, rhs\n    type(string_type) :: temp\n    temp = lhs\n    lhs = rhs\n    rhs = temp\n  end subroutine\nend module\nprogram p\n  use string_m, only: string_type, assignment(=), operator(==)\n  use math_m, only: swap\n  implicit none\n  type(string_type) :: x(2), y(2)\n  x = ['abcde', 'fghij']\n  y = ['fghij', 'abcde']\n  call swap(x, y)\n  if (.not. all(x == ['fghij', 'abcde'])) error stop 1\n  if (.not. all(y == ['abcde', 'fghij'])) error stop 2\n  call swap(x, x)\n  if (.not. all(x == ['fghij', 'abcde'])) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("elemental_derived_string_swap", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("elemental derived string swap compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "elemental derived string swap compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("elemental derived string swap run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "elemental derived string swap run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn stdlib_style_string_array_swap_routes_nested_defined_gt() {
+    // stdlib_string_type's `operator(==)` is written in terms of its
+    // user-defined `operator(>)` overloads. Lowering must resolve those nested
+    // derived/character comparisons before the intrinsic character shortcut,
+    // otherwise the string_type storage is compared as a zero-length character.
+    let src = write_program(
+        "module string_m\n  implicit none\n  type :: string_type\n    sequence\n    private\n    character(len=:), allocatable :: raw\n  end type string_type\n  interface assignment(=)\n    module procedure assign_string_char\n  end interface\n  interface operator(>)\n    module procedure gt_string_char\n    module procedure gt_char_string\n  end interface\n  interface operator(==)\n    module procedure eq_string_char\n  end interface\ncontains\n  elemental subroutine assign_string_char(lhs, rhs)\n    type(string_type), intent(inout) :: lhs\n    character(len=*), intent(in) :: rhs\n    lhs%raw = rhs\n  end subroutine\n  elemental logical function gt_string_char(lhs, rhs) result(is_gt)\n    type(string_type), intent(in) :: lhs\n    character(len=*), intent(in) :: rhs\n    if (allocated(lhs%raw)) then\n      is_gt = lhs%raw > rhs\n    else\n      is_gt = '' > rhs\n    end if\n  end function\n  elemental logical function gt_char_string(lhs, rhs) result(is_gt)\n    character(len=*), intent(in) :: lhs\n    type(string_type), intent(in) :: rhs\n    if (allocated(rhs%raw)) then\n      is_gt = lhs > rhs%raw\n    else\n      is_gt = lhs > ''\n    end if\n  end function\n  elemental logical function eq_string_char(lhs, rhs) result(is_eq)\n    type(string_type), intent(in) :: lhs\n    character(len=*), intent(in) :: rhs\n    is_eq = .not.(lhs > rhs)\n    if (is_eq) then\n      is_eq = .not.(rhs > lhs)\n    end if\n  end function\nend module\nmodule math_m\n  use string_m, only: string_type\n  implicit none\n  interface swap\n    module procedure swap_stt\n  end interface\ncontains\n  elemental subroutine swap_stt(lhs, rhs)\n    type(string_type), intent(inout) :: lhs, rhs\n    type(string_type) :: temp\n    temp = lhs\n    lhs = rhs\n    rhs = temp\n  end subroutine\nend module\nprogram p\n  use string_m, only: string_type, assignment(=), operator(==)\n  use math_m, only: swap\n  implicit none\n  type(string_type) :: x(2), y(2)\n  x = ['abcde', 'fghij']\n  y = ['fghij', 'abcde']\n  call swap(x, y)\n  if (.not. all(x == ['fghij', 'abcde'])) error stop 1\n  if (.not. all(y == ['abcde', 'fghij'])) error stop 2\n  call swap(x, x)\n  if (.not. all(x == ['fghij', 'abcde'])) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("stdlib_style_string_swap", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("stdlib-style string swap compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "stdlib-style string swap compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("stdlib-style string swap run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "stdlib-style string swap run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn complex_array_power_loads_exponent_elements_not_descriptor() {
+    // Surfaced by stdlib_math's logspace_1_cdp_n_rbase:
+    //   res = base ** exponents
+    // where `base` is a real scalar and `exponents` is complex(dp)(:).
+    // The complex-array power path lowered the whole RHS descriptor as a
+    // scalar integer exponent, truncated the descriptor pointer to i32,
+    // and entered a huge repeated-multiply loop. The RHS must be loaded
+    // element-wise and lowered as complex power.
+    let src = write_program(
+        "program p\n  implicit none\n  integer, parameter :: dp = kind(0.0d0)\n  real(dp) :: base\n  complex(dp) :: exponents(3)\n  complex(dp) :: z(3), scalar\n  base = 10.0_dp\n  exponents(1) = cmplx(1.0_dp, 0.0_dp, kind=dp)\n  exponents(2) = cmplx(2.0_dp, 0.0_dp, kind=dp)\n  exponents(3) = cmplx(0.0_dp, 0.0_dp, kind=dp)\n  z = base ** exponents\n  scalar = cmplx(2.0_dp, 0.0_dp, kind=dp) ** cmplx(3.0_dp, 0.0_dp, kind=dp)\n  if (abs(real(z(1)) - 10.0_dp) > 1.0d-8) error stop 1\n  if (abs(aimag(z(1))) > 1.0d-8) error stop 2\n  if (abs(real(z(2)) - 100.0_dp) > 1.0d-7) error stop 3\n  if (abs(aimag(z(2))) > 1.0d-7) error stop 4\n  if (abs(real(z(3)) - 1.0_dp) > 1.0d-8) error stop 5\n  if (abs(aimag(z(3))) > 1.0d-8) error stop 6\n  if (abs(real(scalar) - 8.0_dp) > 1.0d-8) error stop 7\n  if (abs(aimag(scalar)) > 1.0d-8) error stop 8\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("complex_array_power", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("complex array power compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "complex array power compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = run_binary_with_timeout(&out, std::time::Duration::from_secs(60));
+    let Some(run) = run else {
+        panic!("complex array power run timed out");
+    };
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "complex array power run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn allocate_source_from_strided_section_walks_per_element() {
     // F2018 §9.7.1.2: ALLOCATE(dest, source = strided_section) must
     // populate dest by reading the source per-element via the
@@ -28948,7 +34647,9 @@ fn allocate_stat_int64_writes_back_to_user_variable() {
         "alloc-stat-int64 compile failed: {}",
         String::from_utf8_lossy(&compile.stderr)
     );
-    let run = Command::new(&out).output().expect("alloc-stat-int64 run failed");
+    let run = Command::new(&out)
+        .output()
+        .expect("alloc-stat-int64 run failed");
     assert!(
         run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
         "alloc-stat-int64 run failed: status={:?} stdout={} stderr={}",
@@ -28996,5 +34697,415 @@ fn rank2_section_with_vector_subscript_gathers_into_fresh_descriptor() {
         String::from_utf8_lossy(&run.stderr)
     );
     let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn rank2_vector_subscript_assignment_scatters_array_rhs() {
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: connectivity(3,3), locdof(3), i\n  real :: dense(5,5), mat(3,3)\n  connectivity(1:3,1) = [1,2,3]\n  connectivity(1:3,2) = [2,3,4]\n  connectivity(1:3,3) = [3,4,5]\n  mat(:,1) = [1,2,3]\n  mat(:,2) = [2,1,4]\n  mat(:,3) = [3,4,1]\n  dense = 0.0\n  do i = 1, 3\n    locdof(1:3) = connectivity(1:3,i)\n    dense(locdof,locdof) = dense(locdof,locdof) + mat\n  end do\n  if (abs(dense(1,1) - 1.0) > 1.0e-6) error stop 1\n  if (abs(dense(2,2) - 2.0) > 1.0e-6) error stop 2\n  if (abs(dense(3,3) - 3.0) > 1.0e-6) error stop 3\n  if (abs(dense(3,2) - 6.0) > 1.0e-6) error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("rank2_vector_subscript_scatter", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("rank-2 vector subscript assignment compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "rank-2 vector subscript assignment compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("rank-2 vector subscript assignment run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "rank-2 vector subscript assignment run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn generic_literal_kind_suffix_uses_current_block_parameter() {
+    let src = write_program(
+        "module m\n  implicit none\n  private\n  public :: is_close\n  interface is_close\n    module procedure is_close_rsp\n    module procedure is_close_rdp\n  end interface\ncontains\n  elemental logical function is_close_rsp(a, b) result(close)\n    real(4), intent(in) :: a, b\n    close = abs(a - b) < 1.0e-5_4\n  end function\n  elemental logical function is_close_rdp(a, b) result(close)\n    real(8), intent(in) :: a, b\n    close = abs(a - b) < 1.0e-12_8\n  end function\nend module\nprogram p\n  use m, only: is_close\n  implicit none\n  integer, parameter :: sp = 4\n  integer, parameter :: dp = 8\n  block\n    integer, parameter :: wp = sp\n    real(sp), allocatable :: amat(:,:)\n    allocate(amat(1,1))\n    amat(1,1) = 5.0_wp\n    if (.not. is_close(amat(1,1), 5.0_wp)) error stop 1\n  end block\n  block\n    integer, parameter :: wp = dp\n    real(dp), allocatable :: amat(:,:)\n    allocate(amat(1,1))\n    amat(1,1) = 5.0_wp\n    if (.not. is_close(amat(1,1), 5.0_wp)) error stop 2\n  end block\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("generic_literal_kind_block_param", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("block-parameter generic compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "block-parameter generic compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("block-parameter generic run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "block-parameter generic run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn generic_character_substring_actual_uses_local_character_type() {
+    let src = write_program(
+        "module m\n  implicit none\n  private\n  public :: run\n  interface swap\n    module procedure swap_int8\n    module procedure swap_str\n  end interface\ncontains\n  elemental subroutine swap_int8(lhs, rhs)\n    integer(1), intent(inout) :: lhs, rhs\n    integer(1) :: tmp\n    tmp = lhs; lhs = rhs; rhs = tmp\n  end subroutine\n  elemental subroutine swap_str(lhs, rhs)\n    character(*), intent(inout) :: lhs, rhs\n    character(len=max(len(lhs), len(rhs))) :: tmp\n    tmp = lhs; lhs = rhs; rhs = tmp\n  end subroutine\n  subroutine pollute\n    integer(1) :: x(2), y(2)\n    x = [1_1, 2_1]\n    y = [3_1, 4_1]\n    call swap(x, y)\n  end subroutine\n  subroutine run\n    character(4) :: x\n    character(6) :: y\n    x = 'abcd'\n    y = 'efghij'\n    call swap(x, y(1:4))\n    if (x /= 'efgh') error stop 1\n    if (y /= 'abcdij') error stop 2\n  end subroutine\nend module\nprogram p\n  use m, only: run\n  call run\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("generic_character_substring_actual", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("character substring generic compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "character substring generic compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn generic_actual_all_of_defined_operator_has_logical_type() {
+    let src = write_program(
+        "module m\n  implicit none\n  private\n  public :: run\n  type :: string_type\n    character(5) :: raw\n  end type\n  interface operator(==)\n    module procedure eq_string_char\n  end interface\n  interface check\n    module procedure check_logical\n    module procedure check_integer\n  end interface\ncontains\n  elemental logical function eq_string_char(lhs, rhs) result(ok)\n    type(string_type), intent(in) :: lhs\n    character(*), intent(in) :: rhs\n    ok = lhs%raw == rhs\n  end function\n  subroutine check_logical(ok)\n    logical, intent(in) :: ok\n    if (.not. ok) error stop 10\n  end subroutine\n  subroutine check_integer(value)\n    integer, intent(in) :: value\n    error stop value\n  end subroutine\n  subroutine run\n    type(string_type) :: x(2)\n    x(1)%raw = 'abcde'\n    x(2)%raw = 'fghij'\n    call check(all(x == ['abcde','fghij']))\n  end subroutine\nend module\nprogram p\n  use m, only: run\n  call run\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("generic_all_defined_operator", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("defined operator ALL generic compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "defined operator ALL generic compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn imported_generic_all_of_ranked_function_comparison_is_scalar() {
+    let dir = unique_dir("generic_all_ranked_result");
+    let stats = write_program_in(
+        &dir,
+        "stats_like.f90",
+        "module stats_like\n  implicit none\n  private\n  public :: mean, moment\n  interface mean\n    module procedure mean_r3\n  end interface\n  interface moment\n    module procedure moment_r3\n  end interface\ncontains\n  function mean_r3(x, dim) result(res)\n    real, intent(in) :: x(:,:,:)\n    integer, intent(in) :: dim\n    real :: res(size(x, 1), size(x, 2))\n    res = 1.0\n    if (dim < 1) res = -1.0\n  end function\n  function moment_r3(x, order, dim, center) result(res)\n    real, intent(in) :: x(:,:,:)\n    integer, intent(in) :: order, dim\n    real, intent(in) :: center(:,:)\n    real :: res(size(x, 1), size(x, 2))\n    res = 1.0 + 0.0 * real(order + dim) + 0.0 * center\n  end function\nend module\n",
+    );
+    let check = write_program_in(
+        &dir,
+        "check_like.f90",
+        "module check_like\n  implicit none\n  private\n  public :: error_type, check\n  type :: error_type\n    integer :: code = 0\n  end type\n  interface check\n    module procedure check_logical\n  end interface\ncontains\n  subroutine check_logical(error, expression)\n    type(error_type), allocatable, intent(out) :: error\n    logical, intent(in) :: expression\n    if (.not. expression) allocate(error)\n  end subroutine\nend module\n",
+    );
+    let prog = write_program_in(
+        &dir,
+        "p.f90",
+        "program p\n  use check_like, only: error_type, check\n  use stats_like, only: mean, moment\n  implicit none\n  type(error_type), allocatable :: error\n  real :: x3(2,2,3), zero3(2,2)\n  integer :: order\n  x3 = 1.0\n  zero3 = 0.0\n  order = 1\n  call check(error, all(abs(moment(x3, order, dim = 3, center = zero3) - mean(x3, 3)) < 1.0e-5))\n  if (allocated(error)) error stop 1\n  print *, 'ok'\nend program\n",
+    );
+    let stats_o = dir.join("stats_like.o");
+    let check_o = dir.join("check_like.o");
+    let prog_o = dir.join("p.o");
+    for (src, obj) in [(&stats, &stats_o), (&check, &check_o), (&prog, &prog_o)] {
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-c",
+                src.to_str().unwrap(),
+                "-I",
+                dir.to_str().unwrap(),
+                "-J",
+                dir.to_str().unwrap(),
+                "-o",
+                obj.to_str().unwrap(),
+            ])
+            .output()
+            .expect("ranked ALL generic compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "ranked ALL generic compile failed for {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn imported_generic_keyword_actual_does_not_skip_required_formal() {
+    let dir = unique_dir("generic_keyword_required_slot");
+    let stats = write_program_in(
+        &dir,
+        "stats_like.f90",
+        "module stats_like\n  implicit none\n  private\n  public :: mean, moment\n  interface mean\n    module procedure mean_all_c2\n  end interface\n  interface moment\n    module procedure moment_dim_c2\n    module procedure moment_all_c2\n  end interface\ncontains\n  function mean_all_c2(x) result(res)\n    complex, intent(in) :: x(:,:)\n    complex :: res\n    res = (1.0, 0.0)\n  end function\n  function moment_dim_c2(x, order, dim, center) result(res)\n    complex, intent(in) :: x(:,:)\n    integer, intent(in) :: order, dim\n    complex, intent(in), optional :: center(:)\n    complex :: res(size(x, 1))\n    res = (1.0, 0.0) + 0.0 * real(order + dim)\n  end function\n  function moment_all_c2(x, order, center) result(res)\n    complex, intent(in) :: x(:,:)\n    integer, intent(in) :: order\n    complex, intent(in), optional :: center\n    complex :: res\n    res = (1.0, 0.0) + 0.0 * real(order)\n  end function\nend module\n",
+    );
+    let check = write_program_in(
+        &dir,
+        "check_like.f90",
+        "module check_like\n  implicit none\n  private\n  public :: error_type, check\n  type :: error_type\n    integer :: code = 0\n  end type\n  interface check\n    module procedure check_logical\n  end interface\ncontains\n  subroutine check_logical(error, expression)\n    type(error_type), allocatable, intent(out) :: error\n    logical, intent(in) :: expression\n    if (.not. expression) allocate(error)\n  end subroutine\nend module\n",
+    );
+    let prog = write_program_in(
+        &dir,
+        "p.f90",
+        "program p\n  use check_like, only: error_type, check\n  use stats_like, only: mean, moment\n  implicit none\n  type(error_type), allocatable :: error\n  complex :: x2(2,2)\n  integer :: order\n  x2 = (1.0, 0.0)\n  order = 1\n  call check(error, abs(moment(x2, order, center = (0.0, 0.0)) - mean(x2)) < 1.0e-5)\n  if (allocated(error)) error stop 1\n  print *, 'ok'\nend program\n",
+    );
+    let stats_o = dir.join("stats_like.o");
+    let check_o = dir.join("check_like.o");
+    let prog_o = dir.join("p.o");
+    for (src, obj) in [(&stats, &stats_o), (&check, &check_o), (&prog, &prog_o)] {
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-c",
+                src.to_str().unwrap(),
+                "-I",
+                dir.to_str().unwrap(),
+                "-J",
+                dir.to_str().unwrap(),
+                "-o",
+                obj.to_str().unwrap(),
+            ])
+            .output()
+            .expect("keyword required-slot generic compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "keyword required-slot generic compile failed for {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn local_generic_gamma_falls_back_to_intrinsic_for_real_actual() {
+    let src = write_program(
+        "module gamma_like\n  implicit none\n  private\n  public :: gamma\n  interface gamma\n    module procedure gamma_iint32\n    module procedure gamma_csp\n  end interface\ncontains\n  elemental real function gamma_iint32(z) result(res)\n    integer, intent(in) :: z\n    res = real(z)\n  end function\n  impure elemental complex function gamma_csp(z) result(res)\n    complex, intent(in) :: z\n    res = cmplx(gamma(z%re), kind=4)\n  end function\nend module\nprogram p\n  use gamma_like, only: gamma\n  implicit none\n  complex :: got\n  got = gamma((2.0, 0.0))\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let ir = unique_path("generic_gamma_intrinsic_fallback", "ir");
+    let emit = Command::new(compiler("armfortas"))
+        .args([
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("gamma intrinsic fallback IR compile failed to spawn");
+    assert!(
+        emit.status.success(),
+        "gamma intrinsic fallback IR compile failed: {}",
+        String::from_utf8_lossy(&emit.stderr)
+    );
+    let ir_text = fs::read_to_string(&ir).expect("cannot read gamma fallback IR");
+    assert!(
+        ir_text.contains("call @tgammaf"),
+        "real gamma actual did not fall back to intrinsic:\n{}",
+        ir_text
+    );
+    let _ = std::fs::remove_file(&ir);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn generic_callee_type_ignores_unrelated_same_name_data_symbol() {
+    let src = write_program(
+        "module m\n  implicit none\n  private\n  public :: run\n  interface arg\n    module procedure arg_sp\n    module procedure arg_dp\n  end interface\n  interface check\n    module procedure check_logical\n    module procedure check_integer\n  end interface\ncontains\n  elemental real(4) function arg_sp(z) result(result)\n    complex(4), intent(in) :: z\n    result = 0.5_4\n  end function\n  elemental real(8) function arg_dp(z) result(result)\n    complex(8), intent(in) :: z\n    result = 0.5_8\n  end function\n  subroutine check_logical(ok, message)\n    logical, intent(in) :: ok\n    character(*), intent(in), optional :: message\n    if (.not. ok) error stop 10\n  end subroutine\n  subroutine check_integer(value, message)\n    integer, intent(in) :: value\n    character(*), intent(in), optional :: message\n    error stop value\n  end subroutine\n  subroutine pollute\n    character(:), allocatable :: arg\n    arg = 'not the generic'\n  end subroutine\n  subroutine run\n    real(4), parameter :: tol = 1.0e-4_4\n    call check(abs(arg(2*exp((0.0_4, 0.5_4))) - 0.5_4) < tol, 'test_nonzero_scalar')\n  end subroutine\nend module\nprogram p\n  use m, only: run\n  call run\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("generic_callee_same_name_data", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("same-name generic callee compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "same-name generic callee compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("same-name generic callee run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "same-name generic callee run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn callable_generic_not_treated_as_character_substring_by_unrelated_data_symbol() {
+    let src = write_program(
+        "module polluter\n  implicit none\n  character(:), allocatable :: arg\n  integer :: keep = 0\nend module\nmodule math_like\n  implicit none\n  private\n  public :: arg\n  interface arg\n    module procedure arg_sp\n  end interface\ncontains\n  elemental real(4) function arg_sp(z) result(result)\n    complex(4), intent(in) :: z\n    result = 0.5_4\n  end function\nend module\nmodule check_like\n  implicit none\n  private\n  public :: check\n  interface check\n    module procedure check_logical\n  end interface\ncontains\n  subroutine check_logical(ok, message)\n    logical, intent(in) :: ok\n    character(*), intent(in), optional :: message\n    if (.not. ok) error stop 10\n  end subroutine\nend module\nmodule run_mod\n  use polluter, only: keep\n  use math_like, only: arg\n  use check_like, only: check\n  implicit none\ncontains\n  subroutine run\n    real(4), parameter :: tol = 1.0e-4_4\n    call check(abs(arg(2*exp((0.0_4, 0.5_4))) - 0.5_4) < tol, 'test_nonzero_scalar')\n  end subroutine\nend module\nprogram p\n  use run_mod, only: run\n  call run\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("generic_not_character_substring", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("generic callee substring disambiguation compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "generic callee substring disambiguation compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("generic callee substring disambiguation run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "generic callee substring disambiguation run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn generic_optional_character_concat_probe_matches_character_dummy() {
+    let src = write_program(
+        "module m\n  implicit none\n  private\n  public :: run\n  type :: error_type\n    integer :: code = 0\n  end type\n  type :: bitset_like\n  contains\n    procedure :: bits\n  end type\n  interface check\n    module procedure check_int\n    module procedure check_logical\n  end interface\ncontains\n  integer function bits(self) result(n)\n    class(bitset_like), intent(in) :: self\n    n = 0\n  end function\n  subroutine check_int(error, actual, expected, message)\n    type(error_type), allocatable, intent(out) :: error\n    integer, intent(in) :: actual, expected\n    character(*), intent(in), optional :: message\n    if (actual /= expected) allocate(error)\n  end subroutine\n  subroutine check_logical(error, expression, message)\n    type(error_type), allocatable, intent(out) :: error\n    logical, intent(in) :: expression\n    character(*), intent(in), optional :: message\n    if (.not. expression) allocate(error)\n  end subroutine\n  subroutine run\n    type(error_type), allocatable :: error\n    type(bitset_like) :: set\n    call check(error, set%bits(), 0, 'bit count ' // 'message')\n    if (allocated(error)) error stop 1\n  end subroutine\nend module\nprogram p\n  use m, only: run\n  call run\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("generic_optional_char_concat_probe", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("optional character concat generic compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "optional character concat generic compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("optional character concat generic run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "optional character concat generic run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn size_kind_argument_drives_generic_integer_kind() {
+    let src = write_program(
+        "module m\n  implicit none\n  private\n  public :: run\n  interface take\n    module procedure take_i1\n    module procedure take_i4\n  end interface\ncontains\n  subroutine take_i1(k, out)\n    integer(1), intent(in) :: k\n    integer(1), intent(out) :: out\n    out = k\n  end subroutine\n  subroutine take_i4(k, out)\n    integer(4), intent(in) :: k\n    integer(4), intent(out) :: out\n    out = k\n  end subroutine\n  subroutine run\n    integer, parameter :: ip = 1\n    integer(1) :: a(5), out\n    call take(size(a, kind=ip) + 1_ip - 4_ip, out)\n    if (out /= 2_1) error stop 1\n  end subroutine\nend module\nprogram p\n  use m, only: run\n  call run\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("size_kind_generic_integer", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("size-kind generic compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "size-kind generic compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("size-kind generic run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "size-kind generic run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn imported_generic_subroutine_shadows_intrinsic_subroutine() {
+    let src = write_program(
+        "module m\n  implicit none\n  interface random_seed\n    module procedure seed_i1\n    module procedure seed_i4\n  end interface\ncontains\n  subroutine seed_i1(put, get)\n    integer(1), intent(in) :: put\n    integer(1), intent(out) :: get\n    get = -9_1\n  end subroutine\n\n  subroutine seed_i4(put, get)\n    integer, intent(in) :: put\n    integer, intent(out) :: get\n    get = put + 7\n  end subroutine\nend module\nprogram p\n  use m, only: random_seed\n  implicit none\n  integer :: seed, got\n  seed = 5\n  got = -1\n  call random_seed(seed, got)\n  if (got /= 12) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("generic_subroutine_shadows_intrinsic", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("intrinsic-shadowing generic compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "intrinsic-shadowing generic compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("intrinsic-shadowing generic run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "intrinsic-shadowing generic run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn imported_generic_function_shadows_intrinsic_type_probe() {
+    let src = write_program(
+        "module special_like\n  implicit none\n  private\n  public :: log_gamma\n  interface log_gamma\n    module procedure l_gamma_iint32\n  end interface\ncontains\n  elemental real(8) function l_gamma_iint32(z) result(res)\n    integer, intent(in) :: z\n    res = real(z, 8) + 0.25_8\n  end function\nend module\nmodule check_like\n  implicit none\n  private\n  public :: error_type, check\n  type :: error_type\n    integer :: code = 0\n  end type\n  interface check\n    module procedure check_float_dp\n  end interface\ncontains\n  subroutine check_float_dp(error, actual, expected, message, more, thr, rel)\n    type(error_type), allocatable, intent(out) :: error\n    real(8), intent(in) :: actual\n    real(8), intent(in) :: expected\n    character(*), intent(in), optional :: message\n    character(*), intent(in), optional :: more\n    real(8), intent(in), optional :: thr\n    logical, intent(in), optional :: rel\n    if (abs(actual - expected) > 1.0e-12_8) allocate(error)\n  end subroutine\nend module\nprogram p\n  use special_like, only: log_gamma\n  use check_like, only: error_type, check\n  implicit none\n  type(error_type), allocatable :: error\n  integer :: i\n  integer, parameter :: xtest(*) = [1, 2, 10, 47]\n  integer, parameter :: x(*) = pack(xtest, xtest < huge(0_1))\n  real(8), parameter :: ans(*) = [1.25_8, 2.25_8, 10.25_8, 47.25_8]\n  real(8), parameter :: tol = sqrt(epsilon(1.0_8))\n  i = 1\n  call check(error, log_gamma(x(i)), ans(i), 'integer log_gamma', thr=tol, rel=.true.)\n  if (allocated(error)) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let ir = unique_path("generic_function_shadows_intrinsic", "ir");
+    let emit = Command::new(compiler("armfortas"))
+        .args([
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("intrinsic-shadowing generic function IR compile failed to spawn");
+    assert!(
+        emit.status.success(),
+        "intrinsic-shadowing generic function IR compile failed: {}",
+        String::from_utf8_lossy(&emit.stderr)
+    );
+    let ir_text = fs::read_to_string(&ir).expect("cannot read emitted IR");
+    assert!(
+        ir_text.contains("call @afs_modproc_special_like_l_gamma_iint32"),
+        "shadowing generic did not resolve to module specific:\n{}",
+        ir_text
+    );
+    assert!(
+        !ir_text.contains("call @lgamma"),
+        "shadowing generic emitted an intrinsic lgamma probe:\n{}",
+        ir_text
+    );
+
+    let _ = std::fs::remove_file(&ir);
     let _ = std::fs::remove_file(&src);
 }

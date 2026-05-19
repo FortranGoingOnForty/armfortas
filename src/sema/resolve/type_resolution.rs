@@ -33,10 +33,7 @@ pub(super) fn extract_kind(sel: &Option<decl::KindSelector>, st: &SymbolTable) -
 /// for `character(*)` length inference (F2008 §5.3.2). Handles string
 /// literals, references to other character parameters whose length is
 /// already known, and `lit // lit` / `lit // name` concat chains.
-pub(super) fn derived_char_init_len(
-    e: &crate::ast::expr::Expr,
-    st: &SymbolTable,
-) -> Option<usize> {
+pub(super) fn derived_char_init_len(e: &crate::ast::expr::Expr, st: &SymbolTable) -> Option<usize> {
     use crate::ast::expr::Expr;
     match e {
         Expr::StringLiteral { value, .. } => Some(value.len()),
@@ -58,10 +55,7 @@ pub(super) fn derived_char_init_len(
     }
 }
 
-pub(super) fn extract_char_len(
-    sel: &Option<decl::CharSelector>,
-    st: &SymbolTable,
-) -> Option<i64> {
+pub(super) fn extract_char_len(sel: &Option<decl::CharSelector>, st: &SymbolTable) -> Option<i64> {
     match sel {
         Some(cs) => match &cs.len {
             Some(decl::LenSpec::Expr(e)) => eval_const_int_expr(e, st),

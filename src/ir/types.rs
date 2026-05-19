@@ -22,7 +22,10 @@ pub enum IrType {
     /// the NEON ISA supports are accepted by the verifier — 4×i32,
     /// 2×i64, 4×f32, 2×f64, plus narrow integer packings (16×i8,
     /// 8×i16). All vectors are 128 bits wide.
-    Vector { lanes: u8, elem: Box<IrType> },
+    Vector {
+        lanes: u8,
+        elem: Box<IrType>,
+    },
 }
 
 /// Integer bit widths.

@@ -66,8 +66,7 @@ fn o3_vectorizes_where_elsewhere_with_array_load_else() {
         .collect();
     assert_eq!(trimmed.len(), 1, "expected one output line:\n{}", stdout);
     assert_eq!(
-        trimmed[0],
-        "1.0010000E3     1.0160000E3     1.0000000E0     1.6000000E1",
+        trimmed[0], "1.0010000E3     1.0160000E3     1.0000000E0     1.6000000E1",
         "WHERE/ELSEWHERE-arr wrong: {:?}",
         trimmed[0]
     );

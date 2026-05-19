@@ -93,12 +93,57 @@ pub(crate) fn lower_intrinsic_subroutine(
         if let Some(Some(arg)) = args.get(n) {
             if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
                 let dest_ptr = lower_arg_by_ref_ctx(b, ctx, e);
-                if let Some(IrType::Ptr(inner)) = b.func().value_type(dest_ptr) {
-                    let dest_ty = (*inner).clone();
+                let semantic_dest_ty =
+                    generic_actual_expr_type_info(e, &ctx.locals, ctx.st, Some(ctx.type_layouts))
+                        .map(|ti| type_info_to_ir_type(&ti));
+                let pointer_dest_ty = match b.func().value_type(dest_ptr) {
+                    Some(IrType::Ptr(inner)) => Some((*inner).clone()),
+                    _ => None,
+                };
+                if let Some(dest_ty) = semantic_dest_ty.or(pointer_dest_ty) {
                     if dest_ty == IrType::Int(IntWidth::I64) {
                         return (dest_ptr, None);
                     }
                     let tmp_ptr = b.alloca(IrType::Int(IntWidth::I64));
+                    return (
+                        tmp_ptr,
+                        Some(RuntimeOutWriteback {
+                            dest_ptr,
+                            dest_ty,
+                            tmp_ptr,
+                        }),
+                    );
+                }
+                return (dest_ptr, None);
+            }
+        }
+        (b.const_i64(0), None)
+    }
+
+    /// Helper: adapt an intrinsic out-arg to a runtime ABI that writes
+    /// through an f64 slot. Non-f64 destinations get a temporary f64
+    /// alloca followed by an explicit writeback after the runtime call.
+    fn nth_arg_f64_out(
+        b: &mut FuncBuilder,
+        ctx: &LowerCtx,
+        args: &[Option<crate::ast::expr::Argument>],
+        n: usize,
+    ) -> (ValueId, Option<RuntimeOutWriteback>) {
+        if let Some(Some(arg)) = args.get(n) {
+            if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
+                let dest_ptr = lower_arg_by_ref_ctx(b, ctx, e);
+                let semantic_dest_ty =
+                    generic_actual_expr_type_info(e, &ctx.locals, ctx.st, Some(ctx.type_layouts))
+                        .map(|ti| type_info_to_ir_type(&ti));
+                let pointer_dest_ty = match b.func().value_type(dest_ptr) {
+                    Some(IrType::Ptr(inner)) => Some((*inner).clone()),
+                    _ => None,
+                };
+                if let Some(dest_ty) = semantic_dest_ty.or(pointer_dest_ty) {
+                    if dest_ty == IrType::Float(FloatWidth::F64) {
+                        return (dest_ptr, None);
+                    }
+                    let tmp_ptr = b.alloca(IrType::Float(FloatWidth::F64));
                     return (
                         tmp_ptr,
                         Some(RuntimeOutWriteback {
@@ -240,12 +285,17 @@ pub(crate) fn lower_intrinsic_subroutine(
             true
         }
         "cpu_time" => {
-            let time = nth_arg_ref(b, ctx, args, 0);
+            let (time, writeback) = nth_arg_f64_out(b, ctx, args, 0);
             b.call(
                 FuncRef::External("afs_cpu_time".into()),
                 vec![time],
                 IrType::Void,
             );
+            if let Some(writeback) = writeback {
+                let raw = b.load(writeback.tmp_ptr);
+                let coerced = coerce_to_type(b, raw, &writeback.dest_ty);
+                b.store(coerced, writeback.dest_ptr);
+            }
             true
         }
         "date_and_time" => {
@@ -320,17 +370,14 @@ pub(crate) fn lower_intrinsic_subroutine(
             let harvest_expr = nth_arg_expr(args, 0);
             let kind_is_f32 = harvest_expr
                 .and_then(|expr| {
-                    generic_actual_expr_type_info(
-                        expr,
-                        &ctx.locals,
-                        ctx.st,
-                        Some(ctx.type_layouts),
+                    generic_actual_expr_type_info(expr, &ctx.locals, ctx.st, Some(ctx.type_layouts))
+                })
+                .map(|ty| {
+                    matches!(
+                        ty,
+                        crate::sema::symtab::TypeInfo::Real { kind: Some(k) } if k <= 4
                     )
                 })
-                .map(|ty| matches!(
-                    ty,
-                    crate::sema::symtab::TypeInfo::Real { kind: Some(k) } if k <= 4
-                ))
                 .unwrap_or(false);
             let is_array = harvest_expr
                 .map(|e| expr_returns_array(e, &ctx.locals, ctx.st))
@@ -570,13 +617,23 @@ pub(crate) fn lower_intrinsic_subroutine(
                 return true;
             };
             let to_ptr = lower_arg_by_ref_ctx(b, ctx, to_expr);
-            let to_width = match b.func().value_type(to_ptr) {
-                Some(IrType::Ptr(inner)) => match inner.as_ref() {
-                    IrType::Int(w) => *w,
+            let to_width_from_expr =
+                operator_expr_type_info(to_expr, Some(&ctx.locals), ctx.st, Some(ctx.type_layouts))
+                    .or_else(|| {
+                        fortran_type_to_type_info(&crate::sema::types::expr_type(to_expr, ctx.st))
+                    })
+                    .and_then(|ti| match type_info_to_ir_type(&ti) {
+                        IrType::Int(width) => Some(width),
+                        _ => None,
+                    });
+            let to_width =
+                to_width_from_expr.unwrap_or_else(|| match b.func().value_type(to_ptr) {
+                    Some(IrType::Ptr(inner)) => match inner.as_ref() {
+                        IrType::Int(w) => *w,
+                        _ => IntWidth::I32,
+                    },
                     _ => IntWidth::I32,
-                },
-                _ => IntWidth::I32,
-            };
+                });
             let from_val = nth_arg_val(b, ctx, args, 0, 0);
             let from = coerce_int_like_to_width(b, from_val, to_width);
             let frompos_val = nth_arg_val(b, ctx, args, 1, 0);

@@ -30,6 +30,11 @@ The canonical leaf-assertion language lives in source comments inside
 That source comment language is meant to converge with `bencch`, not drift from
 it.
 
+When a stdlib/fpm drill creates scratch Fortran probes, review them during the
+drill wrapup. Keep the probes that capture a real compiler edge by moving them
+into `test_programs/` or `tests/fixtures/` with the appropriate annotations, and
+delete the rest before committing.
+
 ## Relationship To `bencch`
 
 The extracted structured bench lives in the `bencch/` submodule. It remains a

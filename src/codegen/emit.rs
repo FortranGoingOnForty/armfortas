@@ -3,6 +3,7 @@
 //! Produces output compatible with both afs-as and Apple's system assembler.
 
 use super::mir::*;
+use crate::ir::types::{FloatWidth, IrType};
 use std::fmt::Write;
 
 fn split_i128_words(value: i128) -> (u64, u64) {
@@ -81,20 +82,31 @@ pub fn emit_globals(globals: &[crate::ir::inst::Global]) -> String {
         }
 
         // Array globals carry `Array<elem_ty, count>`.  Pick the
-        // directive from the element type so `.long` / `.quad` /
-        // `.single` / `.double` all work correctly.
+        // directive from the element type. Float arrays are emitted
+        // as exact bit patterns; large finite decimal literals can
+        // exceed what Apple's assembler accepts for `.single`.
         if let IrType::Array(elem_ty, count) = &g.ty {
-            let (align, directive, _elem_bytes, is_float) = match elem_ty.as_ref() {
+            let (align, directive, _elem_bytes, is_float, float_lane_ty) = match elem_ty.as_ref() {
                 IrType::Int(IntWidth::I8) | IrType::Bool => {
-                    (byte_array_align_log2(*count), ".byte", 1, false)
+                    (byte_array_align_log2(*count), ".byte", 1, false, None)
                 }
-                IrType::Int(IntWidth::I16) => (1, ".short", 2, false),
-                IrType::Int(IntWidth::I32) => (2, ".long", 4, false),
-                IrType::Int(IntWidth::I64) => (3, ".quad", 8, false),
-                IrType::Int(IntWidth::I128) => (4, ".quad", 16, false),
-                IrType::Float(FloatWidth::F32) => (2, ".single", 4, true),
-                IrType::Float(FloatWidth::F64) => (3, ".double", 8, true),
-                _ => (3, ".quad", 8, false),
+                IrType::Int(IntWidth::I16) => (1, ".short", 2, false, None),
+                IrType::Int(IntWidth::I32) => (2, ".long", 4, false, None),
+                IrType::Int(IntWidth::I64) => (3, ".quad", 8, false, None),
+                IrType::Int(IntWidth::I128) => (4, ".quad", 16, false, None),
+                IrType::Float(FloatWidth::F32) => (2, ".long", 4, true, Some(elem_ty.as_ref())),
+                IrType::Float(FloatWidth::F64) => (3, ".quad", 8, true, Some(elem_ty.as_ref())),
+                IrType::Array(inner, _)
+                    if matches!(inner.as_ref(), IrType::Float(FloatWidth::F32)) =>
+                {
+                    (2, ".long", 4, true, Some(inner.as_ref()))
+                }
+                IrType::Array(inner, _)
+                    if matches!(inner.as_ref(), IrType::Float(FloatWidth::F64)) =>
+                {
+                    (3, ".quad", 8, true, Some(inner.as_ref()))
+                }
+                _ => (3, ".quad", 8, false, None),
             };
             if align > 0 {
                 writeln!(out, ".p2align {}", align).unwrap();
@@ -114,8 +126,15 @@ pub fn emit_globals(globals: &[crate::ir::inst::Global]) -> String {
                     }
                 }
                 Some(GlobalInit::FloatArray(vs)) if is_float => {
+                    let float_lane_ty = float_lane_ty.unwrap_or(elem_ty.as_ref());
                     for v in vs {
-                        writeln!(out, "    {} {}", directive, v).unwrap();
+                        writeln!(
+                            out,
+                            "    {} {}",
+                            directive,
+                            float_bits_literal(float_lane_ty, *v)
+                        )
+                        .unwrap();
                     }
                 }
                 Some(GlobalInit::String(bytes)) => {
@@ -148,31 +167,18 @@ pub fn emit_globals(globals: &[crate::ir::inst::Global]) -> String {
             continue;
         }
 
-        // Scalar globals: pick alignment + storage directive.
-        // Audit Med-5: NaN/Inf must round-trip portably across
-        // assemblers. Apple's `as` accepts `.single NaN` but GNU
-        // binutils does not. Emit non-finite floats as their
-        // bit-pattern via `.long` / `.quad` so the same .s file
-        // assembles cleanly on both.
-        let is_nonfinite_float = matches!(
-            (&g.ty, &g.initializer),
-            (IrType::Float(_), Some(GlobalInit::Float(v))) if !v.is_finite()
-        );
-        let (align, directive, default_zero) = if is_nonfinite_float {
-            match &g.ty {
-                IrType::Float(FloatWidth::F32) => (2, ".long", "0"),
-                _ => (3, ".quad", "0"),
-            }
-        } else {
-            match &g.ty {
-                IrType::Int(IntWidth::I8) | IrType::Bool => (0, ".byte", "0"),
-                IrType::Int(IntWidth::I16) => (1, ".short", "0"),
-                IrType::Int(IntWidth::I32) => (2, ".long", "0"),
-                IrType::Int(IntWidth::I64) => (3, ".quad", "0"),
-                IrType::Float(FloatWidth::F32) => (2, ".single", "0.0"),
-                IrType::Float(FloatWidth::F64) => (3, ".double", "0.0"),
-                _ => (3, ".quad", "0"), // pointers and aggregates: 8-byte slot
-            }
+        // Scalar globals: pick alignment + storage directive. Floats
+        // always use bit-pattern emission, not decimal assembler
+        // literals. This keeps NaN/Inf portable and avoids rejected
+        // fixed-decimal forms for very large finite PARAMETER values.
+        let (align, directive, default_zero) = match &g.ty {
+            IrType::Int(IntWidth::I8) | IrType::Bool => (0, ".byte", "0"),
+            IrType::Int(IntWidth::I16) => (1, ".short", "0"),
+            IrType::Int(IntWidth::I32) => (2, ".long", "0"),
+            IrType::Int(IntWidth::I64) => (3, ".quad", "0"),
+            IrType::Float(FloatWidth::F32) => (2, ".long", "0"),
+            IrType::Float(FloatWidth::F64) => (3, ".quad", "0"),
+            _ => (3, ".quad", "0"), // pointers and aggregates: 8-byte slot
         };
         if align > 0 {
             writeln!(out, ".p2align {}", align).unwrap();
@@ -180,19 +186,7 @@ pub fn emit_globals(globals: &[crate::ir::inst::Global]) -> String {
         writeln!(out, "{}:", symbol).unwrap();
         let value = match &g.initializer {
             Some(GlobalInit::Int(v)) => v.to_string(),
-            Some(GlobalInit::Float(v)) => {
-                if v.is_finite() {
-                    format!("{}", v)
-                } else {
-                    // Bit-pattern emission for NaN / ±Inf.
-                    match &g.ty {
-                        IrType::Float(FloatWidth::F32) => {
-                            format!("0x{:08x}", (*v as f32).to_bits())
-                        }
-                        _ => format!("0x{:016x}", v.to_bits()),
-                    }
-                }
-            }
+            Some(GlobalInit::Float(v)) => float_bits_literal(&g.ty, *v),
             Some(GlobalInit::Zero) | None => default_zero.into(),
             Some(GlobalInit::String(bytes))
                 if matches!(g.ty, IrType::Int(IntWidth::I8) | IrType::Bool) =>
@@ -209,6 +203,14 @@ pub fn emit_globals(globals: &[crate::ir::inst::Global]) -> String {
         writeln!(out, "    {} {}", directive, value).unwrap();
     }
     out
+}
+
+fn float_bits_literal(ty: &IrType, value: f64) -> String {
+    match ty {
+        IrType::Float(FloatWidth::F32) => format!("0x{:08x}", (value as f32).to_bits()),
+        IrType::Float(FloatWidth::F64) => format!("0x{:016x}", value.to_bits()),
+        _ => value.to_string(),
+    }
 }
 
 /// Emit a machine function as ARM64 assembly text.

@@ -97,7 +97,9 @@ pub(crate) fn init_decls(
                                 None,
                                 None,
                             );
-                        } else if let Some(values) = super::core::extract_reshape_source_ac(&init_expr.node) {
+                        } else if let Some(values) =
+                            super::core::extract_reshape_source_ac(&init_expr.node)
+                        {
                             // F2018 §16.9.169 RESHAPE used as a declared
                             // initializer for a fixed-shape stack array.
                             // The source AC is laid out column-major into
@@ -118,6 +120,22 @@ pub(crate) fn init_decls(
                                 &info.ty,
                                 info.derived_type.as_deref(),
                                 values,
+                                st,
+                                type_layouts,
+                                None,
+                                None,
+                                None,
+                            );
+                        } else if let Some(values) =
+                            super::core::extract_transpose_reshape_source_ac(&init_expr.node, st)
+                        {
+                            store_ac_values_into(
+                                b,
+                                locals,
+                                info.addr,
+                                &info.ty,
+                                info.derived_type.as_deref(),
+                                &values,
                                 st,
                                 type_layouts,
                                 None,

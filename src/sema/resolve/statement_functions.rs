@@ -14,9 +14,7 @@
 //!
 //! Extracted from `core.rs` in Sprint 14.
 
-use crate::sema::symtab::{
-    ScopeId, StatementFunctionDef, SymbolKind, SymbolTable, TypeInfo,
-};
+use crate::sema::symtab::{ScopeId, StatementFunctionDef, SymbolKind, SymbolTable, TypeInfo};
 
 pub(super) fn detect_statement_functions(
     st: &mut SymbolTable,

@@ -72,7 +72,7 @@ pub(crate) fn lower_unit(
         } => {
             let fname = name.clone().unwrap_or_else(|| "main".into());
             let visible_param_consts =
-                collect_decl_param_consts_with_host(decls, host_param_consts);
+                collect_decl_param_consts_with_scope(decls, host_param_consts, st);
             let body_fname = format!("__prog_{}", fname);
             let mut func = Function::new(body_fname.clone(), vec![], IrType::Void);
             let mut ctx = LowerCtx::new(
@@ -90,16 +90,15 @@ pub(crate) fn lower_unit(
             );
             ctx.proc_scope_id = {
                 let raw_name = name.as_deref();
-                st.all_scopes()
-                    .iter()
-                    .enumerate()
-                    .find_map(|(idx, scope)| match (&scope.kind, raw_name) {
+                st.all_scopes().iter().enumerate().find_map(|(idx, scope)| {
+                    match (&scope.kind, raw_name) {
                         (crate::sema::symtab::ScopeKind::Program(scope_name), Some(n)) => {
                             scope_name.eq_ignore_ascii_case(n).then_some(idx)
                         }
                         (crate::sema::symtab::ScopeKind::Program(_), None) => Some(idx),
                         _ => None,
-                    })
+                    }
+                })
             };
             let mut pending_globals: Vec<PendingGlobal> = Vec::new();
 
@@ -109,8 +108,15 @@ pub(crate) fn lower_unit(
 
             {
                 let mut b = FuncBuilder::new(&mut func);
+                let _setup_proc_scope_guard = ProcScopeGuard::enter(ctx.proc_scope_id);
                 install_common_locals(&mut b, &mut ctx.locals, decls);
-                install_equivalence_locals(&mut b, &mut ctx.locals, decls, &visible_param_consts, st);
+                install_equivalence_locals(
+                    &mut b,
+                    &mut ctx.locals,
+                    decls,
+                    &visible_param_consts,
+                    st,
+                );
                 super::alloc::alloc_decls(
                     &mut b,
                     &mut ctx.locals,
@@ -274,7 +280,7 @@ pub(crate) fn lower_unit(
             let proc_scope_id =
                 procedure_scope_for_dummy_args_with_host(st, name, args, host_scope_id);
             let visible_param_consts =
-                collect_decl_param_consts_with_host(decls, host_param_consts);
+                collect_decl_param_consts_with_scope(decls, host_param_consts, st);
             let mut params: Vec<Param> = args
                 .iter()
                 .enumerate()
@@ -403,6 +409,7 @@ pub(crate) fn lower_unit(
 
             {
                 let mut b = FuncBuilder::new(&mut func);
+                let _setup_proc_scope_guard = ProcScopeGuard::enter(ctx.proc_scope_id);
 
                 // Set up hidden-length locals for assumed-len char dummies.
                 let mut hidden_len_addrs: HashMap<String, ValueId> = HashMap::new();
@@ -418,12 +425,8 @@ pub(crate) fn lower_unit(
                         b.store(*pid, slot);
                         ctx.insert_scalar(pname.clone(), slot, elem_ty.clone());
                     } else {
-                        let uses_descriptor = arg_uses_descriptor_for_lowering(
-                            pname,
-                            decls,
-                            st,
-                            proc_scope_id,
-                        );
+                        let uses_descriptor =
+                            arg_uses_descriptor_for_lowering(pname, decls, st, proc_scope_id);
                         let uses_string_descriptor =
                             arg_uses_string_descriptor_from_decls(pname, decls);
                         let dt_name = arg_derived_type_name(pname, decls);
@@ -466,7 +469,9 @@ pub(crate) fn lower_unit(
                                 Some(&visible_param_consts),
                                 st,
                             ),
-                            last_dim_assumed_size: arg_last_dim_assumed_size_from_decls(pname, decls),
+                            last_dim_assumed_size: arg_last_dim_assumed_size_from_decls(
+                                pname, decls,
+                            ),
                         };
                         ctx.locals.insert(pname.clone(), info);
                         if decl_is_optional(pname, decls) {
@@ -530,6 +535,7 @@ pub(crate) fn lower_unit(
                     ctx.st,
                     type_layouts,
                 );
+                clear_intent_out_allocatable_array_params(&mut b, &param_info, &ctx.locals, decls);
                 clear_intent_out_derived_params(
                     &mut b,
                     &param_info,
@@ -539,7 +545,13 @@ pub(crate) fn lower_unit(
                 );
 
                 install_common_locals(&mut b, &mut ctx.locals, decls);
-                install_equivalence_locals(&mut b, &mut ctx.locals, decls, &visible_param_consts, st);
+                install_equivalence_locals(
+                    &mut b,
+                    &mut ctx.locals,
+                    decls,
+                    &visible_param_consts,
+                    st,
+                );
                 // Install host-association by_ref locals before alloc_decls
                 // so any same-named callee local (shouldn't occur per F
                 // scoping rules) is short-circuited, and so init_decls has
@@ -654,7 +666,7 @@ pub(crate) fn lower_unit(
             let proc_scope_id =
                 procedure_scope_for_dummy_args_with_host(st, name, args, host_scope_id);
             let visible_param_consts =
-                collect_decl_param_consts_with_host(decls, host_param_consts);
+                collect_decl_param_consts_with_scope(decls, host_param_consts, st);
 
             // Hidden-result ABI: allocatable arrays use a 384-byte array
             // descriptor, while scalar character results use a 32-byte
@@ -674,12 +686,13 @@ pub(crate) fn lower_unit(
                     HiddenResultAbi::ArrayDescriptor => 384,
                     HiddenResultAbi::StringDescriptor => 32,
                     HiddenResultAbi::DerivedAggregate => {
-                        let result_name = result
-                            .as_deref()
-                            .unwrap_or(name.as_str())
-                            .to_lowercase();
+                        let result_name = result.as_deref().unwrap_or(name.as_str()).to_lowercase();
                         derived_type_name_for_result_var(return_type, &result_name, decls)
-                            .and_then(|dt_name| type_layouts.get(&dt_name).map(|layout| layout.size.max(1) as u64))
+                            .and_then(|dt_name| {
+                                type_layouts
+                                    .get(&dt_name)
+                                    .map(|layout| layout.size.max(1) as u64)
+                            })
                             .unwrap_or(8)
                     }
                     HiddenResultAbi::ComplexBuffer => {
@@ -887,6 +900,7 @@ pub(crate) fn lower_unit(
 
             {
                 let mut b = FuncBuilder::new(&mut func);
+                let _setup_proc_scope_guard = ProcScopeGuard::enter(ctx.proc_scope_id);
 
                 let mut hidden_len_addrs: HashMap<String, ValueId> = HashMap::new();
                 for (hname, hid) in &hidden_len_params {
@@ -901,12 +915,8 @@ pub(crate) fn lower_unit(
                         b.store(*pid, slot);
                         ctx.insert_scalar(pname.clone(), slot, elem_ty.clone());
                     } else {
-                        let uses_descriptor = arg_uses_descriptor_for_lowering(
-                            pname,
-                            decls,
-                            st,
-                            proc_scope_id,
-                        );
+                        let uses_descriptor =
+                            arg_uses_descriptor_for_lowering(pname, decls, st, proc_scope_id);
                         let uses_string_descriptor =
                             arg_uses_string_descriptor_from_decls(pname, decls);
                         let dt_name = arg_derived_type_name(pname, decls);
@@ -950,7 +960,9 @@ pub(crate) fn lower_unit(
                                     Some(&visible_param_consts),
                                     st,
                                 ),
-                                last_dim_assumed_size: arg_last_dim_assumed_size_from_decls(pname, decls),
+                                last_dim_assumed_size: arg_last_dim_assumed_size_from_decls(
+                                    pname, decls,
+                                ),
                             },
                         );
                         if decl_is_optional(pname, decls) {
@@ -999,6 +1011,7 @@ pub(crate) fn lower_unit(
                     ctx.st,
                     type_layouts,
                 );
+                clear_intent_out_allocatable_array_params(&mut b, &param_info, &ctx.locals, decls);
                 clear_intent_out_derived_params(
                     &mut b,
                     &param_info,
@@ -1043,17 +1056,14 @@ pub(crate) fn lower_unit(
                             is_pointer: false,
                             runtime_dim_upper: vec![],
                             is_class: false,
-            logical_kind: None,
+                            logical_kind: None,
                             last_dim_assumed_size: false,
                         },
                     );
                 } else if hidden_result_abi == HiddenResultAbi::DerivedAggregate {
-                    let dt_name = derived_type_name_for_result_var(
-                        return_type,
-                        &result_name,
-                        decls,
-                    )
-                    .expect("derived hidden-result function missing result type");
+                    let dt_name =
+                        derived_type_name_for_result_var(return_type, &result_name, decls)
+                            .expect("derived hidden-result function missing result type");
                     if let Some(layout) = type_layouts.get(&dt_name) {
                         if derived_layout_needs_runtime_initialization(layout, type_layouts) {
                             initialize_derived_storage(&mut b, ValueId(0), layout, type_layouts);
@@ -1074,7 +1084,7 @@ pub(crate) fn lower_unit(
                             is_pointer: false,
                             runtime_dim_upper: vec![],
                             is_class: false,
-            logical_kind: None,
+                            logical_kind: None,
                             last_dim_assumed_size: false,
                         },
                     );
@@ -1103,7 +1113,11 @@ pub(crate) fn lower_unit(
                         decls,
                         st,
                     );
-                    let fw = if kind == 8 { FloatWidth::F64 } else { FloatWidth::F32 };
+                    let fw = if kind == 8 {
+                        FloatWidth::F64
+                    } else {
+                        FloatWidth::F32
+                    };
                     let cplx_ty = IrType::Array(Box::new(IrType::Float(fw)), 2);
                     let zero_off = b.const_i64(0);
                     let typed_addr = b.gep(ValueId(0), vec![zero_off], cplx_ty.clone());
@@ -1165,7 +1179,7 @@ pub(crate) fn lower_unit(
                             is_pointer: true,
                             runtime_dim_upper: vec![],
                             is_class: false,
-            logical_kind: None,
+                            logical_kind: None,
                             last_dim_assumed_size: false,
                         },
                     );
@@ -1209,7 +1223,7 @@ pub(crate) fn lower_unit(
                             is_pointer: false,
                             runtime_dim_upper: vec![],
                             is_class: false,
-            logical_kind: None,
+                            logical_kind: None,
                             last_dim_assumed_size: false,
                         },
                     );
@@ -1223,7 +1237,13 @@ pub(crate) fn lower_unit(
                 }
 
                 install_common_locals(&mut b, &mut ctx.locals, decls);
-                install_equivalence_locals(&mut b, &mut ctx.locals, decls, &visible_param_consts, st);
+                install_equivalence_locals(
+                    &mut b,
+                    &mut ctx.locals,
+                    decls,
+                    &visible_param_consts,
+                    st,
+                );
                 install_host_ref_locals(&mut b, &mut ctx.locals, &host_ref_infos);
                 super::alloc::alloc_decls(
                     &mut b,
@@ -1236,6 +1256,7 @@ pub(crate) fn lower_unit(
                     st,
                 );
                 if hidden_result_abi == HiddenResultAbi::StringDescriptor {
+                    let _proc_scope_guard = ProcScopeGuard::enter(ctx.proc_scope_id);
                     ensure_hidden_string_result_local(
                         &mut b,
                         &mut ctx.locals,
@@ -1243,6 +1264,7 @@ pub(crate) fn lower_unit(
                         return_type.as_ref(),
                         &visible_param_consts,
                         st,
+                        type_layouts,
                     );
                 }
                 install_host_param_consts(&mut b, &mut ctx.locals, host_param_consts, st);
@@ -1381,7 +1403,7 @@ pub(crate) fn lower_unit(
             // subprograms (module procedures) must be lowered as top-level
             // functions so they are emitted into the object file.
             let visible_param_consts =
-                collect_decl_param_consts_with_host(decls, host_param_consts);
+                collect_decl_param_consts_with_scope(decls, host_param_consts, st);
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
                 host_uses.iter().chain(uses.iter()).cloned().collect();
             let module_name = match &unit.node {
@@ -1495,16 +1517,18 @@ pub(crate) fn lower_unit(
                 } else {
                     None
                 };
-                let submod_scope = st.all_scopes().iter().enumerate().find_map(|(idx, scope)| {
-                    match &scope.kind {
-                        crate::sema::symtab::ScopeKind::Submodule(scope_name)
-                            if scope_name.eq_ignore_ascii_case(submodule_name) =>
-                        {
-                            Some(idx)
-                        }
-                        _ => None,
-                    }
-                });
+                let submod_scope =
+                    st.all_scopes()
+                        .iter()
+                        .enumerate()
+                        .find_map(|(idx, scope)| match &scope.kind {
+                            crate::sema::symtab::ScopeKind::Submodule(scope_name)
+                                if scope_name.eq_ignore_ascii_case(submodule_name) =>
+                            {
+                                Some(idx)
+                            }
+                            _ => None,
+                        });
                 lower_unit(
                     module,
                     sub,

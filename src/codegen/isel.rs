@@ -142,6 +142,7 @@ pub fn select_function(func: &Function) -> MachineFunction {
                 );
             }
             IncomingParam::Narrow(vreg, RegClass::Fp64, AbiArgLoc::Fp(reg), _) => {
+                mf.entry_arg_receipts.push(*vreg);
                 mf.block_mut(MBlockId(0)).insts.push(MachineInst {
                     opcode: ArmOpcode::FmovReg,
                     operands: vec![
@@ -152,6 +153,7 @@ pub fn select_function(func: &Function) -> MachineFunction {
                 });
             }
             IncomingParam::Narrow(vreg, RegClass::Fp32, AbiArgLoc::Fp32(reg), _) => {
+                mf.entry_arg_receipts.push(*vreg);
                 mf.block_mut(MBlockId(0)).insts.push(MachineInst {
                     opcode: ArmOpcode::FmovReg,
                     operands: vec![
@@ -162,6 +164,7 @@ pub fn select_function(func: &Function) -> MachineFunction {
                 });
             }
             IncomingParam::Narrow(vreg, RegClass::Gp32, AbiArgLoc::Gp32(reg), _) => {
+                mf.entry_arg_receipts.push(*vreg);
                 mf.block_mut(MBlockId(0)).insts.push(MachineInst {
                     opcode: ArmOpcode::MovReg,
                     operands: vec![
@@ -172,6 +175,7 @@ pub fn select_function(func: &Function) -> MachineFunction {
                 });
             }
             IncomingParam::Narrow(vreg, _, AbiArgLoc::Gp(reg), _) => {
+                mf.entry_arg_receipts.push(*vreg);
                 mf.block_mut(MBlockId(0)).insts.push(MachineInst {
                     opcode: ArmOpcode::MovReg,
                     operands: vec![
@@ -401,6 +405,24 @@ fn select_call_inst(
         }
     }
 
+    let indirect_target_reg = if let Some(target) = indirect_target {
+        let target_vreg = ctx.lookup_vreg(target);
+        // Keep BLR targets out of x0..x7 and out of x16, which final
+        // assembly emission may clobber while synthesizing large frame
+        // offsets immediately before the call.
+        mf.block_mut(mb).insts.push(MachineInst {
+            opcode: ArmOpcode::MovReg,
+            operands: vec![
+                MachineOperand::PhysReg(PhysReg::Gp(17)),
+                MachineOperand::VReg(target_vreg),
+            ],
+            def: None,
+        });
+        Some(PhysReg::Gp(17))
+    } else {
+        None
+    };
+
     for (opcode, dst, src) in pending_reg_arg_moves {
         mf.block_mut(mb).insts.push(MachineInst {
             opcode,
@@ -409,10 +431,10 @@ fn select_call_inst(
         });
     }
 
-    if let Some(target) = indirect_target {
+    if let Some(target_reg) = indirect_target_reg {
         mf.block_mut(mb).insts.push(MachineInst {
             opcode: ArmOpcode::Blr,
-            operands: vec![MachineOperand::VReg(ctx.lookup_vreg(target))],
+            operands: vec![MachineOperand::PhysReg(target_reg)],
             def: None,
         });
     } else {
@@ -1469,7 +1491,8 @@ fn select_inst(
             // generic offset cursor, so dispatching by the pointee
             // would silently truncate non-byte stores.
             let val_ty = func.value_type(*val);
-            let val_class = mf.vregs
+            let val_class = mf
+                .vregs
                 .iter()
                 .find(|v| v.id == val_vreg)
                 .map(|v| v.class)
@@ -3028,10 +3051,7 @@ fn store_opcode_for(ty: Option<&IrType>, class: RegClass) -> ArmOpcode {
 /// arms in `select_inst`. The wide-i128 paths build their own operand
 /// pairs directly because they target the `emit_*_phys_i128_pair`
 /// helpers, which take `i64` offsets and only need a base operand.
-fn narrow_load_store_addr(
-    ctx: &ISelCtx,
-    addr: ValueId,
-) -> (MachineOperand, MachineOperand) {
+fn narrow_load_store_addr(ctx: &ISelCtx, addr: ValueId) -> (MachineOperand, MachineOperand) {
     if let Some(&offset) = ctx.alloca_offsets.get(&addr) {
         (
             MachineOperand::PhysReg(PhysReg::FP),
@@ -3069,7 +3089,14 @@ fn emit_i128_binop_via_slots(
     let lhs_slot = ctx.lookup_wide_slot(lhs_id);
     let rhs_slot = ctx.lookup_wide_slot(rhs_id);
     let fp = || MachineOperand::PhysReg(PhysReg::FP);
-    emit_load_phys_i128_pair(mf, mb, fp(), lhs_slot as i64, PhysReg::Gp(16), PhysReg::Gp(17));
+    emit_load_phys_i128_pair(
+        mf,
+        mb,
+        fp(),
+        lhs_slot as i64,
+        PhysReg::Gp(16),
+        PhysReg::Gp(17),
+    );
     match op {
         I128BinOp::Add => emit_i128_add_from_slot(
             mf,
@@ -3090,7 +3117,14 @@ fn emit_i128_binop_via_slots(
             PhysReg::Gp(8),
         ),
     }
-    emit_store_phys_i128_pair(mf, mb, fp(), dest_slot as i64, PhysReg::Gp(16), PhysReg::Gp(17));
+    emit_store_phys_i128_pair(
+        mf,
+        mb,
+        fp(),
+        dest_slot as i64,
+        PhysReg::Gp(16),
+        PhysReg::Gp(17),
+    );
 }
 
 fn type_to_reg_class(ty: &IrType) -> RegClass {
@@ -3419,7 +3453,7 @@ fn alloca_size(ty: &IrType) -> u32 {
             elem_size * (*count as u32)
         }
         IrType::FuncPtr(_) => 8,
-        IrType::Struct(_) => 8, // placeholder
+        IrType::Struct(_) => 8,      // placeholder
         IrType::Vector { .. } => 16, // 128-bit NEON
     }
 }
@@ -3719,6 +3753,63 @@ mod tests {
             b.ret_void();
         });
         assert!(mf.blocks[0].insts.iter().any(|i| i.opcode == ArmOpcode::Bl));
+    }
+
+    #[test]
+    fn select_indirect_call_routes_target_through_ip1_before_arg_moves() {
+        let mf = select_simple(|b| {
+            let raw_target = b.const_i64(4096);
+            let target = b.int_to_ptr(raw_target, IrType::Int(IntWidth::I8));
+            let mut args = Vec::new();
+            for value in 100..108 {
+                args.push(b.const_i64(value));
+            }
+            b.call(FuncRef::Indirect(target), args, IrType::Void);
+            b.ret_void();
+        });
+
+        let insts = &mf.blocks[0].insts;
+        let blr_idx = insts
+            .iter()
+            .position(|inst| inst.opcode == ArmOpcode::Blr)
+            .expect("indirect call should lower to BLR");
+        assert_eq!(
+            insts[blr_idx].operands,
+            vec![MachineOperand::PhysReg(PhysReg::Gp(17))],
+            "indirect calls should branch through IP1, not an argument register or x16",
+        );
+
+        let save_idx = insts
+            .iter()
+            .position(|inst| {
+                inst.opcode == ArmOpcode::MovReg
+                    && matches!(
+                        inst.operands.as_slice(),
+                        [
+                            MachineOperand::PhysReg(PhysReg::Gp(17)),
+                            MachineOperand::VReg(_)
+                        ]
+                    )
+            })
+            .expect("indirect target should be copied into IP1");
+        let arg7_idx = insts
+            .iter()
+            .position(|inst| {
+                inst.opcode == ArmOpcode::MovReg
+                    && matches!(
+                        inst.operands.as_slice(),
+                        [
+                            MachineOperand::PhysReg(PhysReg::Gp(7)),
+                            MachineOperand::VReg(_)
+                        ]
+                    )
+            })
+            .expect("the eighth integer argument should still use x7");
+
+        assert!(
+            save_idx < arg7_idx && arg7_idx < blr_idx,
+            "target must be preserved before x7 argument setup reaches the call",
+        );
     }
 
     #[test]
@@ -4125,8 +4216,12 @@ mod tests {
         }
 
         let mf = select_function(&func);
-        let opcodes: Vec<ArmOpcode> =
-            mf.blocks.iter().flat_map(|b| b.insts.iter()).map(|i| i.opcode).collect();
+        let opcodes: Vec<ArmOpcode> = mf
+            .blocks
+            .iter()
+            .flat_map(|b| b.insts.iter())
+            .map(|i| i.opcode)
+            .collect();
         assert!(
             opcodes.contains(&ArmOpcode::FaddV4S),
             "expected FaddV4S in MIR, got {:?}",
@@ -4207,8 +4302,12 @@ mod tests {
         }
 
         let mf = select_function(&func);
-        let opcodes: Vec<ArmOpcode> =
-            mf.blocks.iter().flat_map(|b| b.insts.iter()).map(|i| i.opcode).collect();
+        let opcodes: Vec<ArmOpcode> = mf
+            .blocks
+            .iter()
+            .flat_map(|b| b.insts.iter())
+            .map(|i| i.opcode)
+            .collect();
         assert!(
             opcodes.contains(&ArmOpcode::FmlaV2D),
             "expected FmlaV2D, got {:?}",

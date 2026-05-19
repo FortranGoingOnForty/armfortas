@@ -11,13 +11,13 @@
 //! the sprint progresses (`ctx` lifted in step 2). Public re-exports
 //! preserve the historical `crate::ir::lower::*` API.
 
+mod alloc;
 mod const_scalar;
 mod core;
 mod ctx;
-mod helpers;
-mod alloc;
-mod init;
 mod expr;
+mod helpers;
+mod init;
 mod intrinsic;
 mod intrinsic_sub;
 mod stmt;

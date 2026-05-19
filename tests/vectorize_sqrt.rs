@@ -61,7 +61,15 @@ fn o3_vectorizes_elementwise_sqrt() {
             "expected sqrt(1)=1 first: {:?}",
             line
         );
-        assert!(line.contains("2."), "expected sqrt(4)=2 in line: {:?}", line);
-        assert!(line.contains("4."), "expected sqrt(16)=4 in line: {:?}", line);
+        assert!(
+            line.contains("2."),
+            "expected sqrt(4)=2 in line: {:?}",
+            line
+        );
+        assert!(
+            line.contains("4."),
+            "expected sqrt(16)=4 in line: {:?}",
+            line
+        );
     }
 }

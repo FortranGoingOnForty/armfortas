@@ -114,6 +114,13 @@ fn lsf_in_function(func: &mut Function) -> bool {
                         .filter(|arg| value_is_pointer(func, *arg))
                         .collect();
                     if !pointer_args.is_empty() {
+                        if pointer_args
+                            .iter()
+                            .any(|arg| call_arg_may_carry_indirect_pointer(func, *arg))
+                        {
+                            available.clear();
+                            continue;
+                        }
                         // Call boundaries use the coarser
                         // may_reach_through_call_arg predicate: a
                         // callee that gets a pointer can walk to
@@ -198,6 +205,17 @@ fn value_is_pointer(func: &Function, value: ValueId) -> bool {
         .find(|inst| inst.id == value)
         .map(|inst| matches!(inst.ty, IrType::Ptr(_)))
         .unwrap_or(false)
+}
+
+fn call_arg_may_carry_indirect_pointer(func: &Function, value: ValueId) -> bool {
+    matches!(
+        func.value_type(value),
+        Some(IrType::Ptr(inner))
+            if matches!(
+                inner.as_ref(),
+                IrType::Array(..) | IrType::Struct(_) | IrType::Ptr(_) | IrType::FuncPtr(_)
+            )
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -707,6 +725,72 @@ mod tests {
         assert!(
             matches!(term, Terminator::Return(Some(v)) if *v == v42),
             "return should use the forwarded value across the noalias call, got {:?}",
+            term
+        );
+    }
+
+    #[test]
+    fn aggregate_call_arg_invalidates_store_reachable_through_wrapped_pointer() {
+        // Mirrors type-bound calls through class descriptors:
+        //
+        //   store 42, %payload
+        //   store %payload, %wrapper[0]
+        //   call @touch(%wrapper)
+        //   load %payload
+        //
+        // The call's direct argument is a different alloca from
+        // %payload, but the aggregate wrapper carries %payload inside
+        // it. LSF must not forward the pre-call value across this call.
+        let mut m = Module::new("test".into());
+        let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I64));
+
+        let payload = push(
+            &mut f,
+            InstKind::Alloca(IrType::Int(IntWidth::I64)),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I64))),
+        );
+        let wrapper_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384);
+        let wrapper = push(
+            &mut f,
+            InstKind::Alloca(wrapper_ty.clone()),
+            IrType::Ptr(Box::new(wrapper_ty)),
+        );
+        let zero = push(
+            &mut f,
+            InstKind::ConstInt(0, IntWidth::I64),
+            IrType::Int(IntWidth::I64),
+        );
+        let wrapper_slot = push(
+            &mut f,
+            InstKind::GetElementPtr(wrapper, vec![zero]),
+            IrType::Ptr(Box::new(IrType::Ptr(Box::new(IrType::Int(IntWidth::I64))))),
+        );
+        let v42 = push(
+            &mut f,
+            InstKind::ConstInt(42, IntWidth::I64),
+            IrType::Int(IntWidth::I64),
+        );
+        push(&mut f, InstKind::Store(v42, payload), IrType::Void);
+        push(&mut f, InstKind::Store(payload, wrapper_slot), IrType::Void);
+        push(
+            &mut f,
+            InstKind::Call(FuncRef::Internal(0), vec![wrapper]),
+            IrType::Void,
+        );
+        let load = push(&mut f, InstKind::Load(payload), IrType::Int(IntWidth::I64));
+        let entry = f.entry;
+        f.block_mut(entry).terminator = Some(Terminator::Return(Some(load)));
+        m.add_function(f);
+
+        LocalLsf.run(&mut m);
+        let term = m.functions[0]
+            .block(m.functions[0].entry)
+            .terminator
+            .as_ref()
+            .unwrap();
+        assert!(
+            matches!(term, Terminator::Return(Some(v)) if *v == load),
+            "LSF must not forward a payload load across a call receiving an aggregate wrapper, got {:?}",
             term
         );
     }

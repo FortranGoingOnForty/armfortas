@@ -355,9 +355,7 @@ fn detect_where_loop(
             true_args,
             false_dest,
             false_args,
-        }) if true_args.is_empty() && false_args.is_empty() => {
-            (*cond, *true_dest, *false_dest)
-        }
+        }) if true_args.is_empty() && false_args.is_empty() => (*cond, *true_dest, *false_dest),
         _ => return None,
     };
     if lp.body.contains(&true_dest) || !lp.body.contains(&false_dest) {
@@ -506,7 +504,14 @@ fn build_vector_plan(
             return None;
         }
         let stored_inst = defs.get(stored_value)?;
-        let op = classify_body_op(*stored_value, &stored_inst.kind, func, shape, &dest, loop_defs)?;
+        let op = classify_body_op(
+            *stored_value,
+            &stored_inst.kind,
+            func,
+            shape,
+            &dest,
+            loop_defs,
+        )?;
         statements.push(Statement {
             op,
             store: *store_id,
@@ -515,9 +520,7 @@ fn build_vector_plan(
 
     // Find the iv-increment in the body.
     let body_term = match &body.terminator {
-        Some(Terminator::Branch(dest, args)) if *dest == shape.header && args.len() == 1 => {
-            args[0]
-        }
+        Some(Terminator::Branch(dest, args)) if *dest == shape.header && args.len() == 1 => args[0],
         _ => return None,
     };
     let step_inst = defs.get(&body_term)?;
@@ -572,48 +575,110 @@ fn classify_body_op(
                 BinopOperand::InvariantScalar(_) => None,
             }
         }
-        InstKind::INeg(src) | InstKind::FNeg(src) => {
-            unary_body(stored_value, UnaryKind::Neg, *src, func, shape, dest, loop_defs)
-        }
-        InstKind::FAbs(src) => {
-            unary_body(stored_value, UnaryKind::Abs, *src, func, shape, dest, loop_defs)
-        }
+        InstKind::INeg(src) | InstKind::FNeg(src) => unary_body(
+            stored_value,
+            UnaryKind::Neg,
+            *src,
+            func,
+            shape,
+            dest,
+            loop_defs,
+        ),
+        InstKind::FAbs(src) => unary_body(
+            stored_value,
+            UnaryKind::Abs,
+            *src,
+            func,
+            shape,
+            dest,
+            loop_defs,
+        ),
         InstKind::FSqrt(src) => {
             // sqrt is float-only.
             if !matches!(dest.elem_ty, IrType::Float(_)) {
                 return None;
             }
-            unary_body(stored_value, UnaryKind::Sqrt, *src, func, shape, dest, loop_defs)
+            unary_body(
+                stored_value,
+                UnaryKind::Sqrt,
+                *src,
+                func,
+                shape,
+                dest,
+                loop_defs,
+            )
         }
-        InstKind::IAdd(l, r) => {
-            binop_body(stored_value, BinaryKind::Add, *l, *r, func, shape, dest, loop_defs)
-        }
-        InstKind::ISub(l, r) => {
-            binop_body(stored_value, BinaryKind::Sub, *l, *r, func, shape, dest, loop_defs)
-        }
-        InstKind::IMul(l, r) => {
-            binop_body(stored_value, BinaryKind::Mul, *l, *r, func, shape, dest, loop_defs)
-        }
+        InstKind::IAdd(l, r) => binop_body(
+            stored_value,
+            BinaryKind::Add,
+            *l,
+            *r,
+            func,
+            shape,
+            dest,
+            loop_defs,
+        ),
+        InstKind::ISub(l, r) => binop_body(
+            stored_value,
+            BinaryKind::Sub,
+            *l,
+            *r,
+            func,
+            shape,
+            dest,
+            loop_defs,
+        ),
+        InstKind::IMul(l, r) => binop_body(
+            stored_value,
+            BinaryKind::Mul,
+            *l,
+            *r,
+            func,
+            shape,
+            dest,
+            loop_defs,
+        ),
         InstKind::FAdd(l, r) => {
             // Detect element-wise FMA: `c(i) = a(i)*b(i) + d(i)`.
             // The store value is FAdd whose one operand is an FMul of
             // two operands (each load or invariant scalar). NEON
             // FMLA is float-only, so gate on a Float dest.
             if matches!(dest.elem_ty, IrType::Float(_)) {
-                if let Some(fma) =
-                    fma_body(stored_value, *l, *r, func, shape, dest, loop_defs)
-                {
+                if let Some(fma) = fma_body(stored_value, *l, *r, func, shape, dest, loop_defs) {
                     return Some(fma);
                 }
             }
-            binop_body(stored_value, BinaryKind::Add, *l, *r, func, shape, dest, loop_defs)
+            binop_body(
+                stored_value,
+                BinaryKind::Add,
+                *l,
+                *r,
+                func,
+                shape,
+                dest,
+                loop_defs,
+            )
         }
-        InstKind::FSub(l, r) => {
-            binop_body(stored_value, BinaryKind::Sub, *l, *r, func, shape, dest, loop_defs)
-        }
-        InstKind::FMul(l, r) => {
-            binop_body(stored_value, BinaryKind::Mul, *l, *r, func, shape, dest, loop_defs)
-        }
+        InstKind::FSub(l, r) => binop_body(
+            stored_value,
+            BinaryKind::Sub,
+            *l,
+            *r,
+            func,
+            shape,
+            dest,
+            loop_defs,
+        ),
+        InstKind::FMul(l, r) => binop_body(
+            stored_value,
+            BinaryKind::Mul,
+            *l,
+            *r,
+            func,
+            shape,
+            dest,
+            loop_defs,
+        ),
         InstKind::FDiv(l, r) => {
             // Integer divide has no NEON form; only floats. The
             // binop_body classifier doesn't itself check element
@@ -622,7 +687,16 @@ fn classify_body_op(
             if !matches!(dest.elem_ty, IrType::Float(_)) {
                 return None;
             }
-            binop_body(stored_value, BinaryKind::Div, *l, *r, func, shape, dest, loop_defs)
+            binop_body(
+                stored_value,
+                BinaryKind::Div,
+                *l,
+                *r,
+                func,
+                shape,
+                dest,
+                loop_defs,
+            )
         }
         // Element-wise `c(i) = max(a(i), b(i))` and `min(...)`. The
         // IR shape is `select(cmp(la, lb), t, f)` where {t, f} is
@@ -1042,8 +1116,9 @@ fn apply_vector_plan(func: &mut Function, shape: &CountedLoop, plan: VectorPlan)
             let body_block = func.block_mut(shape.body);
             if let Some(inst) = body_block.insts.iter_mut().find(|i| i.id == *unary_id) {
                 let new_kind = match (inst.kind.clone(), unary_kind) {
-                    (InstKind::INeg(s), UnaryKind::Neg)
-                    | (InstKind::FNeg(s), UnaryKind::Neg) => InstKind::VNeg(s),
+                    (InstKind::INeg(s), UnaryKind::Neg) | (InstKind::FNeg(s), UnaryKind::Neg) => {
+                        InstKind::VNeg(s)
+                    }
                     (InstKind::FAbs(s), UnaryKind::Abs) => InstKind::VAbs(s),
                     (InstKind::FSqrt(s), UnaryKind::Sqrt) => InstKind::VSqrt(s),
                     _ => inst.kind.clone(),
@@ -1332,8 +1407,7 @@ fn build_where_plan(func: &Function, shape: &WhereLoop) -> Option<WherePlan> {
     // unary (FNeg/FAbs/FSqrt/INeg) OR a binop with an invariant
     // scalar OR a binop with the second array load, and exactly one
     // Store.
-    let body_gep_ids: HashSet<ValueId> =
-        body_geps.iter().map(|i| i.id).collect();
+    let body_gep_ids: HashSet<ValueId> = body_geps.iter().map(|i| i.id).collect();
     let mut store_id = None;
     let mut then_load_id = None;
     let mut then_load_b: Option<(ValueId, ValueId)> = None;
@@ -1549,150 +1623,155 @@ fn build_where_plan(func: &Function, shape: &WhereLoop) -> Option<WherePlan> {
         Option<UnaryKind>,
         Option<(BinaryKind, ValueId, bool)>,
     );
-    let (else_const, else_load_ptr, else_unary, else_binop): ElseArmInfo
-        = if let Some(else_blk_id) = shape.else_block {
-        let else_blk = func.block(else_blk_id);
-        if else_blk
-            .insts
-            .iter()
-            .any(|inst| matches!(inst.kind, InstKind::Call(..) | InstKind::RuntimeCall(..)))
-        {
-            return None;
-        }
-        let mut else_load: Option<(ValueId, ValueId)> = None;
-        let mut e_unary: Option<(ValueId, UnaryKind)> = None;
-        let mut e_binop: Option<(ValueId, BinaryKind, ValueId, bool)> = None;
-        let mut else_store: Option<(ValueId, ValueId)> = None;
-        for inst in &else_blk.insts {
-            let is_else_load = |v: ValueId| else_load.map(|(id, _)| id) == Some(v);
-            match inst.kind {
-                InstKind::Load(p) if body_gep_ids.contains(&p) => {
-                    if else_load.is_some() {
-                        return None;
-                    }
-                    else_load = Some((inst.id, p));
-                }
-                InstKind::FNeg(src) | InstKind::INeg(src) => {
-                    if e_unary.is_some() || e_binop.is_some() || !is_else_load(src) {
-                        return None;
-                    }
-                    e_unary = Some((inst.id, UnaryKind::Neg));
-                }
-                InstKind::FAbs(src) => {
-                    if e_unary.is_some() || e_binop.is_some() || !is_else_load(src) {
-                        return None;
-                    }
-                    e_unary = Some((inst.id, UnaryKind::Abs));
-                }
-                InstKind::FSqrt(src) => {
-                    if e_unary.is_some() || e_binop.is_some() || !is_else_load(src) {
-                        return None;
-                    }
-                    e_unary = Some((inst.id, UnaryKind::Sqrt));
-                }
-                InstKind::IAdd(l, r)
-                | InstKind::ISub(l, r)
-                | InstKind::IMul(l, r)
-                | InstKind::FAdd(l, r)
-                | InstKind::FSub(l, r)
-                | InstKind::FMul(l, r)
-                | InstKind::FDiv(l, r) => {
-                    if e_unary.is_some() || e_binop.is_some() {
-                        return None;
-                    }
-                    let kind = match inst.kind {
-                        InstKind::IAdd(..) | InstKind::FAdd(..) => BinaryKind::Add,
-                        InstKind::ISub(..) | InstKind::FSub(..) => BinaryKind::Sub,
-                        InstKind::IMul(..) | InstKind::FMul(..) => BinaryKind::Mul,
-                        InstKind::FDiv(..) => BinaryKind::Div,
-                        _ => unreachable!(),
-                    };
-                    let (load_on_lhs, scalar_v) = if is_else_load(l) {
-                        (true, r)
-                    } else if is_else_load(r) {
-                        (false, l)
-                    } else {
-                        return None;
-                    };
-                    e_binop = Some((inst.id, kind, scalar_v, load_on_lhs));
-                }
-                InstKind::Store(v, p) => {
-                    if else_store.is_some() {
-                        return None;
-                    }
-                    else_store = Some((v, p));
-                }
-                _ => return None,
-            }
-        }
-        let (else_v, else_p) = else_store?;
-        if else_p != store_ptr {
-            return None;
-        }
-        let else_ids: HashSet<ValueId> = else_blk.insts.iter().map(|i| i.id).collect();
-        let unary_id = e_unary.map(|(id, _)| id);
-        let binop_id = e_binop.map(|(id, _, _, _)| id);
-        // Determine the case via the store_value.
-        if let Some((load_id, load_ptr)) = else_load {
-            // Validate the load's access shape covers the full span.
-            let acc = classify_array_access(func, load_ptr, shape.iv_param)?;
-            let upper = acc
-                .lower
-                .checked_add(acc.len as i64)
-                .and_then(|v| v.checked_sub(1))?;
-            if shape.iv_init != acc.lower
-                || shape.iv_bound != upper
-                || acc.elem_ty != src_access.elem_ty
+    let (else_const, else_load_ptr, else_unary, else_binop): ElseArmInfo =
+        if let Some(else_blk_id) = shape.else_block {
+            let else_blk = func.block(else_blk_id);
+            if else_blk
+                .insts
+                .iter()
+                .any(|inst| matches!(inst.kind, InstKind::Call(..) | InstKind::RuntimeCall(..)))
             {
                 return None;
             }
-            if Some(else_v) == unary_id {
-                // Case (c): unary on load.
-                let (_, kind) = e_unary.unwrap();
-                match (&src_access.elem_ty, kind) {
-                    (IrType::Float(_), UnaryKind::Neg)
-                    | (IrType::Float(_), UnaryKind::Abs)
-                    | (IrType::Float(_), UnaryKind::Sqrt)
-                    | (IrType::Int(_), UnaryKind::Neg) => {}
+            let mut else_load: Option<(ValueId, ValueId)> = None;
+            let mut e_unary: Option<(ValueId, UnaryKind)> = None;
+            let mut e_binop: Option<(ValueId, BinaryKind, ValueId, bool)> = None;
+            let mut else_store: Option<(ValueId, ValueId)> = None;
+            for inst in &else_blk.insts {
+                let is_else_load = |v: ValueId| else_load.map(|(id, _)| id) == Some(v);
+                match inst.kind {
+                    InstKind::Load(p) if body_gep_ids.contains(&p) => {
+                        if else_load.is_some() {
+                            return None;
+                        }
+                        else_load = Some((inst.id, p));
+                    }
+                    InstKind::FNeg(src) | InstKind::INeg(src) => {
+                        if e_unary.is_some() || e_binop.is_some() || !is_else_load(src) {
+                            return None;
+                        }
+                        e_unary = Some((inst.id, UnaryKind::Neg));
+                    }
+                    InstKind::FAbs(src) => {
+                        if e_unary.is_some() || e_binop.is_some() || !is_else_load(src) {
+                            return None;
+                        }
+                        e_unary = Some((inst.id, UnaryKind::Abs));
+                    }
+                    InstKind::FSqrt(src) => {
+                        if e_unary.is_some() || e_binop.is_some() || !is_else_load(src) {
+                            return None;
+                        }
+                        e_unary = Some((inst.id, UnaryKind::Sqrt));
+                    }
+                    InstKind::IAdd(l, r)
+                    | InstKind::ISub(l, r)
+                    | InstKind::IMul(l, r)
+                    | InstKind::FAdd(l, r)
+                    | InstKind::FSub(l, r)
+                    | InstKind::FMul(l, r)
+                    | InstKind::FDiv(l, r) => {
+                        if e_unary.is_some() || e_binop.is_some() {
+                            return None;
+                        }
+                        let kind = match inst.kind {
+                            InstKind::IAdd(..) | InstKind::FAdd(..) => BinaryKind::Add,
+                            InstKind::ISub(..) | InstKind::FSub(..) => BinaryKind::Sub,
+                            InstKind::IMul(..) | InstKind::FMul(..) => BinaryKind::Mul,
+                            InstKind::FDiv(..) => BinaryKind::Div,
+                            _ => unreachable!(),
+                        };
+                        let (load_on_lhs, scalar_v) = if is_else_load(l) {
+                            (true, r)
+                        } else if is_else_load(r) {
+                            (false, l)
+                        } else {
+                            return None;
+                        };
+                        e_binop = Some((inst.id, kind, scalar_v, load_on_lhs));
+                    }
+                    InstKind::Store(v, p) => {
+                        if else_store.is_some() {
+                            return None;
+                        }
+                        else_store = Some((v, p));
+                    }
                     _ => return None,
                 }
-                (None, Some(load_ptr), Some(kind), None)
-            } else if Some(else_v) == binop_id {
-                // Case (d): binop on (load, invariant_scalar).
-                let (_, kind, scalar_v, load_on_lhs) = e_binop.unwrap();
-                if body_ids.contains(&scalar_v)
-                    || then_ids.contains(&scalar_v)
-                    || else_ids.contains(&scalar_v)
-                    || incr_ids.contains(&scalar_v)
-                {
-                    return None;
-                }
-                if matches!(kind, BinaryKind::Div)
-                    && !matches!(src_access.elem_ty, IrType::Float(_))
-                {
-                    return None;
-                }
-                (None, Some(load_ptr), None, Some((kind, scalar_v, load_on_lhs)))
-            } else if else_v == load_id {
-                // Case (b): identity load.
-                (None, Some(load_ptr), None, None)
-            } else {
+            }
+            let (else_v, else_p) = else_store?;
+            if else_p != store_ptr {
                 return None;
+            }
+            let else_ids: HashSet<ValueId> = else_blk.insts.iter().map(|i| i.id).collect();
+            let unary_id = e_unary.map(|(id, _)| id);
+            let binop_id = e_binop.map(|(id, _, _, _)| id);
+            // Determine the case via the store_value.
+            if let Some((load_id, load_ptr)) = else_load {
+                // Validate the load's access shape covers the full span.
+                let acc = classify_array_access(func, load_ptr, shape.iv_param)?;
+                let upper = acc
+                    .lower
+                    .checked_add(acc.len as i64)
+                    .and_then(|v| v.checked_sub(1))?;
+                if shape.iv_init != acc.lower
+                    || shape.iv_bound != upper
+                    || acc.elem_ty != src_access.elem_ty
+                {
+                    return None;
+                }
+                if Some(else_v) == unary_id {
+                    // Case (c): unary on load.
+                    let (_, kind) = e_unary.unwrap();
+                    match (&src_access.elem_ty, kind) {
+                        (IrType::Float(_), UnaryKind::Neg)
+                        | (IrType::Float(_), UnaryKind::Abs)
+                        | (IrType::Float(_), UnaryKind::Sqrt)
+                        | (IrType::Int(_), UnaryKind::Neg) => {}
+                        _ => return None,
+                    }
+                    (None, Some(load_ptr), Some(kind), None)
+                } else if Some(else_v) == binop_id {
+                    // Case (d): binop on (load, invariant_scalar).
+                    let (_, kind, scalar_v, load_on_lhs) = e_binop.unwrap();
+                    if body_ids.contains(&scalar_v)
+                        || then_ids.contains(&scalar_v)
+                        || else_ids.contains(&scalar_v)
+                        || incr_ids.contains(&scalar_v)
+                    {
+                        return None;
+                    }
+                    if matches!(kind, BinaryKind::Div)
+                        && !matches!(src_access.elem_ty, IrType::Float(_))
+                    {
+                        return None;
+                    }
+                    (
+                        None,
+                        Some(load_ptr),
+                        None,
+                        Some((kind, scalar_v, load_on_lhs)),
+                    )
+                } else if else_v == load_id {
+                    // Case (b): identity load.
+                    (None, Some(load_ptr), None, None)
+                } else {
+                    return None;
+                }
+            } else {
+                // No load in else_block — Case (a): invariant constant.
+                if body_ids.contains(&else_v)
+                    || then_ids.contains(&else_v)
+                    || else_ids.contains(&else_v)
+                    || incr_ids.contains(&else_v)
+                {
+                    return None;
+                }
+                (Some(else_v), None, None, None)
             }
         } else {
-            // No load in else_block — Case (a): invariant constant.
-            if body_ids.contains(&else_v)
-                || then_ids.contains(&else_v)
-                || else_ids.contains(&else_v)
-                || incr_ids.contains(&else_v)
-            {
-                return None;
-            }
-            (Some(else_v), None, None, None)
-        }
-    } else {
-        (None, None, None, None)
-    };
+            (None, None, None, None)
+        };
     // If the binop's other operand is a b-array load, OR the binop's
     // main load is on b, OR the unary is applied to a b-array load,
     // validate that b's access shape covers the same span and elem
@@ -1771,7 +1850,11 @@ fn apply_where_plan(func: &mut Function, shape: &WhereLoop, plan: WherePlan) {
     //    full vector lane.
     let bcast_id = {
         let preheader = func.block_mut(shape.preheader);
-        let id = preheader.params.first().map(|_| ()).map_or_else(|| 0, |_| 0);
+        let id = preheader
+            .params
+            .first()
+            .map(|_| ())
+            .map_or_else(|| 0, |_| 0);
         let _ = id;
         let new_id = func.next_value_id();
         func.register_type(new_id, v_ty.clone());
@@ -1793,7 +1876,11 @@ fn apply_where_plan(func: &mut Function, shape: &WhereLoop, plan: WherePlan) {
     // 2. Rewrite load_a (in body) to VLoad. Type changes from elem to vector.
     let load_a_ptr = {
         let body = func.block_mut(shape.body);
-        let inst = body.insts.iter_mut().find(|i| i.id == plan.load_a_id).unwrap();
+        let inst = body
+            .insts
+            .iter_mut()
+            .find(|i| i.id == plan.load_a_id)
+            .unwrap();
         let p = match inst.kind {
             InstKind::Load(p) => p,
             _ => unreachable!(),
@@ -2249,12 +2336,7 @@ fn op_operands(op: &BodyOp) -> Vec<&BinopOperand> {
 
 /// If `op` is an `ArrayLoad`, rewrite its scalar Load to a VLoad and
 /// register the load's type as the vector type.
-fn rewrite_array_load(
-    func: &mut Function,
-    body: BlockId,
-    op: &BinopOperand,
-    v_ty: &IrType,
-) {
+fn rewrite_array_load(func: &mut Function, body: BlockId, op: &BinopOperand, v_ty: &IrType) {
     let load_id = match op {
         BinopOperand::ArrayLoad(id) => *id,
         BinopOperand::InvariantScalar(_) => return,
@@ -2486,7 +2568,9 @@ fn detect_reduction_plan(
         _ => return None,
     };
 
-    let trip = iv_bound.checked_sub(iv_init).and_then(|d| d.checked_add(1))?;
+    let trip = iv_bound
+        .checked_sub(iv_init)
+        .and_then(|d| d.checked_add(1))?;
     if trip <= 0 {
         return None;
     }
@@ -2588,10 +2672,7 @@ fn detect_reduction_plan(
     if !matches!(reduce, ReductionKind::Sum)
         && !matches!(
             value_inst.kind,
-            InstKind::Load(_)
-                | InstKind::INeg(_)
-                | InstKind::FNeg(_)
-                | InstKind::FAbs(_)
+            InstKind::Load(_) | InstKind::INeg(_) | InstKind::FNeg(_) | InstKind::FAbs(_)
         )
     {
         return None;
@@ -2645,8 +2726,7 @@ fn detect_reduction_plan(
                 kind: unary_kind,
             }
         }
-        (IrType::Int(_), InstKind::IMul(la, lb))
-        | (IrType::Float(_), InstKind::FMul(la, lb)) => {
+        (IrType::Int(_), InstKind::IMul(la, lb)) | (IrType::Float(_), InstKind::FMul(la, lb)) => {
             let load_a_inst = defs.get(la)?;
             let load_b_inst = defs.get(lb)?;
             let InstKind::Load(ptr_a) = load_a_inst.kind else {
@@ -2683,8 +2763,7 @@ fn detect_reduction_plan(
         }
         // `acc + (a(i) - b(i))` — sum of differences. Two loads, one
         // sub feeding the accumulator's add.
-        (IrType::Int(_), InstKind::ISub(la, lb))
-        | (IrType::Float(_), InstKind::FSub(la, lb)) => {
+        (IrType::Int(_), InstKind::ISub(la, lb)) | (IrType::Float(_), InstKind::FSub(la, lb)) => {
             let load_a_inst = defs.get(la)?;
             let load_b_inst = defs.get(lb)?;
             let InstKind::Load(ptr_a) = load_a_inst.kind else {
@@ -2910,8 +2989,9 @@ fn apply_reduction_plan(func: &mut Function, lp: &NaturalLoop, plan: ReductionPl
             let body_block = func.block_mut(plan.body);
             if let Some(inst) = body_block.insts.iter_mut().find(|i| i.id == unary_id) {
                 let new_kind = match (inst.kind.clone(), kind) {
-                    (InstKind::INeg(s), UnaryKind::Neg)
-                    | (InstKind::FNeg(s), UnaryKind::Neg) => InstKind::VNeg(s),
+                    (InstKind::INeg(s), UnaryKind::Neg) | (InstKind::FNeg(s), UnaryKind::Neg) => {
+                        InstKind::VNeg(s)
+                    }
                     (InstKind::FAbs(s), UnaryKind::Abs) => InstKind::VAbs(s),
                     (other, _) => other,
                 };
@@ -2981,7 +3061,11 @@ fn apply_reduction_plan(func: &mut Function, lp: &NaturalLoop, plan: ReductionPl
     //    For Min/Max we also drop the icmp predicate's type since
     //    its result is no longer used (regalloc will dead-code it).
     let body_block = func.block_mut(plan.body);
-    if let Some(inst) = body_block.insts.iter_mut().find(|i| i.id == plan.accumulate_id) {
+    if let Some(inst) = body_block
+        .insts
+        .iter_mut()
+        .find(|i| i.id == plan.accumulate_id)
+    {
         let acc_v = plan.acc_param;
         let new_kind = match (inst.kind.clone(), plan.reduce) {
             (InstKind::IAdd(l, r), ReductionKind::Sum)
@@ -3293,9 +3377,24 @@ mod tests {
 
         let arr_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I32)), 32);
         let arr_ptr_ty = IrType::Ptr(Box::new(arr_ty.clone()));
-        let a = push_inst(&mut func, entry, InstKind::Alloca(arr_ty.clone()), arr_ptr_ty.clone());
-        let b = push_inst(&mut func, entry, InstKind::Alloca(arr_ty.clone()), arr_ptr_ty.clone());
-        let c = push_inst(&mut func, entry, InstKind::Alloca(arr_ty.clone()), arr_ptr_ty.clone());
+        let a = push_inst(
+            &mut func,
+            entry,
+            InstKind::Alloca(arr_ty.clone()),
+            arr_ptr_ty.clone(),
+        );
+        let b = push_inst(
+            &mut func,
+            entry,
+            InstKind::Alloca(arr_ty.clone()),
+            arr_ptr_ty.clone(),
+        );
+        let c = push_inst(
+            &mut func,
+            entry,
+            InstKind::Alloca(arr_ty.clone()),
+            arr_ptr_ty.clone(),
+        );
 
         let one_i32 = push_inst(
             &mut func,
@@ -3403,7 +3502,10 @@ mod tests {
     fn rewrites_array_add_loop_to_vload_vadd_vstore() {
         let (mut module, body) = build_array_add_loop();
         let changed = NeonVectorize.run(&mut module);
-        assert!(changed, "neon_vectorize should fire on a clean array-add loop");
+        assert!(
+            changed,
+            "neon_vectorize should fire on a clean array-add loop"
+        );
 
         let func = &module.functions[0];
         let body_block = func.block(body);
@@ -3434,15 +3536,19 @@ mod tests {
             if let InstKind::VLoad(_) = inst.kind {
                 assert_eq!(
                     inst.ty,
-                    IrType::Vector { lanes: 4, elem: Box::new(IrType::Int(IntWidth::I32)) }
+                    IrType::Vector {
+                        lanes: 4,
+                        elem: Box::new(IrType::Int(IntWidth::I32))
+                    }
                 );
             }
         }
 
         // The IV step should now use a ConstInt(4) somewhere in the body.
-        let has_v_step = body_block.insts.iter().any(|i| {
-            matches!(i.kind, InstKind::ConstInt(4, IntWidth::I32))
-        });
+        let has_v_step = body_block
+            .insts
+            .iter()
+            .any(|i| matches!(i.kind, InstKind::ConstInt(4, IntWidth::I32)));
         assert!(has_v_step, "step should now be ConstInt(4)");
     }
 
@@ -3461,8 +3567,18 @@ mod tests {
 
         let arr_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I32)), 32);
         let arr_ptr_ty = IrType::Ptr(Box::new(arr_ty.clone()));
-        let a = push_inst(&mut func, entry, InstKind::Alloca(arr_ty.clone()), arr_ptr_ty.clone());
-        let c = push_inst(&mut func, entry, InstKind::Alloca(arr_ty.clone()), arr_ptr_ty.clone());
+        let a = push_inst(
+            &mut func,
+            entry,
+            InstKind::Alloca(arr_ty.clone()),
+            arr_ptr_ty.clone(),
+        );
+        let c = push_inst(
+            &mut func,
+            entry,
+            InstKind::Alloca(arr_ty.clone()),
+            arr_ptr_ty.clone(),
+        );
 
         let scale = push_inst(
             &mut func,
@@ -3617,8 +3733,18 @@ mod tests {
 
         let arr_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I32)), 32);
         let arr_ptr_ty = IrType::Ptr(Box::new(arr_ty.clone()));
-        let b = push_inst(&mut func, entry, InstKind::Alloca(arr_ty.clone()), arr_ptr_ty.clone());
-        let c = push_inst(&mut func, entry, InstKind::Alloca(arr_ty.clone()), arr_ptr_ty.clone());
+        let b = push_inst(
+            &mut func,
+            entry,
+            InstKind::Alloca(arr_ty.clone()),
+            arr_ptr_ty.clone(),
+        );
+        let c = push_inst(
+            &mut func,
+            entry,
+            InstKind::Alloca(arr_ty.clone()),
+            arr_ptr_ty.clone(),
+        );
 
         let one_i32 = push_inst(
             &mut func,
@@ -3755,9 +3881,24 @@ mod tests {
 
         let arr_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I32)), 31);
         let arr_ptr_ty = IrType::Ptr(Box::new(arr_ty.clone()));
-        let a = push_inst(&mut func, entry, InstKind::Alloca(arr_ty.clone()), arr_ptr_ty.clone());
-        let b = push_inst(&mut func, entry, InstKind::Alloca(arr_ty.clone()), arr_ptr_ty.clone());
-        let c = push_inst(&mut func, entry, InstKind::Alloca(arr_ty.clone()), arr_ptr_ty.clone());
+        let a = push_inst(
+            &mut func,
+            entry,
+            InstKind::Alloca(arr_ty.clone()),
+            arr_ptr_ty.clone(),
+        );
+        let b = push_inst(
+            &mut func,
+            entry,
+            InstKind::Alloca(arr_ty.clone()),
+            arr_ptr_ty.clone(),
+        );
+        let c = push_inst(
+            &mut func,
+            entry,
+            InstKind::Alloca(arr_ty.clone()),
+            arr_ptr_ty.clone(),
+        );
 
         let one_i32 = push_inst(
             &mut func,

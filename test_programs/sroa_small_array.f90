@@ -1,6 +1,5 @@
-! Test SROA: small array decomposed into scalars.
-! At O2, the alloca [i32 x 3] should be decomposed into 3 scalar
-! allocas, then promoted by mem2reg, then folded by const prop.
+! Small fixed-array fixture for optimization capture.
+! At O2, the observable sum should fold to a constant in optimized IR.
 program sroa_small_array
   implicit none
   integer :: p(3)
