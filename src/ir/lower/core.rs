@@ -34573,12 +34573,30 @@ pub(super) fn lower_dynamic_vector_subscript_assign(
         return false;
     }
 
-    // RHS is treated as a scalar broadcast.  Expressions that yield an
-    // array-valued RHS aren't supported here yet; the caller checks
-    // call-site context, so this is safe for the common
-    // `dest(f(mask)) = scalar` pattern.
-    let rhs_raw = super::expr::lower_expr_ctx_tl(b, ctx, value);
-    let rhs_val = coerce_to_type(b, rhs_raw, &dest_info.ty);
+    let src_desc = lower_array_expr_descriptor(
+        b,
+        &ctx.locals,
+        value,
+        ctx.st,
+        Some(ctx.type_layouts),
+        Some(ctx.internal_funcs),
+        Some(ctx.contained_host_refs),
+        Some(ctx.descriptor_params),
+    );
+    let (rhs_val, rhs_complex_src) = if src_desc.is_none() {
+        let rhs_raw = super::expr::lower_expr_ctx_tl(b, ctx, value);
+        if is_complex_ty(&dest_info.ty) {
+            let src = match b.func().value_type(rhs_raw) {
+                Some(IrType::Ptr(inner)) if inner.as_ref() == &dest_info.ty => rhs_raw,
+                _ => materialize_complex_operand(b, rhs_raw, complex_float_width(&dest_info.ty)),
+            };
+            (None, Some(src))
+        } else {
+            (Some(coerce_to_type(b, rhs_raw, &dest_info.ty)), None)
+        }
+    } else {
+        (None, None)
+    };
 
     let dest_base = if local_uses_array_descriptor(dest_info) {
         let desc = array_descriptor_addr(b, dest_info);
@@ -34631,7 +34649,35 @@ pub(super) fn lower_dynamic_vector_subscript_assign(
     let elem_size = b.const_i64(ir_scalar_byte_size(&dest_info.ty));
     let byte_off = b.imul(zero_off, elem_size);
     let dst_ptr = b.gep(dest_base, vec![byte_off], IrType::Int(IntWidth::I8));
-    b.store(rhs_val, dst_ptr);
+    let (stored, complex_src_ptr) = if let Some((src_desc, src_elem_ty)) = src_desc.as_ref() {
+        if is_complex_ty(&dest_info.ty) && is_complex_ty(src_elem_ty) {
+            let src_ptr = rank1_array_desc_elem_ptr(b, *src_desc, src_elem_ty, i);
+            let src_ptr = if complex_float_width(src_elem_ty) == complex_float_width(&dest_info.ty)
+            {
+                src_ptr
+            } else {
+                let src_val = load_rank1_array_desc_elem(b, *src_desc, src_elem_ty, i);
+                materialize_complex_operand(b, src_val, complex_float_width(&dest_info.ty))
+            };
+            (None, Some(src_ptr))
+        } else {
+            let raw = load_rank1_array_desc_elem(b, *src_desc, src_elem_ty, i);
+            (Some(coerce_to_type(b, raw, &dest_info.ty)), None)
+        }
+    } else {
+        (rhs_val, rhs_complex_src)
+    };
+    if let Some(src_ptr) = complex_src_ptr {
+        let copy_bytes = b.const_i64(ir_scalar_byte_size(&dest_info.ty));
+        b.call(
+            FuncRef::External("memcpy".into()),
+            vec![dst_ptr, src_ptr, copy_bytes],
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        );
+    } else {
+        let stored = stored.expect("dynamic vector subscript assign: scalar RHS value");
+        b.store(stored, dst_ptr);
+    }
 
     let one = b.const_i64(1);
     let next = b.iadd(i, one);

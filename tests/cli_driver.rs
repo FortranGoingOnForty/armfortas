@@ -34731,6 +34731,36 @@ fn rank2_vector_subscript_assignment_scatters_array_rhs() {
 }
 
 #[test]
+fn rank1_vector_subscript_assignment_scatters_array_rhs() {
+    let src = write_program(
+        "program p\n  implicit none\n  integer(8), parameter :: dim_range(3) = [1_8, 2_8, 3_8]\n  integer(8) :: iperm(3), perm(3), spack(3), s(3)\n  s = [3_8, 2_8, 4_8]\n  perm = [2_8, pack(dim_range, dim_range /= 2_8)]\n  iperm = -9_8\n  iperm(perm) = dim_range\n  spack = s(perm)\n  if (any(iperm /= [2_8, 1_8, 3_8])) error stop 1\n  if (any(spack /= [2_8, 3_8, 4_8])) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("rank1_vector_subscript_scatter_array_rhs", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("rank-1 vector subscript assignment compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "rank-1 vector subscript assignment compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("rank-1 vector subscript assignment run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "rank-1 vector subscript assignment run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn generic_literal_kind_suffix_uses_current_block_parameter() {
     let src = write_program(
         "module m\n  implicit none\n  private\n  public :: is_close\n  interface is_close\n    module procedure is_close_rsp\n    module procedure is_close_rdp\n  end interface\ncontains\n  elemental logical function is_close_rsp(a, b) result(close)\n    real(4), intent(in) :: a, b\n    close = abs(a - b) < 1.0e-5_4\n  end function\n  elemental logical function is_close_rdp(a, b) result(close)\n    real(8), intent(in) :: a, b\n    close = abs(a - b) < 1.0e-12_8\n  end function\nend module\nprogram p\n  use m, only: is_close\n  implicit none\n  integer, parameter :: sp = 4\n  integer, parameter :: dp = 8\n  block\n    integer, parameter :: wp = sp\n    real(sp), allocatable :: amat(:,:)\n    allocate(amat(1,1))\n    amat(1,1) = 5.0_wp\n    if (.not. is_close(amat(1,1), 5.0_wp)) error stop 1\n  end block\n  block\n    integer, parameter :: wp = dp\n    real(dp), allocatable :: amat(:,:)\n    allocate(amat(1,1))\n    amat(1,1) = 5.0_wp\n    if (.not. is_close(amat(1,1), 5.0_wp)) error stop 2\n  end block\n  print *, 'ok'\nend program\n",

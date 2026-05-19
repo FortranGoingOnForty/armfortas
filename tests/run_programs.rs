@@ -3435,6 +3435,27 @@ fn opt_eq_annotations_allow_hello_cross_opt_invariant() {
 }
 
 #[test]
+fn vector_subscript_array_rhs_scatter_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("vector_subscript_array_rhs_scatter.f90");
+    assert!(
+        source.exists(),
+        "vector_subscript_array_rhs_scatter.f90 missing"
+    );
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "vector_subscript_array_rhs_scatter.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
 fn phase_triangulation_allows_function_call_pipeline_surfaces() {
     let compiler = find_compiler();
     let test_dir = find_test_programs();
