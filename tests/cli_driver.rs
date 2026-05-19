@@ -35146,6 +35146,41 @@ fn allocatable_rank2_section_row_assignment_uses_columnmajor_stride() {
 }
 
 #[test]
+fn negative_stride_section_assignment_snapshots_overlapping_rhs() {
+    // stdlib_selection initializes its quickselect fixture with negative-stride
+    // overlapping assignments such as `x(5:2:-1) = x(2:5)`. Fortran assignment
+    // semantics require the RHS values to be evaluated before the LHS section
+    // is defined; streaming directly through aliased descriptors clobbered
+    // `x(5)` before the later RHS read needed its original value.
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: x(10)\n  integer :: i\n  x = (/( i**2, i=1, size(x) )/)\n  x(5:2:-1) = x(2:5)\n  x(10:8:-1) = x(8:10)\n  if (any(x /= [1, 25, 16, 9, 4, 36, 49, 100, 81, 64])) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("negative_stride_section_overlap", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("negative-stride section compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "negative-stride section compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("negative-stride section run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "negative-stride section run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn allocate_stat_int64_writes_back_to_user_variable() {
     // F2018 §9.7.1.3: STAT= variable receives the allocate status.
     // Runtime writes an i32; when the user's variable is a wider

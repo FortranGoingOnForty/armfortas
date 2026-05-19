@@ -35912,7 +35912,7 @@ pub(super) fn lower_1d_section_assign(
     } else {
         None
     };
-    let src_desc = if scalarized_value.is_none() {
+    let mut src_desc = if scalarized_value.is_none() {
         lower_array_expr_descriptor(
             b,
             &ctx.locals,
@@ -35926,6 +35926,29 @@ pub(super) fn lower_1d_section_assign(
     } else {
         None
     };
+
+    if src_desc.is_some()
+        && dest_info.derived_type.is_none()
+        && dest_info.char_kind == CharKind::None
+        && !descriptor_backed_runtime_char_array(dest_info)
+    {
+        // Assignment evaluates the RHS before defining the LHS. Snapshot array
+        // RHS descriptors so overlapping section assignments such as
+        // `x(5:2:-1) = x(2:5)` do not stream through clobbered source slots.
+        if let Some((desc, ty)) = src_desc.take() {
+            let tmp_desc = allocate_like_array_temp_descriptor_with_elem_type(b, desc, &ty);
+            let stat = b.alloca(IrType::Int(IntWidth::I32));
+            let zero = b.const_i32(0);
+            b.store(zero, stat);
+            b.call(
+                FuncRef::External("afs_copy_array_data".into()),
+                vec![tmp_desc, desc, stat],
+                IrType::Void,
+            );
+            src_desc = Some((tmp_desc, ty));
+        }
+    }
+
     let src_n = src_desc.as_ref().map(|(desc, _)| {
         b.call(
             FuncRef::External("afs_array_size".into()),
