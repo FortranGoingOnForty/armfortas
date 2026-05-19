@@ -458,6 +458,21 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                                     || (i == 1 && kw.is_none())
                                                             },
                                                         )
+                                                ) || (
+                                                    // maxval/minval(arr, dim) are also rank-N-1
+                                                    // when the source rank is greater than one.
+                                                    // Keep rank-1 reductions on the scalar path
+                                                    // so nested forms such as
+                                                    // maxval(sum(abs(A), dim=1), 1) still return
+                                                    // a scalar.
+                                                    matches!(lname.as_str(), "maxval" | "minval")
+                                                        && actual_expr_rank(
+                                                            value,
+                                                            &ctx.locals,
+                                                            ctx.st,
+                                                            Some(ctx.type_layouts),
+                                                        )
+                                                        .is_some_and(|rank| rank > 0)
                                                 )
                                             } else {
                                                 false

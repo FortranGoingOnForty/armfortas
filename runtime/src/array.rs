@@ -3236,6 +3236,324 @@ pub extern "C" fn afs_array_sum_int_dim(
     }
 }
 
+/// MAXVAL(array, DIM=k) - real version. Result element width matches
+/// the source descriptor's element width.
+#[no_mangle]
+pub extern "C" fn afs_array_maxval_real8_dim(
+    src: *const ArrayDescriptor,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+) {
+    if src.is_null() || dst.is_null() || dim < 1 {
+        return;
+    }
+    let s = unsafe { &*src };
+    if s.base_addr.is_null() || dim as usize > s.rank as usize {
+        return;
+    }
+    let d = unsafe { &mut *dst };
+    if !d.is_allocated() {
+        let new_rank = (s.rank - 1).max(0);
+        let mut dim_buf: [DimDescriptor; 15] = [DimDescriptor {
+            lower_bound: 0,
+            upper_bound: 0,
+            stride: 0,
+        }; 15];
+        let mut k = 0usize;
+        let mut acc: i64 = 1;
+        for i in 0..s.rank as usize {
+            if i + 1 == dim as usize {
+                continue;
+            }
+            let extent = s.dims[i].extent();
+            dim_buf[k].lower_bound = 1;
+            dim_buf[k].upper_bound = extent;
+            dim_buf[k].stride = acc;
+            acc *= extent;
+            k += 1;
+        }
+        let dim_ptr = if new_rank > 0 {
+            dim_buf.as_ptr()
+        } else {
+            ptr::null()
+        };
+        let mut stat: i32 = 0;
+        afs_allocate_array(dst, s.elem_size, new_rank, dim_ptr, &mut stat);
+        if stat != 0 || d.base_addr.is_null() {
+            return;
+        }
+    }
+    let dst_total = d.total_elements() as usize;
+    let src_ptr = s.base_addr as *const u8;
+    if s.elem_size == 4 {
+        let buf = d.base_addr as *mut f32;
+        for i in 0..dst_total {
+            unsafe {
+                *buf.add(i) = f32::NEG_INFINITY;
+            }
+        }
+        for_each_reduce_along_dim(s, dim, |byte_off, dst_flat| {
+            let v = unsafe { *(src_ptr.add(byte_off) as *const f32) };
+            unsafe {
+                let slot = buf.add(dst_flat);
+                if v > *slot {
+                    *slot = v;
+                }
+            }
+        });
+    } else {
+        let buf = d.base_addr as *mut f64;
+        for i in 0..dst_total {
+            unsafe {
+                *buf.add(i) = f64::NEG_INFINITY;
+            }
+        }
+        for_each_reduce_along_dim(s, dim, |byte_off, dst_flat| {
+            let v = unsafe { *(src_ptr.add(byte_off) as *const f64) };
+            unsafe {
+                let slot = buf.add(dst_flat);
+                if v > *slot {
+                    *slot = v;
+                }
+            }
+        });
+    }
+}
+
+/// MINVAL(array, DIM=k) - real version. Result element width matches
+/// the source descriptor's element width.
+#[no_mangle]
+pub extern "C" fn afs_array_minval_real8_dim(
+    src: *const ArrayDescriptor,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+) {
+    if src.is_null() || dst.is_null() || dim < 1 {
+        return;
+    }
+    let s = unsafe { &*src };
+    if s.base_addr.is_null() || dim as usize > s.rank as usize {
+        return;
+    }
+    let d = unsafe { &mut *dst };
+    if !d.is_allocated() {
+        let new_rank = (s.rank - 1).max(0);
+        let mut dim_buf: [DimDescriptor; 15] = [DimDescriptor {
+            lower_bound: 0,
+            upper_bound: 0,
+            stride: 0,
+        }; 15];
+        let mut k = 0usize;
+        let mut acc: i64 = 1;
+        for i in 0..s.rank as usize {
+            if i + 1 == dim as usize {
+                continue;
+            }
+            let extent = s.dims[i].extent();
+            dim_buf[k].lower_bound = 1;
+            dim_buf[k].upper_bound = extent;
+            dim_buf[k].stride = acc;
+            acc *= extent;
+            k += 1;
+        }
+        let dim_ptr = if new_rank > 0 {
+            dim_buf.as_ptr()
+        } else {
+            ptr::null()
+        };
+        let mut stat: i32 = 0;
+        afs_allocate_array(dst, s.elem_size, new_rank, dim_ptr, &mut stat);
+        if stat != 0 || d.base_addr.is_null() {
+            return;
+        }
+    }
+    let dst_total = d.total_elements() as usize;
+    let src_ptr = s.base_addr as *const u8;
+    if s.elem_size == 4 {
+        let buf = d.base_addr as *mut f32;
+        for i in 0..dst_total {
+            unsafe {
+                *buf.add(i) = f32::INFINITY;
+            }
+        }
+        for_each_reduce_along_dim(s, dim, |byte_off, dst_flat| {
+            let v = unsafe { *(src_ptr.add(byte_off) as *const f32) };
+            unsafe {
+                let slot = buf.add(dst_flat);
+                if v < *slot {
+                    *slot = v;
+                }
+            }
+        });
+    } else {
+        let buf = d.base_addr as *mut f64;
+        for i in 0..dst_total {
+            unsafe {
+                *buf.add(i) = f64::INFINITY;
+            }
+        }
+        for_each_reduce_along_dim(s, dim, |byte_off, dst_flat| {
+            let v = unsafe { *(src_ptr.add(byte_off) as *const f64) };
+            unsafe {
+                let slot = buf.add(dst_flat);
+                if v < *slot {
+                    *slot = v;
+                }
+            }
+        });
+    }
+}
+
+/// MAXVAL(array, DIM=k) - integer version.
+#[no_mangle]
+pub extern "C" fn afs_array_maxval_int_dim(
+    src: *const ArrayDescriptor,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+) {
+    if src.is_null() || dst.is_null() || dim < 1 {
+        return;
+    }
+    let s = unsafe { &*src };
+    if s.base_addr.is_null() || dim as usize > s.rank as usize {
+        return;
+    }
+    let d = unsafe { &mut *dst };
+    if !d.is_allocated() {
+        let new_rank = (s.rank - 1).max(0);
+        let mut dim_buf: [DimDescriptor; 15] = [DimDescriptor {
+            lower_bound: 0,
+            upper_bound: 0,
+            stride: 0,
+        }; 15];
+        let mut k = 0usize;
+        let mut acc: i64 = 1;
+        for i in 0..s.rank as usize {
+            if i + 1 == dim as usize {
+                continue;
+            }
+            let extent = s.dims[i].extent();
+            dim_buf[k].lower_bound = 1;
+            dim_buf[k].upper_bound = extent;
+            dim_buf[k].stride = acc;
+            acc *= extent;
+            k += 1;
+        }
+        let dim_ptr = if new_rank > 0 {
+            dim_buf.as_ptr()
+        } else {
+            ptr::null()
+        };
+        let mut stat: i32 = 0;
+        afs_allocate_array(dst, s.elem_size, new_rank, dim_ptr, &mut stat);
+        if stat != 0 || d.base_addr.is_null() {
+            return;
+        }
+    }
+    let dst_total = d.total_elements() as usize;
+    let src_ptr = s.base_addr as *const u8;
+    macro_rules! max_dim_kind {
+        ($t:ty, $identity:expr) => {{
+            let buf = d.base_addr as *mut $t;
+            for i in 0..dst_total {
+                unsafe {
+                    *buf.add(i) = $identity;
+                }
+            }
+            for_each_reduce_along_dim(s, dim, |byte_off, dst_flat| {
+                let v = unsafe { *(src_ptr.add(byte_off) as *const $t) };
+                unsafe {
+                    let slot = buf.add(dst_flat);
+                    if v > *slot {
+                        *slot = v;
+                    }
+                }
+            });
+        }};
+    }
+    match s.elem_size {
+        1 => max_dim_kind!(i8, i8::MIN),
+        2 => max_dim_kind!(i16, i16::MIN),
+        8 => max_dim_kind!(i64, i64::MIN),
+        _ => max_dim_kind!(i32, i32::MIN),
+    }
+}
+
+/// MINVAL(array, DIM=k) - integer version.
+#[no_mangle]
+pub extern "C" fn afs_array_minval_int_dim(
+    src: *const ArrayDescriptor,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+) {
+    if src.is_null() || dst.is_null() || dim < 1 {
+        return;
+    }
+    let s = unsafe { &*src };
+    if s.base_addr.is_null() || dim as usize > s.rank as usize {
+        return;
+    }
+    let d = unsafe { &mut *dst };
+    if !d.is_allocated() {
+        let new_rank = (s.rank - 1).max(0);
+        let mut dim_buf: [DimDescriptor; 15] = [DimDescriptor {
+            lower_bound: 0,
+            upper_bound: 0,
+            stride: 0,
+        }; 15];
+        let mut k = 0usize;
+        let mut acc: i64 = 1;
+        for i in 0..s.rank as usize {
+            if i + 1 == dim as usize {
+                continue;
+            }
+            let extent = s.dims[i].extent();
+            dim_buf[k].lower_bound = 1;
+            dim_buf[k].upper_bound = extent;
+            dim_buf[k].stride = acc;
+            acc *= extent;
+            k += 1;
+        }
+        let dim_ptr = if new_rank > 0 {
+            dim_buf.as_ptr()
+        } else {
+            ptr::null()
+        };
+        let mut stat: i32 = 0;
+        afs_allocate_array(dst, s.elem_size, new_rank, dim_ptr, &mut stat);
+        if stat != 0 || d.base_addr.is_null() {
+            return;
+        }
+    }
+    let dst_total = d.total_elements() as usize;
+    let src_ptr = s.base_addr as *const u8;
+    macro_rules! min_dim_kind {
+        ($t:ty, $identity:expr) => {{
+            let buf = d.base_addr as *mut $t;
+            for i in 0..dst_total {
+                unsafe {
+                    *buf.add(i) = $identity;
+                }
+            }
+            for_each_reduce_along_dim(s, dim, |byte_off, dst_flat| {
+                let v = unsafe { *(src_ptr.add(byte_off) as *const $t) };
+                unsafe {
+                    let slot = buf.add(dst_flat);
+                    if v < *slot {
+                        *slot = v;
+                    }
+                }
+            });
+        }};
+    }
+    match s.elem_size {
+        1 => min_dim_kind!(i8, i8::MAX),
+        2 => min_dim_kind!(i16, i16::MAX),
+        8 => min_dim_kind!(i64, i64::MAX),
+        _ => min_dim_kind!(i32, i32::MAX),
+    }
+}
+
 /// SUM(array, DIM=k) for complex(4). Auto-allocates `dst` to rank N-1
 /// and writes interleaved real/imag f32 lanes.
 #[no_mangle]

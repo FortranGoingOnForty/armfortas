@@ -10791,7 +10791,10 @@ pub(super) fn actual_expr_rank(
                         }
                     }
                 }
-                if matches!(key.as_str(), "all" | "any" | "count") {
+                if matches!(
+                    key.as_str(),
+                    "all" | "any" | "count" | "sum" | "product" | "maxval" | "minval" | "norm2"
+                ) {
                     if !has_reduction_dim_arg(args, locals, st, type_layouts) {
                         return Some(0);
                     }
@@ -10804,16 +10807,6 @@ pub(super) fn actual_expr_rank(
                         }
                     }
                     return None;
-                }
-                if key == "norm2" && has_reduction_dim_arg(args, locals, st, type_layouts) {
-                    if let Some(first_arg) = args.first() {
-                        if let crate::ast::expr::SectionSubscript::Element(first_expr) =
-                            &first_arg.value
-                        {
-                            return actual_expr_rank(first_expr, locals, st, type_layouts)
-                                .map(|rank| rank.saturating_sub(1));
-                        }
-                    }
                 }
                 if let Some(rank) =
                     function_call_declared_result_rank(st, locals, name, args, type_layouts)
@@ -30532,6 +30525,107 @@ pub(super) fn lower_array_sum_dim_descriptor(
     Some((result_desc, elem_ty))
 }
 
+pub(super) fn lower_array_minmax_dim_descriptor(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    args: &[crate::ast::expr::Argument],
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+    is_max: bool,
+) -> Option<(ValueId, IrType)> {
+    use crate::ast::expr::SectionSubscript;
+    if args.is_empty() {
+        return None;
+    }
+    let SectionSubscript::Element(array_expr) = &args[0].value else {
+        return None;
+    };
+    if actual_expr_rank(array_expr, locals, st, type_layouts).is_some_and(|rank| rank <= 1) {
+        return None;
+    }
+
+    let mut dim_expr: Option<&crate::ast::expr::SpannedExpr> = None;
+    let mut mask_expr: Option<&crate::ast::expr::SpannedExpr> = None;
+    for (i, arg) in args.iter().enumerate() {
+        let kw = arg.keyword.as_deref().map(|s| s.to_lowercase());
+        match (i, kw.as_deref()) {
+            (1, None) => {
+                if let SectionSubscript::Element(e) = &arg.value {
+                    let is_logical = matches!(
+                        generic_actual_expr_type_info(e, locals, st, type_layouts),
+                        Some(crate::sema::symtab::TypeInfo::Logical { .. })
+                    );
+                    if is_logical {
+                        mask_expr = Some(e);
+                    } else {
+                        dim_expr = Some(e);
+                    }
+                }
+            }
+            (_, Some("dim")) => {
+                if let SectionSubscript::Element(e) = &arg.value {
+                    dim_expr = Some(e);
+                }
+            }
+            (_, Some("mask")) | (2, None) => {
+                if let SectionSubscript::Element(e) = &arg.value {
+                    mask_expr = Some(e);
+                }
+            }
+            _ => {}
+        }
+    }
+    let dim_expr = dim_expr?;
+    if mask_expr.is_some() {
+        return None;
+    }
+
+    let (src_desc, elem_ty) = lower_array_expr_descriptor(
+        b,
+        locals,
+        array_expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    )?;
+
+    let dim_raw =
+        super::expr::lower_expr_with_optional_layouts(b, locals, dim_expr, st, type_layouts);
+    let dim_val = match b.func().value_type(dim_raw) {
+        Some(IrType::Int(IntWidth::I32)) => dim_raw,
+        Some(IrType::Int(_)) => b.int_trunc(dim_raw, IntWidth::I32),
+        _ => dim_raw,
+    };
+
+    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let zero_i32 = b.const_i32(0);
+    let sz384 = b.const_i64(384);
+    b.call(
+        FuncRef::External("memset".into()),
+        vec![result_desc, zero_i32, sz384],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+
+    let helper = match (is_max, &elem_ty) {
+        (true, ty) if ty.is_float() => "afs_array_maxval_real8_dim",
+        (false, ty) if ty.is_float() => "afs_array_minval_real8_dim",
+        (true, IrType::Int(_)) => "afs_array_maxval_int_dim",
+        (false, IrType::Int(_)) => "afs_array_minval_int_dim",
+        _ => return None,
+    };
+    b.call(
+        FuncRef::External(helper.into()),
+        vec![src_desc, dim_val, result_desc],
+        IrType::Void,
+    );
+    Some((result_desc, elem_ty))
+}
+
 /// F2018 §16.9.144: lower PACK(ARRAY, MASK [, VECTOR]) to an
 /// `afs_array_pack` runtime call producing a fresh rank-1 descriptor.
 /// Returns the result descriptor address and the element IR type
@@ -33934,6 +34028,21 @@ pub(super) fn lower_array_expr_descriptor(
                         return Some(result);
                     }
                 }
+                if name.eq_ignore_ascii_case("maxval") || name.eq_ignore_ascii_case("minval") {
+                    if let Some(result) = lower_array_minmax_dim_descriptor(
+                        b,
+                        locals,
+                        args,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
+                        name.eq_ignore_ascii_case("maxval"),
+                    ) {
+                        return Some(result);
+                    }
+                }
                 // F2018 §16.9.46: COUNT(MASK, DIM=k) returns an integer
                 // array of rank N-1. Without this dim-aware path the
                 // scalar logical-reduction lowering returns a single i32
@@ -34579,6 +34688,14 @@ pub(super) fn expr_returns_array(
                     }
                 }
                 if matches!(key.as_str(), "pack" | "spread" | "unpack") {
+                    return true;
+                }
+                if matches!(
+                    key.as_str(),
+                    "count" | "sum" | "maxval" | "minval" | "norm2"
+                ) && has_reduction_dim_arg(args, locals, st, None)
+                    && actual_expr_rank(expr, locals, st, None).is_some_and(|rank| rank > 0)
+                {
                     return true;
                 }
                 // Function whose declared return type carries a rank.

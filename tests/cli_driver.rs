@@ -18238,6 +18238,75 @@ fn sum_along_dim_returns_reduced_array() {
 }
 
 #[test]
+fn maxval_minval_with_dim_return_reduced_arrays() {
+    // F2018 16.9.146 / 16.9.151: MAXVAL/MINVAL with DIM return
+    // rank-(N-1) arrays. The scalar reduction path used to ignore DIM
+    // for maxval(abs(array), dim=1), then passed the scalar result as a
+    // descriptor to afs_assign_allocatable. This surfaced as the
+    // stdlib_linalg_norm maxabs dim=1 cluster.
+    let src = write_program(
+        include_str!("../test_programs/maxval_minval_abs_dim_reduction.f90"),
+        "f90",
+    );
+    let ir = unique_path("maxval_minval_abs_dim", "ir");
+    let emit_ir = Command::new(compiler("armfortas"))
+        .args([
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("maxval/minval dim IR compile failed to spawn");
+    assert!(
+        emit_ir.status.success(),
+        "maxval/minval dim IR compile failed: {}",
+        String::from_utf8_lossy(&emit_ir.stderr)
+    );
+    let ir_text = fs::read_to_string(&ir).expect("cannot read maxval/minval dim IR");
+    assert!(
+        ir_text.contains("call @afs_array_maxval_real8_dim"),
+        "maxval(dim) should lower through dim helper:\n{}",
+        ir_text
+    );
+    assert!(
+        ir_text.contains("call @afs_array_minval_real8_dim"),
+        "minval(dim) should lower through dim helper:\n{}",
+        ir_text
+    );
+    assert!(
+        !ir_text.contains("call @afs_array_maxval_real8(%"),
+        "maxval(dim) should not use scalar maxval helper:\n{}",
+        ir_text
+    );
+
+    let out = unique_path("maxval_minval_abs_dim", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("maxval/minval dim compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "maxval/minval dim should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("maxval/minval dim run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "maxval/minval dim should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&ir);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn rank_reducing_section_arithmetic_uses_strided_descriptor() {
     // F2018 §9.5.3.4: a subscript like `y(1,:)` is a *rank-reducing*
     // selection — the leading scalar index drops the first dim and
