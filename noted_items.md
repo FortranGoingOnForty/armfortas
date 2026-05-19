@@ -26,3 +26,13 @@ starting the full Sprint 29 audit:
   v65b rebuild after routing indirect branch targets through IP1 clears the
   solver SIGSEGV cluster; keep this note as provenance if the archive-order or
   solver-path discrepancy returns.
+- Fortsh smoke regression to verify after the current stdlib drill: the existing
+  armfortas-built scratch binary at
+  `/private/tmp/fortsh-sprint29.X8P616/bin/fortsh` prints `fortsh 1.7.0` for
+  `--version` but aborts on `fortsh -c 'printf ok\n'`; the gfortran-built
+  scratch control at `/private/tmp/fortsh-gfortran-sprint29.edpvJT/bin/fortsh`
+  executes the same basic `-c` path. A quick LLDB run reports
+  `malloc: pointer being freed was not allocated` followed by `SIGABRT`, with
+  many malformed-DWARF warnings. Rebuild fortsh with current `compiler-edges`
+  before classifying this as a current compiler regression versus stale scratch
+  provenance, then drill the invalid-free path if it reproduces.
