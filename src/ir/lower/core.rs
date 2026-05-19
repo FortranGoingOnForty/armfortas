@@ -3787,6 +3787,59 @@ fn collect_const_complex_lanes(
     Some(vec![ConstScalar::Float(re), ConstScalar::Float(im)])
 }
 
+fn const_arg_element(arg: &crate::ast::expr::Argument) -> Option<&crate::ast::expr::SpannedExpr> {
+    match &arg.value {
+        crate::ast::expr::SectionSubscript::Element(expr) => Some(expr),
+        _ => None,
+    }
+}
+
+fn const_cmplx_arg_exprs(
+    args: &[crate::ast::expr::Argument],
+) -> Option<(
+    &crate::ast::expr::SpannedExpr,
+    Option<&crate::ast::expr::SpannedExpr>,
+)> {
+    let mut positional: Vec<&crate::ast::expr::SpannedExpr> = Vec::new();
+    let mut x_arg = None;
+    let mut y_arg = None;
+    for arg in args {
+        let expr = const_arg_element(arg)?;
+        match arg.keyword.as_deref().map(str::to_ascii_lowercase).as_deref() {
+            Some("x") => x_arg = Some(expr),
+            Some("y") => y_arg = Some(expr),
+            Some("kind") => {}
+            Some(_) => return None,
+            None => positional.push(expr),
+        }
+    }
+
+    let x_from_keyword = x_arg.is_some();
+    let x = x_arg.or_else(|| positional.first().copied())?;
+    let y = y_arg.or_else(|| {
+        if x_from_keyword {
+            positional.first().copied()
+        } else {
+            positional.get(1).copied()
+        }
+    });
+    Some((x, y))
+}
+
+fn collect_const_cmplx_intrinsic(
+    args: &[crate::ast::expr::Argument],
+    elem_ty: &IrType,
+    param_consts: &HashMap<String, ConstScalar>,
+) -> Option<Vec<ConstScalar>> {
+    complex_component_ty(elem_ty)?;
+    let (real_expr, imag_expr) = const_cmplx_arg_exprs(args)?;
+    let re = eval_const_scalar(real_expr, param_consts)?.to_float();
+    let im = imag_expr
+        .map(|expr| eval_const_scalar(expr, param_consts).map(|v| v.to_float()))
+        .unwrap_or(Some(0.0))?;
+    Some(vec![ConstScalar::Float(re), ConstScalar::Float(im)])
+}
+
 fn const_array_binary_scalar(
     op: &BinaryOp,
     array: Vec<ConstScalar>,
@@ -4030,6 +4083,12 @@ pub(super) fn collect_const_array_scalars(
         // the result extent.
         Expr::FunctionCall { callee, args } => {
             if let Expr::Name { name } = &callee.node {
+                if name.eq_ignore_ascii_case("cmplx") {
+                    if let Some(values) = collect_const_cmplx_intrinsic(args, elem_ty, param_consts)
+                    {
+                        return Some(values);
+                    }
+                }
                 if let Some(values) = collect_const_array_conversion_intrinsic(
                     name,
                     args,
@@ -4343,11 +4402,22 @@ pub(super) fn eval_const_complex_global_init(
         return None;
     }
     let (re_expr, im_expr) = match &e.node {
-        Expr::ComplexLiteral { real, imag } => (real.as_ref(), imag.as_ref()),
+        Expr::ComplexLiteral { real, imag } => (real.as_ref(), Some(imag.as_ref())),
+        Expr::FunctionCall { callee, args } => {
+            let Expr::Name { name } = &callee.node else {
+                return None;
+            };
+            if !name.eq_ignore_ascii_case("cmplx") {
+                return None;
+            }
+            const_cmplx_arg_exprs(args)?
+        }
         _ => return None,
     };
     let re = eval_const_scalar_with_any_scope(re_expr, param_consts, st)?.to_float();
-    let im = eval_const_scalar_with_any_scope(im_expr, param_consts, st)?.to_float();
+    let im = im_expr
+        .map(|expr| eval_const_scalar_with_any_scope(expr, param_consts, st).map(|v| v.to_float()))
+        .unwrap_or(Some(0.0))?;
     Some(GlobalInit::FloatArray(vec![re, im]))
 }
 

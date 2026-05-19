@@ -12718,6 +12718,79 @@ fn module_complex_parameter_array_from_real_parameter_interleaves_zero_imag_lane
 }
 
 #[test]
+fn module_complex_parameter_array_from_cmplx_reshape_exprs_initializes_lanes() {
+    // stdlib_stats/test_var builds complex module PARAMETER arrays as
+    // `reshape([cs1, cs1*3, cs1*1.5], shape(cs))`, where cs1 itself is
+    // an array of `cmplx(...)` calls. The constant global folder must
+    // preserve both complex lanes through the cmplx intrinsic and the
+    // array-valued constructor expressions.
+    let src = write_program(
+        include_str!("../test_programs/complex_module_param_reshape_exprs.f90"),
+        "f90",
+    );
+    let ir = unique_path("complex_module_param_reshape_exprs", "ir");
+    let emit_ir = Command::new(compiler("armfortas"))
+        .args([
+            src.to_str().unwrap(),
+            "--emit-ir",
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("emit-ir failed");
+    assert!(
+        emit_ir.status.success(),
+        "emit-ir failed: {}",
+        String::from_utf8_lossy(&emit_ir.stderr)
+    );
+    let ir_text = std::fs::read_to_string(&ir).expect("read ir");
+    assert!(
+        ir_text.contains("global @afs_mod_complex_module_param_reshape_exprs_mod_cs1")
+            && ir_text.contains("0.57706")
+            && ir_text.contains("4.32195"),
+        "complex cmplx parameter lanes missing from IR:\n{}",
+        ir_text
+    );
+    assert!(
+        !ir_text.contains(
+            "global @afs_mod_complex_module_param_reshape_exprs_mod_cs: [[f32 x 2] x 15] = zeroinit"
+        ),
+        "complex reshaped parameter array should not be zeroinit:\n{}",
+        ir_text
+    );
+
+    let out = unique_path("complex_module_param_reshape_exprs", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("complex module parameter compile failed");
+    assert!(
+        compile.status.success(),
+        "complex module parameter should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("complex module parameter run failed");
+    assert!(
+        run.status.success(),
+        "complex module parameter should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&ir);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn complex_sum_with_dim_uses_complex_reduction_helpers() {
     let src = write_program(
         "program p\n  use, intrinsic :: iso_fortran_env, only: real32, real64\n  implicit none\n  complex(real32) :: xsp(2,2,2,2), ysp(2,2,2), ymsp(2,2,2)\n  complex(real64) :: xdp(2,2,2,2), ydp(2,2,2), ymdp(2,2,2)\n  xsp = (1.0_real32, -2.0_real32)\n  xdp = (1.0_real64, -2.0_real64)\n  ysp = sum(xsp, 4)\n  ymsp = sum(xsp, 4, xsp%re > 0.0_real32)\n  ydp = sum(xdp, 4)\n  ymdp = sum(xdp, 4, xdp%re > 0.0_real64)\n  if (.not. all(abs(ysp - (2.0_real32, -4.0_real32)) < 1.0e-5_real32)) error stop 1\n  if (.not. all(abs(ymsp - (2.0_real32, -4.0_real32)) < 1.0e-5_real32)) error stop 2\n  if (.not. all(abs(ydp - (2.0_real64, -4.0_real64)) < 1.0e-10_real64)) error stop 3\n  if (.not. all(abs(ymdp - (2.0_real64, -4.0_real64)) < 1.0e-10_real64)) error stop 4\n  print *, 'ok'\nend program\n",
