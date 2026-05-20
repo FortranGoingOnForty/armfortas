@@ -19551,6 +19551,69 @@ pub(super) fn lower_string_expr_ctx(
     )
 }
 
+fn character_expr_type_known(
+    expr: &crate::ast::expr::SpannedExpr,
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> bool {
+    operator_expr_type_info(expr, Some(locals), st, type_layouts).is_some_and(|ti| {
+        matches!(ti, crate::sema::symtab::TypeInfo::Character { .. })
+    })
+}
+
+pub(super) fn string_expr_lowers_to_owned_heap_temp(
+    expr: &crate::ast::expr::SpannedExpr,
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> bool {
+    match &expr.node {
+        Expr::ParenExpr { inner } => {
+            string_expr_lowers_to_owned_heap_temp(inner, locals, st, type_layouts)
+        }
+        Expr::BinaryOp {
+            op: BinaryOp::Concat,
+            left,
+            right,
+        } => {
+            character_expr_type_known(left, locals, st, type_layouts)
+                && character_expr_type_known(right, locals, st, type_layouts)
+        }
+        Expr::FunctionCall { callee, args } => {
+            let Expr::Name { name } = &callee.node else {
+                return false;
+            };
+            let first_arg = args.first().and_then(|arg| match &arg.value {
+                crate::ast::expr::SectionSubscript::Element(expr) => Some(expr),
+                _ => None,
+            });
+            let first_is_char = first_arg
+                .map(|arg| character_expr_type_known(arg, locals, st, type_layouts))
+                .unwrap_or(false);
+            match name.to_ascii_lowercase().as_str() {
+                "trim" | "adjustl" | "adjustr" => args.len() == 1 && first_is_char,
+                "repeat" => args.len() >= 2 && first_is_char,
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+pub(super) fn deallocate_owned_string_expr_temp(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    ptr: ValueId,
+) {
+    if string_expr_lowers_to_owned_heap_temp(expr, locals, st, type_layouts) {
+        b.runtime_call(RuntimeFunc::Deallocate, vec![ptr], IrType::Void);
+    }
+}
+
 pub(super) fn lower_string_expr_full(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -19841,6 +19904,14 @@ pub(super) fn lower_string_expr_full(
                                 vec![src_ptr, len_val],
                                 IrType::Int(IntWidth::I64),
                             );
+                            deallocate_owned_string_expr_temp(
+                                b,
+                                locals,
+                                arg,
+                                st,
+                                type_layouts,
+                                src_ptr,
+                            );
                             return (buf, trimmed_len);
                         }
                     }
@@ -19887,6 +19958,14 @@ pub(super) fn lower_string_expr_full(
                                 vec![src_ptr, src_len, copies, buf],
                                 IrType::Void,
                             );
+                            deallocate_owned_string_expr_temp(
+                                b,
+                                locals,
+                                src_expr,
+                                st,
+                                type_layouts,
+                                src_ptr,
+                            );
                             return (buf, total_len);
                         }
                     }
@@ -19912,6 +19991,14 @@ pub(super) fn lower_string_expr_full(
                                 vec![buf, src_ptr, len_val],
                                 IrType::Void,
                             );
+                            deallocate_owned_string_expr_temp(
+                                b,
+                                locals,
+                                arg,
+                                st,
+                                type_layouts,
+                                src_ptr,
+                            );
                             return (buf, len_val);
                         }
                     }
@@ -19936,6 +20023,14 @@ pub(super) fn lower_string_expr_full(
                                 FuncRef::External("afs_adjustr".into()),
                                 vec![buf, src_ptr, len_val],
                                 IrType::Void,
+                            );
+                            deallocate_owned_string_expr_temp(
+                                b,
+                                locals,
+                                arg,
+                                st,
+                                type_layouts,
+                                src_ptr,
                             );
                             return (buf, len_val);
                         }
@@ -20553,6 +20648,8 @@ pub(super) fn lower_string_expr_full(
                 vec![result_buf, a_ptr, a_len, b_ptr, b_len],
                 IrType::Void,
             );
+            deallocate_owned_string_expr_temp(b, locals, left, st, type_layouts, a_ptr);
+            deallocate_owned_string_expr_temp(b, locals, right, st, type_layouts, b_ptr);
             (result_buf, total_len)
         }
         Expr::BinaryOp { .. } => {
@@ -20897,6 +20994,17 @@ pub(super) fn insert_implicit_dealloc(
         } else if info.allocatable {
             if info.by_ref {
                 continue;
+            }
+            if let Some(type_name) = &info.derived_type {
+                if let Some(layout) = type_layouts.get(type_name) {
+                    deallocate_derived_descriptor_components(
+                        b,
+                        info.addr,
+                        layout,
+                        type_layouts,
+                        stat_addr.unwrap(),
+                    );
+                }
             }
             b.call(
                 FuncRef::External("afs_deallocate_array".into()),
@@ -21810,6 +21918,14 @@ pub(super) fn lower_select_case(
                             vec![sel_ptr, sel_len, case_ptr, case_len],
                             IrType::Int(IntWidth::I32),
                         );
+                        deallocate_owned_string_expr_temp(
+                            b,
+                            &ctx.locals,
+                            expr,
+                            ctx.st,
+                            Some(ctx.type_layouts),
+                            case_ptr,
+                        );
                         let zero = b.const_i32(0);
                         b.icmp(CmpOp::Eq, cmp, zero)
                     } else {
@@ -21825,6 +21941,14 @@ pub(super) fn lower_select_case(
                                 FuncRef::External("afs_compare_char".into()),
                                 vec![sel_ptr, sel_len, lo_ptr, lo_len],
                                 IrType::Int(IntWidth::I32),
+                            );
+                            deallocate_owned_string_expr_temp(
+                                b,
+                                &ctx.locals,
+                                lo,
+                                ctx.st,
+                                Some(ctx.type_layouts),
+                                lo_ptr,
                             );
                             let zero = b.const_i32(0);
                             Some(b.icmp(CmpOp::Ge, cmp, zero))
@@ -21846,6 +21970,14 @@ pub(super) fn lower_select_case(
                                 FuncRef::External("afs_compare_char".into()),
                                 vec![sel_ptr, sel_len, hi_ptr, hi_len],
                                 IrType::Int(IntWidth::I32),
+                            );
+                            deallocate_owned_string_expr_temp(
+                                b,
+                                &ctx.locals,
+                                hi,
+                                ctx.st,
+                                Some(ctx.type_layouts),
+                                hi_ptr,
                             );
                             let zero = b.const_i32(0);
                             Some(b.icmp(CmpOp::Le, cmp, zero))
@@ -21900,6 +22032,16 @@ pub(super) fn lower_select_case(
     }
 
     b.set_block(bb_end);
+    if let Some((sel_ptr, _)) = sel_char {
+        deallocate_owned_string_expr_temp(
+            b,
+            &ctx.locals,
+            selector,
+            ctx.st,
+            Some(ctx.type_layouts),
+            sel_ptr,
+        );
+    }
 }
 
 /// Lower an array element access: compute flat offset from subscripts, GEP, load.
@@ -23555,6 +23697,7 @@ pub(super) fn lower_char_array_store(
         vec![dest_ptr, dest_len, src_ptr, src_len],
         IrType::Void,
     );
+    deallocate_owned_string_expr_temp(b, locals, value, st, type_layouts, src_ptr);
 }
 
 /// Lower an array element store: compute flat offset, GEP, store.
@@ -36960,6 +37103,16 @@ pub(super) fn lower_array_assign(
             vec![dest_ptr, dest_elem_len, src_ptr, src_len],
             IrType::Void,
         );
+        if src_desc.is_none() {
+            deallocate_owned_string_expr_temp(
+                b,
+                &ctx.locals,
+                value,
+                ctx.st,
+                Some(ctx.type_layouts),
+                src_ptr,
+            );
+        }
 
         let one = b.const_i64(1);
         let next_i = b.iadd(i_val, one);
@@ -37044,6 +37197,14 @@ pub(super) fn lower_array_assign(
             b.branch(bb_check, vec![]);
 
             b.set_block(bb_exit);
+            deallocate_owned_string_expr_temp(
+                b,
+                &ctx.locals,
+                value,
+                ctx.st,
+                Some(ctx.type_layouts),
+                src_ptr,
+            );
             return;
         }
 
@@ -39789,6 +39950,207 @@ pub(super) fn clear_derived_storage_for_intent_out(
     initialize_derived_storage(b, base_addr, layout, registry);
 }
 
+pub(super) fn derived_layout_needs_component_deallocation(
+    layout: &crate::sema::type_layout::TypeLayout,
+    registry: &crate::sema::type_layout::TypeLayoutRegistry,
+) -> bool {
+    layout.fields.iter().any(|field| {
+        if field.allocatable {
+            return true;
+        }
+        if field.pointer {
+            return false;
+        }
+        let Some(nested_name) = field_derived_type_name(field) else {
+            return false;
+        };
+        registry
+            .get(&nested_name)
+            .is_some_and(|nested| derived_layout_needs_component_deallocation(nested, registry))
+    })
+}
+
+fn array_descriptor_total_elements_dynamic(b: &mut FuncBuilder, desc: ValueId) -> ValueId {
+    let total_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let idx_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let one = b.const_i64(1);
+    let zero = b.const_i64(0);
+    b.store(one, total_addr);
+    b.store(zero, idx_addr);
+
+    let rank_i32 = load_array_desc_i32_field(b, desc, 16);
+    let rank = b.int_extend(rank_i32, IntWidth::I64, true);
+
+    let bb_check = b.create_block("desc_total_check");
+    let bb_body = b.create_block("desc_total_body");
+    let bb_exit = b.create_block("desc_total_exit");
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let idx = b.load(idx_addr);
+    let done = b.icmp(CmpOp::Ge, idx, rank);
+    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+    b.set_block(bb_body);
+    let dim_stride = b.const_i64(24);
+    let dims_base = b.const_i64(24);
+    let dim_delta = b.imul(idx, dim_stride);
+    let dim_off = b.iadd(dims_base, dim_delta);
+    let lo_ptr = b.gep(desc, vec![dim_off], IrType::Int(IntWidth::I8));
+    let upper_delta = b.const_i64(8);
+    let upper_off = b.iadd(dim_off, upper_delta);
+    let up_ptr = b.gep(desc, vec![upper_off], IrType::Int(IntWidth::I8));
+    let lo = b.load_typed(lo_ptr, IrType::Int(IntWidth::I64));
+    let up = b.load_typed(up_ptr, IrType::Int(IntWidth::I64));
+    let span = b.isub(up, lo);
+    let raw_extent = b.iadd(span, one);
+    let is_empty = b.icmp(CmpOp::Lt, up, lo);
+    let extent = b.select(is_empty, zero, raw_extent);
+    let total = b.load(total_addr);
+    let next_total = b.imul(total, extent);
+    b.store(next_total, total_addr);
+    let next_idx = b.iadd(idx, one);
+    b.store(next_idx, idx_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
+    b.load(total_addr)
+}
+
+pub(super) fn deallocate_derived_descriptor_components(
+    b: &mut FuncBuilder,
+    desc: ValueId,
+    layout: &crate::sema::type_layout::TypeLayout,
+    registry: &crate::sema::type_layout::TypeLayoutRegistry,
+    stat_addr: ValueId,
+) {
+    if !derived_layout_needs_component_deallocation(layout, registry) {
+        return;
+    }
+
+    let flags = load_array_desc_i32_field(b, desc, 20);
+    let one_i32 = b.const_i32(1);
+    let allocated_bit = b.bit_and(flags, one_i32);
+    let zero_i32 = b.const_i32(0);
+    let allocated = b.icmp(CmpOp::Ne, allocated_bit, zero_i32);
+    let bb_walk = b.create_block("derived_dealloc_walk");
+    let bb_done = b.create_block("derived_dealloc_done");
+    b.cond_branch(allocated, bb_walk, vec![], bb_done, vec![]);
+
+    b.set_block(bb_walk);
+    let total = array_descriptor_total_elements_dynamic(b, desc);
+    let base = b.load_typed(desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    let idx_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let zero = b.const_i64(0);
+    b.store(zero, idx_addr);
+
+    let bb_check = b.create_block("derived_dealloc_elem_check");
+    let bb_body = b.create_block("derived_dealloc_elem_body");
+    let bb_exit = b.create_block("derived_dealloc_elem_exit");
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let idx = b.load(idx_addr);
+    let done = b.icmp(CmpOp::Ge, idx, total);
+    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+    b.set_block(bb_body);
+    let elem_size = b.const_i64(layout.size as i64);
+    let elem_off = b.imul(idx, elem_size);
+    let elem_ptr = b.gep(base, vec![elem_off], IrType::Int(IntWidth::I8));
+    deallocate_derived_storage_components(b, elem_ptr, layout, registry, stat_addr);
+    let one = b.const_i64(1);
+    let next_idx = b.iadd(idx, one);
+    b.store(next_idx, idx_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
+    b.branch(bb_done, vec![]);
+
+    b.set_block(bb_done);
+}
+
+pub(super) fn deallocate_derived_storage_components(
+    b: &mut FuncBuilder,
+    base_addr: ValueId,
+    layout: &crate::sema::type_layout::TypeLayout,
+    registry: &crate::sema::type_layout::TypeLayoutRegistry,
+    stat_addr: ValueId,
+) {
+    for field in &layout.fields {
+        let offset = b.const_i64(field.offset as i64);
+        let field_ptr = b.gep(base_addr, vec![offset], IrType::Int(IntWidth::I8));
+
+        if field.allocatable && is_deferred_char_component_field(field) {
+            b.call(
+                FuncRef::External("afs_dealloc_string".into()),
+                vec![field_ptr],
+                IrType::Void,
+            );
+            continue;
+        }
+
+        if field.allocatable && field.size == 384 {
+            if let Some(nested_name) = field_derived_type_name(field) {
+                if let Some(nested_layout) = registry.get(&nested_name) {
+                    deallocate_derived_descriptor_components(
+                        b,
+                        field_ptr,
+                        nested_layout,
+                        registry,
+                        stat_addr,
+                    );
+                }
+            }
+            b.call(
+                FuncRef::External("afs_deallocate_array".into()),
+                vec![field_ptr, stat_addr],
+                IrType::Void,
+            );
+            continue;
+        }
+
+        if field.pointer || field.allocatable {
+            continue;
+        }
+
+        let Some(nested_name) = field_derived_type_name(field) else {
+            continue;
+        };
+        let Some(nested_layout) = registry.get(&nested_name) else {
+            continue;
+        };
+
+        if field.dims.is_empty() {
+            deallocate_derived_storage_components(
+                b,
+                field_ptr,
+                nested_layout,
+                registry,
+                stat_addr,
+            );
+            continue;
+        }
+
+        let elem_count: i64 = field.dims.iter().map(|(_, extent)| *extent).product();
+        if elem_count <= 0 {
+            continue;
+        }
+        let elem_bytes = nested_layout.size as i64;
+        for idx in 0..elem_count {
+            let byte_off = b.const_i64(idx * elem_bytes);
+            let elem_ptr = b.gep(field_ptr, vec![byte_off], IrType::Int(IntWidth::I8));
+            deallocate_derived_storage_components(
+                b,
+                elem_ptr,
+                nested_layout,
+                registry,
+                stat_addr,
+            );
+        }
+    }
+}
+
 pub(super) fn apply_derived_field_default_inits(
     b: &mut FuncBuilder,
     base_addr: ValueId,
@@ -40881,6 +41243,14 @@ pub(super) fn store_derived_field_expr(
             vec![field_ptr, dest_len, src_ptr, src_len],
             IrType::Void,
         );
+        deallocate_owned_string_expr_temp(
+            b,
+            locals,
+            value,
+            st,
+            Some(type_layouts),
+            src_ptr,
+        );
         return;
     }
 
@@ -40909,6 +41279,14 @@ pub(super) fn store_derived_field_expr(
                 IrType::Void,
             );
         }
+        deallocate_owned_string_expr_temp(
+            b,
+            locals,
+            value,
+            st,
+            Some(type_layouts),
+            src_ptr,
+        );
         return;
     }
 

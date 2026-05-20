@@ -745,6 +745,8 @@ pub(crate) fn lower_expr_full(
                     vec![lhs_ptr, lhs_len, rhs_ptr, rhs_len],
                     IrType::Int(IntWidth::I32),
                 );
+                deallocate_owned_string_expr_temp(b, locals, left, st, type_layouts, lhs_ptr);
+                deallocate_owned_string_expr_temp(b, locals, right, st, type_layouts, rhs_ptr);
                 let zero = b.const_i32(0);
                 return match op {
                     BinaryOp::Eq => b.icmp(CmpOp::Eq, cmp, zero),
