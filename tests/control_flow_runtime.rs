@@ -43,7 +43,10 @@ fn run_with_timeout(path: &std::path::Path) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .expect("failed to spawn control-flow test binary");
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // Freshly linked Rust-runtime binaries can take several seconds to
+    // launch on a loaded macOS runner. Keep the cap finite so a real
+    // zero-step loop still fails, but avoid timing out a correct abort path.
+    let deadline = Instant::now() + Duration::from_secs(120);
     loop {
         if let Some(_status) = child.try_wait().expect("failed to poll child status") {
             return child

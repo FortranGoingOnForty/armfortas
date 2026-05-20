@@ -2746,6 +2746,12 @@ pub extern "C" fn afs_array_count_logical(desc: *const ArrayDescriptor) -> i32 {
 /// and returned a single int, which the compiler then passed as the
 /// source descriptor pointer to afs_assign_allocatable, crashing with
 /// a misaligned-pointer dereference (address 0x3 = the count value).
+// The column-major stride loops below intentionally use indexed access
+// across `extents`, `idx`, `dst_running_stride`, and `s.dims` together
+// with a separately-incrementing `dk` counter — clippy's
+// `enumerate().take(rank)` rewrite doesn't apply cleanly without
+// duplicating the index plumbing.
+#[allow(clippy::needless_range_loop)]
 #[no_mangle]
 pub extern "C" fn afs_array_count_logical_dim(
     src: *const ArrayDescriptor,

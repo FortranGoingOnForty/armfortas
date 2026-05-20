@@ -25546,9 +25546,10 @@ pub(super) fn lower_fmt_push(
         if let Expr::Name { name } = &item.node {
             let key = name.to_lowercase();
             if let Some(info) = ctx.locals.get(&key).cloned() {
-                if local_is_array_like(&info)
-                    && !(is_complex_ty(&info.ty) && !local_is_array_like(&info))
-                {
+                // Outer arm is the array path. Scalar complex
+                // formatting is handled separately; this case just
+                // needs the array predicate.
+                if local_is_array_like(&info) {
                     fmt_push_whole_array(b, &info);
                     return;
                 }
@@ -27228,6 +27229,10 @@ pub(super) fn lower_alloc_section_read(
 /// Audit CRITICAL-3: multi-dim slice prints used to mis-dispatch
 /// through afs_create_section on a bare stack pointer and crash
 /// at runtime reading 384 bytes of garbage as a descriptor.
+// Local intermediate `dim_data` collects per-dim values to release the
+// `dims` borrow before emitting IR; a one-shot named struct here would
+// just be ceremony.
+#[allow(clippy::type_complexity)]
 pub(super) fn lower_section_write_nd(
     b: &mut FuncBuilder,
     ctx: &mut LowerCtx,
