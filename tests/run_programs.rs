@@ -3435,6 +3435,210 @@ fn opt_eq_annotations_allow_hello_cross_opt_invariant() {
 }
 
 #[test]
+fn pack_zero_size_mask_expr_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("pack_zero_size_mask_expr.f90");
+    assert!(source.exists(), "pack_zero_size_mask_expr.f90 missing");
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "pack_zero_size_mask_expr.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
+fn pack_strided_row_section_mask_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("pack_strided_row_section_mask.f90");
+    assert!(source.exists(), "pack_strided_row_section_mask.f90 missing");
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "pack_strided_row_section_mask.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
+fn negative_stride_section_overlap_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("negative_stride_section_overlap.f90");
+    assert!(
+        source.exists(),
+        "negative_stride_section_overlap.f90 missing"
+    );
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "negative_stride_section_overlap.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
+fn vector_subscript_array_rhs_scatter_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("vector_subscript_array_rhs_scatter.f90");
+    assert!(
+        source.exists(),
+        "vector_subscript_array_rhs_scatter.f90 missing"
+    );
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "vector_subscript_array_rhs_scatter.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
+fn rank_remap_strided_section_copyin_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("rank_remap_strided_section_copyin.f90");
+    assert!(
+        source.exists(),
+        "rank_remap_strided_section_copyin.f90 missing"
+    );
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "rank_remap_strided_section_copyin.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
+fn maxval_minval_abs_dim_reduction_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("maxval_minval_abs_dim_reduction.f90");
+    assert!(
+        source.exists(),
+        "maxval_minval_abs_dim_reduction.f90 missing"
+    );
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "maxval_minval_abs_dim_reduction.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
+fn array_constructor_whole_array_exprs_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("array_constructor_whole_array_exprs.f90");
+    assert!(
+        source.exists(),
+        "array_constructor_whole_array_exprs.f90 missing"
+    );
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "array_constructor_whole_array_exprs.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
+fn mixed_numeric_array_binary_exprs_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("mixed_numeric_array_binary_exprs.f90");
+    assert!(
+        source.exists(),
+        "mixed_numeric_array_binary_exprs.f90 missing"
+    );
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "mixed_numeric_array_binary_exprs.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
+fn complex_module_param_reshape_exprs_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("complex_module_param_reshape_exprs.f90");
+    assert!(
+        source.exists(),
+        "complex_module_param_reshape_exprs.f90 missing"
+    );
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "complex_module_param_reshape_exprs.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
+fn pointer_result_forward_no_stack_copy_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("pointer_result_forward_no_stack_copy.f90");
+    assert!(
+        source.exists(),
+        "pointer_result_forward_no_stack_copy.f90 missing"
+    );
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "pointer_result_forward_no_stack_copy.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
 fn phase_triangulation_allows_function_call_pipeline_surfaces() {
     let compiler = find_compiler();
     let test_dir = find_test_programs();

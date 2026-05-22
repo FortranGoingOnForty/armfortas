@@ -36,6 +36,7 @@
 use super::pass::Pass;
 use super::util::prune_unreachable;
 use crate::ir::inst::*;
+use crate::ir::walk::{inst_uses, terminator_uses};
 use std::collections::{HashMap, HashSet};
 
 pub struct JumpThread;
@@ -70,9 +71,9 @@ fn thread_func(func: &mut Function) -> bool {
     // For each candidate join block, plan the rewrite.
     // A candidate join:
     //   * has at least one BlockParam
-    //   * has zero non-constant instructions (we allow ConstX
-    //     instructions to remain — they're trivially copyable
-    //     downstream)
+    //   * has zero instructions. Even constants are unsafe here: if the
+    //     join forwards a value defined inside itself to a successor, bypassing
+    //     the join would leave that value no longer dominating the successor.
     //   * ends in CondBranch where `cond` is one of its own params
     //
     // Plan: for each predecessor whose branch arg for that param is
@@ -154,15 +155,15 @@ fn plan_threads(func: &Function, consts: &HashMap<ValueId, ConstKey>) -> Vec<Thr
     let mut seen_pred_join: HashSet<(BlockId, BlockId)> = HashSet::new();
 
     for join in &func.blocks {
-        // Skip blocks with non-const instructions.
-        let has_only_consts = join
-            .insts
-            .iter()
-            .all(|i| ConstKey::from_inst(&i.kind).is_some());
-        if !has_only_consts {
+        // Skip blocks with instructions. Threading bypasses this block, so
+        // definitions inside it would no longer dominate successor uses.
+        if !join.insts.is_empty() {
             continue;
         }
         if join.params.is_empty() {
+            continue;
+        }
+        if join_params_used_outside_block(func, join) {
             continue;
         }
         let Some(Terminator::CondBranch {
@@ -271,6 +272,26 @@ fn plan_threads(func: &Function, consts: &HashMap<ValueId, ConstKey>) -> Vec<Thr
         }
     }
     actions
+}
+
+fn join_params_used_outside_block(func: &Function, join: &BasicBlock) -> bool {
+    let params: HashSet<ValueId> = join.params.iter().map(|p| p.id).collect();
+    for block in &func.blocks {
+        if block.id == join.id {
+            continue;
+        }
+        for inst in &block.insts {
+            if inst_uses(&inst.kind).iter().any(|u| params.contains(u)) {
+                return true;
+            }
+        }
+        if let Some(term) = &block.terminator {
+            if terminator_uses(term).iter().any(|u| params.contains(u)) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn apply_thread(func: &mut Function, action: &ThreadAction) {
@@ -499,6 +520,94 @@ mod tests {
         });
         f.block_mut(bb_a).terminator = Some(Terminator::Return(None));
         f.block_mut(bb_b).terminator = Some(Terminator::Return(None));
+        f.rebuild_type_cache();
+        m.add_function(f);
+
+        assert!(!JumpThread.run(&mut m));
+    }
+
+    /// A ConstBool is side-effect-free, but it still defines an SSA value in
+    /// the join block. If the join forwards that value to a successor block,
+    /// threading the predecessor directly to the successor would leave the
+    /// forwarded value no longer dominating its use.
+    #[test]
+    fn does_not_thread_when_join_forwards_local_const() {
+        let mut m = Module::new("t".into());
+        let mut f = Function::new("f".into(), vec![], IrType::Void);
+        let bb_join = f.create_block("join");
+        let bb_after = f.create_block("after");
+        let join_cond = f.next_value_id();
+        f.block_mut(bb_join).params.push(BlockParam {
+            id: join_cond,
+            ty: IrType::Bool,
+        });
+        let after_p = f.next_value_id();
+        f.block_mut(bb_after).params.push(BlockParam {
+            id: after_p,
+            ty: IrType::Bool,
+        });
+
+        let const_t = f.next_value_id();
+        f.block_mut(f.entry).insts.push(Inst {
+            id: const_t,
+            kind: InstKind::ConstBool(true),
+            ty: IrType::Bool,
+            span: dummy_span(),
+        });
+        f.block_mut(f.entry).terminator = Some(Terminator::Branch(bb_join, vec![const_t]));
+
+        let join_local_const = f.next_value_id();
+        f.block_mut(bb_join).insts.push(Inst {
+            id: join_local_const,
+            kind: InstKind::ConstBool(false),
+            ty: IrType::Bool,
+            span: dummy_span(),
+        });
+        f.block_mut(bb_join).terminator = Some(Terminator::CondBranch {
+            cond: join_cond,
+            true_dest: bb_after,
+            true_args: vec![join_local_const],
+            false_dest: bb_after,
+            false_args: vec![join_local_const],
+        });
+        f.block_mut(bb_after).terminator = Some(Terminator::Return(Some(after_p)));
+        f.rebuild_type_cache();
+        m.add_function(f);
+
+        assert!(!JumpThread.run(&mut m));
+    }
+
+    /// Lowered short-circuit expressions can define a block-param value in a
+    /// merge block and then use it directly in a later dominated block. The
+    /// merge must not be bypassed unless those later uses are also rewritten.
+    #[test]
+    fn does_not_thread_when_join_param_is_used_later() {
+        let mut m = Module::new("t".into());
+        let mut f = Function::new("f".into(), vec![], IrType::Bool);
+        let bb_join = f.create_block("join");
+        let bb_after = f.create_block("after");
+        let join_cond = f.next_value_id();
+        f.block_mut(bb_join).params.push(BlockParam {
+            id: join_cond,
+            ty: IrType::Bool,
+        });
+
+        let const_t = f.next_value_id();
+        f.block_mut(f.entry).insts.push(Inst {
+            id: const_t,
+            kind: InstKind::ConstBool(true),
+            ty: IrType::Bool,
+            span: dummy_span(),
+        });
+        f.block_mut(f.entry).terminator = Some(Terminator::Branch(bb_join, vec![const_t]));
+        f.block_mut(bb_join).terminator = Some(Terminator::CondBranch {
+            cond: join_cond,
+            true_dest: bb_after,
+            true_args: vec![],
+            false_dest: bb_after,
+            false_args: vec![],
+        });
+        f.block_mut(bb_after).terminator = Some(Terminator::Return(Some(join_cond)));
         f.rebuild_type_cache();
         m.add_function(f);
 

@@ -168,6 +168,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         IrType::Void,
                                     );
                                 }
+                                deallocate_owned_string_expr_temp(
+                                    b,
+                                    &ctx.locals,
+                                    value,
+                                    ctx.st,
+                                    Some(ctx.type_layouts),
+                                    src_ptr,
+                                );
                             }
                             CharKind::FixedRuntime { len_addr } => {
                                 let (src_ptr, src_len) = lower_string_expr_ctx(b, ctx, value);
@@ -177,6 +185,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     FuncRef::External("afs_assign_char_fixed".into()),
                                     vec![dest_ptr, dest_len, src_ptr, src_len],
                                     IrType::Void,
+                                );
+                                deallocate_owned_string_expr_temp(
+                                    b,
+                                    &ctx.locals,
+                                    value,
+                                    ctx.st,
+                                    Some(ctx.type_layouts),
+                                    src_ptr,
                                 );
                             }
                             CharKind::Deferred => {
@@ -198,6 +214,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         IrType::Void,
                                     );
                                 }
+                                deallocate_owned_string_expr_temp(
+                                    b,
+                                    &ctx.locals,
+                                    value,
+                                    ctx.st,
+                                    Some(ctx.type_layouts),
+                                    src_ptr,
+                                );
                             }
                             CharKind::AssumedLen { len_addr } => {
                                 // Assumed-length dummy assignment: use
@@ -215,6 +239,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     vec![dest_ptr, dest_len, src_ptr, src_len],
                                     IrType::Void,
                                 );
+                                deallocate_owned_string_expr_temp(
+                                    b,
+                                    &ctx.locals,
+                                    value,
+                                    ctx.st,
+                                    Some(ctx.type_layouts),
+                                    src_ptr,
+                                );
                             }
                             CharKind::None => {
                                 if local_fixed_char_allocatable_scalar_len(&info).is_some() {
@@ -228,6 +260,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                             IrType::Void,
                                         );
                                     }
+                                    deallocate_owned_string_expr_temp(
+                                        b,
+                                        &ctx.locals,
+                                        value,
+                                        ctx.st,
+                                        Some(ctx.type_layouts),
+                                        src_ptr,
+                                    );
                                 } else if local_uses_array_descriptor(&info)
                                     && local_declared_rank(&info) == 0
                                     && info.derived_type.is_some()
@@ -458,6 +498,21 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                                     || (i == 1 && kw.is_none())
                                                             },
                                                         )
+                                                ) || (
+                                                    // maxval/minval(arr, dim) are also rank-N-1
+                                                    // when the source rank is greater than one.
+                                                    // Keep rank-1 reductions on the scalar path
+                                                    // so nested forms such as
+                                                    // maxval(sum(abs(A), dim=1), 1) still return
+                                                    // a scalar.
+                                                    matches!(lname.as_str(), "maxval" | "minval")
+                                                        && actual_expr_rank(
+                                                            value,
+                                                            &ctx.locals,
+                                                            ctx.st,
+                                                            Some(ctx.type_layouts),
+                                                        )
+                                                        .is_some_and(|rank| rank > 0)
                                                 )
                                             } else {
                                                 false
@@ -952,6 +1007,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                             vec![dest_ptr, dest_len, src_ptr, src_len],
                                             IrType::Void,
                                         );
+                                        deallocate_owned_string_expr_temp(
+                                            b,
+                                            &ctx.locals,
+                                            value,
+                                            ctx.st,
+                                            Some(ctx.type_layouts),
+                                            src_ptr,
+                                        );
                                     }
                                 }
                             } else if !is_scalar_fixed_alloc_char && local_is_array_like(&info) {
@@ -1067,6 +1130,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                     vec![dest_ptr, dest_len, src_ptr, src_len],
                                                     IrType::Void,
                                                 );
+                                                deallocate_owned_string_expr_temp(
+                                                    b,
+                                                    &ctx.locals,
+                                                    value,
+                                                    ctx.st,
+                                                    Some(ctx.type_layouts),
+                                                    src_ptr,
+                                                );
                                             }
                                         }
                                     }
@@ -1100,6 +1171,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                             FuncRef::External("afs_assign_char_fixed".into()),
                                             vec![dest_ptr, dest_len, src_ptr, src_len],
                                             IrType::Void,
+                                        );
+                                        deallocate_owned_string_expr_temp(
+                                            b,
+                                            &ctx.locals,
+                                            value,
+                                            ctx.st,
+                                            Some(ctx.type_layouts),
+                                            src_ptr,
                                         );
                                         return;
                                     }
@@ -1146,6 +1225,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                     vec![dest_ptr, dest_len, src_ptr, src_len],
                                                     IrType::Void,
                                                 );
+                                                deallocate_owned_string_expr_temp(
+                                                    b,
+                                                    &ctx.locals,
+                                                    value,
+                                                    ctx.st,
+                                                    Some(ctx.type_layouts),
+                                                    src_ptr,
+                                                );
                                             }
                                         }
                                     }
@@ -1168,6 +1255,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 FuncRef::External("afs_assign_char_fixed".into()),
                                 vec![dest_ptr, dest_len, src_ptr, src_len],
                                 IrType::Void,
+                            );
+                            deallocate_owned_string_expr_temp(
+                                b,
+                                &ctx.locals,
+                                value,
+                                ctx.st,
+                                Some(ctx.type_layouts),
+                                src_ptr,
                             );
                             return;
                         }
@@ -1259,6 +1354,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                 vec![dest_ptr, dest_len, src_ptr, src_len],
                                                 IrType::Void,
                                             );
+                                            deallocate_owned_string_expr_temp(
+                                                b,
+                                                &ctx.locals,
+                                                value,
+                                                ctx.st,
+                                                Some(ctx.type_layouts),
+                                                src_ptr,
+                                            );
                                         }
                                         CharKind::Deferred => {
                                             let (base_ptr, base_len) =
@@ -1282,6 +1385,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                 FuncRef::External("afs_assign_char_fixed".into()),
                                                 vec![dest_ptr, dest_len, src_ptr, src_len],
                                                 IrType::Void,
+                                            );
+                                            deallocate_owned_string_expr_temp(
+                                                b,
+                                                &ctx.locals,
+                                                value,
+                                                ctx.st,
+                                                Some(ctx.type_layouts),
+                                                src_ptr,
                                             );
                                         }
                                         _ => {}
@@ -1326,6 +1437,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         vec![field_ptr, dest_len, src_ptr, src_len],
                                         IrType::Void,
                                     );
+                                    deallocate_owned_string_expr_temp(
+                                        b,
+                                        &ctx.locals,
+                                        value,
+                                        ctx.st,
+                                        Some(ctx.type_layouts),
+                                        src_ptr,
+                                    );
                                 } else if is_deferred_char_component_field(field) {
                                     let (src_ptr, src_len) = lower_string_expr_ctx(b, ctx, value);
                                     if field.pointer {
@@ -1343,6 +1462,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                             IrType::Void,
                                         );
                                     }
+                                    deallocate_owned_string_expr_temp(
+                                        b,
+                                        &ctx.locals,
+                                        value,
+                                        ctx.st,
+                                        Some(ctx.type_layouts),
+                                        src_ptr,
+                                    );
                                 } else if matches!(
                                     field.type_info,
                                     crate::sema::symtab::TypeInfo::Derived(_)
@@ -2156,6 +2283,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         cached_param_mask_for_lookup(ctx.st, ctx.optional_params, k)
                             .or_else(|| callee_optional_arg_mask(ctx.st, k))
                     });
+                    let intent_in_array_mask = first_procedure_lookup(&abi_lookup_keys, |k| {
+                        callee_intent_in_array_arg_mask(ctx.st, k)
+                    });
                     let mut arg_vals: Vec<ValueId> = Vec::with_capacity(arg_slots.len());
                     for (i, slot) in arg_slots.iter().enumerate() {
                         let is_value = value_mask
@@ -2189,6 +2319,10 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 .map(|mask| mask.get(i).copied().unwrap_or(false))
                                 .unwrap_or(false);
                         let wants_string_descriptor = wants_string_descriptor && !wants_bind_c_char;
+                        let wants_intent_in_array = intent_in_array_mask
+                            .as_ref()
+                            .map(|mask| mask.get(i).copied().unwrap_or(false))
+                            .unwrap_or(false);
                         let value = match slot {
                             Some(arg) => match &arg.value {
                                 crate::ast::expr::SectionSubscript::Element(e) => {
@@ -2245,6 +2379,18 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         )
                                     } else if wants_pointer {
                                         lower_pointer_dummy_actual(
+                                            b,
+                                            &ctx.locals,
+                                            e,
+                                            ctx.st,
+                                            Some(ctx.type_layouts),
+                                            Some(ctx.internal_funcs),
+                                            Some(ctx.contained_host_refs),
+                                            Some(ctx.descriptor_params),
+                                        )
+                                        .unwrap_or_else(|| lower_arg_by_ref_ctx(b, ctx, e))
+                                    } else if wants_intent_in_array {
+                                        lower_contiguous_intent_in_array_actual(
                                             b,
                                             &ctx.locals,
                                             e,
@@ -4027,6 +4173,19 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             continue;
                         }
                         if field.size == 384 && (field.allocatable || field.pointer) {
+                            if field.allocatable {
+                                if let Some(type_name) = field_derived_type_name(&field) {
+                                    if let Some(layout) = ctx.type_layouts.get(&type_name) {
+                                        deallocate_derived_descriptor_components(
+                                            b,
+                                            field_ptr,
+                                            layout,
+                                            ctx.type_layouts,
+                                            stat_addr,
+                                        );
+                                    }
+                                }
+                            }
                             b.call(
                                 FuncRef::External("afs_deallocate_array".into()),
                                 vec![field_ptr, stat_addr],
@@ -4073,6 +4232,17 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             );
                         } else if info.allocatable || info.descriptor_arg {
                             let desc = array_descriptor_addr(b, info);
+                            if let Some(type_name) = &info.derived_type {
+                                if let Some(layout) = ctx.type_layouts.get(type_name) {
+                                    deallocate_derived_descriptor_components(
+                                        b,
+                                        desc,
+                                        layout,
+                                        ctx.type_layouts,
+                                        stat_addr,
+                                    );
+                                }
+                            }
                             b.call(
                                 FuncRef::External("afs_deallocate_array".into()),
                                 vec![desc, stat_addr],

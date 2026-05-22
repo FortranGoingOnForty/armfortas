@@ -107,6 +107,12 @@ impl PassManager {
         }
         let errors: Vec<VerifyError> = verify_module(module);
         if !errors.is_empty() {
+            if std::env::var_os("AFS_DUMP_BAD_OPT_IR").is_some() {
+                let safe_after = after.replace(|ch: char| !ch.is_ascii_alphanumeric(), "_");
+                let path = std::env::temp_dir().join(format!("afs_bad_opt_{safe_after}.ir"));
+                let _ = std::fs::write(&path, crate::ir::printer::print_module(module));
+                eprintln!("afs: dumped failing optimized IR to {}", path.display());
+            }
             let mut msg = format!("IR verifier failed after pass `{}`:\n", after);
             for e in &errors {
                 msg.push_str("  - ");

@@ -720,6 +720,13 @@ fn has_escaping_values(
     false
 }
 
+fn latch_body_uses_value(latch_blk: &BasicBlock, value: ValueId) -> bool {
+    latch_blk
+        .insts
+        .iter()
+        .any(|inst| inst.id != value && inst_uses(&inst.kind).contains(&value))
+}
+
 fn block_contains_load(func: &Function, block: BlockId) -> bool {
     func.block(block)
         .insts
@@ -1197,6 +1204,9 @@ fn detect_partial_unroll_loop(
     if resolve_const_int(func, step_const_id) != Some(1) {
         return None;
     }
+    if latch_body_uses_value(latch_blk, iv_next) {
+        return None;
+    }
     // No latch-defined value escapes the loop.
     let body_set: HashSet<BlockId> = nl.body.iter().copied().collect();
     if has_escaping_values(func, latch, &body_set, preds) {
@@ -1625,6 +1635,9 @@ fn detect_partial_unroll_runtime_loop(
         return None;
     };
     if resolve_const_int(func, step_const_id) != Some(1) {
+        return None;
+    }
+    if latch_body_uses_value(latch_blk, iv_next) {
         return None;
     }
     if has_escaping_values(func, latch, &body_set, preds) {
@@ -2217,6 +2230,9 @@ fn detect_partial_unroll_multiblock_loop(
         return None;
     };
     if resolve_const_int(func, step_const_id) != Some(1) {
+        return None;
+    }
+    if latch_body_uses_value(latch_blk, iv_next) {
         return None;
     }
     let body_set: HashSet<BlockId> = nl.body.iter().copied().collect();
@@ -2862,6 +2878,37 @@ mod tests {
             block_count >= 3,
             "expected loop structure preserved, got {} blocks",
             block_count
+        );
+    }
+
+    #[test]
+    fn does_not_partial_unroll_when_increment_is_body_value() {
+        let mut m = build_counted_loop(1, 10);
+        let f = &mut m.functions[0];
+        let latch_id = f
+            .blocks
+            .iter()
+            .find(|b| b.name.starts_with("do_body"))
+            .expect("latch block")
+            .id;
+        let iv_next = match &f.block(latch_id).terminator {
+            Some(Terminator::Branch(_, args)) => args[0],
+            other => panic!("expected latch branch, got {other:?}"),
+        };
+        let use_id = f.next_value_id();
+        f.block_mut(latch_id).insts.push(Inst {
+            id: use_id,
+            ty: IrType::Int(IntWidth::I64),
+            span: span(),
+            kind: InstKind::IntExtend(iv_next, IntWidth::I64, true),
+        });
+        f.rebuild_type_cache();
+
+        let pass = LoopUnroll;
+        let changed = pass.run(&mut m);
+        assert!(
+            !changed,
+            "partial unroll must not move an increment value used by latch body instructions"
         );
     }
 
