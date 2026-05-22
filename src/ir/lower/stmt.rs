@@ -5197,6 +5197,12 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     .map(|k| k.eq_ignore_ascii_case("unit"))
                     .unwrap_or(false)
             });
+            let positional_unit_spec = if file_spec.is_none() {
+                specs.iter().find(|s| s.keyword.is_none())
+            } else {
+                None
+            };
+            let unit_spec = unit_spec.or(positional_unit_spec);
 
             let lower_ref_spec = |b: &mut FuncBuilder, needle: &str| -> ValueId {
                 spec_by_keyword(needle)
@@ -5227,6 +5233,11 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             let (read_ptr, read_len) = lower_string_spec(b, "read");
             let (write_ptr, write_len) = lower_string_spec(b, "write");
             let (readwrite_ptr, readwrite_len) = lower_string_spec(b, "readwrite");
+            let (sequential_ptr, sequential_len) = lower_string_spec(b, "sequential");
+            let (direct_ptr, direct_len) = lower_string_spec(b, "direct");
+            let (stream_ptr, stream_len) = lower_string_spec(b, "stream");
+            let (formatted_ptr, formatted_len) = lower_string_spec(b, "formatted");
+            let (unformatted_ptr, unformatted_len) = lower_string_spec(b, "unformatted");
             let recl_addr = lower_ref_spec(b, "recl");
             let size_spec = spec_by_keyword("size");
             let (size_addr, size_storeback) = if let Some(spec) = size_spec {
@@ -5269,6 +5280,16 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         write_len,
                         readwrite_ptr,
                         readwrite_len,
+                        sequential_ptr,
+                        sequential_len,
+                        direct_ptr,
+                        direct_len,
+                        stream_ptr,
+                        stream_len,
+                        formatted_ptr,
+                        formatted_len,
+                        unformatted_ptr,
+                        unformatted_len,
                     ],
                     IrType::Void,
                 );
@@ -5298,6 +5319,16 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         write_len,
                         readwrite_ptr,
                         readwrite_len,
+                        sequential_ptr,
+                        sequential_len,
+                        direct_ptr,
+                        direct_len,
+                        stream_ptr,
+                        stream_len,
+                        formatted_ptr,
+                        formatted_len,
+                        unformatted_ptr,
+                        unformatted_len,
                     ],
                     IrType::Void,
                 );

@@ -2982,6 +2982,16 @@ pub extern "C" fn afs_inquire_file(
     write_buf_len: i64,
     readwrite_buf: *mut u8,
     readwrite_buf_len: i64,
+    sequential_buf: *mut u8,
+    sequential_buf_len: i64,
+    direct_buf: *mut u8,
+    direct_buf_len: i64,
+    stream_buf: *mut u8,
+    stream_buf_len: i64,
+    formatted_buf: *mut u8,
+    formatted_buf_len: i64,
+    unformatted_buf: *mut u8,
+    unformatted_buf_len: i64,
 ) {
     let fname = unsafe_str(filename, filename_len);
 
@@ -3024,6 +3034,22 @@ pub extern "C" fn afs_inquire_file(
             readwrite_buf,
             readwrite_buf_len,
         );
+        write_access_capabilities(
+            Some(u.access),
+            sequential_buf,
+            sequential_buf_len,
+            direct_buf,
+            direct_buf_len,
+            stream_buf,
+            stream_buf_len,
+        );
+        write_form_capabilities(
+            Some(&u.form),
+            formatted_buf,
+            formatted_buf_len,
+            unformatted_buf,
+            unformatted_buf_len,
+        );
     } else {
         write_inquire_string(access_buf, access_buf_len, "UNDEFINED");
         write_inquire_string(form_buf, form_buf_len, "UNDEFINED");
@@ -3036,6 +3062,22 @@ pub extern "C" fn afs_inquire_file(
             write_buf_len,
             readwrite_buf,
             readwrite_buf_len,
+        );
+        write_access_capabilities(
+            None,
+            sequential_buf,
+            sequential_buf_len,
+            direct_buf,
+            direct_buf_len,
+            stream_buf,
+            stream_buf_len,
+        );
+        write_form_capabilities(
+            None,
+            formatted_buf,
+            formatted_buf_len,
+            unformatted_buf,
+            unformatted_buf_len,
         );
     }
 
@@ -3080,6 +3122,16 @@ pub extern "C" fn afs_inquire_unit(
     write_buf_len: i64,
     readwrite_buf: *mut u8,
     readwrite_buf_len: i64,
+    sequential_buf: *mut u8,
+    sequential_buf_len: i64,
+    direct_buf: *mut u8,
+    direct_buf_len: i64,
+    stream_buf: *mut u8,
+    stream_buf_len: i64,
+    formatted_buf: *mut u8,
+    formatted_buf_len: i64,
+    unformatted_buf: *mut u8,
+    unformatted_buf_len: i64,
 ) {
     let state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     let unit_entry = state.units.get(&unit);
@@ -3116,6 +3168,22 @@ pub extern "C" fn afs_inquire_unit(
             readwrite_buf,
             readwrite_buf_len,
         );
+        write_access_capabilities(
+            Some(u.access),
+            sequential_buf,
+            sequential_buf_len,
+            direct_buf,
+            direct_buf_len,
+            stream_buf,
+            stream_buf_len,
+        );
+        write_form_capabilities(
+            Some(&u.form),
+            formatted_buf,
+            formatted_buf_len,
+            unformatted_buf,
+            unformatted_buf_len,
+        );
 
         if !size_out.is_null() {
             let sz = if !u.filename.is_empty() {
@@ -3142,6 +3210,22 @@ pub extern "C" fn afs_inquire_unit(
             write_buf_len,
             readwrite_buf,
             readwrite_buf_len,
+        );
+        write_access_capabilities(
+            None,
+            sequential_buf,
+            sequential_buf_len,
+            direct_buf,
+            direct_buf_len,
+            stream_buf,
+            stream_buf_len,
+        );
+        write_form_capabilities(
+            None,
+            formatted_buf,
+            formatted_buf_len,
+            unformatted_buf,
+            unformatted_buf_len,
         );
         if !size_out.is_null() {
             unsafe {
@@ -3179,6 +3263,46 @@ fn write_action_capabilities(
     write_inquire_string(read_buf, read_buf_len, read_cap);
     write_inquire_string(write_buf, write_buf_len, write_cap);
     write_inquire_string(readwrite_buf, readwrite_buf_len, rw_cap);
+}
+
+/// Fill SEQUENTIAL=, DIRECT=, STREAM= INQUIRE specifiers based on a
+/// connected unit's access mode. Disconnected files/units report UNKNOWN.
+fn write_access_capabilities(
+    access: Option<Access>,
+    sequential_buf: *mut u8,
+    sequential_buf_len: i64,
+    direct_buf: *mut u8,
+    direct_buf_len: i64,
+    stream_buf: *mut u8,
+    stream_buf_len: i64,
+) {
+    let (sequential_cap, direct_cap, stream_cap) = match access {
+        Some(Access::Sequential) => ("YES", "NO", "NO"),
+        Some(Access::Direct) => ("NO", "YES", "NO"),
+        Some(Access::Stream) => ("NO", "NO", "YES"),
+        None => ("UNKNOWN", "UNKNOWN", "UNKNOWN"),
+    };
+    write_inquire_string(sequential_buf, sequential_buf_len, sequential_cap);
+    write_inquire_string(direct_buf, direct_buf_len, direct_cap);
+    write_inquire_string(stream_buf, stream_buf_len, stream_cap);
+}
+
+/// Fill FORMATTED= and UNFORMATTED= INQUIRE specifiers based on a
+/// connected unit's form. Disconnected files/units report UNKNOWN.
+fn write_form_capabilities(
+    form: Option<&Form>,
+    formatted_buf: *mut u8,
+    formatted_buf_len: i64,
+    unformatted_buf: *mut u8,
+    unformatted_buf_len: i64,
+) {
+    let (formatted_cap, unformatted_cap) = match form {
+        Some(Form::Formatted) => ("YES", "NO"),
+        Some(Form::Unformatted) => ("NO", "YES"),
+        None => ("UNKNOWN", "UNKNOWN"),
+    };
+    write_inquire_string(formatted_buf, formatted_buf_len, formatted_cap);
+    write_inquire_string(unformatted_buf, unformatted_buf_len, unformatted_cap);
 }
 
 /// Write ACCESS, FORM, ACTION, RECL for a connected unit.
