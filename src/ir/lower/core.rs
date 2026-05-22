@@ -41182,6 +41182,20 @@ pub(super) fn emit_derived_value_copy(
             // allocatable components instead of aliasing their
             // descriptors. A raw memcpy here makes sibling copies of
             // a derived object share the same array storage.
+            if let Some(nested_name) = field_derived_type_name(field) {
+                if let Some(nested_layout) = type_layouts.get(&nested_name) {
+                    if derived_layout_needs_deep_copy(nested_layout, type_layouts) {
+                        emit_allocatable_derived_array_component_copy(
+                            b,
+                            type_layouts,
+                            nested_layout,
+                            dest_field,
+                            src_field,
+                        );
+                        continue;
+                    }
+                }
+            }
             b.call(
                 FuncRef::External("afs_assign_allocatable".into()),
                 vec![dest_field, src_field],
@@ -41205,6 +41219,57 @@ pub(super) fn emit_derived_value_copy(
 
         emit_memcpy_bytes(b, dest_field, src_field, field.size as i64);
     }
+}
+
+fn emit_allocatable_derived_array_component_copy(
+    b: &mut FuncBuilder,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+    elem_layout: &crate::sema::type_layout::TypeLayout,
+    dest_desc: ValueId,
+    source_desc: ValueId,
+) {
+    let stat_addr = b.alloca(IrType::Int(IntWidth::I32));
+    let zero_i32 = b.const_i32(0);
+    b.store(zero_i32, stat_addr);
+
+    let source_alloc = b.call(
+        FuncRef::External("afs_array_allocated".into()),
+        vec![source_desc],
+        IrType::Int(IntWidth::I32),
+    );
+    let is_unallocated = b.icmp(CmpOp::Eq, source_alloc, zero_i32);
+    let unalloc_bb = b.create_block("derived_alloc_array_unalloc");
+    let copy_bb = b.create_block("derived_alloc_array_copy");
+    let join_bb = b.create_block("derived_alloc_array_copy_join");
+    b.cond_branch(is_unallocated, unalloc_bb, vec![], copy_bb, vec![]);
+
+    b.set_block(unalloc_bb);
+    deallocate_derived_descriptor_components(b, dest_desc, elem_layout, type_layouts, stat_addr);
+    b.call(
+        FuncRef::External("afs_deallocate_array".into()),
+        vec![dest_desc, stat_addr],
+        IrType::Void,
+    );
+    b.branch(join_bb, vec![]);
+
+    b.set_block(copy_bb);
+    b.store(zero_i32, stat_addr);
+    deallocate_derived_descriptor_components(b, dest_desc, elem_layout, type_layouts, stat_addr);
+    b.call(
+        FuncRef::External("afs_deallocate_array".into()),
+        vec![dest_desc, stat_addr],
+        IrType::Void,
+    );
+    b.store(zero_i32, stat_addr);
+    b.call(
+        FuncRef::External("afs_allocate_like".into()),
+        vec![dest_desc, source_desc, stat_addr],
+        IrType::Void,
+    );
+    emit_derived_array_desc_copy(b, type_layouts, elem_layout, dest_desc, source_desc);
+    b.branch(join_bb, vec![]);
+
+    b.set_block(join_bb);
 }
 
 pub(super) fn pointer_slot_addr_elem_type(slot_pointee_ty: &IrType) -> IrType {
