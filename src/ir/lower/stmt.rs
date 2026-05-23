@@ -3482,14 +3482,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 logical_kind: None,
                                 last_dim_assumed_size: false,
                             };
-                            let source_scalar_layout = if rank == 0 && source_desc.is_none() {
+                            let source_scalar_layout = if source_desc.is_none() {
                                 source_expr.and_then(|expr| {
                                     expr_type_layout(expr, None, ctx.st, ctx.type_layouts)
                                 })
                             } else {
                                 None
                             };
-                            let source_scalar_type = if rank == 0 && source_desc.is_none() {
+                            let source_scalar_type = if source_desc.is_none() {
                                 source_expr.and_then(|expr| {
                                     expr_derived_type_name(expr, None, ctx.st, ctx.type_layouts)
                                 })
@@ -3503,7 +3503,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         .as_deref()
                                         .and_then(|type_name| ctx.type_layouts.get(type_name))
                                 });
-                            let scalar_source_copy_plan = if rank == 0 && source_desc.is_none() {
+                            let scalar_source_copy_plan = if source_desc.is_none() {
                                 source_expr.and_then(|expr| {
                                     expr_scalar_alloc_source_copy_plan(
                                         expr,
@@ -3636,6 +3636,26 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                             source_expr,
                                         );
                                     }
+                                }
+                            } else if let Some(source_expr) = source_expr {
+                                if !expr_is_character_expr(
+                                    b,
+                                    &ctx.locals,
+                                    source_expr,
+                                    ctx.st,
+                                    Some(ctx.type_layouts),
+                                ) {
+                                    emit_array_allocate_scalar_source_init_on_success(
+                                        b,
+                                        ctx,
+                                        stat_addr,
+                                        field_ptr,
+                                        &elem_ty,
+                                        source_scalar_type
+                                            .as_deref()
+                                            .or(field_derived_type_name(&field).as_deref()),
+                                        source_expr,
+                                    );
                                 }
                             }
                             if rank == 0 {
@@ -3834,14 +3854,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
 
                         if info.allocatable || info.descriptor_arg {
                             let rank = args.len();
-                            let source_scalar_layout = if rank == 0 && source_desc.is_none() {
+                            let source_scalar_layout = if source_desc.is_none() {
                                 source_expr.and_then(|expr| {
                                     expr_type_layout(expr, None, ctx.st, ctx.type_layouts)
                                 })
                             } else {
                                 None
                             };
-                            let source_scalar_type = if rank == 0 && source_desc.is_none() {
+                            let source_scalar_type = if source_desc.is_none() {
                                 source_expr.and_then(|expr| {
                                     expr_derived_type_name(expr, None, ctx.st, ctx.type_layouts)
                                 })
@@ -3854,7 +3874,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         .as_deref()
                                         .and_then(|type_name| ctx.type_layouts.get(type_name))
                                 });
-                            let scalar_source_copy_plan = if rank == 0 && source_desc.is_none() {
+                            let scalar_source_copy_plan = if source_desc.is_none() {
                                 source_expr.and_then(|expr| {
                                     expr_scalar_alloc_source_copy_plan(
                                         expr,
@@ -3994,6 +4014,26 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                             source_expr,
                                         );
                                     }
+                                }
+                            } else if let Some(source_expr) = source_expr {
+                                if !expr_is_character_expr(
+                                    b,
+                                    &ctx.locals,
+                                    source_expr,
+                                    ctx.st,
+                                    Some(ctx.type_layouts),
+                                ) {
+                                    emit_array_allocate_scalar_source_init_on_success(
+                                        b,
+                                        ctx,
+                                        stat_addr,
+                                        desc,
+                                        &info.ty,
+                                        source_scalar_type
+                                            .as_deref()
+                                            .or(info.derived_type.as_deref()),
+                                        source_expr,
+                                    );
                                 }
                             }
                             if rank == 0 {
@@ -5197,6 +5237,12 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     .map(|k| k.eq_ignore_ascii_case("unit"))
                     .unwrap_or(false)
             });
+            let positional_unit_spec = if file_spec.is_none() {
+                specs.iter().find(|s| s.keyword.is_none())
+            } else {
+                None
+            };
+            let unit_spec = unit_spec.or(positional_unit_spec);
 
             let lower_ref_spec = |b: &mut FuncBuilder, needle: &str| -> ValueId {
                 spec_by_keyword(needle)
@@ -5227,6 +5273,11 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             let (read_ptr, read_len) = lower_string_spec(b, "read");
             let (write_ptr, write_len) = lower_string_spec(b, "write");
             let (readwrite_ptr, readwrite_len) = lower_string_spec(b, "readwrite");
+            let (sequential_ptr, sequential_len) = lower_string_spec(b, "sequential");
+            let (direct_ptr, direct_len) = lower_string_spec(b, "direct");
+            let (stream_ptr, stream_len) = lower_string_spec(b, "stream");
+            let (formatted_ptr, formatted_len) = lower_string_spec(b, "formatted");
+            let (unformatted_ptr, unformatted_len) = lower_string_spec(b, "unformatted");
             let recl_addr = lower_ref_spec(b, "recl");
             let size_spec = spec_by_keyword("size");
             let (size_addr, size_storeback) = if let Some(spec) = size_spec {
@@ -5269,6 +5320,16 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         write_len,
                         readwrite_ptr,
                         readwrite_len,
+                        sequential_ptr,
+                        sequential_len,
+                        direct_ptr,
+                        direct_len,
+                        stream_ptr,
+                        stream_len,
+                        formatted_ptr,
+                        formatted_len,
+                        unformatted_ptr,
+                        unformatted_len,
                     ],
                     IrType::Void,
                 );
@@ -5298,6 +5359,16 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         write_len,
                         readwrite_ptr,
                         readwrite_len,
+                        sequential_ptr,
+                        sequential_len,
+                        direct_ptr,
+                        direct_len,
+                        stream_ptr,
+                        stream_len,
+                        formatted_ptr,
+                        formatted_len,
+                        unformatted_ptr,
+                        unformatted_len,
                     ],
                     IrType::Void,
                 );

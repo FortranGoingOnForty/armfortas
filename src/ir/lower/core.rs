@@ -2745,7 +2745,32 @@ pub(super) fn collect_implicit_locals(
 }
 
 pub(super) fn collect_name_refs_stmt(stmt: &crate::ast::stmt::SpannedStmt, out: &mut Vec<String>) {
-    use crate::ast::stmt::Stmt;
+    use crate::ast::expr::SectionSubscript;
+    use crate::ast::stmt::{RankGuard, Stmt, TypeGuard};
+
+    fn collect_name_refs_controls(controls: &[crate::ast::stmt::IoControl], out: &mut Vec<String>) {
+        for control in controls {
+            collect_name_refs_expr(&control.value, out);
+        }
+    }
+
+    fn collect_name_refs_subscript(subscript: &SectionSubscript, out: &mut Vec<String>) {
+        match subscript {
+            SectionSubscript::Element(expr) => collect_name_refs_expr(expr, out),
+            SectionSubscript::Range { start, end, stride } => {
+                if let Some(expr) = start {
+                    collect_name_refs_expr(expr, out);
+                }
+                if let Some(expr) = end {
+                    collect_name_refs_expr(expr, out);
+                }
+                if let Some(expr) = stride {
+                    collect_name_refs_expr(expr, out);
+                }
+            }
+        }
+    }
+
     match &stmt.node {
         Stmt::Assignment { target, value } | Stmt::PointerAssignment { target, value } => {
             collect_name_refs_expr(target, out);
@@ -2810,19 +2835,55 @@ pub(super) fn collect_name_refs_stmt(stmt: &crate::ast::stmt::SpannedStmt, out: 
                 collect_name_refs_stmt(s, out);
             }
         }
-        Stmt::DoConcurrent { body, .. }
-        | Stmt::Block { body, .. }
-        | Stmt::Associate { body, .. } => {
+        Stmt::DoConcurrent {
+            controls,
+            mask,
+            body,
+            ..
+        } => {
+            for control in controls {
+                out.push(control.var.clone());
+                collect_name_refs_expr(&control.start, out);
+                collect_name_refs_expr(&control.end, out);
+                if let Some(step) = &control.step {
+                    collect_name_refs_expr(step, out);
+                }
+            }
+            if let Some(mask) = mask {
+                collect_name_refs_expr(mask, out);
+            }
             for s in body {
                 collect_name_refs_stmt(s, out);
             }
         }
-        Stmt::Print { items, .. } => {
+        Stmt::Block {
+            implicit,
+            decls,
+            body,
+            ..
+        } => {
+            collect_name_refs_decls(implicit, out);
+            collect_name_refs_decls(decls, out);
+            for s in body {
+                collect_name_refs_stmt(s, out);
+            }
+        }
+        Stmt::Associate { assocs, body, .. } => {
+            for (_, expr) in assocs {
+                collect_name_refs_expr(expr, out);
+            }
+            for s in body {
+                collect_name_refs_stmt(s, out);
+            }
+        }
+        Stmt::Print { format, items } => {
+            collect_name_refs_expr(format, out);
             for e in items {
                 collect_name_refs_expr(e, out);
             }
         }
-        Stmt::Write { items, .. } | Stmt::Read { items, .. } => {
+        Stmt::Write { controls, items } | Stmt::Read { controls, items } => {
+            collect_name_refs_controls(controls, out);
             for e in items {
                 collect_name_refs_expr(e, out);
             }
@@ -2830,12 +2891,15 @@ pub(super) fn collect_name_refs_stmt(stmt: &crate::ast::stmt::SpannedStmt, out: 
         Stmt::Call { callee, args } => {
             collect_name_refs_expr(callee, out);
             for arg in args {
-                if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
-                    collect_name_refs_expr(e, out);
-                }
+                collect_name_refs_subscript(&arg.value, out);
             }
         }
-        Stmt::Return { value: Some(e) } => collect_name_refs_expr(e, out),
+        Stmt::Return { value: Some(e) }
+        | Stmt::ComputedGoto { selector: e, .. }
+        | Stmt::ArithmeticIf { expr: e, .. } => collect_name_refs_expr(e, out),
+        Stmt::Stop { code: Some(e), .. } | Stmt::ErrorStop { code: Some(e), .. } => {
+            collect_name_refs_expr(e, out);
+        }
         Stmt::Labeled { stmt, .. } => collect_name_refs_stmt(stmt, out),
         Stmt::SelectCase {
             selector, cases, ..
@@ -2863,12 +2927,124 @@ pub(super) fn collect_name_refs_stmt(stmt: &crate::ast::stmt::SpannedStmt, out: 
                 }
             }
         }
-        Stmt::Allocate { items, .. } | Stmt::Deallocate { items, .. } | Stmt::Nullify { items } => {
+        Stmt::SelectType {
+            selector, guards, ..
+        } => {
+            collect_name_refs_expr(selector, out);
+            for guard in guards {
+                let body = match guard {
+                    TypeGuard::TypeIs { body, .. }
+                    | TypeGuard::ClassIs { body, .. }
+                    | TypeGuard::ClassDefault { body } => body,
+                };
+                for s in body {
+                    collect_name_refs_stmt(s, out);
+                }
+            }
+        }
+        Stmt::SelectRank {
+            selector, guards, ..
+        } => {
+            collect_name_refs_expr(selector, out);
+            for guard in guards {
+                let body = match guard {
+                    RankGuard::Rank { body, .. }
+                    | RankGuard::RankStar { body }
+                    | RankGuard::RankDefault { body } => body,
+                };
+                for s in body {
+                    collect_name_refs_stmt(s, out);
+                }
+            }
+        }
+        Stmt::WhereConstruct {
+            mask,
+            body,
+            elsewhere,
+            ..
+        } => {
+            collect_name_refs_expr(mask, out);
+            for s in body {
+                collect_name_refs_stmt(s, out);
+            }
+            for (mask, body) in elsewhere {
+                if let Some(mask) = mask {
+                    collect_name_refs_expr(mask, out);
+                }
+                for s in body {
+                    collect_name_refs_stmt(s, out);
+                }
+            }
+        }
+        Stmt::WhereStmt { mask, stmt } => {
+            collect_name_refs_expr(mask, out);
+            collect_name_refs_stmt(stmt, out);
+        }
+        Stmt::ForallConstruct {
+            specs, mask, body, ..
+        } => {
+            for spec in specs {
+                out.push(spec.var.clone());
+                collect_name_refs_expr(&spec.start, out);
+                collect_name_refs_expr(&spec.end, out);
+                if let Some(step) = &spec.step {
+                    collect_name_refs_expr(step, out);
+                }
+            }
+            if let Some(mask) = mask {
+                collect_name_refs_expr(mask, out);
+            }
+            for s in body {
+                collect_name_refs_stmt(s, out);
+            }
+        }
+        Stmt::ForallStmt { specs, mask, stmt } => {
+            for spec in specs {
+                out.push(spec.var.clone());
+                collect_name_refs_expr(&spec.start, out);
+                collect_name_refs_expr(&spec.end, out);
+                if let Some(step) = &spec.step {
+                    collect_name_refs_expr(step, out);
+                }
+            }
+            if let Some(mask) = mask {
+                collect_name_refs_expr(mask, out);
+            }
+            collect_name_refs_stmt(stmt, out);
+        }
+        Stmt::Open { specs }
+        | Stmt::Close { specs }
+        | Stmt::Rewind { specs }
+        | Stmt::Backspace { specs }
+        | Stmt::Endfile { specs }
+        | Stmt::Flush { specs }
+        | Stmt::Wait { specs } => collect_name_refs_controls(specs, out),
+        Stmt::Inquire { specs, items } => {
+            collect_name_refs_controls(specs, out);
+            for item in items {
+                collect_name_refs_expr(item, out);
+            }
+        }
+        Stmt::Allocate { items, opts, .. } | Stmt::Deallocate { items, opts } => {
+            for e in items {
+                collect_name_refs_expr(e, out);
+            }
+            collect_name_refs_controls(opts, out);
+        }
+        Stmt::Nullify { items } => {
             for e in items {
                 collect_name_refs_expr(e, out);
             }
         }
-        _ => {}
+        Stmt::Declaration(decl) => collect_name_refs_decls(std::slice::from_ref(decl), out),
+        Stmt::Return { value: None }
+        | Stmt::Stop { code: None, .. }
+        | Stmt::ErrorStop { code: None, .. }
+        | Stmt::Exit { .. }
+        | Stmt::Cycle { .. }
+        | Stmt::Goto { .. }
+        | Stmt::Continue { .. }
+        | Stmt::Namelist { .. } => {}
     }
 }
 
@@ -14870,6 +15046,7 @@ pub(super) fn intrinsic_subroutine_arg_order(callee_key: &str) -> Option<&'stati
         "get_command" => Some(&["command", "length", "status"]),
         "get_environment_variable" => Some(&["name", "value", "length", "status"]),
         "random_number" => Some(&["harvest"]),
+        "random_seed" => Some(&["size", "put", "get"]),
         "execute_command_line" => Some(&["command", "wait", "exitstat", "cmdstat"]),
         "c_f_pointer" => Some(&["cptr", "fptr", "shape"]),
         "cmplx" => Some(&["x", "y", "kind"]),
@@ -41182,6 +41359,20 @@ pub(super) fn emit_derived_value_copy(
             // allocatable components instead of aliasing their
             // descriptors. A raw memcpy here makes sibling copies of
             // a derived object share the same array storage.
+            if let Some(nested_name) = field_derived_type_name(field) {
+                if let Some(nested_layout) = type_layouts.get(&nested_name) {
+                    if derived_layout_needs_deep_copy(nested_layout, type_layouts) {
+                        emit_allocatable_derived_array_component_copy(
+                            b,
+                            type_layouts,
+                            nested_layout,
+                            dest_field,
+                            src_field,
+                        );
+                        continue;
+                    }
+                }
+            }
             b.call(
                 FuncRef::External("afs_assign_allocatable".into()),
                 vec![dest_field, src_field],
@@ -41205,6 +41396,57 @@ pub(super) fn emit_derived_value_copy(
 
         emit_memcpy_bytes(b, dest_field, src_field, field.size as i64);
     }
+}
+
+fn emit_allocatable_derived_array_component_copy(
+    b: &mut FuncBuilder,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+    elem_layout: &crate::sema::type_layout::TypeLayout,
+    dest_desc: ValueId,
+    source_desc: ValueId,
+) {
+    let stat_addr = b.alloca(IrType::Int(IntWidth::I32));
+    let zero_i32 = b.const_i32(0);
+    b.store(zero_i32, stat_addr);
+
+    let source_alloc = b.call(
+        FuncRef::External("afs_array_allocated".into()),
+        vec![source_desc],
+        IrType::Int(IntWidth::I32),
+    );
+    let is_unallocated = b.icmp(CmpOp::Eq, source_alloc, zero_i32);
+    let unalloc_bb = b.create_block("derived_alloc_array_unalloc");
+    let copy_bb = b.create_block("derived_alloc_array_copy");
+    let join_bb = b.create_block("derived_alloc_array_copy_join");
+    b.cond_branch(is_unallocated, unalloc_bb, vec![], copy_bb, vec![]);
+
+    b.set_block(unalloc_bb);
+    deallocate_derived_descriptor_components(b, dest_desc, elem_layout, type_layouts, stat_addr);
+    b.call(
+        FuncRef::External("afs_deallocate_array".into()),
+        vec![dest_desc, stat_addr],
+        IrType::Void,
+    );
+    b.branch(join_bb, vec![]);
+
+    b.set_block(copy_bb);
+    b.store(zero_i32, stat_addr);
+    deallocate_derived_descriptor_components(b, dest_desc, elem_layout, type_layouts, stat_addr);
+    b.call(
+        FuncRef::External("afs_deallocate_array".into()),
+        vec![dest_desc, stat_addr],
+        IrType::Void,
+    );
+    b.store(zero_i32, stat_addr);
+    b.call(
+        FuncRef::External("afs_allocate_like".into()),
+        vec![dest_desc, source_desc, stat_addr],
+        IrType::Void,
+    );
+    emit_derived_array_desc_copy(b, type_layouts, elem_layout, dest_desc, source_desc);
+    b.branch(join_bb, vec![]);
+
+    b.set_block(join_bb);
 }
 
 pub(super) fn pointer_slot_addr_elem_type(slot_pointee_ty: &IrType) -> IrType {
@@ -42717,6 +42959,110 @@ pub(super) fn emit_scalar_allocate_source_init_on_success(
         let coerced = coerce_to_type(b, raw, dest_ty);
         b.store(coerced, dest_base);
     }
+    b.branch(done_bb, vec![]);
+    b.set_block(done_bb);
+}
+
+pub(super) fn emit_array_allocate_scalar_source_init_on_success(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    stat_addr: ValueId,
+    dest_desc: ValueId,
+    dest_ty: &IrType,
+    derived_type: Option<&str>,
+    source_expr: &SpannedExpr,
+) {
+    let stat = b.load_typed(stat_addr, IrType::Int(IntWidth::I32));
+    let zero32 = b.const_i32(0);
+    let ok = b.icmp(CmpOp::Eq, stat, zero32);
+    let init_bb = b.create_block("alloc_array_source_init");
+    let done_bb = b.create_block("alloc_array_source_init_done");
+    b.cond_branch(ok, init_bb, vec![], done_bb, vec![]);
+
+    b.set_block(init_bb);
+    let dest_n = b.call(
+        FuncRef::External("afs_array_size".into()),
+        vec![dest_desc],
+        IrType::Int(IntWidth::I64),
+    );
+    let dest_base = b.load_typed(dest_desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    let dest_stride = load_array_desc_i64_field(b, dest_desc, 24 + 16);
+    let scalar_raw = super::expr::lower_expr_ctx_tl(b, ctx, source_expr);
+
+    let elem_bytes = if let Some(type_name) = derived_type {
+        ctx.type_layouts
+            .get(type_name)
+            .map(|layout| layout.size as i64)
+            .unwrap_or_else(|| ir_scalar_byte_size(dest_ty))
+    } else if is_complex_ty(dest_ty) {
+        complex_byte_size(dest_ty)
+    } else {
+        ir_scalar_byte_size(dest_ty)
+    };
+    let elem_bytes_val = b.const_i64(elem_bytes);
+
+    let complex_scalar_src = if is_complex_ty(dest_ty) {
+        let raw_ty = b.func().value_type(scalar_raw);
+        Some(match raw_ty {
+            Some(IrType::Ptr(ref inner)) if inner.as_ref() == dest_ty => scalar_raw,
+            Some(IrType::Ptr(ref inner))
+                if matches!(
+                    inner.as_ref(),
+                    IrType::Array(ref e, n)
+                        if (*n == 2 && matches!(e.as_ref(), IrType::Float(_)))
+                            || (matches!(e.as_ref(), IrType::Int(IntWidth::I8))
+                                && (*n == 8 || *n == 16))
+                ) || matches!(inner.as_ref(), IrType::Int(IntWidth::I8)) =>
+            {
+                scalar_raw
+            }
+            _ => materialize_complex_operand(b, scalar_raw, complex_float_width(dest_ty)),
+        })
+    } else {
+        None
+    };
+    let scalar = if derived_type.is_none() && complex_scalar_src.is_none() {
+        Some(coerce_to_type(b, scalar_raw, dest_ty))
+    } else {
+        None
+    };
+
+    let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let zero64 = b.const_i64(0);
+    b.store(zero64, i_addr);
+
+    let bb_check = b.create_block("alloc_array_source_broadcast_check");
+    let bb_body = b.create_block("alloc_array_source_broadcast_body");
+    let bb_exit = b.create_block("alloc_array_source_broadcast_exit");
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let i = b.load(i_addr);
+    let done = b.icmp(CmpOp::Ge, i, dest_n);
+    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+    b.set_block(bb_body);
+    let i_val = b.load(i_addr);
+    let dest_index = b.imul(i_val, dest_stride);
+    let dest_off = b.imul(dest_index, elem_bytes_val);
+    let dest_ptr = b.gep(dest_base, vec![dest_off], IrType::Int(IntWidth::I8));
+    if let Some(type_name) = derived_type {
+        emit_derived_value_copy(b, ctx.type_layouts, type_name, dest_ptr, scalar_raw);
+    } else if let Some(src_ptr) = complex_scalar_src {
+        b.call(
+            FuncRef::External("memcpy".into()),
+            vec![dest_ptr, src_ptr, elem_bytes_val],
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        );
+    } else if let Some(scalar) = scalar {
+        b.store(scalar, dest_ptr);
+    }
+    let one = b.const_i64(1);
+    let next_i = b.iadd(i_val, one);
+    b.store(next_i, i_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
     b.branch(done_bb, vec![]);
     b.set_block(done_bb);
 }
