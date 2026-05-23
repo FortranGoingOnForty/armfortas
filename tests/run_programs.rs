@@ -3474,6 +3474,24 @@ fn derived_alloc_array_component_deep_copy_fixture_passes_all_opts() {
 }
 
 #[test]
+fn allocate_array_scalar_source_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("allocate_array_scalar_source.f90");
+    assert!(source.exists(), "allocate_array_scalar_source.f90 missing");
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "allocate_array_scalar_source.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
 fn inquire_positional_unit_capabilities_fixture_passes_all_opts() {
     let compiler = find_compiler();
     let test_dir = find_test_programs();

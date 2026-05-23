@@ -42786,6 +42786,110 @@ pub(super) fn emit_scalar_allocate_source_init_on_success(
     b.set_block(done_bb);
 }
 
+pub(super) fn emit_array_allocate_scalar_source_init_on_success(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    stat_addr: ValueId,
+    dest_desc: ValueId,
+    dest_ty: &IrType,
+    derived_type: Option<&str>,
+    source_expr: &SpannedExpr,
+) {
+    let stat = b.load_typed(stat_addr, IrType::Int(IntWidth::I32));
+    let zero32 = b.const_i32(0);
+    let ok = b.icmp(CmpOp::Eq, stat, zero32);
+    let init_bb = b.create_block("alloc_array_source_init");
+    let done_bb = b.create_block("alloc_array_source_init_done");
+    b.cond_branch(ok, init_bb, vec![], done_bb, vec![]);
+
+    b.set_block(init_bb);
+    let dest_n = b.call(
+        FuncRef::External("afs_array_size".into()),
+        vec![dest_desc],
+        IrType::Int(IntWidth::I64),
+    );
+    let dest_base = b.load_typed(dest_desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    let dest_stride = load_array_desc_i64_field(b, dest_desc, 24 + 16);
+    let scalar_raw = super::expr::lower_expr_ctx_tl(b, ctx, source_expr);
+
+    let elem_bytes = if let Some(type_name) = derived_type {
+        ctx.type_layouts
+            .get(type_name)
+            .map(|layout| layout.size as i64)
+            .unwrap_or_else(|| ir_scalar_byte_size(dest_ty))
+    } else if is_complex_ty(dest_ty) {
+        complex_byte_size(dest_ty)
+    } else {
+        ir_scalar_byte_size(dest_ty)
+    };
+    let elem_bytes_val = b.const_i64(elem_bytes);
+
+    let complex_scalar_src = if is_complex_ty(dest_ty) {
+        let raw_ty = b.func().value_type(scalar_raw);
+        Some(match raw_ty {
+            Some(IrType::Ptr(ref inner)) if inner.as_ref() == dest_ty => scalar_raw,
+            Some(IrType::Ptr(ref inner))
+                if matches!(
+                    inner.as_ref(),
+                    IrType::Array(ref e, n)
+                        if (*n == 2 && matches!(e.as_ref(), IrType::Float(_)))
+                            || (matches!(e.as_ref(), IrType::Int(IntWidth::I8))
+                                && (*n == 8 || *n == 16))
+                ) || matches!(inner.as_ref(), IrType::Int(IntWidth::I8)) =>
+            {
+                scalar_raw
+            }
+            _ => materialize_complex_operand(b, scalar_raw, complex_float_width(dest_ty)),
+        })
+    } else {
+        None
+    };
+    let scalar = if derived_type.is_none() && complex_scalar_src.is_none() {
+        Some(coerce_to_type(b, scalar_raw, dest_ty))
+    } else {
+        None
+    };
+
+    let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let zero64 = b.const_i64(0);
+    b.store(zero64, i_addr);
+
+    let bb_check = b.create_block("alloc_array_source_broadcast_check");
+    let bb_body = b.create_block("alloc_array_source_broadcast_body");
+    let bb_exit = b.create_block("alloc_array_source_broadcast_exit");
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let i = b.load(i_addr);
+    let done = b.icmp(CmpOp::Ge, i, dest_n);
+    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+    b.set_block(bb_body);
+    let i_val = b.load(i_addr);
+    let dest_index = b.imul(i_val, dest_stride);
+    let dest_off = b.imul(dest_index, elem_bytes_val);
+    let dest_ptr = b.gep(dest_base, vec![dest_off], IrType::Int(IntWidth::I8));
+    if let Some(type_name) = derived_type {
+        emit_derived_value_copy(b, ctx.type_layouts, type_name, dest_ptr, scalar_raw);
+    } else if let Some(src_ptr) = complex_scalar_src {
+        b.call(
+            FuncRef::External("memcpy".into()),
+            vec![dest_ptr, src_ptr, elem_bytes_val],
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        );
+    } else if let Some(scalar) = scalar {
+        b.store(scalar, dest_ptr);
+    }
+    let one = b.const_i64(1);
+    let next_i = b.iadd(i_val, one);
+    b.store(next_i, i_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
+    b.branch(done_bb, vec![]);
+    b.set_block(done_bb);
+}
+
 /// Resolve a base expression for a type-bound procedure call.
 /// Returns (object_address, type_name) — the address of the base object.
 /// For simple `obj%method()`, base is `obj` → returns (obj.addr, obj.type).
