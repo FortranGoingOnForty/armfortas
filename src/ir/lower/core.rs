@@ -2745,7 +2745,32 @@ pub(super) fn collect_implicit_locals(
 }
 
 pub(super) fn collect_name_refs_stmt(stmt: &crate::ast::stmt::SpannedStmt, out: &mut Vec<String>) {
-    use crate::ast::stmt::Stmt;
+    use crate::ast::expr::SectionSubscript;
+    use crate::ast::stmt::{RankGuard, Stmt, TypeGuard};
+
+    fn collect_name_refs_controls(controls: &[crate::ast::stmt::IoControl], out: &mut Vec<String>) {
+        for control in controls {
+            collect_name_refs_expr(&control.value, out);
+        }
+    }
+
+    fn collect_name_refs_subscript(subscript: &SectionSubscript, out: &mut Vec<String>) {
+        match subscript {
+            SectionSubscript::Element(expr) => collect_name_refs_expr(expr, out),
+            SectionSubscript::Range { start, end, stride } => {
+                if let Some(expr) = start {
+                    collect_name_refs_expr(expr, out);
+                }
+                if let Some(expr) = end {
+                    collect_name_refs_expr(expr, out);
+                }
+                if let Some(expr) = stride {
+                    collect_name_refs_expr(expr, out);
+                }
+            }
+        }
+    }
+
     match &stmt.node {
         Stmt::Assignment { target, value } | Stmt::PointerAssignment { target, value } => {
             collect_name_refs_expr(target, out);
@@ -2810,19 +2835,55 @@ pub(super) fn collect_name_refs_stmt(stmt: &crate::ast::stmt::SpannedStmt, out: 
                 collect_name_refs_stmt(s, out);
             }
         }
-        Stmt::DoConcurrent { body, .. }
-        | Stmt::Block { body, .. }
-        | Stmt::Associate { body, .. } => {
+        Stmt::DoConcurrent {
+            controls,
+            mask,
+            body,
+            ..
+        } => {
+            for control in controls {
+                out.push(control.var.clone());
+                collect_name_refs_expr(&control.start, out);
+                collect_name_refs_expr(&control.end, out);
+                if let Some(step) = &control.step {
+                    collect_name_refs_expr(step, out);
+                }
+            }
+            if let Some(mask) = mask {
+                collect_name_refs_expr(mask, out);
+            }
             for s in body {
                 collect_name_refs_stmt(s, out);
             }
         }
-        Stmt::Print { items, .. } => {
+        Stmt::Block {
+            implicit,
+            decls,
+            body,
+            ..
+        } => {
+            collect_name_refs_decls(implicit, out);
+            collect_name_refs_decls(decls, out);
+            for s in body {
+                collect_name_refs_stmt(s, out);
+            }
+        }
+        Stmt::Associate { assocs, body, .. } => {
+            for (_, expr) in assocs {
+                collect_name_refs_expr(expr, out);
+            }
+            for s in body {
+                collect_name_refs_stmt(s, out);
+            }
+        }
+        Stmt::Print { format, items } => {
+            collect_name_refs_expr(format, out);
             for e in items {
                 collect_name_refs_expr(e, out);
             }
         }
-        Stmt::Write { items, .. } | Stmt::Read { items, .. } => {
+        Stmt::Write { controls, items } | Stmt::Read { controls, items } => {
+            collect_name_refs_controls(controls, out);
             for e in items {
                 collect_name_refs_expr(e, out);
             }
@@ -2830,12 +2891,15 @@ pub(super) fn collect_name_refs_stmt(stmt: &crate::ast::stmt::SpannedStmt, out: 
         Stmt::Call { callee, args } => {
             collect_name_refs_expr(callee, out);
             for arg in args {
-                if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
-                    collect_name_refs_expr(e, out);
-                }
+                collect_name_refs_subscript(&arg.value, out);
             }
         }
-        Stmt::Return { value: Some(e) } => collect_name_refs_expr(e, out),
+        Stmt::Return { value: Some(e) }
+        | Stmt::ComputedGoto { selector: e, .. }
+        | Stmt::ArithmeticIf { expr: e, .. } => collect_name_refs_expr(e, out),
+        Stmt::Stop { code: Some(e), .. } | Stmt::ErrorStop { code: Some(e), .. } => {
+            collect_name_refs_expr(e, out);
+        }
         Stmt::Labeled { stmt, .. } => collect_name_refs_stmt(stmt, out),
         Stmt::SelectCase {
             selector, cases, ..
@@ -2863,12 +2927,124 @@ pub(super) fn collect_name_refs_stmt(stmt: &crate::ast::stmt::SpannedStmt, out: 
                 }
             }
         }
-        Stmt::Allocate { items, .. } | Stmt::Deallocate { items, .. } | Stmt::Nullify { items } => {
+        Stmt::SelectType {
+            selector, guards, ..
+        } => {
+            collect_name_refs_expr(selector, out);
+            for guard in guards {
+                let body = match guard {
+                    TypeGuard::TypeIs { body, .. }
+                    | TypeGuard::ClassIs { body, .. }
+                    | TypeGuard::ClassDefault { body } => body,
+                };
+                for s in body {
+                    collect_name_refs_stmt(s, out);
+                }
+            }
+        }
+        Stmt::SelectRank {
+            selector, guards, ..
+        } => {
+            collect_name_refs_expr(selector, out);
+            for guard in guards {
+                let body = match guard {
+                    RankGuard::Rank { body, .. }
+                    | RankGuard::RankStar { body }
+                    | RankGuard::RankDefault { body } => body,
+                };
+                for s in body {
+                    collect_name_refs_stmt(s, out);
+                }
+            }
+        }
+        Stmt::WhereConstruct {
+            mask,
+            body,
+            elsewhere,
+            ..
+        } => {
+            collect_name_refs_expr(mask, out);
+            for s in body {
+                collect_name_refs_stmt(s, out);
+            }
+            for (mask, body) in elsewhere {
+                if let Some(mask) = mask {
+                    collect_name_refs_expr(mask, out);
+                }
+                for s in body {
+                    collect_name_refs_stmt(s, out);
+                }
+            }
+        }
+        Stmt::WhereStmt { mask, stmt } => {
+            collect_name_refs_expr(mask, out);
+            collect_name_refs_stmt(stmt, out);
+        }
+        Stmt::ForallConstruct {
+            specs, mask, body, ..
+        } => {
+            for spec in specs {
+                out.push(spec.var.clone());
+                collect_name_refs_expr(&spec.start, out);
+                collect_name_refs_expr(&spec.end, out);
+                if let Some(step) = &spec.step {
+                    collect_name_refs_expr(step, out);
+                }
+            }
+            if let Some(mask) = mask {
+                collect_name_refs_expr(mask, out);
+            }
+            for s in body {
+                collect_name_refs_stmt(s, out);
+            }
+        }
+        Stmt::ForallStmt { specs, mask, stmt } => {
+            for spec in specs {
+                out.push(spec.var.clone());
+                collect_name_refs_expr(&spec.start, out);
+                collect_name_refs_expr(&spec.end, out);
+                if let Some(step) = &spec.step {
+                    collect_name_refs_expr(step, out);
+                }
+            }
+            if let Some(mask) = mask {
+                collect_name_refs_expr(mask, out);
+            }
+            collect_name_refs_stmt(stmt, out);
+        }
+        Stmt::Open { specs }
+        | Stmt::Close { specs }
+        | Stmt::Rewind { specs }
+        | Stmt::Backspace { specs }
+        | Stmt::Endfile { specs }
+        | Stmt::Flush { specs }
+        | Stmt::Wait { specs } => collect_name_refs_controls(specs, out),
+        Stmt::Inquire { specs, items } => {
+            collect_name_refs_controls(specs, out);
+            for item in items {
+                collect_name_refs_expr(item, out);
+            }
+        }
+        Stmt::Allocate { items, opts, .. } | Stmt::Deallocate { items, opts } => {
+            for e in items {
+                collect_name_refs_expr(e, out);
+            }
+            collect_name_refs_controls(opts, out);
+        }
+        Stmt::Nullify { items } => {
             for e in items {
                 collect_name_refs_expr(e, out);
             }
         }
-        _ => {}
+        Stmt::Declaration(decl) => collect_name_refs_decls(std::slice::from_ref(decl), out),
+        Stmt::Return { value: None }
+        | Stmt::Stop { code: None, .. }
+        | Stmt::ErrorStop { code: None, .. }
+        | Stmt::Exit { .. }
+        | Stmt::Cycle { .. }
+        | Stmt::Goto { .. }
+        | Stmt::Continue { .. }
+        | Stmt::Namelist { .. } => {}
     }
 }
 
