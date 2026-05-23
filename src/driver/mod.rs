@@ -1623,23 +1623,19 @@ fn link_inputs_with_afs_ld(
     output: &Path,
     opts: &Options,
 ) -> Result<(), String> {
-    if opts.shared {
-        return Err("AFS_LD override does not yet support shared-library links".into());
-    }
     if opts.static_link {
         return Err("AFS_LD override does not yet support static-link mode".into());
     }
 
     let rt_path = find_runtime_lib()?;
     let libsystem_tbd = find_libsystem_tbd()?;
-    let mut args: Vec<String> = vec![
-        "-arch".into(),
-        "arm64".into(),
-        "-e".into(),
-        "_main".into(),
-        "-o".into(),
-        output.to_string_lossy().into_owned(),
-    ];
+    let mut args: Vec<String> = vec!["-arch".into(), "arm64".into()];
+    if opts.shared {
+        args.push("-dylib".into());
+    } else {
+        args.extend(["-e".into(), "_main".into()]);
+    }
+    args.extend(["-o".into(), output.to_string_lossy().into_owned()]);
     for input in inputs {
         args.push(input.to_string_lossy().into_owned());
     }
