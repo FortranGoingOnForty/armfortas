@@ -14870,6 +14870,7 @@ pub(super) fn intrinsic_subroutine_arg_order(callee_key: &str) -> Option<&'stati
         "get_command" => Some(&["command", "length", "status"]),
         "get_environment_variable" => Some(&["name", "value", "length", "status"]),
         "random_number" => Some(&["harvest"]),
+        "random_seed" => Some(&["size", "put", "get"]),
         "execute_command_line" => Some(&["command", "wait", "exitstat", "cmdstat"]),
         "c_f_pointer" => Some(&["cptr", "fptr", "shape"]),
         "cmplx" => Some(&["x", "y", "kind"]),

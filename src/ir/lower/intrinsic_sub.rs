@@ -426,13 +426,78 @@ pub(crate) fn lower_intrinsic_subroutine(
             true
         }
         "random_seed" => {
-            let seed = nth_arg_val(b, ctx, args, 0, 0);
-            let widened = b.int_extend(seed, IntWidth::I64, true);
-            b.call(
-                FuncRef::External("afs_random_seed".into()),
-                vec![widened],
-                IrType::Void,
-            );
+            let has_size = nth_arg_expr(args, 0).is_some();
+            let has_put = nth_arg_expr(args, 1).is_some();
+            let has_get = nth_arg_expr(args, 2).is_some();
+
+            if !has_size && !has_put && !has_get {
+                b.call(
+                    FuncRef::External("afs_random_seed_init".into()),
+                    vec![],
+                    IrType::Void,
+                );
+                return true;
+            }
+
+            if has_size {
+                let (size, writeback) = nth_arg_i64_out(b, ctx, args, 0);
+                b.call(
+                    FuncRef::External("afs_random_seed_size".into()),
+                    vec![size],
+                    IrType::Void,
+                );
+                if let Some(writeback) = writeback {
+                    let raw = b.load(writeback.tmp_ptr);
+                    let coerced = coerce_to_type(b, raw, &writeback.dest_ty);
+                    b.store(coerced, writeback.dest_ptr);
+                }
+            }
+
+            if let Some(put_expr) = nth_arg_expr(args, 1) {
+                if let Some((desc, _elem_ty)) = lower_array_expr_descriptor(
+                    b,
+                    &ctx.locals,
+                    put_expr,
+                    ctx.st,
+                    Some(ctx.type_layouts),
+                    Some(ctx.internal_funcs),
+                    Some(ctx.contained_host_refs),
+                    Some(ctx.descriptor_params),
+                ) {
+                    b.call(
+                        FuncRef::External("afs_random_seed_put".into()),
+                        vec![desc],
+                        IrType::Void,
+                    );
+                } else {
+                    let seed = super::expr::lower_expr_ctx(b, ctx, put_expr);
+                    let widened = b.int_extend(seed, IntWidth::I64, true);
+                    b.call(
+                        FuncRef::External("afs_random_seed".into()),
+                        vec![widened],
+                        IrType::Void,
+                    );
+                }
+            }
+
+            if let Some(get_expr) = nth_arg_expr(args, 2) {
+                if let Some((desc, _elem_ty)) = lower_array_expr_descriptor(
+                    b,
+                    &ctx.locals,
+                    get_expr,
+                    ctx.st,
+                    Some(ctx.type_layouts),
+                    Some(ctx.internal_funcs),
+                    Some(ctx.contained_host_refs),
+                    Some(ctx.descriptor_params),
+                ) {
+                    b.call(
+                        FuncRef::External("afs_random_seed_get".into()),
+                        vec![desc],
+                        IrType::Void,
+                    );
+                }
+            }
             true
         }
         "execute_command_line" => {

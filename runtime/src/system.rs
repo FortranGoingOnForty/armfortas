@@ -368,11 +368,15 @@ pub extern "C" fn afs_execute_command_line(
 }
 
 // Shared RNG state for RANDOM_NUMBER / RANDOM_SEED.
+use crate::descriptor::ArrayDescriptor;
 use std::cell::Cell;
+use std::ptr;
 thread_local! {
     static RNG_SEED: Cell<u64> = const { Cell::new(0) };
     static RNG_INITIALIZED: Cell<bool> = const { Cell::new(false) };
 }
+
+const RANDOM_SEED_VECTOR_SIZE: i64 = 1;
 
 fn default_random_seed() -> u64 {
     let now = std::time::SystemTime::now()
@@ -387,6 +391,26 @@ fn default_random_seed() -> u64 {
         seed = 0x0123_4567_89ab_cdef;
     }
     seed
+}
+
+fn set_random_seed(seed: u64) {
+    RNG_SEED.with(|s| s.set(seed));
+    RNG_INITIALIZED.with(|initialized| initialized.set(true));
+}
+
+fn current_random_seed() -> u64 {
+    RNG_SEED.with(|s| {
+        RNG_INITIALIZED.with(|initialized| {
+            if !initialized.get() {
+                let seed = default_random_seed();
+                s.set(seed);
+                initialized.set(true);
+                seed
+            } else {
+                s.get()
+            }
+        })
+    })
 }
 
 fn next_random_u64() -> u64 {
@@ -404,6 +428,40 @@ fn next_random_u64() -> u64 {
         s.set(x);
         x
     })
+}
+
+unsafe fn read_seed_element(addr: *const u8, elem_size: i64) -> u64 {
+    match elem_size {
+        1 => ptr::read_unaligned(addr as *const i8) as i64 as u64,
+        2 => ptr::read_unaligned(addr as *const i16) as i64 as u64,
+        4 => ptr::read_unaligned(addr as *const i32) as i64 as u64,
+        8 => ptr::read_unaligned(addr as *const i64) as u64,
+        n if n > 0 => {
+            let mut value = 0u64;
+            let bytes = n.min(8) as usize;
+            for i in 0..bytes {
+                value |= (ptr::read(addr.add(i)) as u64) << (i * 8);
+            }
+            value
+        }
+        _ => 0,
+    }
+}
+
+unsafe fn write_seed_element(addr: *mut u8, elem_size: i64, seed: u64) {
+    match elem_size {
+        1 => ptr::write_unaligned(addr as *mut i8, seed as i8),
+        2 => ptr::write_unaligned(addr as *mut i16, seed as i16),
+        4 => ptr::write_unaligned(addr as *mut i32, seed as i32),
+        8 => ptr::write_unaligned(addr as *mut i64, seed as i64),
+        n if n > 0 => {
+            let bytes = n.min(8) as usize;
+            for i in 0..bytes {
+                ptr::write(addr.add(i), ((seed >> (i * 8)) & 0xff) as u8);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// RANDOM_NUMBER: fill a scalar single-precision real with a random value in [0, 1).
@@ -466,8 +524,50 @@ pub extern "C" fn afs_random_number_array_f64(harvest: *mut f64, n: i64) {
 /// RANDOM_SEED: seed the random number generator.
 #[no_mangle]
 pub extern "C" fn afs_random_seed(seed_val: i64) {
-    RNG_SEED.with(|s| s.set(seed_val as u64));
-    RNG_INITIALIZED.with(|initialized| initialized.set(true));
+    set_random_seed(seed_val as u64);
+}
+
+#[no_mangle]
+pub extern "C" fn afs_random_seed_init() {
+    set_random_seed(default_random_seed());
+}
+
+#[no_mangle]
+pub extern "C" fn afs_random_seed_size(size: *mut i64) {
+    if size.is_null() {
+        return;
+    }
+    unsafe {
+        *size = RANDOM_SEED_VECTOR_SIZE;
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_random_seed_put(seed_desc: *const ArrayDescriptor) {
+    if seed_desc.is_null() {
+        return;
+    }
+    let desc = unsafe { &*seed_desc };
+    if desc.base_addr.is_null() || desc.total_elements() <= 0 {
+        return;
+    }
+    let seed = unsafe { read_seed_element(desc.base_addr as *const u8, desc.elem_size) };
+    set_random_seed(seed);
+}
+
+#[no_mangle]
+pub extern "C" fn afs_random_seed_get(seed_desc: *mut ArrayDescriptor) {
+    if seed_desc.is_null() {
+        return;
+    }
+    let desc = unsafe { &mut *seed_desc };
+    if desc.base_addr.is_null() || desc.total_elements() <= 0 {
+        return;
+    }
+    let seed = current_random_seed();
+    unsafe {
+        write_seed_element(desc.base_addr, desc.elem_size, seed);
+    }
 }
 
 /// POPCOUNT: count set bits in an integer (Hamming weight).
