@@ -1294,6 +1294,135 @@ pub extern "C" fn afs_copy_array_result_to_fixed(
     }
 }
 
+#[no_mangle]
+pub extern "C" fn afs_copy_array_result_to_fixed_convert(
+    dest: *mut u8,
+    source: *const ArrayDescriptor,
+    dest_bytes: i64,
+    dest_kind_tag: i32,
+    src_kind_tag: i32,
+) {
+    if dest.is_null() || dest_bytes <= 0 {
+        return;
+    }
+
+    let dest_len = dest_bytes as usize;
+    unsafe {
+        ptr::write_bytes(dest, 0, dest_len);
+    }
+
+    let Some(dest_elem_size) = numeric_kind_elem_size(dest_kind_tag) else {
+        return;
+    };
+    let Some(src_elem_size) = numeric_kind_elem_size(src_kind_tag) else {
+        return;
+    };
+    let max_dest_elems = dest_bytes / dest_elem_size;
+    if max_dest_elems <= 0 || source.is_null() {
+        return;
+    }
+
+    let source = unsafe { &*source };
+    if source.base_addr.is_null() || source.total_bytes() <= 0 {
+        return;
+    }
+
+    let rank = source.rank.max(0) as usize;
+    let source_elems = source.total_elements().max(0);
+    let n = source_elems.min(max_dest_elems) as usize;
+    if n == 0 {
+        return;
+    }
+
+    let extents: Vec<i64> = (0..rank).map(|i| source.dims[i].extent()).collect();
+    let raw_strides: Vec<i64> = (0..rank).map(|i| source.dims[i].stride).collect();
+    let mut canonical_step: i64 = 1;
+    let mut canonical: Vec<i64> = Vec::with_capacity(rank);
+    let mut strided = false;
+    for d in 0..rank {
+        canonical.push(canonical_step);
+        if raw_strides[d] < 0 || raw_strides[d] > canonical_step {
+            strided = true;
+        }
+        canonical_step = canonical_step.saturating_mul(extents[d].max(1));
+    }
+    let strides: &[i64] = if strided { &raw_strides } else { &canonical };
+    let mut idx = vec![0i64; rank];
+
+    for k in 0..n {
+        let mut src_off_elems: i64 = 0;
+        for d in 0..rank {
+            src_off_elems += idx[d] * strides[d];
+        }
+        let src_byte_off = src_off_elems * src_elem_size;
+        let (src_re_f64, src_im_f64): (f64, f64) = unsafe {
+            match src_kind_tag {
+                0 => (
+                    *(source.base_addr.offset(src_byte_off as isize) as *const i8) as f64,
+                    0.0,
+                ),
+                1 => (
+                    *(source.base_addr.offset(src_byte_off as isize) as *const i16) as f64,
+                    0.0,
+                ),
+                2 => (
+                    *(source.base_addr.offset(src_byte_off as isize) as *const i32) as f64,
+                    0.0,
+                ),
+                3 => (
+                    *(source.base_addr.offset(src_byte_off as isize) as *const i64) as f64,
+                    0.0,
+                ),
+                4 => (
+                    *(source.base_addr.offset(src_byte_off as isize) as *const f32) as f64,
+                    0.0,
+                ),
+                5 => (
+                    *(source.base_addr.offset(src_byte_off as isize) as *const f64),
+                    0.0,
+                ),
+                6 => {
+                    let p = source.base_addr.offset(src_byte_off as isize) as *const f32;
+                    ((*p) as f64, (*p.add(1)) as f64)
+                }
+                7 => {
+                    let p = source.base_addr.offset(src_byte_off as isize) as *const f64;
+                    (*p, *p.add(1))
+                }
+                _ => return,
+            }
+        };
+        unsafe {
+            match dest_kind_tag {
+                0 => *(dest.add(k) as *mut i8) = src_re_f64 as i8,
+                1 => *(dest.add(2 * k) as *mut i16) = src_re_f64 as i16,
+                2 => *(dest.add(4 * k) as *mut i32) = src_re_f64 as i32,
+                3 => *(dest.add(8 * k) as *mut i64) = src_re_f64 as i64,
+                4 => *(dest.add(4 * k) as *mut f32) = src_re_f64 as f32,
+                5 => *(dest.add(8 * k) as *mut f64) = src_re_f64,
+                6 => {
+                    let p = dest.add(8 * k) as *mut f32;
+                    *p = src_re_f64 as f32;
+                    *p.add(1) = src_im_f64 as f32;
+                }
+                7 => {
+                    let p = dest.add(16 * k) as *mut f64;
+                    *p = src_re_f64;
+                    *p.add(1) = src_im_f64;
+                }
+                _ => return,
+            }
+        }
+        for d in 0..rank {
+            idx[d] += 1;
+            if idx[d] < extents[d] {
+                break;
+            }
+            idx[d] = 0;
+        }
+    }
+}
+
 /// Validate `ALLOCATE(..., SOURCE=...)` array conformance after the destination
 /// has already been allocated with its final shape.
 ///
@@ -1618,6 +1747,17 @@ unsafe fn copy_same_type_payload_to_contiguous(source: &ArrayDescriptor, dest_ba
     }
 }
 
+fn numeric_kind_elem_size(kind_tag: i32) -> Option<i64> {
+    match kind_tag {
+        0 => Some(1),
+        1 => Some(2),
+        2 | 4 => Some(4),
+        3 | 5 | 6 => Some(8),
+        7 => Some(16),
+        _ => None,
+    }
+}
+
 /// Element-converting allocatable assignment.
 ///
 /// F2018 §10.2.1.3: when the LHS and RHS of an array assignment have
@@ -1625,7 +1765,8 @@ unsafe fn copy_same_type_payload_to_contiguous(source: &ArrayDescriptor, dest_ba
 /// LHS type. This entry point performs that conversion when the source
 /// descriptor's element kind differs from the destination's.
 ///
-/// kind_tag: 0=i8, 1=i16, 2=i32, 3=i64, 4=f32, 5=f64
+/// kind_tag: 0=i8, 1=i16, 2=i32, 3=i64, 4=f32, 5=f64,
+/// 6=complex(f32), 7=complex(f64)
 #[no_mangle]
 pub extern "C" fn afs_assign_allocatable_convert(
     dest: *mut ArrayDescriptor,
@@ -1653,14 +1794,8 @@ pub extern "C" fn afs_assign_allocatable_convert(
         return;
     }
 
-    let dest_elem_size: i64 = match dest_kind_tag {
-        0 => 1,
-        1 => 2,
-        2 | 4 => 4,
-        3 | 5 => 8,
-        6 => 8,
-        7 => 16,
-        _ => return,
+    let Some(dest_elem_size) = numeric_kind_elem_size(dest_kind_tag) else {
+        return;
     };
 
     let shapes_match = dest_ref.rank == source_ref.rank
@@ -1708,14 +1843,8 @@ pub extern "C" fn afs_assign_allocatable_convert(
 
     let src_p = source_ref.base_addr;
     let dst_p = dest_ref.base_addr;
-    let src_elem_size: i64 = match src_kind_tag {
-        0 => 1,
-        1 => 2,
-        2 | 4 => 4,
-        3 | 5 => 8,
-        6 => 8,
-        7 => 16,
-        _ => return,
+    let Some(src_elem_size) = numeric_kind_elem_size(src_kind_tag) else {
+        return;
     };
     // Source may be non-contiguous (e.g. transpose result, section).
     // Walk each multi-index column-major and apply per-dim strides.

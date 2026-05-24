@@ -33,10 +33,29 @@ pub(crate) fn lower_stmts(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmts: &[Span
     }
 }
 
-fn copy_array_result_to_fixed_dest(b: &mut FuncBuilder, info: &LocalInfo, src_desc: ValueId) {
+fn copy_array_result_to_fixed_dest(
+    b: &mut FuncBuilder,
+    info: &LocalInfo,
+    src_desc: ValueId,
+    src_elem_ty: Option<&IrType>,
+) {
     let n = array_total_elems_value(b, info);
     let elem_bytes = b.const_i64(ir_scalar_byte_size(&info.ty));
     let byte_count = b.imul(n, elem_bytes);
+    let src_kind_tag = src_elem_ty.and_then(numeric_kind_tag_for_ir_type);
+    let dest_kind_tag = numeric_kind_tag_for_ir_type(&info.ty);
+    if let (Some(sk), Some(dk)) = (src_kind_tag, dest_kind_tag) {
+        if sk != dk {
+            let dk_v = b.const_i32(dk);
+            let sk_v = b.const_i32(sk);
+            b.call(
+                FuncRef::External("afs_copy_array_result_to_fixed_convert".into()),
+                vec![info.addr, src_desc, byte_count, dk_v, sk_v],
+                IrType::Void,
+            );
+            return;
+        }
+    }
     b.call(
         FuncRef::External("afs_copy_array_result_to_fixed".into()),
         vec![info.addr, src_desc, byte_count],
@@ -580,6 +599,18 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                 if local_uses_array_descriptor(&info) {
                                                     lower_array_assign(b, ctx, name, &info, value);
                                                 } else {
+                                                    let src_elem_ty =
+                                                        array_function_result_elem_type(
+                                                            b,
+                                                            &ctx.locals,
+                                                            callee,
+                                                            call_args,
+                                                            ctx.st,
+                                                            Some(ctx.type_layouts),
+                                                            Some(ctx.internal_funcs),
+                                                            Some(ctx.contained_host_refs),
+                                                            Some(ctx.descriptor_params),
+                                                        );
                                                     let tmp_desc = b.alloca(IrType::Array(
                                                         Box::new(IrType::Int(IntWidth::I8)),
                                                         384,
@@ -601,7 +632,10 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                         call_args,
                                                     );
                                                     copy_array_result_to_fixed_dest(
-                                                        b, &info, tmp_desc,
+                                                        b,
+                                                        &info,
+                                                        tmp_desc,
+                                                        src_elem_ty.as_ref(),
                                                     );
                                                     let stat = b.alloca(IrType::Int(IntWidth::I32));
                                                     b.store(zero32, stat);
@@ -675,7 +709,10 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                     }
                                                 } else {
                                                     copy_array_result_to_fixed_dest(
-                                                        b, &info, src_desc,
+                                                        b,
+                                                        &info,
+                                                        src_desc,
+                                                        src_elem_ty.as_ref(),
                                                     );
                                                 }
                                                 let stat = b.alloca(IrType::Int(IntWidth::I32));
@@ -744,7 +781,12 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                     );
                                                 }
                                             } else {
-                                                copy_array_result_to_fixed_dest(b, &info, src_desc);
+                                                copy_array_result_to_fixed_dest(
+                                                    b,
+                                                    &info,
+                                                    src_desc,
+                                                    src_elem_ty.as_ref(),
+                                                );
                                             }
                                             let stat = b.alloca(IrType::Int(IntWidth::I32));
                                             let zero32 = b.const_i32(0);
