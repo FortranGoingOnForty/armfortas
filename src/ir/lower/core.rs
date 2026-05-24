@@ -19734,9 +19734,8 @@ fn character_expr_type_known(
     st: &SymbolTable,
     type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
 ) -> bool {
-    operator_expr_type_info(expr, Some(locals), st, type_layouts).is_some_and(|ti| {
-        matches!(ti, crate::sema::symtab::TypeInfo::Character { .. })
-    })
+    operator_expr_type_info(expr, Some(locals), st, type_layouts)
+        .is_some_and(|ti| matches!(ti, crate::sema::symtab::TypeInfo::Character { .. }))
 }
 
 pub(super) fn string_expr_lowers_to_owned_heap_temp(
@@ -28870,6 +28869,30 @@ pub(super) fn box_actual_into_class_star_descriptor(
     // to put in the descriptor's base_addr. For scalars we lower the
     // expression and store into a temp; for whole-array names we use
     // their existing storage.
+    if expr_is_character_expr(b, locals, expr, st, type_layouts)
+        && !expr_is_array_designator(b, locals, expr, st, type_layouts)
+    {
+        let (base_ptr, elem_size) =
+            lower_string_expr_full(b, locals, expr, st, type_layouts, None, None, None);
+        let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+        let type_tag =
+            intrinsic_class_star_type_tag_value_for_expr(b, expr, Some(locals), st, type_layouts)
+                .or_else(|| {
+                    type_layouts.and_then(|tl| expr_type_tag_value(b, expr, Some(locals), st, tl))
+                });
+        let tbp_lookup =
+            type_layouts.and_then(|tl| expr_tbp_lookup_value(b, expr, Some(locals), st, tl));
+        store_scalar_polymorphic_descriptor_view(
+            b,
+            desc,
+            base_ptr,
+            Some(elem_size),
+            type_tag,
+            tbp_lookup,
+        );
+        return desc;
+    }
+
     let (base_ptr, elem_size_bytes): (ValueId, i64) = if let Expr::Name { name } = &expr.node {
         if let Some(info) = locals.get(&name.to_lowercase()) {
             let bytes = descriptor_element_size_bytes(info).max(1);
@@ -38804,24 +38827,38 @@ pub(super) fn with_select_type_intrinsic_guard_binding<F>(
         },
     );
     let scalar_ty = type_info_to_ir_type(&guard_ti);
-    let typed_base = {
-        let raw = b.ptr_to_int(base);
-        b.int_to_ptr(raw, scalar_ty.clone())
-    };
     let logical_kind = match &guard_ti {
         crate::sema::symtab::TypeInfo::Logical { kind } => *kind,
         _ => None,
     };
-    let char_kind = match &guard_ti {
-        crate::sema::symtab::TypeInfo::Character { len: Some(len), .. } => CharKind::Fixed(*len),
-        _ => CharKind::None,
+    let (addr, ty, descriptor_arg, char_kind) = match &guard_ti {
+        crate::sema::symtab::TypeInfo::Character { len: None, .. } => (
+            desc,
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+            true,
+            CharKind::None,
+        ),
+        crate::sema::symtab::TypeInfo::Character { len: Some(len), .. } => {
+            let typed_base = {
+                let raw = b.ptr_to_int(base);
+                b.int_to_ptr(raw, scalar_ty.clone())
+            };
+            (typed_base, scalar_ty.clone(), false, CharKind::Fixed(*len))
+        }
+        _ => {
+            let typed_base = {
+                let raw = b.ptr_to_int(base);
+                b.int_to_ptr(raw, scalar_ty.clone())
+            };
+            (typed_base, scalar_ty.clone(), false, CharKind::None)
+        }
     };
     let info = LocalInfo {
-        addr: typed_base,
-        ty: scalar_ty,
+        addr,
+        ty,
         dims: vec![],
         allocatable: false,
-        descriptor_arg: false,
+        descriptor_arg,
         by_ref: false,
         char_kind,
         derived_type: None,
@@ -40299,13 +40336,7 @@ pub(super) fn deallocate_derived_storage_components(
         };
 
         if field.dims.is_empty() {
-            deallocate_derived_storage_components(
-                b,
-                field_ptr,
-                nested_layout,
-                registry,
-                stat_addr,
-            );
+            deallocate_derived_storage_components(b, field_ptr, nested_layout, registry, stat_addr);
             continue;
         }
 
@@ -40317,13 +40348,7 @@ pub(super) fn deallocate_derived_storage_components(
         for idx in 0..elem_count {
             let byte_off = b.const_i64(idx * elem_bytes);
             let elem_ptr = b.gep(field_ptr, vec![byte_off], IrType::Int(IntWidth::I8));
-            deallocate_derived_storage_components(
-                b,
-                elem_ptr,
-                nested_layout,
-                registry,
-                stat_addr,
-            );
+            deallocate_derived_storage_components(b, elem_ptr, nested_layout, registry, stat_addr);
         }
     }
 }
@@ -41485,14 +41510,7 @@ pub(super) fn store_derived_field_expr(
             vec![field_ptr, dest_len, src_ptr, src_len],
             IrType::Void,
         );
-        deallocate_owned_string_expr_temp(
-            b,
-            locals,
-            value,
-            st,
-            Some(type_layouts),
-            src_ptr,
-        );
+        deallocate_owned_string_expr_temp(b, locals, value, st, Some(type_layouts), src_ptr);
         return;
     }
 
@@ -41521,14 +41539,7 @@ pub(super) fn store_derived_field_expr(
                 IrType::Void,
             );
         }
-        deallocate_owned_string_expr_temp(
-            b,
-            locals,
-            value,
-            st,
-            Some(type_layouts),
-            src_ptr,
-        );
+        deallocate_owned_string_expr_temp(b, locals, value, st, Some(type_layouts), src_ptr);
         return;
     }
 
