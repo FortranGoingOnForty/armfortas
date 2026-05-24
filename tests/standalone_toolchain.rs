@@ -354,6 +354,42 @@ fn hello_world_runs_through_driver_with_afs_ld_enable_flag() {
 }
 
 #[test]
+fn hello_world_allows_apple_ld_fallback_with_afs_ld_zero() {
+    let Some(armfortas) = binary("armfortas") else {
+        eprintln!("skipping: armfortas binary not built");
+        return;
+    };
+    let Some(afs_as) = binary("afs-as") else {
+        eprintln!("skipping: afs-as binary not built");
+        return;
+    };
+    let Some(runtime) = runtime_archive() else {
+        eprintln!("skipping: libarmfortas_rt.a not built");
+        return;
+    };
+
+    let source = workspace_root().join("test_programs/hello.f90");
+    assert!(source.exists(), "hello.f90 missing at {}", source.display());
+
+    let dir = unique_dir("driver_apple_ld_fallback_hello");
+    let fallback_bin = dir.join("hello-driver-apple-ld-fallback");
+
+    let fallback_compile = compile_with_driver_args_and_vars(
+        &armfortas,
+        &source,
+        &fallback_bin,
+        &[("AFS_AS_PATH", &afs_as), ("AFS_RUNTIME_PATH", &runtime)],
+        &[("AFS_LD", "0")],
+        &[],
+        "AFS_LD=0 armfortas compile",
+    );
+    assert_success(&fallback_compile, "AFS_LD=0 armfortas compile");
+    let fallback_run = run_binary(&fallback_bin, "AFS_LD=0 armfortas run");
+    let fallback_stdout = String::from_utf8_lossy(&fallback_run.stdout);
+    assert_eq!(fallback_stdout, " Hello, World!\n");
+}
+
+#[test]
 fn shared_library_runs_through_driver_with_standalone_linker_override() {
     let Some(armfortas) = binary("armfortas") else {
         eprintln!("skipping: armfortas binary not built");

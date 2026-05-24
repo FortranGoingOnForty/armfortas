@@ -1571,7 +1571,7 @@ _main:
 
 /// Link an object file with the runtime library to produce a binary.
 /// `opts` contributes the user-supplied `-L`, `-l`, `-rpath`,
-/// `-shared`, and `-static` flags that need to make it through to ld.
+/// `-shared`, and `-static` flags that need to make it through to the linker.
 fn link(obj: &Path, output: &Path, opts: &Options) -> Result<(), String> {
     link_inputs(&[obj.to_path_buf()], output, opts)
 }
@@ -1624,7 +1624,9 @@ fn link_inputs_with_afs_ld(
     opts: &Options,
 ) -> Result<(), String> {
     if opts.static_link {
-        return Err("AFS_LD override does not yet support static-link mode".into());
+        return Err(
+            "afs-ld does not yet support static-link mode; set AFS_LD=0 to use Apple ld".into(),
+        );
     }
 
     let rt_path = find_runtime_lib()?;
@@ -1643,16 +1645,15 @@ fn link_inputs_with_afs_ld(
     args.push(libsystem_tbd);
     push_afs_ld_link_flags(&mut args, opts);
 
-    let output = Command::new(linker)
-        .args(&args)
-        .output()
-        .map_err(|e| format!("cannot run linker: {}", e))?;
+    let output = Command::new(linker).args(&args).output().map_err(|e| {
+        format!("cannot run afs-ld linker `{linker}`: {e}\nset AFS_LD=0 to use Apple ld")
+    })?;
 
     if output.status.success() {
         Ok(())
     } else {
         Err(format!(
-            "linker failed:\n{}",
+            "afs-ld linker failed:\n{}\nset AFS_LD=0 to retry with Apple ld",
             String::from_utf8_lossy(&output.stderr)
         ))
     }
@@ -1700,15 +1701,14 @@ fn push_afs_ld_link_flags(args: &mut Vec<String>, opts: &Options) {
 }
 
 fn afs_ld_override() -> Option<String> {
+    if env_override("AFS_LD")
+        .as_deref()
+        .is_some_and(|value| matches!(value, "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF"))
+    {
+        return None;
+    }
     if let Some(linker) = env_override("AFS_LD_PATH") {
         return Some(linker);
-    }
-    let enabled = env_override("AFS_LD")?;
-    if matches!(
-        enabled.as_str(),
-        "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF"
-    ) {
-        return None;
     }
     Some(resolve_sibling_tool("afs-ld"))
 }
