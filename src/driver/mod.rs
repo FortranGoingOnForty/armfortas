@@ -1624,9 +1624,7 @@ fn link_inputs_with_afs_ld(
     opts: &Options,
 ) -> Result<(), String> {
     if opts.static_link {
-        return Err(
-            "afs-ld does not yet support static-link mode; set AFS_LD=0 to use Apple ld".into(),
-        );
+        return Err("AFS_LD override does not yet support static-link mode".into());
     }
 
     let rt_path = find_runtime_lib()?;
@@ -1645,15 +1643,16 @@ fn link_inputs_with_afs_ld(
     args.push(libsystem_tbd);
     push_afs_ld_link_flags(&mut args, opts);
 
-    let output = Command::new(linker).args(&args).output().map_err(|e| {
-        format!("cannot run afs-ld linker `{linker}`: {e}\nset AFS_LD=0 to use Apple ld")
-    })?;
+    let output = Command::new(linker)
+        .args(&args)
+        .output()
+        .map_err(|e| format!("cannot run linker: {}", e))?;
 
     if output.status.success() {
         Ok(())
     } else {
         Err(format!(
-            "afs-ld linker failed:\n{}\nset AFS_LD=0 to retry with Apple ld",
+            "linker failed:\n{}",
             String::from_utf8_lossy(&output.stderr)
         ))
     }
@@ -1701,14 +1700,15 @@ fn push_afs_ld_link_flags(args: &mut Vec<String>, opts: &Options) {
 }
 
 fn afs_ld_override() -> Option<String> {
-    if env_override("AFS_LD")
-        .as_deref()
-        .is_some_and(|value| matches!(value, "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF"))
-    {
-        return None;
-    }
     if let Some(linker) = env_override("AFS_LD_PATH") {
         return Some(linker);
+    }
+    let enabled = env_override("AFS_LD")?;
+    if matches!(
+        enabled.as_str(),
+        "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF"
+    ) {
+        return None;
     }
     Some(resolve_sibling_tool("afs-ld"))
 }
