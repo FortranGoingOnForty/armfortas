@@ -3777,6 +3777,27 @@ fn mixed_numeric_array_binary_exprs_fixture_passes_all_opts() {
 }
 
 #[test]
+fn matmul_transpose_inline_rank2_array_expr_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("matmul_transpose_inline_rank2_array_expr.f90");
+    assert!(
+        source.exists(),
+        "matmul_transpose_inline_rank2_array_expr.f90 missing"
+    );
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "matmul_transpose_inline_rank2_array_expr.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
 fn real_alloc_result_to_complex_fixed_array_fixture_passes_all_opts() {
     let compiler = find_compiler();
     let test_dir = find_test_programs();

@@ -2091,11 +2091,42 @@ unsafe fn libc_free(ptr: *mut u8) {
     free(ptr)
 }
 
+fn set_rank2_contiguous_shape(desc: &mut ArrayDescriptor, dim0: usize, dim1: usize) {
+    desc.rank = 2;
+    desc.dims[0] = DimDescriptor {
+        lower_bound: 1,
+        upper_bound: dim0 as i64,
+        stride: 1,
+    };
+    desc.dims[1] = DimDescriptor {
+        lower_bound: 1,
+        upper_bound: dim1 as i64,
+        stride: dim0.max(1) as i64,
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn i32_descriptor(data: &mut [i32], extents: &[i64]) -> ArrayDescriptor {
+        let mut desc = ArrayDescriptor::zeroed();
+        desc.base_addr = data.as_mut_ptr() as *mut u8;
+        desc.elem_size = 4;
+        desc.rank = extents.len() as i32;
+        let mut stride = 1;
+        for (i, extent) in extents.iter().copied().enumerate() {
+            desc.dims[i] = DimDescriptor {
+                lower_bound: 1,
+                upper_bound: extent,
+                stride,
+            };
+            stride *= extent.max(0);
+        }
+        desc
+    }
+
+    fn f32_descriptor(data: &mut [f32], extents: &[i64]) -> ArrayDescriptor {
         let mut desc = ArrayDescriptor::zeroed();
         desc.base_addr = data.as_mut_ptr() as *mut u8;
         desc.elem_size = 4;
@@ -2202,6 +2233,26 @@ mod tests {
         assert_eq!(dest.dims[1].stride, 4);
 
         afs_deallocate_array(&mut dest, ptr::null_mut());
+    }
+
+    #[test]
+    fn matmul_and_transpose_publish_rank2_column_major_strides() {
+        let mut data = [1.0_f32, 2.0, 3.0, 4.0];
+        let source = f32_descriptor(&mut data, &[2, 2]);
+
+        let mut transposed = ArrayDescriptor::zeroed();
+        afs_transpose_real8(&source, &mut transposed);
+        assert_eq!(transposed.rank, 2);
+        assert_eq!(transposed.dims[0].stride, 1);
+        assert_eq!(transposed.dims[1].stride, 2);
+        afs_deallocate_array(&mut transposed, ptr::null_mut());
+
+        let mut product = ArrayDescriptor::zeroed();
+        afs_matmul_real8(&source, &source, &mut product);
+        assert_eq!(product.rank, 2);
+        assert_eq!(product.dims[0].stride, 1);
+        assert_eq!(product.dims[1].stride, 2);
+        afs_deallocate_array(&mut product, ptr::null_mut());
     }
 
     #[test]
@@ -5365,17 +5416,7 @@ pub extern "C" fn afs_transpose_real8(
     // get the right buffer size and stride.
     afs_allocate_1d(result, elem_size, (n * m) as i64);
     let res = unsafe { &mut *result };
-    res.rank = 2;
-    res.dims[0] = DimDescriptor {
-        lower_bound: 1,
-        upper_bound: n as i64,
-        stride: 1,
-    };
-    res.dims[1] = DimDescriptor {
-        lower_bound: 1,
-        upper_bound: m as i64,
-        stride: 1,
-    };
+    set_rank2_contiguous_shape(res, n, m);
 
     // Fortran arrays are column-major: source A(i,j) at offset j*m+i for
     // an m-row source; result B = transpose(A) has n rows, so B(j,i) at
@@ -5458,17 +5499,7 @@ pub extern "C" fn afs_matmul_real8(
     // real(8) inputs both produce correctly-sized output buffers.
     afs_allocate_1d(result, elem_size, (m * n) as i64);
     let res = unsafe { &mut *result };
-    res.rank = 2;
-    res.dims[0] = DimDescriptor {
-        lower_bound: 1,
-        upper_bound: m as i64,
-        stride: 1,
-    };
-    res.dims[1] = DimDescriptor {
-        lower_bound: 1,
-        upper_bound: n as i64,
-        stride: 1,
-    };
+    set_rank2_contiguous_shape(res, m, n);
 
     // Fortran is column-major: A(m,k) stores A(i,l) at l*m + i,
     // B(k,n) stores B(l,j) at j*k + l, C(m,n) stores C(i,j) at j*m + i.
@@ -5541,17 +5572,7 @@ pub extern "C" fn afs_matmul_complex(
 
     afs_allocate_1d(result, elem_size, (m * n) as i64);
     let res = unsafe { &mut *result };
-    res.rank = 2;
-    res.dims[0] = DimDescriptor {
-        lower_bound: 1,
-        upper_bound: m as i64,
-        stride: 1,
-    };
-    res.dims[1] = DimDescriptor {
-        lower_bound: 1,
-        upper_bound: n as i64,
-        stride: 1,
-    };
+    set_rank2_contiguous_shape(res, m, n);
 
     if elem_size == 8 {
         // complex(4): pairs of f32 (re, im).
@@ -5635,17 +5656,7 @@ pub extern "C" fn afs_matmul_int(
 
     afs_allocate_1d(result, 4, (m * n) as i64);
     let res = unsafe { &mut *result };
-    res.rank = 2;
-    res.dims[0] = DimDescriptor {
-        lower_bound: 1,
-        upper_bound: m as i64,
-        stride: 1,
-    };
-    res.dims[1] = DimDescriptor {
-        lower_bound: 1,
-        upper_bound: n as i64,
-        stride: 1,
-    };
+    set_rank2_contiguous_shape(res, m, n);
     let rp = res.base_addr as *mut i32;
 
     // Fortran is column-major: A(m,k) stores A(i,l) at l*m + i,
