@@ -1541,7 +1541,7 @@ pub extern "C" fn afs_deallocate_array(desc: *mut ArrayDescriptor, stat: *mut i3
 // ---- ALLOCATABLE ASSIGNMENT ----
 
 fn descriptor_looks_sane(desc: &ArrayDescriptor) -> bool {
-    let known_flags = DESC_ALLOCATED | DESC_CONTIGUOUS | DESC_POINTER;
+    let known_flags = DESC_ALLOCATED | DESC_CONTIGUOUS | DESC_POINTER | DESC_TYPE_TAG_MASK;
     if desc.flags & !known_flags != 0 {
         return false;
     }

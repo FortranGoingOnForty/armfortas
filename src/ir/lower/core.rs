@@ -27165,8 +27165,29 @@ pub(super) fn load_array_desc_i64_field(
     b.load_typed(ptr, IrType::Int(IntWidth::I64))
 }
 
+const ARRAY_DESC_RANK_OFFSET: i64 = 16;
+const ARRAY_DESC_FLAGS_OFFSET: i64 = 20;
+const ARRAY_DESC_SCALAR_TYPE_TAG_OFFSET: i64 = 24;
+const ARRAY_DESC_FLAGS_LOW_BITS_MASK: i32 = 0x0000_00ff;
+const ARRAY_DESC_TYPE_TAG_COMPACT_MASK: i64 = 0x00ff_ffff;
+const ARRAY_DESC_TYPE_TAG_FLAGS_SHIFT: i32 = 8;
+const CLASS_STAR_TAG_INTRINSIC_PREFIX: u64 = 0x0AF5_C1A5_5000_0000;
+
 pub(super) fn load_array_desc_type_tag(b: &mut FuncBuilder, desc: ValueId) -> ValueId {
-    load_array_desc_i64_field(b, desc, 24)
+    let scalar_tag = load_array_desc_i64_field(b, desc, ARRAY_DESC_SCALAR_TYPE_TAG_OFFSET);
+    let rank = load_array_desc_i32_field(b, desc, ARRAY_DESC_RANK_OFFSET);
+    let flags = load_array_desc_i32_field(b, desc, ARRAY_DESC_FLAGS_OFFSET);
+    let shift = b.const_i32(ARRAY_DESC_TYPE_TAG_FLAGS_SHIFT);
+    let compact32 = b.lshr(flags, shift);
+    let compact64 = b.int_extend(compact32, IntWidth::I64, false);
+    let zero64 = b.const_i64(0);
+    let has_compact_tag = b.icmp(CmpOp::Ne, compact64, zero64);
+    let prefix = b.const_i64(CLASS_STAR_TAG_INTRINSIC_PREFIX as i64);
+    let reconstructed = b.bit_or(prefix, compact64);
+    let array_tag = b.select(has_compact_tag, reconstructed, zero64);
+    let zero32 = b.const_i32(0);
+    let is_scalar = b.icmp(CmpOp::Eq, rank, zero32);
+    b.select(is_scalar, scalar_tag, array_tag)
 }
 
 pub(super) fn lower_parameter_derived_component_const(
@@ -27219,9 +27240,36 @@ pub(super) fn load_array_desc_tbp_lookup_ptr(b: &mut FuncBuilder, desc: ValueId)
 }
 
 pub(super) fn store_array_desc_type_tag(b: &mut FuncBuilder, desc: ValueId, tag: ValueId) {
-    let off = b.const_i64(24);
+    let rank = load_array_desc_i32_field(b, desc, ARRAY_DESC_RANK_OFFSET);
+    let zero32 = b.const_i32(0);
+    let is_scalar = b.icmp(CmpOp::Eq, rank, zero32);
+    let scalar_bb = b.create_block("desc_type_tag_scalar");
+    let array_bb = b.create_block("desc_type_tag_array");
+    let done_bb = b.create_block("desc_type_tag_done");
+    b.cond_branch(is_scalar, scalar_bb, vec![], array_bb, vec![]);
+
+    b.set_block(scalar_bb);
+    let off = b.const_i64(ARRAY_DESC_SCALAR_TYPE_TAG_OFFSET);
     let ptr = b.gep(desc, vec![off], IrType::Int(IntWidth::I8));
     b.store(tag, ptr);
+    b.branch(done_bb, vec![]);
+
+    b.set_block(array_bb);
+    let flags_off = b.const_i64(ARRAY_DESC_FLAGS_OFFSET);
+    let flags_ptr = b.gep(desc, vec![flags_off], IrType::Int(IntWidth::I8));
+    let flags = b.load_typed(flags_ptr, IrType::Int(IntWidth::I32));
+    let low_bits = b.const_i32(ARRAY_DESC_FLAGS_LOW_BITS_MASK);
+    let preserved_flags = b.bit_and(flags, low_bits);
+    let compact_mask = b.const_i64(ARRAY_DESC_TYPE_TAG_COMPACT_MASK);
+    let compact64 = b.bit_and(tag, compact_mask);
+    let compact32 = b.int_trunc(compact64, IntWidth::I32);
+    let shift = b.const_i32(ARRAY_DESC_TYPE_TAG_FLAGS_SHIFT);
+    let encoded_tag = b.shl(compact32, shift);
+    let new_flags = b.bit_or(preserved_flags, encoded_tag);
+    b.store(new_flags, flags_ptr);
+    b.branch(done_bb, vec![]);
+
+    b.set_block(done_bb);
 }
 
 pub(super) fn store_array_desc_tbp_lookup_ptr(
@@ -27271,55 +27319,228 @@ pub(super) fn store_scalar_polymorphic_descriptor_view(
     }
 }
 
-const CLASS_STAR_TAG_INTEGER: u64 = 0x0AF5_C1A5_5000_0001;
-const CLASS_STAR_TAG_REAL: u64 = 0x0AF5_C1A5_5000_0002;
-const CLASS_STAR_TAG_DOUBLE: u64 = 0x0AF5_C1A5_5000_0003;
-const CLASS_STAR_TAG_COMPLEX: u64 = 0x0AF5_C1A5_5000_0004;
-const CLASS_STAR_TAG_LOGICAL: u64 = 0x0AF5_C1A5_5000_0005;
-const CLASS_STAR_TAG_CHARACTER: u64 = 0x0AF5_C1A5_5000_0006;
+const CLASS_STAR_TAG_INTEGER_BASE: u64 = 0x0AF5_C1A5_5001_0000;
+const CLASS_STAR_TAG_REAL_BASE: u64 = 0x0AF5_C1A5_5002_0000;
+const CLASS_STAR_TAG_COMPLEX_BASE: u64 = 0x0AF5_C1A5_5003_0000;
+const CLASS_STAR_TAG_LOGICAL_BASE: u64 = 0x0AF5_C1A5_5004_0000;
+const CLASS_STAR_TAG_CHARACTER_BASE: u64 = 0x0AF5_C1A5_5005_0000;
+
+#[derive(Debug, Clone, Copy)]
+enum IntrinsicClassStarGuard {
+    Integer(u8),
+    Real(u8),
+    Complex(u8),
+    Logical(u8),
+    Character(u8),
+}
+
+fn class_star_intrinsic_tag(base: u64, kind: u8) -> u64 {
+    base | u64::from(kind)
+}
+
+fn intrinsic_class_star_tag_from_guard_spec(spec: IntrinsicClassStarGuard) -> u64 {
+    match spec {
+        IntrinsicClassStarGuard::Integer(kind) => {
+            class_star_intrinsic_tag(CLASS_STAR_TAG_INTEGER_BASE, kind)
+        }
+        IntrinsicClassStarGuard::Real(kind) => {
+            class_star_intrinsic_tag(CLASS_STAR_TAG_REAL_BASE, kind)
+        }
+        IntrinsicClassStarGuard::Complex(kind) => {
+            class_star_intrinsic_tag(CLASS_STAR_TAG_COMPLEX_BASE, kind)
+        }
+        IntrinsicClassStarGuard::Logical(kind) => {
+            class_star_intrinsic_tag(CLASS_STAR_TAG_LOGICAL_BASE, kind)
+        }
+        IntrinsicClassStarGuard::Character(kind) => {
+            class_star_intrinsic_tag(CLASS_STAR_TAG_CHARACTER_BASE, kind)
+        }
+    }
+}
+
+fn compact_intrinsic_guard_name(type_name: &str) -> String {
+    type_name
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect()
+}
+
+fn intrinsic_guard_selector<'a>(compact: &'a str, base: &str) -> Option<Option<&'a str>> {
+    if compact == base {
+        return Some(None);
+    }
+    if compact.starts_with(base)
+        && compact.as_bytes().get(base.len()) == Some(&b'(')
+        && compact.ends_with(')')
+    {
+        return Some(Some(&compact[base.len() + 1..compact.len() - 1]));
+    }
+    None
+}
+
+fn top_level_selector_items(selector: &str) -> Vec<&str> {
+    let mut items = Vec::new();
+    let mut start = 0;
+    let mut depth = 0_i32;
+    for (idx, ch) in selector.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                items.push(&selector[start..idx]);
+                start = idx + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    items.push(&selector[start..]);
+    items
+}
+
+fn kind_expr_from_intrinsic_guard_selector<'a>(
+    selector: Option<&'a str>,
+    bare_selector_is_kind: bool,
+) -> Option<&'a str> {
+    let selector = selector?;
+    let items = top_level_selector_items(selector);
+    for item in &items {
+        if let Some(rest) = item.strip_prefix("kind=") {
+            return Some(rest);
+        }
+    }
+    if bare_selector_is_kind {
+        let first = items.first().copied().unwrap_or_default();
+        if !first.is_empty() && !first.starts_with("len=") && first != "*" {
+            return Some(first);
+        }
+    }
+    None
+}
+
+fn common_intrinsic_kind_name_value(kind_name: &str) -> Option<u8> {
+    match kind_name {
+        "int8" | "c_int8_t" => Some(1),
+        "int16" | "c_int16_t" => Some(2),
+        "int32" | "c_int" | "c_int32_t" => Some(4),
+        "int64" | "c_long" | "c_long_long" | "c_int64_t" => Some(8),
+        "real32" | "sp" | "c_float" => Some(4),
+        "real64" | "dp" | "xdp" | "c_double" => Some(8),
+        "real128" | "qp" | "c_long_double" => Some(16),
+        "c_bool" => Some(1),
+        _ => None,
+    }
+}
+
+fn intrinsic_guard_kind_value(
+    selector: Option<&str>,
+    default: u8,
+    bare_selector_is_kind: bool,
+    st: Option<&SymbolTable>,
+) -> u8 {
+    let Some(kind_expr) = kind_expr_from_intrinsic_guard_selector(selector, bare_selector_is_kind)
+    else {
+        return default;
+    };
+    named_kind_value(kind_expr, None, None, st)
+        .or_else(|| common_intrinsic_kind_name_value(kind_expr))
+        .unwrap_or(default)
+}
+
+fn parse_intrinsic_class_star_guard(
+    type_name: &str,
+    st: Option<&SymbolTable>,
+) -> Option<IntrinsicClassStarGuard> {
+    let compact = compact_intrinsic_guard_name(type_name);
+    match compact.as_str() {
+        "double" | "doubleprecision" => return Some(IntrinsicClassStarGuard::Real(8)),
+        "doublecomplex" => return Some(IntrinsicClassStarGuard::Complex(8)),
+        _ => {}
+    }
+    if let Some(selector) = intrinsic_guard_selector(&compact, "integer") {
+        let kind = intrinsic_guard_kind_value(
+            selector,
+            crate::driver::defaults::default_int_kind(),
+            true,
+            st,
+        );
+        return Some(IntrinsicClassStarGuard::Integer(kind));
+    }
+    if let Some(selector) = intrinsic_guard_selector(&compact, "real") {
+        let kind = intrinsic_guard_kind_value(
+            selector,
+            crate::driver::defaults::default_real_kind(),
+            true,
+            st,
+        );
+        return Some(IntrinsicClassStarGuard::Real(kind));
+    }
+    if let Some(selector) = intrinsic_guard_selector(&compact, "complex") {
+        let kind = intrinsic_guard_kind_value(selector, 4, true, st);
+        return Some(IntrinsicClassStarGuard::Complex(kind));
+    }
+    if let Some(selector) = intrinsic_guard_selector(&compact, "logical") {
+        let kind = intrinsic_guard_kind_value(selector, 4, true, st);
+        return Some(IntrinsicClassStarGuard::Logical(kind));
+    }
+    if let Some(selector) = intrinsic_guard_selector(&compact, "character") {
+        let kind = intrinsic_guard_kind_value(selector, 1, false, st);
+        return Some(IntrinsicClassStarGuard::Character(kind));
+    }
+    None
+}
 
 pub(super) fn intrinsic_class_star_type_tag_for_type_info(
     ti: &crate::sema::symtab::TypeInfo,
 ) -> Option<u64> {
     use crate::sema::symtab::TypeInfo;
     match ti {
-        TypeInfo::Integer { .. } => Some(CLASS_STAR_TAG_INTEGER),
-        TypeInfo::Real { .. } => Some(CLASS_STAR_TAG_REAL),
-        TypeInfo::DoublePrecision => Some(CLASS_STAR_TAG_DOUBLE),
-        TypeInfo::Complex { .. } => Some(CLASS_STAR_TAG_COMPLEX),
-        TypeInfo::Logical { .. } => Some(CLASS_STAR_TAG_LOGICAL),
-        TypeInfo::Character { .. } => Some(CLASS_STAR_TAG_CHARACTER),
+        TypeInfo::Integer { kind } => Some(class_star_intrinsic_tag(
+            CLASS_STAR_TAG_INTEGER_BASE,
+            kind.unwrap_or_else(crate::driver::defaults::default_int_kind),
+        )),
+        TypeInfo::Real { kind } => Some(class_star_intrinsic_tag(
+            CLASS_STAR_TAG_REAL_BASE,
+            kind.unwrap_or_else(crate::driver::defaults::default_real_kind),
+        )),
+        TypeInfo::DoublePrecision => Some(class_star_intrinsic_tag(CLASS_STAR_TAG_REAL_BASE, 8)),
+        TypeInfo::Complex { kind } => Some(class_star_intrinsic_tag(
+            CLASS_STAR_TAG_COMPLEX_BASE,
+            kind.unwrap_or(4),
+        )),
+        TypeInfo::Logical { kind } => Some(class_star_intrinsic_tag(
+            CLASS_STAR_TAG_LOGICAL_BASE,
+            kind.unwrap_or(4),
+        )),
+        TypeInfo::Character { kind, .. } => Some(class_star_intrinsic_tag(
+            CLASS_STAR_TAG_CHARACTER_BASE,
+            kind.unwrap_or(1),
+        )),
         _ => None,
     }
 }
 
-pub(super) fn intrinsic_class_star_type_tag_for_guard(type_name: &str) -> Option<u64> {
-    match type_name.to_ascii_lowercase().replace(' ', "").as_str() {
-        "integer" => Some(CLASS_STAR_TAG_INTEGER),
-        "real" => Some(CLASS_STAR_TAG_REAL),
-        "double" | "doubleprecision" => Some(CLASS_STAR_TAG_DOUBLE),
-        "complex" => Some(CLASS_STAR_TAG_COMPLEX),
-        "logical" => Some(CLASS_STAR_TAG_LOGICAL),
-        "character" => Some(CLASS_STAR_TAG_CHARACTER),
-        _ => None,
-    }
+pub(super) fn intrinsic_class_star_type_tag_for_guard(
+    type_name: &str,
+    st: Option<&SymbolTable>,
+) -> Option<u64> {
+    parse_intrinsic_class_star_guard(type_name, st).map(intrinsic_class_star_tag_from_guard_spec)
 }
 
 pub(super) fn intrinsic_class_star_type_info_for_guard(
     type_name: &str,
+    st: Option<&SymbolTable>,
 ) -> Option<crate::sema::symtab::TypeInfo> {
     use crate::sema::symtab::TypeInfo;
-    match type_name.to_ascii_lowercase().replace(' ', "").as_str() {
-        "integer" => Some(TypeInfo::Integer { kind: None }),
-        "real" => Some(TypeInfo::Real { kind: None }),
-        "double" | "doubleprecision" => Some(TypeInfo::DoublePrecision),
-        "complex" => Some(TypeInfo::Complex { kind: None }),
-        "logical" => Some(TypeInfo::Logical { kind: None }),
-        "character" => Some(TypeInfo::Character {
+    match parse_intrinsic_class_star_guard(type_name, st)? {
+        IntrinsicClassStarGuard::Integer(kind) => Some(TypeInfo::Integer { kind: Some(kind) }),
+        IntrinsicClassStarGuard::Real(kind) => Some(TypeInfo::Real { kind: Some(kind) }),
+        IntrinsicClassStarGuard::Complex(kind) => Some(TypeInfo::Complex { kind: Some(kind) }),
+        IntrinsicClassStarGuard::Logical(kind) => Some(TypeInfo::Logical { kind: Some(kind) }),
+        IntrinsicClassStarGuard::Character(kind) => Some(TypeInfo::Character {
             len: None,
-            kind: Some(1),
+            kind: Some(kind),
         }),
-        _ => None,
     }
 }
 
@@ -28720,6 +28941,42 @@ pub(super) fn expr_needs_static_scalar_descriptor_view(
         && !info.is_class
 }
 
+fn descriptor_with_polymorphic_type_tag(
+    b: &mut FuncBuilder,
+    desc: ValueId,
+    expr: &crate::ast::expr::SpannedExpr,
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> ValueId {
+    if let Expr::Name { name } = &expr.node {
+        if let Some(info) = locals.get(&name.to_lowercase()) {
+            if info.is_class && local_uses_array_descriptor(info) {
+                return desc;
+            }
+        }
+    }
+
+    let type_tag =
+        intrinsic_class_star_type_tag_value_for_expr(b, expr, Some(locals), st, type_layouts)
+            .or_else(|| {
+                type_layouts.and_then(|tl| expr_type_tag_value(b, expr, Some(locals), st, tl))
+            });
+    let Some(type_tag) = type_tag else {
+        return desc;
+    };
+
+    let tagged = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let size = b.const_i64(384);
+    b.call(
+        FuncRef::External("memcpy".into()),
+        vec![tagged, desc, size],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+    store_array_desc_type_tag(b, tagged, type_tag);
+    tagged
+}
+
 pub(super) fn lower_arg_descriptor(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -28772,6 +29029,9 @@ pub(super) fn lower_arg_descriptor_full(
         contained_host_refs,
         descriptor_params,
     ) {
+        if force_static_scalar_polymorphic_view {
+            return descriptor_with_polymorphic_type_tag(b, desc, expr, locals, st, type_layouts);
+        }
         return desc;
     }
     if let Expr::Name { name } = &expr.node {
@@ -38790,7 +39050,7 @@ pub(super) fn with_select_type_intrinsic_guard_binding<F>(
         f(b, ctx);
         return;
     };
-    let Some(guard_ti) = intrinsic_class_star_type_info_for_guard(guard_type) else {
+    let Some(guard_ti) = intrinsic_class_star_type_info_for_guard(guard_type, Some(ctx.st)) else {
         f(b, ctx);
         return;
     };
@@ -38807,6 +39067,37 @@ pub(super) fn with_select_type_intrinsic_guard_binding<F>(
     };
 
     let desc = array_descriptor_addr(b, &selector_info);
+    if local_declared_rank(&selector_info) > 0 {
+        let info = LocalInfo {
+            addr: desc,
+            ty: type_info_to_ir_type(&guard_ti),
+            dims: selector_info.dims.clone(),
+            allocatable: false,
+            descriptor_arg: true,
+            by_ref: false,
+            char_kind: selector_info.char_kind.clone(),
+            derived_type: None,
+            inline_const: None,
+            is_pointer: false,
+            runtime_dim_upper: selector_info.runtime_dim_upper.clone(),
+            is_class: false,
+            logical_kind: match &guard_ti {
+                crate::sema::symtab::TypeInfo::Logical { kind } => *kind,
+                _ => None,
+            },
+            last_dim_assumed_size: selector_info.last_dim_assumed_size,
+        };
+
+        let saved = ctx.locals.insert(binding_name.clone(), info);
+        f(b, ctx);
+        if let Some(orig) = saved {
+            ctx.locals.insert(binding_name, orig);
+        } else {
+            ctx.locals.remove(&binding_name);
+        }
+        return;
+    }
+
     let base = scalar_descriptor_base_addr_raw(
         b,
         &LocalInfo {

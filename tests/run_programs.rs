@@ -3570,6 +3570,48 @@ fn class_star_character_select_type_message_fixture_passes_all_opts() {
 }
 
 #[test]
+fn class_star_real_kind_select_type_state_message_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("class_star_real_kind_select_type_state_message.f90");
+    assert!(
+        source.exists(),
+        "class_star_real_kind_select_type_state_message.f90 missing"
+    );
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "class_star_real_kind_select_type_state_message.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
+fn class_star_rank1_complex_select_type_state_message_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("class_star_rank1_complex_select_type_state_message.f90");
+    assert!(
+        source.exists(),
+        "class_star_rank1_complex_select_type_state_message.f90 missing"
+    );
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "class_star_rank1_complex_select_type_state_message.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
 fn inquire_positional_unit_capabilities_fixture_passes_all_opts() {
     let compiler = find_compiler();
     let test_dir = find_test_programs();

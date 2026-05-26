@@ -3002,7 +3002,6 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             );
             let dynamic_class_selector = selector_info.as_ref().filter(|info| {
                 local_uses_array_descriptor(info)
-                    && local_declared_rank(info) == 0
                     && (info.derived_type.is_some() || info.is_class || selector_is_unlimited)
             });
 
@@ -3020,7 +3019,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             body,
                         } => {
                             if let Some(guard_tag) =
-                                intrinsic_class_star_type_tag_for_guard(guard_type)
+                                intrinsic_class_star_type_tag_for_guard(guard_type, Some(ctx.st))
                             {
                                 let guard_tag = b.const_i64(guard_tag as i64);
                                 let matches = b.icmp(CmpOp::Eq, tag_val, guard_tag);

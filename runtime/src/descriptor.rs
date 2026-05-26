@@ -20,6 +20,8 @@ pub const MAX_RANK: usize = 15;
 pub const DESC_ALLOCATED: u32 = 1 << 0;
 pub const DESC_CONTIGUOUS: u32 = 1 << 1;
 pub const DESC_POINTER: u32 = 1 << 2;
+/// Compiler-private array CLASS(*) dynamic type bits stored above flags.
+pub const DESC_TYPE_TAG_MASK: u32 = 0xffff_ff00;
 
 /// Array descriptor — the runtime representation of a Fortran array.
 ///
@@ -29,7 +31,7 @@ pub const DESC_POINTER: u32 = 1 << 2;
 /// 0       base_addr      8 bytes (pointer)
 /// 8       elem_size      8 bytes (i64)
 /// 16      rank           4 bytes (i32)
-/// 20      flags          4 bytes (u32)
+/// 20      flags          4 bytes (u32; low 8 status bits, high 24 type tag)
 /// 24      dims[0]        24 bytes (DimDescriptor)
 /// 48      dims[1]        24 bytes
 /// ...
