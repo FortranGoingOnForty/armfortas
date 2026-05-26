@@ -21045,6 +21045,89 @@ pub(super) fn lower_complex_pow_lanes(
     (b.fmul(magnitude, angle_cos), b.fmul(magnitude, angle_sin))
 }
 
+pub(super) fn lower_complex_integer_pow_lanes(
+    b: &mut FuncBuilder,
+    fw: FloatWidth,
+    base_re: ValueId,
+    base_im: ValueId,
+    order_raw: ValueId,
+) -> (ValueId, ValueId) {
+    let order_i32 = match b.func().value_type(order_raw) {
+        Some(IrType::Int(IntWidth::I64)) => b.int_trunc(order_raw, IntWidth::I32),
+        _ => coerce_to_type(b, order_raw, &IrType::Int(IntWidth::I32)),
+    };
+    let zero_i32 = b.const_i32(0);
+    let one_f = match fw {
+        FloatWidth::F64 => b.const_f64(1.0),
+        FloatWidth::F32 => b.const_f32(1.0),
+    };
+    let zero_f = match fw {
+        FloatWidth::F64 => b.const_f64(0.0),
+        FloatWidth::F32 => b.const_f32(0.0),
+    };
+
+    let res_re_addr = b.alloca(IrType::Float(fw));
+    let res_im_addr = b.alloca(IrType::Float(fw));
+    b.store(one_f, res_re_addr);
+    b.store(zero_f, res_im_addr);
+    let base_re_addr = b.alloca(IrType::Float(fw));
+    let base_im_addr = b.alloca(IrType::Float(fw));
+    let counter_addr = b.alloca(IrType::Int(IntWidth::I32));
+
+    let neg = b.icmp(CmpOp::Lt, order_i32, zero_i32);
+    let bb_positive = b.create_block("complex_int_pow_nonnegative");
+    let bb_negative = b.create_block("complex_int_pow_negative");
+    let bb_check = b.create_block("complex_int_pow_check");
+    let bb_body = b.create_block("complex_int_pow_body");
+    let bb_exit = b.create_block("complex_int_pow_exit");
+    b.cond_branch(neg, bb_negative, vec![], bb_positive, vec![]);
+
+    b.set_block(bb_negative);
+    let neg_order = b.isub(zero_i32, order_i32);
+    let re_sq = b.fmul(base_re, base_re);
+    let im_sq = b.fmul(base_im, base_im);
+    let denom = b.fadd(re_sq, im_sq);
+    let inv_re = b.fdiv(base_re, denom);
+    let neg_im = b.fsub(zero_f, base_im);
+    let inv_im = b.fdiv(neg_im, denom);
+    b.store(inv_re, base_re_addr);
+    b.store(inv_im, base_im_addr);
+    b.store(neg_order, counter_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_positive);
+    b.store(base_re, base_re_addr);
+    b.store(base_im, base_im_addr);
+    b.store(order_i32, counter_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let counter = b.load(counter_addr);
+    let still_pos = b.icmp(CmpOp::Gt, counter, zero_i32);
+    b.cond_branch(still_pos, bb_body, vec![], bb_exit, vec![]);
+
+    b.set_block(bb_body);
+    let cur_re = b.load(res_re_addr);
+    let cur_im = b.load(res_im_addr);
+    let base_re = b.load(base_re_addr);
+    let base_im = b.load(base_im_addr);
+    let ac = b.fmul(cur_re, base_re);
+    let bd = b.fmul(cur_im, base_im);
+    let ad = b.fmul(cur_re, base_im);
+    let bc = b.fmul(cur_im, base_re);
+    let new_re = b.fsub(ac, bd);
+    let new_im = b.fadd(ad, bc);
+    b.store(new_re, res_re_addr);
+    b.store(new_im, res_im_addr);
+    let one_i32 = b.const_i32(1);
+    let dec = b.isub(counter, one_i32);
+    b.store(dec, counter_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
+    (b.load(res_re_addr), b.load(res_im_addr))
+}
+
 /// Insert implicit deallocation calls for all local allocatable variables.
 /// Uses a dummy STAT variable so already-deallocated arrays don't abort.
 ///

@@ -900,6 +900,9 @@ pub(crate) fn lower_expr_full(
                         let imag_num = b.fsub(bc, ad);
                         (b.fdiv(real_num, denom), b.fdiv(imag_num, denom))
                     }
+                    BinaryOp::Pow if matches!(rty, IrType::Int(_)) => {
+                        lower_complex_integer_pow_lanes(b, fw, re_l, im_l, rhs)
+                    }
                     BinaryOp::Pow => lower_complex_pow_lanes(b, fw, re_l, im_l, re_r, im_r),
                     _ => (re_l, im_l), // unsupported: return lhs unchanged
                 };
