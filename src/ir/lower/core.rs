@@ -43877,6 +43877,13 @@ pub(super) fn lower_arg_by_ref_full(
         if let Some(info) = locals.get(&key) {
             if let Some(c) = info.inline_const {
                 let val = materialize_const_scalar(b, c, &info.ty);
+                if is_complex_ty(&info.ty)
+                    && b.func()
+                        .value_type(val)
+                        .is_some_and(|ty| is_complex_ptr_ty(&ty))
+                {
+                    return val;
+                }
                 let tmp = b.alloca(info.ty.clone());
                 b.store(val, tmp);
                 return tmp;
