@@ -37797,13 +37797,12 @@ pub(super) fn lower_array_assign(
                 let logical_idx = b.imul(iv, dest_stride);
                 let doff = b.imul(logical_idx, dest_elem_bytes);
                 let dp = b.gep(dest_base, vec![doff], IrType::Int(IntWidth::I8));
-                if is_complex_ty(&src_elem_ty) && is_complex_ty(&dest_info.ty) {
-                    let src_ptr = rank1_array_desc_elem_ptr(b, src_desc, &src_elem_ty, iv);
-                    let copy_bytes = b.const_i64(ir_scalar_byte_size(&dest_info.ty));
-                    let src_ptr = if complex_float_width(&src_elem_ty)
-                        == complex_float_width(&dest_info.ty)
+                if is_complex_ty(&dest_info.ty) {
+                    let copy_bytes = b.const_i64(complex_byte_size(&dest_info.ty));
+                    let src_ptr = if is_complex_ty(&src_elem_ty)
+                        && complex_float_width(&src_elem_ty) == complex_float_width(&dest_info.ty)
                     {
-                        src_ptr
+                        rank1_array_desc_elem_ptr(b, src_desc, &src_elem_ty, iv)
                     } else {
                         let src_val = load_rank1_array_desc_elem(b, src_desc, &src_elem_ty, iv);
                         materialize_complex_operand(b, src_val, complex_float_width(&dest_info.ty))

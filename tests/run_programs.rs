@@ -3882,6 +3882,27 @@ fn complex_zero_integer_power_lapack_shift_fixture_passes_all_opts() {
 }
 
 #[test]
+fn complex_reshape_integer_constructor_zero_imag_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("complex_reshape_integer_constructor_zero_imag.f90");
+    assert!(
+        source.exists(),
+        "complex_reshape_integer_constructor_zero_imag.f90 missing"
+    );
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "complex_reshape_integer_constructor_zero_imag.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
 fn pointer_result_forward_no_stack_copy_fixture_passes_all_opts() {
     let compiler = find_compiler();
     let test_dir = find_test_programs();
