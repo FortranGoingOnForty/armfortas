@@ -6668,7 +6668,7 @@ pub(super) fn eval_const_scalar_with_any_scope(
         Expr::Name { name } => {
             let key = name.to_ascii_lowercase();
             param_consts.get(&key).copied().or_else(|| {
-                st.find_symbol_any_scope(&key)
+                st.lookup_local_then_any(current_proc_scope(), &key)
                     .and_then(|sym| sym.const_value.map(|v| ConstScalar::Int(v as i128)))
             })
         }
@@ -7430,7 +7430,7 @@ pub(super) fn eval_const_scalar_with_decl_scope(
         Expr::Name { name } => {
             let key = name.to_ascii_lowercase();
             param_consts.get(&key).copied().or_else(|| {
-                st.find_symbol_any_scope(&key)
+                st.lookup_local_then_any(current_proc_scope(), &key)
                     .and_then(|sym| sym.const_value.map(|v| ConstScalar::Int(v as i128)))
             })
         }
