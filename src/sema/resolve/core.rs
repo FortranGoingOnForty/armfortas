@@ -11,7 +11,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use super::statement_functions::detect_statement_functions;
-use super::type_resolution::{derived_char_init_len, type_spec_to_info};
+use super::type_resolution::{derived_char_init_len, entity_char_len_to_info, type_spec_to_info};
 use super::use_resolution::{load_external_module, preload_stmt_uses, process_uses};
 
 thread_local! {
@@ -1517,6 +1517,7 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                     // init is a string literal or another character
                     // parameter whose length we already know.
                     let mut entity_type_info = type_info.clone();
+                    entity_char_len_to_info(&mut entity_type_info, entity.char_len.as_ref(), st);
                     if sym_attrs.parameter
                         && matches!(&entity_type_info, TypeInfo::Character { len: None, .. })
                     {

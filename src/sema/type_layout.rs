@@ -654,6 +654,23 @@ fn type_spec_to_type_info(
     }
 }
 
+fn entity_char_len_type_info(
+    mut ti: TypeInfo,
+    entity_len: Option<&crate::ast::decl::LenSpec>,
+    const_params: &HashMap<String, i64>,
+) -> TypeInfo {
+    let Some(entity_len) = entity_len else {
+        return ti;
+    };
+    if let TypeInfo::Character { len, .. } = &mut ti {
+        *len = match entity_len {
+            crate::ast::decl::LenSpec::Expr(e) => eval_const_int_expr(e, const_params),
+            crate::ast::decl::LenSpec::Star | crate::ast::decl::LenSpec::Colon => None,
+        };
+    }
+    ti
+}
+
 /// Compute the layout of a derived type from its component declarations.
 pub fn compute_layout(
     type_name: &str,
@@ -726,8 +743,13 @@ pub fn compute_layout_with_attrs(
                 .iter()
                 .any(|a| matches!(a, crate::ast::decl::Attribute::Dimension(_)));
 
-            let ti = type_spec_to_type_info(type_spec, const_params);
+            let base_ti = type_spec_to_type_info(type_spec, const_params);
             for entity in entities {
+                let ti = entity_char_len_type_info(
+                    base_ti.clone(),
+                    entity.char_len.as_ref(),
+                    const_params,
+                );
                 let declared_array = entity.array_spec.is_some() || has_dimension_attr;
                 let dims = if is_allocatable || is_pointer {
                     Vec::new()

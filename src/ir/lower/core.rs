@@ -3324,17 +3324,22 @@ pub(super) fn collect_module_globals(
                     .as_ref()
                     .or_else(|| parameter_inits.get(&key).copied());
                 let is_parameter = is_parameter_decl || parameter_inits.contains_key(&key);
-                let char_len =
-                    declared_char_len(type_spec, init_expr, &param_consts, &param_char_consts, st);
-                let global_char_kind = if matches!(
+                let char_len = declared_char_len(
                     type_spec,
-                    TypeSpec::Character(Some(sel))
-                        if matches!(&sel.len, Some(crate::ast::decl::LenSpec::Colon))
-                ) {
-                    CharKind::Deferred
-                } else {
-                    char_len.map(CharKind::Fixed).unwrap_or(CharKind::None)
-                };
+                    entity.char_len.as_ref(),
+                    init_expr,
+                    &param_consts,
+                    &param_char_consts,
+                    st,
+                );
+                let effective_char_len =
+                    effective_decl_char_len_spec(type_spec, entity.char_len.as_ref());
+                let global_char_kind =
+                    if matches!(effective_char_len, Some(crate::ast::decl::LenSpec::Colon)) {
+                        CharKind::Deferred
+                    } else {
+                        char_len.map(CharKind::Fixed).unwrap_or(CharKind::None)
+                    };
 
                 let array_spec = entity.array_spec.as_ref().or(attr_dims);
 
@@ -3382,9 +3387,8 @@ pub(super) fn collect_module_globals(
 
                 // Deferred-length allocatable character: 32-byte
                 // StringDescriptor global.
-                let is_deferred_char = matches!(type_spec,
-                    TypeSpec::Character(Some(sel)) if matches!(&sel.len, Some(crate::ast::decl::LenSpec::Colon))
-                );
+                let is_deferred_char =
+                    matches!(effective_char_len, Some(crate::ast::decl::LenSpec::Colon));
                 if is_allocatable && is_deferred_char && array_spec.is_none() {
                     let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 32);
                     module.add_global(Global {
@@ -4826,58 +4830,68 @@ pub(super) fn install_param_char_component_defaults(
 
 pub(super) fn declared_char_len(
     type_spec: &TypeSpec,
+    entity_char_len: Option<&crate::ast::decl::LenSpec>,
     init_expr: Option<&crate::ast::expr::SpannedExpr>,
     param_consts: &HashMap<String, ConstScalar>,
     param_char_consts: &HashMap<String, Vec<u8>>,
     st: &SymbolTable,
 ) -> Option<i64> {
-    match type_spec {
-        TypeSpec::Character(Some(sel)) => match &sel.len {
-            Some(crate::ast::decl::LenSpec::Expr(e)) => {
-                eval_const_int_in_scope_or_any_scope(e, param_consts, st)
-            }
-            Some(crate::ast::decl::LenSpec::Star) => init_expr.and_then(|expr| {
-                eval_const_char_bytes(expr, param_consts, param_char_consts)
-                    .map(|bytes| bytes.len() as i64)
-                    .or_else(|| {
-                        collect_const_char_array_elems(expr, param_consts, param_char_consts).map(
-                            |elems| {
-                                elems
-                                    .iter()
-                                    .map(|elem| elem.len() as i64)
-                                    .max()
-                                    .unwrap_or(0)
-                            },
-                        )
-                    })
-                    .or_else(|| {
-                        // Fallback: when the init is a Name that
-                        // refers to another character parameter
-                        // visible via host/use association (e.g.
-                        // `character(*), parameter :: vtype = type_rsp`
-                        // where type_rsp lives in the parent module),
-                        // extract the length from the symbol table.
-                        if let crate::ast::expr::Expr::Name { name } = &expr.node {
-                            let key = name.to_lowercase();
-                            if let Some(sym) = st.find_symbol_any_scope(&key) {
-                                if let Some(crate::sema::symtab::TypeInfo::Character {
-                                    len: Some(n),
-                                    ..
-                                }) = &sym.type_info
-                                {
-                                    return Some(*n);
-                                }
+    if !matches!(type_spec, TypeSpec::Character(_)) {
+        return None;
+    }
+    match effective_decl_char_len_spec(type_spec, entity_char_len) {
+        Some(crate::ast::decl::LenSpec::Expr(e)) => {
+            eval_const_int_in_scope_or_any_scope(e, param_consts, st)
+        }
+        Some(crate::ast::decl::LenSpec::Star) => init_expr.and_then(|expr| {
+            eval_const_char_bytes(expr, param_consts, param_char_consts)
+                .map(|bytes| bytes.len() as i64)
+                .or_else(|| {
+                    collect_const_char_array_elems(expr, param_consts, param_char_consts).map(
+                        |elems| {
+                            elems
+                                .iter()
+                                .map(|elem| elem.len() as i64)
+                                .max()
+                                .unwrap_or(0)
+                        },
+                    )
+                })
+                .or_else(|| {
+                    // Fallback: when the init is a Name that
+                    // refers to another character parameter
+                    // visible via host/use association (e.g.
+                    // `character(*), parameter :: vtype = type_rsp`
+                    // where type_rsp lives in the parent module),
+                    // extract the length from the symbol table.
+                    if let crate::ast::expr::Expr::Name { name } = &expr.node {
+                        let key = name.to_lowercase();
+                        if let Some(sym) = st.find_symbol_any_scope(&key) {
+                            if let Some(crate::sema::symtab::TypeInfo::Character {
+                                len: Some(n),
+                                ..
+                            }) = &sym.type_info
+                            {
+                                return Some(*n);
                             }
                         }
-                        None
-                    })
-            }),
-            Some(crate::ast::decl::LenSpec::Colon) => None,
-            None => Some(1),
-        },
-        TypeSpec::Character(None) => Some(1),
-        _ => None,
+                    }
+                    None
+                })
+        }),
+        Some(crate::ast::decl::LenSpec::Colon) => None,
+        None => Some(1),
     }
+}
+
+pub(super) fn effective_decl_char_len_spec<'a>(
+    type_spec: &'a TypeSpec,
+    entity_char_len: Option<&'a crate::ast::decl::LenSpec>,
+) -> Option<&'a crate::ast::decl::LenSpec> {
+    entity_char_len.or_else(|| match type_spec {
+        TypeSpec::Character(Some(sel)) => sel.len.as_ref(),
+        _ => None,
+    })
 }
 
 pub(super) fn eval_const_char_global_init(
