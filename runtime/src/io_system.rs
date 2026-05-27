@@ -503,7 +503,7 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
     }
     let cb = unsafe { &*cb };
     let unit = cb.unit;
-    let fname = unsafe_str(cb.filename, cb.filename_len);
+    let fname = fortran_file_name(cb.filename, cb.filename_len);
     let status_str = unsafe_str(cb.status, cb.status_len).to_lowercase();
     let status = status_str.trim();
     let is_scratch = status == "scratch";
@@ -1864,6 +1864,10 @@ fn unsafe_str(ptr: *const u8, len: i64) -> String {
     }
 }
 
+fn fortran_file_name(ptr: *const u8, len: i64) -> String {
+    unsafe_str(ptr, len).trim_end_matches(' ').to_string()
+}
+
 // ---- Direct access helpers ----
 
 impl Unit {
@@ -2993,7 +2997,7 @@ pub extern "C" fn afs_inquire_file(
     unformatted_buf: *mut u8,
     unformatted_buf_len: i64,
 ) {
-    let fname = unsafe_str(filename, filename_len);
+    let fname = fortran_file_name(filename, filename_len);
 
     let file_exists = std::path::Path::new(&fname).exists();
     if !exist.is_null() {

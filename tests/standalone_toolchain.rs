@@ -354,6 +354,131 @@ fn hello_world_runs_through_driver_with_afs_ld_enable_flag() {
 }
 
 #[test]
+fn hello_world_keeps_apple_ld_path_with_afs_ld_zero() {
+    let Some(armfortas) = binary("armfortas") else {
+        eprintln!("skipping: armfortas binary not built");
+        return;
+    };
+    let Some(afs_as) = binary("afs-as") else {
+        eprintln!("skipping: afs-as binary not built");
+        return;
+    };
+    let Some(runtime) = runtime_archive() else {
+        eprintln!("skipping: libarmfortas_rt.a not built");
+        return;
+    };
+
+    let source = workspace_root().join("test_programs/hello.f90");
+    assert!(source.exists(), "hello.f90 missing at {}", source.display());
+
+    let dir = unique_dir("driver_apple_ld_fallback_hello");
+    let apple_ld_bin = dir.join("hello-driver-apple-ld");
+
+    let apple_ld_compile = compile_with_driver_args_and_vars(
+        &armfortas,
+        &source,
+        &apple_ld_bin,
+        &[("AFS_AS_PATH", &afs_as), ("AFS_RUNTIME_PATH", &runtime)],
+        &[("AFS_LD", "0")],
+        &[],
+        "AFS_LD=0 armfortas compile",
+    );
+    assert_success(&apple_ld_compile, "AFS_LD=0 armfortas compile");
+    let apple_ld_run = run_binary(&apple_ld_bin, "AFS_LD=0 armfortas run");
+    let apple_ld_stdout = String::from_utf8_lossy(&apple_ld_run.stdout);
+    assert_eq!(apple_ld_stdout, " Hello, World!\n");
+}
+
+#[test]
+fn shared_library_runs_through_driver_with_standalone_linker_override() {
+    let Some(armfortas) = binary("armfortas") else {
+        eprintln!("skipping: armfortas binary not built");
+        return;
+    };
+    let Some(afs_as) = binary("afs-as") else {
+        eprintln!("skipping: afs-as binary not built");
+        return;
+    };
+    let Some(afs_ld) = binary("afs-ld") else {
+        eprintln!("skipping: afs-ld binary not built");
+        return;
+    };
+    let Some(runtime) = runtime_archive() else {
+        eprintln!("skipping: libarmfortas_rt.a not built");
+        return;
+    };
+    let Some(libsystem) = libsystem_tbd() else {
+        eprintln!("skipping: libSystem.tbd not found");
+        return;
+    };
+
+    let dir = unique_dir("driver_standalone_shared");
+    let lib_src = dir.join("mylib.f90");
+    let user_src = dir.join("user.f90");
+    fs::write(
+        &lib_src,
+        "module m\ncontains\n  integer function answer()\n    answer = 42\n  end function\nend module\n",
+    )
+    .expect("write shared library source");
+    fs::write(
+        &user_src,
+        "program p\n  use m\n  print *, answer()\nend program\n",
+    )
+    .expect("write shared library consumer source");
+
+    let dylib = dir.join("libmylib.dylib");
+    let shared_compile = run_command(
+        Command::new(&armfortas)
+            .env("AFS_AS_PATH", &afs_as)
+            .env("AFS_LD_PATH", &afs_ld)
+            .env("AFS_RUNTIME_PATH", &runtime)
+            .env("AFS_LIBSYSTEM_TBD", &libsystem)
+            .arg("-shared")
+            .arg(&lib_src)
+            .arg("-o")
+            .arg(&dylib),
+        "standalone armfortas shared compile",
+    );
+    assert_success(&shared_compile, "standalone armfortas shared compile");
+    assert!(
+        dir.join("m.amod").exists(),
+        "standalone shared compile should emit module interface"
+    );
+
+    let exe = dir.join("use_m");
+    let dir_str = dir.to_str().expect("temp dir is utf-8");
+    let user_compile = run_command(
+        Command::new(&armfortas)
+            .env("AFS_AS_PATH", &afs_as)
+            .env("AFS_LD_PATH", &afs_ld)
+            .env("AFS_RUNTIME_PATH", &runtime)
+            .env("AFS_LIBSYSTEM_TBD", &libsystem)
+            .arg("-I")
+            .arg(dir_str)
+            .arg("-L")
+            .arg(dir_str)
+            .arg("-rpath")
+            .arg(dir_str)
+            .arg("-lmylib")
+            .arg(&user_src)
+            .arg("-o")
+            .arg(&exe),
+        "standalone armfortas shared consumer compile",
+    );
+    assert_success(
+        &user_compile,
+        "standalone armfortas shared consumer compile",
+    );
+
+    let run = run_binary(&exe, "standalone armfortas shared consumer run");
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("42"),
+        "shared consumer output should contain 42: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+}
+
+#[test]
 fn hello_world_compiles_to_object_with_standalone_assembler_override() {
     let Some(armfortas) = binary("armfortas") else {
         eprintln!("skipping: armfortas binary not built");

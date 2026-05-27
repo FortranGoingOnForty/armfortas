@@ -93,3 +93,20 @@ pub(super) fn type_spec_to_info(ts: &TypeSpec, st: &SymbolTable) -> TypeInfo {
         TypeSpec::TypeStar => TypeInfo::TypeStar,
     }
 }
+
+pub(super) fn entity_char_len_to_info(
+    info: &mut TypeInfo,
+    entity_len: Option<&decl::LenSpec>,
+    st: &SymbolTable,
+) {
+    let Some(entity_len) = entity_len else {
+        return;
+    };
+    let TypeInfo::Character { len, .. } = info else {
+        return;
+    };
+    *len = match entity_len {
+        decl::LenSpec::Expr(e) => eval_const_int_expr(e, st),
+        decl::LenSpec::Star | decl::LenSpec::Colon => None,
+    };
+}

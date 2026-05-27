@@ -12,6 +12,7 @@ use crate::ir::inst::*;
 use crate::ir::types::*;
 use crate::sema::symtab::SymbolTable;
 
+use super::const_scalar::{materialize_const_scalar, ConstScalar};
 use super::core::*;
 use super::ctx::{CharKind, LocalInfo};
 use super::helpers::coerce_to_type;
@@ -47,6 +48,9 @@ pub(crate) fn init_decls(
     // Pre-collect the set of GlobalAddr-defining ValueIds so the
     // inner skip check is O(1). Audit Maj-3.
     let global_addr_ids = collect_global_addr_values(b);
+    let param_consts = collect_decl_param_consts_with_scope(decls, &HashMap::new(), st);
+    let param_array_consts: HashMap<String, Vec<ConstScalar>> = HashMap::new();
+    let param_array_elem_tys: HashMap<String, IrType> = HashMap::new();
     for decl in decls {
         match &decl.node {
             Decl::TypeDecl { entities, .. } => {
@@ -168,6 +172,29 @@ pub(crate) fn init_decls(
                                     let idx = b.const_i64(i);
                                     let slot = b.gep(info.addr, vec![idx], info.ty.clone());
                                     b.store(val, slot);
+                                }
+                            }
+                        } else if !is_complex_ty(&info.ty) {
+                            if let Some(mut scalars) = collect_const_array_scalars(
+                                init_expr,
+                                &info.ty,
+                                &param_consts,
+                                &param_array_consts,
+                                &param_array_elem_tys,
+                            ) {
+                                let total: i64 = info.dims.iter().map(|(_, n)| *n).product();
+                                if total > 1 && scalars.len() == 1 {
+                                    scalars.resize(total as usize, scalars[0]);
+                                }
+                                if total > 0 && scalars.len() >= total as usize {
+                                    for (i, scalar) in
+                                        scalars.into_iter().take(total as usize).enumerate()
+                                    {
+                                        let idx = b.const_i64(i as i64);
+                                        let slot = b.gep(info.addr, vec![idx], info.ty.clone());
+                                        let val = materialize_const_scalar(b, scalar, &info.ty);
+                                        b.store(val, slot);
+                                    }
                                 }
                             }
                         }

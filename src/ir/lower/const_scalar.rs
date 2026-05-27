@@ -609,10 +609,15 @@ pub(super) fn materialize_const_scalar(
     target: &IrType,
 ) -> ValueId {
     // Complex target — materialize a 2-lane buffer with the const as
-    // the real part and 0 as the imaginary part. Without this case
-    // `complex(sp), parameter :: alpha = 1.0_sp` would fall through
-    // to `const_i32(0)`, mis-typing the parameter at every reference
-    // and breaking generic dispatch on alpha against complex formals.
+    // the real part and 0 as the imaginary part. Return the typed
+    // buffer address, matching ordinary complex local lowering; the
+    // backend scalar load/store path cannot safely carry a 16-byte
+    // complex(real64) aggregate through a single GP register.
+    //
+    // Without this case `complex(sp), parameter :: alpha = 1.0_sp`
+    // would fall through to `const_i32(0)`, mis-typing the parameter
+    // at every reference and breaking generic dispatch on alpha
+    // against complex formals.
     if let IrType::Array(elem, 2) = target {
         if let IrType::Float(fw) = elem.as_ref() {
             let fw = *fw;
@@ -637,7 +642,7 @@ pub(super) fn materialize_const_scalar(
             let im_ptr = b.gep(buf, vec![lane_bytes], IrType::Int(IntWidth::I8));
             b.store(re, re_ptr);
             b.store(zero, im_ptr);
-            return b.load_typed(buf, IrType::Array(Box::new(IrType::Float(fw)), 2));
+            return buf;
         }
     }
     match (c, target) {

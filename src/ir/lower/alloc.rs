@@ -89,23 +89,26 @@ pub(crate) fn alloc_decls(
                 let array_spec = entity.array_spec.as_ref().or(attr_dims);
 
                 // Check for character type.
-                let char_len =
-                    declared_char_len(type_spec, init_expr, &param_consts, &param_char_consts, st);
-                let runtime_char_len_expr = match type_spec {
-                    TypeSpec::Character(Some(sel)) => match &sel.len {
-                        Some(crate::ast::decl::LenSpec::Expr(e))
-                            if eval_const_int_in_scope_or_any_scope(e, &param_consts, st)
-                                .is_none() =>
-                        {
-                            Some(e)
-                        }
-                        _ => None,
-                    },
+                let char_len = declared_char_len(
+                    type_spec,
+                    entity.char_len.as_ref(),
+                    init_expr,
+                    &param_consts,
+                    &param_char_consts,
+                    st,
+                );
+                let effective_char_len =
+                    super::core::effective_decl_char_len_spec(type_spec, entity.char_len.as_ref());
+                let runtime_char_len_expr = match effective_char_len {
+                    Some(crate::ast::decl::LenSpec::Expr(e))
+                        if eval_const_int_in_scope_or_any_scope(e, &param_consts, st).is_none() =>
+                    {
+                        Some(e)
+                    }
                     _ => None,
                 };
-                let is_deferred_char = matches!(type_spec,
-                    TypeSpec::Character(Some(sel)) if matches!(&sel.len, Some(crate::ast::decl::LenSpec::Colon))
-                );
+                let is_deferred_char =
+                    matches!(effective_char_len, Some(crate::ast::decl::LenSpec::Colon));
 
                 if is_pointer_attr && array_spec.is_some() {
                     // Pointer to array.  Reuses the 384-byte array

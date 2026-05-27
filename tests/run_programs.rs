@@ -3514,13 +3514,97 @@ fn open_module_char_parameter_file_fixture_passes_all_opts() {
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("open_module_char_parameter_file.f90");
-    assert!(source.exists(), "open_module_char_parameter_file.f90 missing");
+    assert!(
+        source.exists(),
+        "open_module_char_parameter_file.f90 missing"
+    );
 
     for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
         match run_test(&compiler, &source, opt_flag) {
             TestOutcome::Pass => {}
             other => panic!(
                 "open_module_char_parameter_file.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
+fn open_fixed_char_filename_trim_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("open_fixed_char_filename_trim.f90");
+    assert!(source.exists(), "open_fixed_char_filename_trim.f90 missing");
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "open_fixed_char_filename_trim.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
+fn class_star_character_select_type_message_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("class_star_character_select_type_message.f90");
+    assert!(
+        source.exists(),
+        "class_star_character_select_type_message.f90 missing"
+    );
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "class_star_character_select_type_message.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
+fn class_star_real_kind_select_type_state_message_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("class_star_real_kind_select_type_state_message.f90");
+    assert!(
+        source.exists(),
+        "class_star_real_kind_select_type_state_message.f90 missing"
+    );
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "class_star_real_kind_select_type_state_message.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
+fn class_star_rank1_complex_select_type_state_message_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("class_star_rank1_complex_select_type_state_message.f90");
+    assert!(
+        source.exists(),
+        "class_star_rank1_complex_select_type_state_message.f90 missing"
+    );
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "class_star_rank1_complex_select_type_state_message.f90 should pass at {}, got {:?}",
                 opt_flag, other
             ),
         }
@@ -3693,6 +3777,153 @@ fn mixed_numeric_array_binary_exprs_fixture_passes_all_opts() {
 }
 
 #[test]
+fn matmul_transpose_inline_rank2_array_expr_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("matmul_transpose_inline_rank2_array_expr.f90");
+    assert!(
+        source.exists(),
+        "matmul_transpose_inline_rank2_array_expr.f90 missing"
+    );
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "matmul_transpose_inline_rank2_array_expr.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
+fn real_alloc_result_to_complex_fixed_array_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("real_alloc_result_to_complex_fixed_array.f90");
+    assert!(
+        source.exists(),
+        "real_alloc_result_to_complex_fixed_array.f90 missing"
+    );
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "real_alloc_result_to_complex_fixed_array.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
+fn sibling_parameter_reshape_shape_scope_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("sibling_parameter_reshape_shape_scope.f90");
+    assert!(
+        source.exists(),
+        "sibling_parameter_reshape_shape_scope.f90 missing"
+    );
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "sibling_parameter_reshape_shape_scope.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
+fn parameter_array_assumed_size_initializer_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("parameter_array_assumed_size_initializer.f90");
+    assert!(
+        source.exists(),
+        "parameter_array_assumed_size_initializer.f90 missing"
+    );
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "parameter_array_assumed_size_initializer.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
+fn logical_kind_array_scalar_broadcast_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("logical_kind_array_scalar_broadcast.f90");
+    assert!(
+        source.exists(),
+        "logical_kind_array_scalar_broadcast.f90 missing"
+    );
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "logical_kind_array_scalar_broadcast.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
+fn entity_character_length_declarators_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("entity_character_length_declarators.f90");
+    assert!(
+        source.exists(),
+        "entity_character_length_declarators.f90 missing"
+    );
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "entity_character_length_declarators.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
+fn complex_vector_subscript_section_expr_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("complex_vector_subscript_section_expr.f90");
+    assert!(
+        source.exists(),
+        "complex_vector_subscript_section_expr.f90 missing"
+    );
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "complex_vector_subscript_section_expr.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
 fn complex_module_param_reshape_exprs_fixture_passes_all_opts() {
     let compiler = find_compiler();
     let test_dir = find_test_programs();
@@ -3707,6 +3938,69 @@ fn complex_module_param_reshape_exprs_fixture_passes_all_opts() {
             TestOutcome::Pass => {}
             other => panic!(
                 "complex_module_param_reshape_exprs.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
+fn complex_zero_integer_power_lapack_shift_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("complex_zero_integer_power_lapack_shift.f90");
+    assert!(
+        source.exists(),
+        "complex_zero_integer_power_lapack_shift.f90 missing"
+    );
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "complex_zero_integer_power_lapack_shift.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
+fn complex_reshape_integer_constructor_zero_imag_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("complex_reshape_integer_constructor_zero_imag.f90");
+    assert!(
+        source.exists(),
+        "complex_reshape_integer_constructor_zero_imag.f90 missing"
+    );
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "complex_reshape_integer_constructor_zero_imag.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
+fn complex_dp_parameter_zero_compare_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("complex_dp_parameter_zero_compare.f90");
+    assert!(
+        source.exists(),
+        "complex_dp_parameter_zero_compare.f90 missing"
+    );
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "complex_dp_parameter_zero_compare.f90 should pass at {}, got {:?}",
                 opt_flag, other
             ),
         }

@@ -527,34 +527,48 @@ impl<'a> Parser<'a> {
     /// Accepts derived names like `foo`, intrinsic types with optional
     /// kind/length like `real(sp)`, `integer(int8)`, `character(len=*)`.
     fn parse_select_type_spec(&mut self) -> Result<String, ParseError> {
-        let base = self.advance().clone().text;
+        let mut spec = self.advance().clone().text;
+        let base = spec.clone();
         let base_lc = base.to_lowercase();
+        if base_lc == "double" && self.peek_text().eq_ignore_ascii_case("precision") {
+            self.advance();
+            spec.push_str("precision");
+            return Ok(spec);
+        }
+        if base_lc == "double" && self.peek_text().eq_ignore_ascii_case("complex") {
+            self.advance();
+            spec.push_str("complex");
+            return Ok(spec);
+        }
         let is_intrinsic = matches!(
             base_lc.as_str(),
             "integer" | "real" | "double" | "complex" | "logical" | "character"
         );
         if is_intrinsic && self.peek() == &TokenKind::LParen {
-            // Skip over the kind/length spec without storing it.
-            // We just need to consume balanced parens.
+            // Preserve intrinsic kind/length specs. SELECT TYPE on
+            // CLASS(*) needs `real(real64)` to remain distinct from
+            // `real(real32)` when lowering dynamic type tags.
+            spec.push('(');
             self.advance(); // consume '('
             let mut depth = 1;
             while depth > 0 && self.peek() != &TokenKind::Eof {
-                match self.peek() {
+                let tok = self.advance().clone();
+                match tok.kind {
                     TokenKind::LParen => {
-                        self.advance();
                         depth += 1;
+                        spec.push('(');
                     }
                     TokenKind::RParen => {
-                        self.advance();
                         depth -= 1;
+                        spec.push(')');
                     }
                     _ => {
-                        self.advance();
+                        spec.push_str(&tok.text);
                     }
                 }
             }
         }
-        Ok(base)
+        Ok(spec)
     }
 
     fn parse_select_type_body(&mut self) -> Result<Vec<SpannedStmt>, ParseError> {

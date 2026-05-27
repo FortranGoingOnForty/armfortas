@@ -3324,17 +3324,22 @@ pub(super) fn collect_module_globals(
                     .as_ref()
                     .or_else(|| parameter_inits.get(&key).copied());
                 let is_parameter = is_parameter_decl || parameter_inits.contains_key(&key);
-                let char_len =
-                    declared_char_len(type_spec, init_expr, &param_consts, &param_char_consts, st);
-                let global_char_kind = if matches!(
+                let char_len = declared_char_len(
                     type_spec,
-                    TypeSpec::Character(Some(sel))
-                        if matches!(&sel.len, Some(crate::ast::decl::LenSpec::Colon))
-                ) {
-                    CharKind::Deferred
-                } else {
-                    char_len.map(CharKind::Fixed).unwrap_or(CharKind::None)
-                };
+                    entity.char_len.as_ref(),
+                    init_expr,
+                    &param_consts,
+                    &param_char_consts,
+                    st,
+                );
+                let effective_char_len =
+                    effective_decl_char_len_spec(type_spec, entity.char_len.as_ref());
+                let global_char_kind =
+                    if matches!(effective_char_len, Some(crate::ast::decl::LenSpec::Colon)) {
+                        CharKind::Deferred
+                    } else {
+                        char_len.map(CharKind::Fixed).unwrap_or(CharKind::None)
+                    };
 
                 let array_spec = entity.array_spec.as_ref().or(attr_dims);
 
@@ -3382,9 +3387,8 @@ pub(super) fn collect_module_globals(
 
                 // Deferred-length allocatable character: 32-byte
                 // StringDescriptor global.
-                let is_deferred_char = matches!(type_spec,
-                    TypeSpec::Character(Some(sel)) if matches!(&sel.len, Some(crate::ast::decl::LenSpec::Colon))
-                );
+                let is_deferred_char =
+                    matches!(effective_char_len, Some(crate::ast::decl::LenSpec::Colon));
                 if is_allocatable && is_deferred_char && array_spec.is_none() {
                     let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 32);
                     module.add_global(Global {
@@ -4826,58 +4830,68 @@ pub(super) fn install_param_char_component_defaults(
 
 pub(super) fn declared_char_len(
     type_spec: &TypeSpec,
+    entity_char_len: Option<&crate::ast::decl::LenSpec>,
     init_expr: Option<&crate::ast::expr::SpannedExpr>,
     param_consts: &HashMap<String, ConstScalar>,
     param_char_consts: &HashMap<String, Vec<u8>>,
     st: &SymbolTable,
 ) -> Option<i64> {
-    match type_spec {
-        TypeSpec::Character(Some(sel)) => match &sel.len {
-            Some(crate::ast::decl::LenSpec::Expr(e)) => {
-                eval_const_int_in_scope_or_any_scope(e, param_consts, st)
-            }
-            Some(crate::ast::decl::LenSpec::Star) => init_expr.and_then(|expr| {
-                eval_const_char_bytes(expr, param_consts, param_char_consts)
-                    .map(|bytes| bytes.len() as i64)
-                    .or_else(|| {
-                        collect_const_char_array_elems(expr, param_consts, param_char_consts).map(
-                            |elems| {
-                                elems
-                                    .iter()
-                                    .map(|elem| elem.len() as i64)
-                                    .max()
-                                    .unwrap_or(0)
-                            },
-                        )
-                    })
-                    .or_else(|| {
-                        // Fallback: when the init is a Name that
-                        // refers to another character parameter
-                        // visible via host/use association (e.g.
-                        // `character(*), parameter :: vtype = type_rsp`
-                        // where type_rsp lives in the parent module),
-                        // extract the length from the symbol table.
-                        if let crate::ast::expr::Expr::Name { name } = &expr.node {
-                            let key = name.to_lowercase();
-                            if let Some(sym) = st.find_symbol_any_scope(&key) {
-                                if let Some(crate::sema::symtab::TypeInfo::Character {
-                                    len: Some(n),
-                                    ..
-                                }) = &sym.type_info
-                                {
-                                    return Some(*n);
-                                }
+    if !matches!(type_spec, TypeSpec::Character(_)) {
+        return None;
+    }
+    match effective_decl_char_len_spec(type_spec, entity_char_len) {
+        Some(crate::ast::decl::LenSpec::Expr(e)) => {
+            eval_const_int_in_scope_or_any_scope(e, param_consts, st)
+        }
+        Some(crate::ast::decl::LenSpec::Star) => init_expr.and_then(|expr| {
+            eval_const_char_bytes(expr, param_consts, param_char_consts)
+                .map(|bytes| bytes.len() as i64)
+                .or_else(|| {
+                    collect_const_char_array_elems(expr, param_consts, param_char_consts).map(
+                        |elems| {
+                            elems
+                                .iter()
+                                .map(|elem| elem.len() as i64)
+                                .max()
+                                .unwrap_or(0)
+                        },
+                    )
+                })
+                .or_else(|| {
+                    // Fallback: when the init is a Name that
+                    // refers to another character parameter
+                    // visible via host/use association (e.g.
+                    // `character(*), parameter :: vtype = type_rsp`
+                    // where type_rsp lives in the parent module),
+                    // extract the length from the symbol table.
+                    if let crate::ast::expr::Expr::Name { name } = &expr.node {
+                        let key = name.to_lowercase();
+                        if let Some(sym) = st.find_symbol_any_scope(&key) {
+                            if let Some(crate::sema::symtab::TypeInfo::Character {
+                                len: Some(n),
+                                ..
+                            }) = &sym.type_info
+                            {
+                                return Some(*n);
                             }
                         }
-                        None
-                    })
-            }),
-            Some(crate::ast::decl::LenSpec::Colon) => None,
-            None => Some(1),
-        },
-        TypeSpec::Character(None) => Some(1),
-        _ => None,
+                    }
+                    None
+                })
+        }),
+        Some(crate::ast::decl::LenSpec::Colon) => None,
+        None => Some(1),
     }
+}
+
+pub(super) fn effective_decl_char_len_spec<'a>(
+    type_spec: &'a TypeSpec,
+    entity_char_len: Option<&'a crate::ast::decl::LenSpec>,
+) -> Option<&'a crate::ast::decl::LenSpec> {
+    entity_char_len.or(match type_spec {
+        TypeSpec::Character(Some(sel)) => sel.len.as_ref(),
+        _ => None,
+    })
 }
 
 pub(super) fn eval_const_char_global_init(
@@ -6604,12 +6618,8 @@ pub(super) fn extract_array_dims_with_init(
         return dims;
     };
 
-    let init_len = init_expr.and_then(|expr| match &expr.node {
-        Expr::ArrayConstructor { values, .. } => {
-            const_array_constructor_len_in_scope(values, param_consts, st)
-        }
-        _ => None,
-    });
+    let init_len =
+        init_expr.and_then(|expr| const_array_initializer_len_in_scope(expr, param_consts, st));
     let Some(init_len) = init_len else {
         return dims;
     };
@@ -6632,6 +6642,36 @@ pub(super) fn extract_array_dims_with_init(
     };
     dims[last_assumed_idx] = (lower, init_len / prefix_extent);
     dims
+}
+
+fn const_array_initializer_len_in_scope(
+    expr: &crate::ast::expr::SpannedExpr,
+    param_consts: &HashMap<String, ConstScalar>,
+    st: Option<&SymbolTable>,
+) -> Option<i64> {
+    match &expr.node {
+        Expr::ParenExpr { inner } => const_array_initializer_len_in_scope(inner, param_consts, st),
+        Expr::ArrayConstructor { values, .. } => {
+            const_array_constructor_len_in_scope(values, param_consts, st)
+        }
+        Expr::FunctionCall { callee, args } => {
+            let Expr::Name { name } = &callee.node else {
+                return None;
+            };
+            if !matches!(
+                name.to_ascii_lowercase().as_str(),
+                "real" | "dble" | "dfloat" | "float" | "int" | "cmplx" | "complex" | "logical"
+            ) {
+                return None;
+            }
+            let first = args.first()?;
+            let crate::ast::expr::SectionSubscript::Element(arg_expr) = &first.value else {
+                return None;
+            };
+            const_array_initializer_len_in_scope(arg_expr, param_consts, st)
+        }
+        _ => None,
+    }
 }
 
 /// Try to evaluate a constant integer expression at compile time.
@@ -6668,7 +6708,7 @@ pub(super) fn eval_const_scalar_with_any_scope(
         Expr::Name { name } => {
             let key = name.to_ascii_lowercase();
             param_consts.get(&key).copied().or_else(|| {
-                st.find_symbol_any_scope(&key)
+                st.lookup_local_then_any(current_proc_scope(), &key)
                     .and_then(|sym| sym.const_value.map(|v| ConstScalar::Int(v as i128)))
             })
         }
@@ -7430,7 +7470,7 @@ pub(super) fn eval_const_scalar_with_decl_scope(
         Expr::Name { name } => {
             let key = name.to_ascii_lowercase();
             param_consts.get(&key).copied().or_else(|| {
-                st.find_symbol_any_scope(&key)
+                st.lookup_local_then_any(current_proc_scope(), &key)
                     .and_then(|sym| sym.const_value.map(|v| ConstScalar::Int(v as i128)))
             })
         }
@@ -19734,9 +19774,8 @@ fn character_expr_type_known(
     st: &SymbolTable,
     type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
 ) -> bool {
-    operator_expr_type_info(expr, Some(locals), st, type_layouts).is_some_and(|ti| {
-        matches!(ti, crate::sema::symtab::TypeInfo::Character { .. })
-    })
+    operator_expr_type_info(expr, Some(locals), st, type_layouts)
+        .is_some_and(|ti| matches!(ti, crate::sema::symtab::TypeInfo::Character { .. }))
 }
 
 pub(super) fn string_expr_lowers_to_owned_heap_temp(
@@ -21044,6 +21083,89 @@ pub(super) fn lower_complex_pow_lanes(
     let angle_cos = b.call(FuncRef::External(libm("cos")), vec![angle], lane_ty.clone());
     let angle_sin = b.call(FuncRef::External(libm("sin")), vec![angle], lane_ty);
     (b.fmul(magnitude, angle_cos), b.fmul(magnitude, angle_sin))
+}
+
+pub(super) fn lower_complex_integer_pow_lanes(
+    b: &mut FuncBuilder,
+    fw: FloatWidth,
+    base_re: ValueId,
+    base_im: ValueId,
+    order_raw: ValueId,
+) -> (ValueId, ValueId) {
+    let order_i32 = match b.func().value_type(order_raw) {
+        Some(IrType::Int(IntWidth::I64)) => b.int_trunc(order_raw, IntWidth::I32),
+        _ => coerce_to_type(b, order_raw, &IrType::Int(IntWidth::I32)),
+    };
+    let zero_i32 = b.const_i32(0);
+    let one_f = match fw {
+        FloatWidth::F64 => b.const_f64(1.0),
+        FloatWidth::F32 => b.const_f32(1.0),
+    };
+    let zero_f = match fw {
+        FloatWidth::F64 => b.const_f64(0.0),
+        FloatWidth::F32 => b.const_f32(0.0),
+    };
+
+    let res_re_addr = b.alloca(IrType::Float(fw));
+    let res_im_addr = b.alloca(IrType::Float(fw));
+    b.store(one_f, res_re_addr);
+    b.store(zero_f, res_im_addr);
+    let base_re_addr = b.alloca(IrType::Float(fw));
+    let base_im_addr = b.alloca(IrType::Float(fw));
+    let counter_addr = b.alloca(IrType::Int(IntWidth::I32));
+
+    let neg = b.icmp(CmpOp::Lt, order_i32, zero_i32);
+    let bb_positive = b.create_block("complex_int_pow_nonnegative");
+    let bb_negative = b.create_block("complex_int_pow_negative");
+    let bb_check = b.create_block("complex_int_pow_check");
+    let bb_body = b.create_block("complex_int_pow_body");
+    let bb_exit = b.create_block("complex_int_pow_exit");
+    b.cond_branch(neg, bb_negative, vec![], bb_positive, vec![]);
+
+    b.set_block(bb_negative);
+    let neg_order = b.isub(zero_i32, order_i32);
+    let re_sq = b.fmul(base_re, base_re);
+    let im_sq = b.fmul(base_im, base_im);
+    let denom = b.fadd(re_sq, im_sq);
+    let inv_re = b.fdiv(base_re, denom);
+    let neg_im = b.fsub(zero_f, base_im);
+    let inv_im = b.fdiv(neg_im, denom);
+    b.store(inv_re, base_re_addr);
+    b.store(inv_im, base_im_addr);
+    b.store(neg_order, counter_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_positive);
+    b.store(base_re, base_re_addr);
+    b.store(base_im, base_im_addr);
+    b.store(order_i32, counter_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let counter = b.load(counter_addr);
+    let still_pos = b.icmp(CmpOp::Gt, counter, zero_i32);
+    b.cond_branch(still_pos, bb_body, vec![], bb_exit, vec![]);
+
+    b.set_block(bb_body);
+    let cur_re = b.load(res_re_addr);
+    let cur_im = b.load(res_im_addr);
+    let base_re = b.load(base_re_addr);
+    let base_im = b.load(base_im_addr);
+    let ac = b.fmul(cur_re, base_re);
+    let bd = b.fmul(cur_im, base_im);
+    let ad = b.fmul(cur_re, base_im);
+    let bc = b.fmul(cur_im, base_re);
+    let new_re = b.fsub(ac, bd);
+    let new_im = b.fadd(ad, bc);
+    b.store(new_re, res_re_addr);
+    b.store(new_im, res_im_addr);
+    let one_i32 = b.const_i32(1);
+    let dec = b.isub(counter, one_i32);
+    b.store(dec, counter_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
+    (b.load(res_re_addr), b.load(res_im_addr))
 }
 
 /// Insert implicit deallocation calls for all local allocatable variables.
@@ -27166,8 +27288,29 @@ pub(super) fn load_array_desc_i64_field(
     b.load_typed(ptr, IrType::Int(IntWidth::I64))
 }
 
+const ARRAY_DESC_RANK_OFFSET: i64 = 16;
+const ARRAY_DESC_FLAGS_OFFSET: i64 = 20;
+const ARRAY_DESC_SCALAR_TYPE_TAG_OFFSET: i64 = 24;
+const ARRAY_DESC_FLAGS_LOW_BITS_MASK: i32 = 0x0000_00ff;
+const ARRAY_DESC_TYPE_TAG_COMPACT_MASK: i64 = 0x00ff_ffff;
+const ARRAY_DESC_TYPE_TAG_FLAGS_SHIFT: i32 = 8;
+const CLASS_STAR_TAG_INTRINSIC_PREFIX: u64 = 0x0AF5_C1A5_5000_0000;
+
 pub(super) fn load_array_desc_type_tag(b: &mut FuncBuilder, desc: ValueId) -> ValueId {
-    load_array_desc_i64_field(b, desc, 24)
+    let scalar_tag = load_array_desc_i64_field(b, desc, ARRAY_DESC_SCALAR_TYPE_TAG_OFFSET);
+    let rank = load_array_desc_i32_field(b, desc, ARRAY_DESC_RANK_OFFSET);
+    let flags = load_array_desc_i32_field(b, desc, ARRAY_DESC_FLAGS_OFFSET);
+    let shift = b.const_i32(ARRAY_DESC_TYPE_TAG_FLAGS_SHIFT);
+    let compact32 = b.lshr(flags, shift);
+    let compact64 = b.int_extend(compact32, IntWidth::I64, false);
+    let zero64 = b.const_i64(0);
+    let has_compact_tag = b.icmp(CmpOp::Ne, compact64, zero64);
+    let prefix = b.const_i64(CLASS_STAR_TAG_INTRINSIC_PREFIX as i64);
+    let reconstructed = b.bit_or(prefix, compact64);
+    let array_tag = b.select(has_compact_tag, reconstructed, zero64);
+    let zero32 = b.const_i32(0);
+    let is_scalar = b.icmp(CmpOp::Eq, rank, zero32);
+    b.select(is_scalar, scalar_tag, array_tag)
 }
 
 pub(super) fn lower_parameter_derived_component_const(
@@ -27220,9 +27363,36 @@ pub(super) fn load_array_desc_tbp_lookup_ptr(b: &mut FuncBuilder, desc: ValueId)
 }
 
 pub(super) fn store_array_desc_type_tag(b: &mut FuncBuilder, desc: ValueId, tag: ValueId) {
-    let off = b.const_i64(24);
+    let rank = load_array_desc_i32_field(b, desc, ARRAY_DESC_RANK_OFFSET);
+    let zero32 = b.const_i32(0);
+    let is_scalar = b.icmp(CmpOp::Eq, rank, zero32);
+    let scalar_bb = b.create_block("desc_type_tag_scalar");
+    let array_bb = b.create_block("desc_type_tag_array");
+    let done_bb = b.create_block("desc_type_tag_done");
+    b.cond_branch(is_scalar, scalar_bb, vec![], array_bb, vec![]);
+
+    b.set_block(scalar_bb);
+    let off = b.const_i64(ARRAY_DESC_SCALAR_TYPE_TAG_OFFSET);
     let ptr = b.gep(desc, vec![off], IrType::Int(IntWidth::I8));
     b.store(tag, ptr);
+    b.branch(done_bb, vec![]);
+
+    b.set_block(array_bb);
+    let flags_off = b.const_i64(ARRAY_DESC_FLAGS_OFFSET);
+    let flags_ptr = b.gep(desc, vec![flags_off], IrType::Int(IntWidth::I8));
+    let flags = b.load_typed(flags_ptr, IrType::Int(IntWidth::I32));
+    let low_bits = b.const_i32(ARRAY_DESC_FLAGS_LOW_BITS_MASK);
+    let preserved_flags = b.bit_and(flags, low_bits);
+    let compact_mask = b.const_i64(ARRAY_DESC_TYPE_TAG_COMPACT_MASK);
+    let compact64 = b.bit_and(tag, compact_mask);
+    let compact32 = b.int_trunc(compact64, IntWidth::I32);
+    let shift = b.const_i32(ARRAY_DESC_TYPE_TAG_FLAGS_SHIFT);
+    let encoded_tag = b.shl(compact32, shift);
+    let new_flags = b.bit_or(preserved_flags, encoded_tag);
+    b.store(new_flags, flags_ptr);
+    b.branch(done_bb, vec![]);
+
+    b.set_block(done_bb);
 }
 
 pub(super) fn store_array_desc_tbp_lookup_ptr(
@@ -27272,55 +27442,228 @@ pub(super) fn store_scalar_polymorphic_descriptor_view(
     }
 }
 
-const CLASS_STAR_TAG_INTEGER: u64 = 0x0AF5_C1A5_5000_0001;
-const CLASS_STAR_TAG_REAL: u64 = 0x0AF5_C1A5_5000_0002;
-const CLASS_STAR_TAG_DOUBLE: u64 = 0x0AF5_C1A5_5000_0003;
-const CLASS_STAR_TAG_COMPLEX: u64 = 0x0AF5_C1A5_5000_0004;
-const CLASS_STAR_TAG_LOGICAL: u64 = 0x0AF5_C1A5_5000_0005;
-const CLASS_STAR_TAG_CHARACTER: u64 = 0x0AF5_C1A5_5000_0006;
+const CLASS_STAR_TAG_INTEGER_BASE: u64 = 0x0AF5_C1A5_5001_0000;
+const CLASS_STAR_TAG_REAL_BASE: u64 = 0x0AF5_C1A5_5002_0000;
+const CLASS_STAR_TAG_COMPLEX_BASE: u64 = 0x0AF5_C1A5_5003_0000;
+const CLASS_STAR_TAG_LOGICAL_BASE: u64 = 0x0AF5_C1A5_5004_0000;
+const CLASS_STAR_TAG_CHARACTER_BASE: u64 = 0x0AF5_C1A5_5005_0000;
+
+#[derive(Debug, Clone, Copy)]
+enum IntrinsicClassStarGuard {
+    Integer(u8),
+    Real(u8),
+    Complex(u8),
+    Logical(u8),
+    Character(u8),
+}
+
+fn class_star_intrinsic_tag(base: u64, kind: u8) -> u64 {
+    base | u64::from(kind)
+}
+
+fn intrinsic_class_star_tag_from_guard_spec(spec: IntrinsicClassStarGuard) -> u64 {
+    match spec {
+        IntrinsicClassStarGuard::Integer(kind) => {
+            class_star_intrinsic_tag(CLASS_STAR_TAG_INTEGER_BASE, kind)
+        }
+        IntrinsicClassStarGuard::Real(kind) => {
+            class_star_intrinsic_tag(CLASS_STAR_TAG_REAL_BASE, kind)
+        }
+        IntrinsicClassStarGuard::Complex(kind) => {
+            class_star_intrinsic_tag(CLASS_STAR_TAG_COMPLEX_BASE, kind)
+        }
+        IntrinsicClassStarGuard::Logical(kind) => {
+            class_star_intrinsic_tag(CLASS_STAR_TAG_LOGICAL_BASE, kind)
+        }
+        IntrinsicClassStarGuard::Character(kind) => {
+            class_star_intrinsic_tag(CLASS_STAR_TAG_CHARACTER_BASE, kind)
+        }
+    }
+}
+
+fn compact_intrinsic_guard_name(type_name: &str) -> String {
+    type_name
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect()
+}
+
+fn intrinsic_guard_selector<'a>(compact: &'a str, base: &str) -> Option<Option<&'a str>> {
+    if compact == base {
+        return Some(None);
+    }
+    if compact.starts_with(base)
+        && compact.as_bytes().get(base.len()) == Some(&b'(')
+        && compact.ends_with(')')
+    {
+        return Some(Some(&compact[base.len() + 1..compact.len() - 1]));
+    }
+    None
+}
+
+fn top_level_selector_items(selector: &str) -> Vec<&str> {
+    let mut items = Vec::new();
+    let mut start = 0;
+    let mut depth = 0_i32;
+    for (idx, ch) in selector.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                items.push(&selector[start..idx]);
+                start = idx + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    items.push(&selector[start..]);
+    items
+}
+
+fn kind_expr_from_intrinsic_guard_selector(
+    selector: Option<&str>,
+    bare_selector_is_kind: bool,
+) -> Option<&str> {
+    let selector = selector?;
+    let items = top_level_selector_items(selector);
+    for item in &items {
+        if let Some(rest) = item.strip_prefix("kind=") {
+            return Some(rest);
+        }
+    }
+    if bare_selector_is_kind {
+        let first = items.first().copied().unwrap_or_default();
+        if !first.is_empty() && !first.starts_with("len=") && first != "*" {
+            return Some(first);
+        }
+    }
+    None
+}
+
+fn common_intrinsic_kind_name_value(kind_name: &str) -> Option<u8> {
+    match kind_name {
+        "int8" | "c_int8_t" => Some(1),
+        "int16" | "c_int16_t" => Some(2),
+        "int32" | "c_int" | "c_int32_t" => Some(4),
+        "int64" | "c_long" | "c_long_long" | "c_int64_t" => Some(8),
+        "real32" | "sp" | "c_float" => Some(4),
+        "real64" | "dp" | "xdp" | "c_double" => Some(8),
+        "real128" | "qp" | "c_long_double" => Some(16),
+        "c_bool" => Some(1),
+        _ => None,
+    }
+}
+
+fn intrinsic_guard_kind_value(
+    selector: Option<&str>,
+    default: u8,
+    bare_selector_is_kind: bool,
+    st: Option<&SymbolTable>,
+) -> u8 {
+    let Some(kind_expr) = kind_expr_from_intrinsic_guard_selector(selector, bare_selector_is_kind)
+    else {
+        return default;
+    };
+    named_kind_value(kind_expr, None, None, st)
+        .or_else(|| common_intrinsic_kind_name_value(kind_expr))
+        .unwrap_or(default)
+}
+
+fn parse_intrinsic_class_star_guard(
+    type_name: &str,
+    st: Option<&SymbolTable>,
+) -> Option<IntrinsicClassStarGuard> {
+    let compact = compact_intrinsic_guard_name(type_name);
+    match compact.as_str() {
+        "double" | "doubleprecision" => return Some(IntrinsicClassStarGuard::Real(8)),
+        "doublecomplex" => return Some(IntrinsicClassStarGuard::Complex(8)),
+        _ => {}
+    }
+    if let Some(selector) = intrinsic_guard_selector(&compact, "integer") {
+        let kind = intrinsic_guard_kind_value(
+            selector,
+            crate::driver::defaults::default_int_kind(),
+            true,
+            st,
+        );
+        return Some(IntrinsicClassStarGuard::Integer(kind));
+    }
+    if let Some(selector) = intrinsic_guard_selector(&compact, "real") {
+        let kind = intrinsic_guard_kind_value(
+            selector,
+            crate::driver::defaults::default_real_kind(),
+            true,
+            st,
+        );
+        return Some(IntrinsicClassStarGuard::Real(kind));
+    }
+    if let Some(selector) = intrinsic_guard_selector(&compact, "complex") {
+        let kind = intrinsic_guard_kind_value(selector, 4, true, st);
+        return Some(IntrinsicClassStarGuard::Complex(kind));
+    }
+    if let Some(selector) = intrinsic_guard_selector(&compact, "logical") {
+        let kind = intrinsic_guard_kind_value(selector, 4, true, st);
+        return Some(IntrinsicClassStarGuard::Logical(kind));
+    }
+    if let Some(selector) = intrinsic_guard_selector(&compact, "character") {
+        let kind = intrinsic_guard_kind_value(selector, 1, false, st);
+        return Some(IntrinsicClassStarGuard::Character(kind));
+    }
+    None
+}
 
 pub(super) fn intrinsic_class_star_type_tag_for_type_info(
     ti: &crate::sema::symtab::TypeInfo,
 ) -> Option<u64> {
     use crate::sema::symtab::TypeInfo;
     match ti {
-        TypeInfo::Integer { .. } => Some(CLASS_STAR_TAG_INTEGER),
-        TypeInfo::Real { .. } => Some(CLASS_STAR_TAG_REAL),
-        TypeInfo::DoublePrecision => Some(CLASS_STAR_TAG_DOUBLE),
-        TypeInfo::Complex { .. } => Some(CLASS_STAR_TAG_COMPLEX),
-        TypeInfo::Logical { .. } => Some(CLASS_STAR_TAG_LOGICAL),
-        TypeInfo::Character { .. } => Some(CLASS_STAR_TAG_CHARACTER),
+        TypeInfo::Integer { kind } => Some(class_star_intrinsic_tag(
+            CLASS_STAR_TAG_INTEGER_BASE,
+            kind.unwrap_or_else(crate::driver::defaults::default_int_kind),
+        )),
+        TypeInfo::Real { kind } => Some(class_star_intrinsic_tag(
+            CLASS_STAR_TAG_REAL_BASE,
+            kind.unwrap_or_else(crate::driver::defaults::default_real_kind),
+        )),
+        TypeInfo::DoublePrecision => Some(class_star_intrinsic_tag(CLASS_STAR_TAG_REAL_BASE, 8)),
+        TypeInfo::Complex { kind } => Some(class_star_intrinsic_tag(
+            CLASS_STAR_TAG_COMPLEX_BASE,
+            kind.unwrap_or(4),
+        )),
+        TypeInfo::Logical { kind } => Some(class_star_intrinsic_tag(
+            CLASS_STAR_TAG_LOGICAL_BASE,
+            kind.unwrap_or(4),
+        )),
+        TypeInfo::Character { kind, .. } => Some(class_star_intrinsic_tag(
+            CLASS_STAR_TAG_CHARACTER_BASE,
+            kind.unwrap_or(1),
+        )),
         _ => None,
     }
 }
 
-pub(super) fn intrinsic_class_star_type_tag_for_guard(type_name: &str) -> Option<u64> {
-    match type_name.to_ascii_lowercase().replace(' ', "").as_str() {
-        "integer" => Some(CLASS_STAR_TAG_INTEGER),
-        "real" => Some(CLASS_STAR_TAG_REAL),
-        "double" | "doubleprecision" => Some(CLASS_STAR_TAG_DOUBLE),
-        "complex" => Some(CLASS_STAR_TAG_COMPLEX),
-        "logical" => Some(CLASS_STAR_TAG_LOGICAL),
-        "character" => Some(CLASS_STAR_TAG_CHARACTER),
-        _ => None,
-    }
+pub(super) fn intrinsic_class_star_type_tag_for_guard(
+    type_name: &str,
+    st: Option<&SymbolTable>,
+) -> Option<u64> {
+    parse_intrinsic_class_star_guard(type_name, st).map(intrinsic_class_star_tag_from_guard_spec)
 }
 
 pub(super) fn intrinsic_class_star_type_info_for_guard(
     type_name: &str,
+    st: Option<&SymbolTable>,
 ) -> Option<crate::sema::symtab::TypeInfo> {
     use crate::sema::symtab::TypeInfo;
-    match type_name.to_ascii_lowercase().replace(' ', "").as_str() {
-        "integer" => Some(TypeInfo::Integer { kind: None }),
-        "real" => Some(TypeInfo::Real { kind: None }),
-        "double" | "doubleprecision" => Some(TypeInfo::DoublePrecision),
-        "complex" => Some(TypeInfo::Complex { kind: None }),
-        "logical" => Some(TypeInfo::Logical { kind: None }),
-        "character" => Some(TypeInfo::Character {
+    match parse_intrinsic_class_star_guard(type_name, st)? {
+        IntrinsicClassStarGuard::Integer(kind) => Some(TypeInfo::Integer { kind: Some(kind) }),
+        IntrinsicClassStarGuard::Real(kind) => Some(TypeInfo::Real { kind: Some(kind) }),
+        IntrinsicClassStarGuard::Complex(kind) => Some(TypeInfo::Complex { kind: Some(kind) }),
+        IntrinsicClassStarGuard::Logical(kind) => Some(TypeInfo::Logical { kind: Some(kind) }),
+        IntrinsicClassStarGuard::Character(kind) => Some(TypeInfo::Character {
             len: None,
-            kind: Some(1),
+            kind: Some(kind),
         }),
-        _ => None,
     }
 }
 
@@ -28721,6 +29064,42 @@ pub(super) fn expr_needs_static_scalar_descriptor_view(
         && !info.is_class
 }
 
+fn descriptor_with_polymorphic_type_tag(
+    b: &mut FuncBuilder,
+    desc: ValueId,
+    expr: &crate::ast::expr::SpannedExpr,
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> ValueId {
+    if let Expr::Name { name } = &expr.node {
+        if let Some(info) = locals.get(&name.to_lowercase()) {
+            if info.is_class && local_uses_array_descriptor(info) {
+                return desc;
+            }
+        }
+    }
+
+    let type_tag =
+        intrinsic_class_star_type_tag_value_for_expr(b, expr, Some(locals), st, type_layouts)
+            .or_else(|| {
+                type_layouts.and_then(|tl| expr_type_tag_value(b, expr, Some(locals), st, tl))
+            });
+    let Some(type_tag) = type_tag else {
+        return desc;
+    };
+
+    let tagged = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let size = b.const_i64(384);
+    b.call(
+        FuncRef::External("memcpy".into()),
+        vec![tagged, desc, size],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+    store_array_desc_type_tag(b, tagged, type_tag);
+    tagged
+}
+
 pub(super) fn lower_arg_descriptor(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -28773,6 +29152,9 @@ pub(super) fn lower_arg_descriptor_full(
         contained_host_refs,
         descriptor_params,
     ) {
+        if force_static_scalar_polymorphic_view {
+            return descriptor_with_polymorphic_type_tag(b, desc, expr, locals, st, type_layouts);
+        }
         return desc;
     }
     if let Expr::Name { name } = &expr.node {
@@ -28870,6 +29252,30 @@ pub(super) fn box_actual_into_class_star_descriptor(
     // to put in the descriptor's base_addr. For scalars we lower the
     // expression and store into a temp; for whole-array names we use
     // their existing storage.
+    if expr_is_character_expr(b, locals, expr, st, type_layouts)
+        && !expr_is_array_designator(b, locals, expr, st, type_layouts)
+    {
+        let (base_ptr, elem_size) =
+            lower_string_expr_full(b, locals, expr, st, type_layouts, None, None, None);
+        let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+        let type_tag =
+            intrinsic_class_star_type_tag_value_for_expr(b, expr, Some(locals), st, type_layouts)
+                .or_else(|| {
+                    type_layouts.and_then(|tl| expr_type_tag_value(b, expr, Some(locals), st, tl))
+                });
+        let tbp_lookup =
+            type_layouts.and_then(|tl| expr_tbp_lookup_value(b, expr, Some(locals), st, tl));
+        store_scalar_polymorphic_descriptor_view(
+            b,
+            desc,
+            base_ptr,
+            Some(elem_size),
+            type_tag,
+            tbp_lookup,
+        );
+        return desc;
+    }
+
     let (base_ptr, elem_size_bytes): (ValueId, i64) = if let Expr::Name { name } = &expr.node {
         if let Some(info) = locals.get(&name.to_lowercase()) {
             let bytes = descriptor_element_size_bytes(info).max(1);
@@ -37431,13 +37837,12 @@ pub(super) fn lower_array_assign(
                 let logical_idx = b.imul(iv, dest_stride);
                 let doff = b.imul(logical_idx, dest_elem_bytes);
                 let dp = b.gep(dest_base, vec![doff], IrType::Int(IntWidth::I8));
-                if is_complex_ty(&src_elem_ty) && is_complex_ty(&dest_info.ty) {
-                    let src_ptr = rank1_array_desc_elem_ptr(b, src_desc, &src_elem_ty, iv);
-                    let copy_bytes = b.const_i64(ir_scalar_byte_size(&dest_info.ty));
-                    let src_ptr = if complex_float_width(&src_elem_ty)
-                        == complex_float_width(&dest_info.ty)
+                if is_complex_ty(&dest_info.ty) {
+                    let copy_bytes = b.const_i64(complex_byte_size(&dest_info.ty));
+                    let src_ptr = if is_complex_ty(&src_elem_ty)
+                        && complex_float_width(&src_elem_ty) == complex_float_width(&dest_info.ty)
                     {
-                        src_ptr
+                        rank1_array_desc_elem_ptr(b, src_desc, &src_elem_ty, iv)
                     } else {
                         let src_val = load_rank1_array_desc_elem(b, src_desc, &src_elem_ty, iv);
                         materialize_complex_operand(b, src_val, complex_float_width(&dest_info.ty))
@@ -38162,9 +38567,6 @@ pub(super) fn lower_array_section_with_vector_subscripts(
                 });
             }
             let src_off = src_byte_off.unwrap_or(zero64);
-            let src_p = b.gep(src_base, vec![src_off], IrType::Int(IntWidth::I8));
-            let elem_val = b.load_typed(src_p, elem_ty.clone());
-
             // Result byte offset (column-major): for each kept dim k2,
             // contribution = counters[k2] * (prod_{j<k2} ext_j) * elem_bytes.
             let mut dst_byte_off: Option<ValueId> = None;
@@ -38184,8 +38586,13 @@ pub(super) fn lower_array_section_with_vector_subscripts(
                 });
             }
             let dst_off = dst_byte_off.unwrap_or(zero64);
+            let src_p = b.gep(src_base, vec![src_off], IrType::Int(IntWidth::I8));
             let dst_p = b.gep(dst_base, vec![dst_off], IrType::Int(IntWidth::I8));
-            b.store(elem_val, dst_p);
+            b.call(
+                FuncRef::External("memcpy".into()),
+                vec![dst_p, src_p, elem_bytes_v],
+                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+            );
             b.branch(incrs[0], vec![]);
         } else {
             // Reset next-inner counter to 0 and dive in.
@@ -38767,7 +39174,7 @@ pub(super) fn with_select_type_intrinsic_guard_binding<F>(
         f(b, ctx);
         return;
     };
-    let Some(guard_ti) = intrinsic_class_star_type_info_for_guard(guard_type) else {
+    let Some(guard_ti) = intrinsic_class_star_type_info_for_guard(guard_type, Some(ctx.st)) else {
         f(b, ctx);
         return;
     };
@@ -38784,6 +39191,37 @@ pub(super) fn with_select_type_intrinsic_guard_binding<F>(
     };
 
     let desc = array_descriptor_addr(b, &selector_info);
+    if local_declared_rank(&selector_info) > 0 {
+        let info = LocalInfo {
+            addr: desc,
+            ty: type_info_to_ir_type(&guard_ti),
+            dims: selector_info.dims.clone(),
+            allocatable: false,
+            descriptor_arg: true,
+            by_ref: false,
+            char_kind: selector_info.char_kind.clone(),
+            derived_type: None,
+            inline_const: None,
+            is_pointer: false,
+            runtime_dim_upper: selector_info.runtime_dim_upper.clone(),
+            is_class: false,
+            logical_kind: match &guard_ti {
+                crate::sema::symtab::TypeInfo::Logical { kind } => *kind,
+                _ => None,
+            },
+            last_dim_assumed_size: selector_info.last_dim_assumed_size,
+        };
+
+        let saved = ctx.locals.insert(binding_name.clone(), info);
+        f(b, ctx);
+        if let Some(orig) = saved {
+            ctx.locals.insert(binding_name, orig);
+        } else {
+            ctx.locals.remove(&binding_name);
+        }
+        return;
+    }
+
     let base = scalar_descriptor_base_addr_raw(
         b,
         &LocalInfo {
@@ -38804,24 +39242,38 @@ pub(super) fn with_select_type_intrinsic_guard_binding<F>(
         },
     );
     let scalar_ty = type_info_to_ir_type(&guard_ti);
-    let typed_base = {
-        let raw = b.ptr_to_int(base);
-        b.int_to_ptr(raw, scalar_ty.clone())
-    };
     let logical_kind = match &guard_ti {
         crate::sema::symtab::TypeInfo::Logical { kind } => *kind,
         _ => None,
     };
-    let char_kind = match &guard_ti {
-        crate::sema::symtab::TypeInfo::Character { len: Some(len), .. } => CharKind::Fixed(*len),
-        _ => CharKind::None,
+    let (addr, ty, descriptor_arg, char_kind) = match &guard_ti {
+        crate::sema::symtab::TypeInfo::Character { len: None, .. } => (
+            desc,
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+            true,
+            CharKind::None,
+        ),
+        crate::sema::symtab::TypeInfo::Character { len: Some(len), .. } => {
+            let typed_base = {
+                let raw = b.ptr_to_int(base);
+                b.int_to_ptr(raw, scalar_ty.clone())
+            };
+            (typed_base, scalar_ty.clone(), false, CharKind::Fixed(*len))
+        }
+        _ => {
+            let typed_base = {
+                let raw = b.ptr_to_int(base);
+                b.int_to_ptr(raw, scalar_ty.clone())
+            };
+            (typed_base, scalar_ty.clone(), false, CharKind::None)
+        }
     };
     let info = LocalInfo {
-        addr: typed_base,
-        ty: scalar_ty,
+        addr,
+        ty,
         dims: vec![],
         allocatable: false,
-        descriptor_arg: false,
+        descriptor_arg,
         by_ref: false,
         char_kind,
         derived_type: None,
@@ -40299,13 +40751,7 @@ pub(super) fn deallocate_derived_storage_components(
         };
 
         if field.dims.is_empty() {
-            deallocate_derived_storage_components(
-                b,
-                field_ptr,
-                nested_layout,
-                registry,
-                stat_addr,
-            );
+            deallocate_derived_storage_components(b, field_ptr, nested_layout, registry, stat_addr);
             continue;
         }
 
@@ -40317,13 +40763,7 @@ pub(super) fn deallocate_derived_storage_components(
         for idx in 0..elem_count {
             let byte_off = b.const_i64(idx * elem_bytes);
             let elem_ptr = b.gep(field_ptr, vec![byte_off], IrType::Int(IntWidth::I8));
-            deallocate_derived_storage_components(
-                b,
-                elem_ptr,
-                nested_layout,
-                registry,
-                stat_addr,
-            );
+            deallocate_derived_storage_components(b, elem_ptr, nested_layout, registry, stat_addr);
         }
     }
 }
@@ -41485,14 +41925,7 @@ pub(super) fn store_derived_field_expr(
             vec![field_ptr, dest_len, src_ptr, src_len],
             IrType::Void,
         );
-        deallocate_owned_string_expr_temp(
-            b,
-            locals,
-            value,
-            st,
-            Some(type_layouts),
-            src_ptr,
-        );
+        deallocate_owned_string_expr_temp(b, locals, value, st, Some(type_layouts), src_ptr);
         return;
     }
 
@@ -41521,14 +41954,7 @@ pub(super) fn store_derived_field_expr(
                 IrType::Void,
             );
         }
-        deallocate_owned_string_expr_temp(
-            b,
-            locals,
-            value,
-            st,
-            Some(type_layouts),
-            src_ptr,
-        );
+        deallocate_owned_string_expr_temp(b, locals, value, st, Some(type_layouts), src_ptr);
         return;
     }
 
@@ -43493,6 +43919,13 @@ pub(super) fn lower_arg_by_ref_full(
         if let Some(info) = locals.get(&key) {
             if let Some(c) = info.inline_const {
                 let val = materialize_const_scalar(b, c, &info.ty);
+                if is_complex_ty(&info.ty)
+                    && b.func()
+                        .value_type(val)
+                        .is_some_and(|ty| is_complex_ptr_ty(&ty))
+                {
+                    return val;
+                }
                 let tmp = b.alloca(info.ty.clone());
                 b.store(val, tmp);
                 return tmp;
