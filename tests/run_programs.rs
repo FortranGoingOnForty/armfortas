@@ -3882,6 +3882,48 @@ fn logical_kind_array_scalar_broadcast_fixture_passes_all_opts() {
 }
 
 #[test]
+fn entity_character_length_declarators_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("entity_character_length_declarators.f90");
+    assert!(
+        source.exists(),
+        "entity_character_length_declarators.f90 missing"
+    );
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "entity_character_length_declarators.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
+fn complex_vector_subscript_section_expr_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("complex_vector_subscript_section_expr.f90");
+    assert!(
+        source.exists(),
+        "complex_vector_subscript_section_expr.f90 missing"
+    );
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "complex_vector_subscript_section_expr.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
 fn complex_module_param_reshape_exprs_fixture_passes_all_opts() {
     let compiler = find_compiler();
     let test_dir = find_test_programs();

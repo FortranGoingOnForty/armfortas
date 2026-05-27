@@ -38567,9 +38567,6 @@ pub(super) fn lower_array_section_with_vector_subscripts(
                 });
             }
             let src_off = src_byte_off.unwrap_or(zero64);
-            let src_p = b.gep(src_base, vec![src_off], IrType::Int(IntWidth::I8));
-            let elem_val = b.load_typed(src_p, elem_ty.clone());
-
             // Result byte offset (column-major): for each kept dim k2,
             // contribution = counters[k2] * (prod_{j<k2} ext_j) * elem_bytes.
             let mut dst_byte_off: Option<ValueId> = None;
@@ -38589,8 +38586,13 @@ pub(super) fn lower_array_section_with_vector_subscripts(
                 });
             }
             let dst_off = dst_byte_off.unwrap_or(zero64);
+            let src_p = b.gep(src_base, vec![src_off], IrType::Int(IntWidth::I8));
             let dst_p = b.gep(dst_base, vec![dst_off], IrType::Int(IntWidth::I8));
-            b.store(elem_val, dst_p);
+            b.call(
+                FuncRef::External("memcpy".into()),
+                vec![dst_p, src_p, elem_bytes_v],
+                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+            );
             b.branch(incrs[0], vec![]);
         } else {
             // Reset next-inner counter to 0 and dive in.
