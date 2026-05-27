@@ -4888,7 +4888,7 @@ pub(super) fn effective_decl_char_len_spec<'a>(
     type_spec: &'a TypeSpec,
     entity_char_len: Option<&'a crate::ast::decl::LenSpec>,
 ) -> Option<&'a crate::ast::decl::LenSpec> {
-    entity_char_len.or_else(|| match type_spec {
+    entity_char_len.or(match type_spec {
         TypeSpec::Character(Some(sel)) => sel.len.as_ref(),
         _ => None,
     })
@@ -27521,10 +27521,10 @@ fn top_level_selector_items(selector: &str) -> Vec<&str> {
     items
 }
 
-fn kind_expr_from_intrinsic_guard_selector<'a>(
-    selector: Option<&'a str>,
+fn kind_expr_from_intrinsic_guard_selector(
+    selector: Option<&str>,
     bare_selector_is_kind: bool,
-) -> Option<&'a str> {
+) -> Option<&str> {
     let selector = selector?;
     let items = top_level_selector_items(selector);
     for item in &items {
