@@ -6604,12 +6604,8 @@ pub(super) fn extract_array_dims_with_init(
         return dims;
     };
 
-    let init_len = init_expr.and_then(|expr| match &expr.node {
-        Expr::ArrayConstructor { values, .. } => {
-            const_array_constructor_len_in_scope(values, param_consts, st)
-        }
-        _ => None,
-    });
+    let init_len =
+        init_expr.and_then(|expr| const_array_initializer_len_in_scope(expr, param_consts, st));
     let Some(init_len) = init_len else {
         return dims;
     };
@@ -6632,6 +6628,36 @@ pub(super) fn extract_array_dims_with_init(
     };
     dims[last_assumed_idx] = (lower, init_len / prefix_extent);
     dims
+}
+
+fn const_array_initializer_len_in_scope(
+    expr: &crate::ast::expr::SpannedExpr,
+    param_consts: &HashMap<String, ConstScalar>,
+    st: Option<&SymbolTable>,
+) -> Option<i64> {
+    match &expr.node {
+        Expr::ParenExpr { inner } => const_array_initializer_len_in_scope(inner, param_consts, st),
+        Expr::ArrayConstructor { values, .. } => {
+            const_array_constructor_len_in_scope(values, param_consts, st)
+        }
+        Expr::FunctionCall { callee, args } => {
+            let Expr::Name { name } = &callee.node else {
+                return None;
+            };
+            if !matches!(
+                name.to_ascii_lowercase().as_str(),
+                "real" | "dble" | "dfloat" | "float" | "int" | "cmplx" | "complex" | "logical"
+            ) {
+                return None;
+            }
+            let first = args.first()?;
+            let crate::ast::expr::SectionSubscript::Element(arg_expr) = &first.value else {
+                return None;
+            };
+            const_array_initializer_len_in_scope(arg_expr, param_consts, st)
+        }
+        _ => None,
+    }
 }
 
 /// Try to evaluate a constant integer expression at compile time.
