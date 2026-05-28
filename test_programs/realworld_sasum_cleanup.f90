@@ -1,6 +1,6 @@
 ! stdlib BLAS sasum-inspired cleanup + chunked reduction loop.
 ! CHECK: 29
-! IR_CHECK: rt_call @__afs_check_bounds
+! IR_NOT: rt_call @__afs_check_bounds
 ! REPRO_CHECK: asm
 ! REPRO_CHECK: obj
 ! REPRO_CHECK: run

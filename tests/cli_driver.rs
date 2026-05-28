@@ -9100,7 +9100,6 @@ fn accepted_but_unimplemented_flags_emit_warnings() {
         .args([
             "-c",
             "-g",
-            "-fcheck=bounds",
             "-fmax-stack-var-size=64",
             "-frecursive",
             "-fbackslash",
@@ -9122,7 +9121,6 @@ fn accepted_but_unimplemented_flags_emit_warnings() {
     let stderr = String::from_utf8_lossy(&result.stderr);
     for needle in [
         "-g is accepted, but debug info emission is not yet implemented",
-        "-fcheck=bounds currently has no effect",
         "-fmax-stack-var-size is recognized but not yet implemented",
         "-frecursive is recognized but not yet implemented",
         "-fbackslash is recognized but string escape processing is not yet implemented",
@@ -9170,12 +9168,71 @@ fn fcheck_all_warns_about_partial_support() {
     assert!(result.status.success());
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
-        stderr.contains("-fcheck=all is accepted, but only array bounds checks exist today"),
+        stderr.contains(
+            "-fcheck=all is accepted, but only array bounds checks are implemented today"
+        ),
         "expected -fcheck=all warning: {}",
         stderr
     );
     let _ = std::fs::remove_file(&src);
     let _ = std::fs::remove_file(&out);
+}
+
+#[test]
+fn fcheck_bounds_controls_emitted_bounds_checks() {
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: i, a(4), s\n  a = [1, 2, 3, 4]\n  s = 0\n  do i = 1, 4\n    s = s + a(i)\n  end do\n  print *, s\nend program\n",
+        "f90",
+    );
+    let unchecked_ir = unique_path("bounds_policy_unchecked", "ir");
+    let checked_ir = unique_path("bounds_policy_checked", "ir");
+
+    let unchecked = Command::new(compiler("armfortas"))
+        .args([
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-o",
+            unchecked_ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("unchecked emit-ir spawn failed");
+    assert!(
+        unchecked.status.success(),
+        "unchecked emit-ir should succeed: {}",
+        String::from_utf8_lossy(&unchecked.stderr)
+    );
+    let unchecked_text = fs::read_to_string(&unchecked_ir).expect("read unchecked IR");
+    assert!(
+        !unchecked_text.contains("rt_call @__afs_check_bounds"),
+        "default CLI IR should not retain runtime bounds checks:\n{}",
+        unchecked_text
+    );
+
+    let checked = Command::new(compiler("armfortas"))
+        .args([
+            "-fcheck=bounds",
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-o",
+            checked_ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("checked emit-ir spawn failed");
+    assert!(
+        checked.status.success(),
+        "checked emit-ir should succeed: {}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    let checked_text = fs::read_to_string(&checked_ir).expect("read checked IR");
+    assert!(
+        checked_text.contains("rt_call @__afs_check_bounds"),
+        "-fcheck=bounds CLI IR should retain runtime bounds checks:\n{}",
+        checked_text
+    );
+
+    let _ = std::fs::remove_file(&checked_ir);
+    let _ = std::fs::remove_file(&unchecked_ir);
+    let _ = std::fs::remove_file(&src);
 }
 
 #[test]
