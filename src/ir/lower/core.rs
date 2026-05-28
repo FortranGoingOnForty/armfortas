@@ -13143,14 +13143,23 @@ pub(super) fn local_intrinsic_call_type_info(
         }
     }
     if matches!(lower_name.as_str(), "real" | "float") && (args.len() > 1 || has_keyword) {
+        if let Some(kind) = intrinsic_kind_call_arg_width(args, 1, "kind", locals, st) {
+            return Some(crate::sema::symtab::TypeInfo::Real { kind: Some(kind) });
+        }
         return fortran_type_to_type_info(&crate::sema::types::expr_type(expr, st));
     }
     if matches!(lower_name.as_str(), "int" | "nint" | "floor" | "ceiling")
         && (args.len() > 1 || has_keyword)
     {
+        if let Some(kind) = intrinsic_kind_call_arg_width(args, 1, "kind", locals, st) {
+            return Some(crate::sema::symtab::TypeInfo::Integer { kind: Some(kind) });
+        }
         return fortran_type_to_type_info(&crate::sema::types::expr_type(expr, st));
     }
     if lower_name == "cmplx" && (args.len() > 2 || has_keyword) {
+        if let Some(kind) = intrinsic_kind_call_arg_width(args, 2, "kind", locals, st) {
+            return Some(crate::sema::symtab::TypeInfo::Complex { kind: Some(kind) });
+        }
         return fortran_type_to_type_info(&crate::sema::types::expr_type(expr, st));
     }
 
