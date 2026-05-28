@@ -1365,7 +1365,8 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         }
     }
 
-    let use_naive_regalloc = std::env::var_os("ARMFORTAS_USE_NAIVE_REGALLOC").is_some();
+    let use_naive_regalloc = opts.opt_level == OptLevel::O0
+        || std::env::var_os("ARMFORTAS_USE_NAIVE_REGALLOC").is_some();
 
     // 8. Register allocation.
     for mf in &mut allocated {
@@ -1385,12 +1386,12 @@ pub fn compile(opts: &Options) -> Result<(), String> {
             if opts.opt_level >= OptLevel::O1 {
                 crate::codegen::tailcall::tail_call_opt(mf);
             }
-            // 8.6. Branch relaxation: any B.cond whose target lies
-            // outside the ±1MB conditional-branch window is expanded
-            // to a `B.{!cond} skip; B far_target; skip:` trampoline
-            // so the assembler doesn't choke on the encoding.
-            crate::codegen::relax_branches::relax_branches(mf);
         }
+        // 8.6. Branch relaxation: any B.cond whose target lies
+        // outside the ±1MB conditional-branch window is expanded
+        // to a `B.{!cond} skip; B far_target; skip:` trampoline
+        // so the assembler doesn't choke on the encoding.
+        crate::codegen::relax_branches::relax_branches(mf);
     }
 
     // 9. Emit assembly.
