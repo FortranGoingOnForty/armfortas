@@ -430,6 +430,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                             &arg.value,
                                                             crate::ast::expr::SectionSubscript::Element(e)
                                                                 if expr_contains_array_refs(e, &ctx.locals)
+                                                                    || expr_contains_array_constructor(e)
                                                         )
                                                     })
                                             } else {

@@ -3882,6 +3882,27 @@ fn explicit_shape_sequence_section_fixture_passes_all_opts() {
 }
 
 #[test]
+fn elemental_conversion_array_constructor_alloc_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("elemental_conversion_array_constructor_alloc.f90");
+    assert!(
+        source.exists(),
+        "elemental_conversion_array_constructor_alloc.f90 missing"
+    );
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "elemental_conversion_array_constructor_alloc.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
 fn parameter_array_assumed_size_initializer_fixture_passes_all_opts() {
     let compiler = find_compiler();
     let test_dir = find_test_programs();
