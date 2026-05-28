@@ -43860,6 +43860,24 @@ pub(super) fn lower_contiguous_intent_in_array_actual(
     contained_host_refs: Option<&HashMap<String, Vec<String>>>,
     descriptor_params: Option<&HashMap<String, Vec<bool>>>,
 ) -> Option<ValueId> {
+    if explicit_shape_sequence_section_actual(locals, expr) {
+        let (source_desc, elem_ty) = lower_array_expr_descriptor(
+            b,
+            locals,
+            expr,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        )?;
+        let supported_elem = matches!(elem_ty, IrType::Int(_) | IrType::Float(_) | IrType::Bool)
+            || is_complex_ty(&elem_ty);
+        if supported_elem {
+            return Some(b.load_typed(source_desc, IrType::Ptr(Box::new(elem_ty))));
+        }
+    }
+
     let needs_copy_candidate = match &expr.node {
         Expr::Name { .. } => actual_is_descriptor_array(locals, expr),
         Expr::FunctionCall { callee, args } => {
@@ -43905,6 +43923,41 @@ pub(super) fn lower_contiguous_intent_in_array_actual(
         IrType::Void,
     );
     Some(b.load_typed(tmp_desc, IrType::Ptr(Box::new(elem_ty))))
+}
+
+fn explicit_shape_sequence_section_actual(
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+) -> bool {
+    let Expr::FunctionCall { callee, args } = &expr.node else {
+        return false;
+    };
+    let Expr::Name { name } = &callee.node else {
+        return false;
+    };
+    let Some(info) = locals.get(&name.to_lowercase()) else {
+        return false;
+    };
+    if info.dims.is_empty() && !local_uses_array_descriptor(info) {
+        return false;
+    }
+
+    let mut saw_range = false;
+    let mut saw_element = false;
+    for arg in args {
+        match &arg.value {
+            crate::ast::expr::SectionSubscript::Range { start, end, stride } => {
+                if saw_element || start.is_some() || end.is_some() || stride.is_some() {
+                    return false;
+                }
+                saw_range = true;
+            }
+            crate::ast::expr::SectionSubscript::Element(_) => {
+                saw_element = true;
+            }
+        }
+    }
+    saw_range
 }
 
 pub(super) fn lower_arg_by_ref_full(
