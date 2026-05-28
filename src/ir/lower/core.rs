@@ -6192,6 +6192,18 @@ fn resolve_exported_global_key(
     globals.contains_key(&source_key).then_some(source_key)
 }
 
+fn resolve_visible_global_key(
+    st: &SymbolTable,
+    globals: &HashMap<(String, String), ModuleGlobalInfo>,
+    scope_id: crate::sema::symtab::ScopeId,
+    local_key: &str,
+) -> Option<(String, String)> {
+    let sym = st.lookup_in(scope_id, local_key)?;
+    let source_mod = module_scope_name_for_symbol(st, sym.scope)?;
+    let source_key = (source_mod, sym.name.to_lowercase());
+    globals.contains_key(&source_key).then_some(source_key)
+}
+
 /// Install module globals imported by this function's USE
 /// statements as `LocalInfo` entries. Honors:
 ///   * USE ONLY filtering — only names in the only-list are installed
@@ -6331,6 +6343,18 @@ pub(super) fn install_globals_as_locals_in(
                         && !pending.iter().any(|(k, _)| k == &local_lc)
                     {
                         pending.push((local_lc, (src_mod_key, var_lc)));
+                    }
+                }
+                if let Some(required) = required_names {
+                    for local_lc in required {
+                        if pending.iter().any(|(k, _)| k == local_lc) {
+                            continue;
+                        }
+                        if let Some(resolved_key) =
+                            resolve_visible_global_key(st, globals, host_scope_id, local_lc)
+                        {
+                            pending.push((local_lc.clone(), resolved_key));
+                        }
                     }
                 }
             }
