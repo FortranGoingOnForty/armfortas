@@ -2105,6 +2105,69 @@ fn set_rank2_contiguous_shape(desc: &mut ArrayDescriptor, dim0: usize, dim1: usi
     };
 }
 
+#[derive(Clone, Copy)]
+struct MatmulShape {
+    m: usize,
+    k: usize,
+    n: usize,
+    result_rank: i32,
+}
+
+fn matmul_shape(a: &ArrayDescriptor, b: &ArrayDescriptor) -> Option<MatmulShape> {
+    match (a.rank, b.rank) {
+        (2, 2) => {
+            let k = a.dims[1].extent() as usize;
+            if b.dims[0].extent() as usize != k {
+                return None;
+            }
+            Some(MatmulShape {
+                m: a.dims[0].extent() as usize,
+                k,
+                n: b.dims[1].extent() as usize,
+                result_rank: 2,
+            })
+        }
+        (2, 1) => {
+            let k = a.dims[1].extent() as usize;
+            if b.dims[0].extent() as usize != k {
+                return None;
+            }
+            Some(MatmulShape {
+                m: a.dims[0].extent() as usize,
+                k,
+                n: 1,
+                result_rank: 1,
+            })
+        }
+        (1, 2) => {
+            let k = a.dims[0].extent() as usize;
+            if b.dims[0].extent() as usize != k {
+                return None;
+            }
+            Some(MatmulShape {
+                m: 1,
+                k,
+                n: b.dims[1].extent() as usize,
+                result_rank: 1,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn allocate_matmul_result(result: *mut ArrayDescriptor, elem_size: i64, shape: MatmulShape) {
+    let len = if shape.result_rank == 1 {
+        shape.m.max(shape.n)
+    } else {
+        shape.m * shape.n
+    };
+    afs_allocate_1d(result, elem_size, len as i64);
+    if shape.result_rank == 2 {
+        let res = unsafe { &mut *result };
+        set_rank2_contiguous_shape(res, shape.m, shape.n);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2252,6 +2315,36 @@ mod tests {
         assert_eq!(product.rank, 2);
         assert_eq!(product.dims[0].stride, 1);
         assert_eq!(product.dims[1].stride, 2);
+        afs_deallocate_array(&mut product, ptr::null_mut());
+    }
+
+    #[test]
+    fn matmul_matrix_vector_and_vector_matrix_publish_rank1_shape() {
+        let mut matrix_data = [
+            9.0_f32, 4.0, 0.0, 4.0, 0.0, 7.0, 8.0, 0.0, 0.0, 0.0, -1.0, 5.0, 0.0, 0.0, 8.0, 6.0,
+            -3.0, 0.0, 0.0, 0.0,
+        ];
+        let mut col_vector_data = [1.0_f32; 5];
+        let matrix = f32_descriptor(&mut matrix_data, &[4, 5]);
+        let col_vector = f32_descriptor(&mut col_vector_data, &[5]);
+
+        let mut product = ArrayDescriptor::zeroed();
+        afs_matmul_real8(&matrix, &col_vector, &mut product);
+        assert_eq!(product.rank, 1);
+        assert_eq!(product.dims[0].extent(), 4);
+        let got =
+            unsafe { core::slice::from_raw_parts(product.base_addr as *const f32, 4).to_vec() };
+        assert_eq!(got, vec![6.0, 11.0, 15.0, 15.0]);
+        afs_deallocate_array(&mut product, ptr::null_mut());
+
+        let mut row_vector_data = [1.0_f32; 4];
+        let row_vector = f32_descriptor(&mut row_vector_data, &[4]);
+        afs_matmul_real8(&row_vector, &matrix, &mut product);
+        assert_eq!(product.rank, 1);
+        assert_eq!(product.dims[0].extent(), 5);
+        let got =
+            unsafe { core::slice::from_raw_parts(product.base_addr as *const f32, 5).to_vec() };
+        assert_eq!(got, vec![17.0, 15.0, 4.0, 14.0, -3.0]);
         afs_deallocate_array(&mut product, ptr::null_mut());
     }
 
@@ -5482,24 +5575,16 @@ pub extern "C" fn afs_matmul_real8(
         return;
     }
 
-    let m = da.dims[0].extent() as usize;
-    let k = if da.rank >= 2 {
-        da.dims[1].extent() as usize
-    } else {
-        1
+    let Some(shape) = matmul_shape(da, db) else {
+        return;
     };
-    let n = if db.rank >= 2 {
-        db.dims[1].extent() as usize
-    } else {
-        db.dims[0].extent() as usize
-    };
+    let MatmulShape { m, k, n, .. } = shape;
     let elem_size = da.elem_size.max(1);
 
     // Allocate result using the source element width so real(4) and
     // real(8) inputs both produce correctly-sized output buffers.
-    afs_allocate_1d(result, elem_size, (m * n) as i64);
+    allocate_matmul_result(result, elem_size, shape);
     let res = unsafe { &mut *result };
-    set_rank2_contiguous_shape(res, m, n);
 
     // Fortran is column-major: A(m,k) stores A(i,l) at l*m + i,
     // B(k,n) stores B(l,j) at j*k + l, C(m,n) stores C(i,j) at j*m + i.
@@ -5557,22 +5642,14 @@ pub extern "C" fn afs_matmul_complex(
         return;
     }
 
-    let m = da.dims[0].extent() as usize;
-    let k = if da.rank >= 2 {
-        da.dims[1].extent() as usize
-    } else {
-        1
+    let Some(shape) = matmul_shape(da, db) else {
+        return;
     };
-    let n = if db.rank >= 2 {
-        db.dims[1].extent() as usize
-    } else {
-        db.dims[0].extent() as usize
-    };
+    let MatmulShape { m, k, n, .. } = shape;
     let elem_size = da.elem_size.max(8);
 
-    afs_allocate_1d(result, elem_size, (m * n) as i64);
+    allocate_matmul_result(result, elem_size, shape);
     let res = unsafe { &mut *result };
-    set_rank2_contiguous_shape(res, m, n);
 
     if elem_size == 8 {
         // complex(4): pairs of f32 (re, im).
@@ -5639,24 +5716,16 @@ pub extern "C" fn afs_matmul_int(
         return;
     }
 
-    let m = da.dims[0].extent() as usize;
-    let k = if da.rank >= 2 {
-        da.dims[1].extent() as usize
-    } else {
-        1
+    let Some(shape) = matmul_shape(da, db) else {
+        return;
     };
-    let n = if db.rank >= 2 {
-        db.dims[1].extent() as usize
-    } else {
-        db.dims[0].extent() as usize
-    };
+    let MatmulShape { m, k, n, .. } = shape;
 
     let ap = da.base_addr as *const i32;
     let bp = db.base_addr as *const i32;
 
-    afs_allocate_1d(result, 4, (m * n) as i64);
+    allocate_matmul_result(result, 4, shape);
     let res = unsafe { &mut *result };
-    set_rank2_contiguous_shape(res, m, n);
     let rp = res.base_addr as *mut i32;
 
     // Fortran is column-major: A(m,k) stores A(i,l) at l*m + i,
