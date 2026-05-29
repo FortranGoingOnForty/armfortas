@@ -3824,7 +3824,7 @@ fn complex_component_ty(elem_ty: &IrType) -> Option<&IrType> {
     }
 }
 
-fn const_array_storage_scalar_count(elem_ty: &IrType, total: i64) -> Option<i64> {
+pub(super) fn const_array_storage_scalar_count(elem_ty: &IrType, total: i64) -> Option<i64> {
     let lanes = if complex_component_ty(elem_ty).is_some() {
         2
     } else {
@@ -3833,7 +3833,7 @@ fn const_array_storage_scalar_count(elem_ty: &IrType, total: i64) -> Option<i64>
     total.checked_mul(lanes)
 }
 
-fn zero_const_for_array_lane(elem_ty: &IrType) -> ConstScalar {
+pub(super) fn zero_const_for_array_lane(elem_ty: &IrType) -> ConstScalar {
     if matches!(elem_ty, IrType::Float(_)) || complex_component_ty(elem_ty).is_some() {
         ConstScalar::Float(0.0)
     } else {
@@ -3841,7 +3841,7 @@ fn zero_const_for_array_lane(elem_ty: &IrType) -> ConstScalar {
     }
 }
 
-fn coerce_scalar_to_array_lanes(raw: ConstScalar, elem_ty: &IrType) -> Vec<ConstScalar> {
+pub(super) fn coerce_scalar_to_array_lanes(raw: ConstScalar, elem_ty: &IrType) -> Vec<ConstScalar> {
     if complex_component_ty(elem_ty).is_some() {
         vec![ConstScalar::Float(raw.to_float()), ConstScalar::Float(0.0)]
     } else if matches!(elem_ty, IrType::Float(_)) {
@@ -4354,11 +4354,172 @@ pub(super) fn collect_const_array_scalars(
                         }
                     }
                 }
+                if name.eq_ignore_ascii_case("matmul") {
+                    if let Some(values) = collect_const_matmul_scalars(
+                        args,
+                        elem_ty,
+                        param_consts,
+                        param_array_consts,
+                        param_array_elem_tys,
+                    ) {
+                        return Some(values);
+                    }
+                }
             }
             None
         }
         _ => None,
     }
+}
+
+fn collect_const_matmul_scalars(
+    args: &[crate::ast::expr::Argument],
+    elem_ty: &IrType,
+    param_consts: &HashMap<String, ConstScalar>,
+    param_array_consts: &HashMap<String, Vec<ConstScalar>>,
+    param_array_elem_tys: &HashMap<String, IrType>,
+) -> Option<Vec<ConstScalar>> {
+    let left_expr = const_arg_element(args.first()?)?;
+    let right_expr = const_arg_element(args.get(1)?)?;
+    let left = collect_const_array_scalars(
+        left_expr,
+        elem_ty,
+        param_consts,
+        param_array_consts,
+        param_array_elem_tys,
+    )?;
+    let right = collect_const_array_scalars(
+        right_expr,
+        elem_ty,
+        param_consts,
+        param_array_consts,
+        param_array_elem_tys,
+    )?;
+    let lanes = const_array_storage_scalar_count(elem_ty, 1)? as usize;
+    if lanes == 0 || left.len() % lanes != 0 || right.len() % lanes != 0 {
+        return None;
+    }
+    let left_elems = left.len() / lanes;
+    let right_elems = right.len() / lanes;
+    if left_elems == 0 || right_elems == 0 || left_elems == right_elems {
+        return None;
+    }
+
+    if left_elems % right_elems == 0 {
+        let rows = left_elems / right_elems;
+        let cols = right_elems;
+        let mut out = Vec::with_capacity(rows * lanes);
+        for row in 0..rows {
+            let mut acc = const_zero_lanes(elem_ty, lanes);
+            for col in 0..cols {
+                let left_idx = (row + col * rows) * lanes;
+                let right_idx = col * lanes;
+                let product = const_mul_lanes(
+                    &left[left_idx..left_idx + lanes],
+                    &right[right_idx..right_idx + lanes],
+                    elem_ty,
+                )?;
+                acc = const_add_lanes(&acc, &product, elem_ty)?;
+            }
+            out.extend(acc);
+        }
+        return Some(out);
+    }
+
+    if right_elems % left_elems == 0 {
+        let rows = left_elems;
+        let cols = right_elems / left_elems;
+        let mut out = Vec::with_capacity(cols * lanes);
+        for col in 0..cols {
+            let mut acc = const_zero_lanes(elem_ty, lanes);
+            for row in 0..rows {
+                let left_idx = row * lanes;
+                let right_idx = (row + col * rows) * lanes;
+                let product = const_mul_lanes(
+                    &left[left_idx..left_idx + lanes],
+                    &right[right_idx..right_idx + lanes],
+                    elem_ty,
+                )?;
+                acc = const_add_lanes(&acc, &product, elem_ty)?;
+            }
+            out.extend(acc);
+        }
+        return Some(out);
+    }
+
+    None
+}
+
+fn const_zero_lanes(elem_ty: &IrType, lanes: usize) -> Vec<ConstScalar> {
+    vec![zero_const_for_array_lane(elem_ty); lanes]
+}
+
+fn const_mul_lanes(
+    left: &[ConstScalar],
+    right: &[ConstScalar],
+    elem_ty: &IrType,
+) -> Option<Vec<ConstScalar>> {
+    if complex_component_ty(elem_ty).is_some() {
+        if left.len() != 2 || right.len() != 2 {
+            return None;
+        }
+        let ar = left[0].to_float();
+        let ai = left[1].to_float();
+        let br = right[0].to_float();
+        let bi = right[1].to_float();
+        return Some(vec![
+            ConstScalar::Float(ar * br - ai * bi),
+            ConstScalar::Float(ar * bi + ai * br),
+        ]);
+    }
+
+    let l = *left.first()?;
+    let r = *right.first()?;
+    if matches!(elem_ty, IrType::Float(_))
+        || matches!(l, ConstScalar::Float(_))
+        || matches!(r, ConstScalar::Float(_))
+    {
+        return Some(vec![ConstScalar::Float(l.to_float() * r.to_float())]);
+    }
+    let ConstScalar::Int(li) = l else {
+        return None;
+    };
+    let ConstScalar::Int(ri) = r else {
+        return None;
+    };
+    Some(vec![ConstScalar::Int(li.checked_mul(ri)?)])
+}
+
+fn const_add_lanes(
+    left: &[ConstScalar],
+    right: &[ConstScalar],
+    elem_ty: &IrType,
+) -> Option<Vec<ConstScalar>> {
+    if complex_component_ty(elem_ty).is_some() {
+        if left.len() != 2 || right.len() != 2 {
+            return None;
+        }
+        return Some(vec![
+            ConstScalar::Float(left[0].to_float() + right[0].to_float()),
+            ConstScalar::Float(left[1].to_float() + right[1].to_float()),
+        ]);
+    }
+
+    let l = *left.first()?;
+    let r = *right.first()?;
+    if matches!(elem_ty, IrType::Float(_))
+        || matches!(l, ConstScalar::Float(_))
+        || matches!(r, ConstScalar::Float(_))
+    {
+        return Some(vec![ConstScalar::Float(l.to_float() + r.to_float())]);
+    }
+    let ConstScalar::Int(li) = l else {
+        return None;
+    };
+    let ConstScalar::Int(ri) = r else {
+        return None;
+    };
+    Some(vec![ConstScalar::Int(li.checked_add(ri)?)])
 }
 
 fn collect_const_transpose_scalars(

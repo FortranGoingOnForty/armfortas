@@ -5,14 +5,14 @@
 
 use std::collections::HashMap;
 
-use crate::ast::decl::Decl;
+use crate::ast::decl::{Attribute, Decl, TypeSpec};
 use crate::ast::expr::Expr;
 use crate::ir::builder::FuncBuilder;
 use crate::ir::inst::*;
 use crate::ir::types::*;
 use crate::sema::symtab::SymbolTable;
 
-use super::const_scalar::{materialize_const_scalar, ConstScalar};
+use super::const_scalar::{eval_const_scalar, materialize_const_scalar, ConstScalar};
 use super::core::*;
 use super::ctx::{CharKind, LocalInfo};
 use super::helpers::coerce_to_type;
@@ -49,8 +49,93 @@ pub(crate) fn init_decls(
     // inner skip check is O(1). Audit Maj-3.
     let global_addr_ids = collect_global_addr_values(b);
     let param_consts = collect_decl_param_consts_with_scope(decls, &HashMap::new(), st);
-    let param_array_consts: HashMap<String, Vec<ConstScalar>> = HashMap::new();
-    let param_array_elem_tys: HashMap<String, IrType> = HashMap::new();
+    let mut param_array_consts: HashMap<String, Vec<ConstScalar>> = HashMap::new();
+    let mut param_array_elem_tys: HashMap<String, IrType> = HashMap::new();
+    let mut parameter_inits: HashMap<String, &crate::ast::expr::SpannedExpr> = HashMap::new();
+    for decl in decls {
+        if let Decl::ParameterStmt { pairs } = &decl.node {
+            for (name, expr) in pairs {
+                parameter_inits.insert(name.to_lowercase(), expr);
+            }
+        }
+    }
+    for decl in decls {
+        let Decl::TypeDecl {
+            type_spec,
+            attrs,
+            entities,
+        } = &decl.node
+        else {
+            continue;
+        };
+        if matches!(type_spec, TypeSpec::Character(_) | TypeSpec::Type(_)) {
+            continue;
+        }
+        let attr_dims: Option<&Vec<crate::ast::decl::ArraySpec>> = attrs.iter().find_map(|a| {
+            if let Attribute::Dimension(specs) = a {
+                Some(specs)
+            } else {
+                None
+            }
+        });
+        let is_parameter_decl = attrs.iter().any(|a| matches!(a, Attribute::Parameter));
+        let elem_ty = lower_type_spec_with_param_consts(type_spec, Some(&param_consts), Some(st));
+        for entity in entities {
+            let key = entity.name.to_lowercase();
+            let init_expr = entity
+                .init
+                .as_ref()
+                .or_else(|| parameter_inits.get(&key).copied());
+            let is_parameter = is_parameter_decl || parameter_inits.contains_key(&key);
+            let Some(init_expr) = init_expr else {
+                continue;
+            };
+            let Some(specs) = entity.array_spec.as_ref().or(attr_dims) else {
+                continue;
+            };
+            if !is_parameter {
+                continue;
+            }
+            let dims =
+                extract_array_dims_with_init(specs, Some(init_expr), &param_consts, Some(st));
+            let total: i64 = dims.iter().map(|(_, size)| *size).product();
+            if total <= 0 {
+                continue;
+            }
+            let Some(mut scalars) = collect_const_array_scalars(
+                init_expr,
+                &elem_ty,
+                &param_consts,
+                &param_array_consts,
+                &param_array_elem_tys,
+            )
+            .or_else(|| {
+                eval_const_scalar(init_expr, &param_consts)
+                    .map(|s| coerce_scalar_to_array_lanes(s, &elem_ty))
+            }) else {
+                continue;
+            };
+            let storage_total = const_array_storage_scalar_count(&elem_ty, total).unwrap_or(total);
+            if (scalars.len() as i64) > storage_total {
+                continue;
+            }
+            let lanes_per_element =
+                const_array_storage_scalar_count(&elem_ty, 1).unwrap_or(1) as usize;
+            if scalars.len() == lanes_per_element && total > 1 {
+                let element = scalars.clone();
+                scalars.clear();
+                for _ in 0..total {
+                    scalars.extend_from_slice(&element);
+                }
+            } else {
+                while (scalars.len() as i64) < storage_total {
+                    scalars.push(zero_const_for_array_lane(&elem_ty));
+                }
+            }
+            param_array_consts.insert(key, scalars);
+            param_array_elem_tys.insert(entity.name.to_lowercase(), elem_ty.clone());
+        }
+    }
     for decl in decls {
         match &decl.node {
             Decl::TypeDecl { entities, .. } => {
