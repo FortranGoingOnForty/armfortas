@@ -11486,8 +11486,9 @@ pub(super) fn actual_expr_rank(
         Expr::IntegerLiteral { .. }
         | Expr::RealLiteral { .. }
         | Expr::LogicalLiteral { .. }
-        | Expr::StringLiteral { .. } => Some(0),
-        _ => None,
+        | Expr::StringLiteral { .. }
+        | Expr::ComplexLiteral { .. }
+        | Expr::BozLiteral { .. } => Some(0),
     }
 }
 

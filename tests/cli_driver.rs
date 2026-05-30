@@ -29234,6 +29234,128 @@ fn imported_generic_subroutine_resolution_uses_specific_keyword_slots() {
 }
 
 #[test]
+fn imported_generic_resolution_treats_complex_literals_as_scalar_rank() {
+    let dir = unique_dir("imported_complex_literal_rank_generic");
+    let mod_src = write_program_in(
+        &dir,
+        "m.f90",
+        "module m\n  implicit none\n  interface pick\n    module procedure :: pick_scalar\n    module procedure :: pick_array\n  end interface\ncontains\n  integer function pick_scalar(x, center) result(res)\n    complex, intent(in) :: x(:,:)\n    complex, intent(in) :: center\n    res = 1\n  end function\n\n  integer function pick_array(x, center) result(res)\n    complex, intent(in) :: x(:,:)\n    complex, intent(in) :: center(:)\n    res = 2\n  end function\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use m, only : pick\n  implicit none\n  complex :: x(2,2)\n  integer :: v\n  x = (1.0, 2.0)\n  v = pick(x, center=(0.0, 0.0))\n  if (v /= 1) error stop v\n  print *, 'ok'\nend program\n",
+    );
+
+    let mod_obj = dir.join("m.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            mod_src.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("complex generic provider compile failed to spawn");
+    assert!(
+        compile_mod.status.success(),
+        "complex generic provider should compile: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let ir = dir.join("main.ir");
+    let emit_ir = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "--emit-ir",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            main_src.to_str().unwrap(),
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("complex generic consumer emit-ir failed to spawn");
+    assert!(
+        emit_ir.status.success(),
+        "consumer should emit IR through imported .amod: {}",
+        String::from_utf8_lossy(&emit_ir.stderr)
+    );
+    let ir_text = std::fs::read_to_string(&ir).expect("read complex generic consumer IR");
+    assert!(
+        ir_text.contains("pick_scalar"),
+        "complex scalar literal should dispatch to scalar specific:\n{}",
+        ir_text
+    );
+    assert!(
+        !ir_text.contains("pick_array"),
+        "complex scalar literal must not dispatch to array specific:\n{}",
+        ir_text
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_main = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            main_src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("complex generic consumer compile failed to spawn");
+    assert!(
+        compile_main.status.success(),
+        "complex generic consumer should compile: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let out = dir.join("p");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            mod_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("complex generic link failed to spawn");
+    assert!(
+        link.status.success(),
+        "complex generic binary should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("complex generic binary run failed");
+    assert!(
+        run.status.success(),
+        "complex generic binary should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn imported_array_function_actual_to_descriptor_dummy_keeps_nested_descriptor_abi() {
     let dir = unique_dir("imported_array_fn_descriptor_actual");
     let mod_src = write_program_in(
