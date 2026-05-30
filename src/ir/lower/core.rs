@@ -34363,6 +34363,9 @@ pub(super) fn lower_rank1_array_unary_descriptor(
     if matches!(op, UnaryOp::Plus) {
         return Some((source_desc, elem_ty));
     }
+    let source_rank = actual_expr_rank(operand, locals, st, type_layouts)
+        .unwrap_or(1)
+        .max(1);
 
     let result_desc = allocate_like_array_temp_descriptor(b, source_desc);
     let n = b.call(
@@ -34387,14 +34390,14 @@ pub(super) fn lower_rank1_array_unary_descriptor(
 
     b.set_block(bb_body);
     let idx = b.load(i_addr);
-    let operand_val = load_rank1_array_desc_elem(b, source_desc, &elem_ty, idx);
+    let operand_val = load_array_desc_elem_rank(b, source_desc, &elem_ty, idx, source_rank);
     let result = match (&elem_ty, op) {
         (IrType::Int(_), UnaryOp::Minus) => b.ineg(operand_val),
         (IrType::Float(_), UnaryOp::Minus) => b.fneg(operand_val),
         (IrType::Bool, UnaryOp::Not) => b.not(operand_val),
         _ => unreachable!("unsupported unary array op should have returned before block creation"),
     };
-    store_rank1_array_desc_elem(b, result_desc, &elem_ty, idx, result);
+    store_array_desc_elem_rank(b, result_desc, &elem_ty, idx, source_rank, result);
 
     let one = b.const_i64(1);
     let next = b.iadd(idx, one);
@@ -34409,6 +34412,7 @@ pub(super) fn lower_rank1_float_array_abs_descriptor(
     b: &mut FuncBuilder,
     source_desc: ValueId,
     elem_ty: IrType,
+    source_rank: usize,
 ) -> Option<(ValueId, IrType)> {
     if !matches!(elem_ty, IrType::Float(_)) {
         return None;
@@ -34435,9 +34439,10 @@ pub(super) fn lower_rank1_float_array_abs_descriptor(
 
     b.set_block(bb_body);
     let idx = b.load(i_addr);
-    let operand_val = load_rank1_array_desc_elem(b, source_desc, &elem_ty, idx);
+    let source_rank = source_rank.max(1);
+    let operand_val = load_array_desc_elem_rank(b, source_desc, &elem_ty, idx, source_rank);
     let result = b.fabs(operand_val);
-    store_rank1_array_desc_elem(b, result_desc, &elem_ty, idx, result);
+    store_array_desc_elem_rank(b, result_desc, &elem_ty, idx, source_rank, result);
     let one = b.const_i64(1);
     let next = b.iadd(idx, one);
     b.store(next, i_addr);
@@ -34445,6 +34450,55 @@ pub(super) fn lower_rank1_float_array_abs_descriptor(
 
     b.set_block(bb_exit);
     Some((result_desc, elem_ty))
+}
+
+pub(super) fn promote_array_desc_to_complex_descriptor(
+    b: &mut FuncBuilder,
+    source_desc: ValueId,
+    source_elem_ty: &IrType,
+    source_rank: usize,
+    target_fw: FloatWidth,
+) -> ValueId {
+    if is_complex_ty(source_elem_ty) && complex_float_width(source_elem_ty) == target_fw {
+        return source_desc;
+    }
+
+    let complex_elem_ty = IrType::Array(Box::new(IrType::Float(target_fw)), 2);
+    let result_desc =
+        allocate_like_array_temp_descriptor_with_elem_type(b, source_desc, &complex_elem_ty);
+    let n = b.call(
+        FuncRef::External("afs_array_size".into()),
+        vec![source_desc],
+        IrType::Int(IntWidth::I64),
+    );
+
+    let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let zero64 = b.const_i64(0);
+    b.store(zero64, i_addr);
+
+    let bb_check = b.create_block("array_promote_complex_check");
+    let bb_body = b.create_block("array_promote_complex_body");
+    let bb_exit = b.create_block("array_promote_complex_exit");
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let i = b.load(i_addr);
+    let done = b.icmp(CmpOp::Ge, i, n);
+    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+    b.set_block(bb_body);
+    let idx = b.load(i_addr);
+    let rank = source_rank.max(1);
+    let raw = load_array_desc_elem_rank(b, source_desc, source_elem_ty, idx, rank);
+    let complex_value = materialize_complex_operand(b, raw, target_fw);
+    store_array_desc_elem_rank(b, result_desc, &complex_elem_ty, idx, rank, complex_value);
+    let one = b.const_i64(1);
+    let next = b.iadd(idx, one);
+    b.store(next, i_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
+    result_desc
 }
 
 /// F2018 §10.1.5: relational ops over rank-1 array operands produce a
@@ -35551,7 +35605,12 @@ pub(super) fn lower_array_expr_descriptor(
                                     contained_host_refs,
                                     descriptor_params,
                                 ) {
-                                    return Some((desc, elem_ty));
+                                    let result_elem_ty = if key == "matmul" {
+                                        matmul_result_elem_ty_for_args(&elem_ty, args, locals)
+                                    } else {
+                                        elem_ty
+                                    };
+                                    return Some((desc, result_elem_ty));
                                 }
                             }
                         }
@@ -35630,10 +35689,15 @@ pub(super) fn lower_array_expr_descriptor(
                                 descriptor_params,
                             ) {
                                 if name.eq_ignore_ascii_case("abs") {
+                                    let source_rank =
+                                        actual_expr_rank(first_expr, locals, st, type_layouts)
+                                            .unwrap_or(1)
+                                            .max(1);
                                     if let Some(result) = lower_rank1_float_array_abs_descriptor(
                                         b,
                                         src_desc,
                                         elem_ty.clone(),
+                                        source_rank,
                                     ) {
                                         return Some(result);
                                     }
@@ -38467,6 +38531,42 @@ pub(super) fn first_arg_is_complex(
         .unwrap_or(false)
 }
 
+fn matmul_result_elem_ty_for_args(
+    first_elem_ty: &IrType,
+    args: &[crate::ast::expr::Argument],
+    locals: &HashMap<String, LocalInfo>,
+) -> IrType {
+    let second_elem_ty = args.get(1).and_then(|a| {
+        if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+            array_arg_elem_ty(e, locals).cloned()
+        } else {
+            None
+        }
+    });
+    let complex_fw = match (
+        is_complex_ty(first_elem_ty),
+        second_elem_ty.as_ref().is_some_and(is_complex_ty),
+    ) {
+        (true, true) => {
+            let lhs = complex_float_width(first_elem_ty);
+            let rhs = complex_float_width(second_elem_ty.as_ref().expect("checked complex"));
+            Some(if lhs == FloatWidth::F64 || rhs == FloatWidth::F64 {
+                FloatWidth::F64
+            } else {
+                FloatWidth::F32
+            })
+        }
+        (true, false) => Some(complex_float_width(first_elem_ty)),
+        (false, true) => Some(complex_float_width(
+            second_elem_ty.as_ref().expect("checked complex"),
+        )),
+        (false, false) => None,
+    };
+    complex_fw
+        .map(|fw| IrType::Array(Box::new(IrType::Float(fw)), 2))
+        .unwrap_or_else(|| first_elem_ty.clone())
+}
+
 /// F2018 §9.5.3.3: array section with one or more vector subscripts mixed
 /// with ordinary range subscripts. afs_create_section can't represent a
 /// vector subscript, so when one is present we materialize the result
@@ -40260,41 +40360,61 @@ pub(super) fn lower_array_intrinsic(
             // (e.g. TRANSPOSE(L), a section, or another array intrinsic
             // result). Lower it through the descriptor path so any array-
             // returning expression yields a usable descriptor pointer.
-            let second_desc = args.get(1).and_then(|a| {
+            let second_arg_expr = args.get(1).and_then(|a| {
                 if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
-                    lower_array_expr_descriptor(
-                        b,
-                        locals,
-                        e,
-                        st,
-                        type_layouts,
-                        internal_funcs,
-                        contained_host_refs,
-                        descriptor_params,
-                    )
-                    .map(|(d, _)| d)
-                    .or_else(|| {
-                        if let Expr::Name { name } = &e.node {
-                            locals
-                                .get(&name.to_lowercase())
-                                .filter(|i| local_uses_array_descriptor(i) || !i.dims.is_empty())
-                                .map(|i| {
-                                    if local_uses_array_descriptor(i) {
-                                        array_descriptor_addr(b, i)
-                                    } else {
-                                        materialize_array_descriptor_for_info(b, i)
-                                    }
-                                })
-                        } else {
-                            None
-                        }
-                    })
+                    Some(e)
                 } else {
                     None
                 }
             })?;
-            let is_real = first_arg_is_real(args, locals);
-            let is_complex = first_arg_is_complex(args, locals);
+            let (second_desc, second_elem_ty) = lower_array_expr_descriptor(
+                b,
+                locals,
+                second_arg_expr,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            )
+            .or_else(|| {
+                if let Expr::Name { name } = &second_arg_expr.node {
+                    locals
+                        .get(&name.to_lowercase())
+                        .filter(|i| local_uses_array_descriptor(i) || !i.dims.is_empty())
+                        .map(|i| {
+                            let desc = if local_uses_array_descriptor(i) {
+                                array_descriptor_addr(b, i)
+                            } else {
+                                materialize_array_descriptor_for_info(b, i)
+                            };
+                            (desc, i.ty.clone())
+                        })
+                } else {
+                    None
+                }
+            })?;
+            let first_rank = actual_expr_rank(first_expr, locals, st, type_layouts)
+                .unwrap_or(1)
+                .max(1);
+            let second_rank = actual_expr_rank(second_arg_expr, locals, st, type_layouts)
+                .unwrap_or(1)
+                .max(1);
+            let complex_fw = match (is_complex_ty(&elem_ty), is_complex_ty(&second_elem_ty)) {
+                (true, true) => {
+                    let lhs = complex_float_width(&elem_ty);
+                    let rhs = complex_float_width(&second_elem_ty);
+                    Some(if lhs == FloatWidth::F64 || rhs == FloatWidth::F64 {
+                        FloatWidth::F64
+                    } else {
+                        FloatWidth::F32
+                    })
+                }
+                (true, false) => Some(complex_float_width(&elem_ty)),
+                (false, true) => Some(complex_float_width(&second_elem_ty)),
+                (false, false) => None,
+            };
+            let is_real = complex_fw.is_none() && first_arg_is_real(args, locals);
             let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
             let zero = b.const_i32(0);
             let sz384 = b.const_i64(384);
@@ -40303,16 +40423,25 @@ pub(super) fn lower_array_intrinsic(
                 vec![result_desc, zero, sz384],
                 IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
             );
-            let func = if is_complex {
-                "afs_matmul_complex"
+            let (func, lhs_desc, rhs_desc) = if let Some(fw) = complex_fw {
+                let lhs =
+                    promote_array_desc_to_complex_descriptor(b, desc, &elem_ty, first_rank, fw);
+                let rhs = promote_array_desc_to_complex_descriptor(
+                    b,
+                    second_desc,
+                    &second_elem_ty,
+                    second_rank,
+                    fw,
+                );
+                ("afs_matmul_complex", lhs, rhs)
             } else if is_real {
-                "afs_matmul_real8"
+                ("afs_matmul_real8", desc, second_desc)
             } else {
-                "afs_matmul_int"
+                ("afs_matmul_int", desc, second_desc)
             };
             b.call(
                 FuncRef::External(func.into()),
-                vec![desc, second_desc, result_desc],
+                vec![lhs_desc, rhs_desc, result_desc],
                 IrType::Void,
             );
             Some(result_desc)
