@@ -63,6 +63,49 @@ fn copy_array_result_to_fixed_dest(
     );
 }
 
+fn synth_defined_unary_array_result_call(
+    ctx: &LowerCtx<'_>,
+    value: &crate::ast::expr::SpannedExpr,
+) -> Option<crate::ast::expr::SpannedExpr> {
+    let Expr::UnaryOp { op, operand } = &value.node else {
+        return None;
+    };
+    let specific = resolve_defined_unary_operator_specific_by_semantics(
+        ctx.st,
+        Some(&ctx.locals),
+        Some(ctx.type_layouts),
+        op,
+        operand,
+    )?;
+    let specific_key = specific.to_lowercase();
+    let (call_name, callee_key) = resolved_symbol_call_target(ctx.st, &specific_key, &specific);
+    let abi_lookup_keys = procedure_abi_lookup_keys_for_call_target(
+        ctx.st,
+        call_name.as_str(),
+        &[&callee_key, &specific_key],
+    );
+    if !matches!(
+        first_procedure_lookup(&abi_lookup_keys, |k| callee_hidden_result_abi(ctx.st, k)),
+        Some(HiddenResultAbi::ArrayDescriptor)
+    ) {
+        return None;
+    }
+
+    Some(crate::ast::Spanned::new(
+        Expr::FunctionCall {
+            callee: Box::new(crate::ast::Spanned::new(
+                Expr::Name { name: specific },
+                operand.span,
+            )),
+            args: vec![crate::ast::expr::Argument {
+                keyword: None,
+                value: crate::ast::expr::SectionSubscript::Element((**operand).clone()),
+            }],
+        },
+        value.span,
+    ))
+}
+
 fn io_control_by_keyword<'a>(controls: &'a [IoControl], needle: &str) -> Option<&'a IoControl> {
     controls.iter().find(|c| {
         c.keyword
@@ -374,10 +417,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     {
                                         return;
                                     }
+                                    let defined_unary_array_result =
+                                        synth_defined_unary_array_result_call(ctx, value);
+                                    let array_rhs =
+                                        defined_unary_array_result.as_ref().unwrap_or(value);
                                     if let Expr::FunctionCall {
                                         callee,
                                         args: call_args,
-                                    } = &value.node
+                                    } = &array_rhs.node
                                     {
                                         // F2018 §9.5.3.3 vector subscript: when the
                                         // callee resolves to a local array (not a
@@ -527,7 +574,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                     // a scalar.
                                                     matches!(lname.as_str(), "maxval" | "minval")
                                                         && actual_expr_rank(
-                                                            value,
+                                                            array_rhs,
                                                             &ctx.locals,
                                                             ctx.st,
                                                             Some(ctx.type_layouts),
@@ -580,7 +627,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                             || callee_is_transformational_intrinsic
                                             || callee_is_scalar_broadcast_intrinsic
                                         {
-                                            lower_array_assign(b, ctx, name, &info, value);
+                                            lower_array_assign(b, ctx, name, &info, array_rhs);
                                             return;
                                         }
                                         if let Expr::Name { name: callee_name } = &callee.node {
@@ -598,7 +645,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                 // the bytes back, and deallocate the heap
                                                 // result.
                                                 if local_uses_array_descriptor(&info) {
-                                                    lower_array_assign(b, ctx, name, &info, value);
+                                                    lower_array_assign(
+                                                        b, ctx, name, &info, array_rhs,
+                                                    );
                                                 } else {
                                                     let src_elem_ty =
                                                         array_function_result_elem_type(
@@ -665,8 +714,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                     Some(ctx.contained_host_refs),
                                                     Some(ctx.descriptor_params),
                                                 );
-                                                let src_desc =
-                                                    super::expr::lower_expr_ctx_tl(b, ctx, value);
+                                                let src_desc = super::expr::lower_expr_ctx_tl(
+                                                    b, ctx, array_rhs,
+                                                );
                                                 if local_uses_array_descriptor(&info) {
                                                     let dest_desc = array_descriptor_addr(b, &info);
                                                     let src_kind_tag = src_elem_ty
@@ -741,7 +791,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                 Some(ctx.descriptor_params),
                                             );
                                             let src_desc =
-                                                super::expr::lower_expr_ctx_tl(b, ctx, value);
+                                                super::expr::lower_expr_ctx_tl(b, ctx, array_rhs);
                                             if local_uses_array_descriptor(&info) {
                                                 let dest_desc = array_descriptor_addr(b, &info);
                                                 let src_kind_tag = src_elem_ty

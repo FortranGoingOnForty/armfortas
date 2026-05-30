@@ -3924,6 +3924,27 @@ fn mixed_real_complex_matmul_reconstruction_fixture_passes_all_opts() {
 }
 
 #[test]
+fn defined_unary_array_result_assignment_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("defined_unary_array_result_assignment.f90");
+    assert!(
+        source.exists(),
+        "defined_unary_array_result_assignment.f90 missing"
+    );
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "defined_unary_array_result_assignment.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
 fn elemental_conversion_array_constructor_alloc_fixture_passes_all_opts() {
     let compiler = find_compiler();
     let test_dir = find_test_programs();
