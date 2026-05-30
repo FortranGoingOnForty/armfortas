@@ -2753,11 +2753,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             let mut array_bases: HashMap<String, ValueId> = HashMap::new();
             for arr_name in &array_names {
                 if let Some(info) = ctx.locals.get(arr_name) {
-                    let base = if info.allocatable {
-                        b.load_typed(info.addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
-                    } else {
-                        info.addr
-                    };
+                    let base = array_base_addr(b, info);
                     array_bases.insert(arr_name.clone(), base);
                 }
             }
@@ -2921,11 +2917,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             let mut array_bases: HashMap<String, ValueId> = HashMap::new();
             for arr_name in &array_names {
                 if let Some(info) = ctx.locals.get(arr_name) {
-                    let base = if info.allocatable {
-                        b.load_typed(info.addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
-                    } else {
-                        info.addr
-                    };
+                    let base = array_base_addr(b, info);
                     array_bases.insert(arr_name.clone(), base);
                 }
             }
