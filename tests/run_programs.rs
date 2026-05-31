@@ -4050,6 +4050,27 @@ fn parameter_array_assumed_size_initializer_fixture_passes_all_opts() {
 }
 
 #[test]
+fn stdlib_parameter_array_init_from_module_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("stdlib_parameter_array_init_from_module.f90");
+    assert!(
+        source.exists(),
+        "stdlib_parameter_array_init_from_module.f90 missing"
+    );
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "stdlib_parameter_array_init_from_module.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
 fn logical_kind_array_scalar_broadcast_fixture_passes_all_opts() {
     let compiler = find_compiler();
     let test_dir = find_test_programs();

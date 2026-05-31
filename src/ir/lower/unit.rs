@@ -141,7 +141,14 @@ pub(crate) fn lower_unit(
                 ctx.filtered_names = compute_filtered_names(globals, &combined_uses, decls);
                 check_no_filtered_refs(body, &ctx.filtered_names);
                 collect_implicit_locals(&mut b, &mut ctx, body, UnitScope::Program(&fname));
-                super::init::init_decls(&mut b, &ctx.locals, decls, st, Some(type_layouts));
+                super::init::init_decls(
+                    &mut b,
+                    &ctx.locals,
+                    decls,
+                    st,
+                    ctx.proc_scope_id,
+                    Some(type_layouts),
+                );
                 collect_label_blocks(&mut b, body, &mut ctx.label_blocks);
                 let _proc_scope_guard = ProcScopeGuard::enter(ctx.proc_scope_id);
                 super::stmt::lower_stmts(&mut b, &mut ctx, body);
@@ -582,7 +589,14 @@ pub(crate) fn lower_unit(
                 ctx.filtered_names = compute_filtered_names(globals, &combined_uses, decls);
                 check_no_filtered_refs(body, &ctx.filtered_names);
                 collect_implicit_locals(&mut b, &mut ctx, body, UnitScope::Subroutine(name));
-                super::init::init_decls(&mut b, &ctx.locals, decls, st, Some(type_layouts));
+                super::init::init_decls(
+                    &mut b,
+                    &ctx.locals,
+                    decls,
+                    st,
+                    ctx.proc_scope_id,
+                    Some(type_layouts),
+                );
                 // Pre-create blocks for all statement labels so GOTO can branch forward.
                 collect_label_blocks(&mut b, body, &mut ctx.label_blocks);
                 let _proc_scope_guard = ProcScopeGuard::enter(ctx.proc_scope_id);
@@ -1281,7 +1295,14 @@ pub(crate) fn lower_unit(
                 ctx.filtered_names = compute_filtered_names(globals, &combined_uses, decls);
                 check_no_filtered_refs(body, &ctx.filtered_names);
                 collect_implicit_locals(&mut b, &mut ctx, body, UnitScope::Function(name));
-                super::init::init_decls(&mut b, &ctx.locals, decls, st, Some(type_layouts));
+                super::init::init_decls(
+                    &mut b,
+                    &ctx.locals,
+                    decls,
+                    st,
+                    ctx.proc_scope_id,
+                    Some(type_layouts),
+                );
                 if hidden_result_abi == HiddenResultAbi::ArrayDescriptor {
                     if let Some(info) = ctx.locals.get(&result_name).cloned() {
                         if !info.allocatable || info.is_pointer {

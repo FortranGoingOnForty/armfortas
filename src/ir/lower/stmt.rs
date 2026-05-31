@@ -4527,6 +4527,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     &ctx.locals,
                     &effective_decls,
                     ctx.st,
+                    ctx.proc_scope_id,
                     Some(ctx.type_layouts),
                 );
             }
