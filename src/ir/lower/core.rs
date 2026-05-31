@@ -4405,7 +4405,7 @@ fn collect_const_matmul_scalars(
         return None;
     }
 
-    if left_elems % right_elems == 0 {
+    if left_elems.is_multiple_of(right_elems) {
         let rows = left_elems / right_elems;
         let cols = right_elems;
         let mut out = Vec::with_capacity(rows * lanes);
@@ -4426,7 +4426,7 @@ fn collect_const_matmul_scalars(
         return Some(out);
     }
 
-    if right_elems % left_elems == 0 {
+    if right_elems.is_multiple_of(left_elems) {
         let rows = left_elems;
         let cols = right_elems / left_elems;
         let mut out = Vec::with_capacity(cols * lanes);
@@ -8741,7 +8741,7 @@ pub(super) fn array_constructor_type_spec_info(
     }
     let kind_inside = raw
         .find('(')
-        .and_then(|lp| raw.rfind(')').map(|rp| (lp, rp)))
+        .zip(raw.rfind(')'))
         .filter(|(lp, rp)| rp > lp)
         .map(|(lp, rp)| raw[lp + 1..rp].trim().to_string());
     let prefix = raw.split('(').next().unwrap_or(&raw).trim();
