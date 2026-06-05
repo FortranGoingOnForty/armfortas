@@ -36121,3 +36121,33 @@ fn imported_generic_function_shadows_intrinsic_type_probe() {
     let _ = std::fs::remove_file(&ir);
     let _ = std::fs::remove_file(&src);
 }
+
+#[test]
+fn shadowed_intrinsic_fallback_lowers_real_actual_not_generic_probe() {
+    let src = write_program(
+        "module special_like\n  implicit none\n  private\n  public :: real_log_gamma\n  interface log_gamma\n    module procedure l_gamma_iint32\n  end interface\ncontains\n  elemental real(8) function l_gamma_iint32(z) result(res)\n    integer, intent(in) :: z\n    res = real(z, 8) + 0.25_8\n  end function\n  real(4) function real_log_gamma(x) result(res)\n    real(4), intent(in) :: x\n    res = log_gamma(x)\n  end function\nend module\nprogram p\n  use special_like, only: real_log_gamma\n  implicit none\n  real(4) :: got\n  got = real_log_gamma(2.5_4)\n  if (abs(got - 0.28468287_4) > 1.0e-5_4) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("shadowed_intrinsic_real_actual", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("shadowed intrinsic fallback compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "shadowed intrinsic fallback compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("shadowed intrinsic fallback run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "shadowed intrinsic fallback run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}

@@ -2105,8 +2105,28 @@ pub(crate) fn lower_expr_full(
                             || original_args.iter().all(|arg| arg.keyword.is_none()))
                         && crate::sema::validate::is_intrinsic_name(&key)
                     {
+                        let intrinsic_arg_slots =
+                            reorder_args_by_keyword_slots(original_args, &key, st);
+                        let intrinsic_args: Vec<crate::ast::expr::Argument> =
+                            intrinsic_arg_slots.iter().flatten().cloned().collect();
+                        let intrinsic_arg_vals: Vec<ValueId> = intrinsic_args
+                            .iter()
+                            .map(|a| match &a.value {
+                                crate::ast::expr::SectionSubscript::Element(e) => lower_expr_full(
+                                    b,
+                                    locals,
+                                    e,
+                                    st,
+                                    type_layouts,
+                                    internal_funcs,
+                                    contained_host_refs,
+                                    descriptor_params,
+                                ),
+                                _ => b.const_i32(0),
+                            })
+                            .collect();
                         if let Some(result) =
-                            super::intrinsic::lower_intrinsic(b, &key, &resolution_arg_vals)
+                            super::intrinsic::lower_intrinsic(b, &key, &intrinsic_arg_vals)
                         {
                             return result;
                         }
