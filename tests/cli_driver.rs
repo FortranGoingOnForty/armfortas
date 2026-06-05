@@ -3162,6 +3162,47 @@ fn allocatable_c_char_array_result_assigns_into_intent_out_dummy() {
 }
 
 #[test]
+fn optional_deferred_char_intent_out_deallocates_actual_on_entry() {
+    let dir = unique_dir("optional_deferred_char_intent_out");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "module m\n  implicit none\ncontains\n  subroutine maybe_clear(msg)\n    character(len=:), allocatable, intent(out), optional :: msg\n    if (present(msg)) then\n      if (allocated(msg)) error stop 11\n    end if\n  end subroutine maybe_clear\nend module m\n\nprogram p\n  use m\n  implicit none\n  character(len=:), allocatable :: msg\n  msg = 'seed'\n  call maybe_clear(msg)\n  if (allocated(msg)) error stop 1\n  call maybe_clear()\n  msg = 'again'\n  call maybe_clear(msg)\n  if (allocated(msg)) error stop 2\n  print *, 'ok'\nend program p\n",
+    );
+
+    let exe = dir.join("optional_deferred_char_intent_out.bin");
+    let compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([src.to_str().unwrap(), "-o", exe.to_str().unwrap()])
+        .output()
+        .expect("optional deferred char intent(out) compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "optional deferred char intent(out) should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("optional deferred char intent(out) run failed");
+    assert!(
+        run.status.success(),
+        "optional deferred char intent(out) should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected optional deferred char intent(out) output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn deferred_char_array_component_len_survives_function_result_and_dummy_pass() {
     let dir = unique_dir("deferred_char_array_component_len");
     let src = write_program_in(

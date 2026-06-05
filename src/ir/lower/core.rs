@@ -18980,6 +18980,57 @@ pub(super) fn clear_intent_out_allocatable_array_params(
     }
 }
 
+pub(super) fn clear_intent_out_deferred_char_params(
+    b: &mut FuncBuilder,
+    param_info: &[(String, ValueId, IrType, bool)],
+    locals: &HashMap<String, LocalInfo>,
+    decls: &[crate::ast::decl::SpannedDecl],
+) {
+    for (pname, _, _, is_value) in param_info {
+        if *is_value || !decl_has_intent_out(pname, decls) || !decl_is_allocatable(pname, decls) {
+            continue;
+        }
+
+        let Some(info) = locals.get(pname) else {
+            continue;
+        };
+        if info.is_pointer
+            || local_uses_array_descriptor(info)
+            || !matches!(info.char_kind, CharKind::Deferred)
+        {
+            continue;
+        }
+
+        if decl_is_optional(pname, decls) && info.by_ref {
+            let ptr_val = b.load(info.addr);
+            let zero = b.const_i64(0);
+            let present = b.icmp(CmpOp::Ne, ptr_val, zero);
+            let bb_clear = b.create_block("intent_out_char_clear_present");
+            let bb_skip = b.create_block("intent_out_char_clear_skip");
+            b.cond_branch(present, bb_clear, vec![], bb_skip, vec![]);
+
+            b.set_block(bb_clear);
+            let desc = string_descriptor_addr(b, info);
+            b.call(
+                FuncRef::External("afs_dealloc_string".into()),
+                vec![desc],
+                IrType::Void,
+            );
+            b.branch(bb_skip, vec![]);
+
+            b.set_block(bb_skip);
+            continue;
+        }
+
+        let desc = string_descriptor_addr(b, info);
+        b.call(
+            FuncRef::External("afs_dealloc_string".into()),
+            vec![desc],
+            IrType::Void,
+        );
+    }
+}
+
 /// Metadata for one host-associated variable threaded into a contained
 /// procedure via closure passing. Assembled from the host's declaration
 /// list once per (callee, host-var) pair; the contained proc uses it to

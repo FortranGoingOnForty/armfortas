@@ -543,6 +543,7 @@ pub(crate) fn lower_unit(
                     type_layouts,
                 );
                 clear_intent_out_allocatable_array_params(&mut b, &param_info, &ctx.locals, decls);
+                clear_intent_out_deferred_char_params(&mut b, &param_info, &ctx.locals, decls);
                 clear_intent_out_derived_params(
                     &mut b,
                     &param_info,
@@ -1026,6 +1027,7 @@ pub(crate) fn lower_unit(
                     type_layouts,
                 );
                 clear_intent_out_allocatable_array_params(&mut b, &param_info, &ctx.locals, decls);
+                clear_intent_out_deferred_char_params(&mut b, &param_info, &ctx.locals, decls);
                 clear_intent_out_derived_params(
                     &mut b,
                     &param_info,
