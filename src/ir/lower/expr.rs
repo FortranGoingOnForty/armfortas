@@ -1564,6 +1564,164 @@ pub(crate) fn lower_expr_full(
                     }
                 }
 
+                // sin(z) / cos(z) for complex:
+                //   sin(a+bi) = sin(a)cosh(b) + i*cos(a)sinh(b)
+                //   cos(a+bi) = cos(a)cosh(b) - i*sin(a)sinh(b)
+                if (key == "sin"
+                    || key == "dsin"
+                    || key == "csin"
+                    || key == "zsin"
+                    || key == "cos"
+                    || key == "dcos"
+                    || key == "ccos"
+                    || key == "zcos")
+                    && args.len() == 1
+                {
+                    if let Some(arg0) = args.first() {
+                        if let crate::ast::expr::SectionSubscript::Element(e) = &arg0.value {
+                            let val = lower_expr_full(
+                                b,
+                                locals,
+                                e,
+                                st,
+                                type_layouts,
+                                internal_funcs,
+                                contained_host_refs,
+                                descriptor_params,
+                            );
+                            let ty = b
+                                .func()
+                                .value_type(val)
+                                .unwrap_or(IrType::Int(IntWidth::I32));
+                            if is_complex_ty(&ty) {
+                                let fw = complex_float_width(&ty);
+                                let elem = IrType::Float(fw);
+                                let lane_bytes =
+                                    b.const_i64(if fw == FloatWidth::F64 { 8 } else { 4 });
+                                let zero = b.const_i64(0);
+                                let src = materialize_complex_operand(b, val, fw);
+                                let re_ptr = b.gep(src, vec![zero], IrType::Int(IntWidth::I8));
+                                let im_ptr =
+                                    b.gep(src, vec![lane_bytes], IrType::Int(IntWidth::I8));
+                                let re_in = b.load_typed(re_ptr, elem.clone());
+                                let im_in = b.load_typed(im_ptr, elem.clone());
+
+                                let suffix = if fw == FloatWidth::F32 { "f" } else { "" };
+                                let sin_re = b.call(
+                                    FuncRef::External(format!("sin{}", suffix)),
+                                    vec![re_in],
+                                    elem.clone(),
+                                );
+                                let cos_re = b.call(
+                                    FuncRef::External(format!("cos{}", suffix)),
+                                    vec![re_in],
+                                    elem.clone(),
+                                );
+                                let sinh_im = b.call(
+                                    FuncRef::External(format!("sinh{}", suffix)),
+                                    vec![im_in],
+                                    elem.clone(),
+                                );
+                                let cosh_im = b.call(
+                                    FuncRef::External(format!("cosh{}", suffix)),
+                                    vec![im_in],
+                                    elem.clone(),
+                                );
+
+                                let is_cos =
+                                    key == "cos" || key == "dcos" || key == "ccos" || key == "zcos";
+                                let re_out = if is_cos {
+                                    b.fmul(cos_re, cosh_im)
+                                } else {
+                                    b.fmul(sin_re, cosh_im)
+                                };
+                                let im_mag = if is_cos {
+                                    b.fmul(sin_re, sinh_im)
+                                } else {
+                                    b.fmul(cos_re, sinh_im)
+                                };
+                                let im_out = if is_cos { b.fneg(im_mag) } else { im_mag };
+
+                                let out = b.alloca(IrType::Array(Box::new(elem), 2));
+                                let out_re = b.gep(out, vec![zero], IrType::Int(IntWidth::I8));
+                                let out_im =
+                                    b.gep(out, vec![lane_bytes], IrType::Int(IntWidth::I8));
+                                b.store(re_out, out_re);
+                                b.store(im_out, out_im);
+                                return out;
+                            }
+                        }
+                    }
+                }
+
+                // log(z) for complex: log(|z|) + i*atan2(im, re).
+                // Like exp/sqrt, this must stay out of the scalar libm
+                // intrinsic path; otherwise the pointer-backed complex
+                // buffer is passed to `log` as if it were a real value.
+                if (key == "log" || key == "clog" || key == "zlog" || key == "cdlog")
+                    && args.len() == 1
+                {
+                    if let Some(arg0) = args.first() {
+                        if let crate::ast::expr::SectionSubscript::Element(e) = &arg0.value {
+                            let val = lower_expr_full(
+                                b,
+                                locals,
+                                e,
+                                st,
+                                type_layouts,
+                                internal_funcs,
+                                contained_host_refs,
+                                descriptor_params,
+                            );
+                            let ty = b
+                                .func()
+                                .value_type(val)
+                                .unwrap_or(IrType::Int(IntWidth::I32));
+                            if is_complex_ty(&ty) {
+                                let fw = complex_float_width(&ty);
+                                let elem = IrType::Float(fw);
+                                let lane_bytes =
+                                    b.const_i64(if fw == FloatWidth::F64 { 8 } else { 4 });
+                                let zero = b.const_i64(0);
+                                let src = materialize_complex_operand(b, val, fw);
+                                let re_ptr = b.gep(src, vec![zero], IrType::Int(IntWidth::I8));
+                                let im_ptr =
+                                    b.gep(src, vec![lane_bytes], IrType::Int(IntWidth::I8));
+                                let re_in = b.load_typed(re_ptr, elem.clone());
+                                let im_in = b.load_typed(im_ptr, elem.clone());
+
+                                let suffix = if fw == FloatWidth::F32 { "f" } else { "" };
+                                let re2 = b.fmul(re_in, re_in);
+                                let im2 = b.fmul(im_in, im_in);
+                                let radius_sq = b.fadd(re2, im2);
+                                let log_radius_sq = b.call(
+                                    FuncRef::External(format!("log{}", suffix)),
+                                    vec![radius_sq],
+                                    elem.clone(),
+                                );
+                                let half = match fw {
+                                    FloatWidth::F32 => b.const_f32(0.5),
+                                    FloatWidth::F64 => b.const_f64(0.5),
+                                };
+                                let re_out = b.fmul(half, log_radius_sq);
+                                let im_out = b.call(
+                                    FuncRef::External(format!("atan2{}", suffix)),
+                                    vec![im_in, re_in],
+                                    elem.clone(),
+                                );
+
+                                let out = b.alloca(IrType::Array(Box::new(elem), 2));
+                                let out_re = b.gep(out, vec![zero], IrType::Int(IntWidth::I8));
+                                let out_im =
+                                    b.gep(out, vec![lane_bytes], IrType::Int(IntWidth::I8));
+                                b.store(re_out, out_re);
+                                b.store(im_out, out_im);
+                                return out;
+                            }
+                        }
+                    }
+                }
+
                 // sqrt(z) for complex (F2018 §16.9.184): principal-branch
                 // sqrt of a complex number, computed as
                 //     re = sqrt((|z| + a) / 2)

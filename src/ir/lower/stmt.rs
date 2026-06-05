@@ -881,12 +881,12 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     // SEGV-ing on this exact path).
                                     let raw = super::expr::lower_expr_ctx_tl(b, ctx, value);
                                     let src_ty = b.func().value_type(raw);
-                                    let src = if matches!(&src_ty, Some(t) if is_complex_ptr_ty(t))
+                                    let dst_fw = complex_float_width(&info.ty);
+                                    let src = if matches!(&src_ty, Some(t) if is_complex_ptr_ty(t) && complex_float_width(t) == dst_fw)
                                     {
                                         raw
                                     } else {
-                                        let fw = complex_float_width(&info.ty);
-                                        materialize_complex_operand(b, raw, fw)
+                                        materialize_complex_operand(b, raw, dst_fw)
                                     };
                                     let bytes = complex_byte_size(&info.ty);
                                     let sz = b.const_i64(bytes);

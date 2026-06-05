@@ -21922,6 +21922,152 @@ end program
 }
 
 #[test]
+fn complex_log_intrinsic_uses_complex_lanes() {
+    let src = write_program(
+        r#"
+program main
+  use iso_fortran_env, only: real64
+  implicit none
+  complex(real64) :: z, got
+  z = cmplx(10.650511_real64, 0.25_real64, kind=real64)
+  got = log(z)
+  if (abs(real(got, kind=real64) - 2.3658832884453433_real64) > 1.0e-12_real64) error stop 1
+  if (abs(aimag(got) - 2.3468742469272174e-2_real64) > 1.0e-12_real64) error stop 2
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("complex_log_lanes", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("complex log compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "complex log program should compile cleanly: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("complex log run failed");
+    assert!(
+        run.status.success(),
+        "complex log runtime failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected complex log smoke output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn complex_assignment_narrows_lanes_by_value() {
+    let src = write_program(
+        r#"
+program main
+  use iso_fortran_env, only: real32, real64
+  implicit none
+  complex(real64) :: wide
+  complex(real32) :: narrow
+  wide = cmplx(1.651133280388921_real64, -1.837875874994789_real64, kind=real64)
+  narrow = wide
+  if (abs(real(narrow) - 1.6511333_real32) > 1.0e-5_real32) error stop 1
+  if (abs(aimag(narrow) + 1.8378758_real32) > 1.0e-5_real32) error stop 2
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("complex_assignment_narrows_lanes", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("complex assignment narrowing compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "complex assignment narrowing should compile cleanly: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("complex assignment narrowing run failed");
+    assert!(
+        run.status.success(),
+        "complex assignment narrowing failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected complex assignment narrowing output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn complex_sin_cos_intrinsics_use_complex_lanes() {
+    let src = write_program(
+        r#"
+program main
+  use iso_fortran_env, only: real64
+  implicit none
+  complex(real64) :: z, s, c
+  z = cmplx(0.25_real64, 0.5_real64, kind=real64)
+  s = sin(z)
+  c = cos(z)
+  if (abs(real(s, kind=real64) - 0.2789791283502615_real64) > 1.0e-12_real64) error stop 1
+  if (abs(aimag(s) - 0.5048957143879950_real64) > 1.0e-12_real64) error stop 2
+  if (abs(real(c, kind=real64) - 1.0925708047319176_real64) > 1.0e-12_real64) error stop 3
+  if (abs(aimag(c) + 0.12892104172809826_real64) > 1.0e-12_real64) error stop 4
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("complex_sin_cos_lanes", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("complex sin/cos compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "complex sin/cos program should compile cleanly: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("complex sin/cos run failed");
+    assert!(
+        run.status.success(),
+        "complex sin/cos runtime failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected complex sin/cos output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn real_intrinsic_preserves_complex_kind_without_explicit_kind_argument() {
     let src = write_program(
         r#"

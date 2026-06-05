@@ -24336,11 +24336,12 @@ pub(super) fn lower_array_store(
         // — passing the scalar value as the memcpy src dereferences a
         // junk pointer.
         let src_ty = b.func().value_type(value);
-        let src = if matches!(&src_ty, Some(t) if is_complex_ty(t)) {
+        let dst_fw = complex_float_width(&info.ty);
+        let src = if matches!(&src_ty, Some(t) if is_complex_ty(t) && complex_float_width(t) == dst_fw)
+        {
             value
         } else {
-            let fw = complex_float_width(&info.ty);
-            materialize_complex_operand(b, value, fw)
+            materialize_complex_operand(b, value, dst_fw)
         };
         let size = b.const_i64(complex_byte_size(&info.ty));
         b.call(
