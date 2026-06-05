@@ -4843,9 +4843,7 @@ pub(super) fn eval_const_char_bytes(
             let crate::ast::expr::SectionSubscript::Element(arg_expr) = &args[0].value else {
                 return None;
             };
-            let ConstScalar::Int(code) = eval_const_scalar(arg_expr, param_consts)? else {
-                return None;
-            };
+            let code = eval_const_char_int_expr(arg_expr, param_consts, param_chars)?;
             if !(0..=255).contains(&code) {
                 return None;
             }
@@ -4859,6 +4857,59 @@ pub(super) fn eval_const_char_bytes(
             let mut out = eval_const_char_bytes(left, param_consts, param_chars)?;
             out.extend(eval_const_char_bytes(right, param_consts, param_chars)?);
             Some(out)
+        }
+        _ => None,
+    }
+}
+
+fn eval_const_char_int_expr(
+    e: &crate::ast::expr::SpannedExpr,
+    param_consts: &HashMap<String, ConstScalar>,
+    param_chars: &HashMap<String, Vec<u8>>,
+) -> Option<i128> {
+    if let Some(ConstScalar::Int(value)) = eval_const_scalar(e, param_consts) {
+        return Some(value);
+    }
+    match &e.node {
+        Expr::ParenExpr { inner } => eval_const_char_int_expr(inner, param_consts, param_chars),
+        Expr::UnaryOp { op, operand } => {
+            let value = eval_const_char_int_expr(operand, param_consts, param_chars)?;
+            match op {
+                UnaryOp::Plus => Some(value),
+                UnaryOp::Minus => Some(-value),
+                _ => None,
+            }
+        }
+        Expr::BinaryOp { op, left, right } => {
+            let left = eval_const_char_int_expr(left, param_consts, param_chars)?;
+            let right = eval_const_char_int_expr(right, param_consts, param_chars)?;
+            match op {
+                BinaryOp::Add => Some(left.wrapping_add(right)),
+                BinaryOp::Sub => Some(left.wrapping_sub(right)),
+                BinaryOp::Mul => Some(left.wrapping_mul(right)),
+                BinaryOp::Div if right != 0 => Some(left / right),
+                BinaryOp::Pow if right >= 0 && right <= i32::MAX as i128 => {
+                    let mut acc = 1_i128;
+                    for _ in 0..(right as usize) {
+                        acc = acc.wrapping_mul(left);
+                    }
+                    Some(acc)
+                }
+                _ => None,
+            }
+        }
+        Expr::FunctionCall { callee, args } => {
+            let Expr::Name { name } = &callee.node else {
+                return None;
+            };
+            if !name.eq_ignore_ascii_case("len") || args.len() != 1 || args[0].keyword.is_some() {
+                return None;
+            }
+            let crate::ast::expr::SectionSubscript::Element(arg_expr) = &args[0].value else {
+                return None;
+            };
+            eval_const_char_bytes(arg_expr, param_consts, param_chars)
+                .and_then(|bytes| i128::try_from(bytes.len()).ok())
         }
         _ => None,
     }

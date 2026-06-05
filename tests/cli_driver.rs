@@ -563,6 +563,64 @@ fn stream_unformatted_char_write_preserves_exact_bytes() {
 }
 
 #[test]
+fn character_star_parameter_concat_with_char_len_writes_stream_header() {
+    let output_file = unique_path("stream_unformatted_npy_header", "bin");
+    let src = write_program(
+        &format!(
+            "program p\n  implicit none\n  integer :: unit_num\n  character(len=*), parameter :: dict = &\n      \"{{'descr': '<f8', 'fortran_order': True, 'shape': (10, 4, ), }}        \" // char(10)\n  character(len=*), parameter :: header = &\n      char(int(z\"93\")) // \"NUMPY\" // char(1) // char(0) // char(len(dict)) // char(0) // dict\n  real(8) :: payload(10, 4)\n  payload = 0.0d0\n  if (len(dict) /= 70) error stop 1\n  if (len(header) /= 80) error stop 2\n  open(newunit=unit_num, file='{}', status='replace', access='stream', form='unformatted')\n  write(unit_num) header\n  write(unit_num) payload\n  close(unit_num)\n  write(*,'(A,I0)') 'LEN=', len(header)\nend program\n",
+            output_file.display()
+        ),
+        "stream_unformatted_npy_header.f90",
+    );
+    let out = unique_path("stream_unformatted_npy_header", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("stream unformatted NPY header compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "stream unformatted NPY header compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("stream unformatted NPY header run failed");
+    assert!(
+        run.status.success(),
+        "stream unformatted NPY header run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("LEN=80"),
+        "expected fixed header length, got: {}",
+        stdout
+    );
+
+    let bytes = std::fs::read(&output_file).expect("cannot read stream NPY header output");
+    assert_eq!(
+        bytes.len(),
+        400,
+        "expected 80-byte header plus 320-byte payload, got {} bytes",
+        bytes.len()
+    );
+    assert_eq!(
+        &bytes[..10],
+        &[0x93, b'N', b'U', b'M', b'P', b'Y', 1, 0, 70, 0],
+        "unexpected NPY header prefix: {:?}",
+        &bytes[..bytes.len().min(10)]
+    );
+    assert_eq!(bytes[79], b'\n', "header should end with newline");
+
+    let _ = std::fs::remove_file(&output_file);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn stream_unformatted_narrow_integer_io_preserves_raw_widths() {
     let input = unique_path("stream_unformatted_narrow_integer_read", "bin");
     std::fs::write(&input, [0x32u8, 0x00, 0x09, 0xde, 0x34, 0x12, 0xfe, 0xff])

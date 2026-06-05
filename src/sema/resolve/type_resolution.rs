@@ -46,6 +46,32 @@ pub(super) fn derived_char_init_len(e: &crate::ast::expr::Expr, st: &SymbolTable
             }
         }
         Expr::ParenExpr { inner } => derived_char_init_len(&inner.node, st),
+        Expr::FunctionCall { callee, args } => {
+            let Expr::Name { name } = &callee.node else {
+                return None;
+            };
+            match name.to_ascii_lowercase().as_str() {
+                "char" | "achar" if !args.is_empty() => Some(1),
+                "new_line" if args.len() == 1 => Some(1),
+                "repeat" if args.len() == 2 => {
+                    let crate::ast::expr::SectionSubscript::Element(source) = &args[0].value else {
+                        return None;
+                    };
+                    let crate::ast::expr::SectionSubscript::Element(count) = &args[1].value else {
+                        return None;
+                    };
+                    let source_len = derived_char_init_len(&source.node, st)?;
+                    let count = eval_const_int_expr(count, st)?;
+                    if count < 0 {
+                        return None;
+                    }
+                    usize::try_from(count)
+                        .ok()
+                        .and_then(|n| source_len.checked_mul(n))
+                }
+                _ => None,
+            }
+        }
         Expr::BinaryOp {
             op: crate::ast::expr::BinaryOp::Concat,
             left,
