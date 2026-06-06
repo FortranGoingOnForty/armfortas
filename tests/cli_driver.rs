@@ -35337,6 +35337,86 @@ fn elemental_derived_string_array_swap_uses_defined_assignment_and_operator() {
 }
 
 #[test]
+fn block_use_defined_assignment_survives_prior_generic_import_from_amod() {
+    let dir = unique_dir("block_use_assignment_import_order");
+    let string_src = write_program_in(
+        &dir,
+        "string_m.f90",
+        "module string_m\n  implicit none\n  type :: string_type\n    character(len=:), allocatable :: raw\n  end type\n  interface assignment(=)\n    module procedure assign_string_char\n  end interface\ncontains\n  elemental subroutine assign_string_char(lhs, rhs)\n    type(string_type), intent(inout) :: lhs\n    character(len=*), intent(in) :: rhs\n    lhs%raw = rhs\n  end subroutine\nend module\n",
+    );
+    let math_src = write_program_in(
+        &dir,
+        "math_m.f90",
+        "module math_m\n  use string_m, only: string_type\n  implicit none\n  private\n  public :: swap\n  interface swap\n    module procedure swap_stt\n  end interface\ncontains\n  elemental subroutine swap_stt(lhs, rhs)\n    type(string_type), intent(inout) :: lhs, rhs\n    type(string_type) :: temp\n    temp = lhs\n    lhs = rhs\n    rhs = temp\n  end subroutine\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use math_m, only: swap\n  implicit none\n  block\n    use string_m\n    type(string_type) :: x, y\n    x = 'abcde'\n    y = 'fghij'\n    call swap(x, y)\n    if (x%raw /= 'fghij') error stop 1\n    if (y%raw /= 'abcde') error stop 2\n  end block\n  print *, 'ok'\nend program\n",
+    );
+
+    let string_obj = dir.join("string_m.o");
+    let math_obj = dir.join("math_m.o");
+    let main_obj = dir.join("main.o");
+    for (src, obj) in [
+        (&string_src, &string_obj),
+        (&math_src, &math_obj),
+        (&main_src, &main_obj),
+    ] {
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                "-c",
+                src.to_str().unwrap(),
+                "-I",
+                dir.to_str().unwrap(),
+                "-J",
+                dir.to_str().unwrap(),
+                "-o",
+                obj.to_str().unwrap(),
+            ])
+            .output()
+            .expect("block-use assignment compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "block-use assignment compile failed for {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let exe = dir.join("block_use_assignment_import_order.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            string_obj.to_str().unwrap(),
+            math_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("block-use assignment link failed to spawn");
+    assert!(
+        link.status.success(),
+        "block-use assignment link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = run_binary_with_timeout(&exe, std::time::Duration::from_secs(5))
+        .expect("block-use assignment run timed out");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "block-use assignment run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn stdlib_style_string_array_swap_routes_nested_defined_gt() {
     // stdlib_string_type's `operator(==)` is written in terms of its
     // user-defined `operator(>)` overloads. Lowering must resolve those nested

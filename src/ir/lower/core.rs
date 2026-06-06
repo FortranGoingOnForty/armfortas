@@ -13882,25 +13882,6 @@ pub(super) fn array_expr_elem_type_only(
     }
 }
 
-fn specific_name_is_elemental(st: &SymbolTable, name: &str) -> bool {
-    use crate::sema::symtab::SymbolKind;
-
-    let key = name.to_ascii_lowercase();
-    st.all_scopes().iter().any(|scope| {
-        scope.symbols.get(&key).is_some_and(|sym| {
-            sym.attrs.elemental
-                && matches!(
-                    sym.kind,
-                    SymbolKind::Function
-                        | SymbolKind::Subroutine
-                        | SymbolKind::ExternalProc
-                        | SymbolKind::IntrinsicProc
-                        | SymbolKind::ProcedurePointer
-                )
-        })
-    })
-}
-
 #[allow(clippy::too_many_arguments)]
 fn lower_defined_assignment_array_constructor_values(
     b: &mut FuncBuilder,
@@ -13994,18 +13975,18 @@ fn try_defined_array_constructor_assignment(
     b: &mut FuncBuilder,
     ctx: &mut LowerCtx,
     lhs_info: &LocalInfo,
-    semantic_candidates: &[String],
+    semantic_candidates: &[SpecificProcCandidate],
     values: &[crate::ast::expr::AcValue],
 ) -> bool {
     if !local_is_array_like(lhs_info) {
         return false;
     }
 
-    let Some(resolved) = semantic_candidates.iter().find(|specific| {
-        if !specific_name_is_elemental(ctx.st, specific) {
+    let Some(resolved) = semantic_candidates.iter().find(|candidate| {
+        if !specific_candidate_is_elemental(ctx.st, candidate) {
             return false;
         }
-        let Some(scope) = procedure_scope_by_name(ctx.st, specific) else {
+        let Some(scope) = procedure_scope_for_candidate(ctx.st, candidate) else {
             return false;
         };
         let declared_args = declared_args_for_scope(scope);
@@ -14025,7 +14006,7 @@ fn try_defined_array_constructor_assignment(
         return false;
     };
 
-    let rk = resolved.to_lowercase();
+    let rk = resolved.name.to_lowercase();
     let mask = cached_param_mask_for_lookup(ctx.st, ctx.char_len_star_params, &rk);
     if !mask
         .as_ref()
@@ -14035,7 +14016,7 @@ fn try_defined_array_constructor_assignment(
         return false;
     }
 
-    let (call_name, _) = resolved_symbol_call_target(ctx.st, &rk, resolved);
+    let (call_name, _) = resolved_symbol_call_target_for_candidate(ctx.st, resolved);
     let func_ref = same_unit_func_ref(
         ctx.st,
         b.func().name.as_str(),
@@ -14130,14 +14111,53 @@ fn lower_elemental_defined_assignment_array_broadcast(
     b.set_block(bb_exit);
 }
 
-fn defined_assignment_specific_has_scalar_formals(st: &SymbolTable, specific: &str) -> bool {
-    let Some(scope) = procedure_scope_by_name(st, specific) else {
+fn defined_assignment_specific_has_scalar_formals(
+    st: &SymbolTable,
+    candidate: &SpecificProcCandidate,
+) -> bool {
+    let Some(scope) = procedure_scope_for_candidate(st, candidate) else {
         return false;
     };
     let declared_args = declared_args_for_scope(scope);
     declared_args.len() == 2
         && formal_declared_rank(declared_args[0]) == Some(0)
         && formal_declared_rank(declared_args[1]) == Some(0)
+}
+
+fn defined_assignment_semantic_candidates(
+    st: &SymbolTable,
+    lhs_semantic_ti: Option<&crate::sema::symtab::TypeInfo>,
+    rhs_semantic_ti: Option<&crate::sema::symtab::TypeInfo>,
+) -> Vec<SpecificProcCandidate> {
+    let Some(candidates) = named_interface_specific_candidates(st, "assignment(=)") else {
+        return Vec::new();
+    };
+
+    candidates
+        .into_iter()
+        .filter(|candidate| {
+            let Some(scope) = procedure_scope_for_candidate(st, candidate) else {
+                return false;
+            };
+            let declared_args = declared_args_for_scope(scope);
+            if declared_args.len() != 2 {
+                return false;
+            }
+
+            if let Some(ti) = declared_args.first().and_then(|sym| sym.type_info.as_ref()) {
+                if !defined_assignment_arg_semantic_match(ti, lhs_semantic_ti) {
+                    return false;
+                }
+            }
+            if let Some(ti) = declared_args.get(1).and_then(|sym| sym.type_info.as_ref()) {
+                if !defined_assignment_arg_semantic_match(ti, rhs_semantic_ti) {
+                    return false;
+                }
+            }
+
+            true
+        })
+        .collect()
 }
 
 pub(super) fn try_defined_assignment_for_array_element(
@@ -14148,17 +14168,6 @@ pub(super) fn try_defined_assignment_for_array_element(
     args: &[crate::ast::expr::Argument],
     rhs: &crate::ast::expr::SpannedExpr,
 ) -> bool {
-    let sym = match ctx
-        .st
-        .lookup_local_then_any(ctx.proc_scope_id, "assignment(=)")
-    {
-        Some(s) if s.kind == crate::sema::symtab::SymbolKind::NamedInterface => s,
-        _ => return false,
-    };
-    if sym.arg_names.is_empty() {
-        return false;
-    }
-
     let lhs_semantic_ti = ctx
         .proc_scope_id
         .and_then(|sid| ctx.st.lookup_in(sid, lhs_key))
@@ -14172,39 +14181,11 @@ pub(super) fn try_defined_assignment_for_array_element(
         Some(ctx.type_layouts),
     );
 
-    let semantic_candidates: Vec<String> = sym
-        .arg_names
-        .iter()
-        .filter_map(|specific| {
-            let scope = ctx.st.all_scopes().iter().find(|s| match &s.kind {
-                crate::sema::symtab::ScopeKind::Function(n)
-                | crate::sema::symtab::ScopeKind::Subroutine(n) => n.eq_ignore_ascii_case(specific),
-                _ => false,
-            })?;
-
-            let declared_args: Vec<&crate::sema::symtab::Symbol> = scope
-                .arg_order
-                .iter()
-                .filter_map(|n| scope.symbols.get(n))
-                .collect();
-            if declared_args.len() != 2 {
-                return None;
-            }
-
-            if let Some(ti) = declared_args.first().and_then(|sym| sym.type_info.as_ref()) {
-                if !defined_assignment_arg_semantic_match(ti, lhs_semantic_ti.as_ref()) {
-                    return None;
-                }
-            }
-            if let Some(ti) = declared_args.get(1).and_then(|sym| sym.type_info.as_ref()) {
-                if !defined_assignment_arg_semantic_match(ti, rhs_semantic_ti.as_ref()) {
-                    return None;
-                }
-            }
-
-            Some(specific.clone())
-        })
-        .collect();
+    let semantic_candidates = defined_assignment_semantic_candidates(
+        ctx.st,
+        lhs_semantic_ti.as_ref(),
+        rhs_semantic_ti.as_ref(),
+    );
     if semantic_candidates.is_empty() {
         return false;
     }
@@ -14223,12 +14204,8 @@ pub(super) fn try_defined_assignment_for_array_element(
     let arg_vals = [lhs_val, rhs_val];
     let actual_types: Vec<Option<IrType>> =
         arg_vals.iter().map(|v| b.func().value_type(*v)).collect();
-    let resolved = semantic_candidates.iter().find_map(|specific| {
-        let scope = ctx.st.all_scopes().iter().find(|s| match &s.kind {
-            crate::sema::symtab::ScopeKind::Function(n)
-            | crate::sema::symtab::ScopeKind::Subroutine(n) => n.eq_ignore_ascii_case(specific),
-            _ => false,
-        })?;
+    let resolved = semantic_candidates.iter().find_map(|candidate| {
+        let scope = procedure_scope_for_candidate(ctx.st, candidate)?;
 
         let declared_args: Vec<&crate::sema::symtab::Symbol> = scope
             .arg_order
@@ -14259,14 +14236,14 @@ pub(super) fn try_defined_assignment_for_array_element(
             }
         }
 
-        type_match.then(|| specific.clone())
+        type_match.then(|| candidate.clone())
     });
     let Some(resolved) = resolved else {
         return false;
     };
 
-    let rk = resolved.to_lowercase();
-    let (call_name, _) = resolved_symbol_call_target(ctx.st, &rk, &resolved);
+    let rk = resolved.name.to_lowercase();
+    let (call_name, _) = resolved_symbol_call_target_for_candidate(ctx.st, &resolved);
     let func_ref = same_unit_func_ref(
         ctx.st,
         b.func().name.as_str(),
@@ -14365,17 +14342,6 @@ pub(super) fn try_defined_assignment(
     lhs_key: &str,
     rhs: &crate::ast::expr::SpannedExpr,
 ) -> bool {
-    let sym = match ctx
-        .st
-        .lookup_local_then_any(ctx.proc_scope_id, "assignment(=)")
-    {
-        Some(s) if s.kind == crate::sema::symtab::SymbolKind::NamedInterface => s,
-        _ => return false,
-    };
-    if sym.arg_names.is_empty() {
-        return false;
-    }
-
     let lhs_info = match ctx.locals.get(lhs_key) {
         Some(i) => i.clone(),
         None => return false,
@@ -14395,7 +14361,8 @@ pub(super) fn try_defined_assignment(
     let lhs_semantic_ti = ctx
         .proc_scope_id
         .and_then(|sid| ctx.st.lookup_in(sid, lhs_key))
-        .and_then(|sym| sym.type_info.clone());
+        .and_then(|sym| sym.type_info.clone())
+        .or_else(|| local_semantic_type_info(&lhs_info));
     let rhs_semantic_ti = assignment_expr_type_info(
         rhs,
         Some(&ctx.locals),
@@ -14404,39 +14371,11 @@ pub(super) fn try_defined_assignment(
         Some(ctx.type_layouts),
     );
 
-    let semantic_candidates: Vec<String> = sym
-        .arg_names
-        .iter()
-        .filter_map(|specific| {
-            let scope = ctx.st.all_scopes().iter().find(|s| match &s.kind {
-                crate::sema::symtab::ScopeKind::Function(n)
-                | crate::sema::symtab::ScopeKind::Subroutine(n) => n.eq_ignore_ascii_case(specific),
-                _ => false,
-            })?;
-
-            let declared_args: Vec<&crate::sema::symtab::Symbol> = scope
-                .arg_order
-                .iter()
-                .filter_map(|n| scope.symbols.get(n))
-                .collect();
-            if declared_args.len() != 2 {
-                return None;
-            }
-
-            if let Some(ti) = declared_args.first().and_then(|sym| sym.type_info.as_ref()) {
-                if !defined_assignment_arg_semantic_match(ti, lhs_semantic_ti.as_ref()) {
-                    return None;
-                }
-            }
-            if let Some(ti) = declared_args.get(1).and_then(|sym| sym.type_info.as_ref()) {
-                if !defined_assignment_arg_semantic_match(ti, rhs_semantic_ti.as_ref()) {
-                    return None;
-                }
-            }
-
-            Some(specific.clone())
-        })
-        .collect();
+    let semantic_candidates = defined_assignment_semantic_candidates(
+        ctx.st,
+        lhs_semantic_ti.as_ref(),
+        rhs_semantic_ti.as_ref(),
+    );
     if semantic_candidates.is_empty() {
         return false;
     }
@@ -14508,12 +14447,8 @@ pub(super) fn try_defined_assignment(
     let arg_vals = [lhs_val, rhs_val];
     let actual_types: Vec<Option<IrType>> =
         arg_vals.iter().map(|v| b.func().value_type(*v)).collect();
-    let resolved = semantic_candidates.iter().find_map(|specific| {
-        let scope = ctx.st.all_scopes().iter().find(|s| match &s.kind {
-            crate::sema::symtab::ScopeKind::Function(n)
-            | crate::sema::symtab::ScopeKind::Subroutine(n) => n.eq_ignore_ascii_case(specific),
-            _ => false,
-        })?;
+    let resolved = semantic_candidates.iter().find_map(|candidate| {
+        let scope = procedure_scope_for_candidate(ctx.st, candidate)?;
 
         let declared_args: Vec<&crate::sema::symtab::Symbol> = scope
             .arg_order
@@ -14543,13 +14478,13 @@ pub(super) fn try_defined_assignment(
             }
         }
 
-        type_match.then(|| specific.clone())
+        type_match.then(|| candidate.clone())
     });
     let Some(resolved) = resolved else {
         return false;
     };
-    let rk = resolved.to_lowercase();
-    let (call_name, _) = resolved_symbol_call_target(ctx.st, &rk, &resolved);
+    let rk = resolved.name.to_lowercase();
+    let (call_name, _) = resolved_symbol_call_target_for_candidate(ctx.st, &resolved);
     let func_ref = same_unit_func_ref(
         ctx.st,
         b.func().name.as_str(),
@@ -14649,8 +14584,8 @@ pub(super) fn try_defined_assignment(
         rhs_for_call
     };
     if local_is_array_like(&lhs_info)
-        && specific_name_is_elemental(ctx.st, &rk)
-        && defined_assignment_specific_has_scalar_formals(ctx.st, &rk)
+        && specific_candidate_is_elemental(ctx.st, &resolved)
+        && defined_assignment_specific_has_scalar_formals(ctx.st, &resolved)
         && actual_expr_rank(rhs, &ctx.locals, ctx.st, Some(ctx.type_layouts)) == Some(0)
     {
         lower_elemental_defined_assignment_array_broadcast(
