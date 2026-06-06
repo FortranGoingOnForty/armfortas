@@ -28,6 +28,32 @@ fn capture_run_stdout(request: CaptureRequest) -> String {
 }
 
 #[test]
+fn o0_scalar_fma_fixture_runs_correctly() {
+    let source = fixture("do_loop_vectorize_fma.f90");
+
+    let stdout = capture_run_stdout(CaptureRequest {
+        input: source,
+        requested: BTreeSet::from([Stage::Run]),
+        opt_level: OptLevel::O0,
+    });
+    assert!(
+        stdout.contains("3.3000000E1"),
+        "f32 c(16) wrong at O0:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("3.300000000000000E1"),
+        "f64 c(16) wrong at O0:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("2.0000000E1"),
+        "broadcast FMA wrong at O0:\n{}",
+        stdout
+    );
+}
+
+#[test]
 fn o3_vectorizes_elementwise_fma() {
     let source = fixture("do_loop_vectorize_fma.f90");
 

@@ -3824,7 +3824,7 @@ fn complex_component_ty(elem_ty: &IrType) -> Option<&IrType> {
     }
 }
 
-fn const_array_storage_scalar_count(elem_ty: &IrType, total: i64) -> Option<i64> {
+pub(super) fn const_array_storage_scalar_count(elem_ty: &IrType, total: i64) -> Option<i64> {
     let lanes = if complex_component_ty(elem_ty).is_some() {
         2
     } else {
@@ -3833,7 +3833,7 @@ fn const_array_storage_scalar_count(elem_ty: &IrType, total: i64) -> Option<i64>
     total.checked_mul(lanes)
 }
 
-fn zero_const_for_array_lane(elem_ty: &IrType) -> ConstScalar {
+pub(super) fn zero_const_for_array_lane(elem_ty: &IrType) -> ConstScalar {
     if matches!(elem_ty, IrType::Float(_)) || complex_component_ty(elem_ty).is_some() {
         ConstScalar::Float(0.0)
     } else {
@@ -3841,7 +3841,7 @@ fn zero_const_for_array_lane(elem_ty: &IrType) -> ConstScalar {
     }
 }
 
-fn coerce_scalar_to_array_lanes(raw: ConstScalar, elem_ty: &IrType) -> Vec<ConstScalar> {
+pub(super) fn coerce_scalar_to_array_lanes(raw: ConstScalar, elem_ty: &IrType) -> Vec<ConstScalar> {
     if complex_component_ty(elem_ty).is_some() {
         vec![ConstScalar::Float(raw.to_float()), ConstScalar::Float(0.0)]
     } else if matches!(elem_ty, IrType::Float(_)) {
@@ -4354,11 +4354,172 @@ pub(super) fn collect_const_array_scalars(
                         }
                     }
                 }
+                if name.eq_ignore_ascii_case("matmul") {
+                    if let Some(values) = collect_const_matmul_scalars(
+                        args,
+                        elem_ty,
+                        param_consts,
+                        param_array_consts,
+                        param_array_elem_tys,
+                    ) {
+                        return Some(values);
+                    }
+                }
             }
             None
         }
         _ => None,
     }
+}
+
+fn collect_const_matmul_scalars(
+    args: &[crate::ast::expr::Argument],
+    elem_ty: &IrType,
+    param_consts: &HashMap<String, ConstScalar>,
+    param_array_consts: &HashMap<String, Vec<ConstScalar>>,
+    param_array_elem_tys: &HashMap<String, IrType>,
+) -> Option<Vec<ConstScalar>> {
+    let left_expr = const_arg_element(args.first()?)?;
+    let right_expr = const_arg_element(args.get(1)?)?;
+    let left = collect_const_array_scalars(
+        left_expr,
+        elem_ty,
+        param_consts,
+        param_array_consts,
+        param_array_elem_tys,
+    )?;
+    let right = collect_const_array_scalars(
+        right_expr,
+        elem_ty,
+        param_consts,
+        param_array_consts,
+        param_array_elem_tys,
+    )?;
+    let lanes = const_array_storage_scalar_count(elem_ty, 1)? as usize;
+    if lanes == 0 || left.len() % lanes != 0 || right.len() % lanes != 0 {
+        return None;
+    }
+    let left_elems = left.len() / lanes;
+    let right_elems = right.len() / lanes;
+    if left_elems == 0 || right_elems == 0 || left_elems == right_elems {
+        return None;
+    }
+
+    if left_elems.is_multiple_of(right_elems) {
+        let rows = left_elems / right_elems;
+        let cols = right_elems;
+        let mut out = Vec::with_capacity(rows * lanes);
+        for row in 0..rows {
+            let mut acc = const_zero_lanes(elem_ty, lanes);
+            for col in 0..cols {
+                let left_idx = (row + col * rows) * lanes;
+                let right_idx = col * lanes;
+                let product = const_mul_lanes(
+                    &left[left_idx..left_idx + lanes],
+                    &right[right_idx..right_idx + lanes],
+                    elem_ty,
+                )?;
+                acc = const_add_lanes(&acc, &product, elem_ty)?;
+            }
+            out.extend(acc);
+        }
+        return Some(out);
+    }
+
+    if right_elems.is_multiple_of(left_elems) {
+        let rows = left_elems;
+        let cols = right_elems / left_elems;
+        let mut out = Vec::with_capacity(cols * lanes);
+        for col in 0..cols {
+            let mut acc = const_zero_lanes(elem_ty, lanes);
+            for row in 0..rows {
+                let left_idx = row * lanes;
+                let right_idx = (row + col * rows) * lanes;
+                let product = const_mul_lanes(
+                    &left[left_idx..left_idx + lanes],
+                    &right[right_idx..right_idx + lanes],
+                    elem_ty,
+                )?;
+                acc = const_add_lanes(&acc, &product, elem_ty)?;
+            }
+            out.extend(acc);
+        }
+        return Some(out);
+    }
+
+    None
+}
+
+fn const_zero_lanes(elem_ty: &IrType, lanes: usize) -> Vec<ConstScalar> {
+    vec![zero_const_for_array_lane(elem_ty); lanes]
+}
+
+fn const_mul_lanes(
+    left: &[ConstScalar],
+    right: &[ConstScalar],
+    elem_ty: &IrType,
+) -> Option<Vec<ConstScalar>> {
+    if complex_component_ty(elem_ty).is_some() {
+        if left.len() != 2 || right.len() != 2 {
+            return None;
+        }
+        let ar = left[0].to_float();
+        let ai = left[1].to_float();
+        let br = right[0].to_float();
+        let bi = right[1].to_float();
+        return Some(vec![
+            ConstScalar::Float(ar * br - ai * bi),
+            ConstScalar::Float(ar * bi + ai * br),
+        ]);
+    }
+
+    let l = *left.first()?;
+    let r = *right.first()?;
+    if matches!(elem_ty, IrType::Float(_))
+        || matches!(l, ConstScalar::Float(_))
+        || matches!(r, ConstScalar::Float(_))
+    {
+        return Some(vec![ConstScalar::Float(l.to_float() * r.to_float())]);
+    }
+    let ConstScalar::Int(li) = l else {
+        return None;
+    };
+    let ConstScalar::Int(ri) = r else {
+        return None;
+    };
+    Some(vec![ConstScalar::Int(li.checked_mul(ri)?)])
+}
+
+fn const_add_lanes(
+    left: &[ConstScalar],
+    right: &[ConstScalar],
+    elem_ty: &IrType,
+) -> Option<Vec<ConstScalar>> {
+    if complex_component_ty(elem_ty).is_some() {
+        if left.len() != 2 || right.len() != 2 {
+            return None;
+        }
+        return Some(vec![
+            ConstScalar::Float(left[0].to_float() + right[0].to_float()),
+            ConstScalar::Float(left[1].to_float() + right[1].to_float()),
+        ]);
+    }
+
+    let l = *left.first()?;
+    let r = *right.first()?;
+    if matches!(elem_ty, IrType::Float(_))
+        || matches!(l, ConstScalar::Float(_))
+        || matches!(r, ConstScalar::Float(_))
+    {
+        return Some(vec![ConstScalar::Float(l.to_float() + r.to_float())]);
+    }
+    let ConstScalar::Int(li) = l else {
+        return None;
+    };
+    let ConstScalar::Int(ri) = r else {
+        return None;
+    };
+    Some(vec![ConstScalar::Int(li.checked_add(ri)?)])
 }
 
 fn collect_const_transpose_scalars(
@@ -4682,9 +4843,7 @@ pub(super) fn eval_const_char_bytes(
             let crate::ast::expr::SectionSubscript::Element(arg_expr) = &args[0].value else {
                 return None;
             };
-            let ConstScalar::Int(code) = eval_const_scalar(arg_expr, param_consts)? else {
-                return None;
-            };
+            let code = eval_const_char_int_expr(arg_expr, param_consts, param_chars)?;
             if !(0..=255).contains(&code) {
                 return None;
             }
@@ -4698,6 +4857,59 @@ pub(super) fn eval_const_char_bytes(
             let mut out = eval_const_char_bytes(left, param_consts, param_chars)?;
             out.extend(eval_const_char_bytes(right, param_consts, param_chars)?);
             Some(out)
+        }
+        _ => None,
+    }
+}
+
+fn eval_const_char_int_expr(
+    e: &crate::ast::expr::SpannedExpr,
+    param_consts: &HashMap<String, ConstScalar>,
+    param_chars: &HashMap<String, Vec<u8>>,
+) -> Option<i128> {
+    if let Some(ConstScalar::Int(value)) = eval_const_scalar(e, param_consts) {
+        return Some(value);
+    }
+    match &e.node {
+        Expr::ParenExpr { inner } => eval_const_char_int_expr(inner, param_consts, param_chars),
+        Expr::UnaryOp { op, operand } => {
+            let value = eval_const_char_int_expr(operand, param_consts, param_chars)?;
+            match op {
+                UnaryOp::Plus => Some(value),
+                UnaryOp::Minus => Some(-value),
+                _ => None,
+            }
+        }
+        Expr::BinaryOp { op, left, right } => {
+            let left = eval_const_char_int_expr(left, param_consts, param_chars)?;
+            let right = eval_const_char_int_expr(right, param_consts, param_chars)?;
+            match op {
+                BinaryOp::Add => Some(left.wrapping_add(right)),
+                BinaryOp::Sub => Some(left.wrapping_sub(right)),
+                BinaryOp::Mul => Some(left.wrapping_mul(right)),
+                BinaryOp::Div if right != 0 => Some(left / right),
+                BinaryOp::Pow if right >= 0 && right <= i32::MAX as i128 => {
+                    let mut acc = 1_i128;
+                    for _ in 0..(right as usize) {
+                        acc = acc.wrapping_mul(left);
+                    }
+                    Some(acc)
+                }
+                _ => None,
+            }
+        }
+        Expr::FunctionCall { callee, args } => {
+            let Expr::Name { name } = &callee.node else {
+                return None;
+            };
+            if !name.eq_ignore_ascii_case("len") || args.len() != 1 || args[0].keyword.is_some() {
+                return None;
+            }
+            let crate::ast::expr::SectionSubscript::Element(arg_expr) = &args[0].value else {
+                return None;
+            };
+            eval_const_char_bytes(arg_expr, param_consts, param_chars)
+                .and_then(|bytes| i128::try_from(bytes.len()).ok())
         }
         _ => None,
     }
@@ -6192,6 +6404,18 @@ fn resolve_exported_global_key(
     globals.contains_key(&source_key).then_some(source_key)
 }
 
+fn resolve_visible_global_key(
+    st: &SymbolTable,
+    globals: &HashMap<(String, String), ModuleGlobalInfo>,
+    scope_id: crate::sema::symtab::ScopeId,
+    local_key: &str,
+) -> Option<(String, String)> {
+    let sym = st.lookup_in(scope_id, local_key)?;
+    let source_mod = module_scope_name_for_symbol(st, sym.scope)?;
+    let source_key = (source_mod, sym.name.to_lowercase());
+    globals.contains_key(&source_key).then_some(source_key)
+}
+
 /// Install module globals imported by this function's USE
 /// statements as `LocalInfo` entries. Honors:
 ///   * USE ONLY filtering — only names in the only-list are installed
@@ -6331,6 +6555,18 @@ pub(super) fn install_globals_as_locals_in(
                         && !pending.iter().any(|(k, _)| k == &local_lc)
                     {
                         pending.push((local_lc, (src_mod_key, var_lc)));
+                    }
+                }
+                if let Some(required) = required_names {
+                    for local_lc in required {
+                        if pending.iter().any(|(k, _)| k == local_lc) {
+                            continue;
+                        }
+                        if let Some(resolved_key) =
+                            resolve_visible_global_key(st, globals, host_scope_id, local_lc)
+                        {
+                            pending.push((local_lc.clone(), resolved_key));
+                        }
                     }
                 }
             }
@@ -8556,7 +8792,7 @@ pub(super) fn array_constructor_type_spec_info(
     }
     let kind_inside = raw
         .find('(')
-        .and_then(|lp| raw.rfind(')').map(|rp| (lp, rp)))
+        .zip(raw.rfind(')'))
         .filter(|(lp, rp)| rp > lp)
         .map(|(lp, rp)| raw[lp + 1..rp].trim().to_string());
     let prefix = raw.split('(').next().unwrap_or(&raw).trim();
@@ -11301,8 +11537,9 @@ pub(super) fn actual_expr_rank(
         Expr::IntegerLiteral { .. }
         | Expr::RealLiteral { .. }
         | Expr::LogicalLiteral { .. }
-        | Expr::StringLiteral { .. } => Some(0),
-        _ => None,
+        | Expr::StringLiteral { .. }
+        | Expr::ComplexLiteral { .. }
+        | Expr::BozLiteral { .. } => Some(0),
     }
 }
 
@@ -13119,14 +13356,23 @@ pub(super) fn local_intrinsic_call_type_info(
         }
     }
     if matches!(lower_name.as_str(), "real" | "float") && (args.len() > 1 || has_keyword) {
+        if let Some(kind) = intrinsic_kind_call_arg_width(args, 1, "kind", locals, st) {
+            return Some(crate::sema::symtab::TypeInfo::Real { kind: Some(kind) });
+        }
         return fortran_type_to_type_info(&crate::sema::types::expr_type(expr, st));
     }
     if matches!(lower_name.as_str(), "int" | "nint" | "floor" | "ceiling")
         && (args.len() > 1 || has_keyword)
     {
+        if let Some(kind) = intrinsic_kind_call_arg_width(args, 1, "kind", locals, st) {
+            return Some(crate::sema::symtab::TypeInfo::Integer { kind: Some(kind) });
+        }
         return fortran_type_to_type_info(&crate::sema::types::expr_type(expr, st));
     }
     if lower_name == "cmplx" && (args.len() > 2 || has_keyword) {
+        if let Some(kind) = intrinsic_kind_call_arg_width(args, 2, "kind", locals, st) {
+            return Some(crate::sema::symtab::TypeInfo::Complex { kind: Some(kind) });
+        }
         return fortran_type_to_type_info(&crate::sema::types::expr_type(expr, st));
     }
 
@@ -18734,6 +18980,57 @@ pub(super) fn clear_intent_out_allocatable_array_params(
     }
 }
 
+pub(super) fn clear_intent_out_deferred_char_params(
+    b: &mut FuncBuilder,
+    param_info: &[(String, ValueId, IrType, bool)],
+    locals: &HashMap<String, LocalInfo>,
+    decls: &[crate::ast::decl::SpannedDecl],
+) {
+    for (pname, _, _, is_value) in param_info {
+        if *is_value || !decl_has_intent_out(pname, decls) || !decl_is_allocatable(pname, decls) {
+            continue;
+        }
+
+        let Some(info) = locals.get(pname) else {
+            continue;
+        };
+        if info.is_pointer
+            || local_uses_array_descriptor(info)
+            || !matches!(info.char_kind, CharKind::Deferred)
+        {
+            continue;
+        }
+
+        if decl_is_optional(pname, decls) && info.by_ref {
+            let ptr_val = b.load(info.addr);
+            let zero = b.const_i64(0);
+            let present = b.icmp(CmpOp::Ne, ptr_val, zero);
+            let bb_clear = b.create_block("intent_out_char_clear_present");
+            let bb_skip = b.create_block("intent_out_char_clear_skip");
+            b.cond_branch(present, bb_clear, vec![], bb_skip, vec![]);
+
+            b.set_block(bb_clear);
+            let desc = string_descriptor_addr(b, info);
+            b.call(
+                FuncRef::External("afs_dealloc_string".into()),
+                vec![desc],
+                IrType::Void,
+            );
+            b.branch(bb_skip, vec![]);
+
+            b.set_block(bb_skip);
+            continue;
+        }
+
+        let desc = string_descriptor_addr(b, info);
+        b.call(
+            FuncRef::External("afs_dealloc_string".into()),
+            vec![desc],
+            IrType::Void,
+        );
+    }
+}
+
 /// Metadata for one host-associated variable threaded into a contained
 /// procedure via closure passing. Assembled from the host's declaration
 /// list once per (callee, host-var) pair; the contained proc uses it to
@@ -24039,11 +24336,12 @@ pub(super) fn lower_array_store(
         // — passing the scalar value as the memcpy src dereferences a
         // junk pointer.
         let src_ty = b.func().value_type(value);
-        let src = if matches!(&src_ty, Some(t) if is_complex_ty(t)) {
+        let dst_fw = complex_float_width(&info.ty);
+        let src = if matches!(&src_ty, Some(t) if is_complex_ty(t) && complex_float_width(t) == dst_fw)
+        {
             value
         } else {
-            let fw = complex_float_width(&info.ty);
-            materialize_complex_operand(b, value, fw)
+            materialize_complex_operand(b, value, dst_fw)
         };
         let size = b.const_i64(complex_byte_size(&info.ty));
         b.call(
@@ -34169,6 +34467,9 @@ pub(super) fn lower_rank1_array_unary_descriptor(
     if matches!(op, UnaryOp::Plus) {
         return Some((source_desc, elem_ty));
     }
+    let source_rank = actual_expr_rank(operand, locals, st, type_layouts)
+        .unwrap_or(1)
+        .max(1);
 
     let result_desc = allocate_like_array_temp_descriptor(b, source_desc);
     let n = b.call(
@@ -34193,14 +34494,14 @@ pub(super) fn lower_rank1_array_unary_descriptor(
 
     b.set_block(bb_body);
     let idx = b.load(i_addr);
-    let operand_val = load_rank1_array_desc_elem(b, source_desc, &elem_ty, idx);
+    let operand_val = load_array_desc_elem_rank(b, source_desc, &elem_ty, idx, source_rank);
     let result = match (&elem_ty, op) {
         (IrType::Int(_), UnaryOp::Minus) => b.ineg(operand_val),
         (IrType::Float(_), UnaryOp::Minus) => b.fneg(operand_val),
         (IrType::Bool, UnaryOp::Not) => b.not(operand_val),
         _ => unreachable!("unsupported unary array op should have returned before block creation"),
     };
-    store_rank1_array_desc_elem(b, result_desc, &elem_ty, idx, result);
+    store_array_desc_elem_rank(b, result_desc, &elem_ty, idx, source_rank, result);
 
     let one = b.const_i64(1);
     let next = b.iadd(idx, one);
@@ -34215,6 +34516,7 @@ pub(super) fn lower_rank1_float_array_abs_descriptor(
     b: &mut FuncBuilder,
     source_desc: ValueId,
     elem_ty: IrType,
+    source_rank: usize,
 ) -> Option<(ValueId, IrType)> {
     if !matches!(elem_ty, IrType::Float(_)) {
         return None;
@@ -34241,9 +34543,10 @@ pub(super) fn lower_rank1_float_array_abs_descriptor(
 
     b.set_block(bb_body);
     let idx = b.load(i_addr);
-    let operand_val = load_rank1_array_desc_elem(b, source_desc, &elem_ty, idx);
+    let source_rank = source_rank.max(1);
+    let operand_val = load_array_desc_elem_rank(b, source_desc, &elem_ty, idx, source_rank);
     let result = b.fabs(operand_val);
-    store_rank1_array_desc_elem(b, result_desc, &elem_ty, idx, result);
+    store_array_desc_elem_rank(b, result_desc, &elem_ty, idx, source_rank, result);
     let one = b.const_i64(1);
     let next = b.iadd(idx, one);
     b.store(next, i_addr);
@@ -34251,6 +34554,55 @@ pub(super) fn lower_rank1_float_array_abs_descriptor(
 
     b.set_block(bb_exit);
     Some((result_desc, elem_ty))
+}
+
+pub(super) fn promote_array_desc_to_complex_descriptor(
+    b: &mut FuncBuilder,
+    source_desc: ValueId,
+    source_elem_ty: &IrType,
+    source_rank: usize,
+    target_fw: FloatWidth,
+) -> ValueId {
+    if is_complex_ty(source_elem_ty) && complex_float_width(source_elem_ty) == target_fw {
+        return source_desc;
+    }
+
+    let complex_elem_ty = IrType::Array(Box::new(IrType::Float(target_fw)), 2);
+    let result_desc =
+        allocate_like_array_temp_descriptor_with_elem_type(b, source_desc, &complex_elem_ty);
+    let n = b.call(
+        FuncRef::External("afs_array_size".into()),
+        vec![source_desc],
+        IrType::Int(IntWidth::I64),
+    );
+
+    let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let zero64 = b.const_i64(0);
+    b.store(zero64, i_addr);
+
+    let bb_check = b.create_block("array_promote_complex_check");
+    let bb_body = b.create_block("array_promote_complex_body");
+    let bb_exit = b.create_block("array_promote_complex_exit");
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let i = b.load(i_addr);
+    let done = b.icmp(CmpOp::Ge, i, n);
+    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+    b.set_block(bb_body);
+    let idx = b.load(i_addr);
+    let rank = source_rank.max(1);
+    let raw = load_array_desc_elem_rank(b, source_desc, source_elem_ty, idx, rank);
+    let complex_value = materialize_complex_operand(b, raw, target_fw);
+    store_array_desc_elem_rank(b, result_desc, &complex_elem_ty, idx, rank, complex_value);
+    let one = b.const_i64(1);
+    let next = b.iadd(idx, one);
+    b.store(next, i_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
+    result_desc
 }
 
 /// F2018 §10.1.5: relational ops over rank-1 array operands produce a
@@ -35357,7 +35709,12 @@ pub(super) fn lower_array_expr_descriptor(
                                     contained_host_refs,
                                     descriptor_params,
                                 ) {
-                                    return Some((desc, elem_ty));
+                                    let result_elem_ty = if key == "matmul" {
+                                        matmul_result_elem_ty_for_args(&elem_ty, args, locals)
+                                    } else {
+                                        elem_ty
+                                    };
+                                    return Some((desc, result_elem_ty));
                                 }
                             }
                         }
@@ -35436,10 +35793,15 @@ pub(super) fn lower_array_expr_descriptor(
                                 descriptor_params,
                             ) {
                                 if name.eq_ignore_ascii_case("abs") {
+                                    let source_rank =
+                                        actual_expr_rank(first_expr, locals, st, type_layouts)
+                                            .unwrap_or(1)
+                                            .max(1);
                                     if let Some(result) = lower_rank1_float_array_abs_descriptor(
                                         b,
                                         src_desc,
                                         elem_ty.clone(),
+                                        source_rank,
                                     ) {
                                         return Some(result);
                                     }
@@ -37450,6 +37812,27 @@ pub(super) fn lower_array_assign(
             Some(ctx.descriptor_params),
         ) {
             if !derived_array_needs_deep_copy {
+                let mut assign_src_desc = src_desc;
+                let tmp_src_desc = if !dest_name.is_empty() && expr_mentions_name(value, dest_name)
+                {
+                    let tmp_desc = allocate_like_array_temp_descriptor_with_elem_type(
+                        b,
+                        src_desc,
+                        &src_elem_ty,
+                    );
+                    let stat = b.alloca(IrType::Int(IntWidth::I32));
+                    let zero32 = b.const_i32(0);
+                    b.store(zero32, stat);
+                    b.call(
+                        FuncRef::External("afs_copy_array_data".into()),
+                        vec![tmp_desc, src_desc, stat],
+                        IrType::Void,
+                    );
+                    assign_src_desc = tmp_desc;
+                    Some(tmp_desc)
+                } else {
+                    None
+                };
                 // F2018 §10.2.1.3: numeric element type mismatch between
                 // RHS array result and LHS allocatable forces per-element
                 // conversion. The standard `afs_assign_allocatable` memcpys
@@ -37466,17 +37849,37 @@ pub(super) fn lower_array_assign(
                         let sk_v = b.const_i32(sk);
                         b.call(
                             FuncRef::External("afs_assign_allocatable_convert".into()),
-                            vec![dest_desc, src_desc, dk_v, sk_v],
+                            vec![dest_desc, assign_src_desc, dk_v, sk_v],
                             IrType::Void,
                         );
+                        if let Some(tmp_desc) = tmp_src_desc {
+                            let tmp_stat = b.alloca(IrType::Int(IntWidth::I32));
+                            let zero32 = b.const_i32(0);
+                            b.store(zero32, tmp_stat);
+                            b.call(
+                                FuncRef::External("afs_deallocate_array".into()),
+                                vec![tmp_desc, tmp_stat],
+                                IrType::Void,
+                            );
+                        }
                         return;
                     }
                 }
                 b.call(
                     FuncRef::External("afs_assign_allocatable".into()),
-                    vec![dest_desc, src_desc],
+                    vec![dest_desc, assign_src_desc],
                     IrType::Void,
                 );
+                if let Some(tmp_desc) = tmp_src_desc {
+                    let tmp_stat = b.alloca(IrType::Int(IntWidth::I32));
+                    let zero32 = b.const_i32(0);
+                    b.store(zero32, tmp_stat);
+                    b.call(
+                        FuncRef::External("afs_deallocate_array".into()),
+                        vec![tmp_desc, tmp_stat],
+                        IrType::Void,
+                    );
+                }
                 return;
             }
 
@@ -37810,6 +38213,27 @@ pub(super) fn lower_array_assign(
                 Some(ctx.contained_host_refs),
                 Some(ctx.descriptor_params),
             ) {
+                let mut copy_src_desc = src_desc;
+                let tmp_src_desc = if !dest_name.is_empty() && expr_mentions_name(value, dest_name)
+                {
+                    let tmp_desc = allocate_like_array_temp_descriptor_with_elem_type(
+                        b,
+                        src_desc,
+                        &src_elem_ty,
+                    );
+                    let stat = b.alloca(IrType::Int(IntWidth::I32));
+                    let zero32 = b.const_i32(0);
+                    b.store(zero32, stat);
+                    b.call(
+                        FuncRef::External("afs_copy_array_data".into()),
+                        vec![tmp_desc, src_desc, stat],
+                        IrType::Void,
+                    );
+                    copy_src_desc = tmp_desc;
+                    Some(tmp_desc)
+                } else {
+                    None
+                };
                 let dest_base = array_base_addr(b, dest_info);
                 let n = array_total_elems_value(b, dest_info);
                 let dest_elem_bytes = b.const_i64(ir_scalar_byte_size(&dest_info.ty));
@@ -37842,9 +38266,10 @@ pub(super) fn lower_array_assign(
                     let src_ptr = if is_complex_ty(&src_elem_ty)
                         && complex_float_width(&src_elem_ty) == complex_float_width(&dest_info.ty)
                     {
-                        rank1_array_desc_elem_ptr(b, src_desc, &src_elem_ty, iv)
+                        rank1_array_desc_elem_ptr(b, copy_src_desc, &src_elem_ty, iv)
                     } else {
-                        let src_val = load_rank1_array_desc_elem(b, src_desc, &src_elem_ty, iv);
+                        let src_val =
+                            load_rank1_array_desc_elem(b, copy_src_desc, &src_elem_ty, iv);
                         materialize_complex_operand(b, src_val, complex_float_width(&dest_info.ty))
                     };
                     b.call(
@@ -37853,7 +38278,7 @@ pub(super) fn lower_array_assign(
                         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
                     );
                 } else {
-                    let elem_val = load_rank1_array_desc_elem(b, src_desc, &src_elem_ty, iv);
+                    let elem_val = load_rank1_array_desc_elem(b, copy_src_desc, &src_elem_ty, iv);
                     let coerced = coerce_to_type(b, elem_val, &dest_info.ty);
                     b.store(coerced, dp);
                 }
@@ -37862,6 +38287,16 @@ pub(super) fn lower_array_assign(
                 b.store(ni, i_addr);
                 b.branch(bb_chk, vec![]);
                 b.set_block(bb_ext);
+                if let Some(tmp_desc) = tmp_src_desc {
+                    let tmp_stat = b.alloca(IrType::Int(IntWidth::I32));
+                    let zero32 = b.const_i32(0);
+                    b.store(zero32, tmp_stat);
+                    b.call(
+                        FuncRef::External("afs_deallocate_array".into()),
+                        vec![tmp_desc, tmp_stat],
+                        IrType::Void,
+                    );
+                }
                 return;
             }
         }
@@ -38271,6 +38706,42 @@ pub(super) fn first_arg_is_complex(
             }
         })
         .unwrap_or(false)
+}
+
+fn matmul_result_elem_ty_for_args(
+    first_elem_ty: &IrType,
+    args: &[crate::ast::expr::Argument],
+    locals: &HashMap<String, LocalInfo>,
+) -> IrType {
+    let second_elem_ty = args.get(1).and_then(|a| {
+        if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+            array_arg_elem_ty(e, locals).cloned()
+        } else {
+            None
+        }
+    });
+    let complex_fw = match (
+        is_complex_ty(first_elem_ty),
+        second_elem_ty.as_ref().is_some_and(is_complex_ty),
+    ) {
+        (true, true) => {
+            let lhs = complex_float_width(first_elem_ty);
+            let rhs = complex_float_width(second_elem_ty.as_ref().expect("checked complex"));
+            Some(if lhs == FloatWidth::F64 || rhs == FloatWidth::F64 {
+                FloatWidth::F64
+            } else {
+                FloatWidth::F32
+            })
+        }
+        (true, false) => Some(complex_float_width(first_elem_ty)),
+        (false, true) => Some(complex_float_width(
+            second_elem_ty.as_ref().expect("checked complex"),
+        )),
+        (false, false) => None,
+    };
+    complex_fw
+        .map(|fw| IrType::Array(Box::new(IrType::Float(fw)), 2))
+        .unwrap_or_else(|| first_elem_ty.clone())
 }
 
 /// F2018 §9.5.3.3: array section with one or more vector subscripts mixed
@@ -40066,41 +40537,61 @@ pub(super) fn lower_array_intrinsic(
             // (e.g. TRANSPOSE(L), a section, or another array intrinsic
             // result). Lower it through the descriptor path so any array-
             // returning expression yields a usable descriptor pointer.
-            let second_desc = args.get(1).and_then(|a| {
+            let second_arg_expr = args.get(1).and_then(|a| {
                 if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
-                    lower_array_expr_descriptor(
-                        b,
-                        locals,
-                        e,
-                        st,
-                        type_layouts,
-                        internal_funcs,
-                        contained_host_refs,
-                        descriptor_params,
-                    )
-                    .map(|(d, _)| d)
-                    .or_else(|| {
-                        if let Expr::Name { name } = &e.node {
-                            locals
-                                .get(&name.to_lowercase())
-                                .filter(|i| local_uses_array_descriptor(i) || !i.dims.is_empty())
-                                .map(|i| {
-                                    if local_uses_array_descriptor(i) {
-                                        array_descriptor_addr(b, i)
-                                    } else {
-                                        materialize_array_descriptor_for_info(b, i)
-                                    }
-                                })
-                        } else {
-                            None
-                        }
-                    })
+                    Some(e)
                 } else {
                     None
                 }
             })?;
-            let is_real = first_arg_is_real(args, locals);
-            let is_complex = first_arg_is_complex(args, locals);
+            let (second_desc, second_elem_ty) = lower_array_expr_descriptor(
+                b,
+                locals,
+                second_arg_expr,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            )
+            .or_else(|| {
+                if let Expr::Name { name } = &second_arg_expr.node {
+                    locals
+                        .get(&name.to_lowercase())
+                        .filter(|i| local_uses_array_descriptor(i) || !i.dims.is_empty())
+                        .map(|i| {
+                            let desc = if local_uses_array_descriptor(i) {
+                                array_descriptor_addr(b, i)
+                            } else {
+                                materialize_array_descriptor_for_info(b, i)
+                            };
+                            (desc, i.ty.clone())
+                        })
+                } else {
+                    None
+                }
+            })?;
+            let first_rank = actual_expr_rank(first_expr, locals, st, type_layouts)
+                .unwrap_or(1)
+                .max(1);
+            let second_rank = actual_expr_rank(second_arg_expr, locals, st, type_layouts)
+                .unwrap_or(1)
+                .max(1);
+            let complex_fw = match (is_complex_ty(&elem_ty), is_complex_ty(&second_elem_ty)) {
+                (true, true) => {
+                    let lhs = complex_float_width(&elem_ty);
+                    let rhs = complex_float_width(&second_elem_ty);
+                    Some(if lhs == FloatWidth::F64 || rhs == FloatWidth::F64 {
+                        FloatWidth::F64
+                    } else {
+                        FloatWidth::F32
+                    })
+                }
+                (true, false) => Some(complex_float_width(&elem_ty)),
+                (false, true) => Some(complex_float_width(&second_elem_ty)),
+                (false, false) => None,
+            };
+            let is_real = complex_fw.is_none() && first_arg_is_real(args, locals);
             let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
             let zero = b.const_i32(0);
             let sz384 = b.const_i64(384);
@@ -40109,16 +40600,25 @@ pub(super) fn lower_array_intrinsic(
                 vec![result_desc, zero, sz384],
                 IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
             );
-            let func = if is_complex {
-                "afs_matmul_complex"
+            let (func, lhs_desc, rhs_desc) = if let Some(fw) = complex_fw {
+                let lhs =
+                    promote_array_desc_to_complex_descriptor(b, desc, &elem_ty, first_rank, fw);
+                let rhs = promote_array_desc_to_complex_descriptor(
+                    b,
+                    second_desc,
+                    &second_elem_ty,
+                    second_rank,
+                    fw,
+                );
+                ("afs_matmul_complex", lhs, rhs)
             } else if is_real {
-                "afs_matmul_real8"
+                ("afs_matmul_real8", desc, second_desc)
             } else {
-                "afs_matmul_int"
+                ("afs_matmul_int", desc, second_desc)
             };
             b.call(
                 FuncRef::External(func.into()),
-                vec![desc, second_desc, result_desc],
+                vec![lhs_desc, rhs_desc, result_desc],
                 IrType::Void,
             );
             Some(result_desc)
@@ -43827,6 +44327,24 @@ pub(super) fn lower_contiguous_intent_in_array_actual(
     contained_host_refs: Option<&HashMap<String, Vec<String>>>,
     descriptor_params: Option<&HashMap<String, Vec<bool>>>,
 ) -> Option<ValueId> {
+    if explicit_shape_sequence_section_actual(locals, expr) {
+        let (source_desc, elem_ty) = lower_array_expr_descriptor(
+            b,
+            locals,
+            expr,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        )?;
+        let supported_elem = matches!(elem_ty, IrType::Int(_) | IrType::Float(_) | IrType::Bool)
+            || is_complex_ty(&elem_ty);
+        if supported_elem {
+            return Some(b.load_typed(source_desc, IrType::Ptr(Box::new(elem_ty))));
+        }
+    }
+
     let needs_copy_candidate = match &expr.node {
         Expr::Name { .. } => actual_is_descriptor_array(locals, expr),
         Expr::FunctionCall { callee, args } => {
@@ -43872,6 +44390,41 @@ pub(super) fn lower_contiguous_intent_in_array_actual(
         IrType::Void,
     );
     Some(b.load_typed(tmp_desc, IrType::Ptr(Box::new(elem_ty))))
+}
+
+fn explicit_shape_sequence_section_actual(
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+) -> bool {
+    let Expr::FunctionCall { callee, args } = &expr.node else {
+        return false;
+    };
+    let Expr::Name { name } = &callee.node else {
+        return false;
+    };
+    let Some(info) = locals.get(&name.to_lowercase()) else {
+        return false;
+    };
+    if info.dims.is_empty() && !local_uses_array_descriptor(info) {
+        return false;
+    }
+
+    let mut saw_range = false;
+    let mut saw_element = false;
+    for arg in args {
+        match &arg.value {
+            crate::ast::expr::SectionSubscript::Range { start, end, stride } => {
+                if saw_element || start.is_some() || end.is_some() || stride.is_some() {
+                    return false;
+                }
+                saw_range = true;
+            }
+            crate::ast::expr::SectionSubscript::Element(_) => {
+                saw_element = true;
+            }
+        }
+    }
+    saw_range
 }
 
 pub(super) fn lower_arg_by_ref_full(

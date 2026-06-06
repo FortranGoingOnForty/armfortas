@@ -1,7 +1,7 @@
 ! stdlib/numerics-style small fixed-tap blend kernel.
 ! CHECK: 20 44 68 2072
 ! IR_CHECK: alloca [i32 x 4]
-! IR_CHECK: rt_call @__afs_check_bounds
+! IR_NOT: rt_call @__afs_check_bounds
 ! REPRO_CHECK: asm
 ! REPRO_CHECK: obj
 ! REPRO_CHECK: run

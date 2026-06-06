@@ -250,6 +250,67 @@ fn generic_interface_transitive_use() {
 }
 
 #[test]
+fn submodule_host_association_resolves_transitive_real_parameter() {
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let consts_f90 = dir.join("consts.f90");
+    let middle_f90 = dir.join("middle.f90");
+    let parent_f90 = dir.join("parent.f90");
+    let body_f90 = dir.join("body.f90");
+    let main_f90 = dir.join("main.f90");
+    let consts_o = dir.join("consts.o");
+    let middle_o = dir.join("middle.o");
+    let parent_o = dir.join("parent.o");
+    let body_o = dir.join("body.o");
+    let main_o = dir.join("main.o");
+    let binary = dir.join("test_bin");
+
+    std::fs::write(
+        &consts_f90,
+        "module consts_m\n  implicit none\n  public\n  real, parameter :: one = 1.0\nend module\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &middle_f90,
+        "module middle_m\n  use consts_m\n  implicit none\n  public\nend module\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &parent_f90,
+        "module parent_m\n  use middle_m\n  implicit none\n  private\n  interface\n    module subroutine fill(y)\n      real, intent(out) :: y\n    end subroutine\n  end interface\n  public :: fill\nend module\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &body_f90,
+        "submodule(parent_m) parent_body\ncontains\n  module subroutine fill(y)\n    real, intent(out) :: y\n    y = one\n  end subroutine\nend submodule\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &main_f90,
+        "program p\n  use parent_m, only: fill\n  implicit none\n  real :: y\n  call fill(y)\n  if (abs(y - 1.0) > 0.001) error stop 10\n  print *, 'ok'\nend program\n",
+    )
+    .unwrap();
+
+    compile_file(&compiler, &consts_f90, &consts_o, None);
+    compile_file(&compiler, &middle_f90, &middle_o, Some(&dir));
+    compile_file(&compiler, &parent_f90, &parent_o, Some(&dir));
+    compile_file(&compiler, &body_f90, &body_o, Some(&dir));
+    compile_file(&compiler, &main_f90, &main_o, Some(&dir));
+    link_files(
+        &[&main_o, &body_o, &parent_o, &middle_o, &consts_o],
+        &binary,
+    );
+    let output = run_binary(&binary);
+    assert!(
+        output.contains("ok"),
+        "expected transitive parameter submodule body to print ok, got:\n{}",
+        output
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn generic_interface_beats_private_renamed_import() {
     let compiler = find_compiler();
     let dir = unique_dir();

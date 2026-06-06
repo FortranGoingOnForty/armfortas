@@ -3840,6 +3840,195 @@ fn sibling_parameter_reshape_shape_scope_fixture_passes_all_opts() {
 }
 
 #[test]
+fn block_kind_intrinsic_source_alloc_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("block_kind_intrinsic_source_alloc.f90");
+    assert!(
+        source.exists(),
+        "block_kind_intrinsic_source_alloc.f90 missing"
+    );
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "block_kind_intrinsic_source_alloc.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
+fn explicit_shape_sequence_section_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("explicit_shape_sequence_section.f90");
+    assert!(
+        source.exists(),
+        "explicit_shape_sequence_section.f90 missing"
+    );
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "explicit_shape_sequence_section.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
+fn noncontiguous_section_abs_expr_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("noncontiguous_section_abs_expr.f90");
+    assert!(
+        source.exists(),
+        "noncontiguous_section_abs_expr.f90 missing"
+    );
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "noncontiguous_section_abs_expr.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
+fn mixed_real_complex_matmul_reconstruction_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("mixed_real_complex_matmul_reconstruction.f90");
+    assert!(
+        source.exists(),
+        "mixed_real_complex_matmul_reconstruction.f90 missing"
+    );
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "mixed_real_complex_matmul_reconstruction.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
+fn defined_unary_array_result_assignment_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("defined_unary_array_result_assignment.f90");
+    assert!(
+        source.exists(),
+        "defined_unary_array_result_assignment.f90 missing"
+    );
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "defined_unary_array_result_assignment.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
+fn where_descriptor_dummy_section_assignment_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("where_descriptor_dummy_section_assignment.f90");
+    assert!(
+        source.exists(),
+        "where_descriptor_dummy_section_assignment.f90 missing"
+    );
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "where_descriptor_dummy_section_assignment.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
+fn array_self_reverse_section_assignment_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("array_self_reverse_section_assignment.f90");
+    assert!(
+        source.exists(),
+        "array_self_reverse_section_assignment.f90 missing"
+    );
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "array_self_reverse_section_assignment.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
+fn elemental_conversion_array_constructor_alloc_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("elemental_conversion_array_constructor_alloc.f90");
+    assert!(
+        source.exists(),
+        "elemental_conversion_array_constructor_alloc.f90 missing"
+    );
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "elemental_conversion_array_constructor_alloc.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
+fn parameter_matmul_matrix_vector_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("parameter_matmul_matrix_vector.f90");
+    assert!(
+        source.exists(),
+        "parameter_matmul_matrix_vector.f90 missing"
+    );
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "parameter_matmul_matrix_vector.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
 fn parameter_array_assumed_size_initializer_fixture_passes_all_opts() {
     let compiler = find_compiler();
     let test_dir = find_test_programs();
@@ -3854,6 +4043,27 @@ fn parameter_array_assumed_size_initializer_fixture_passes_all_opts() {
             TestOutcome::Pass => {}
             other => panic!(
                 "parameter_array_assumed_size_initializer.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
+fn stdlib_parameter_array_init_from_module_fixture_passes_all_opts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("stdlib_parameter_array_init_from_module.f90");
+    assert!(
+        source.exists(),
+        "stdlib_parameter_array_init_from_module.f90 missing"
+    );
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "stdlib_parameter_array_init_from_module.f90 should pass at {}, got {:?}",
                 opt_flag, other
             ),
         }
