@@ -2296,6 +2296,12 @@ mod tests {
         );
     }
 
+    /// The five backend_allows_* tests assert ARM64 instruction shapes;
+    /// since x00 they say so instead of assuming the host is ARM64.
+    fn arm64_macos() -> crate::target::TargetSpec {
+        crate::target::TargetSpec::parse("arm64-macos").unwrap()
+    }
+
     #[test]
     fn backend_allows_simple_integer16_memory_codegen_at_o0() {
         let output = std::env::temp_dir().join(format!(
@@ -2313,6 +2319,7 @@ mod tests {
             opt_level: OptLevel::O0,
             extra_inputs: vec![],
             module_search_paths: vec![],
+            target: arm64_macos(),
             ..Options::default()
         };
 
@@ -2343,6 +2350,7 @@ mod tests {
             opt_level: OptLevel::O0,
             extra_inputs: vec![],
             module_search_paths: vec![],
+            target: arm64_macos(),
             ..Options::default()
         };
 
@@ -2373,6 +2381,7 @@ mod tests {
             opt_level: OptLevel::O0,
             extra_inputs: vec![],
             module_search_paths: vec![],
+            target: arm64_macos(),
             ..Options::default()
         };
 
@@ -2408,6 +2417,7 @@ mod tests {
             opt_level: OptLevel::O0,
             extra_inputs: vec![],
             module_search_paths: vec![],
+            target: arm64_macos(),
             ..Options::default()
         };
 
@@ -2443,6 +2453,7 @@ mod tests {
             opt_level: OptLevel::O1,
             extra_inputs: vec![],
             module_search_paths: vec![],
+            target: arm64_macos(),
             ..Options::default()
         };
 
