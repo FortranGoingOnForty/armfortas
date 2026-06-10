@@ -328,6 +328,10 @@ impl<'a> Parser<'a> {
                 self.advance();
                 Some(self.parse_dimension_spec().map(Attribute::Dimension))
             }
+            "rank" => {
+                self.advance();
+                Some(self.parse_rank_spec().map(Attribute::Rank))
+            }
             "intent" => {
                 self.advance();
                 Some(self.parse_intent_spec().map(Attribute::Intent))
@@ -338,6 +342,31 @@ impl<'a> Parser<'a> {
             }
             _ => None,
         }
+    }
+
+    /// `RANK(n)` attribute bound (F2023 8.5.17). The bound must be a
+    /// nonnegative integer literal no larger than the descriptor's
+    /// 15-dimension capacity. The standard allows any constant
+    /// expression; named-constant bounds are not folded yet and error
+    /// loudly (recorded in the f2023 matrix) rather than mis-compile.
+    fn parse_rank_spec(&mut self) -> Result<u8, ParseError> {
+        self.expect(&TokenKind::LParen)?;
+        let expr = self.parse_expr()?;
+        let n = match &expr.node {
+            crate::ast::expr::Expr::IntegerLiteral { text, .. } => {
+                text.parse::<u8>().ok().filter(|n| *n <= 15)
+            }
+            _ => None,
+        };
+        let Some(n) = n else {
+            return Err(self.error(
+                "RANK bound must be an integer literal in 0..=15 \
+                 (general constant expressions are not folded here yet)"
+                    .into(),
+            ));
+        };
+        self.expect(&TokenKind::RParen)?;
+        Ok(n)
     }
 
     fn parse_dimension_spec(&mut self) -> Result<Vec<ArraySpec>, ParseError> {
@@ -494,6 +523,28 @@ impl<'a> Parser<'a> {
 
         // Parse entity list.
         let entities = self.parse_entity_list()?;
+
+        // RANK(n) desugars to a deferred-shape spec with n colons so
+        // every downstream consumer sees an ordinary Dimension (sema
+        // reclassifies deferred to assumed-shape for non-allocatable
+        // dummies, exactly as it does for `dimension(:)`). The Rank
+        // marker stays for conformance validation. C-constraint: RANK
+        // conflicts with DIMENSION and with per-entity array specs.
+        if let Some(n) = attrs.iter().find_map(|a| match a {
+            Attribute::Rank(n) => Some(*n),
+            _ => None,
+        }) {
+            if attrs.iter().any(|a| matches!(a, Attribute::Dimension(_))) {
+                return Err(self.error("RANK and DIMENSION cannot both be specified".into()));
+            }
+            if entities.iter().any(|e| e.array_spec.is_some()) {
+                return Err(self
+                    .error("an entity declared with RANK cannot also have an array-spec".into()));
+            }
+            if n > 0 {
+                attrs.push(Attribute::Dimension(vec![ArraySpec::Deferred; n as usize]));
+            }
+        }
 
         let span = crate::parser::expr::span_from_to(start, self.prev_span());
         Ok(Spanned::new(
