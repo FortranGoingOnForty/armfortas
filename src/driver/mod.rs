@@ -6,6 +6,7 @@
 pub mod defaults;
 pub mod dep_scan;
 pub mod diag;
+pub mod elf_crt;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -163,6 +164,13 @@ pub struct Options {
     // ---- Target ----
     /// What we compile for (`--target <triple>`; defaults to the host).
     pub target: crate::target::TargetSpec,
+    /// Extra crt-object search directories (`-B <dir>` / `AFS_CRT_DIR`),
+    /// searched before the built-in ELF probe list. The configuration
+    /// path on layouts without an FHS crt location (NixOS).
+    pub crt_search_dirs: Vec<PathBuf>,
+    /// `-no-pie`: link a position-dependent executable (crt1.o, no
+    /// -pie). ELF targets only; the default is PIE.
+    pub no_pie: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,6 +225,8 @@ impl Default for Options {
             static_link: false,
             rpath: Vec::new(),
             target: crate::target::TargetSpec::host(),
+            crt_search_dirs: Vec::new(),
+            no_pie: false,
         }
     }
 }
@@ -317,6 +327,15 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
             arg if arg.starts_with("--target=") => {
                 opts.target = crate::target::TargetSpec::parse(&arg["--target=".len()..])?;
             }
+            "-B" => {
+                i += 1;
+                opts.crt_search_dirs
+                    .push(PathBuf::from(args.get(i).ok_or("-B requires a directory")?));
+            }
+            arg if arg.starts_with("-B") => opts
+                .crt_search_dirs
+                .push(PathBuf::from(short_option_value(arg, "-B", "a directory")?)),
+            "-no-pie" => opts.no_pie = true,
 
             // ---- Optimization ----
             "-O" => opts.opt_level = OptLevel::O0,
@@ -771,6 +790,11 @@ COMPILATION:
   --target <triple>           Target to compile for (default: this machine).
                               Supported: arm64-macos, x86_64-freebsd,
                               x86_64-linux-gnu, x86_64-linux-musl
+  -B <dir>                    Extra crt-object search directory (ELF link;
+                              also AFS_CRT_DIR). Required on layouts without
+                              an FHS crt location, e.g. NixOS
+  -no-pie                     Link a position-dependent executable (ELF;
+                              default is PIE)
 
 LANGUAGE:
   -std=<standard>             GNU-compatible alias for --std=<standard>
@@ -1457,10 +1481,10 @@ pub fn compile(opts: &Options) -> Result<(), String> {
             }
             return Ok(());
         }
-        return Err(format!(
-            "cannot link for target '{}': the ELF link step is not implemented yet (sprint x06)",
-            opts.target
-        ));
+        let _ = fs::remove_file(&asm_path);
+        let result = link_inputs(std::slice::from_ref(&obj_path), &opts.output_path(), opts);
+        let _ = fs::remove_file(&obj_path);
+        return result;
     }
 
     let phase = phases.start("assemble");
@@ -1566,15 +1590,75 @@ fn link(obj: &Path, output: &Path, opts: &Options) -> Result<(), String> {
 
 /// Link prebuilt objects and archives with the runtime to produce a
 /// binary or shared library, preserving the user-supplied input order.
-fn link_inputs(inputs: &[PathBuf], output: &Path, opts: &Options) -> Result<(), String> {
-    // x00: both link paths (system ld and afs-ld) are Mach-O only; the ELF
-    // link path lands in sprint x06. Live today for link-artifact inputs
-    // (`armfortas --target x86_64-freebsd foo.o`), which skip codegen.
-    if opts.target.object_format() != crate::target::ObjectFormat::MachO {
+/// Link ELF objects into a dynamically linked PIE by invoking the
+/// system `ld` directly (sprint x06). The driver owns the whole link
+/// line — crt discovery, dynamic linker, library order — and no `cc`
+/// appears anywhere in the pipeline. Flag surface sticks to the
+/// lld/bfd intersection (FreeBSD ld is lld, Linux usually GNU bfd).
+fn link_inputs_elf(inputs: &[PathBuf], output: &Path, opts: &Options) -> Result<(), String> {
+    let host = crate::target::TargetSpec::host();
+    if host.arch != opts.target.arch
+        || host.object_format() != crate::target::ObjectFormat::Elf
+        || host.os != opts.target.os
+    {
         return Err(format!(
-            "cannot link for target '{}': ELF toolchain support is not implemented yet (sprint x06)",
-            opts.target
+            "cannot link for target '{}' on host '{}': cross-linking is out of scope for this arc (native builds only)",
+            opts.target, host
         ));
+    }
+    if env_override("AFS_LD").is_some() || env_override("AFS_LD_PATH").is_some() {
+        return Err(
+            "AFS_LD routing is Mach-O only: afs-ld has no ELF writer (out of this arc; see the sprint index)"
+                .to_string(),
+        );
+    }
+    if opts.static_link {
+        return Err("-static on ELF targets lands in sprint x11 (musl static story)".to_string());
+    }
+    if opts.shared {
+        return Err(
+            "-shared on ELF targets is a follow-up after x06 (executables only this sprint)"
+                .to_string(),
+        );
+    }
+
+    let pie = !opts.no_pie;
+    let mut override_dirs = opts.crt_search_dirs.clone();
+    if let Some(dir) = env_override("AFS_CRT_DIR") {
+        override_dirs.push(PathBuf::from(dir));
+    }
+    let crt = elf_crt::find_crt(&opts.target, &override_dirs, pie)?;
+    let rt_path = find_runtime_lib()?;
+    let args = elf_crt::elf_link_args(
+        &opts.target,
+        &crt,
+        inputs,
+        Path::new(&rt_path),
+        output,
+        pie,
+        &opts.library_search_paths,
+        &opts.link_libs,
+    )?;
+
+    if opts.verbose {
+        eprintln!(" linking: ld {}", args.join(" "));
+    }
+    let result = Command::new("ld")
+        .args(&args)
+        .output()
+        .map_err(|e| format!("cannot run ld: {}", e))?;
+    if !result.status.success() {
+        return Err(format!(
+            "linker failed:\n{}",
+            String::from_utf8_lossy(&result.stderr)
+        ));
+    }
+    Ok(())
+}
+
+fn link_inputs(inputs: &[PathBuf], output: &Path, opts: &Options) -> Result<(), String> {
+    if opts.target.object_format() == crate::target::ObjectFormat::Elf {
+        return link_inputs_elf(inputs, output, opts);
     }
     if let Some(linker) = afs_ld_override() {
         return link_inputs_with_afs_ld(&linker, inputs, output, opts);
