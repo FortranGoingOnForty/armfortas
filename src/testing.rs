@@ -1108,7 +1108,7 @@ impl ObjectInspector {
 
 /// Resolve an ELF inspection tool: env override first, then the first
 /// candidate on PATH that answers `--version`.
-fn find_inspection_tool(env_key: &str, candidates: &[&str]) -> String {
+pub fn find_inspection_tool(env_key: &str, candidates: &[&str]) -> String {
     if let Some(over) = std::env::var_os(env_key) {
         return over.to_string_lossy().into_owned();
     }

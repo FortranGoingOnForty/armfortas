@@ -21,12 +21,20 @@ skips=$(grep -c '^HARNESS_SKIP ' "$log" || true)
 
 case "$profile" in
 macos)
-    if [ "$skips" -ne 0 ]; then
-        echo "check_skips: $skips HARNESS_SKIP line(s) on macOS — none allowed:" >&2
-        grep '^HARNESS_SKIP ' "$log" >&2
-        exit 1
-    fi
-    echo "check_skips: macOS profile clean (0 skips)"
+    # x03+: a small closed set of ELF-host-only suites may skip on
+    # macOS; anything outside the list failing to run is the regression
+    # this gate exists to catch.
+    macos_list="$(dirname "$0")/expected_skips_macos.txt"
+    status=0
+    grep '^HARNESS_SKIP ' "$log" | sed 's/^HARNESS_SKIP suite=\([^ ]*\) .*/\1/' | sort -u |
+    while IFS= read -r seen; do
+        if ! grep -qx "$seen" "$macos_list"; then
+            echo "check_skips: unexpected suite '$seen' skipped on macOS" >&2
+            exit 1
+        fi
+    done || status=1
+    [ "$status" -eq 0 ] && echo "check_skips: macOS profile clean ($skips expected skip lines)"
+    exit "$status"
     ;;
 posix-elf)
     if [ "$skips" -eq 0 ]; then
