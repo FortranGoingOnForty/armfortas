@@ -51,6 +51,13 @@ fn parse_last_int(stdout: &str) -> i32 {
 
 #[test]
 fn ofast_reassociates_float_constant_chain_but_o3_stays_strict() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=ofast_fast_math test=ofast_reassociates_float_constant_chain_but_o3_stays_strict count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let source = fixture("ofast_fast_math_reassoc.f90");
 
     let o3_ir = capture_text(

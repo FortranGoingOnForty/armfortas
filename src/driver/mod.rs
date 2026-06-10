@@ -317,8 +317,7 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
                 opts.target = crate::target::TargetSpec::parse(triple)?;
             }
             arg if arg.starts_with("--target=") => {
-                opts.target =
-                    crate::target::TargetSpec::parse(&arg["--target=".len()..])?;
+                opts.target = crate::target::TargetSpec::parse(&arg["--target=".len()..])?;
             }
 
             // ---- Optimization ----
@@ -2131,7 +2130,10 @@ mod tests {
 
     #[test]
     fn options_from_args_rejects_unknown_target() {
-        let args = vec!["--target=riscv64-linux".to_string(), "hello.f90".to_string()];
+        let args = vec![
+            "--target=riscv64-linux".to_string(),
+            "hello.f90".to_string(),
+        ];
         let err = Options::from_args(&args)
             .err()
             .expect("unknown target must be rejected");

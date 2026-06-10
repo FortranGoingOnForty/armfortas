@@ -62,6 +62,13 @@ fn integer16_internal_io_uses_wide_internal_symbols() {
 
 #[test]
 fn integer16_internal_io_runs_across_all_opt_levels() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_internal_io test=integer16_internal_io_runs_across_all_opt_levels count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     for level in [
         OptLevel::O0,
         OptLevel::O1,
@@ -98,6 +105,13 @@ fn integer16_internal_io_runs_across_all_opt_levels() {
 
 #[test]
 fn integer16_internal_io_object_snapshot_is_deterministic_at_o2() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_internal_io test=integer16_internal_io_object_snapshot_is_deterministic_at_o2 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let source = program("integer16_internal_io.f90");
     let first = capture_text(
         CaptureRequest {
@@ -147,6 +161,13 @@ fn integer16_internal_format_uses_internal_format_sink() {
 
 #[test]
 fn integer16_internal_format_runs_across_all_opt_levels() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_internal_io test=integer16_internal_format_runs_across_all_opt_levels count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     for level in [
         OptLevel::O0,
         OptLevel::O1,
@@ -185,6 +206,13 @@ fn integer16_internal_format_runs_across_all_opt_levels() {
 
 #[test]
 fn integer16_internal_format_object_snapshot_is_deterministic_at_o2() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_internal_io test=integer16_internal_format_object_snapshot_is_deterministic_at_o2 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let source = program("integer16_internal_format.f90");
     let first = capture_text(
         CaptureRequest {
@@ -232,6 +260,13 @@ fn integer16_internal_format_read_uses_internal_format_reader() {
 
 #[test]
 fn integer16_internal_format_read_runs_across_all_opt_levels() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_internal_io test=integer16_internal_format_read_runs_across_all_opt_levels count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     for level in [
         OptLevel::O0,
         OptLevel::O1,
@@ -270,6 +305,13 @@ fn integer16_internal_format_read_runs_across_all_opt_levels() {
 
 #[test]
 fn integer16_internal_format_read_object_snapshot_is_deterministic_at_o2() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_internal_io test=integer16_internal_format_read_object_snapshot_is_deterministic_at_o2 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let source = program("integer16_internal_format_read.f90");
     let first = capture_text(
         CaptureRequest {
@@ -319,6 +361,13 @@ fn integer16_internal_format_read_targets_use_internal_format_readers() {
 
 #[test]
 fn integer16_internal_format_read_targets_run_across_all_opt_levels() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_internal_io test=integer16_internal_format_read_targets_run_across_all_opt_levels count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     for level in [
         OptLevel::O0,
         OptLevel::O1,
@@ -370,6 +419,13 @@ fn integer16_internal_format_read_targets_run_across_all_opt_levels() {
 
 #[test]
 fn integer16_internal_format_read_targets_object_snapshot_is_deterministic_at_o2() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_internal_io test=integer16_internal_format_read_targets_object_snapshot_is_deterministic_at_o2 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let source = program("integer16_internal_format_read_targets.f90");
     let first = capture_text(
         CaptureRequest {
@@ -417,6 +473,13 @@ fn integer16_internal_format_read_arrays_use_internal_format_readers() {
 
 #[test]
 fn integer16_internal_format_read_arrays_run_across_all_opt_levels() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_internal_io test=integer16_internal_format_read_arrays_run_across_all_opt_levels count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     for level in [
         OptLevel::O0,
         OptLevel::O1,
@@ -458,6 +521,13 @@ fn integer16_internal_format_read_arrays_run_across_all_opt_levels() {
 
 #[test]
 fn integer16_internal_format_read_arrays_object_snapshot_is_deterministic_at_o2() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_internal_io test=integer16_internal_format_read_arrays_object_snapshot_is_deterministic_at_o2 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let source = program("integer16_internal_format_read_arrays.f90");
     let first = capture_text(
         CaptureRequest {
@@ -505,6 +575,13 @@ fn integer16_internal_format_read_sections_use_internal_format_readers() {
 
 #[test]
 fn integer16_internal_format_read_sections_run_across_all_opt_levels() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_internal_io test=integer16_internal_format_read_sections_run_across_all_opt_levels count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     for level in [
         OptLevel::O0,
         OptLevel::O1,
@@ -542,6 +619,13 @@ fn integer16_internal_format_read_sections_run_across_all_opt_levels() {
 
 #[test]
 fn integer16_internal_format_read_sections_object_snapshot_is_deterministic_at_o2() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_internal_io test=integer16_internal_format_read_sections_object_snapshot_is_deterministic_at_o2 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let source = program("integer16_internal_format_read_sections.f90");
     let first = capture_text(
         CaptureRequest {
@@ -590,6 +674,13 @@ fn integer16_internal_format_read_alloc_section_uses_descriptor_bounds_and_wide_
 
 #[test]
 fn integer16_internal_format_read_alloc_section_runs_across_all_opt_levels() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_internal_io test=integer16_internal_format_read_alloc_section_runs_across_all_opt_levels count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     for level in [
         OptLevel::O1,
         OptLevel::O2,
@@ -625,6 +716,13 @@ fn integer16_internal_format_read_alloc_section_runs_across_all_opt_levels() {
 
 #[test]
 fn integer16_internal_format_read_alloc_section_object_snapshot_is_deterministic_at_o2() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_internal_io test=integer16_internal_format_read_alloc_section_object_snapshot_is_deterministic_at_o2 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let source = fixture("integer16_internal_format_read_alloc_section.f90");
     let first = capture_text(
         CaptureRequest {
@@ -672,6 +770,13 @@ fn integer16_internal_format_read_alloc_reverse_section_uses_wide_reader() {
 
 #[test]
 fn integer16_internal_format_read_alloc_reverse_section_runs_across_all_opt_levels() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_internal_io test=integer16_internal_format_read_alloc_reverse_section_runs_across_all_opt_levels count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     for level in [
         OptLevel::O1,
         OptLevel::O2,
@@ -702,6 +807,13 @@ fn integer16_internal_format_read_alloc_reverse_section_runs_across_all_opt_leve
 
 #[test]
 fn integer16_internal_format_read_alloc_reverse_section_object_snapshot_is_deterministic_at_o2() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_internal_io test=integer16_internal_format_read_alloc_reverse_section_object_snapshot_is_deterministic_at_o2 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let source = fixture("integer16_internal_format_read_alloc_reverse_section.f90");
     let first = capture_text(
         CaptureRequest {

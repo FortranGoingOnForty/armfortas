@@ -209,3 +209,57 @@ jobs:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test -p afs-as --test perf_sanity
+
+  # ---- Sprint x01: non-macOS hosts. Compiler + lib suite run for real;
+  # e2e suites skip with machine-readable counts until x06 lands the
+  # native ELF toolchain path. afs-as suites stay on the macOS jobs:
+  # ARM64 + Mach-O by construction.
+  build-linux-gnu:
+    name: "Linux glibc: build + tests (e2e skip-gated)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --workspace
+      - run: cargo test -p armfortas --lib
+      - run: cargo test -p armfortas --tests -- --nocapture --test-threads=1 2>&1 | tee /tmp/tests.log
+      - run: ci/check_skips.sh /tmp/tests.log posix-elf
+
+  build-linux-musl:
+    name: "Linux musl: build + tests (e2e skip-gated)"
+    runs-on: ubuntu-latest
+    container: rust:1-alpine
+    steps:
+      # rust:1-alpine has no git; without it actions/checkout falls back
+      # to a REST tarball download that cannot fetch submodules. Install
+      # deps BEFORE checkout (binutils: rustc needs a linker for test
+      # binaries; the image ships none).
+      - run: apk add --no-cache git binutils musl-dev grep
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - run: cargo build --workspace
+      - run: cargo test -p armfortas --lib
+      - run: cargo test -p armfortas --tests -- --nocapture --test-threads=1 2>&1 | tee /tmp/tests.log
+      - run: ci/check_skips.sh /tmp/tests.log posix-elf
+
+  build-freebsd:
+    name: "FreeBSD 15: build + lib tests (VM)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      # VM boots fresh each run: no cargo cache, minutes of overhead.
+      # Keep the surface small; e2e sweeps on FreeBSD wait for x06/x07.
+      - uses: vmactions/freebsd-vm@v1
+        with:
+          release: "15.0"
+          usesh: true
+          prepare: pkg install -y rust
+          run: |
+            cargo build --workspace
+            cargo test -p armfortas --lib

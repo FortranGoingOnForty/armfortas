@@ -49,6 +49,13 @@ fn external_i128_call_uses_pair_arg_and_return_regs_at_o0() {
 
 #[test]
 fn external_i128_call_object_snapshot_tracks_external_symbol_at_o0() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_external_backend test=external_i128_call_object_snapshot_tracks_external_symbol_at_o0 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let obj = capture_text(
         CaptureRequest {
             input: fixture("integer16_external_call.f90"),
@@ -67,6 +74,13 @@ fn external_i128_call_object_snapshot_tracks_external_symbol_at_o0() {
 
 #[test]
 fn external_i128_call_object_snapshot_is_deterministic_at_o0() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_external_backend test=external_i128_call_object_snapshot_is_deterministic_at_o0 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let source = fixture("integer16_external_call.f90");
     let first = capture_text(
         CaptureRequest {

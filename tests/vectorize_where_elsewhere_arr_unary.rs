@@ -29,6 +29,13 @@ fn capture_run_stdout(request: CaptureRequest) -> String {
 
 #[test]
 fn o3_vectorizes_where_elsewhere_with_unary_on_else_load() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=vectorize_where_elsewhere_arr_unary test=o3_vectorizes_where_elsewhere_with_unary_on_else_load count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let source = fixture("do_loop_vectorize_where_elsewhere_arr_unary.f90");
 
     let o3_ir = capture_text(

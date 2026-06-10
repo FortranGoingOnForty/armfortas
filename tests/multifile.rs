@@ -141,6 +141,13 @@ fn multifile_test(mod_source: &str, main_source: &str, expected_substring: &str)
 
 #[test]
 fn basic_module_variable_and_subroutine() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=basic_module_variable_and_subroutine count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     multifile_test(
         "module m\n  implicit none\n  integer :: counter = 0\ncontains\n  subroutine bump()\n    counter = counter + 1\n  end subroutine\n  integer function get() result(r)\n    r = counter\n  end function\nend module\n",
         "program p\n  use m\n  call bump(); call bump(); call bump()\n  print *, get()\nend program\n",
@@ -150,6 +157,13 @@ fn basic_module_variable_and_subroutine() {
 
 #[test]
 fn module_with_allocatable_array() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=module_with_allocatable_array count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     multifile_test(
         "module arr_mod\n  implicit none\n  integer, allocatable :: buf(:)\ncontains\n  subroutine init()\n    allocate(buf(3))\n    buf(1) = 10; buf(2) = 20; buf(3) = 30\n  end subroutine\nend module\n",
         "program p\n  use arr_mod\n  call init()\n  print *, buf(1), buf(2), buf(3)\nend program\n",
@@ -159,6 +173,13 @@ fn module_with_allocatable_array() {
 
 #[test]
 fn module_with_derived_type() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=module_with_derived_type count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     multifile_test(
         "module dt_mod\n  implicit none\n  type :: point\n    real :: x, y\n  end type\ncontains\n  subroutine set_pt(p, a, b)\n    type(point), intent(out) :: p\n    real, intent(in) :: a, b\n    p%x = a; p%y = b\n  end subroutine\nend module\n",
         "program p\n  use dt_mod\n  type(point) :: pt\n  call set_pt(pt, 1.5, 2.5)\n  print *, pt%x, pt%y\nend program\n",
@@ -168,6 +189,13 @@ fn module_with_derived_type() {
 
 #[test]
 fn module_parameter_constants() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=module_parameter_constants count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     multifile_test(
         "module consts\n  implicit none\n  integer, parameter :: MAX_N = 1024\n  integer, parameter :: HALF = MAX_N / 2\nend module\n",
         "program p\n  use consts\n  print *, MAX_N, HALF\nend program\n",
@@ -177,6 +205,13 @@ fn module_parameter_constants() {
 
 #[test]
 fn use_only_filtering() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=use_only_filtering count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     multifile_test(
         "module big_mod\n  implicit none\n  integer :: alpha = 10\n  integer :: beta = 20\n  integer :: gamma = 30\nend module\n",
         "program p\n  use big_mod, only: beta\n  print *, beta\nend program\n",
@@ -186,6 +221,13 @@ fn use_only_filtering() {
 
 #[test]
 fn use_rename() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=use_rename count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     multifile_test(
         "module rename_mod\n  implicit none\n  integer :: original = 99\nend module\n",
         "program p\n  use rename_mod, renamed => original\n  print *, renamed\nend program\n",
@@ -198,6 +240,13 @@ fn use_rename() {
 /// dispatches each specific at the call site.
 #[test]
 fn generic_interface_cross_module() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=generic_interface_cross_module count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     multifile_test(
         "module mgen\n  implicit none\n  interface add\n    module procedure add_int, add_real\n  end interface\ncontains\n  integer function add_int(a, b)\n    integer, intent(in) :: a, b\n    add_int = a + b\n  end function\n  real function add_real(a, b)\n    real, intent(in) :: a, b\n    add_real = a + b\n  end function\nend module\n",
         "program p\n  use mgen\n  print *, add(1, 2)\n  print *, add(1.5, 2.5)\nend program\n",
@@ -212,6 +261,13 @@ fn generic_interface_cross_module() {
 /// dispatch walks the chain.
 #[test]
 fn generic_interface_transitive_use() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=generic_interface_transitive_use count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let compiler = find_compiler();
     let dir = unique_dir();
     let base_f90 = dir.join("base.f90");
@@ -251,6 +307,13 @@ fn generic_interface_transitive_use() {
 
 #[test]
 fn submodule_host_association_resolves_transitive_real_parameter() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=submodule_host_association_resolves_transitive_real_parameter count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let compiler = find_compiler();
     let dir = unique_dir();
     let consts_f90 = dir.join("consts.f90");
@@ -312,6 +375,13 @@ fn submodule_host_association_resolves_transitive_real_parameter() {
 
 #[test]
 fn generic_interface_beats_private_renamed_import() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=generic_interface_beats_private_renamed_import count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let compiler = find_compiler();
     let dir = unique_dir();
     let dep_f90 = dir.join("dep.f90");
@@ -354,6 +424,13 @@ fn generic_interface_beats_private_renamed_import() {
 
 #[test]
 fn imported_type_bound_result_guides_operator_generic() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=imported_type_bound_result_guides_operator_generic count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let compiler = find_compiler();
     let dir = unique_dir();
     let string_f90 = dir.join("string_mod.f90");
@@ -472,6 +549,13 @@ end program
 
 #[test]
 fn module_private_default() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=module_private_default count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2008 §12.2.3.2: submodules of a module see *all* parent entities,
     // including the privates. The .amod must therefore round-trip private
     // module variables — but tagged `private` so module-level USE

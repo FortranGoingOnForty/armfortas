@@ -139,6 +139,13 @@ fn sasum_cleanup_eliminates_chunked_loop_bounds_checks_at_o2() {
 
 #[test]
 fn realworld_29_8_kernels_have_deterministic_o2_objects() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=opt_audit_29_11 test=realworld_29_8_kernels_have_deterministic_o2_objects count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     for name in [
         "realworld_sasum_cleanup.f90",
         "realworld_three_point_apply.f90",

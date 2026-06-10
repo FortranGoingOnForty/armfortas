@@ -54,6 +54,13 @@ fn integer16_read_uses_wide_reader_in_ir_and_asm() {
 
 #[test]
 fn integer16_read_runs_across_all_opt_levels() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_runtime_read test=integer16_read_runs_across_all_opt_levels count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     for level in [
         OptLevel::O0,
         OptLevel::O1,
@@ -98,6 +105,13 @@ fn integer16_read_runs_across_all_opt_levels() {
 
 #[test]
 fn integer16_read_object_snapshot_is_deterministic_at_o2() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_runtime_read test=integer16_read_object_snapshot_is_deterministic_at_o2 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let source = program("integer16_read.f90");
     let first = capture_text(
         CaptureRequest {

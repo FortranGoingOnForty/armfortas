@@ -197,6 +197,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use armfortas::target::{Arch, Os, TargetSpec};
+
 static NEXT_TEMP_ID: AtomicUsize = AtomicUsize::new(0);
 
 /// A single expected check.
@@ -387,13 +389,36 @@ fn find_runtime() -> PathBuf {
     panic!("libarmfortas_rt.a not found — run `cargo build` first");
 }
 
-/// Get the macOS SDK path for linking.
-fn sdk_path() -> String {
+/// Get the macOS SDK path for linking. Only reachable behind the
+/// native_e2e_support gate (x01), so the error path is defensive.
+fn sdk_path() -> Result<String, String> {
     let out = Command::new("xcrun")
         .args(["--sdk", "macosx", "--show-sdk-path"])
         .output()
-        .expect("xcrun failed");
-    String::from_utf8(out.stdout).unwrap().trim().to_string()
+        .map_err(|e| format!("cannot run xcrun: {}", e))?;
+    if !out.status.success() {
+        return Err(format!(
+            "xcrun failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Print the machine-readable skip line and return true when this host
+/// cannot run the native toolchain path (sprint x01). `count` must come
+/// from real discovery, never a literal.
+fn skip_native_e2e(test_name: &str, count: usize) -> bool {
+    match armfortas::testing::native_e2e_support() {
+        Ok(()) => false,
+        Err(reason) => {
+            eprintln!(
+                "\nHARNESS_SKIP suite=run_programs test={} count={} reason=\"{}\"",
+                test_name, count, reason
+            );
+            true
+        }
+    }
 }
 
 /// Compile a single .f90 to .o with -c.
@@ -431,7 +456,7 @@ fn compile_to_object(
 /// Link object files with the runtime into a binary.
 fn link_objects(objects: &[PathBuf], output: &Path) -> Result<(), String> {
     let runtime = find_runtime();
-    let sdk = sdk_path();
+    let sdk = sdk_path()?;
     let mut args: Vec<String> = vec!["-o".into(), output.to_str().unwrap().into()];
     for o in objects {
         args.push(o.to_str().unwrap().into());
@@ -499,18 +524,136 @@ fn extract_stderr_checks(source: &str) -> Vec<Check> {
     extract_prefixed_checks(source, "! STDERR_CHECK:")
 }
 
-/// Extract `! XFAIL:` reason text. Returns the first reason found, or
-/// `None` if the program has no XFAIL annotation. Multiple XFAIL lines
-/// are allowed (only the first is reported); a typical pattern is one
-/// audit ID per line for findings of the same class.
-fn extract_xfail(source: &str) -> Option<String> {
-    for line in source.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("! XFAIL:") {
-            return Some(rest.trim().to_string());
+/// Target selector inside a directive qualifier (sprint x01). Closed
+/// set reusing x00's triple grammar plus arch/OS shorthands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetSelector {
+    Arch(Arch),
+    Os(Os),
+    Triple(TargetSpec),
+    /// `x86_64-linux` — matches both -gnu and -musl.
+    LinuxAnyLibc,
+}
+
+impl TargetSelector {
+    fn matches(&self, t: &TargetSpec) -> bool {
+        match self {
+            TargetSelector::Arch(a) => t.arch == *a,
+            TargetSelector::Os(o) => t.os == *o,
+            TargetSelector::Triple(spec) => spec == t,
+            TargetSelector::LinuxAnyLibc => t.arch == Arch::X86_64 && t.os == Os::Linux,
         }
     }
-    None
+}
+
+/// Parse one selector token. `x86_64-linux` is handled before the
+/// triple grammar because `TargetSpec::parse` would resolve it to the
+/// -gnu triple, but as a selector it must match both libcs.
+fn parse_target_selector(token: &str) -> Option<TargetSelector> {
+    match token {
+        "arm64" | "aarch64" => Some(TargetSelector::Arch(Arch::Arm64)),
+        "x86_64" | "amd64" => Some(TargetSelector::Arch(Arch::X86_64)),
+        "macos" | "darwin" => Some(TargetSelector::Os(Os::MacOs)),
+        "freebsd" => Some(TargetSelector::Os(Os::FreeBsd)),
+        "linux" => Some(TargetSelector::Os(Os::Linux)),
+        "x86_64-linux" | "amd64-linux" => Some(TargetSelector::LinuxAnyLibc),
+        other => TargetSpec::parse(other).ok().map(TargetSelector::Triple),
+    }
+}
+
+/// Match an optionally target-qualified directive line: `! NAME: rest`
+/// (active on every target) or `! NAME(sel[,sel...]): rest` (active iff
+/// any selector matches `active`). Returns `Ok(None)` when the line is
+/// not this directive at all. Unknown/empty selectors are errors on
+/// EVERY target — a typo'd selector silently matching nothing would
+/// convert a tracked bug into a green test (x01 pitfall).
+fn match_qualified_directive<'a>(
+    line: &'a str,
+    name: &str,
+    active: &TargetSpec,
+    filename: &str,
+    line_num: usize,
+) -> Result<Option<(bool, &'a str)>, String> {
+    let trimmed = line.trim();
+    let Some(after_bang) = trimmed.strip_prefix("! ") else {
+        return Ok(None);
+    };
+    let Some(after_name) = after_bang.strip_prefix(name) else {
+        return Ok(None);
+    };
+    if let Some(rest) = after_name.strip_prefix(':') {
+        return Ok(Some((true, rest)));
+    }
+    let Some(after_paren) = after_name.strip_prefix('(') else {
+        return Ok(None); // some other directive sharing the prefix
+    };
+    let Some(close) = after_paren.find(')') else {
+        return Err(format!(
+            "{}:{}: {} target qualifier is missing ')'",
+            filename, line_num, name,
+        ));
+    };
+    let selector_list = &after_paren[..close];
+    let Some(rest) = after_paren[close + 1..].strip_prefix(':') else {
+        return Err(format!(
+            "{}:{}: expected ':' after {} target qualifier",
+            filename, line_num, name,
+        ));
+    };
+    let mut is_active = false;
+    let mut seen_any = false;
+    for token in selector_list.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        seen_any = true;
+        let selector = parse_target_selector(token).ok_or_else(|| {
+            format!(
+                "{}:{}: unknown target selector '{}' in {} qualifier; \
+                 selectors: arm64, x86_64, macos, freebsd, linux, \
+                 x86_64-linux, or a triple ({})",
+                filename,
+                line_num,
+                token,
+                name,
+                armfortas::target::SUPPORTED_TARGETS.join(", "),
+            )
+        })?;
+        if selector.matches(active) {
+            is_active = true;
+        }
+    }
+    if !seen_any {
+        return Err(format!(
+            "{}:{}: empty {} target qualifier",
+            filename, line_num, name,
+        ));
+    }
+    Ok(Some((is_active, rest)))
+}
+
+/// Extract `! XFAIL:` / `! XFAIL(<selectors>):` reason text. The first
+/// *active* XFAIL line wins; a file may carry both bare and qualified
+/// lines. A qualified line whose selectors do not match the active
+/// target behaves as if absent (the program must pass), but its
+/// selector spelling is validated regardless.
+fn extract_xfail(
+    source: &str,
+    filename: &str,
+    active: &TargetSpec,
+) -> Result<Option<String>, String> {
+    let mut first_active: Option<String> = None;
+    for (i, line) in source.lines().enumerate() {
+        if let Some((is_active, rest)) =
+            match_qualified_directive(line, "XFAIL", active, filename, i + 1)?
+        {
+            if is_active && first_active.is_none() {
+                first_active = Some(rest.trim().to_string());
+            }
+        }
+    }
+    Ok(first_active)
 }
 
 /// Extract `! ERROR_EXPECTED:` substring text. Returns the expected
@@ -1115,9 +1258,42 @@ fn extract_ir_checks(source: &str) -> Vec<ShapeCheck> {
     extract_shape_checks(source, "! IR_CHECK:", "! IR_NOT:")
 }
 
-/// Extract `! ASM_CHECK:` and `! ASM_NOT:` annotations from a source.
-fn extract_asm_checks(source: &str) -> Vec<ShapeCheck> {
-    extract_shape_checks(source, "! ASM_CHECK:", "! ASM_NOT:")
+/// Extract `! ASM_CHECK:` / `! ASM_NOT:` annotations, honoring target
+/// qualifiers (`! ASM_CHECK(arm64): ...`). An inactive qualified check
+/// is simply not asserted on this target; selector spelling is
+/// validated on every target.
+fn extract_asm_checks(
+    source: &str,
+    filename: &str,
+    active: &TargetSpec,
+) -> Result<Vec<ShapeCheck>, String> {
+    let mut checks = Vec::new();
+    for (i, line) in source.lines().enumerate() {
+        if let Some((is_active, rest)) =
+            match_qualified_directive(line, "ASM_CHECK", active, filename, i + 1)?
+        {
+            if is_active {
+                checks.push(ShapeCheck {
+                    line_num: i + 1,
+                    pattern: rest.trim().to_string(),
+                    negative: false,
+                });
+            }
+            continue;
+        }
+        if let Some((is_active, rest)) =
+            match_qualified_directive(line, "ASM_NOT", active, filename, i + 1)?
+        {
+            if is_active {
+                checks.push(ShapeCheck {
+                    line_num: i + 1,
+                    pattern: rest.trim().to_string(),
+                    negative: true,
+                });
+            }
+        }
+    }
+    Ok(checks)
 }
 
 /// Apply IR shape assertions against an --emit-ir text dump.
@@ -2028,7 +2204,13 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
         Err(e) => return TestOutcome::Fail(format!("{}: cannot read: {}", filename, e)),
     };
 
-    let xfail_reason = extract_xfail(&source_text);
+    // The harness compiles for the host (no --target yet; x07 widens
+    // this), so the host is the active target for directive qualifiers.
+    let active_target = TargetSpec::host();
+    let xfail_reason = match extract_xfail(&source_text, filename, &active_target) {
+        Ok(reason) => reason,
+        Err(e) => return TestOutcome::Fail(e),
+    };
     let error_expected = extract_error_expected(&source_text);
     let extra_flags = match extract_flags(&source_text, filename) {
         Ok(flags) => flags,
@@ -2045,7 +2227,10 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
         Err(e) => return TestOutcome::Fail(e),
     };
     let ir_checks = extract_ir_checks(&source_text);
-    let asm_checks = extract_asm_checks(&source_text);
+    let asm_checks = match extract_asm_checks(&source_text, filename, &active_target) {
+        Ok(checks) => checks,
+        Err(e) => return TestOutcome::Fail(e),
+    };
     let file_checks =
         match extract_file_checks(&source_text, filename, "! FILE_CHECK:", "! FILE_NOT:") {
             Ok(checks) => checks,
@@ -2557,7 +2742,7 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
 /// Discover the test programs and run each at every supported opt level.
 /// This enforces the correctness invariant: same source must produce
 /// the same output regardless of optimization level.
-fn run_all_at(opt_flag: &str) -> Result<(), String> {
+fn run_all_at(opt_flag: &str, test_name: &str) -> Result<(), String> {
     let compiler = find_compiler();
     let test_dir = find_test_programs();
 
@@ -2569,10 +2754,17 @@ fn run_all_at(opt_flag: &str) -> Result<(), String> {
         .collect();
     sources.sort();
 
+    // Discovery runs (and its non-empty assert fires) BEFORE the skip
+    // gate: a skip with count=0 from a wrong CWD would report "nothing
+    // hidden" while hiding everything (x01 pitfall).
     assert!(
         !sources.is_empty(),
         "no Fortran sources found in test_programs/"
     );
+
+    if skip_native_e2e(test_name, sources.len()) {
+        return Ok(());
+    }
 
     let mut failures = Vec::new();
     let mut passed = 0;
@@ -2622,42 +2814,42 @@ fn run_all_at(opt_flag: &str) -> Result<(), String> {
 
 #[test]
 fn test_programs_end_to_end() {
-    if let Err(msg) = run_all_at("-O0") {
+    if let Err(msg) = run_all_at("-O0", "test_programs_end_to_end") {
         panic!("Test failures at -O0:\n\n{}", msg);
     }
 }
 
 #[test]
 fn test_programs_end_to_end_o1() {
-    if let Err(msg) = run_all_at("-O1") {
+    if let Err(msg) = run_all_at("-O1", "test_programs_end_to_end_o1") {
         panic!("Test failures at -O1:\n\n{}", msg);
     }
 }
 
 #[test]
 fn test_programs_end_to_end_o2() {
-    if let Err(msg) = run_all_at("-O2") {
+    if let Err(msg) = run_all_at("-O2", "test_programs_end_to_end_o2") {
         panic!("Test failures at -O2:\n\n{}", msg);
     }
 }
 
 #[test]
 fn test_programs_end_to_end_o3() {
-    if let Err(msg) = run_all_at("-O3") {
+    if let Err(msg) = run_all_at("-O3", "test_programs_end_to_end_o3") {
         panic!("Test failures at -O3:\n\n{}", msg);
     }
 }
 
 #[test]
 fn test_programs_end_to_end_os() {
-    if let Err(msg) = run_all_at("-Os") {
+    if let Err(msg) = run_all_at("-Os", "test_programs_end_to_end_os") {
         panic!("Test failures at -Os:\n\n{}", msg);
     }
 }
 
 #[test]
 fn test_programs_end_to_end_ofast() {
-    if let Err(msg) = run_all_at("-Ofast") {
+    if let Err(msg) = run_all_at("-Ofast", "test_programs_end_to_end_ofast") {
         panic!("Test failures at -Ofast:\n\n{}", msg);
     }
 }
@@ -2689,6 +2881,10 @@ fn compile_to_asm(compiler: &Path, source: &Path, opt: &str) -> Vec<u8> {
             source.to_str().unwrap(),
             opt,
             "-S",
+            // Pinned since x01: determinism is asserted on the ARM64
+            // backend's text output, which -S can produce on any host.
+            "--target",
+            "arm64-macos",
             "-o",
             asm_path.to_str().unwrap(),
         ])
@@ -2949,6 +3145,9 @@ fn diagnostic_contains_span_matches_line_and_column_fragment() {
 
 #[test]
 fn stderr_and_exit_code_annotations_allow_error_stop() {
+    if skip_native_e2e("stderr_and_exit_code_annotations_allow_error_stop", 1) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("error_stop_status.f90");
@@ -2984,6 +3183,9 @@ fn error_expected_and_span_match_hidden_use_only_error() {
 
 #[test]
 fn file_checks_allow_file_roundtrip() {
+    if skip_native_e2e("file_checks_allow_file_roundtrip", 1) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("file_io.f90");
@@ -3003,6 +3205,9 @@ fn file_checks_allow_file_roundtrip() {
 
 #[test]
 fn file_presence_checks_allow_rewind_side_effects() {
+    if skip_native_e2e("file_presence_checks_allow_rewind_side_effects", 1) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("io_rewind.f90");
@@ -3022,6 +3227,9 @@ fn file_presence_checks_allow_rewind_side_effects() {
 
 #[test]
 fn file_set_exact_allows_rewind_single_output() {
+    if skip_native_e2e("file_set_exact_allows_rewind_single_output", 1) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("io_rewind.f90");
@@ -3041,6 +3249,12 @@ fn file_set_exact_allows_rewind_single_output() {
 
 #[test]
 fn file_rerun_mode_append_fixture_passes_and_keeps_append_coverage() {
+    if skip_native_e2e(
+        "file_rerun_mode_append_fixture_passes_and_keeps_append_coverage",
+        1,
+    ) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("io_append_log.f90");
@@ -3060,6 +3274,12 @@ fn file_rerun_mode_append_fixture_passes_and_keeps_append_coverage() {
 
 #[test]
 fn file_line_count_and_same_sandbox_repro_allow_flush_stress() {
+    if skip_native_e2e(
+        "file_line_count_and_same_sandbox_repro_allow_flush_stress",
+        1,
+    ) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("io_flush_stress.f90");
@@ -3079,6 +3299,9 @@ fn file_line_count_and_same_sandbox_repro_allow_flush_stress() {
 
 #[test]
 fn repro_checks_allow_hello_stage_repro() {
+    if skip_native_e2e("repro_checks_allow_hello_stage_repro", 1) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("hello.f90");
@@ -3098,6 +3321,12 @@ fn repro_checks_allow_hello_stage_repro() {
 
 #[test]
 fn scalar_real_array_integer_bulk_fill_fixture_passes_at_o0() {
+    if skip_native_e2e(
+        "scalar_real_array_integer_bulk_fill_fixture_passes_at_o0",
+        1,
+    ) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("scalar_real_array_integer_bulk_fill.f90");
@@ -3117,6 +3346,12 @@ fn scalar_real_array_integer_bulk_fill_fixture_passes_at_o0() {
 
 #[test]
 fn complex_section_assign_preserves_imag_fixture_passes_at_o0() {
+    if skip_native_e2e(
+        "complex_section_assign_preserves_imag_fixture_passes_at_o0",
+        1,
+    ) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("complex_section_assign_preserves_imag.f90");
@@ -3136,6 +3371,12 @@ fn complex_section_assign_preserves_imag_fixture_passes_at_o0() {
 
 #[test]
 fn procedure_dummy_interface_scope_hidden_lengths_fixture_passes_at_o0() {
+    if skip_native_e2e(
+        "procedure_dummy_interface_scope_hidden_lengths_fixture_passes_at_o0",
+        1,
+    ) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("procedure_dummy_interface_scope_hidden_lengths.f90");
@@ -3155,6 +3396,9 @@ fn procedure_dummy_interface_scope_hidden_lengths_fixture_passes_at_o0() {
 
 #[test]
 fn parenthesized_concat_char_actual_fixture_passes_at_o0() {
+    if skip_native_e2e("parenthesized_concat_char_actual_fixture_passes_at_o0", 1) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("parenthesized_concat_char_actual.f90");
@@ -3174,6 +3418,12 @@ fn parenthesized_concat_char_actual_fixture_passes_at_o0() {
 
 #[test]
 fn defined_assignment_logical_kind_allocatable_fixture_passes_at_o0() {
+    if skip_native_e2e(
+        "defined_assignment_logical_kind_allocatable_fixture_passes_at_o0",
+        1,
+    ) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("defined_assignment_logical_kind_allocatable.f90");
@@ -3193,6 +3443,9 @@ fn defined_assignment_logical_kind_allocatable_fixture_passes_at_o0() {
 
 #[test]
 fn host_assumed_len_closure_forward_fixture_passes_at_o0() {
+    if skip_native_e2e("host_assumed_len_closure_forward_fixture_passes_at_o0", 1) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("host_assumed_len_closure_forward.f90");
@@ -3212,6 +3465,9 @@ fn host_assumed_len_closure_forward_fixture_passes_at_o0() {
 
 #[test]
 fn merge_scalar_sources_array_mask_fixture_passes_at_o0() {
+    if skip_native_e2e("merge_scalar_sources_array_mask_fixture_passes_at_o0", 1) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("merge_scalar_sources_array_mask.f90");
@@ -3231,6 +3487,9 @@ fn merge_scalar_sources_array_mask_fixture_passes_at_o0() {
 
 #[test]
 fn complex_merge_element_zero_fixture_passes_at_o0() {
+    if skip_native_e2e("complex_merge_element_zero_fixture_passes_at_o0", 1) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("complex_merge_element_zero.f90");
@@ -3247,6 +3506,9 @@ fn complex_merge_element_zero_fixture_passes_at_o0() {
 
 #[test]
 fn format_g0_nonfinite_fixture_passes_at_o0() {
+    if skip_native_e2e("format_g0_nonfinite_fixture_passes_at_o0", 1) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("format_g0_nonfinite.f90");
@@ -3263,6 +3525,9 @@ fn format_g0_nonfinite_fixture_passes_at_o0() {
 
 #[test]
 fn formatted_write_g0_iostat_fixture_passes_at_o0() {
+    if skip_native_e2e("formatted_write_g0_iostat_fixture_passes_at_o0", 1) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("formatted_write_g0_iostat.f90");
@@ -3279,6 +3544,12 @@ fn formatted_write_g0_iostat_fixture_passes_at_o0() {
 
 #[test]
 fn generic_private_rename_derived_result_fixture_passes_at_o0() {
+    if skip_native_e2e(
+        "generic_private_rename_derived_result_fixture_passes_at_o0",
+        1,
+    ) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("generic_private_rename_derived_result.f90");
@@ -3298,6 +3569,12 @@ fn generic_private_rename_derived_result_fixture_passes_at_o0() {
 
 #[test]
 fn elemental_generic_array_expr_actual_fixture_passes_at_o0() {
+    if skip_native_e2e(
+        "elemental_generic_array_expr_actual_fixture_passes_at_o0",
+        1,
+    ) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("elemental_generic_array_expr_actual.f90");
@@ -3317,6 +3594,9 @@ fn elemental_generic_array_expr_actual_fixture_passes_at_o0() {
 
 #[test]
 fn submodule_use_generic_sqrt_diag_fixture_passes_at_o0() {
+    if skip_native_e2e("submodule_use_generic_sqrt_diag_fixture_passes_at_o0", 1) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("submodule_use_generic_sqrt_diag.f90");
@@ -3336,6 +3616,9 @@ fn submodule_use_generic_sqrt_diag_fixture_passes_at_o0() {
 
 #[test]
 fn block_use_generic_string_function_fixture_passes_at_o0() {
+    if skip_native_e2e("block_use_generic_string_function_fixture_passes_at_o0", 1) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("block_use_generic_string_function.f90");
@@ -3355,6 +3638,9 @@ fn block_use_generic_string_function_fixture_passes_at_o0() {
 
 #[test]
 fn generic_len_result_character_fixture_passes_at_o0() {
+    if skip_native_e2e("generic_len_result_character_fixture_passes_at_o0", 1) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("generic_len_result_character.f90");
@@ -3371,6 +3657,12 @@ fn generic_len_result_character_fixture_passes_at_o0() {
 
 #[test]
 fn list_directed_real_implicit_exponent_fixture_passes_at_o0() {
+    if skip_native_e2e(
+        "list_directed_real_implicit_exponent_fixture_passes_at_o0",
+        1,
+    ) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("list_directed_real_implicit_exponent.f90");
@@ -3390,6 +3682,9 @@ fn list_directed_real_implicit_exponent_fixture_passes_at_o0() {
 
 #[test]
 fn complex_abs_array_scalar_compare_fixture_passes_at_o0() {
+    if skip_native_e2e("complex_abs_array_scalar_compare_fixture_passes_at_o0", 1) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("complex_abs_array_scalar_compare.f90");
@@ -3409,6 +3704,12 @@ fn complex_abs_array_scalar_compare_fixture_passes_at_o0() {
 
 #[test]
 fn assumed_size_param_constructor_pack_fixture_passes_at_o0() {
+    if skip_native_e2e(
+        "assumed_size_param_constructor_pack_fixture_passes_at_o0",
+        1,
+    ) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("assumed_size_param_constructor_pack.f90");
@@ -3428,6 +3729,12 @@ fn assumed_size_param_constructor_pack_fixture_passes_at_o0() {
 
 #[test]
 fn fixed_char_alloc_array_constructor_len_fixture_passes_at_o0() {
+    if skip_native_e2e(
+        "fixed_char_alloc_array_constructor_len_fixture_passes_at_o0",
+        1,
+    ) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("fixed_char_alloc_array_constructor_len.f90");
@@ -3447,6 +3754,12 @@ fn fixed_char_alloc_array_constructor_len_fixture_passes_at_o0() {
 
 #[test]
 fn defined_operator_char_array_element_actual_fixture_passes_at_o0() {
+    if skip_native_e2e(
+        "defined_operator_char_array_element_actual_fixture_passes_at_o0",
+        1,
+    ) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("defined_operator_char_array_element_actual.f90");
@@ -3466,6 +3779,12 @@ fn defined_operator_char_array_element_actual_fixture_passes_at_o0() {
 
 #[test]
 fn defined_assignment_derived_operator_result_fixture_passes_at_o0() {
+    if skip_native_e2e(
+        "defined_assignment_derived_operator_result_fixture_passes_at_o0",
+        1,
+    ) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("defined_assignment_derived_operator_result.f90");
@@ -3485,6 +3804,9 @@ fn defined_assignment_derived_operator_result_fixture_passes_at_o0() {
 
 #[test]
 fn opt_eq_annotations_allow_hello_cross_opt_invariant() {
+    if skip_native_e2e("opt_eq_annotations_allow_hello_cross_opt_invariant", 1) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("hello.f90");
@@ -3504,6 +3826,9 @@ fn opt_eq_annotations_allow_hello_cross_opt_invariant() {
 
 #[test]
 fn pack_zero_size_mask_expr_fixture_passes_all_opts() {
+    if skip_native_e2e("pack_zero_size_mask_expr_fixture_passes_all_opts", 1) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("pack_zero_size_mask_expr.f90");
@@ -3522,6 +3847,12 @@ fn pack_zero_size_mask_expr_fixture_passes_all_opts() {
 
 #[test]
 fn derived_alloc_array_component_deep_copy_fixture_passes_all_opts() {
+    if skip_native_e2e(
+        "derived_alloc_array_component_deep_copy_fixture_passes_all_opts",
+        1,
+    ) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("derived_alloc_array_component_deep_copy.f90");
@@ -3543,6 +3874,9 @@ fn derived_alloc_array_component_deep_copy_fixture_passes_all_opts() {
 
 #[test]
 fn allocate_array_scalar_source_fixture_passes_all_opts() {
+    if skip_native_e2e("allocate_array_scalar_source_fixture_passes_all_opts", 1) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("allocate_array_scalar_source.f90");
@@ -3561,6 +3895,9 @@ fn allocate_array_scalar_source_fixture_passes_all_opts() {
 
 #[test]
 fn random_seed_size_put_get_fixture_passes_all_opts() {
+    if skip_native_e2e("random_seed_size_put_get_fixture_passes_all_opts", 1) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("random_seed_size_put_get.f90");
@@ -3579,6 +3916,9 @@ fn random_seed_size_put_get_fixture_passes_all_opts() {
 
 #[test]
 fn open_module_char_parameter_file_fixture_passes_all_opts() {
+    if skip_native_e2e("open_module_char_parameter_file_fixture_passes_all_opts", 1) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("open_module_char_parameter_file.f90");
@@ -3600,6 +3940,9 @@ fn open_module_char_parameter_file_fixture_passes_all_opts() {
 
 #[test]
 fn open_fixed_char_filename_trim_fixture_passes_all_opts() {
+    if skip_native_e2e("open_fixed_char_filename_trim_fixture_passes_all_opts", 1) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("open_fixed_char_filename_trim.f90");
@@ -3618,6 +3961,12 @@ fn open_fixed_char_filename_trim_fixture_passes_all_opts() {
 
 #[test]
 fn class_star_character_select_type_message_fixture_passes_all_opts() {
+    if skip_native_e2e(
+        "class_star_character_select_type_message_fixture_passes_all_opts",
+        1,
+    ) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("class_star_character_select_type_message.f90");
@@ -3639,6 +3988,12 @@ fn class_star_character_select_type_message_fixture_passes_all_opts() {
 
 #[test]
 fn class_star_real_kind_select_type_state_message_fixture_passes_all_opts() {
+    if skip_native_e2e(
+        "class_star_real_kind_select_type_state_message_fixture_passes_all_opts",
+        1,
+    ) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("class_star_real_kind_select_type_state_message.f90");
@@ -3660,6 +4015,12 @@ fn class_star_real_kind_select_type_state_message_fixture_passes_all_opts() {
 
 #[test]
 fn class_star_rank1_complex_select_type_state_message_fixture_passes_all_opts() {
+    if skip_native_e2e(
+        "class_star_rank1_complex_select_type_state_message_fixture_passes_all_opts",
+        1,
+    ) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("class_star_rank1_complex_select_type_state_message.f90");
@@ -3681,6 +4042,12 @@ fn class_star_rank1_complex_select_type_state_message_fixture_passes_all_opts() 
 
 #[test]
 fn inquire_positional_unit_capabilities_fixture_passes_all_opts() {
+    if skip_native_e2e(
+        "inquire_positional_unit_capabilities_fixture_passes_all_opts",
+        1,
+    ) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("inquire_positional_unit_capabilities.f90");
@@ -3702,6 +4069,9 @@ fn inquire_positional_unit_capabilities_fixture_passes_all_opts() {
 
 #[test]
 fn pack_strided_row_section_mask_fixture_passes_all_opts() {
+    if skip_native_e2e("pack_strided_row_section_mask_fixture_passes_all_opts", 1) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("pack_strided_row_section_mask.f90");
@@ -3720,6 +4090,9 @@ fn pack_strided_row_section_mask_fixture_passes_all_opts() {
 
 #[test]
 fn negative_stride_section_overlap_fixture_passes_all_opts() {
+    if skip_native_e2e("negative_stride_section_overlap_fixture_passes_all_opts", 1) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("negative_stride_section_overlap.f90");
@@ -3741,6 +4114,12 @@ fn negative_stride_section_overlap_fixture_passes_all_opts() {
 
 #[test]
 fn vector_subscript_array_rhs_scatter_fixture_passes_all_opts() {
+    if skip_native_e2e(
+        "vector_subscript_array_rhs_scatter_fixture_passes_all_opts",
+        1,
+    ) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("vector_subscript_array_rhs_scatter.f90");
@@ -3762,6 +4141,12 @@ fn vector_subscript_array_rhs_scatter_fixture_passes_all_opts() {
 
 #[test]
 fn rank_remap_strided_section_copyin_fixture_passes_all_opts() {
+    if skip_native_e2e(
+        "rank_remap_strided_section_copyin_fixture_passes_all_opts",
+        1,
+    ) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("rank_remap_strided_section_copyin.f90");
@@ -3783,6 +4168,9 @@ fn rank_remap_strided_section_copyin_fixture_passes_all_opts() {
 
 #[test]
 fn maxval_minval_abs_dim_reduction_fixture_passes_all_opts() {
+    if skip_native_e2e("maxval_minval_abs_dim_reduction_fixture_passes_all_opts", 1) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("maxval_minval_abs_dim_reduction.f90");
@@ -3804,6 +4192,12 @@ fn maxval_minval_abs_dim_reduction_fixture_passes_all_opts() {
 
 #[test]
 fn array_constructor_whole_array_exprs_fixture_passes_all_opts() {
+    if skip_native_e2e(
+        "array_constructor_whole_array_exprs_fixture_passes_all_opts",
+        1,
+    ) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("array_constructor_whole_array_exprs.f90");
@@ -3825,6 +4219,12 @@ fn array_constructor_whole_array_exprs_fixture_passes_all_opts() {
 
 #[test]
 fn mixed_numeric_array_binary_exprs_fixture_passes_all_opts() {
+    if skip_native_e2e(
+        "mixed_numeric_array_binary_exprs_fixture_passes_all_opts",
+        1,
+    ) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("mixed_numeric_array_binary_exprs.f90");
@@ -3846,6 +4246,12 @@ fn mixed_numeric_array_binary_exprs_fixture_passes_all_opts() {
 
 #[test]
 fn matmul_transpose_inline_rank2_array_expr_fixture_passes_all_opts() {
+    if skip_native_e2e(
+        "matmul_transpose_inline_rank2_array_expr_fixture_passes_all_opts",
+        1,
+    ) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("matmul_transpose_inline_rank2_array_expr.f90");
@@ -3867,6 +4273,12 @@ fn matmul_transpose_inline_rank2_array_expr_fixture_passes_all_opts() {
 
 #[test]
 fn real_alloc_result_to_complex_fixed_array_fixture_passes_all_opts() {
+    if skip_native_e2e(
+        "real_alloc_result_to_complex_fixed_array_fixture_passes_all_opts",
+        1,
+    ) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("real_alloc_result_to_complex_fixed_array.f90");
@@ -3888,6 +4300,12 @@ fn real_alloc_result_to_complex_fixed_array_fixture_passes_all_opts() {
 
 #[test]
 fn sibling_parameter_reshape_shape_scope_fixture_passes_all_opts() {
+    if skip_native_e2e(
+        "sibling_parameter_reshape_shape_scope_fixture_passes_all_opts",
+        1,
+    ) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("sibling_parameter_reshape_shape_scope.f90");
@@ -3909,6 +4327,12 @@ fn sibling_parameter_reshape_shape_scope_fixture_passes_all_opts() {
 
 #[test]
 fn block_kind_intrinsic_source_alloc_fixture_passes_all_opts() {
+    if skip_native_e2e(
+        "block_kind_intrinsic_source_alloc_fixture_passes_all_opts",
+        1,
+    ) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("block_kind_intrinsic_source_alloc.f90");
@@ -3930,6 +4354,9 @@ fn block_kind_intrinsic_source_alloc_fixture_passes_all_opts() {
 
 #[test]
 fn explicit_shape_sequence_section_fixture_passes_all_opts() {
+    if skip_native_e2e("explicit_shape_sequence_section_fixture_passes_all_opts", 1) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("explicit_shape_sequence_section.f90");
@@ -3951,6 +4378,9 @@ fn explicit_shape_sequence_section_fixture_passes_all_opts() {
 
 #[test]
 fn noncontiguous_section_abs_expr_fixture_passes_all_opts() {
+    if skip_native_e2e("noncontiguous_section_abs_expr_fixture_passes_all_opts", 1) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("noncontiguous_section_abs_expr.f90");
@@ -3972,6 +4402,12 @@ fn noncontiguous_section_abs_expr_fixture_passes_all_opts() {
 
 #[test]
 fn mixed_real_complex_matmul_reconstruction_fixture_passes_all_opts() {
+    if skip_native_e2e(
+        "mixed_real_complex_matmul_reconstruction_fixture_passes_all_opts",
+        1,
+    ) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("mixed_real_complex_matmul_reconstruction.f90");
@@ -3993,6 +4429,12 @@ fn mixed_real_complex_matmul_reconstruction_fixture_passes_all_opts() {
 
 #[test]
 fn defined_unary_array_result_assignment_fixture_passes_all_opts() {
+    if skip_native_e2e(
+        "defined_unary_array_result_assignment_fixture_passes_all_opts",
+        1,
+    ) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("defined_unary_array_result_assignment.f90");
@@ -4014,6 +4456,12 @@ fn defined_unary_array_result_assignment_fixture_passes_all_opts() {
 
 #[test]
 fn where_descriptor_dummy_section_assignment_fixture_passes_all_opts() {
+    if skip_native_e2e(
+        "where_descriptor_dummy_section_assignment_fixture_passes_all_opts",
+        1,
+    ) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("where_descriptor_dummy_section_assignment.f90");
@@ -4035,6 +4483,12 @@ fn where_descriptor_dummy_section_assignment_fixture_passes_all_opts() {
 
 #[test]
 fn array_self_reverse_section_assignment_fixture_passes_all_opts() {
+    if skip_native_e2e(
+        "array_self_reverse_section_assignment_fixture_passes_all_opts",
+        1,
+    ) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("array_self_reverse_section_assignment.f90");
@@ -4056,6 +4510,12 @@ fn array_self_reverse_section_assignment_fixture_passes_all_opts() {
 
 #[test]
 fn elemental_conversion_array_constructor_alloc_fixture_passes_all_opts() {
+    if skip_native_e2e(
+        "elemental_conversion_array_constructor_alloc_fixture_passes_all_opts",
+        1,
+    ) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("elemental_conversion_array_constructor_alloc.f90");
@@ -4077,6 +4537,9 @@ fn elemental_conversion_array_constructor_alloc_fixture_passes_all_opts() {
 
 #[test]
 fn parameter_matmul_matrix_vector_fixture_passes_all_opts() {
+    if skip_native_e2e("parameter_matmul_matrix_vector_fixture_passes_all_opts", 1) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("parameter_matmul_matrix_vector.f90");
@@ -4098,6 +4561,12 @@ fn parameter_matmul_matrix_vector_fixture_passes_all_opts() {
 
 #[test]
 fn parameter_array_assumed_size_initializer_fixture_passes_all_opts() {
+    if skip_native_e2e(
+        "parameter_array_assumed_size_initializer_fixture_passes_all_opts",
+        1,
+    ) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("parameter_array_assumed_size_initializer.f90");
@@ -4119,6 +4588,12 @@ fn parameter_array_assumed_size_initializer_fixture_passes_all_opts() {
 
 #[test]
 fn stdlib_parameter_array_init_from_module_fixture_passes_all_opts() {
+    if skip_native_e2e(
+        "stdlib_parameter_array_init_from_module_fixture_passes_all_opts",
+        1,
+    ) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("stdlib_parameter_array_init_from_module.f90");
@@ -4140,6 +4615,12 @@ fn stdlib_parameter_array_init_from_module_fixture_passes_all_opts() {
 
 #[test]
 fn logical_kind_array_scalar_broadcast_fixture_passes_all_opts() {
+    if skip_native_e2e(
+        "logical_kind_array_scalar_broadcast_fixture_passes_all_opts",
+        1,
+    ) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("logical_kind_array_scalar_broadcast.f90");
@@ -4161,6 +4642,12 @@ fn logical_kind_array_scalar_broadcast_fixture_passes_all_opts() {
 
 #[test]
 fn entity_character_length_declarators_fixture_passes_all_opts() {
+    if skip_native_e2e(
+        "entity_character_length_declarators_fixture_passes_all_opts",
+        1,
+    ) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("entity_character_length_declarators.f90");
@@ -4182,6 +4669,12 @@ fn entity_character_length_declarators_fixture_passes_all_opts() {
 
 #[test]
 fn complex_vector_subscript_section_expr_fixture_passes_all_opts() {
+    if skip_native_e2e(
+        "complex_vector_subscript_section_expr_fixture_passes_all_opts",
+        1,
+    ) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("complex_vector_subscript_section_expr.f90");
@@ -4203,6 +4696,12 @@ fn complex_vector_subscript_section_expr_fixture_passes_all_opts() {
 
 #[test]
 fn complex_module_param_reshape_exprs_fixture_passes_all_opts() {
+    if skip_native_e2e(
+        "complex_module_param_reshape_exprs_fixture_passes_all_opts",
+        1,
+    ) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("complex_module_param_reshape_exprs.f90");
@@ -4224,6 +4723,12 @@ fn complex_module_param_reshape_exprs_fixture_passes_all_opts() {
 
 #[test]
 fn complex_zero_integer_power_lapack_shift_fixture_passes_all_opts() {
+    if skip_native_e2e(
+        "complex_zero_integer_power_lapack_shift_fixture_passes_all_opts",
+        1,
+    ) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("complex_zero_integer_power_lapack_shift.f90");
@@ -4245,6 +4750,12 @@ fn complex_zero_integer_power_lapack_shift_fixture_passes_all_opts() {
 
 #[test]
 fn complex_reshape_integer_constructor_zero_imag_fixture_passes_all_opts() {
+    if skip_native_e2e(
+        "complex_reshape_integer_constructor_zero_imag_fixture_passes_all_opts",
+        1,
+    ) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("complex_reshape_integer_constructor_zero_imag.f90");
@@ -4266,6 +4777,12 @@ fn complex_reshape_integer_constructor_zero_imag_fixture_passes_all_opts() {
 
 #[test]
 fn complex_dp_parameter_zero_compare_fixture_passes_all_opts() {
+    if skip_native_e2e(
+        "complex_dp_parameter_zero_compare_fixture_passes_all_opts",
+        1,
+    ) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("complex_dp_parameter_zero_compare.f90");
@@ -4287,6 +4804,12 @@ fn complex_dp_parameter_zero_compare_fixture_passes_all_opts() {
 
 #[test]
 fn pointer_result_forward_no_stack_copy_fixture_passes_all_opts() {
+    if skip_native_e2e(
+        "pointer_result_forward_no_stack_copy_fixture_passes_all_opts",
+        1,
+    ) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("pointer_result_forward_no_stack_copy.f90");
@@ -4308,6 +4831,12 @@ fn pointer_result_forward_no_stack_copy_fixture_passes_all_opts() {
 
 #[test]
 fn phase_triangulation_allows_function_call_pipeline_surfaces() {
+    if skip_native_e2e(
+        "phase_triangulation_allows_function_call_pipeline_surfaces",
+        1,
+    ) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("function_call.f90");
@@ -4327,6 +4856,12 @@ fn phase_triangulation_allows_function_call_pipeline_surfaces() {
 
 #[test]
 fn phase_triangulation_repro_keeps_function_call_compile_surfaces_stable() {
+    if skip_native_e2e(
+        "phase_triangulation_repro_keeps_function_call_compile_surfaces_stable",
+        1,
+    ) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("function_call.f90");
@@ -4346,6 +4881,12 @@ fn phase_triangulation_repro_keeps_function_call_compile_surfaces_stable() {
 
 #[test]
 fn phase_triangulation_clean_keeps_compile_phases_free_of_runtime_files() {
+    if skip_native_e2e(
+        "phase_triangulation_clean_keeps_compile_phases_free_of_runtime_files",
+        1,
+    ) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("io_flush_stress.f90");
@@ -4401,6 +4942,9 @@ fn extract_multifile_link_parses_order() {
 
 #[test]
 fn multifile_basic_module_runs_at_o0() {
+    if skip_native_e2e("multifile_basic_module_runs_at_o0", 1) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("multifile_basic_module.f90");
@@ -4416,6 +4960,9 @@ fn multifile_basic_module_runs_at_o0() {
 
 #[test]
 fn multifile_three_modules_runs_at_o0() {
+    if skip_native_e2e("multifile_three_modules_runs_at_o0", 1) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("multifile_three_modules.f90");
@@ -4491,6 +5038,9 @@ fn multifile_error_circular_indirect_detected_at_o1() {
 
 #[test]
 fn single_file_module_program_does_not_leave_root_amod() {
+    if skip_native_e2e("single_file_module_program_does_not_leave_root_amod", 1) {
+        return;
+    }
     let compiler = find_compiler();
     let test_dir = find_test_programs();
     let source = test_dir.join("module_global_host_assoc.f90");
@@ -4617,6 +5167,10 @@ fn gfortran_dg_fixtures() {
         "no .f90 fixtures found in tests/fixtures/gfortran-dg/"
     );
 
+    if skip_native_e2e("gfortran_dg_fixtures", sources.len()) {
+        return;
+    }
+
     let mut failures = Vec::new();
     let mut passed = 0;
     let mut xfailed = 0;
@@ -4658,4 +5212,95 @@ fn gfortran_dg_fixtures() {
             failures.join("\n\n")
         );
     }
+}
+
+// ---- Sprint x01: target qualifiers ----
+
+#[test]
+fn qualifier_bare_directive_is_active_everywhere() {
+    let host = TargetSpec::host();
+    let (active, rest) =
+        match_qualified_directive("! XFAIL: some reason", "XFAIL", &host, "t.f90", 1)
+            .unwrap()
+            .expect("directive should match");
+    assert!(active);
+    assert_eq!(rest.trim(), "some reason");
+}
+
+#[test]
+fn qualifier_selector_matching() {
+    let mac = TargetSpec::parse("arm64-macos").unwrap();
+    let fbsd = TargetSpec::parse("x86_64-freebsd").unwrap();
+    let musl = TargetSpec::parse("x86_64-linux-musl").unwrap();
+
+    let active_on = |line: &str, t: &TargetSpec| -> bool {
+        match_qualified_directive(line, "XFAIL", t, "t.f90", 1)
+            .unwrap()
+            .expect("directive should match")
+            .0
+    };
+
+    assert!(active_on("! XFAIL(arm64): r", &mac));
+    assert!(!active_on("! XFAIL(arm64): r", &fbsd));
+    assert!(active_on("! XFAIL(aarch64): r", &mac), "alias spelling");
+    assert!(active_on("! XFAIL(freebsd): r", &fbsd));
+    assert!(
+        active_on("! XFAIL(x86_64-linux): r", &musl),
+        "libc-agnostic"
+    );
+    assert!(!active_on("! XFAIL(x86_64-linux-gnu): r", &musl));
+    assert!(
+        active_on("! XFAIL(macos, x86_64-linux): r", &mac),
+        "multi-selector"
+    );
+    assert!(
+        active_on("! XFAIL(freebsd): reason (with parens)", &fbsd),
+        "parens in reason text are fine — qualifier sits before the colon"
+    );
+}
+
+#[test]
+fn qualifier_unknown_selector_is_loud_even_when_inactive() {
+    let mac = TargetSpec::parse("arm64-macos").unwrap();
+    for bad in [
+        "! XFAIL(x86-64-linux): r", // typo'd arch
+        "! XFAIL(windows): r",
+        "! XFAIL(): r",
+        "! XFAIL(arm64: r", // missing close paren
+    ] {
+        assert!(
+            match_qualified_directive(bad, "XFAIL", &mac, "t.f90", 1).is_err(),
+            "must reject: {}",
+            bad
+        );
+    }
+}
+
+#[test]
+fn qualifier_first_active_xfail_wins() {
+    let mac = TargetSpec::parse("arm64-macos").unwrap();
+    let src = "! XFAIL(x86_64-linux): linux reason\n! XFAIL: everywhere reason\nprogram t\nend\n";
+    assert_eq!(
+        extract_xfail(src, "t.f90", &mac).unwrap().as_deref(),
+        Some("everywhere reason")
+    );
+    let musl = TargetSpec::parse("x86_64-linux-musl").unwrap();
+    assert_eq!(
+        extract_xfail(src, "t.f90", &musl).unwrap().as_deref(),
+        Some("linux reason")
+    );
+}
+
+#[test]
+fn qualifier_inactive_asm_check_not_asserted() {
+    let fbsd = TargetSpec::parse("x86_64-freebsd").unwrap();
+    let src = "! ASM_CHECK(arm64): ldp x29, x30\n! ASM_NOT(arm64): bl _memcpy\nprogram t\nend\n";
+    let checks = extract_asm_checks(src, "t.f90", &fbsd).unwrap();
+    assert!(
+        checks.is_empty(),
+        "arm64-qualified checks inactive on freebsd"
+    );
+    let mac = TargetSpec::parse("arm64-macos").unwrap();
+    let checks = extract_asm_checks(src, "t.f90", &mac).unwrap();
+    assert_eq!(checks.len(), 2);
 }

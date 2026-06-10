@@ -54,6 +54,13 @@ fn integer16_print_uses_wide_writer_in_ir_and_asm() {
 
 #[test]
 fn integer16_print_runs_across_all_opt_levels() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_runtime_io test=integer16_print_runs_across_all_opt_levels count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     for level in [
         OptLevel::O0,
         OptLevel::O1,
@@ -98,6 +105,13 @@ fn integer16_print_runs_across_all_opt_levels() {
 
 #[test]
 fn integer16_print_object_snapshot_is_deterministic_at_o2() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_runtime_io test=integer16_print_object_snapshot_is_deterministic_at_o2 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let source = program("integer16_print.f90");
     let first = capture_text(
         CaptureRequest {
@@ -157,6 +171,13 @@ fn integer16_formatted_write_uses_wide_push_in_ir_and_asm() {
 
 #[test]
 fn integer16_formatted_write_runs_across_all_opt_levels() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_runtime_io test=integer16_formatted_write_runs_across_all_opt_levels count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     for level in [
         OptLevel::O0,
         OptLevel::O1,
@@ -206,6 +227,13 @@ fn integer16_formatted_write_runs_across_all_opt_levels() {
 
 #[test]
 fn integer16_formatted_write_object_snapshot_is_deterministic_at_o2() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_runtime_io test=integer16_formatted_write_object_snapshot_is_deterministic_at_o2 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let source = program("integer16_format.f90");
     let first = capture_text(
         CaptureRequest {

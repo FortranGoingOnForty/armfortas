@@ -191,6 +191,13 @@ fn simple_local_i128_ordered_compares_emit_signed_and_unsigned_limb_checks_at_o0
 
 #[test]
 fn simple_local_i128_ordered_branch_runs_at_o0() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_memory_backend test=simple_local_i128_ordered_branch_runs_at_o0 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let result = capture_from_path(&CaptureRequest {
         input: fixture("integer16_ordered_branch.f90"),
         requested: BTreeSet::from([Stage::Run]),
@@ -217,6 +224,13 @@ fn simple_local_i128_ordered_branch_runs_at_o0() {
 
 #[test]
 fn pointer_to_i128_storage_round_trips_through_c_ptr_at_o0() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_memory_backend test=pointer_to_i128_storage_round_trips_through_c_ptr_at_o0 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let result = capture_from_path(&CaptureRequest {
         input: fixture("integer16_pointer_roundtrip.f90"),
         requested: BTreeSet::from([Stage::Run]),
@@ -275,6 +289,13 @@ fn simple_local_i128_select_lowers_to_ir_select_and_pair_csel_at_o0() {
 
 #[test]
 fn simple_local_i128_select_runs_at_o0() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_memory_backend test=simple_local_i128_select_runs_at_o0 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let result = capture_from_path(&CaptureRequest {
         input: fixture("integer16_select.f90"),
         requested: BTreeSet::from([Stage::Run]),
@@ -301,6 +322,13 @@ fn simple_local_i128_select_runs_at_o0() {
 
 #[test]
 fn simple_local_i128_select_object_snapshot_is_deterministic_at_o0() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_memory_backend test=simple_local_i128_select_object_snapshot_is_deterministic_at_o0 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let source = fixture("integer16_select.f90");
     let first = capture_text(
         CaptureRequest {
@@ -355,6 +383,13 @@ fn simple_internal_i128_call_uses_pair_arg_and_return_regs_at_o0() {
 
 #[test]
 fn simple_internal_i128_call_runs_at_o0() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_memory_backend test=simple_internal_i128_call_runs_at_o0 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let result = capture_from_path(&CaptureRequest {
         input: fixture("integer16_internal_call.f90"),
         requested: BTreeSet::from([Stage::Run]),
@@ -381,6 +416,13 @@ fn simple_internal_i128_call_runs_at_o0() {
 
 #[test]
 fn simple_internal_i128_call_object_snapshot_is_deterministic_at_o0() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_memory_backend test=simple_internal_i128_call_object_snapshot_is_deterministic_at_o0 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let source = fixture("integer16_internal_call.f90");
     let first = capture_text(
         CaptureRequest {
@@ -407,6 +449,13 @@ fn simple_internal_i128_call_object_snapshot_is_deterministic_at_o0() {
 
 #[test]
 fn simple_local_i128_object_snapshot_is_deterministic_at_o0() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_memory_backend test=simple_local_i128_object_snapshot_is_deterministic_at_o0 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let source = fixture("integer16_local_roundtrip.f90");
     let first = capture_text(
         CaptureRequest {

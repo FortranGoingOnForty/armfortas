@@ -77,6 +77,13 @@ fn compile_module(compiler: &Path, dir: &Path, name: &str, source: &str) -> Vec<
 
 #[test]
 fn same_source_produces_identical_amod() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=incremental test=same_source_produces_identical_amod count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let compiler = find_compiler();
     let dir = unique_dir();
     let src = "module m\n  implicit none\n  integer :: x = 42\nend module\n";
@@ -91,6 +98,13 @@ fn same_source_produces_identical_amod() {
 
 #[test]
 fn changed_public_interface_changes_amod() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=incremental test=changed_public_interface_changes_amod count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let compiler = find_compiler();
     let dir = unique_dir();
 
@@ -109,6 +123,13 @@ fn changed_public_interface_changes_amod() {
 
 #[test]
 fn changed_private_impl_does_not_change_amod() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=incremental test=changed_private_impl_does_not_change_amod count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let compiler = find_compiler();
     let dir = unique_dir();
 
@@ -150,6 +171,13 @@ end module
 
 #[test]
 fn consumer_object_stable_when_amod_unchanged() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=incremental test=consumer_object_stable_when_amod_unchanged count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let compiler = find_compiler();
     let dir = unique_dir();
 
@@ -179,6 +207,13 @@ fn consumer_object_stable_when_amod_unchanged() {
 
 #[test]
 fn consumer_object_changes_when_amod_changes() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=incremental test=consumer_object_changes_when_amod_changes count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let compiler = find_compiler();
     let dir = unique_dir();
 

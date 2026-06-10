@@ -112,6 +112,13 @@ fn is_hard_failure(stderr: &str) -> bool {
 
 #[test]
 fn fortsh_module_graph_resolves() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=fortsh_module_graph test=fortsh_module_graph_resolves count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let fortsh_src = match find_fortsh() {
         Some(p) => p,
         None => {

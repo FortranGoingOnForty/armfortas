@@ -66,6 +66,13 @@ fn internal_i128_stack_call_spills_fifth_arg_and_loads_incoming_slot_at_o0() {
 
 #[test]
 fn internal_i128_stack_call_runs_at_o0() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_stack_args test=internal_i128_stack_call_runs_at_o0 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let result = capture_from_path(&CaptureRequest {
         input: fixture("integer16_internal_stack_call.f90"),
         requested: BTreeSet::from([Stage::Run]),
@@ -92,6 +99,13 @@ fn internal_i128_stack_call_runs_at_o0() {
 
 #[test]
 fn internal_i128_stack_call_runs_through_optimized_levels() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_stack_args test=internal_i128_stack_call_runs_through_optimized_levels count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     for level in [
         OptLevel::O1,
         OptLevel::O2,
@@ -132,6 +146,13 @@ fn internal_i128_stack_call_runs_through_optimized_levels() {
 
 #[test]
 fn internal_i128_stack_call_object_snapshot_is_deterministic_at_o0() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_stack_args test=internal_i128_stack_call_object_snapshot_is_deterministic_at_o0 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let source = fixture("integer16_internal_stack_call.f90");
     let first = capture_text(
         CaptureRequest {
@@ -186,6 +207,13 @@ fn external_i128_stack_call_spills_fifth_arg_and_tracks_symbol_at_o0() {
 
 #[test]
 fn external_i128_stack_call_object_snapshot_is_deterministic_at_o0() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_stack_args test=external_i128_stack_call_object_snapshot_is_deterministic_at_o0 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let source = fixture("integer16_external_stack_call.f90");
     let first = capture_text(
         CaptureRequest {

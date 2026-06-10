@@ -29,6 +29,13 @@ fn capture_run_stdout(request: CaptureRequest) -> String {
 
 #[test]
 fn o2_partial_unrolls_runtime_trip_loop_with_remainder() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=loop_partial_unroll_runtime test=o2_partial_unrolls_runtime_trip_loop_with_remainder count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let source = fixture("loop_partial_unroll_runtime.f90");
     let opt_ir = capture_text(
         CaptureRequest {

@@ -29,6 +29,13 @@ fn capture_run_stdout(request: CaptureRequest) -> String {
 
 #[test]
 fn o0_scalar_minmax_binary_fixture_runs_correctly() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=vectorize_minmax_binary test=o0_scalar_minmax_binary_fixture_runs_correctly count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let source = fixture("do_loop_vectorize_minmax_binary.f90");
 
     let stdout = capture_run_stdout(CaptureRequest {
@@ -68,6 +75,13 @@ fn o0_scalar_minmax_binary_fixture_runs_correctly() {
 
 #[test]
 fn o3_vectorizes_elementwise_minmax_binary() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=vectorize_minmax_binary test=o3_vectorizes_elementwise_minmax_binary count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let source = fixture("do_loop_vectorize_minmax_binary.f90");
 
     let o3_ir = capture_text(

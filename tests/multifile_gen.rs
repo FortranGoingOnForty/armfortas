@@ -246,42 +246,91 @@ fn run_generated_test(
 
 #[test]
 fn chain_depth_5() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile_gen test=chain_depth_5 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let (files, main_src, expected) = gen_chain(5);
     run_generated_test(files, main_src, expected, "-O0", "chain5");
 }
 
 #[test]
 fn chain_depth_10() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile_gen test=chain_depth_10 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let (files, main_src, expected) = gen_chain(10);
     run_generated_test(files, main_src, expected, "-O0", "chain10");
 }
 
 #[test]
 fn chain_depth_20() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile_gen test=chain_depth_20 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let (files, main_src, expected) = gen_chain(20);
     run_generated_test(files, main_src, expected, "-O0", "chain20");
 }
 
 #[test]
 fn chain_depth_10_o2() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile_gen test=chain_depth_10_o2 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let (files, main_src, expected) = gen_chain(10);
     run_generated_test(files, main_src, expected, "-O2", "chain10_o2");
 }
 
 #[test]
 fn diamond_width_4() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile_gen test=diamond_width_4 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let (files, main_src, expected) = gen_diamond(4);
     run_generated_test(files, main_src, expected, "-O0", "diamond4");
 }
 
 #[test]
 fn diamond_width_8() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile_gen test=diamond_width_8 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let (files, main_src, expected) = gen_diamond(8);
     run_generated_test(files, main_src, expected, "-O0", "diamond8");
 }
 
 #[test]
 fn diamond_width_4_o2() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile_gen test=diamond_width_4_o2 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let (files, main_src, expected) = gen_diamond(4);
     run_generated_test(files, main_src, expected, "-O2", "diamond4_o2");
 }
@@ -340,30 +389,65 @@ fn run_cross_opt_test(
 
 #[test]
 fn abi_matrix_chain5_mod_o0_main_o2() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile_gen test=abi_matrix_chain5_mod_o0_main_o2 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let (files, main_src, expected) = gen_chain(5);
     run_cross_opt_test(files, main_src, expected, "-O0", "-O2", "abi_chain5_0_2");
 }
 
 #[test]
 fn abi_matrix_chain5_mod_o2_main_o0() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile_gen test=abi_matrix_chain5_mod_o2_main_o0 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let (files, main_src, expected) = gen_chain(5);
     run_cross_opt_test(files, main_src, expected, "-O2", "-O0", "abi_chain5_2_0");
 }
 
 #[test]
 fn abi_matrix_diamond4_mod_o0_main_o2() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile_gen test=abi_matrix_diamond4_mod_o0_main_o2 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let (files, main_src, expected) = gen_diamond(4);
     run_cross_opt_test(files, main_src, expected, "-O0", "-O2", "abi_dia4_0_2");
 }
 
 #[test]
 fn abi_matrix_diamond4_mod_o2_main_o0() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile_gen test=abi_matrix_diamond4_mod_o2_main_o0 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let (files, main_src, expected) = gen_diamond(4);
     run_cross_opt_test(files, main_src, expected, "-O2", "-O0", "abi_dia4_2_0");
 }
 
 #[test]
 fn abi_matrix_chain5_mod_o0_main_ofast() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile_gen test=abi_matrix_chain5_mod_o0_main_ofast count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let (files, main_src, expected) = gen_chain(5);
     run_cross_opt_test(
         files,
@@ -377,6 +461,13 @@ fn abi_matrix_chain5_mod_o0_main_ofast() {
 
 #[test]
 fn abi_matrix_chain5_mod_ofast_main_o0() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile_gen test=abi_matrix_chain5_mod_ofast_main_o0 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let (files, main_src, expected) = gen_chain(5);
     run_cross_opt_test(
         files,

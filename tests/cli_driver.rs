@@ -222,6 +222,13 @@ fn no_input_after_flags_prints_help_and_mentions_missing_input() {
 
 #[test]
 fn ambiguous_use_warning_is_deduped_across_contained_procedures() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=ambiguous_use_warning_is_deduped_across_contained_procedures count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         r#"
 module mod_a
@@ -278,6 +285,13 @@ end program
 
 #[test]
 fn only_filtered_name_stays_accessible_when_imported_from_another_module() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=only_filtered_name_stays_accessible_when_imported_from_another_module count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         r#"
 module mod_a
@@ -316,6 +330,13 @@ end program
 
 #[test]
 fn dash_c_produces_object_file_only() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=dash_c_produces_object_file_only count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program("module foo\n  integer :: x = 1\nend module\n", "f90");
     let out = unique_path("obj", "o");
     let result = Command::new(compiler("armfortas"))
@@ -334,6 +355,13 @@ fn dash_c_produces_object_file_only() {
 
 #[test]
 fn fixed_form_program_compiles_and_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_form_program_compiles_and_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "      PROGRAM P\n      INTEGER I, S\n      S = 0\n      DO 10 I = 1, 3\n         S = S + I\n   10 CONTINUE\n      PRINT *, S\n      END\n",
         "f",
@@ -368,6 +396,13 @@ fn fixed_form_program_compiles_and_runs() {
 
 #[test]
 fn formatted_char_read_with_size_from_redirected_stdin_compiles_and_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=formatted_char_read_with_size_from_redirected_stdin_compiles_and_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  use iso_fortran_env, only: input_unit\n  implicit none\n  character(len=16) :: buf\n  integer :: ios, n\n  read(input_unit, '(a)', iostat=ios, advance='no', size=n) buf\n  write(*,'(a,i0)') 'IOS=', ios\n  write(*,'(a,i0)') 'N=', n\n  write(*,'(a,a,a)') 'BUF=<', trim(buf), '>'\nend program\n",
         "f90",
@@ -416,6 +451,13 @@ fn formatted_char_read_with_size_from_redirected_stdin_compiles_and_runs() {
 
 #[test]
 fn formatted_char_pointer_read_preserves_blank_record_before_following_input() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=formatted_char_pointer_read_preserves_blank_record_before_following_input count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  character(:), pointer :: line\n  integer :: ios\n  allocate(character(len=32) :: line)\n  line = 'seed'\n  read(*,'(a)',iostat=ios) line\n  write(*,'(a,i0,a,a,a)') 'IOS1=', ios, ' LINE1=<', trim(line), '>'\n  read(*,'(a)',iostat=ios) line\n  write(*,'(a,i0,a,a,a)') 'IOS2=', ios, ' LINE2=<', trim(line), '>'\n  read(*,'(a)',iostat=ios) line\n  write(*,'(a,i0)') 'IOS3=', ios\nend program\n",
         "f90",
@@ -469,6 +511,13 @@ fn formatted_char_pointer_read_preserves_blank_record_before_following_input() {
 
 #[test]
 fn stream_unformatted_scalar_char_read_preserves_each_byte() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=stream_unformatted_scalar_char_read_preserves_each_byte count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let input = unique_path("stream_unformatted_char_read", "bin");
     std::fs::write(&input, b"A\0B").expect("cannot write stream char read input");
 
@@ -521,6 +570,13 @@ fn stream_unformatted_scalar_char_read_preserves_each_byte() {
 
 #[test]
 fn stream_unformatted_char_write_preserves_exact_bytes() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=stream_unformatted_char_write_preserves_exact_bytes count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let output_file = unique_path("stream_unformatted_char_write", "bin");
     let src = write_program(
         &format!(
@@ -564,6 +620,13 @@ fn stream_unformatted_char_write_preserves_exact_bytes() {
 
 #[test]
 fn character_star_parameter_concat_with_char_len_writes_stream_header() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=character_star_parameter_concat_with_char_len_writes_stream_header count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let output_file = unique_path("stream_unformatted_npy_header", "bin");
     let src = write_program(
         &format!(
@@ -622,6 +685,13 @@ fn character_star_parameter_concat_with_char_len_writes_stream_header() {
 
 #[test]
 fn stream_unformatted_narrow_integer_io_preserves_raw_widths() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=stream_unformatted_narrow_integer_io_preserves_raw_widths count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let input = unique_path("stream_unformatted_narrow_integer_read", "bin");
     std::fs::write(&input, [0x32u8, 0x00, 0x09, 0xde, 0x34, 0x12, 0xfe, 0xff])
         .expect("cannot seed narrow integer stream input");
@@ -678,6 +748,13 @@ fn stream_unformatted_narrow_integer_io_preserves_raw_widths() {
 
 #[test]
 fn sequential_unformatted_array_sections_round_trip_allocatables_and_components() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=sequential_unformatted_array_sections_round_trip_allocatables_and_components count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: box_t\n    integer(kind=8), allocatable :: blocks(:)\n  end type\n  integer :: unit_num, ios\n  integer(kind=8), allocatable :: a(:), b(:)\n  type(box_t) :: source_box, dest_box\n  allocate(a(2), b(2), source_box%blocks(2), dest_box%blocks(2))\n  a = [123456789_8, -77_8]\n  b = -1_8\n  source_box%blocks = [987654321_8, -33_8]\n  dest_box%blocks = -1_8\n  open(newunit=unit_num, form='unformatted', status='scratch', action='readwrite', iostat=ios)\n  if (ios /= 0) error stop 1\n  write(unit_num, iostat=ios) a(:)\n  if (ios /= 0) error stop 2\n  write(unit_num, iostat=ios) source_box%blocks(:)\n  if (ios /= 0) error stop 3\n  rewind(unit_num)\n  read(unit_num, iostat=ios) b(:)\n  if (ios /= 0) error stop 4\n  read(unit_num, iostat=ios) dest_box%blocks(:)\n  if (ios /= 0) error stop 5\n  close(unit_num)\n  if (any(b /= a)) error stop 6\n  if (any(dest_box%blocks /= source_box%blocks)) error stop 7\n  print *, 'ok'\nend program\n",
         "f90",
@@ -715,6 +792,13 @@ fn sequential_unformatted_array_sections_round_trip_allocatables_and_components(
 
 #[test]
 fn stream_unformatted_char_array_section_read_preserves_byte_count() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=stream_unformatted_char_array_section_read_preserves_byte_count count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let input = unique_path("stream_unformatted_char_array_section_read", "bin");
     std::fs::write(&input, [118u8, 0, b'{', b'd', b'e', b's'])
         .expect("cannot seed stream char section input");
@@ -760,6 +844,13 @@ fn stream_unformatted_char_array_section_read_preserves_byte_count() {
 
 #[test]
 fn stream_unformatted_real_array_read_preserves_raw_f32_bytes() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=stream_unformatted_real_array_read_preserves_raw_f32_bytes count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let input = unique_path("stream_unformatted_real_array_read", "dat");
     let mut bytes = Vec::new();
     for value in [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0] {
@@ -808,6 +899,13 @@ fn stream_unformatted_real_array_read_preserves_raw_f32_bytes() {
 
 #[test]
 fn sequential_unformatted_write_emits_record_markers_and_clears_iostat() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=sequential_unformatted_write_emits_record_markers_and_clears_iostat count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let output_file = unique_path("seq_unformatted_iostat", "bin");
     let src = write_program(
         &format!(
@@ -867,6 +965,13 @@ fn sequential_unformatted_write_emits_record_markers_and_clears_iostat() {
 
 #[test]
 fn sequential_unformatted_roundtrip_recovers_three_integers() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=sequential_unformatted_roundtrip_recovers_three_integers count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let bin = unique_path("seq_unformatted_roundtrip", "bin");
     let src = write_program(
         &format!(
@@ -916,6 +1021,13 @@ fn sequential_unformatted_roundtrip_recovers_three_integers() {
 
 #[test]
 fn runtime_advance_no_via_optval_suppresses_newline_in_formatted_write() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=runtime_advance_no_via_optval_suppresses_newline_in_formatted_write count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // Stdlib bitsets `write_bitset_unit_64` calls `write(unit,'(A)',
     // advance=optval(advance,'YES'),...) string`. Because optval is
     // not a string literal, the prior lowering ignored the advance=
@@ -965,6 +1077,13 @@ fn runtime_advance_no_via_optval_suppresses_newline_in_formatted_write() {
 
 #[test]
 fn advancing_a1_read_consumes_in_flight_noadvance_cursor() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=advancing_a1_read_consumes_in_flight_noadvance_cursor count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // After a `read(...,advance='NO',FMT='(A1)')` consumes part of a
     // record, an immediately-following advancing read on the same
     // record (e.g. `advance=optval(adv,'YES')` where optval returns
@@ -1019,6 +1138,13 @@ fn advancing_a1_read_consumes_in_flight_noadvance_cursor() {
 
 #[test]
 fn same_module_routine_dispatches_generic_to_complex_specific() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=same_module_routine_dispatches_generic_to_complex_specific count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // stdlib_linalg_blas_aux::stdlib_icamax calls the generic
     // stdlib_cabs1 with `zx(1)` of `complex(sp), intent(in) :: zx(*)`.
     // Compile-time dispatch must pick stdlib_scabs1 (the complex(sp)
@@ -1046,6 +1172,13 @@ fn same_module_routine_dispatches_generic_to_complex_specific() {
 
 #[test]
 fn error_stop_with_allocatable_character_message_prints_user_text() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=error_stop_with_allocatable_character_message_prints_user_text count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // Stdlib's linalg_error_handling does
     //   err_msg = ierr%print()
     //   error stop err_msg
@@ -1092,6 +1225,13 @@ fn error_stop_with_allocatable_character_message_prints_user_text() {
 
 #[test]
 fn repeated_nonadvancing_a1_read_preserves_embedded_nul_bytes() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=repeated_nonadvancing_a1_read_preserves_embedded_nul_bytes count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let input = unique_path("nonadvancing_a1_char_read", "bin");
     std::fs::write(&input, b"A\0B").expect("cannot write nonadvancing A1 input");
 
@@ -1142,6 +1282,13 @@ fn repeated_nonadvancing_a1_read_preserves_embedded_nul_bytes() {
 
 #[test]
 fn imported_param_fixed_char_len_preserves_get_command_argument_buffer() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_param_fixed_char_len_preserves_get_command_argument_buffer count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("imported_param_char_len");
     let mod_src = write_program_in(
         &dir,
@@ -1233,6 +1380,13 @@ fn imported_param_fixed_char_len_preserves_get_command_argument_buffer() {
 
 #[test]
 fn module_parameter_alias_from_used_module_initializes_global() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=module_parameter_alias_from_used_module_initializes_global count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("module_param_alias_init");
     let cfg_src = write_program_in(
         &dir,
@@ -1348,6 +1502,13 @@ fn module_parameter_alias_from_used_module_initializes_global() {
 
 #[test]
 fn module_boz_int_parameter_initializes_global_and_exports_value() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=module_boz_int_parameter_initializes_global_and_exports_value count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("module_boz_int_param");
     let m_src = write_program_in(
         &dir,
@@ -1436,6 +1597,13 @@ fn module_boz_int_parameter_initializes_global_and_exports_value() {
 
 #[test]
 fn imported_param_char_dummy_element_assignment_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_param_char_dummy_element_assignment_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("imported_param_char_dummy");
     let cfg_src = write_program_in(
         &dir,
@@ -1551,6 +1719,13 @@ fn imported_param_char_dummy_element_assignment_runs() {
 
 #[test]
 fn imported_param_char_section_assignment_preserves_elements() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_param_char_section_assignment_preserves_elements count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("imported_param_char_section");
     let cfg_src = write_program_in(
         &dir,
@@ -1666,6 +1841,13 @@ fn imported_param_char_section_assignment_preserves_elements() {
 
 #[test]
 fn select_lowering_coerces_mixed_width_branch_values() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=select_lowering_coerces_mixed_width_branch_values count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  integer :: x\n  integer(8) :: y\n  y = 7_8\n  if (y > 0_8) then\n    x = 1\n  else\n    x = y\n  end if\n  print *, x\nend program\n",
         "f90",
@@ -1691,6 +1873,13 @@ fn select_lowering_coerces_mixed_width_branch_values() {
 
 #[test]
 fn max_intrinsic_coerces_mixed_width_integer_args() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=max_intrinsic_coerces_mixed_width_integer_args count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  integer :: x\n  integer(8) :: y\n  y = 7_8\n  x = max(1, y)\n  print *, x\nend program\n",
         "f90",
@@ -1716,6 +1905,13 @@ fn max_intrinsic_coerces_mixed_width_integer_args() {
 
 #[test]
 fn counted_do_coerces_mixed_width_bounds() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=counted_do_coerces_mixed_width_bounds count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  character(len=5) :: s\n  integer :: i, total\n  s = 'abc  '\n  total = 0\n  do i = len_trim(s), 1, -1\n    total = total + i\n  end do\n  print *, total\nend program\n",
         "f90",
@@ -1738,6 +1934,13 @@ fn counted_do_coerces_mixed_width_bounds() {
 
 #[test]
 fn runtime_sized_local_character_uses_runtime_string_support() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=runtime_sized_local_character_uses_runtime_string_support count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "subroutine f(input, trimmed)\n  implicit none\n  character(len=*), intent(in) :: input\n  integer, intent(out) :: trimmed\n  character(len=len(input)) :: working_input\n  working_input = input\n  trimmed = len_trim(working_input)\nend subroutine\n",
         "f90",
@@ -1776,6 +1979,13 @@ fn runtime_sized_local_character_uses_runtime_string_support() {
 
 #[test]
 fn assumed_length_character_dummy_keeps_hidden_length_abi() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=assumed_length_character_dummy_keeps_hidden_length_abi count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "subroutine f(prompt_str, first)\n  implicit none\n  character(len=*), intent(in) :: prompt_str\n  character(len=1), intent(out) :: first\n  first = prompt_str(1:1)\nend subroutine\n",
         "f90",
@@ -1804,6 +2014,13 @@ fn assumed_length_character_dummy_keeps_hidden_length_abi() {
 
 #[test]
 fn fixed_char_out_dummy_writes_back_to_caller() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_char_out_dummy_writes_back_to_caller count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  integer :: pos\n  character(len=1) :: op\n  pos = find_op('6*7', op)\n  if (pos /= 2) error stop 1\n  if (op /= '*') error stop 2\n  print *, pos, op\ncontains\n  function find_op(expr, op) result(pos)\n    character(len=*), intent(in) :: expr\n    character(len=1), intent(out) :: op\n    integer :: pos, i\n    pos = 0\n    op = ' '\n    do i = len_trim(expr), 1, -1\n      if (expr(i:i) == '*') then\n        pos = i\n        op = expr(i:i)\n        return\n      end if\n    end do\n  end function find_op\nend program\n",
         "f90",
@@ -1841,6 +2058,13 @@ fn fixed_char_out_dummy_writes_back_to_caller() {
 
 #[test]
 fn allocatable_component_substring_result_keeps_dynamic_upper_bound() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_component_substring_result_keeps_dynamic_upper_bound count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  use iso_c_binding, only: c_int\n  implicit none\n  interface\n    subroutine c_exit(code) bind(C, name='exit')\n      import :: c_int\n      integer(c_int), value :: code\n    end subroutine\n  end interface\n  type :: var_t\n    character(len=32) :: name = ''\n    character(len=:), allocatable :: value\n    integer :: value_len = 0\n  end type\n  type :: shell_t\n    type(var_t) :: variables(4)\n  end type\ncontains\n  function get_var(shell, name) result(v)\n    type(shell_t), intent(in) :: shell\n    character(len=*), intent(in) :: name\n    character(len=:), allocatable :: v\n    v = ''\n    if (trim(shell%variables(1)%name) == trim(name)) then\n      if (shell%variables(1)%value_len > 0) then\n        v = shell%variables(1)%value(1:shell%variables(1)%value_len)\n      end if\n    end if\n  end function\nend module\n\nprogram p\n  use m\n  implicit none\n  type(shell_t) :: shell\n  character(len=:), allocatable :: v\n  shell%variables(1)%name = 'a'\n  shell%variables(1)%value = '10'\n  shell%variables(1)%value_len = 2\n  v = get_var(shell, 'a')\n  if (trim(v) /= '10') call c_exit(3_c_int)\n  call c_exit(0_c_int)\nend program\n",
         "f90",
@@ -1872,6 +2096,13 @@ fn allocatable_component_substring_result_keeps_dynamic_upper_bound() {
 
 #[test]
 fn bind_c_exit_flushes_pending_nonadvancing_stdout_output() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=bind_c_exit_flushes_pending_nonadvancing_stdout_output count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  use iso_c_binding, only: c_int\n  implicit none\n  interface\n    subroutine c_exit(code) bind(C, name='exit')\n      import :: c_int\n      integer(c_int), value :: code\n    end subroutine\n  end interface\n  write(*, '(A,A)', advance='no') 'hello', char(0)\n  call c_exit(0_c_int)\nend program\n",
         "f90",
@@ -1907,6 +2138,13 @@ fn bind_c_exit_flushes_pending_nonadvancing_stdout_output() {
 
 #[test]
 fn call_flush_intrinsic_subroutine_links_and_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=call_flush_intrinsic_subroutine_links_and_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  use iso_fortran_env, only: output_unit\n  implicit none\n  write(output_unit, '(A)', advance='no') 'ok'\n  call flush(output_unit)\nend program\n",
         "f90",
@@ -1939,6 +2177,13 @@ fn call_flush_intrinsic_subroutine_links_and_runs() {
 
 #[test]
 fn real_mod_intrinsic_compiles_and_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=real_mod_intrinsic_compiles_and_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  use iso_fortran_env, only: real64\n  implicit none\n  real(real64) :: x\n  x = mod(-5.5_real64, 2.0_real64)\n  if (abs(x + 1.5_real64) > 1.0e-12_real64) error stop 1\n  print *, 'ok'\nend program\n",
         "f90",
@@ -1968,6 +2213,13 @@ fn real_mod_intrinsic_compiles_and_runs() {
 
 #[test]
 fn reshape_array_actual_to_assumed_shape_dummy_compiles_and_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=reshape_array_actual_to_assumed_shape_dummy_compiles_and_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\ncontains\n  function wrap(matrix_data) result(total)\n    use iso_fortran_env, only: real64\n    real(real64), intent(in) :: matrix_data(:,:)\n    real(real64) :: total\n    if (size(matrix_data, 1) /= 2 .or. size(matrix_data, 2) /= 2) error stop 11\n    total = matrix_data(2, 1) + matrix_data(1, 2)\n  end function wrap\nend module m\n\nprogram p\n  use m\n  use iso_fortran_env, only: real64\n  implicit none\n  real(real64) :: total\n  total = wrap(reshape([1.0_real64, 3.0_real64, 2.0_real64, 4.0_real64], [2, 2]))\n  if (abs(total - 5.0_real64) > 1.0e-12_real64) error stop 12\n  print *, 'ok'\nend program p\n",
         "f90",
@@ -2005,6 +2257,13 @@ fn reshape_array_actual_to_assumed_shape_dummy_compiles_and_runs() {
 
 #[test]
 fn function_result_kind_alias_flows_to_caller_abi() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=function_result_kind_alias_flows_to_caller_abi count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\ncontains\n  function wrap() result(total)\n    use iso_fortran_env, only: real64\n    real(real64) :: total\n    total = 5.0_real64\n  end function wrap\nend module m\n\nprogram p\n  use m\n  use iso_fortran_env, only: real64\n  implicit none\n  real(real64) :: total\n  total = wrap()\n  if (abs(total - 5.0_real64) > 1.0e-12_real64) error stop 1\n  print *, 'ok'\nend program p\n",
         "f90",
@@ -2042,6 +2301,13 @@ fn function_result_kind_alias_flows_to_caller_abi() {
 
 #[test]
 fn reshape_array_actual_to_assumed_shape_subroutine_dummy_compiles_and_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=reshape_array_actual_to_assumed_shape_subroutine_dummy_compiles_and_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\ncontains\n  subroutine show(matrix_data)\n    use iso_fortran_env, only: real64\n    real(real64), intent(in) :: matrix_data(:,:)\n    if (size(matrix_data, 1) /= 2 .or. size(matrix_data, 2) /= 2) error stop 21\n    if (abs(matrix_data(2, 1) - 3.0_real64) > 1.0e-12_real64) error stop 22\n    if (abs(matrix_data(1, 2) - 2.0_real64) > 1.0e-12_real64) error stop 23\n    print *, 'ok'\n  end subroutine show\nend module m\n\nprogram p\n  use m\n  use iso_fortran_env, only: real64\n  implicit none\n  call show(reshape([1.0_real64, 3.0_real64, 2.0_real64, 4.0_real64], [2, 2]))\nend program p\n",
         "f90",
@@ -2079,6 +2345,13 @@ fn reshape_array_actual_to_assumed_shape_subroutine_dummy_compiles_and_runs() {
 
 #[test]
 fn real_intrinsic_honors_named_kind_argument_for_integer_inputs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=real_intrinsic_honors_named_kind_argument_for_integer_inputs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  use iso_fortran_env, only: real64\n  implicit none\n  real(real64) :: x\n  x = real(nint(3.5_real64), real64)\n  if (abs(x - 4.0_real64) > 1.0e-12_real64) error stop 1\n  x = real(nint(3.4_real64), real64)\n  if (abs(x - 3.0_real64) > 1.0e-12_real64) error stop 2\n  print *, 'ok'\nend program p\n",
         "f90",
@@ -2112,6 +2385,13 @@ fn real_intrinsic_honors_named_kind_argument_for_integer_inputs() {
 
 #[test]
 fn deferred_local_zero_len_buffer_substring_preserves_written_bytes() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=deferred_local_zero_len_buffer_substring_preserves_written_bytes count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\ncontains\n  function build(prompt) result(expanded)\n    character(len=*), intent(in) :: prompt\n    character(len=:), allocatable :: expanded\n    character(len=:), allocatable :: result\n    integer :: i, j\n    allocate(character(len=len(prompt) * 2 + 8) :: result)\n    result = ''\n    i = 1\n    j = 1\n    do while (i <= len(prompt))\n      result(j:j) = prompt(i:i)\n      i = i + 1\n      j = j + 1\n    end do\n    expanded = result(1:j-1)\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  character(len=:), allocatable :: s\n  s = build('+ ')\n  if (len(s) /= 2) error stop 1\n  if (s /= '+ ') error stop 2\n  print *, s\nend program\n",
         "f90",
@@ -2150,6 +2430,13 @@ fn deferred_local_zero_len_buffer_substring_preserves_written_bytes() {
 
 #[test]
 fn deferred_char_component_substring_reads_back_written_chars() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=deferred_char_component_substring_reads_back_written_chars count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: state_t\n    character(len=:), allocatable :: search_string\n    integer :: search_length = 0\n  end type\ncontains\n  subroutine init_state(state)\n    type(state_t), intent(inout) :: state\n    allocate(character(len=64) :: state%search_string)\n    state%search_string = ''\n    state%search_length = 0\n  end subroutine\n\n  subroutine set_search_char(state, pos, ch)\n    type(state_t), intent(inout) :: state\n    integer, intent(in) :: pos\n    character, intent(in) :: ch\n    state%search_string(pos:pos) = ch\n  end subroutine\n\n  subroutine get_search_string(state, str, slen)\n    type(state_t), intent(in) :: state\n    character(len=*), intent(out) :: str\n    integer, intent(in) :: slen\n    integer :: j\n    str = ''\n    if (slen <= 0) return\n    do j = 1, min(slen, len(str))\n      str(j:j) = state%search_string(j:j)\n    end do\n  end subroutine\nend module\n\nprogram p\n  use m\n  implicit none\n  type(state_t) :: state\n  character(len=64) :: buf\n  call init_state(state)\n  state%search_length = 4\n  call set_search_char(state, 1, 'f')\n  call set_search_char(state, 2, 'i')\n  call set_search_char(state, 3, 'n')\n  call set_search_char(state, 4, 'd')\n  call get_search_string(state, buf, state%search_length)\n  if (buf(:state%search_length) /= 'find') error stop 1\n  print *, buf(:state%search_length)\nend program\n",
         "f90",
@@ -2187,6 +2474,13 @@ fn deferred_char_component_substring_reads_back_written_chars() {
 
 #[test]
 fn local_parameter_from_range_sizes_fixed_char_before_substring_assignment() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=local_parameter_from_range_sizes_fixed_char_before_substring_assignment count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\ncontains\n  function f(val) result(s)\n    integer, intent(in) :: val\n    character(len=:), allocatable :: s\n    integer, parameter :: buffer_len = range(val)+2\n    character(len=buffer_len) :: buffer\n    buffer = '       1234'\n    s = buffer(8:)\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  character(len=:), allocatable :: s\n  s = f(-1234)\n  if (len(s) /= 4) error stop 1\n  if (s /= '1234') error stop 2\n  print *, s\nend program\n",
         "f90",
@@ -2224,6 +2518,13 @@ fn local_parameter_from_range_sizes_fixed_char_before_substring_assignment() {
 
 #[test]
 fn allocatable_character_component_descriptor_starts_zeroed() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_character_component_descriptor_starts_zeroed count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  use iso_c_binding, only: c_int\n  implicit none\n  interface\n    subroutine c_exit(code) bind(C, name='exit')\n      import :: c_int\n      integer(c_int), value :: code\n    end subroutine\n  end interface\n  type :: var_t\n    character(len=:), allocatable :: value\n  end type\n  type :: shell_t\n    type(var_t) :: vars(4)\n  end type\nend module\n\nprogram p\n  use m\n  implicit none\n  type(shell_t) :: shell\n  shell%vars(1)%value = '10'\n  if (.not. allocated(shell%vars(1)%value)) call c_exit(1_c_int)\n  deallocate(shell%vars(1)%value)\n  call c_exit(0_c_int)\nend program\n",
         "f90",
@@ -2255,6 +2556,13 @@ fn allocatable_character_component_descriptor_starts_zeroed() {
 
 #[test]
 fn allocatable_character_component_update_through_inout_dummy_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_character_component_update_through_inout_dummy_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  use iso_c_binding, only: c_int\n  implicit none\n  interface\n    subroutine c_exit(code) bind(C, name='exit')\n      import :: c_int\n      integer(c_int), value :: code\n    end subroutine\n  end interface\n  type :: var_t\n    character(len=:), allocatable :: value\n    integer :: value_len = 0\n  end type\n  type :: shell_t\n    type(var_t) :: vars(4)\n  end type\ncontains\n  subroutine safe_assign_alloc_str(dest, src, src_len)\n    character(len=:), allocatable, intent(inout) :: dest\n    character(len=*), intent(in) :: src\n    integer, intent(in) :: src_len\n    integer :: k\n    if (allocated(dest)) deallocate(dest)\n    if (src_len <= 0) then\n      allocate(character(len=0) :: dest)\n      return\n    end if\n    allocate(character(len=src_len) :: dest)\n    do k = 1, src_len\n      dest(k:k) = src(k:k)\n    end do\n  end subroutine\nend module\n\nprogram p\n  use m\n  implicit none\n  type(shell_t) :: shell\n  shell%vars(1)%value = '10'\n  shell%vars(1)%value_len = 2\n  call safe_assign_alloc_str(shell%vars(1)%value, '20', 2)\n  if (trim(shell%vars(1)%value) /= '20') call c_exit(1_c_int)\n  call c_exit(0_c_int)\nend program\n",
         "f90",
@@ -2286,6 +2594,13 @@ fn allocatable_character_component_update_through_inout_dummy_runs() {
 
 #[test]
 fn bind_c_name_call_uses_declared_c_symbol() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=bind_c_name_call_uses_declared_c_symbol count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  use iso_c_binding, only: c_int\n  implicit none\n  interface\n    function getpid_c() bind(c, name='getpid') result(pid)\n      import :: c_int\n      integer(c_int) :: pid\n    end function getpid_c\n  end interface\n  integer(c_int) :: pid\n  pid = getpid_c()\nend program\n",
         "f90",
@@ -2319,6 +2634,13 @@ fn bind_c_name_call_uses_declared_c_symbol() {
 
 #[test]
 fn bind_c_subroutine_value_arg_is_passed_by_value() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=bind_c_subroutine_value_arg_is_passed_by_value count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("bind_c_subroutine_value");
     let c_src = write_program_in(
         &dir,
@@ -2389,6 +2711,13 @@ fn bind_c_subroutine_value_arg_is_passed_by_value() {
 
 #[test]
 fn bind_c_value_arg_uses_alias_abi_when_label_collides() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=bind_c_value_arg_uses_alias_abi_when_label_collides count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("bind_c_value_label_collision");
     let c_src = write_program_in(
         &dir,
@@ -2454,6 +2783,13 @@ fn bind_c_value_arg_uses_alias_abi_when_label_collides() {
 
 #[test]
 fn bind_c_interface_subroutine_value_survives_amod_import_and_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=bind_c_interface_subroutine_value_survives_amod_import_and_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("bind_c_interface_value_amod");
     let c_src = write_program_in(
         &dir,
@@ -2559,6 +2895,13 @@ fn bind_c_interface_subroutine_value_survives_amod_import_and_runs() {
 
 #[test]
 fn bind_c_c_char_buffer_writes_scalar_character_storage() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=bind_c_c_char_buffer_writes_scalar_character_storage count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("bind_c_c_char_buffer");
     let c_src = write_program_in(
         &dir,
@@ -2629,6 +2972,13 @@ fn bind_c_c_char_buffer_writes_scalar_character_storage() {
 
 #[test]
 fn bind_c_c_char_buffer_survives_amod_import_without_hidden_lengths() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=bind_c_c_char_buffer_survives_amod_import_without_hidden_lengths count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("bind_c_c_char_buffer_amod");
     let c_src = write_program_in(
         &dir,
@@ -2739,6 +3089,13 @@ fn bind_c_c_char_buffer_survives_amod_import_without_hidden_lengths() {
 
 #[test]
 fn bind_c_c_char_value_arg_passes_actual_byte_after_value_handle() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=bind_c_c_char_value_arg_passes_actual_byte_after_value_handle count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("bind_c_c_char_value_arg");
     let c_src = write_program_in(
         &dir,
@@ -2809,6 +3166,13 @@ fn bind_c_c_char_value_arg_passes_actual_byte_after_value_handle() {
 
 #[test]
 fn bind_c_c_ptr_value_and_i64_values_preserve_scalar_call_abi() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=bind_c_c_ptr_value_and_i64_values_preserve_scalar_call_abi count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("bind_c_c_ptr_i64_value_args");
     let c_src = write_program_in(
         &dir,
@@ -2881,6 +3245,13 @@ fn bind_c_c_ptr_value_and_i64_values_preserve_scalar_call_abi() {
 
 #[test]
 fn bind_c_c_ptr_value_and_i64_values_survive_wrapper_dummy_call() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=bind_c_c_ptr_value_and_i64_values_survive_wrapper_dummy_call count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("bind_c_c_ptr_i64_wrapper");
     let c_src = write_program_in(
         &dir,
@@ -2953,6 +3324,13 @@ fn bind_c_c_ptr_value_and_i64_values_survive_wrapper_dummy_call() {
 
 #[test]
 fn bind_c_c_char_function_result_round_trips_through_wrapper_module() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=bind_c_c_char_function_result_round_trips_through_wrapper_module count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("bind_c_c_char_result");
     let c_src = write_program_in(
         &dir,
@@ -3053,6 +3431,13 @@ fn bind_c_c_char_function_result_round_trips_through_wrapper_module() {
 
 #[test]
 fn allocatable_c_char_array_function_result_passes_bind_c_assumed_size_dummy() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_c_char_array_function_result_passes_bind_c_assumed_size_dummy count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("alloc_c_char_result_bind_c");
     let c_src = write_program_in(
         &dir,
@@ -3123,6 +3508,13 @@ fn allocatable_c_char_array_function_result_passes_bind_c_assumed_size_dummy() {
 
 #[test]
 fn allocatable_c_char_array_result_assigns_into_intent_out_dummy() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_c_char_array_result_assigns_into_intent_out_dummy count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("alloc_c_char_result_intent_out");
     let src = write_program_in(
         &dir,
@@ -3163,6 +3555,13 @@ fn allocatable_c_char_array_result_assigns_into_intent_out_dummy() {
 
 #[test]
 fn optional_deferred_char_intent_out_deallocates_actual_on_entry() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=optional_deferred_char_intent_out_deallocates_actual_on_entry count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("optional_deferred_char_intent_out");
     let src = write_program_in(
         &dir,
@@ -3204,6 +3603,13 @@ fn optional_deferred_char_intent_out_deallocates_actual_on_entry() {
 
 #[test]
 fn deferred_char_array_component_len_survives_function_result_and_dummy_pass() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=deferred_char_array_component_len_survives_function_result_and_dummy_pass count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("deferred_char_array_component_len");
     let src = write_program_in(
         &dir,
@@ -3244,6 +3650,13 @@ fn deferred_char_array_component_len_survives_function_result_and_dummy_pass() {
 
 #[test]
 fn absent_optional_char_array_forwarding_uses_zero_hidden_length() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=absent_optional_char_array_forwarding_uses_zero_hidden_length count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("optional_char_array_hidden_len");
     let src = write_program_in(
         &dir,
@@ -3284,6 +3697,13 @@ fn absent_optional_char_array_forwarding_uses_zero_hidden_length() {
 
 #[test]
 fn unallocated_allocatable_char_actual_is_absent_for_optional_dummy() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=unallocated_allocatable_char_actual_is_absent_for_optional_dummy count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: holder_t\n    character(:), allocatable :: missing\n    character(:), allocatable :: value\n  end type\ncontains\n  subroutine require_absent_and_value(missing, value)\n    character(len=*), intent(in), optional :: missing\n    character(len=*), intent(in), optional :: value\n    if (present(missing)) error stop 1\n    if (.not. present(value)) error stop 2\n    if (len(value) /= 0) error stop 3\n  end subroutine\n\n  integer function component_code(missing, value) result(code)\n    character(len=*), intent(in), optional :: missing\n    character(len=*), intent(in), optional :: value\n    code = 0\n    if (present(missing)) code = code + 10 + len(missing)\n    if (present(value)) code = code + 100 + len(value)\n  end function\n\n  subroutine run()\n    character(:), allocatable :: missing\n    character(:), allocatable :: value\n    type(holder_t) :: holder\n    value = ''\n    call require_absent_and_value(missing, value)\n    holder%value = ''\n    if (component_code(holder%missing, holder%value) /= 100) error stop 4\n  end subroutine\nend module\n\nprogram p\n  use m\n  implicit none\n  call run()\n  print *, 'ok'\nend program\n",
         "optional_unallocated_allocatable_char.f90",
@@ -3321,6 +3741,13 @@ fn unallocated_allocatable_char_actual_is_absent_for_optional_dummy() {
 
 #[test]
 fn cross_tu_absent_optional_char_array_forwarding_survives_function_result_wrapper() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=cross_tu_absent_optional_char_array_forwarding_survives_function_result_wrapper count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("cross_tu_optional_char_array_forward");
     let types_src = write_program_in(
         &dir,
@@ -3465,6 +3892,13 @@ fn cross_tu_absent_optional_char_array_forwarding_survives_function_result_wrapp
 
 #[test]
 fn stream_unformatted_read_into_allocatable_char_scalar_preserves_bytes() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=stream_unformatted_read_into_allocatable_char_scalar_preserves_bytes count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("stream_read_alloc_char_scalar");
     let input_path = dir.join("external_hello.txt");
     std::fs::write(&input_path, b"hello").expect("failed to seed stream input");
@@ -3511,6 +3945,13 @@ fn stream_unformatted_read_into_allocatable_char_scalar_preserves_bytes() {
 
 #[test]
 fn logical_intrinsic_kind_argument_compiles_and_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=logical_intrinsic_kind_argument_compiles_and_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("logical_kind_intrinsic");
     let src = write_program_in(
         &dir,
@@ -3551,6 +3992,13 @@ fn logical_intrinsic_kind_argument_compiles_and_runs() {
 
 #[test]
 fn ieee_value_quiet_nan_from_intrinsic_module_compiles_and_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=ieee_value_quiet_nan_from_intrinsic_module_compiles_and_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("ieee_value_quiet_nan");
     let src = write_program_in(
         &dir,
@@ -3590,6 +4038,13 @@ fn ieee_value_quiet_nan_from_intrinsic_module_compiles_and_runs() {
 
 #[test]
 fn ieee_value_positive_inf_from_intrinsic_module_is_not_finite() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=ieee_value_positive_inf_from_intrinsic_module_is_not_finite count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("ieee_value_positive_inf");
     let src = write_program_in(
         &dir,
@@ -3629,6 +4084,13 @@ fn ieee_value_positive_inf_from_intrinsic_module_is_not_finite() {
 
 #[test]
 fn contained_char_function_in_comparison_uses_internal_call_target() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=contained_char_function_in_comparison_uses_internal_call_target count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("contained_char_fn_compare");
     let src = write_program_in(
         &dir,
@@ -3671,6 +4133,13 @@ fn contained_char_function_in_comparison_uses_internal_call_target() {
 
 #[test]
 fn close_status_delete_removes_file() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=close_status_delete_removes_file count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let path = unique_path("close_status_delete", "txt");
     let src = write_program(
         &format!(
@@ -3712,6 +4181,13 @@ fn close_status_delete_removes_file() {
 
 #[test]
 fn bind_c_interface_function_returning_c_ptr_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=bind_c_interface_function_returning_c_ptr_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("bind_c_c_ptr_return");
     let c_src = write_program_in(
         &dir,
@@ -3782,6 +4258,13 @@ fn bind_c_interface_function_returning_c_ptr_runs() {
 
 #[test]
 fn module_procedure_case_and_bind_label_survive_amod_import() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=module_procedure_case_and_bind_label_survive_amod_import count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("amod_case_bind");
     let mod_src = write_program_in(
         &dir,
@@ -3867,6 +4350,13 @@ fn module_procedure_case_and_bind_label_survive_amod_import() {
 
 #[test]
 fn repeat_intrinsic_lowers_to_runtime_symbol() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=repeat_intrinsic_lowers_to_runtime_symbol count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  character(len=:), allocatable :: s\n  s = repeat('ab', 3)\n  print *, len_trim(s)\nend program\n",
         "f90",
@@ -3900,6 +4390,13 @@ fn repeat_intrinsic_lowers_to_runtime_symbol() {
 
 #[test]
 fn pointer_dummy_associated_lowers_without_raw_symbol() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=pointer_dummy_associated_lowers_without_raw_symbol count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: node_t\n    integer :: value = 0\n  end type node_t\ncontains\n  logical function present(node) result(ok)\n    type(node_t), pointer, intent(in) :: node\n    ok = associated(node)\n  end function present\nend module m\n",
         "f90",
@@ -3929,6 +4426,13 @@ fn pointer_dummy_associated_lowers_without_raw_symbol() {
 
 #[test]
 fn local_derived_pointer_actual_passes_target_to_pointer_dummy() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=local_derived_pointer_actual_passes_target_to_pointer_dummy count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: node_t\n    integer :: value = 0\n  end type node_t\n  type(node_t), target :: target_node\n  type(node_t), pointer :: root\n  target_node%value = 42\n  root => target_node\n  call check(root)\ncontains\n  subroutine check(node)\n    type(node_t), pointer, intent(in) :: node\n    if (.not. associated(node)) error stop 1\n    if (node%value /= 42) error stop 2\n    print *, 'ok'\n  end subroutine check\nend program p\n",
         "f90",
@@ -3966,6 +4470,13 @@ fn local_derived_pointer_actual_passes_target_to_pointer_dummy() {
 
 #[test]
 fn pointer_function_result_associated_lowers_without_raw_symbol() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=pointer_function_result_associated_lowers_without_raw_symbol count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: node_t\n    integer :: value = 0\n  end type node_t\ncontains\n  recursive function parse() result(node)\n    type(node_t), pointer :: node, right_node\n    nullify(node)\n    if (.not. associated(node)) return\n    if (.not. associated(right_node)) return\n  end function parse\nend module m\n",
         "f90",
@@ -3995,6 +4506,13 @@ fn pointer_function_result_associated_lowers_without_raw_symbol() {
 
 #[test]
 fn component_array_intrinsics_survive_logical_condition_lowering() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=component_array_intrinsics_survive_logical_condition_lowering count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: cmd_t\n    character(:), allocatable :: tokens(:)\n    integer, allocatable :: token_lengths(:)\n  end type cmd_t\ncontains\n  integer function f(cmd, i) result(strip_len)\n    type(cmd_t), intent(in) :: cmd\n    integer, intent(in) :: i\n    if (allocated(cmd%token_lengths) .and. i <= size(cmd%token_lengths) .and. cmd%token_lengths(i) > 0) then\n      strip_len = cmd%token_lengths(i)\n    else\n      strip_len = len_trim(cmd%tokens(i))\n    end if\n  end function f\nend module m\n",
         "f90",
@@ -4040,6 +4558,13 @@ fn component_array_intrinsics_survive_logical_condition_lowering() {
 
 #[test]
 fn allocatable_array_element_component_intrinsics_do_not_escape() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_array_element_component_intrinsics_do_not_escape count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  integer, parameter :: max_token_len = 32\n  type :: command_t\n    character(len=:), allocatable :: tokens(:)\n    character(len=max_token_len), allocatable :: prefix_assignments(:)\n    character(len=:), allocatable :: heredoc_delimiter\n  end type command_t\ncontains\n  subroutine f()\n    type(command_t), allocatable :: temp_commands(:)\n    integer :: i\n    allocate(temp_commands(2))\n    i = 1\n    if (allocated(temp_commands(i)%prefix_assignments)) print *, 1\n    if (allocated(temp_commands(i)%tokens)) print *, 2\n    if (allocated(temp_commands(i)%heredoc_delimiter)) print *, 3\n  end subroutine f\nend module m\n",
         "f90",
@@ -4079,6 +4604,13 @@ fn allocatable_array_element_component_intrinsics_do_not_escape() {
 
 #[test]
 fn allocated_intrinsic_on_class_component_chain_compiles_and_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocated_intrinsic_on_class_component_chain_compiles_and_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type, abstract :: base_t\n    character(len=:), allocatable :: key\n  end type base_t\n  type, extends(base_t) :: child_t\n    integer :: x = 0\n  end type child_t\n  type :: node_t\n    class(base_t), allocatable :: val\n  end type node_t\n  type :: container_t\n    type(node_t), allocatable :: lst(:)\n  end type container_t\ncontains\n  logical function has_key(c)\n    type(container_t), intent(in) :: c\n    has_key = allocated(c%lst(1)%val%key)\n  end function has_key\nend module m\nprogram p\n  use m\n  implicit none\n  type(container_t) :: c\n  allocate(c%lst(1))\n  allocate(child_t :: c%lst(1)%val)\n  c%lst(1)%val%key = 'abc'\n  if (.not. has_key(c)) error stop 1\n  print *, 'ok'\nend program\n",
         "f90",
@@ -4116,6 +4648,13 @@ fn allocated_intrinsic_on_class_component_chain_compiles_and_runs() {
 
 #[test]
 fn explicit_shape_runtime_bound_function_result_array_compiles_and_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=explicit_shape_runtime_bound_function_result_array_compiles_and_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  integer :: idx\n  idx = strstr('ababa', 'aba')\n  if (idx /= 1) error stop 1\n  print *, 'ok'\ncontains\n  integer function strstr(string, pattern) result(res)\n    character(*), intent(in) :: string\n    character(*), intent(in) :: pattern\n    integer :: lps_array(len(pattern))\n    integer :: res, s_i, p_i, length_string, length_pattern\n    res = 0\n    length_string = len(string)\n    length_pattern = len(pattern)\n    if (length_pattern > 0 .and. length_pattern <= length_string) then\n      lps_array = compute_lps(pattern)\n      s_i = 1\n      p_i = 1\n      do while (s_i <= length_string)\n        if (string(s_i:s_i) == pattern(p_i:p_i)) then\n          if (p_i == length_pattern) then\n            res = s_i - length_pattern + 1\n            exit\n          end if\n          s_i = s_i + 1\n          p_i = p_i + 1\n        else if (p_i > 1) then\n          p_i = lps_array(p_i - 1) + 1\n        else\n          s_i = s_i + 1\n        end if\n      end do\n    end if\n  contains\n    pure function compute_lps(string) result(lps_array)\n      character(*), intent(in) :: string\n      integer :: lps_array(len(string))\n      integer :: i, j, length_string\n      length_string = len(string)\n      if (length_string > 0) then\n        lps_array(1) = 0\n        i = 2\n        j = 1\n        do while (i <= length_string)\n          if (string(j:j) == string(i:i)) then\n            lps_array(i) = j\n            i = i + 1\n            j = j + 1\n          else if (j > 1) then\n            j = lps_array(j - 1) + 1\n          else\n            lps_array(i) = 0\n            i = i + 1\n          end if\n        end do\n      end if\n    end function compute_lps\n  end function strstr\nend program\n",
         "f90",
@@ -4153,6 +4692,13 @@ fn explicit_shape_runtime_bound_function_result_array_compiles_and_runs() {
 
 #[test]
 fn fixed_component_array_size_lowers_without_raw_symbol() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_component_array_size_lowers_without_raw_symbol count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: shell_t\n    integer :: vars(4)\n  end type shell_t\ncontains\n  integer function f(shell) result(n)\n    type(shell_t), intent(in) :: shell\n    n = size(shell%vars)\n  end function f\nend module m\n",
         "f90",
@@ -4182,6 +4728,13 @@ fn fixed_component_array_size_lowers_without_raw_symbol() {
 
 #[test]
 fn allocate_bounds_size_intrinsic_lowers_without_raw_symbol() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocate_bounds_size_intrinsic_lowers_without_raw_symbol count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: string_t\n    character(:), allocatable :: str\n  end type string_t\n  type :: shell_t\n    type(string_t), allocatable :: positional_params(:)\n  end type shell_t\ncontains\n  subroutine f(shell)\n    type(shell_t), intent(inout) :: shell\n    type(string_t), allocatable :: saved(:)\n    integer :: i\n    if (allocated(shell%positional_params)) then\n      allocate(saved(size(shell%positional_params)))\n      do i = 1, size(shell%positional_params)\n        saved(i)%str = shell%positional_params(i)%str\n      end do\n    end if\n  end subroutine f\nend module m\n",
         "f90",
@@ -4216,6 +4769,13 @@ fn allocate_bounds_size_intrinsic_lowers_without_raw_symbol() {
 
 #[test]
 fn rank_remap_pointer_to_array_section_populates_descriptor() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=rank_remap_pointer_to_array_section_populates_descriptor count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §10.2.2.3: rank-remap pointer assignment with section RHS:
     //   real(sp), pointer :: tau(:)
     //   real(sp), target  :: q(5, 5)
@@ -4287,6 +4847,13 @@ end program
 
 #[test]
 fn print_complex_array_emits_each_element_as_complex() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=print_complex_array_emits_each_element_as_complex count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §13.10.2: list-directed output of a complex array
     // prints each element as `(re, im)`. The per-PRINT-item
     // dispatch in lower_write_items_adv used to check
@@ -4364,6 +4931,13 @@ end program
 
 #[test]
 fn reshape_descriptor_stride_walks_columns_under_dim_reduction() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=reshape_descriptor_stride_walks_columns_under_dim_reduction count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §15.5.2.4: an actual argument that's an intrinsic-call
     // expression (e.g. `reshape(...)`) passed to an assumed-shape dummy
     // gets a fresh descriptor.  The reshape descriptor builder used to
@@ -4419,6 +4993,13 @@ end program
 
 #[test]
 fn matmul_transpose_real_dispatches_to_real_matmul_runtime() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=matmul_transpose_real_dispatches_to_real_matmul_runtime count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §16.9.114 + §16.9.198: `matmul(transpose(A), A)` for real A
     // should produce a real-valued m×m matrix.  Two latent bugs collided:
     //   (a) `afs_transpose_real8/_int` used row-major index formulas
@@ -4486,6 +5067,13 @@ end program
 
 #[test]
 fn count_with_dim_returns_per_slice_integer_array() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=count_with_dim_returns_per_slice_integer_array count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §16.9.46: COUNT(MASK, DIM=k) returns an integer ARRAY of
     // rank N-1 with per-slice true-element counts. The scalar logical-
     // reduction lowering returned a single i32 total — when assigned
@@ -4543,6 +5131,13 @@ end program
 
 #[test]
 fn real_of_count_with_dim_does_not_emit_scalar_count_probe() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=real_of_count_with_dim_does_not_emit_scalar_count_probe count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §16.9.46: COUNT(MASK, DIM) returns a rank N-1 integer array.
     // The elemental-call dispatcher probes argument types via
     // generic_dispatch_probe_value, which falls through to lower_expr_full
@@ -4595,6 +5190,13 @@ end program
 
 #[test]
 fn intrinsic_repeat_keeps_length_through_user_generic_shadow() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=intrinsic_repeat_keeps_length_through_user_generic_shadow count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2008 §12.5.5.2: a user-defined generic only shadows an intrinsic
     // for argument signatures matching one of its specifics. stdlib's
     // `repeat` generic only has `(string_type, integer)`, so a call
@@ -4669,6 +5271,13 @@ end program
 
 #[test]
 fn allocatable_rank2_assign_from_transpose_uses_column_major_stride() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_rank2_assign_from_transpose_uses_column_major_stride count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §10.1.5: allocatable LHS = transpose(reshape(...)) reallocates
     // dest with source's shape and copies the data. afs_assign_allocatable
     // used to set dest.dims[i].stride = 1 across the board, but the
@@ -4734,6 +5343,13 @@ end program
 
 #[test]
 fn runtime_shape_local_uses_column_major_stride_for_row_section_assign() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=runtime_shape_local_uses_column_major_stride_for_row_section_assign count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §6.5.3.2: Fortran arrays are stored in column-major order.
     // The runtime-shape allocate path in alloc.rs hardcoded
     // dim[k].stride = 1 for every dim, so a rank-2 local
@@ -4799,6 +5415,13 @@ end program
 
 #[test]
 fn scalarized_rank1_assignment_rewrites_full_slice_sections() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=scalarized_rank1_assignment_rewrites_full_slice_sections count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         r#"
 program test
@@ -4855,6 +5478,13 @@ end program
 
 #[test]
 fn rank_2_runtime_shape_assign_with_size_in_scalar_does_not_scalarize() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=rank_2_runtime_shape_assign_with_size_in_scalar_does_not_scalarize count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §16.9.171: SIZE(arr, dim) is a whole-array inquiry intrinsic.
     // The scalarized-subscript-array-assign path detected `arr` as an
     // "array ref in subscripts" because arr appears as a positional
@@ -4911,6 +5541,13 @@ end program
 
 #[test]
 fn allocatable_lhs_eq_elemental_of_rank1_array_reallocates() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_lhs_eq_elemental_of_rank1_array_reallocates count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §10.2.1.3: an allocatable LHS gets reallocated to the RHS
     // shape before assignment. The subscript-scalarization path
     // synthesized `r(i) = sqrt(w)(i)` over `1..size(r)` for unallocated
@@ -4963,6 +5600,13 @@ end program
 
 #[test]
 fn intrinsic_trim_not_shadowed_by_loaded_only_named_interface() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=intrinsic_trim_not_shadowed_by_loaded_only_named_interface count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §11.2.2: a name from another module shadows an intrinsic
     // only when it is actually use-associated. `find_named_interface_symbol`'s
     // all-scope fallback walked every loaded scope unconditionally,
@@ -5044,6 +5688,13 @@ end program
 
 #[test]
 fn reshape_typed_array_constructor_preserves_elem_size_through_assumed_shape() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=reshape_typed_array_constructor_preserves_elem_size_through_assumed_shape count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §7.8: a typed array constructor `[T :: ...]` has element
     // type T regardless of the element expressions' types.  The reshape
     // lowering used to ignore type_spec and infer elem_ty from the
@@ -5110,6 +5761,13 @@ end program
 
 #[test]
 fn allocate_with_source_from_assumed_shape_dummy_populates_base_addr() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocate_with_source_from_assumed_shape_dummy_populates_base_addr count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §9.7.1.2: ALLOCATE(..., SOURCE=expr) requires only that
     // SOURCE-expr have a defined value of the right shape — it doesn't
     // have to be itself an ALLOCATABLE.  The common stdlib pattern is:
@@ -5180,6 +5838,13 @@ end program
 
 #[test]
 fn automatic_component_array_bound_size_lowers_without_raw_symbol() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=automatic_component_array_bound_size_lowers_without_raw_symbol count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: state_set_t\n    integer(8) :: bits(4) = 0_8\n  contains\n    procedure :: f\n  end type\ncontains\n  subroutine f(state_set)\n    type(state_set_t), intent(inout) :: state_set\n    integer(8) :: original_bits(size(state_set%bits))\n    original_bits = state_set%bits\n    print *, size(original_bits)\n  end subroutine\nend module\n",
         "f90",
@@ -5214,6 +5879,13 @@ fn automatic_component_array_bound_size_lowers_without_raw_symbol() {
 
 #[test]
 fn fixed_component_array_element_assignment_compiles() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_component_array_element_assignment_compiles count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: command_t\n    integer :: code = 0\n  end type command_t\n  type :: trap_table_t\n    type(command_t) :: commands(3)\n  end type trap_table_t\ncontains\n  subroutine set_code(tab, i, v)\n    type(trap_table_t), intent(inout) :: tab\n    integer, intent(in) :: i, v\n    tab%commands(i)%code = v\n  end subroutine set_code\nend module m\n",
         "f90",
@@ -5235,6 +5907,13 @@ fn fixed_component_array_element_assignment_compiles() {
 
 #[test]
 fn scalar_char_component_ops_and_achar_compile() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=scalar_char_component_ops_and_achar_compile count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: shell_t\n    character(len=8) :: ifs = ''\n  end type shell_t\ncontains\n  subroutine f(shell, sep)\n    type(shell_t), intent(in) :: shell\n    character(len=1), intent(out) :: sep\n    if (len_trim(shell%ifs) > 0) then\n      sep = shell%ifs(1:1)\n    else\n      sep = achar(0)\n    end if\n  end subroutine f\nend module m\n",
         "f90",
@@ -5273,6 +5952,13 @@ fn scalar_char_component_ops_and_achar_compile() {
 
 #[test]
 fn allocated_derived_pointer_preserves_blank_char_component_default() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocated_derived_pointer_preserves_blank_char_component_default count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: simple_command_data_t\n    character(len=8) :: heredoc_delimiter = ''\n  end type simple_command_data_t\n  type(simple_command_data_t), pointer :: cmd\n  allocate(cmd)\n  if (len_trim(cmd%heredoc_delimiter) /= 0) error stop 1\n  print *, 'ok'\nend program p\n",
         "f90",
@@ -5304,6 +5990,13 @@ fn allocated_derived_pointer_preserves_blank_char_component_default() {
 
 #[test]
 fn allocated_pointer_component_preserves_blank_char_component_default() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocated_pointer_component_preserves_blank_char_component_default count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: simple_command_data_t\n    character(len=:), allocatable :: words(:)\n    integer, allocatable :: word_lengths(:)\n    integer :: num_words = 0\n    character(len=256) :: heredoc_delimiter = ''\n    logical :: heredoc_quoted = .false.\n  end type simple_command_data_t\n  type :: command_node_t\n    type(simple_command_data_t), pointer :: simple_cmd => null()\n  end type command_node_t\n  type(command_node_t), pointer :: node\n  node => create_simple_command()\n  if (.not. associated(node%simple_cmd)) error stop 2\n  if (len_trim(node%simple_cmd%heredoc_delimiter) /= 0) error stop 1\n  print *, 'ok'\ncontains\n  function create_simple_command() result(node)\n    type(command_node_t), pointer :: node\n    allocate(node)\n    allocate(node%simple_cmd)\n    allocate(character(len=32) :: node%simple_cmd%words(1))\n    node%simple_cmd%words(1) = 'false'\n  end function create_simple_command\nend program p\n",
         "f90",
@@ -5335,6 +6028,13 @@ fn allocated_pointer_component_preserves_blank_char_component_default() {
 
 #[test]
 fn scalar_pointer_component_assignment_and_read_round_trip() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=scalar_pointer_component_assignment_and_read_round_trip count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: box_t\n    integer, pointer :: p => null()\n  end type\n  type(box_t) :: box\n  integer, target :: value\n  value = 11\n  box%p => value\n  print *, box%p\nend program p\n",
         "f90",
@@ -5372,6 +6072,13 @@ fn scalar_pointer_component_assignment_and_read_round_trip() {
 
 #[test]
 fn nested_pointer_component_array_element_access_round_trips() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=nested_pointer_component_array_element_access_round_trips count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: cmd_t\n    integer :: x = 0\n  end type\n  type :: pipeline_t\n    type(cmd_t), pointer :: commands(:) => null()\n  end type\n  type :: node_t\n    type(pipeline_t), pointer :: pipeline => null()\n  end type\n  type(node_t) :: node\n  type(cmd_t), target :: backing(2)\n  backing(1)%x = 11\n  backing(2)%x = 22\n  allocate(node%pipeline)\n  node%pipeline%commands => backing\n  print *, node%pipeline%commands(1)%x, node%pipeline%commands(2)%x\nend program p\n",
         "f90",
@@ -5409,6 +6116,13 @@ fn nested_pointer_component_array_element_access_round_trips() {
 
 #[test]
 fn nested_scalar_derived_pointer_component_access_and_call_round_trip() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=nested_scalar_derived_pointer_component_access_and_call_round_trip count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: list_t\n    type(node_t), pointer :: left => null()\n    type(node_t), pointer :: right => null()\n    integer :: sep = 0\n  end type\n  type :: node_t\n    integer :: kind = 0\n    type(list_t), pointer :: list => null()\n  end type\ncontains\n  function make_simple(v) result(node)\n    integer, intent(in) :: v\n    type(node_t), pointer :: node\n    allocate(node)\n    node%kind = v\n  end function\n\n  function make_list(left, right, sep) result(node)\n    type(node_t), pointer, intent(in) :: left, right\n    integer, intent(in) :: sep\n    type(node_t), pointer :: node\n    allocate(node)\n    node%kind = 99\n    allocate(node%list)\n    node%list%left => left\n    node%list%right => right\n    node%list%sep = sep\n  end function\n\n  function read_kind(node) result(v)\n    type(node_t), pointer, intent(in) :: node\n    integer :: v\n    if (associated(node)) then\n      v = node%kind\n    else\n      v = -1\n    end if\n  end function\nend module\n\nprogram main\n  use m\n  implicit none\n  type(node_t), pointer :: root\n  root => make_list(make_simple(11), make_simple(22), 7)\n  print *, root%list%left%kind\n  print *, read_kind(root%list%left)\n  print *, read_kind(root%list%right)\nend program\n",
         "f90",
@@ -5446,6 +6160,13 @@ fn nested_scalar_derived_pointer_component_access_and_call_round_trip() {
 
 #[test]
 fn pointer_result_self_argument_survives_module_boundary() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=pointer_result_self_argument_survives_module_boundary count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("pointer_result_self_argument");
     let tree_src = write_program_in(
         &dir,
@@ -5562,6 +6283,13 @@ fn pointer_result_self_argument_survives_module_boundary() {
 
 #[test]
 fn pointer_component_null_assignment_and_default_do_not_escape_null_symbol() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=pointer_component_null_assignment_and_default_do_not_escape_null_symbol count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: cmd_t\n    integer :: x = 0\n  end type\n  type :: entry_t\n    type(cmd_t), pointer :: body => null()\n  end type\n  type(entry_t) :: entry\n  if (associated(entry%body)) error stop 1\n  entry%body => null()\n  if (associated(entry%body)) error stop 2\n  print *, 'ok'\nend program p\n",
         "f90",
@@ -5599,6 +6327,13 @@ fn pointer_component_null_assignment_and_default_do_not_escape_null_symbol() {
 
 #[test]
 fn nullified_pointer_component_actual_passes_slot_to_pointer_dummy() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=nullified_pointer_component_actual_passes_slot_to_pointer_dummy count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: child_t\n    integer :: tag = 0\n  end type\n  type :: holder_t\n    type(child_t), pointer :: body => null()\n  end type\n  type :: node_t\n    type(holder_t), pointer :: fn => null()\n  end type\ncontains\n  subroutine check_child(n)\n    type(child_t), pointer, intent(inout) :: n\n    if (associated(n)) then\n      print *, 'ASSOC', n%tag\n    else\n      print *, 'NULL'\n    end if\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(child_t), pointer :: leaf\n  type(node_t), pointer :: parent\n  allocate(parent)\n  allocate(parent%fn)\n  allocate(leaf)\n  leaf%tag = 42\n  parent%fn%body => leaf\n  nullify(parent%fn%body)\n  call check_child(parent%fn%body)\n  print *, 'DONE'\nend program\n",
         "f90",
@@ -5641,6 +6376,13 @@ fn nullified_pointer_component_actual_passes_slot_to_pointer_dummy() {
 
 #[test]
 fn pointer_component_actual_to_class_dummy_uses_associated_target() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=pointer_component_actual_to_class_dummy_uses_associated_target count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module repro\n  implicit none\n  type :: table_t\n    integer :: value = 0\n  end type table_t\n  type :: parser_t\n    type(table_t), allocatable :: root\n    type(table_t), pointer :: current\n  end type parser_t\ncontains\n  subroutine init(parser)\n    type(parser_t), intent(out), target :: parser\n    parser%root = table_t(1)\n    parser%current => parser%root\n  end subroutine init\n  subroutine bump(self)\n    class(table_t), intent(inout) :: self\n    self%value = self%value + 1\n  end subroutine bump\nend module repro\nprogram p\n  use repro\n  implicit none\n  type(parser_t) :: parser\n  call init(parser)\n  call bump(parser%current)\n  if (parser%root%value /= 2) error stop 1\n  print *, 'ok'\nend program p\n",
         "f90",
@@ -5678,6 +6420,13 @@ fn pointer_component_actual_to_class_dummy_uses_associated_target() {
 
 #[test]
 fn allocatable_derived_component_structure_constructor_persists_after_return() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_derived_component_structure_constructor_persists_after_return count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module repro\n  implicit none\n  type :: table_t\n    integer :: value = 0\n  end type table_t\n  type :: parser_t\n    type(table_t), allocatable :: root\n  end type parser_t\ncontains\n  subroutine init(parser)\n    type(parser_t), intent(out) :: parser\n    parser%root = table_t(1)\n  end subroutine init\nend module repro\nprogram p\n  use repro\n  implicit none\n  type(parser_t) :: parser\n  call init(parser)\n  if (.not. allocated(parser%root)) error stop 1\n  if (parser%root%value /= 1) error stop 2\n  print *, 'ok'\nend program p\n",
         "f90",
@@ -5715,6 +6464,13 @@ fn allocatable_derived_component_structure_constructor_persists_after_return() {
 
 #[test]
 fn allocatable_derived_component_structure_constructor_preserves_class_dispatch() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_derived_component_structure_constructor_preserves_class_dispatch count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module repro\n  implicit none\n  type, abstract :: base_t\n  contains\n    procedure(accept_i), deferred :: accept\n  end type base_t\n  type, abstract :: visitor_t\n  contains\n    procedure(visit_i), deferred :: visit\n  end type visitor_t\n  type, extends(base_t) :: child_t\n    integer :: x = 0\n  contains\n    procedure :: accept => child_accept\n  end type child_t\n  type, extends(visitor_t) :: printer_t\n    integer :: seen = -1\n  contains\n    procedure :: visit => printer_visit\n  end type printer_t\n  type :: parser_t\n    type(child_t), allocatable :: root\n  end type parser_t\n  abstract interface\n    subroutine accept_i(self, vis)\n      import :: base_t, visitor_t\n      class(base_t), intent(in) :: self\n      class(visitor_t), intent(inout) :: vis\n    end subroutine accept_i\n    subroutine visit_i(self, val)\n      import :: visitor_t, base_t\n      class(visitor_t), intent(inout) :: self\n      class(base_t), intent(in) :: val\n    end subroutine visit_i\n  end interface\ncontains\n  subroutine child_accept(self, vis)\n    class(child_t), intent(in) :: self\n    class(visitor_t), intent(inout) :: vis\n    call vis%visit(self)\n  end subroutine child_accept\n  subroutine printer_visit(self, val)\n    class(printer_t), intent(inout) :: self\n    class(base_t), intent(in) :: val\n    select type(val)\n    type is(child_t)\n      self%seen = val%x\n    class default\n      self%seen = -99\n    end select\n  end subroutine printer_visit\n  subroutine init(parser)\n    type(parser_t), intent(out) :: parser\n    parser%root = child_t(7)\n  end subroutine init\nend module repro\nprogram p\n  use repro\n  implicit none\n  type(parser_t) :: parser\n  type(printer_t) :: vis\n  call init(parser)\n  call parser%root%accept(vis)\n  if (vis%seen /= 7) error stop 1\n  print *, 'ok'\nend program p\n",
         "f90",
@@ -5752,6 +6508,13 @@ fn allocatable_derived_component_structure_constructor_preserves_class_dispatch(
 
 #[test]
 fn pointer_dummy_deallocate_and_nullify_write_back_to_actual_slot() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=pointer_dummy_deallocate_and_nullify_write_back_to_actual_slot count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  integer :: count = 0\n  type :: child_t\n    integer :: tag = 0\n  end type\ncontains\n  subroutine destroy_child(n)\n    type(child_t), pointer, intent(inout) :: n\n    if (.not. associated(n)) return\n    count = count + 1\n    deallocate(n)\n    nullify(n)\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(child_t), pointer :: cached\n  allocate(cached)\n  cached%tag = 42\n  call destroy_child(cached)\n  print *, 'COUNT', count\n  if (associated(cached)) then\n    print *, 'CACHED', cached%tag\n  else\n    print *, 'CACHED', -1\n  end if\nend program\n",
         "f90",
@@ -5794,6 +6557,13 @@ fn pointer_dummy_deallocate_and_nullify_write_back_to_actual_slot() {
 
 #[test]
 fn deferred_char_component_allocate_source_copies_runtime_string_value() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=deferred_char_component_allocate_source_copies_runtime_string_value count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: redirect_t\n    character(:), allocatable :: filename\n  end type redirect_t\n  type(redirect_t) :: redirects(1)\n  character(len=8) :: tok\n  tok = 'abc   '\n  allocate(redirects(1)%filename, source=trim(tok))\n  if (len(redirects(1)%filename) /= 3) error stop 1\n  if (redirects(1)%filename /= 'abc') error stop 2\n  print *, 'ok'\nend program p\n",
         "f90",
@@ -5825,6 +6595,13 @@ fn deferred_char_component_allocate_source_copies_runtime_string_value() {
 
 #[test]
 fn typed_allocate_char_len_from_derived_component_expr_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=typed_allocate_char_len_from_derived_component_expr_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  use, intrinsic :: iso_c_binding\n  implicit none\n  type :: line_info_t\n    integer(c_size_t) :: start_pos = 0\n    integer(c_size_t) :: length = 0\n  end type line_info_t\ncontains\n  function get_line_text(data_ptr, data_size, info) result(line)\n    type(c_ptr), intent(in) :: data_ptr\n    integer(c_size_t), intent(in) :: data_size\n    type(line_info_t), intent(in) :: info\n    character(len=:), allocatable :: line\n    character(len=1, kind=c_char), pointer :: file_data(:)\n    integer :: i\n    if (info%length == 0) then\n      line = ''\n      return\n    end if\n    call c_f_pointer(data_ptr, file_data, [data_size])\n    allocate(character(len=info%length) :: line)\n    do i = 1, int(info%length)\n      line(i:i) = file_data(info%start_pos + i)\n    end do\n  end function get_line_text\nend module m\n\nprogram p\n  use, intrinsic :: iso_c_binding\n  use m\n  implicit none\n  character(kind=c_char), target :: buf(11)\n  type(line_info_t) :: info\n  character(len=:), allocatable :: line\n  buf = [char(104, kind=c_char), char(101, kind=c_char), char(108, kind=c_char), &\n         char(108, kind=c_char), char(111, kind=c_char), char(10, kind=c_char), &\n         char(119, kind=c_char), char(111, kind=c_char), char(114, kind=c_char), &\n         char(108, kind=c_char), char(100, kind=c_char)]\n  info%start_pos = 0\n  info%length = 5\n  line = get_line_text(c_loc(buf(1)), 11_c_size_t, info)\n  if (len(line) /= 5) error stop 1\n  if (line /= 'hello') error stop 2\n  print *, line\nend program p\n",
         "f90",
@@ -5864,6 +6641,13 @@ fn typed_allocate_char_len_from_derived_component_expr_runs() {
 
 #[test]
 fn type_bound_deferred_char_result_preserves_pass_object_and_length() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=type_bound_deferred_char_result_preserves_pass_object_and_length count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  use, intrinsic :: iso_c_binding\n  implicit none\n  type :: line_info_t\n    integer(c_size_t) :: start_pos = 0\n    integer(c_size_t) :: length = 0\n  end type line_info_t\n  type :: holder_t\n    type(c_ptr) :: data = c_null_ptr\n    integer(c_size_t) :: size = 0\n    logical :: is_open = .false.\n  contains\n    procedure :: get_line_text\n  end type holder_t\ncontains\n  function get_line_text(this, info) result(line)\n    class(holder_t), intent(in) :: this\n    type(line_info_t), intent(in) :: info\n    character(len=:), allocatable :: line\n    character(len=1, kind=c_char), pointer :: file_data(:)\n    integer :: i\n    if (.not. this%is_open .or. .not. c_associated(this%data)) then\n      line = ''\n      return\n    end if\n    if (info%length == 0) then\n      line = ''\n      return\n    end if\n    call c_f_pointer(this%data, file_data, [this%size])\n    allocate(character(len=info%length) :: line)\n    do i = 1, int(info%length)\n      line(i:i) = file_data(info%start_pos + i)\n    end do\n  end function get_line_text\nend module m\n\nprogram p\n  use, intrinsic :: iso_c_binding\n  use m\n  implicit none\n  character(kind=c_char), target :: buf(11)\n  type(holder_t) :: holder\n  type(line_info_t) :: info\n  character(len=:), allocatable :: line\n  buf = [char(104, kind=c_char), char(101, kind=c_char), char(108, kind=c_char), &\n         char(108, kind=c_char), char(111, kind=c_char), char(10, kind=c_char), &\n         char(119, kind=c_char), char(111, kind=c_char), char(114, kind=c_char), &\n         char(108, kind=c_char), char(100, kind=c_char)]\n  holder%data = c_loc(buf(1))\n  holder%size = 11\n  holder%is_open = .true.\n  info%start_pos = 0\n  info%length = 5\n  line = holder%get_line_text(info)\n  if (len(line) /= 5) error stop 1\n  if (line /= 'hello') error stop 2\n  print *, line\nend program p\n",
         "f90",
@@ -5903,6 +6687,13 @@ fn type_bound_deferred_char_result_preserves_pass_object_and_length() {
 
 #[test]
 fn scalar_char_substring_argument_avoids_raw_local_symbol() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=scalar_char_substring_argument_avoids_raw_local_symbol count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\ncontains\n  integer function visual_length(s)\n    character(len=*), intent(in) :: s\n    visual_length = len_trim(s)\n  end function visual_length\n\n  integer function run(input) result(n)\n    character(len=*), intent(in) :: input\n    character(len=len(input)) :: working_input\n    working_input = input\n    n = visual_length(working_input(2:3))\n  end function run\nend module m\n",
         "f90",
@@ -5936,6 +6727,13 @@ fn scalar_char_substring_argument_avoids_raw_local_symbol() {
 
 #[test]
 fn allocated_on_derived_array_element_component_uses_descriptor_runtime() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocated_on_derived_array_element_component_uses_descriptor_runtime count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: cmd_t\n    character(:), allocatable :: tokens(:)\n  end type cmd_t\n  type(cmd_t) :: cmds(2)\n  logical :: ok\n  ok = allocated(cmds(1)%tokens)\n  if (ok) print *, size(cmds(1)%tokens)\nend program\n",
         "f90",
@@ -5974,6 +6772,13 @@ fn allocated_on_derived_array_element_component_uses_descriptor_runtime() {
 
 #[test]
 fn allocatable_derived_shell_initialization_runs_through_components() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_derived_shell_initialization_runs_through_components count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: string_t\n    character(:), allocatable :: str\n  end type string_t\n  type :: shell_t\n    type(string_t), allocatable :: positional_params(:)\n    integer, allocatable :: counts(:)\n  end type shell_t\n  type(shell_t), allocatable :: shell\n  allocate(shell)\n  call initialize_shell(shell)\n  if (.not. allocated(shell%positional_params)) stop 10\n  if (.not. allocated(shell%counts)) stop 11\n  if (shell%counts(1) /= 7) stop 12\n  print *, trim(shell%positional_params(1)%str)\ncontains\n  subroutine initialize_shell(shell)\n    type(shell_t), intent(out) :: shell\n    if (allocated(shell%positional_params)) stop 1\n    if (allocated(shell%counts)) stop 2\n    allocate(shell%positional_params(2))\n    allocate(shell%counts(2))\n    shell%positional_params(1)%str = 'ok'\n    shell%counts = [7, 9]\n  end subroutine initialize_shell\nend program\n",
         "f90",
@@ -6010,6 +6815,13 @@ fn allocatable_derived_shell_initialization_runs_through_components() {
 
 #[test]
 fn allocatable_scalar_derived_type_preserves_field_defaults_on_allocate() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_scalar_derived_type_preserves_field_defaults_on_allocate count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: shell_t\n    integer :: ifs_len = -1\n    integer :: other = 7\n  end type shell_t\n  type(shell_t), allocatable :: shell\n  allocate(shell)\n  if (shell%ifs_len /= -1) error stop 1\n  if (shell%other /= 7) error stop 2\n  print *, shell%ifs_len, shell%other\nend program\n",
         "f90",
@@ -6047,6 +6859,13 @@ fn allocatable_scalar_derived_type_preserves_field_defaults_on_allocate() {
 
 #[test]
 fn allocatable_shell_default_ifs_follows_trim_branch() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_shell_default_ifs_follows_trim_branch count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: shell_t\n    integer :: ifs_len = -1\n  end type shell_t\n  type(shell_t), allocatable :: shell\n  character(len=32) :: input_line\n  character(len=32) :: var\n  integer :: actual_input_len\n\n  allocate(shell)\n\n  input_line = 'hello\\\\world '\n  actual_input_len = 12\n  if (shell%ifs_len == 0) then\n    var = input_line(:actual_input_len)\n  else\n    var = trim(adjustl(input_line))\n  end if\n  if (trim(var) /= 'hello\\\\world') error stop 1\n\n  input_line = '  x  '\n  actual_input_len = 5\n  if (shell%ifs_len == 0) then\n    var = input_line(:actual_input_len)\n  else\n    var = trim(adjustl(input_line))\n  end if\n  if (trim(var) /= 'x') error stop 2\n\n  print *, 'ok'\nend program\n",
         "f90",
@@ -6084,6 +6903,13 @@ fn allocatable_shell_default_ifs_follows_trim_branch() {
 
 #[test]
 fn derived_array_section_actual_preserves_bounds_and_elements() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=derived_array_section_actual_preserves_bounds_and_elements count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: string_t\n    character(len=:), allocatable :: str\n  end type\n  type :: var_t\n    type(string_t), allocatable :: array_values(:)\n    integer :: array_size = 0\n  end type\n  type :: shell_t\n    type(var_t) :: variables(4)\n    integer :: num_variables = 0\n  end type\n  type(string_t), allocatable :: values(:)\n  type(shell_t) :: shell\n  integer :: count\n\n  allocate(values(20))\n  count = 3\n  values(1)%str = 'a'\n  values(2)%str = 'b'\n  values(3)%str = 'c'\n  call set_array_variable_string_t(shell, values(1:count), count)\n  if (.not. allocated(shell%variables(1)%array_values)) error stop 1\n  if (size(shell%variables(1)%array_values) /= 3) error stop 2\n  if (trim(shell%variables(1)%array_values(1)%str) /= 'a') error stop 3\n  if (trim(shell%variables(1)%array_values(2)%str) /= 'b') error stop 4\n  if (trim(shell%variables(1)%array_values(3)%str) /= 'c') error stop 5\n  print *, trim(shell%variables(1)%array_values(1)%str), trim(shell%variables(1)%array_values(2)%str), trim(shell%variables(1)%array_values(3)%str)\ncontains\n  subroutine set_array_variable_string_t(shell, values, count)\n    type(shell_t), intent(inout) :: shell\n    type(string_t), intent(in) :: values(:)\n    integer, intent(in) :: count\n    integer :: k\n    allocate(shell%variables(1)%array_values(count))\n    do k = 1, count\n      shell%variables(1)%array_values(k)%str = values(k)%str\n    end do\n    shell%variables(1)%array_size = count\n  end subroutine\nend program\n",
         "f90",
@@ -6121,6 +6947,13 @@ fn derived_array_section_actual_preserves_bounds_and_elements() {
 
 #[test]
 fn allocatable_derived_shell_initialization_survives_large_component_offsets() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_derived_shell_initialization_survives_large_component_offsets count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: string_t\n    character(:), allocatable :: str\n  end type string_t\n  type :: shell_t\n    integer :: pad(50000) = 0\n    type(string_t), allocatable :: local_vars(:,:)\n    integer, allocatable :: local_var_counts(:)\n    type(string_t), allocatable :: positional_params(:)\n  end type shell_t\n  type(shell_t), allocatable :: shell\n  allocate(shell)\n  call initialize_shell(shell)\n  if (.not. allocated(shell%local_vars)) stop 10\n  if (.not. allocated(shell%local_var_counts)) stop 11\n  if (.not. allocated(shell%positional_params)) stop 12\n  if (shell%local_var_counts(1) /= 1) stop 13\n  print *, trim(shell%positional_params(1)%str)\ncontains\n  subroutine initialize_shell(shell)\n    type(shell_t), intent(out) :: shell\n    allocate(shell%local_vars(1, 1))\n    allocate(shell%local_var_counts(1))\n    allocate(shell%positional_params(1))\n    shell%local_var_counts = [1]\n    shell%positional_params(1)%str = 'ok'\n  end subroutine initialize_shell\nend program\n",
         "f90",
@@ -6157,6 +6990,13 @@ fn allocatable_derived_shell_initialization_survives_large_component_offsets() {
 
 #[test]
 fn c_f_pointer_array_target_builds_descriptor_backing() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=c_f_pointer_array_target_builds_descriptor_backing count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  use iso_c_binding\n  implicit none\n  character(kind=c_char), target :: buf(4)\n  type(c_ptr) :: raw\n  character(kind=c_char), pointer :: view(:)\n  buf = [achar(111, kind=c_char), achar(107, kind=c_char), c_null_char, achar(120, kind=c_char)]\n  raw = c_loc(buf)\n  call c_f_pointer(raw, view, [4])\n  if (.not. associated(view)) stop 1\n  if (view(1) /= buf(1)) stop 2\n  if (view(2) /= buf(2)) stop 3\n  if (view(3) /= c_null_char) stop 4\n  print *, 'ok'\nend program\n",
         "f90",
@@ -6187,6 +7027,13 @@ fn c_f_pointer_array_target_builds_descriptor_backing() {
 
 #[test]
 fn c_f_pointer_scalar_fixed_c_char_pointer_reads_back_bytes() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=c_f_pointer_scalar_fixed_c_char_pointer_reads_back_bytes count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  use iso_c_binding\n  implicit none\n  character(kind=c_char), target :: buf(4)\n  type(c_ptr) :: raw\n  character(kind=c_char, len=4), pointer :: view\n  buf = [achar(97, kind=c_char), achar(98, kind=c_char), achar(99, kind=c_char), c_null_char]\n  raw = c_loc(buf(1))\n  call c_f_pointer(raw, view)\n  if (view(1:1) /= achar(97, kind=c_char)) error stop 1\n  if (view(2:2) /= achar(98, kind=c_char)) error stop 2\n  if (view(3:3) /= achar(99, kind=c_char)) error stop 3\n  print *, 'ok'\nend program\n",
         "f90",
@@ -6217,6 +7064,13 @@ fn c_f_pointer_scalar_fixed_c_char_pointer_reads_back_bytes() {
 
 #[test]
 fn fixed_c_char_array_element_assignment_compiles_and_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_c_char_array_element_assignment_compiles_and_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  use iso_c_binding\n  implicit none\n  character(kind=c_char), target :: buf(4)\n  integer :: i\n  do i = 1, 3\n    buf(i) = achar(96 + i, kind=c_char)\n  end do\n  buf(4) = c_null_char\n  if (buf(1) /= achar(97, kind=c_char)) stop 1\n  if (buf(2) /= achar(98, kind=c_char)) stop 2\n  if (buf(3) /= achar(99, kind=c_char)) stop 3\n  if (buf(4) /= c_null_char) stop 4\n  print *, 'ok'\nend program\n",
         "f90",
@@ -6247,6 +7101,13 @@ fn fixed_c_char_array_element_assignment_compiles_and_runs() {
 
 #[test]
 fn fixed_c_char_array_null_scan_compiles_and_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_c_char_array_null_scan_compiles_and_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  use iso_c_binding\n  implicit none\n  character(kind=c_char), target :: buf(256)\n  integer :: i\n  buf = c_null_char\n  buf(1) = achar(97, kind=c_char)\n  do i = 1, 256\n    if (buf(i) == c_null_char) exit\n  end do\n  if (i /= 2) stop 1\n  print *, 'ok'\nend program\n",
         "f90",
@@ -6277,6 +7138,13 @@ fn fixed_c_char_array_null_scan_compiles_and_runs() {
 
 #[test]
 fn imported_param_c_char_array_scan_in_char_result_function_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_param_c_char_array_scan_in_char_result_function_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module constants\n  implicit none\n  integer, parameter :: path_cap = 8\nend module constants\n\nmodule m\n  use iso_c_binding\n  use constants, only: path_cap\ncontains\n  function get_path() result(path)\n    character(len=:), allocatable :: path\n    character(kind=c_char), target :: c_path(path_cap)\n    integer :: i\n    c_path = c_null_char\n    c_path(1) = achar(97, kind=c_char)\n    c_path(2) = c_null_char\n    do i = 1, path_cap\n      if (c_path(i) == c_null_char) exit\n    end do\n    allocate(character(len=i-1) :: path)\n    do i = 1, len(path)\n      path(i:i) = c_path(i)\n    end do\n  end function\nend module m\n\nprogram p\n  use m, only: get_path\n  implicit none\n  if (get_path() /= 'a') error stop 1\n  print *, trim(get_path())\nend program\n",
         "f90",
@@ -6314,6 +7182,13 @@ fn imported_param_c_char_array_scan_in_char_result_function_runs() {
 
 #[test]
 fn verify_on_indexed_parameter_character_array_element_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=verify_on_indexed_parameter_character_array_element_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  character(*), parameter :: toml_base(4) = [ &\n    '0123456789abcdefABCDEF', &\n    '0123456789000000000000', &\n    '0123456700000000000000', &\n    '0100000000000000000000' ]\n  character(1) :: ch\n  integer :: base\n\n  ch = '0'\n  do base = 1, 4\n    if (verify(ch, toml_base(base)) /= 0) error stop base\n  end do\n  print *, 'ok'\nend program\n",
         "f90",
@@ -6351,6 +7226,13 @@ fn verify_on_indexed_parameter_character_array_element_runs() {
 
 #[test]
 fn c_loc_on_allocatable_c_char_array_element_compiles_and_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=c_loc_on_allocatable_c_char_array_element_compiles_and_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  use iso_c_binding\n  implicit none\n  character(kind=c_char), allocatable, target :: c_tokens(:,:)\n  type(c_ptr) :: raw\n  integer :: i\n  allocate(c_tokens(4, 1))\n  do i = 1, 3\n    c_tokens(i, 1) = achar(96 + i, kind=c_char)\n  end do\n  c_tokens(4, 1) = c_null_char\n  raw = c_loc(c_tokens(1, 1))\n  if (.not. c_associated(raw)) stop 1\n  print *, 'ok'\nend program\n",
         "f90",
@@ -6381,6 +7263,13 @@ fn c_loc_on_allocatable_c_char_array_element_compiles_and_runs() {
 
 #[test]
 fn named_len_char_component_substring_and_trim_compile() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=named_len_char_component_substring_and_trim_compile count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  integer, parameter :: max_token_len = 8\n  type :: token_t\n    character(len=max_token_len) :: value\n  end type token_t\ncontains\n  subroutine f(tok, i, is_bang, trimmed)\n    type(token_t), intent(in) :: tok\n    integer, intent(in) :: i\n    logical, intent(out) :: is_bang\n    character(len=max_token_len), intent(out) :: trimmed\n    is_bang = (tok%value(i:i) == '!')\n    trimmed = trim(tok%value)\n  end subroutine f\nend module m\n",
         "f90",
@@ -6406,6 +7295,13 @@ fn named_len_char_component_substring_and_trim_compile() {
 
 #[test]
 fn fixed_char_component_assigns_into_char_array_element() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_char_component_assigns_into_char_array_element count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  integer, parameter :: max_token_len = 16\n  type :: token_t\n    character(len=max_token_len) :: value\n    logical :: quoted = .false.\n    logical :: escaped = .false.\n    integer :: quote_type = 0\n    integer :: value_length = 0\n  end type token_t\n  type(token_t) :: tok\n  character(len=max_token_len) :: words(1)\n  tok%value = 'echo'\n  words(1) = tok%value\n  if (trim(words(1)) /= 'echo') error stop 1\n  print *, trim(words(1))\nend program p\n",
         "f90",
@@ -6443,6 +7339,13 @@ fn fixed_char_component_assigns_into_char_array_element() {
 
 #[test]
 fn fixed_char_array_component_element_assignment_round_trips() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_char_array_component_element_assignment_round_trips count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: t\n    character(len=16) :: arr(4)\n  end type\n  type(t), save :: g\ncontains\n  subroutine fill_direct()\n    g%arr = ''\n    g%arr(1) = 'alpha'\n    g%arr(2) = 'beta'\n  end subroutine\n\n  subroutine fill_via_local_copy()\n    type(t) :: x\n    x%arr = ''\n    x%arr(1) = 'one'\n    x%arr(2) = 'two'\n    g = x\n  end subroutine\nend module\n\nprogram p\n  use m\n  call fill_direct()\n  if (trim(g%arr(1)) /= 'alpha') error stop 1\n  if (trim(g%arr(2)) /= 'beta') error stop 2\n  call fill_via_local_copy()\n  if (trim(g%arr(1)) /= 'one') error stop 3\n  if (trim(g%arr(2)) /= 'two') error stop 4\n  print *, 'ok'\nend program\n",
         "f90",
@@ -6480,6 +7383,13 @@ fn fixed_char_array_component_element_assignment_round_trips() {
 
 #[test]
 fn fixed_char_array_component_element_actual_to_char_function_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_char_array_component_element_actual_to_char_function_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  integer, parameter :: max_path_len = 256, max_dir_stack = 32\n  type :: dir_stack_t\n    character(len=max_path_len) :: directories(max_dir_stack)\n    integer :: top\n  end type\ncontains\n  function echo_path(path) result(out)\n    character(len=*), intent(in) :: path\n    character(len=max_path_len) :: out\n    out = path\n  end function\nend module\n\nprogram p\n  use m\n  implicit none\n  type(dir_stack_t) :: s\n  character(len=max_path_len) :: fixed\n  s%directories = ''\n  s%directories(2) = '/tmp'\n  fixed = echo_path(s%directories(2))\n  if (trim(fixed) /= '/tmp') error stop 1\n  print *, trim(fixed)\nend program\n",
         "f90",
@@ -6517,6 +7427,13 @@ fn fixed_char_array_component_element_actual_to_char_function_runs() {
 
 #[test]
 fn deferred_char_component_array_element_assignment_round_trips() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=deferred_char_component_array_element_assignment_round_trips count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: simple_command_data_t\n    character(len=:), allocatable :: words(:)\n    integer :: num_words = 0\n  end type simple_command_data_t\n  type :: command_node_t\n    type(simple_command_data_t) :: simple_cmd\n  end type command_node_t\n  type(command_node_t), pointer :: node\n  character(len=32) :: words(1)\n  words(1) = 'true'\n  node => create_simple_command(words, 1)\n  if (trim(node%simple_cmd%words(1)) /= 'true') error stop 1\n  print *, trim(node%simple_cmd%words(1))\ncontains\n  function create_simple_command(words, num_words) result(node)\n    character(len=*), intent(in) :: words(:)\n    integer, intent(in) :: num_words\n    type(command_node_t), pointer :: node\n    integer :: i\n    allocate(node)\n    allocate(character(len=32) :: node%simple_cmd%words(num_words))\n    node%simple_cmd%num_words = num_words\n    do i = 1, num_words\n      node%simple_cmd%words(i) = words(i)\n    end do\n  end function create_simple_command\nend program p\n",
         "f90",
@@ -6554,6 +7471,13 @@ fn deferred_char_component_array_element_assignment_round_trips() {
 
 #[test]
 fn allocatable_fixed_char_actual_to_assumed_len_dummy_round_trips() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_fixed_char_actual_to_assumed_len_dummy_round_trips count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  character(len=32), allocatable :: words(:)\n  allocate(words(1))\n  words(1) = 'true'\n  call check(words)\ncontains\n  subroutine check(words)\n    character(len=*), intent(in) :: words(:)\n    if (trim(words(1)) /= 'true') error stop 1\n    print *, trim(words(1))\n  end subroutine check\nend program p\n",
         "f90",
@@ -6591,6 +7515,13 @@ fn allocatable_fixed_char_actual_to_assumed_len_dummy_round_trips() {
 
 #[test]
 fn allocatable_fixed_char_actual_to_deferred_char_component_array_round_trips() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_fixed_char_actual_to_deferred_char_component_array_round_trips count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: simple_command_data_t\n    character(len=:), allocatable :: words(:)\n    integer :: num_words = 0\n  end type simple_command_data_t\n  type :: command_node_t\n    type(simple_command_data_t) :: simple_cmd\n  end type command_node_t\n  type(command_node_t), pointer :: node\n  character(len=32), allocatable :: words(:)\n  allocate(words(2))\n  words(1) = 'echo'\n  words(2) = 'first'\n  node => create_simple_command(words, 2)\n  if (trim(node%simple_cmd%words(1)) /= 'echo') error stop 1\n  if (trim(node%simple_cmd%words(2)) /= 'first') error stop 2\n  print *, trim(node%simple_cmd%words(1)), trim(node%simple_cmd%words(2))\ncontains\n  function create_simple_command(words, num_words) result(node)\n    character(len=*), intent(in) :: words(:)\n    integer, intent(in) :: num_words\n    type(command_node_t), pointer :: node\n    integer :: i\n    allocate(node)\n    allocate(character(len=32) :: node%simple_cmd%words(num_words))\n    node%simple_cmd%num_words = num_words\n    do i = 1, num_words\n      node%simple_cmd%words(i) = words(i)\n    end do\n  end function create_simple_command\nend program p\n",
         "f90",
@@ -6628,6 +7559,13 @@ fn allocatable_fixed_char_actual_to_deferred_char_component_array_round_trips() 
 
 #[test]
 fn imported_parameter_typed_char_component_allocate_preserves_element_len() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_parameter_typed_char_component_allocate_preserves_element_len count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module cfg\n  implicit none\n  integer, parameter :: max_token_len = 4096\nend module cfg\nprogram p\n  use cfg\n  implicit none\n  type :: simple_command_data_t\n    character(len=:), allocatable :: words(:)\n  end type simple_command_data_t\n  type :: command_node_t\n    type(simple_command_data_t), pointer :: simple_cmd => null()\n  end type command_node_t\n  type(command_node_t), pointer :: node\n  allocate(node)\n  allocate(node%simple_cmd)\n  allocate(character(len=max_token_len) :: node%simple_cmd%words(2))\n  node%simple_cmd%words(1) = 'echo'\n  node%simple_cmd%words(2) = 'first'\n  if (trim(node%simple_cmd%words(1)) /= 'echo') error stop 1\n  if (trim(node%simple_cmd%words(2)) /= 'first') error stop 2\n  print *, trim(node%simple_cmd%words(1)), trim(node%simple_cmd%words(2))\nend program p\n",
         "f90",
@@ -6665,6 +7603,13 @@ fn imported_parameter_typed_char_component_allocate_preserves_element_len() {
 
 #[test]
 fn character_len_max_integer_expr_preserves_exact_large_length() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=character_len_max_integer_expr_preserves_exact_large_length count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  integer(kind=8) :: n\n  character(len=:), allocatable :: s\n  n = 16777217_8\n  allocate(character(len=max(n, 1_8)) :: s)\n  if (len(s) /= n) error stop 1\n  print *, len(s)\nend program p\n",
         "f90",
@@ -6702,6 +7647,13 @@ fn character_len_max_integer_expr_preserves_exact_large_length() {
 
 #[test]
 fn fixed_char_array_actual_to_assumed_len_dummy_reads_second_element() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_char_array_actual_to_assumed_len_dummy_reads_second_element count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  character(len=8) :: tokens(2)\n  tokens(1) = 'read'\n  tokens(2) = 'line'\n  call check(tokens)\ncontains\n  subroutine check(tokens)\n    character(len=*), intent(in) :: tokens(:)\n    if (trim(tokens(2)) /= 'line') error stop 1\n    print *, trim(tokens(2))\n  end subroutine check\nend program p\n",
         "f90",
@@ -6739,6 +7691,13 @@ fn fixed_char_array_actual_to_assumed_len_dummy_reads_second_element() {
 
 #[test]
 fn whole_fixed_char_array_print_dispatches_to_string_writer() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=whole_fixed_char_array_print_dispatches_to_string_writer count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // List-directed and unformatted whole-array PRINT for a fixed-len
     // character array used to fall through to `afs_write_int` because
     // `lower_whole_array_print_simple` only matched Int/Float/Bool — the
@@ -6788,6 +7747,13 @@ fn whole_fixed_char_array_print_dispatches_to_string_writer() {
 
 #[test]
 fn whole_fixed_char_array_scalar_fill_preserves_element_slots() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=whole_fixed_char_array_scalar_fill_preserves_element_slots count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  character(len=8) :: tokens(2)\n  tokens = ''\n  tokens(2) = 'line'\n  if (trim(tokens(2)) /= 'line') error stop 1\n  print *, trim(tokens(2))\nend program p\n",
         "f90",
@@ -6825,6 +7791,13 @@ fn whole_fixed_char_array_scalar_fill_preserves_element_slots() {
 
 #[test]
 fn utf8_string_literal_preserves_source_bytes_at_runtime() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=utf8_string_literal_preserves_source_bytes_at_runtime count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  character(len=:), allocatable :: s\n  s = '├──'\n  if (len(s) /= 9) error stop 1\n  if (len_trim(s) /= 9) error stop 2\n  print *, 'ok'\nend program p\n",
         "f90",
@@ -6861,6 +7834,13 @@ fn utf8_string_literal_preserves_source_bytes_at_runtime() {
 
 #[test]
 fn derived_array_element_fixed_char_component_survives_nested_dummy_call() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=derived_array_element_fixed_char_component_survives_nested_dummy_call count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n\n  type :: command_t\n    integer :: num_tokens = 0\n    character(len=32), allocatable :: tokens(:)\n  end type command_t\n\n  type :: pipeline_t\n    type(command_t), allocatable :: commands(:)\n    integer :: num_commands = 0\n  end type pipeline_t\n\n  type(pipeline_t) :: pipeline\n\n  allocate(pipeline%commands(1))\n  pipeline%num_commands = 1\n  pipeline%commands(1)%num_tokens = 1\n  allocate(character(len=32) :: pipeline%commands(1)%tokens(1))\n  pipeline%commands(1)%tokens(1) = 'true'\n\n  call exec(pipeline)\n\ncontains\n\n  subroutine exec(p)\n    type(pipeline_t), intent(inout) :: p\n    call run_single(p%commands(1))\n  end subroutine exec\n\n  subroutine run_single(cmd)\n    type(command_t), intent(inout) :: cmd\n    if (trim(cmd%tokens(1)) /= 'true') error stop 1\n    print *, 'ok'\n  end subroutine run_single\n\nend program p\n",
         "f90",
@@ -6898,6 +7878,13 @@ fn derived_array_element_fixed_char_component_survives_nested_dummy_call() {
 
 #[test]
 fn module_global_derived_array_fixed_char_component_clears_cleanly() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=module_global_derived_array_fixed_char_component_clears_cleanly count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module cache_mod\n  implicit none\n  integer, parameter :: max_entries = 4\n  type :: entry_t\n    logical :: valid = .false.\n    character(len=256) :: command = ''\n  end type entry_t\n  type(entry_t) :: command_cache(max_entries)\ncontains\n  subroutine clear_command_cache()\n    integer :: i\n    do i = 1, max_entries\n      command_cache(i)%valid = .false.\n      command_cache(i)%command = ''\n    end do\n  end subroutine clear_command_cache\nend module cache_mod\n\nprogram p\n  use cache_mod, only: clear_command_cache, command_cache\n  implicit none\n  call clear_command_cache()\n  if (len_trim(command_cache(1)%command) /= 0) error stop 1\n  print *, 'ok'\nend program p\n",
         "f90",
@@ -6935,6 +7922,13 @@ fn module_global_derived_array_fixed_char_component_clears_cleanly() {
 
 #[test]
 fn deferred_char_component_array_element_actual_to_assumed_len_dummy_survives() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=deferred_char_component_array_element_actual_to_assumed_len_dummy_survives count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: command_t\n    character(len=:), allocatable :: tokens(:)\n  end type command_t\n  type(command_t) :: cmd\n  allocate(character(len=32) :: cmd%tokens(1))\n  cmd%tokens(1) = 'true'\n  if (is_keyword(cmd%tokens(1))) error stop 1\n  print *, trim(cmd%tokens(1))\ncontains\n  function is_keyword(word) result(ok)\n    character(len=*), intent(in) :: word\n    logical :: ok\n    ok = trim(word) == 'if'\n  end function is_keyword\nend program p\n",
         "f90",
@@ -6972,6 +7966,13 @@ fn deferred_char_component_array_element_actual_to_assumed_len_dummy_survives() 
 
 #[test]
 fn select_case_on_trimmed_deferred_char_component_dispatches_correctly() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=select_case_on_trimmed_deferred_char_component_dispatches_correctly count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: command_t\n    character(len=:), allocatable :: tokens(:)\n  end type command_t\n  type(command_t) :: cmd\n  integer :: code\n  allocate(character(len=8) :: cmd%tokens(1))\n  cmd%tokens(1) = 'echo'\n  code = dispatch(cmd)\n  if (code /= 42) error stop 1\n  print *, 'ok'\ncontains\n  integer function dispatch(cmd) result(code)\n    type(command_t), intent(in) :: cmd\n    select case (trim(cmd%tokens(1)))\n    case ('echo')\n      code = 42\n    case default\n      code = 0\n    end select\n  end function dispatch\nend program p\n",
         "f90",
@@ -7009,6 +8010,13 @@ fn select_case_on_trimmed_deferred_char_component_dispatches_correctly() {
 
 #[test]
 fn imported_select_case_label_parameter_is_retained() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_select_case_label_parameter_is_retained count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module kinds_m\n  implicit none\n  integer, parameter :: CMD_SIMPLE = 1\nend module kinds_m\n\nmodule dispatch_m\n  use kinds_m, only: CMD_SIMPLE\n  implicit none\ncontains\n  logical function is_simple(node_type) result(ok)\n    integer, intent(in) :: node_type\n    select case (node_type)\n    case (CMD_SIMPLE)\n      ok = .true.\n    case default\n      ok = .false.\n    end select\n  end function is_simple\nend module dispatch_m\n\nprogram p\n  use dispatch_m\n  implicit none\n  if (.not. is_simple(1)) error stop 1\n  print *, 'ok'\nend program p\n",
         "f90",
@@ -7047,6 +8055,13 @@ fn imported_select_case_label_parameter_is_retained() {
 
 #[test]
 fn scalar_component_actual_to_intent_out_dummy_updates_field() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=scalar_component_actual_to_intent_out_dummy_updates_field count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: state_t\n    integer :: num_tokens = 0\n  end type state_t\n  type(state_t) :: state\n  call set_num(state%num_tokens)\n  if (state%num_tokens /= 2) error stop 1\n  print *, state%num_tokens\ncontains\n  subroutine set_num(n)\n    integer, intent(out) :: n\n    n = 2\n  end subroutine set_num\nend program p\n",
         "f90",
@@ -7084,6 +8099,13 @@ fn scalar_component_actual_to_intent_out_dummy_updates_field() {
 
 #[test]
 fn allocatable_two_dimensional_element_actuals_update_storage() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_two_dimensional_element_actuals_update_storage count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  integer, allocatable :: grid(:,:)\n  allocate(grid(2, 1))\n  grid = 0\n  call set_pair(grid(1, 1), grid(2, 1))\n  if (grid(1, 1) /= 11) error stop 1\n  if (grid(2, 1) /= 22) error stop 2\n  print *, grid(1, 1), grid(2, 1)\ncontains\n  subroutine set_pair(x, y)\n    integer, intent(out) :: x, y\n    x = 11\n    y = 22\n  end subroutine set_pair\nend program p\n",
         "f90",
@@ -7121,6 +8143,13 @@ fn allocatable_two_dimensional_element_actuals_update_storage() {
 
 #[test]
 fn imported_derived_array_global_component_access_compiles() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_derived_array_global_component_access_compiles count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("derived_array_global");
     let dep = write_program_in(
         &dir,
@@ -7181,6 +8210,13 @@ fn imported_derived_array_global_component_access_compiles() {
 
 #[test]
 fn derived_array_element_assignment_with_pointer_component_compiles() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=derived_array_element_assignment_with_pointer_component_compiles count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: node_t\n    integer :: x = 0\n  end type node_t\n  type :: entry_t\n    character(len=256) :: name\n    type(node_t), pointer :: body => null()\n  end type entry_t\n  type(entry_t), save :: entries(4)\ncontains\n  subroutine shift(i)\n    integer, intent(in) :: i\n    entries(i) = entries(i + 1)\n  end subroutine shift\nend module m\n",
         "f90",
@@ -7202,6 +8238,13 @@ fn derived_array_element_assignment_with_pointer_component_compiles() {
 
 #[test]
 fn dash_o_equals_form_sets_output_path() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=dash_o_equals_form_sets_output_path count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program("program p\n  print *, 1\nend program\n", "f90");
     let out = unique_path("oeq", "o");
     let arg = format!("-o={}", out.display());
@@ -7248,6 +8291,13 @@ fn duplicate_o_is_rejected() {
 
 #[test]
 fn multi_input_dash_c_produces_one_object_per_source() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=multi_input_dash_c_produces_one_object_per_source count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("multi_c_ok");
     write_program_in(&dir, "m.f90", "module m\n  integer :: x = 7\nend module\n");
     write_program_in(
@@ -7276,6 +8326,13 @@ fn multi_input_dash_c_produces_one_object_per_source() {
 
 #[test]
 fn compile_only_explicit_object_path_keeps_module_in_current_dir() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=compile_only_explicit_object_path_keeps_module_in_current_dir count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("module_cwd_amod");
     std::fs::create_dir_all(dir.join("src/utils")).expect("mkdir utils");
     std::fs::create_dir_all(dir.join("src/buffer")).expect("mkdir buffer");
@@ -7359,6 +8416,13 @@ fn multi_input_dash_c_with_o_is_rejected() {
 
 #[test]
 fn prebuilt_object_input_links_cleanly() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=prebuilt_object_input_links_cleanly count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program("program p\n  print *, 9\nend program\n", "f90");
     let obj = unique_path("link_only_obj", "o");
     let compile = Command::new(compiler("armfortas"))
@@ -7390,6 +8454,13 @@ fn prebuilt_object_input_links_cleanly() {
 
 #[test]
 fn prebuilt_archive_input_links_after_objects() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=prebuilt_archive_input_links_after_objects count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("link_only_archive");
     let helper_src = write_program_in(
         &dir,
@@ -7478,6 +8549,13 @@ fn prebuilt_archive_input_links_after_objects() {
 
 #[test]
 fn dash_capital_s_produces_assembly_text() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=dash_capital_s_produces_assembly_text count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program("program p\n  print *, 1\nend program\n", "f90");
     let out = unique_path("asm", "s");
     let result = Command::new(compiler("armfortas"))
@@ -7557,6 +8635,13 @@ fn dash_capital_e_without_o_writes_to_stdout() {
 
 #[test]
 fn dash_cpp_accepts_lowercase_preprocessor_source() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=dash_cpp_accepts_lowercase_preprocessor_source count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "#define X 77\nprogram p\n  print *, X\nend program\n",
         "f90",
@@ -7590,6 +8675,13 @@ fn dash_cpp_accepts_lowercase_preprocessor_source() {
 
 #[test]
 fn integer8_bit_intrinsics_accept_default_integer_positions() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=integer8_bit_intrinsics_accept_default_integer_positions count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  integer(8) :: words(4) = 0_8\n  integer :: word_idx, bit_idx\n  word_idx = 1\n  bit_idx = 5\n  words(word_idx) = ior(words(word_idx), ishft(1_8, bit_idx))\n  print *, btest(words(word_idx), bit_idx)\nend program\n",
         "f90",
@@ -7623,6 +8715,13 @@ fn integer8_bit_intrinsics_accept_default_integer_positions() {
 
 #[test]
 fn move_alloc_into_allocatable_component_of_class_dummy_compiles_and_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=move_alloc_into_allocatable_component_of_class_dummy_compiles_and_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: token_t\n    integer :: x = 0\n  end type\n  type :: list_t\n    type(token_t), allocatable :: tokens(:)\n  end type\ncontains\n  subroutine grow(this)\n    class(list_t), intent(inout) :: this\n    type(token_t), allocatable :: temp(:)\n    allocate(temp(4))\n    temp(3)%x = 42\n    call move_alloc(temp, this%tokens)\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(list_t) :: items\n  call grow(items)\n  print *, size(items%tokens), items%tokens(3)%x\nend program\n",
         "f90",
@@ -7656,6 +8755,13 @@ fn move_alloc_into_allocatable_component_of_class_dummy_compiles_and_runs() {
 
 #[test]
 fn move_alloc_between_scalar_allocatable_derived_components_compiles_and_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=move_alloc_between_scalar_allocatable_derived_components_compiles_and_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: inner_t\n    integer :: x = 0\n  end type\n  type :: node_t\n    type(inner_t), allocatable :: val\n  end type\ncontains\n  subroutine grow(list)\n    type(node_t), allocatable, intent(inout) :: list(:)\n    type(node_t), allocatable :: tmp(:)\n    integer :: i\n    call move_alloc(list, tmp)\n    allocate(list(4))\n    do i = 1, min(size(tmp), 4)\n      if (allocated(tmp(i)%val)) then\n        call move_alloc(tmp(i)%val, list(i)%val)\n      end if\n    end do\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(node_t), allocatable :: list(:)\n  allocate(list(2))\n  allocate(list(1)%val)\n  list(1)%val%x = 99\n  call grow(list)\n  print *, size(list), allocated(list(1)%val), list(1)%val%x\nend program\n",
         "f90",
@@ -7689,6 +8795,13 @@ fn move_alloc_between_scalar_allocatable_derived_components_compiles_and_runs() 
 
 #[test]
 fn move_alloc_between_scalar_allocatable_polymorphic_components_compiles() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=move_alloc_between_scalar_allocatable_polymorphic_components_compiles count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: base_t\n  end type\n  type, extends(base_t) :: child_t\n    integer :: x = 0\n  end type\n  type :: node_t\n    class(base_t), allocatable :: val\n  end type\ncontains\n  subroutine grow(list)\n    type(node_t), allocatable, intent(inout) :: list(:)\n    type(node_t), allocatable :: tmp(:)\n    integer :: i\n    call move_alloc(list, tmp)\n    allocate(list(4))\n    do i = 1, min(size(tmp), 4)\n      if (allocated(tmp(i)%val)) then\n        call move_alloc(tmp(i)%val, list(i)%val)\n      end if\n    end do\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(node_t), allocatable :: list(:)\n  class(base_t), allocatable :: tmpval\n  allocate(list(1))\n  allocate(tmpval, source=child_t(77))\n  call move_alloc(tmpval, list(1)%val)\n  call grow(list)\n  print *, 0\nend program\n",
         "f90",
@@ -7709,6 +8822,13 @@ fn move_alloc_between_scalar_allocatable_polymorphic_components_compiles() {
 
 #[test]
 fn move_alloc_from_scalar_allocatable_polymorphic_dummy_compiles() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=move_alloc_from_scalar_allocatable_polymorphic_dummy_compiles count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type, abstract :: base_t\n  end type\n  type, extends(base_t) :: child_t\n    integer :: x = 0\n  end type\n  type :: node_t\n    class(base_t), allocatable :: val\n  end type\ncontains\n  subroutine take(val, node)\n    class(base_t), allocatable, intent(inout) :: val\n    type(node_t), intent(inout) :: node\n    call move_alloc(val, node%val)\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  class(base_t), allocatable :: tmp\n  type(node_t) :: node\n  allocate(tmp, source=child_t(17))\n  call take(tmp, node)\n  print *, 0\nend program\n",
         "f90",
@@ -7729,6 +8849,13 @@ fn move_alloc_from_scalar_allocatable_polymorphic_dummy_compiles() {
 
 #[test]
 fn move_alloc_scalar_class_allocatable_preserves_real_payload_through_select_type() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=move_alloc_scalar_class_allocatable_preserves_real_payload_through_select_type count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type, abstract :: generic_value\n  end type\n  type, extends(generic_value) :: float_value\n    real :: raw = -1.0\n  end type\n  type :: keyval_t\n    class(generic_value), allocatable :: val\n  contains\n    procedure :: set_float\n    procedure :: read_float\n  end type\ncontains\n  subroutine set_float(self, x)\n    class(keyval_t), intent(inout) :: self\n    real, intent(in) :: x\n    type(float_value), allocatable :: tmp\n    allocate(tmp)\n    tmp%raw = x\n    call move_alloc(tmp, self%val)\n  end subroutine\n  real function read_float(self) result(x)\n    class(keyval_t), intent(in) :: self\n    real, pointer :: ptr\n    ptr => cast_float(self%val)\n    if (.not.associated(ptr)) error stop 1\n    x = ptr\n  end function\n  function cast_float(val) result(ptr)\n    class(generic_value), intent(in), target :: val\n    real, pointer :: ptr\n    nullify(ptr)\n    select type(val)\n    type is(float_value)\n      ptr => val%raw\n    end select\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  type(keyval_t) :: kv\n  real :: x\n  call kv%set_float(1.0)\n  x = kv%read_float()\n  if (abs(x - 1.0) > 1.0e-6) error stop 2\n  print *, 'ok'\nend program\n",
         "f90",
@@ -7767,6 +8894,13 @@ fn move_alloc_scalar_class_allocatable_preserves_real_payload_through_select_typ
 
 #[test]
 fn move_alloc_scalar_class_allocatable_preserves_real8_payload_through_select_type() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=move_alloc_scalar_class_allocatable_preserves_real8_payload_through_select_type count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  integer, parameter :: rk = selected_real_kind(15)\n  type, abstract :: generic_value\n  end type\n  type, extends(generic_value) :: float_value\n    real(rk) :: raw = -1.0_rk\n  end type\n  type :: keyval_t\n    class(generic_value), allocatable :: val\n  contains\n    procedure :: set_float\n    procedure :: read_float\n  end type\ncontains\n  subroutine set_float(self, x)\n    class(keyval_t), intent(inout) :: self\n    real(rk), intent(in) :: x\n    type(float_value), allocatable :: tmp\n    allocate(tmp)\n    tmp%raw = x\n    call move_alloc(tmp, self%val)\n  end subroutine\n  real(rk) function read_float(self) result(x)\n    class(keyval_t), intent(in) :: self\n    real(rk), pointer :: ptr\n    ptr => cast_float(self%val)\n    if (.not.associated(ptr)) error stop 1\n    x = ptr\n  end function\n  function cast_float(val) result(ptr)\n    class(generic_value), intent(in), target :: val\n    real(rk), pointer :: ptr\n    nullify(ptr)\n    select type(val)\n    type is(float_value)\n      ptr => val%raw\n    end select\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  type(keyval_t) :: kv\n  real(rk) :: x\n  call kv%set_float(1.0_rk)\n  x = kv%read_float()\n  if (abs(x - 1.0_rk) > 1.0e-12_rk) error stop 2\n  print *, 'ok'\nend program\n",
         "f90",
@@ -7805,6 +8939,13 @@ fn move_alloc_scalar_class_allocatable_preserves_real8_payload_through_select_ty
 
 #[test]
 fn real8_payload_round_trips_through_real4_getter_wrapper() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=real8_payload_round_trips_through_real4_getter_wrapper count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  integer, parameter :: tf_sp = selected_real_kind(6)\n  integer, parameter :: rk = selected_real_kind(15)\n  type, abstract :: generic_value\n  end type\n  type, extends(generic_value) :: float_value\n    real(rk) :: raw = -1.0_rk\n  end type\n  type :: keyval_t\n    class(generic_value), allocatable :: val\n  contains\n    procedure :: set_float\n    procedure :: get_float_ptr\n    procedure :: get_float_sp\n  end type\ncontains\n  subroutine set_float(self, x)\n    class(keyval_t), intent(inout) :: self\n    real(rk), intent(in) :: x\n    type(float_value), allocatable :: tmp\n    allocate(tmp)\n    tmp%raw = x\n    call move_alloc(tmp, self%val)\n  end subroutine\n  subroutine get_float_ptr(self, ptr)\n    class(keyval_t), intent(in) :: self\n    real(rk), pointer, intent(out) :: ptr\n    ptr => cast_float(self%val)\n  end subroutine\n  subroutine get_float_sp(self, x)\n    class(keyval_t), intent(in) :: self\n    real(tf_sp), intent(out) :: x\n    real(rk), pointer :: ptr\n    call self%get_float_ptr(ptr)\n    if (.not.associated(ptr)) error stop 1\n    x = real(ptr, tf_sp)\n  end subroutine\n  function cast_float(val) result(ptr)\n    class(generic_value), intent(in), target :: val\n    real(rk), pointer :: ptr\n    nullify(ptr)\n    select type(val)\n    type is(float_value)\n      ptr => val%raw\n    end select\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  type(keyval_t) :: kv\n  real(tf_sp) :: x\n  call kv%set_float(1.0_rk)\n  call kv%get_float_sp(x)\n  if (abs(x - 1.0_tf_sp) > 1.0e-6_tf_sp) error stop 2\n  print *, 'ok'\nend program\n",
         "f90",
@@ -7843,6 +8984,13 @@ fn real8_payload_round_trips_through_real4_getter_wrapper() {
 
 #[test]
 fn move_alloc_nested_class_allocatable_container_preserves_real_payload() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=move_alloc_nested_class_allocatable_container_preserves_real_payload count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type, abstract :: generic_value\n  end type\n  type, extends(generic_value) :: float_value\n    real :: raw = -1.0\n  end type\n  type, abstract :: value_t\n  end type\n  type, extends(value_t) :: keyval_t\n    class(generic_value), allocatable :: val\n  contains\n    procedure :: set_float\n    procedure :: read_float\n  end type\n  type :: node_t\n    class(value_t), allocatable :: val\n  end type\n  type :: list_t\n    type(node_t), allocatable :: lst(:)\n    integer :: n = 0\n  contains\n    procedure :: push_back\n    procedure :: get_float\n  end type\ncontains\n  subroutine set_float(self, x)\n    class(keyval_t), intent(inout) :: self\n    real, intent(in) :: x\n    type(float_value), allocatable :: tmp\n    allocate(tmp)\n    tmp%raw = x\n    call move_alloc(tmp, self%val)\n  end subroutine\n  real function read_float(self) result(x)\n    class(keyval_t), intent(in) :: self\n    real, pointer :: ptr\n    ptr => cast_float(self%val)\n    if (.not.associated(ptr)) error stop 1\n    x = ptr\n  end function\n  function cast_float(val) result(ptr)\n    class(generic_value), intent(in), target :: val\n    real, pointer :: ptr\n    nullify(ptr)\n    select type(val)\n    type is(float_value)\n      ptr => val%raw\n    end select\n  end function\n  subroutine push_back(self, val)\n    class(list_t), intent(inout) :: self\n    class(value_t), allocatable, intent(inout) :: val\n    if (.not.allocated(self%lst)) then\n      allocate(self%lst(1))\n    end if\n    self%n = self%n + 1\n    call move_alloc(val, self%lst(self%n)%val)\n  end subroutine\n  subroutine get_float(self, idx, x)\n    class(list_t), intent(inout) :: self\n    integer, intent(in) :: idx\n    real, intent(out) :: x\n    class(value_t), pointer :: any\n    nullify(any)\n    if (allocated(self%lst(idx)%val)) any => self%lst(idx)%val\n    if (.not.associated(any)) error stop 2\n    select type(any)\n    type is(keyval_t)\n      x = any%read_float()\n    class default\n      error stop 3\n    end select\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(list_t) :: list\n  type(keyval_t), allocatable :: item\n  real :: x\n  allocate(item)\n  call item%set_float(1.0)\n  call list%push_back(item)\n  call list%get_float(1, x)\n  if (abs(x - 1.0) > 1.0e-6) error stop 4\n  print *, 'ok'\nend program\n",
         "f90",
@@ -7881,6 +9029,13 @@ fn move_alloc_nested_class_allocatable_container_preserves_real_payload() {
 
 #[test]
 fn alloc_source_from_class_pointer_deep_copies_nested_allocatable_payload() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=alloc_source_from_class_pointer_deep_copies_nested_allocatable_payload count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type, abstract :: base_value\n  contains\n    procedure(destroy_i), deferred :: destroy\n  end type\n  abstract interface\n    subroutine destroy_i(self)\n      import :: base_value\n      class(base_value), intent(inout) :: self\n    end subroutine\n  end interface\n  type, abstract :: generic_value\n  end type\n  type, extends(generic_value) :: bool_value\n    logical :: raw = .false.\n  end type\n  type, extends(base_value) :: keyval_t\n    class(generic_value), allocatable :: val\n  contains\n    procedure :: destroy => keyval_destroy\n    procedure :: set_bool\n    procedure :: get_bool\n  end type\ncontains\n  subroutine set_bool(self, x)\n    class(keyval_t), intent(inout) :: self\n    logical, intent(in) :: x\n    type(bool_value), allocatable :: tmp\n    allocate(tmp)\n    tmp%raw = x\n    call move_alloc(tmp, self%val)\n  end subroutine\n  subroutine get_bool(self, x)\n    class(keyval_t), intent(in) :: self\n    logical, intent(out) :: x\n    logical, pointer :: ptr\n    ptr => cast_bool(self%val)\n    if (.not.associated(ptr)) error stop 1\n    x = ptr\n  end subroutine\n  function cast_bool(val) result(ptr)\n    class(generic_value), intent(in), target :: val\n    logical, pointer :: ptr\n    nullify(ptr)\n    select type(val)\n    type is(bool_value)\n      ptr => val%raw\n    end select\n  end function\n  subroutine keyval_destroy(self)\n    class(keyval_t), intent(inout) :: self\n    if (allocated(self%val)) deallocate(self%val)\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(keyval_t), allocatable, target :: src\n  class(base_value), allocatable :: clone\n  class(base_value), pointer :: ptr\n  logical :: x\n  allocate(src)\n  call src%set_bool(.false.)\n  ptr => src\n  allocate(clone, source=ptr)\n  call src%destroy()\n  deallocate(src)\n  select type(clone)\n  type is(keyval_t)\n    call clone%get_bool(x)\n  class default\n    error stop 2\n  end select\n  if (x .neqv. .false.) error stop 3\n  print *, 'ok'\nend program\n",
         "f90",
@@ -7917,6 +9072,13 @@ fn alloc_source_from_class_pointer_deep_copies_nested_allocatable_payload() {
 
 #[test]
 fn deferred_bound_get_through_class_holder_returns_allocatable_component_pointer() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=deferred_bound_get_through_class_holder_returns_allocatable_component_pointer count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type, abstract :: payload_t\n  end type\n  type, extends(payload_t) :: keyval_t\n    real :: x = 0.0\n  end type\n  type, abstract :: list_base_t\n  contains\n    procedure(get_i), deferred :: get\n    procedure(push_i), deferred :: push_back\n  end type\n  abstract interface\n    subroutine get_i(self, idx, ptr)\n      import :: list_base_t, payload_t\n      class(list_base_t), intent(inout), target :: self\n      integer, intent(in) :: idx\n      class(payload_t), pointer, intent(out) :: ptr\n    end subroutine\n    subroutine push_i(self, val)\n      import :: list_base_t, payload_t\n      class(list_base_t), intent(inout), target :: self\n      class(payload_t), allocatable, intent(inout) :: val\n    end subroutine\n  end interface\n  type :: node_t\n    class(payload_t), allocatable :: val\n  end type\n  type, extends(list_base_t) :: list_impl_t\n    type(node_t), allocatable :: lst(:)\n    integer :: n = 0\n  contains\n    procedure :: get => impl_get\n    procedure :: push_back => impl_push_back\n  end type\n  type :: array_t\n    class(list_base_t), allocatable :: list\n  contains\n    procedure :: init\n    procedure :: set_first\n    procedure :: get_first\n  end type\ncontains\n  subroutine init(self)\n    class(array_t), intent(out) :: self\n    type(list_impl_t), allocatable :: tmp\n    allocate(tmp)\n    call move_alloc(tmp, self%list)\n  end subroutine\n  subroutine impl_push_back(self, val)\n    class(list_impl_t), intent(inout), target :: self\n    class(payload_t), allocatable, intent(inout) :: val\n    if (.not. allocated(self%lst)) allocate(self%lst(1))\n    self%n = self%n + 1\n    call move_alloc(val, self%lst(self%n)%val)\n  end subroutine\n  subroutine impl_get(self, idx, ptr)\n    class(list_impl_t), intent(inout), target :: self\n    integer, intent(in) :: idx\n    class(payload_t), pointer, intent(out) :: ptr\n    nullify(ptr)\n    if (idx > 0 .and. idx <= self%n) then\n      if (allocated(self%lst(idx)%val)) ptr => self%lst(idx)%val\n    end if\n  end subroutine\n  subroutine set_first(self, x)\n    class(array_t), intent(inout) :: self\n    real, intent(in) :: x\n    type(keyval_t), allocatable :: tmp\n    allocate(tmp)\n    tmp%x = x\n    call self%list%push_back(tmp)\n  end subroutine\n  real function get_first(self) result(x)\n    class(array_t), intent(inout) :: self\n    class(payload_t), pointer :: ptr\n    x = -1.0\n    call self%list%get(1, ptr)\n    if (.not. associated(ptr)) error stop 1\n    select type(ptr)\n    type is(keyval_t)\n      x = ptr%x\n    class default\n      error stop 2\n    end select\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  type(array_t) :: arr\n  call arr%init()\n  call arr%set_first(1.0)\n  if (abs(arr%get_first() - 1.0) > 1.0e-6) error stop 3\n  print *, 'ok'\nend program\n",
         "f90",
@@ -7955,6 +9117,13 @@ fn deferred_bound_get_through_class_holder_returns_allocatable_component_pointer
 
 #[test]
 fn imported_deferred_bound_get_through_class_holder_preserves_payload_pointer() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_deferred_bound_get_through_class_holder_preserves_payload_pointer count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("imported_deferred_bound_get_holder");
     let payload_src = write_program_in(
         &dir,
@@ -8056,6 +9225,13 @@ fn imported_deferred_bound_get_through_class_holder_preserves_payload_pointer() 
 
 #[test]
 fn imported_keyval_cast_after_deferred_bound_get_preserves_real8_payload() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_keyval_cast_after_deferred_bound_get_preserves_real8_payload count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("imported_keyval_cast_after_get");
     let value_src = write_program_in(
         &dir,
@@ -8157,6 +9333,13 @@ fn imported_keyval_cast_after_deferred_bound_get_preserves_real8_payload() {
 
 #[test]
 fn imported_generic_function_accepts_imported_derived_actual() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_generic_function_accepts_imported_derived_actual count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("imported_generic_function_derived");
     let types_src = write_program_in(
         &dir,
@@ -8242,6 +9425,13 @@ fn imported_generic_function_accepts_imported_derived_actual() {
 
 #[test]
 fn merged_imported_generic_function_preserves_imported_derived_specifics() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=merged_imported_generic_function_preserves_imported_derived_specifics count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("merged_imported_generic_function");
     let types_src = write_program_in(
         &dir,
@@ -8335,6 +9525,13 @@ fn merged_imported_generic_function_preserves_imported_derived_specifics() {
 
 #[test]
 fn merged_imported_generic_amod_reexports_imported_specifics() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=merged_imported_generic_amod_reexports_imported_specifics count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("merged_imported_generic_amod");
     let types_src = write_program_in(
         &dir,
@@ -8401,6 +9598,13 @@ fn merged_imported_generic_amod_reexports_imported_specifics() {
 
 #[test]
 fn type_bound_subroutine_call_uses_module_qualified_symbol_and_links() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=type_bound_subroutine_call_uses_module_qualified_symbol_and_links count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: counter_t\n    integer :: value = 0\n  contains\n    procedure :: bump => counter_bump\n  end type\ncontains\n  subroutine counter_bump(this, delta)\n    class(counter_t), intent(inout) :: this\n    integer, intent(in) :: delta\n    this%value = this%value + delta\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(counter_t) :: counter\n  call counter%bump(7)\n  print *, counter%value\nend program\n",
         "f90",
@@ -8434,6 +9638,13 @@ fn type_bound_subroutine_call_uses_module_qualified_symbol_and_links() {
 
 #[test]
 fn type_bound_call_preserves_absent_optional_slots() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=type_bound_call_preserves_absent_optional_slots count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: list_t\n    integer :: x = 0\n  contains\n    procedure :: init\n    procedure :: ensure\n  end type\ncontains\n  subroutine init(this, n)\n    class(list_t), intent(inout) :: this\n    integer, intent(in), optional :: n\n    if (present(n)) then\n      this%x = n\n    else\n      this%x = 42\n    end if\n  end subroutine\n\n  subroutine ensure(this)\n    class(list_t), intent(inout) :: this\n    call this%init()\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(list_t) :: v\n  call v%ensure()\n  if (v%x /= 42) error stop 1\n  print *, v%x\nend program\n",
         "f90",
@@ -8467,6 +9678,13 @@ fn type_bound_call_preserves_absent_optional_slots() {
 
 #[test]
 fn imported_type_bound_call_preserves_absent_optional_slots() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_type_bound_call_preserves_absent_optional_slots count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("imported_type_bound_optional");
     let mod_src = dir.join("m.f90");
     let main_src = dir.join("p.f90");
@@ -8552,6 +9770,13 @@ fn imported_type_bound_call_preserves_absent_optional_slots() {
 
 #[test]
 fn imported_type_bound_alias_preserves_absent_optional_slots() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_type_bound_alias_preserves_absent_optional_slots count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("imported_type_bound_optional_alias");
     let mod_src = dir.join("m.f90");
     let main_src = dir.join("p.f90");
@@ -8637,6 +9862,13 @@ fn imported_type_bound_alias_preserves_absent_optional_slots() {
 
 #[test]
 fn type_bound_call_on_allocatable_component_array_element_mutates_real_receiver() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=type_bound_call_on_allocatable_component_array_element_mutates_real_receiver count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: item_t\n    integer :: n = 0\n    integer, allocatable :: vals(:)\n  contains\n    procedure :: push\n  end type\n  type :: container_t\n    type(item_t), allocatable :: items(:)\n  contains\n    procedure :: init\n  end type\ncontains\n  subroutine push(this, value)\n    class(item_t), intent(inout) :: this\n    integer, intent(in) :: value\n    if (.not. allocated(this%vals)) allocate(this%vals(4))\n    this%n = this%n + 1\n    this%vals(this%n) = value\n  end subroutine\n  subroutine init(this, count)\n    class(container_t), intent(inout) :: this\n    integer, intent(in) :: count\n    if (allocated(this%items)) deallocate(this%items)\n    allocate(this%items(count))\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(container_t) :: box\n  call box%init(2)\n  call box%items(1)%push(19)\n  if (box%items(1)%n /= 1) error stop 1\n  if (box%items(1)%vals(1) /= 19) error stop 2\n  print *, box%items(1)%n, box%items(1)%vals(1)\nend program\n",
         "f90",
@@ -8835,6 +10067,13 @@ fn multiple_select_case_defaults_are_rejected_before_codegen() {
 
 #[test]
 fn logical_and_or_short_circuit_in_conditions() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=logical_and_or_short_circuit_in_conditions count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  if (.false. .and. boom()) stop 1\n  if (.true. .or. boom()) stop 2\ncontains\n  logical function boom()\n    error stop 7\n  end function boom\nend program\n",
         "f90",
@@ -8940,6 +10179,13 @@ fn std_f95_rejects_f2008_error_stop() {
 
 #[test]
 fn std_space_form_is_accepted() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=std_space_form_is_accepted count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program("program p\n  print *, 7\nend program\n", "f90");
     let out = unique_path("std_space", "bin");
     let result = Command::new(compiler("armfortas"))
@@ -9109,6 +10355,13 @@ fn help_and_version_use_last_flag_wins_precedence() {
 
 #[test]
 fn response_file_supplies_arguments() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=response_file_supplies_arguments count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program("program p\n  print *, 7\nend program\n", "f90");
     let out = unique_path("resp", "bin");
     let resp = unique_path("flags", "txt");
@@ -9161,6 +10414,13 @@ fn diagnostics_format_json_is_rejected_until_implemented() {
 
 #[test]
 fn nested_response_files_support_quotes_and_relative_paths() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=nested_response_files_support_quotes_and_relative_paths count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("rsp nested");
     let src = write_program_in(
         &dir,
@@ -9193,6 +10453,13 @@ fn nested_response_files_support_quotes_and_relative_paths() {
 
 #[test]
 fn accepted_but_unimplemented_flags_emit_warnings() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=accepted_but_unimplemented_flags_emit_warnings count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program("program p\n  print *, 7\nend program\n", "f90");
     let out = unique_path("warn_flags", "o");
     let result = Command::new(compiler("armfortas"))
@@ -9252,6 +10519,13 @@ fn accepted_but_unimplemented_flags_emit_warnings() {
 
 #[test]
 fn fcheck_all_warns_about_partial_support() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fcheck_all_warns_about_partial_support count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program("program p\n  print *, 7\nend program\n", "f90");
     let out = unique_path("warn_fcheck_all", "o");
     let result = Command::new(compiler("armfortas"))
@@ -9367,6 +10641,13 @@ fn werror_promotes_cli_warnings_to_errors() {
 
 #[test]
 fn ffree_line_length_none_is_accepted_with_warning() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=ffree_line_length_none_is_accepted_with_warning count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program("program p\n  print *, 7\nend program\n", "f90");
     let out = unique_path("ffree_line_length_none", "o");
     let result = Command::new(compiler("armfortas"))
@@ -9392,6 +10673,13 @@ fn ffree_line_length_none_is_accepted_with_warning() {
 
 #[test]
 fn unknown_warning_flag_emits_warning() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=unknown_warning_flag_emits_warning count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program("program p\n  print *, 7\nend program\n", "f90");
     let out = unique_path("wunknown", "o");
     let result = Command::new(compiler("armfortas"))
@@ -9420,6 +10708,13 @@ fn unknown_warning_flag_emits_warning() {
 
 #[test]
 fn wpedantic_warns_on_arithmetic_if() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=wpedantic_warns_on_arithmetic_if count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  integer :: i\n  i = 0\n  if (i) 10, 20, 30\n10 continue\n20 continue\n30 continue\nend program\n",
         "f90",
@@ -9449,6 +10744,13 @@ fn wpedantic_warns_on_arithmetic_if() {
 
 #[test]
 fn wdeprecated_warns_on_common_block() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=wdeprecated_warns_on_common_block count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  integer :: x\n  common /blk/ x\nend program\n",
         "f90",
@@ -9478,6 +10780,13 @@ fn wdeprecated_warns_on_common_block() {
 
 #[test]
 fn unknown_warning_flag_can_be_suppressed() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=unknown_warning_flag_can_be_suppressed count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program("program p\n  print *, 7\nend program\n", "f90");
     let out = unique_path("wunknown_suppressed", "o");
     let result = Command::new(compiler("armfortas"))
@@ -9524,6 +10833,13 @@ fn missing_response_file_uses_io_exit_code() {
 
 #[test]
 fn escaped_at_prefixed_input_is_treated_as_literal_filename() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=escaped_at_prefixed_input_is_treated_as_literal_filename count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("at_input");
     write_program_in(&dir, "@file.f90", "program p\n  print *, 7\nend program\n");
     let out = dir.join("at_file.o");
@@ -9546,6 +10862,13 @@ fn escaped_at_prefixed_input_is_treated_as_literal_filename() {
 
 #[test]
 fn dash_j_writes_amod_to_chosen_directory() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=dash_j_writes_amod_to_chosen_directory count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program("module dashj_mod\n  integer :: y = 5\nend module\n", "f90");
     let out = unique_path("dashjobj", "o");
     let amod_dir = std::env::temp_dir().join(format!(
@@ -9582,6 +10905,13 @@ fn dash_j_writes_amod_to_chosen_directory() {
 
 #[test]
 fn dash_j_nonexistent_dir_is_hard_error() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=dash_j_nonexistent_dir_is_hard_error count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("dashj_bad");
     let src = write_program_in(
         &dir,
@@ -9614,6 +10944,13 @@ fn dash_j_nonexistent_dir_is_hard_error() {
 
 #[test]
 fn dash_j_also_searches_for_modules_on_dependent_compile() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=dash_j_also_searches_for_modules_on_dependent_compile count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("dashj_search");
     let mod_dir = dir.join("modules");
     std::fs::create_dir_all(&mod_dir).unwrap();
@@ -9671,6 +11008,13 @@ fn dash_j_also_searches_for_modules_on_dependent_compile() {
 
 #[test]
 fn dash_i_equals_form_finds_modules() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=dash_i_equals_form_finds_modules count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("ieq_mod");
     let mod_src = write_program_in(
         &dir,
@@ -9720,6 +11064,13 @@ fn dash_i_equals_form_finds_modules() {
 
 #[test]
 fn block_use_imports_module_values_and_procedures() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=block_use_imports_module_values_and_procedures count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("block_use_mod");
     let mod_src = write_program_in(
         &dir,
@@ -9772,6 +11123,13 @@ fn block_use_imports_module_values_and_procedures() {
 
 #[test]
 fn block_local_variable_shadows_use_associated_parameter_for_assignment() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=block_local_variable_shadows_use_associated_parameter_for_assignment count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module constants\n  implicit none\n  real, parameter :: e = 2.7182818\nend module\nprogram p\n  use constants\n  implicit none\n  block\n    real :: E\n    E = 1.0\n    if (abs(E - 1.0) > 1.0e-6) error stop 1\n  end block\n  print *, 'ok'\nend program\n",
         "f90",
@@ -9807,6 +11165,13 @@ fn block_local_variable_shadows_use_associated_parameter_for_assignment() {
 
 #[test]
 fn block_interface_declares_callable_under_implicit_none() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=block_interface_declares_callable_under_implicit_none count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "subroutine s(acc_status)\n  use iso_c_binding, only: c_char, c_int\n  implicit none\n  integer, intent(out) :: acc_status\n  character(kind=c_char), target :: c_path(2)\n  block\n    interface\n      function cache_access(pathname, mode) bind(C, name=\"access\")\n        import :: c_char, c_int\n        character(kind=c_char), intent(in) :: pathname(*)\n        integer(c_int), value :: mode\n        integer(c_int) :: cache_access\n      end function\n    end interface\n    acc_status = cache_access(c_path, int(1, c_int))\n  end block\nend subroutine\n",
         "f90",
@@ -9828,6 +11193,13 @@ fn block_interface_declares_callable_under_implicit_none() {
 
 #[test]
 fn named_block_exit_after_deferred_char_assignment_skips_remaining_body() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=named_block_exit_after_deferred_char_assignment_skips_remaining_body count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  integer, allocatable :: vshape(:)\n  integer :: stat\n  character(len=:), allocatable :: msg\n\n  allocate(vshape(0))\n  stat = 0\n\n  catch: block\n    if (size(vshape) /= 2) then\n      stat = 1\n      msg = 'rank mismatch'\n      exit catch\n    end if\n    call allocator(vshape)\n  end block catch\n\n  if (stat /= 1) error stop 20\n  if (.not. allocated(msg)) error stop 21\ncontains\n  subroutine allocator(vshape)\n    integer, intent(in) :: vshape(:)\n    integer, allocatable :: array(:, :)\n    allocate(array(vshape(1), vshape(2)))\n  end subroutine allocator\nend program\n",
         "f90",
@@ -9858,6 +11230,13 @@ fn named_block_exit_after_deferred_char_assignment_skips_remaining_body() {
 
 #[test]
 fn public_derived_type_in_private_module_is_emitted_and_importable() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=public_derived_type_in_private_module_is_emitted_and_importable count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("public_type_mod");
     let mod_src = write_program_in(
         &dir,
@@ -9923,6 +11302,13 @@ fn public_derived_type_in_private_module_is_emitted_and_importable() {
 
 #[test]
 fn imported_named_char_component_lengths_round_trip_through_amod_and_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_named_char_component_lengths_round_trip_through_amod_and_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("named_char_component_amod");
     let cfg_src = write_program_in(
         &dir,
@@ -10049,6 +11435,13 @@ fn imported_named_char_component_lengths_round_trip_through_amod_and_run() {
 
 #[test]
 fn deferred_type_bound_proc_interface_survives_amod_export() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=deferred_type_bound_proc_interface_survives_amod_export count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("deferred_tbp_interface_amod");
     let mod_src = write_program_in(
         &dir,
@@ -10092,6 +11485,13 @@ fn deferred_type_bound_proc_interface_survives_amod_export() {
 
 #[test]
 fn polymorphic_component_type_bound_call_dispatches_through_scalar_allocatable_descriptor() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=polymorphic_component_type_bound_call_dispatches_through_scalar_allocatable_descriptor count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type, abstract :: list_base_t\n  contains\n    procedure(get_len_i), deferred :: get_len\n    procedure(push_i), deferred :: push\n  end type\n  abstract interface\n    integer function get_len_i(self) result(length)\n      import :: list_base_t\n      class(list_base_t), intent(in) :: self\n    end function\n    subroutine push_i(self, n)\n      import :: list_base_t\n      class(list_base_t), intent(inout) :: self\n      integer, intent(in) :: n\n    end subroutine\n  end interface\n  type, extends(list_base_t) :: list_impl_t\n    integer :: n = 0\n  contains\n    procedure :: get_len => impl_get_len\n    procedure :: push => impl_push\n  end type\n  type :: array_t\n    class(list_base_t), allocatable :: list\n  contains\n    procedure :: init => array_init\n    procedure :: size_of => array_size_of\n    procedure :: push_one => array_push_one\n  end type\ncontains\n  subroutine array_init(self, n)\n    class(array_t), intent(out) :: self\n    integer, intent(in) :: n\n    type(list_impl_t), allocatable :: list\n    allocate(list)\n    list%n = n\n    call move_alloc(list, self%list)\n  end subroutine\n  integer function impl_get_len(self) result(length)\n    class(list_impl_t), intent(in) :: self\n    length = self%n\n  end function\n  subroutine impl_push(self, n)\n    class(list_impl_t), intent(inout) :: self\n    integer, intent(in) :: n\n    self%n = self%n + n\n  end subroutine\n  integer function array_size_of(self) result(length)\n    class(array_t), intent(in) :: self\n    length = self%list%get_len()\n  end function\n  subroutine array_push_one(self, n)\n    class(array_t), intent(inout) :: self\n    integer, intent(in) :: n\n    call self%list%push(n)\n  end subroutine\nend module\nprogram main\n  use m\n  implicit none\n  type(array_t) :: arr\n  call arr%init(3)\n  call arr%push_one(4)\n  if (arr%size_of() /= 7) error stop 1\n  print *, 'ok'\nend program\n",
         "f90",
@@ -10127,6 +11527,13 @@ fn polymorphic_component_type_bound_call_dispatches_through_scalar_allocatable_d
 
 #[test]
 fn typed_allocate_class_component_sets_runtime_type_tag_for_dispatch() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=typed_allocate_class_component_sets_runtime_type_tag_for_dispatch count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type, abstract :: base\n  contains\n    procedure(get_keys_i), deferred :: get_keys\n  end type\n  abstract interface\n    subroutine get_keys_i(self)\n      import :: base\n      class(base), intent(inout) :: self\n    end subroutine\n  end interface\n  type, extends(base) :: child\n  contains\n    procedure :: get_keys => child_get_keys\n  end type\n  type :: holder\n    class(base), allocatable :: map\n  contains\n    procedure :: ping\n  end type\ncontains\n  subroutine child_get_keys(self)\n    class(child), intent(inout) :: self\n    print *, 'keys'\n  end subroutine\n  subroutine ping(self)\n    class(holder), intent(inout) :: self\n    call self%map%get_keys()\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(holder) :: h\n  allocate(child :: h%map)\n  call h%ping()\nend program\n",
         "f90",
@@ -10163,6 +11570,13 @@ fn typed_allocate_class_component_sets_runtime_type_tag_for_dispatch() {
 
 #[test]
 fn component_bound_dispatch_keeps_module_specific_target_name() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=component_bound_dispatch_keeps_module_specific_target_name count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module list_m\n  implicit none\n  type, abstract :: list_t\n  contains\n    procedure(get_len_i), deferred :: get_len\n  end type\n  abstract interface\n    integer function get_len_i(self) result(length)\n      import :: list_t\n      class(list_t), intent(in) :: self\n    end function\n  end interface\n  type, extends(list_t) :: list_impl_t\n    integer :: n = 0\n  contains\n    procedure :: get_len => impl_get_len\n  end type\ncontains\n  integer function impl_get_len(self) result(length)\n    class(list_impl_t), intent(in) :: self\n    length = self%n\n  end function\nend module\n\nmodule array_m\n  use list_m, only : list_t, list_impl_t\n  implicit none\n  type :: array_t\n    class(list_t), allocatable :: list\n  contains\n    procedure :: init\n    procedure :: get_len => array_get_len\n  end type\ncontains\n  subroutine init(self, n)\n    class(array_t), intent(out) :: self\n    integer, intent(in) :: n\n    type(list_impl_t), allocatable :: tmp\n    allocate(tmp)\n    tmp%n = n\n    call move_alloc(tmp, self%list)\n  end subroutine\n  integer function array_get_len(self) result(length)\n    class(array_t), intent(in) :: self\n    length = self%list%get_len()\n  end function\nend module\n\nprogram p\n  use array_m\n  implicit none\n  type(array_t) :: arr\n  call arr%init(7)\n  if (arr%get_len() /= 7) error stop 1\n  print *, 'ok'\nend program\n",
         "f90",
@@ -10199,6 +11613,13 @@ fn component_bound_dispatch_keeps_module_specific_target_name() {
 
 #[test]
 fn inherited_generic_tbp_alias_retargets_to_cross_tu_override() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=inherited_generic_tbp_alias_retargets_to_cross_tu_override count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("generic_tbp_alias_override");
     let base_src = write_program_in(
         &dir,
@@ -10284,6 +11705,13 @@ fn inherited_generic_tbp_alias_retargets_to_cross_tu_override() {
 
 #[test]
 fn imported_inherited_bound_proc_dispatches_from_external_base_module() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_inherited_bound_proc_dispatches_from_external_base_module count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("imported_inherited_bound_proc_dispatch");
     let base_src = write_program_in(
         &dir,
@@ -10367,6 +11795,13 @@ fn imported_inherited_bound_proc_dispatches_from_external_base_module() {
 
 #[test]
 fn merged_generic_prefers_imported_pointer_specific_over_local_array_specific() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=merged_generic_prefers_imported_pointer_specific_over_local_array_specific count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("merged_generic_pointer_specific");
     let keyval_src = write_program_in(
         &dir,
@@ -10450,6 +11885,13 @@ fn merged_generic_prefers_imported_pointer_specific_over_local_array_specific() 
 
 #[test]
 fn merged_use_associated_generic_char_function_inside_concat_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=merged_use_associated_generic_char_function_inside_concat_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("merged_generic_char_concat");
     let dt_src = write_program_in(
         &dir,
@@ -10535,6 +11977,13 @@ fn merged_use_associated_generic_char_function_inside_concat_runs() {
 
 #[test]
 fn module_subroutine_uses_datetime_stringifier_across_other_generic_modules() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=module_subroutine_uses_datetime_stringifier_across_other_generic_modules count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("module_subroutine_datetime_to_string");
     let dt_src = write_program_in(
         &dir,
@@ -10637,6 +12086,13 @@ fn module_subroutine_uses_datetime_stringifier_across_other_generic_modules() {
 
 #[test]
 fn local_name_semantic_type_beats_cross_scope_fallback_in_generic_dispatch() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=local_name_semantic_type_beats_cross_scope_fallback_in_generic_dispatch count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("generic_local_name_precedence");
     let noise_src = write_program_in(
         &dir,
@@ -10731,6 +12187,13 @@ fn local_name_semantic_type_beats_cross_scope_fallback_in_generic_dispatch() {
 
 #[test]
 fn local_pointer_semantic_type_beats_cross_scope_class_fallback_in_generic_dispatch() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=local_pointer_semantic_type_beats_cross_scope_class_fallback_in_generic_dispatch count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("generic_local_pointer_precedence");
     let noise_src = write_program_in(
         &dir,
@@ -10817,6 +12280,13 @@ fn local_pointer_semantic_type_beats_cross_scope_class_fallback_in_generic_dispa
 
 #[test]
 fn merged_generic_keeps_same_named_specifics_scoped_to_owner_module() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=merged_generic_keeps_same_named_specifics_scoped_to_owner_module count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("merged_generic_owner_scope");
     let storage_src = write_program_in(
         &dir,
@@ -10900,6 +12370,13 @@ fn merged_generic_keeps_same_named_specifics_scoped_to_owner_module() {
 
 #[test]
 fn intrinsic_len_falls_back_when_visible_generic_len_does_not_match() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=intrinsic_len_falls_back_when_visible_generic_len_does_not_match count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: box_t\n  end type\n  interface len\n    module procedure :: get_len\n  end interface\ncontains\n  integer function get_len(self) result(length)\n    class(box_t), intent(in) :: self\n    length = 7\n  end function\n  integer function escaped_len(raw) result(length)\n    character(len=*), intent(in) :: raw\n    length = len(raw)\n  end function\nend module\nprogram p\n  use m, only : box_t, len, escaped_len\n  implicit none\n  type(box_t) :: box\n  if (len(box) /= 7) error stop 1\n  if (escaped_len('abc') /= 3) error stop 2\n  print *, 'ok'\nend program\n",
         "f90",
@@ -10937,6 +12414,13 @@ fn intrinsic_len_falls_back_when_visible_generic_len_does_not_match() {
 
 #[test]
 fn generic_subroutine_accepts_derived_array_element_actual() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=generic_subroutine_accepts_derived_array_element_actual count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: dt\n    integer :: n = 0\n  end type\n  interface get_value\n    module procedure :: get_dt\n  end interface\ncontains\n  subroutine get_dt(array, pos, val, stat)\n    integer, intent(in) :: array\n    integer, intent(in) :: pos\n    type(dt), intent(out) :: val\n    integer, intent(out), optional :: stat\n    val%n = array + pos\n    if (present(stat)) stat = 0\n  end subroutine\n  subroutine fill(vals)\n    type(dt), allocatable, intent(out) :: vals(:)\n    integer :: i, info\n    allocate(vals(2))\n    do i = 1, size(vals)\n      call get_value(10, i, vals(i), info)\n      if (info /= 0) error stop 1\n    end do\n  end subroutine\nend module\nprogram p\n  use m, only : dt, fill\n  implicit none\n  type(dt), allocatable :: vals(:)\n  call fill(vals)\n  if (vals(1)%n /= 11 .or. vals(2)%n /= 12) error stop 2\n  print *, 'ok'\nend program\n",
         "f90",
@@ -10974,6 +12458,13 @@ fn generic_subroutine_accepts_derived_array_element_actual() {
 
 #[test]
 fn generic_subroutine_accepts_imported_derived_array_element_actual() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=generic_subroutine_accepts_imported_derived_array_element_actual count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("generic_imported_derived_array_elem");
     let types_src = write_program_in(
         &dir,
@@ -11057,6 +12548,13 @@ fn generic_subroutine_accepts_imported_derived_array_element_actual() {
 
 #[test]
 fn scalar_pointer_actual_materializes_descriptor_for_class_dummy() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=scalar_pointer_actual_materializes_descriptor_for_class_dummy count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: box_t\n    integer :: n = 0\n  contains\n    procedure :: set_n\n  end type\ncontains\n  subroutine set_n(self, v)\n    class(box_t), intent(inout) :: self\n    integer, intent(in) :: v\n    self%n = v\n  end subroutine\n  subroutine set_box(self, v)\n    class(box_t), intent(inout) :: self\n    integer, intent(in) :: v\n    call self%set_n(v)\n  end subroutine\nend module\nprogram p\n  use m, only : box_t, set_box\n  implicit none\n  type(box_t), pointer :: ptr\n  allocate(ptr)\n  call set_box(ptr, 7)\n  if (.not.associated(ptr)) error stop 1\n  if (ptr%n /= 7) error stop 2\n  print *, 'ok'\nend program\n",
         "f90",
@@ -11093,6 +12591,13 @@ fn scalar_pointer_actual_materializes_descriptor_for_class_dummy() {
 
 #[test]
 fn scalar_allocatable_actual_materializes_descriptor_for_class_dummy() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=scalar_allocatable_actual_materializes_descriptor_for_class_dummy count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: box_t\n    integer :: n = 0\n  contains\n    procedure :: set_n\n  end type\ncontains\n  subroutine set_n(self, v)\n    class(box_t), intent(inout) :: self\n    integer, intent(in) :: v\n    self%n = v\n  end subroutine\n  subroutine set_box(self, v)\n    class(box_t), intent(inout) :: self\n    integer, intent(in) :: v\n    call self%set_n(v)\n  end subroutine\nend module\nprogram p\n  use m, only : box_t, set_box\n  implicit none\n  type(box_t), allocatable :: value\n  allocate(value)\n  call set_box(value, 7)\n  if (.not.allocated(value)) error stop 1\n  if (value%n /= 7) error stop 2\n  print *, 'ok'\nend program\n",
         "f90",
@@ -11129,6 +12634,13 @@ fn scalar_allocatable_actual_materializes_descriptor_for_class_dummy() {
 
 #[test]
 fn imported_allocated_concrete_moved_into_class_component_dispatches_concrete_len() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_allocated_concrete_moved_into_class_component_dispatches_concrete_len count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("imported_concrete_move_alloc_dispatch");
     let base_src = write_program_in(
         &dir,
@@ -11230,6 +12742,13 @@ fn imported_allocated_concrete_moved_into_class_component_dispatches_concrete_le
 
 #[test]
 fn imported_generic_keyword_real_expression_actual_resolves() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_generic_keyword_real_expression_actual_resolves count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("generic_imported_keyword_real_expr");
     let mod_src = write_program_in(
         &dir,
@@ -11305,6 +12824,13 @@ fn imported_generic_keyword_real_expression_actual_resolves() {
 
 #[test]
 fn generic_function_resolution_uses_specific_keyword_slots() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=generic_function_resolution_uses_specific_keyword_slots count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: stamp_t\n    integer :: year = -1\n    integer :: month = -1\n    integer :: day = -1\n    integer :: hour = -1\n    integer :: minute = -1\n    integer :: second = -1\n  end type\n  interface build_stamp\n    module procedure :: build_stamp_fields\n    module procedure :: build_stamp_string\n  end interface\ncontains\n  function build_stamp_fields(year, month, day, hour, minute, second) result(stamp)\n    integer, intent(in), optional :: year, month, day\n    integer, intent(in), optional :: hour, minute, second\n    type(stamp_t) :: stamp\n    if (present(year)) stamp%year = year\n    if (present(month)) stamp%month = month\n    if (present(day)) stamp%day = day\n    if (present(hour)) stamp%hour = hour\n    if (present(minute)) stamp%minute = minute\n    if (present(second)) stamp%second = second\n  end function\n\n  function build_stamp_string(string) result(stamp)\n    character(len=*), intent(in) :: string\n    type(stamp_t) :: stamp\n    stamp%year = len_trim(string)\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  type(stamp_t) :: stamp\n  stamp = build_stamp(hour=17, minute=45, second=0)\n  if (stamp%year /= -1) error stop 1\n  if (stamp%month /= -1) error stop 2\n  if (stamp%day /= -1) error stop 3\n  if (stamp%hour /= 17) error stop 4\n  if (stamp%minute /= 45) error stop 5\n  if (stamp%second /= 0) error stop 6\n  print *, 'ok'\nend program\n",
         "f90",
@@ -11341,6 +12867,13 @@ fn generic_function_resolution_uses_specific_keyword_slots() {
 
 #[test]
 fn random_number_default_real_in_hidden_result_function_uses_scalar_width() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=random_number_default_real_in_hidden_result_function_uses_scalar_width count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  character(len=15) :: name\n  name = get_name()\n  if (name(1:7) /= 'toml-f-') error stop 1\n  print *, trim(name)\ncontains\n  function get_name() result(filename)\n    character(len=15) :: filename\n    real :: val\n    call random_number(val)\n    write(filename, '(a, z8.8)') 'toml-f-', int(val*1.0e9)\n  end function\nend program\n",
         "f90",
@@ -11377,6 +12910,13 @@ fn random_number_default_real_in_hidden_result_function_uses_scalar_width() {
 
 #[test]
 fn open_connected_unit_without_file_preserves_existing_connection() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=open_connected_unit_without_file_preserves_existing_connection count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  integer :: io, stat, chunk\n  logical :: opened\n  character(4096) :: buffer\n  character(len=*), parameter :: filename = 'open_connected_unit_repro.txt'\n\n  open(file=filename, newunit=io, status='replace')\n  write(io, '(a)') 'abc'\n  close(io)\n\n  open(file=filename, newunit=io, status='old')\n  inquire(unit=io, opened=opened)\n  if (.not. opened) error stop 1\n  open(unit=io, pad='yes', iostat=stat)\n  if (stat /= 0) error stop 2\n  read(io, '(a)', advance='no', iostat=stat, size=chunk) buffer\n  if (stat > 0) error stop 3\n  if (chunk /= 3) error stop 4\n  if (buffer(:chunk) /= 'abc') error stop 5\n  close(io, status='delete')\n  print *, 'ok'\nend program\n",
         "f90",
@@ -11413,6 +12953,13 @@ fn open_connected_unit_without_file_preserves_existing_connection() {
 
 #[test]
 fn open_connected_unit_without_file_does_not_rewind_nonadvancing_reads() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=open_connected_unit_without_file_does_not_rewind_nonadvancing_reads count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  integer :: io, stat\n  character(:), allocatable :: line\n  character(len=*), parameter :: filename = 'open_connected_unit_loop_repro.txt'\n\n  open(file=filename, newunit=io, status='replace')\n  write(io, '(a)') 'abc'\n  close(io)\n\n  open(file=filename, newunit=io, status='old')\n  call read_line(io, line, stat)\n  if (stat /= 0) error stop 1\n  if (line /= 'abc') error stop 2\n  call read_line(io, line, stat)\n  if (stat >= 0) error stop 3\n  close(io, status='delete')\n  print *, 'ok'\ncontains\n  subroutine read_line(io, string, stat)\n    integer, intent(in) :: io\n    character(:), allocatable, intent(out) :: string\n    integer, intent(out) :: stat\n    integer, parameter :: bufsize = 16\n    character(bufsize) :: buffer\n    integer :: chunk\n\n    open(unit=io, pad='yes', iostat=stat)\n    string = ''\n    do while (stat == 0)\n      read(io, '(a)', advance='no', iostat=stat, size=chunk) buffer\n      if (stat > 0) exit\n      string = string // buffer(:chunk)\n    end do\n    if (is_iostat_eor(stat)) stat = 0\n  end subroutine\nend program\n",
         "f90",
@@ -11449,6 +12996,13 @@ fn open_connected_unit_without_file_does_not_rewind_nonadvancing_reads() {
 
 #[test]
 fn imported_generic_unary_array_element_actual_preserves_integer_kind() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_generic_unary_array_element_actual_preserves_integer_kind count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("generic_imported_unary_array_element_kind");
     let mod_src = write_program_in(
         &dir,
@@ -11524,6 +13078,13 @@ fn imported_generic_unary_array_element_actual_preserves_integer_kind() {
 
 #[test]
 fn assumed_size_parameter_array_constructor_uses_initializer_extent() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=assumed_size_parameter_array_constructor_uses_initializer_extent count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\ncontains\n  elemental function peek(chunk, pos) result(ch)\n    character(*), intent(in) :: chunk\n    integer, intent(in) :: pos\n    character(1) :: ch\n    if (pos <= len(chunk)) then\n      ch = chunk(pos:pos)\n    else\n      ch = ' '\n    end if\n  end function\n  pure function match_all(chunk, pos, kind) result(match)\n    character(*), intent(in) :: chunk\n    integer, intent(in) :: pos(:)\n    character(1), intent(in) :: kind(:)\n    logical :: match\n    match = all(peek(chunk, pos) == kind)\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  integer, parameter :: offset(*) = [1, 2, 3, 4]\n  character(1), parameter :: truth(4) = ['t', 'r', 'u', 'e']\n  logical :: ok\n  ok = match_all('true', offset, truth)\n  if (.not. ok) error stop 1\n  print *, 'ok'\nend program\n",
         "f90",
@@ -11561,6 +13122,13 @@ fn assumed_size_parameter_array_constructor_uses_initializer_extent() {
 
 #[test]
 fn module_character_parameter_array_constructor_initializes_runtime_bytes() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=module_character_parameter_array_constructor_initializes_runtime_bytes count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  integer, parameter :: offset(4) = [0, 1, 2, 3]\n  character(1), parameter :: truth(4) = ['t', 'r', 'u', 'e']\ncontains\n  elemental function peek(chunk, pos) result(ch)\n    character(*), intent(in) :: chunk\n    integer, intent(in) :: pos\n    character(1) :: ch\n    if (pos <= len(chunk)) then\n      ch = chunk(pos:pos)\n    else\n      ch = ' '\n    end if\n  end function\n  pure function match_all(chunk, pos, kind) result(match)\n    character(*), intent(in) :: chunk\n    integer, intent(in) :: pos(:)\n    character(1), intent(in) :: kind(:)\n    logical :: match\n    match = all(peek(chunk, pos) == kind)\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  logical :: ok\n  if (iachar(truth(1)) /= 116) error stop 1\n  if (iachar(truth(2)) /= 114) error stop 2\n  if (iachar(truth(3)) /= 117) error stop 3\n  if (iachar(truth(4)) /= 101) error stop 4\n  ok = match_all('true', 1 + offset, truth)\n  if (.not. ok) error stop 5\n  print *, 'ok'\nend program\n",
         "f90",
@@ -11598,6 +13166,13 @@ fn module_character_parameter_array_constructor_initializes_runtime_bytes() {
 
 #[test]
 fn elemental_character_compare_uses_hidden_result_bytes() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=elemental_character_compare_uses_hidden_result_bytes count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\ncontains\n  elemental function peek(chunk, pos) result(ch)\n    character(*), intent(in) :: chunk\n    integer, intent(in) :: pos\n    character(1) :: ch\n    if (pos <= len(chunk)) then\n      ch = chunk(pos:pos)\n    else\n      ch = ' '\n    end if\n  end function\n  pure function match_all(chunk, pos, kind) result(match)\n    character(*), intent(in) :: chunk\n    integer, intent(in) :: pos(:)\n    character(1), intent(in) :: kind(:)\n    logical :: match\n    match = all(peek(chunk, pos) == kind)\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  integer, parameter :: offset(*) = [1, 2, 3]\n  character(1), parameter :: truth(3) = ['t', 'r', 'u']\n  logical :: ok\n  ok = match_all('tru', offset, truth)\n  if (.not. ok) error stop 1\n  print *, 'ok'\nend program\n",
         "f90",
@@ -11635,6 +13210,13 @@ fn elemental_character_compare_uses_hidden_result_bytes() {
 
 #[test]
 fn opposite_quote_runs_preserve_fixed_character_lengths() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=opposite_quote_runs_preserve_fixed_character_lengths count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         r#"program p
   implicit none
@@ -11680,6 +13262,13 @@ end program
 
 #[test]
 fn elemental_character_call_over_array_expr_materializes_descriptor_actual() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=elemental_character_call_over_array_expr_materializes_descriptor_actual count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\ncontains\n  elemental function pick(pos) result(ch)\n    integer, intent(in) :: pos\n    character(1) :: ch\n    ch = merge('X', 'Y', pos > 0)\n  end function\n\n  logical function want_ten_chars(string)\n    character(1), intent(in) :: string(:)\n    want_ten_chars = string(5) == 'X'\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  integer, parameter :: offset(*) = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]\n  integer, parameter :: offset_date = 10\n  if (.not. want_ten_chars(pick(1 + offset(:offset_date)))) error stop 1\n  print *, 'ok'\nend program\n",
         "f90",
@@ -11717,6 +13306,13 @@ fn elemental_character_call_over_array_expr_materializes_descriptor_actual() {
 
 #[test]
 fn module_character_star_parameter_from_component_concat_initializes_runtime_bytes() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=module_character_star_parameter_from_component_concat_initializes_runtime_bytes count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: enum_char\n    character(1) :: space = ' '\n    character(1) :: hash = '#'\n    character(1) :: comma = ','\n  end type\n  type(enum_char), parameter :: char_kind = enum_char()\n  character(len=*), parameter :: terminated = char_kind%space // char_kind%hash // char_kind%comma\ncontains\n  subroutine check()\n    if (len(terminated) /= 3) error stop 1\n    if (iachar(terminated(1:1)) /= 32) error stop 2\n    if (iachar(terminated(2:2)) /= 35) error stop 3\n    if (iachar(terminated(3:3)) /= 44) error stop 4\n    print *, 'ok'\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  call check()\nend program\n",
         "f90",
@@ -11754,6 +13350,13 @@ fn module_character_star_parameter_from_component_concat_initializes_runtime_byt
 
 #[test]
 fn module_character_star_parameter_with_achar_and_repeat_defaults_initializes_runtime_bytes() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=module_character_star_parameter_with_achar_and_repeat_defaults_initializes_runtime_bytes count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  integer, parameter :: tfc = kind('a')\n  type :: enum_char\n    character(1, tfc) :: space = \" \"\n    character(1, tfc) :: hash = \"#\"\n    character(3, tfc) :: squote3 = repeat(\"'\", 3)\n    character(1, tfc) :: comma = \",\"\n    character(1, tfc) :: equal = \"=\"\n    character(1, tfc) :: rbrace = \"}\"\n    character(1, tfc) :: rbracket = \"]\"\n    character(1, tfc) :: newline = achar(10, kind=tfc)\n    character(1, tfc) :: carriage_return = achar(13, kind=tfc)\n    character(1, tfc) :: tab = achar(9, kind=tfc)\n  end type\n  type(enum_char), parameter :: char_kind = enum_char()\n  character(*, tfc), parameter :: terminated = &\n    char_kind%space // char_kind%tab // char_kind%newline // char_kind%carriage_return // &\n    char_kind%hash // char_kind%rbrace // char_kind%rbracket // char_kind%comma // &\n    char_kind%equal\ncontains\n  subroutine check()\n    if (len(terminated) /= 9) error stop 1\n    if (iachar(terminated(1:1)) /= 32) error stop 2\n    if (iachar(terminated(2:2)) /= 9) error stop 3\n    if (iachar(terminated(3:3)) /= 10) error stop 4\n    if (iachar(terminated(4:4)) /= 13) error stop 5\n    if (terminated(5:9) /= '#}],=') error stop 6\n    print *, 'ok'\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  call check()\nend program\n",
         "f90",
@@ -11791,6 +13394,13 @@ fn module_character_star_parameter_with_achar_and_repeat_defaults_initializes_ru
 
 #[test]
 fn polymorphic_name_bound_calls_dispatch_for_visitor_and_destroy() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=polymorphic_name_bound_calls_dispatch_for_visitor_and_destroy count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type, abstract :: node_t\n  contains\n    procedure(destroy_i), deferred :: destroy\n  end type\n  type, abstract :: visitor_t\n  contains\n    procedure(visit_i), deferred :: visit\n  end type\n  abstract interface\n    subroutine destroy_i(self)\n      import :: node_t\n      class(node_t), intent(inout) :: self\n    end subroutine\n    subroutine visit_i(self, val)\n      import :: visitor_t, node_t\n      class(visitor_t), intent(inout) :: self\n      class(node_t), intent(inout) :: val\n    end subroutine\n  end interface\n  type, extends(node_t) :: leaf_t\n  contains\n    procedure :: destroy => leaf_destroy\n  end type\n  type, extends(visitor_t) :: print_visitor_t\n  contains\n    procedure :: visit => print_visit\n  end type\ncontains\n  subroutine leaf_destroy(self)\n    class(leaf_t), intent(inout) :: self\n    print *, 'destroy'\n  end subroutine\n  subroutine print_visit(self, val)\n    class(print_visitor_t), intent(inout) :: self\n    class(node_t), intent(inout) :: val\n    print *, 'visit'\n    call val%destroy()\n  end subroutine\n  subroutine run()\n    class(node_t), allocatable :: val\n    class(visitor_t), allocatable :: vis\n    allocate(leaf_t :: val)\n    allocate(print_visitor_t :: vis)\n    call vis%visit(val)\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  call run()\nend program\n",
         "f90",
@@ -11828,6 +13438,13 @@ fn polymorphic_name_bound_calls_dispatch_for_visitor_and_destroy() {
 
 #[test]
 fn cross_tu_polymorphic_component_bound_call_uses_descriptor_lookup() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=cross_tu_polymorphic_component_bound_call_uses_descriptor_lookup count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("cross_tu_polymorphic_component_bound_dispatch");
     let base_src = write_program_in(
         &dir,
@@ -11914,6 +13531,13 @@ fn cross_tu_polymorphic_component_bound_call_uses_descriptor_lookup() {
 
 #[test]
 fn cross_tu_polymorphic_name_bound_call_uses_descriptor_lookup() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=cross_tu_polymorphic_name_bound_call_uses_descriptor_lookup count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("cross_tu_polymorphic_name_bound_dispatch");
     let base_src = write_program_in(
         &dir,
@@ -11999,6 +13623,13 @@ fn cross_tu_polymorphic_name_bound_call_uses_descriptor_lookup() {
 
 #[test]
 fn imported_derived_function_result_with_explicit_return_round_trips_through_amod_and_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_derived_function_result_with_explicit_return_round_trips_through_amod_and_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("derived_result_return_amod");
     let mod_src = write_program_in(
         &dir,
@@ -12087,6 +13718,13 @@ fn imported_derived_function_result_with_explicit_return_round_trips_through_amo
 
 #[test]
 fn typed_header_derived_function_result_uses_hidden_result_abi() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=typed_header_derived_function_result_uses_hidden_result_abi count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: vec\n    real :: x\n  end type\ncontains\n  type(vec) function add_vec(a, b)\n    type(vec), intent(in) :: a, b\n    add_vec%x = a%x + b%x\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  type(vec) :: a, b, r\n  a%x = 1.0\n  b%x = 2.0\n  r = add_vec(a, b)\n  if (abs(r%x - 3.0) > 1.0e-6) error stop 1\n  print *, r%x\nend program\n",
         "f90",
@@ -12125,6 +13763,13 @@ fn typed_header_derived_function_result_uses_hidden_result_abi() {
 
 #[test]
 fn imported_type_finalizer_round_trips_through_amod_and_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_type_finalizer_round_trips_through_amod_and_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("finalizer_amod");
     let mod_src = write_program_in(
         &dir,
@@ -12220,6 +13865,13 @@ fn imported_type_finalizer_round_trips_through_amod_and_runs() {
 
 #[test]
 fn nested_derived_defaults_initialize_locally() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=nested_derived_defaults_initialize_locally count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: control_block_t\n    logical :: should_execute = .true.\n    character(len=4) :: marker = ''\n  end type control_block_t\n  type :: shell_state_t\n    integer :: control_depth = 0\n    type(control_block_t) :: control_stack(2)\n  end type shell_state_t\n  type(shell_state_t) :: shell\n  if (shell%control_depth /= 0) error stop 1\n  if (.not. shell%control_stack(1)%should_execute) error stop 2\n  if (shell%control_stack(2)%marker /= '    ') error stop 3\n  print *, shell%control_depth, shell%control_stack(1)%should_execute\nend program\n",
         "f90",
@@ -12257,6 +13909,13 @@ fn nested_derived_defaults_initialize_locally() {
 
 #[test]
 fn imported_nested_derived_defaults_round_trip_through_amod_and_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_nested_derived_defaults_round_trip_through_amod_and_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("nested_derived_defaults_amod");
     let mod_src = write_program_in(
         &dir,
@@ -12355,6 +14014,13 @@ fn imported_nested_derived_defaults_round_trip_through_amod_and_run() {
 
 #[test]
 fn any_on_vector_subscripted_char_array_compare_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=any_on_vector_subscripted_char_array_compare_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  character(1) :: s(10)\n  logical :: ok\n  s = 'x'\n  s(5) = '-'\n  s(8) = '-'\n  ok = .not. any(s([5, 8]) /= '-')\n  if (.not. ok) error stop 1\n  print *, ok\nend program\n",
         "f90",
@@ -12393,6 +14059,13 @@ fn any_on_vector_subscripted_char_array_compare_runs() {
 
 #[test]
 fn rank1_runtime_shape_array_function_result_into_fixed_dest() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=rank1_runtime_shape_array_function_result_into_fixed_dest count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // Companion to runtime_shape_array_function_result_auto_allocates_on_entry,
     // exercising the rank-1 caller path. Previously the alloc_return assignment
     // path passed the destination buffer (`integer :: r(5)` → `[i32 x 5]`)
@@ -12439,6 +14112,13 @@ fn rank1_runtime_shape_array_function_result_into_fixed_dest() {
 
 #[test]
 fn zero_size_allocatable_function_result_into_fixed_dest_zero_fills() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=zero_size_allocatable_function_result_into_fixed_dest_zero_fills count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // stdlib_intrinsics calls `d = stdlib_matmul(a,b,c,err=linerr)` on an
     // error path where the function result is `allocate(res(0,0))`. The caller
     // lowered fixed-shape assignment by loading the result descriptor's
@@ -12478,6 +14158,13 @@ fn zero_size_allocatable_function_result_into_fixed_dest_zero_fills() {
 
 #[test]
 fn size_with_kind_keyword_arg_returns_total_size_not_size_along_dim() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=size_with_kind_keyword_arg_returns_total_size_not_size_along_dim count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §16.9.193: SIZE(array [, dim] [, kind]). The KIND keyword
     // selects the integer kind of the result; it is *not* a DIM
     // selector. stdlib's `n = size(a, kind=ilp)` was being lowered as
@@ -12521,6 +14208,13 @@ fn size_with_kind_keyword_arg_returns_total_size_not_size_along_dim() {
 
 #[test]
 fn smp_body_parameter_initialized_from_imported_kind_constant() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=smp_body_parameter_initialized_from_imported_kind_constant count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §11.2.3 + §5.5: a submodule's PARAMETER initializer can
     // reference a constant imported via USE — e.g. `use stdlib_kinds`
     // followed by `integer, parameter :: ilp = int64`. The host-aware
@@ -12562,6 +14256,13 @@ fn smp_body_parameter_initialized_from_imported_kind_constant() {
 
 #[test]
 fn matmul_over_integer_matrices_uses_column_major_indexing() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=matmul_over_integer_matrices_uses_column_major_indexing count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // afs_matmul_int had the same row-major indexing bug as the real
     // version: A(i,l) was looked up at `i*k + l` and result(i,j) stored
     // at `i*n + j`. Fortran is column-major so A(i,l) lives at `l*m + i`
@@ -12597,6 +14298,13 @@ fn matmul_over_integer_matrices_uses_column_major_indexing() {
 
 #[test]
 fn matmul_and_transpose_over_real_kind4_matrices_produce_correct_results() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=matmul_and_transpose_over_real_kind4_matrices_produce_correct_results count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // Two pre-existing runtime bugs in afs_matmul_real8 / afs_transpose_real8:
     // (a) both read `*const f64` regardless of descriptor `elem_size`, so
     //     real(4) inputs were misread two-lanes-at-a-time.
@@ -12639,6 +14347,13 @@ fn matmul_and_transpose_over_real_kind4_matrices_produce_correct_results() {
 
 #[test]
 fn matmul_over_complex_kind4_matrices_produces_correct_results() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=matmul_over_complex_kind4_matrices_produces_correct_results count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // Pre-fix: matmul intrinsic dispatched on `is_real` only. Complex
     // arrays (which are neither IrType::Float nor IrType::Int) routed
     // to `afs_matmul_int` and the f32 lane bytes were multiplied as
@@ -12678,6 +14393,13 @@ fn matmul_over_complex_kind4_matrices_produces_correct_results() {
 
 #[test]
 fn matmul_over_complex_kind8_matrices_produces_correct_imag_part() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=matmul_over_complex_kind8_matrices_produces_correct_imag_part count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // complex(dp) matmul → afs_matmul_complex must take elem_size==16
     // branch and use f64 lanes. We use an allocatable LHS to bypass
     // the unrelated complex(dp) descriptor→stack-array imag-lane copy
@@ -12715,6 +14437,13 @@ fn matmul_over_complex_kind8_matrices_produces_correct_imag_part() {
 
 #[test]
 fn inline_array_intrinsic_in_print_handles_complex_elements() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=inline_array_intrinsic_in_print_handles_complex_elements count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // Following on from the FunctionCall descriptor-walk fix: when the
     // resulting array's element type is complex (`Array(Float, 2)`),
     // the element-walker previously fell into the integer writer arm
@@ -12769,6 +14498,13 @@ fn inline_array_intrinsic_in_print_handles_complex_elements() {
 
 #[test]
 fn module_complex_parameter_const_initializes_data_section_with_both_lanes() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=module_complex_parameter_const_initializes_data_section_with_both_lanes count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §13.7 named constants: a complex parameter at module
     // scope must be loaded with its declared value at program start.
     // Pre-fix: eval_const_global_init only handled scalar Int/Float
@@ -12811,6 +14547,13 @@ fn module_complex_parameter_const_initializes_data_section_with_both_lanes() {
 
 #[test]
 fn module_complex_parameter_array_from_real_parameter_interleaves_zero_imag_lanes() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=module_complex_parameter_array_from_real_parameter_interleaves_zero_imag_lanes count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  use, intrinsic :: iso_fortran_env, only: real32, real64\n  implicit none\n  real(real32), parameter :: r_sp(4) = [-10.0_real32, 2.0_real32, 3.0_real32, 4.0_real32]\n  real(real64), parameter :: r_dp(4) = [-10.0_real64, 2.0_real64, 3.0_real64, 4.0_real64]\n  complex(real32), parameter :: c_sp(4) = r_sp\n  complex(real64), parameter :: c_dp(4) = r_dp\n  complex(real32) :: d_sp(3,2) = reshape(c_sp, [3,2], [(7.0_real32, -1.0_real32)])\nend module\nprogram p\n  use, intrinsic :: iso_fortran_env, only: real32, real64\n  use m, only: c_sp, c_dp, d_sp\n  implicit none\n  if (.not. (abs(real(c_sp(1)) + 10.0_real32) < 1.0e-5_real32)) error stop 1\n  if (.not. (abs(aimag(c_sp(1))) < 1.0e-5_real32)) error stop 2\n  if (.not. (abs(real(c_dp(2)) - 2.0_real64) < 1.0e-10_real64)) error stop 3\n  if (.not. (abs(aimag(c_dp(2))) < 1.0e-10_real64)) error stop 4\n  if (.not. (abs(real(d_sp(2,2)) - 7.0_real32) < 1.0e-5_real32)) error stop 5\n  if (.not. (abs(aimag(d_sp(2,2)) + 1.0_real32) < 1.0e-5_real32)) error stop 6\n  print *, 'ok'\nend program\n",
         "f90",
@@ -12875,6 +14618,13 @@ fn module_complex_parameter_array_from_real_parameter_interleaves_zero_imag_lane
 
 #[test]
 fn module_complex_parameter_array_from_cmplx_reshape_exprs_initializes_lanes() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=module_complex_parameter_array_from_cmplx_reshape_exprs_initializes_lanes count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // stdlib_stats/test_var builds complex module PARAMETER arrays as
     // `reshape([cs1, cs1*3, cs1*1.5], shape(cs))`, where cs1 itself is
     // an array of `cmplx(...)` calls. The constant global folder must
@@ -12948,6 +14698,13 @@ fn module_complex_parameter_array_from_cmplx_reshape_exprs_initializes_lanes() {
 
 #[test]
 fn complex_sum_with_dim_uses_complex_reduction_helpers() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=complex_sum_with_dim_uses_complex_reduction_helpers count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  use, intrinsic :: iso_fortran_env, only: real32, real64\n  implicit none\n  complex(real32) :: xsp(2,2,2,2), ysp(2,2,2), ymsp(2,2,2)\n  complex(real64) :: xdp(2,2,2,2), ydp(2,2,2), ymdp(2,2,2)\n  xsp = (1.0_real32, -2.0_real32)\n  xdp = (1.0_real64, -2.0_real64)\n  ysp = sum(xsp, 4)\n  ymsp = sum(xsp, 4, xsp%re > 0.0_real32)\n  ydp = sum(xdp, 4)\n  ymdp = sum(xdp, 4, xdp%re > 0.0_real64)\n  if (.not. all(abs(ysp - (2.0_real32, -4.0_real32)) < 1.0e-5_real32)) error stop 1\n  if (.not. all(abs(ymsp - (2.0_real32, -4.0_real32)) < 1.0e-5_real32)) error stop 2\n  if (.not. all(abs(ydp - (2.0_real64, -4.0_real64)) < 1.0e-10_real64)) error stop 3\n  if (.not. all(abs(ymdp - (2.0_real64, -4.0_real64)) < 1.0e-10_real64)) error stop 4\n  print *, 'ok'\nend program\n",
         "f90",
@@ -13005,6 +14762,13 @@ fn complex_sum_with_dim_uses_complex_reduction_helpers() {
 
 #[test]
 fn module_array_global_reshape_from_parameter_array_initializes_data_section() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=module_array_global_reshape_from_parameter_array_initializes_data_section count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // stdlib's stats tests declare rank-N module data as
     // `d2 = reshape(d1, shape)` where `d1` is a named array
     // PARAMETER. The constant array folder handled literal
@@ -13044,6 +14808,13 @@ fn module_array_global_reshape_from_parameter_array_initializes_data_section() {
 
 #[test]
 fn allocatable_assignment_converts_int_array_constructor_to_real_lhs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_assignment_converts_int_array_constructor_to_real_lhs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §10.2.1.3: numeric element type mismatch between an array RHS
     // and an allocatable LHS forces per-element conversion. Without the
     // converting variant of afs_assign_allocatable, the source descriptor's
@@ -13082,6 +14853,13 @@ fn allocatable_assignment_converts_int_array_constructor_to_real_lhs() {
 
 #[test]
 fn allocatable_assignment_converts_complex_array_to_real_lhs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_assignment_converts_complex_array_to_real_lhs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §10.2.1.3: assigning a complex array expression to a real
     // array converts each element to the real part. The allocatable
     // runtime conversion tagger used to peel complex(sp) to plain f32,
@@ -13121,6 +14899,13 @@ fn allocatable_assignment_converts_complex_array_to_real_lhs() {
 
 #[test]
 fn allocatable_assignment_converts_alloc_return_complex_array_to_real_lhs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_assignment_converts_alloc_return_complex_array_to_real_lhs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // Same conversion as `r = z`, but through the hidden allocatable
     // result ABI. Returning directly into the real destination descriptor
     // lets the complex callee allocate 8-byte elements for a descriptor
@@ -13158,6 +14943,13 @@ fn allocatable_assignment_converts_alloc_return_complex_array_to_real_lhs() {
 
 #[test]
 fn allocatable_assignment_converts_generic_alloc_return_complex_array_to_real_lhs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_assignment_converts_generic_alloc_return_complex_array_to_real_lhs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // Stdlib's `eigvals(A)` is a generic interface. The generic name
     // itself is not in alloc_return_funcs, so statement lowering used to
     // treat the specific's temp descriptor as same-typed and memcpy it
@@ -13195,6 +14987,13 @@ fn allocatable_assignment_converts_generic_alloc_return_complex_array_to_real_lh
 
 #[test]
 fn module_parameter_bit_size_with_named_kind_suffix_folds_to_correct_value() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=module_parameter_bit_size_with_named_kind_suffix_folds_to_correct_value count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // `bit_size(1_int64)` in a module parameter declaration must fold to
     // 64 even when the kind is the iso_fortran_env name `int64` rather
     // than a literal `8`. Previously eval_const_scalar parsed the suffix
@@ -13232,6 +15031,13 @@ fn module_parameter_bit_size_with_named_kind_suffix_folds_to_correct_value() {
 
 #[test]
 fn module_parameter_bit_size_with_imported_renamed_kind_folds_to_correct_value() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=module_parameter_bit_size_with_imported_renamed_kind_folds_to_correct_value count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("bit_size_imported_renamed_kind");
     let kinds_src = write_program_in(
         &dir,
@@ -13349,6 +15155,13 @@ fn module_parameter_bit_size_with_imported_renamed_kind_folds_to_correct_value()
 
 #[test]
 fn logical_int8_array_scalar_broadcast_init_fills_every_element() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=logical_int8_array_scalar_broadcast_init_fills_every_element count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §7.6.6: a scalar initializer in an array declaration is
     // broadcast to every element. Previously the compiler treated
     // `TypeSpec::Logical(_)` as `IrType::Bool` regardless of kind,
@@ -13389,6 +15202,13 @@ fn logical_int8_array_scalar_broadcast_init_fills_every_element() {
 
 #[test]
 fn defined_assignment_passes_array_actual_through_descriptor() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=defined_assignment_passes_array_actual_through_descriptor count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §15.5.2: when an overloaded `assignment(=)` resolves to a
     // procedure whose RHS dummy is an assumed-shape array, the actual
     // array must be passed as a 384-byte descriptor — not as the raw
@@ -13428,6 +15248,13 @@ fn defined_assignment_passes_array_actual_through_descriptor() {
 
 #[test]
 fn ishftc_default_size_full_width_rotate_does_not_zero_result() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=ishftc_default_size_full_width_rotate_does_not_zero_result count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // The previous lowering masked the result with `(1 << size) - 1`,
     // which on AArch64 collapses to mask = 0 when size equals the
     // operand bit width — `1 << 64` rotates back to 1. ishftc with the
@@ -13467,6 +15294,13 @@ fn ishftc_default_size_full_width_rotate_does_not_zero_result() {
 
 #[test]
 fn use_rename_kind_selector_through_re_export_resolves_to_correct_size() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=use_rename_kind_selector_through_re_export_resolves_to_correct_size count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §11.2.2: a renamed USE association `bits_kind => int32`
     // pulled through a re-exporting module must resolve to the same
     // value the original module exports. Previously the layout pass
@@ -13508,6 +15342,13 @@ fn use_rename_kind_selector_through_re_export_resolves_to_correct_size() {
 
 #[test]
 fn submodule_local_with_use_renamed_kind_through_re_export_has_correct_width() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=submodule_local_with_use_renamed_kind_through_re_export_has_correct_width count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // Companion to use_rename_kind_selector_through_re_export_resolves_to_correct_size.
     // The earlier fix corrected the *type-layout* path (offsets of fields
     // inside derived types). The IR-lowering path for *local* variables
@@ -13552,6 +15393,13 @@ fn submodule_local_with_use_renamed_kind_through_re_export_has_correct_width() {
 
 #[test]
 fn defined_assignment_dispatch_resolves_default_kind_actual_against_explicit_kind_specifics() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=defined_assignment_dispatch_resolves_default_kind_actual_against_explicit_kind_specifics count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §15.5.5.2: defined-assignment specific selection compares
     // declared types AND kinds. An actual without an explicit kind means
     // *default kind*, not "any kind". Previously the dispatcher used
@@ -13596,6 +15444,13 @@ fn defined_assignment_dispatch_resolves_default_kind_actual_against_explicit_kin
 
 #[test]
 fn defined_assignment_dispatches_when_rhs_descriptor_peels_to_same_scalar_as_lhs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=defined_assignment_dispatches_when_rhs_descriptor_peels_to_same_scalar_as_lhs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // Regression: `try_defined_assignment` short-circuited via
     // `ir_types_dispatch_equal` on the LHS/RHS IR types. For
     // `arr = derived` where arr is a logical(int32) allocatable
@@ -13638,6 +15493,13 @@ fn defined_assignment_dispatches_when_rhs_descriptor_peels_to_same_scalar_as_lhs
 
 #[test]
 fn defined_assignment_lookup_does_not_leak_lhs_type_across_sibling_procedures() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=defined_assignment_lookup_does_not_leak_lhs_type_across_sibling_procedures count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // Regression: `try_defined_assignment` looked up the LHS name via
     // `find_symbol_any_scope`, which scans every scope and returns
     // the first match. When sibling module procedures declare a same-
@@ -13694,6 +15556,13 @@ fn defined_assignment_lookup_does_not_leak_lhs_type_across_sibling_procedures() 
 
 #[test]
 fn transfer_into_allocatable_array_with_runtime_size_and_named_char_source() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=transfer_into_allocatable_array_with_runtime_size_and_named_char_source count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // Regression: `arr = transfer(s, mold, N)` for an
     // `integer(int8), allocatable :: arr(:)` destination with a
     // character variable source crashed two ways:
@@ -13741,6 +15610,13 @@ fn transfer_into_allocatable_array_with_runtime_size_and_named_char_source() {
 
 #[test]
 fn iso_fortran_env_character_storage_size_folds_to_eight() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=iso_fortran_env_character_storage_size_folds_to_eight count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // Regression: `character_storage_size` was missing from
     // armfortas's `iso_fortran_env` registration, so any module
     // declaring `integer, parameter :: bits_char =
@@ -13783,6 +15659,13 @@ fn iso_fortran_env_character_storage_size_folds_to_eight() {
 
 #[test]
 fn procedure_pointer_component_default_init_resolves_renamed_target() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=procedure_pointer_component_default_init_resolves_renamed_target count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §7.5.4.5 + §11.2.2: a procedure-pointer component with
     // `=> target_proc` carries a default initial association that must
     // be applied at every constructor of the type, including the
@@ -13859,6 +15742,13 @@ fn procedure_pointer_component_default_init_resolves_renamed_target() {
 
 #[test]
 fn intent_out_reapplies_inherited_procedure_pointer_component_defaults() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=intent_out_reapplies_inherited_procedure_pointer_component_defaults count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n\
            implicit none\n\
@@ -13926,6 +15816,13 @@ fn intent_out_reapplies_inherited_procedure_pointer_component_defaults() {
 
 #[test]
 fn two_arg_transfer_into_allocatable_handles_array_constructor_source() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=two_arg_transfer_into_allocatable_handles_array_constructor_source count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §16.9.193: TRANSFER(SOURCE, MOLD) without SIZE produces
     // a rank-1 result of `ceil(bytes(SOURCE) / sizeof(MOLD_elem))`
     // elements when MOLD is array-shaped.  When SOURCE is an inline
@@ -13973,6 +15870,13 @@ fn two_arg_transfer_into_allocatable_handles_array_constructor_source() {
 
 #[test]
 fn deallocate_disassociates_pointer_per_f2018_9_7_3_2() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=deallocate_disassociates_pointer_per_f2018_9_7_3_2 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §9.7.3.2: a successful DEALLOCATE on a pointer object
     // sets its pointer association status to disassociated.  Without
     // this, `associated()` returned true after deallocate, and
@@ -14018,6 +15922,13 @@ fn deallocate_disassociates_pointer_per_f2018_9_7_3_2() {
 
 #[test]
 fn class_star_optional_argument_forwards_through_intermediate_subroutine() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=class_star_optional_argument_forwards_through_intermediate_subroutine count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §15.5.2.12 + §7.3.2.3: a `class(*), intent(in), optional`
     // dummy is passed as a 384-byte descriptor pointer.  When one
     // procedure forwards the actual to another procedure with the
@@ -14088,6 +15999,13 @@ fn class_star_optional_argument_forwards_through_intermediate_subroutine() {
 
 #[test]
 fn class_star_scalar_payload_reaches_procedure_callback() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=class_star_scalar_payload_reaches_procedure_callback count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n\
            implicit none\n\
@@ -14154,6 +16072,13 @@ fn class_star_scalar_payload_reaches_procedure_callback() {
 
 #[test]
 fn class_star_pointer_component_payload_forwards_to_callback() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=class_star_pointer_component_payload_forwards_to_callback count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n\
            implicit none\n\
@@ -14233,6 +16158,13 @@ fn class_star_pointer_component_payload_forwards_to_callback() {
 
 #[test]
 fn tbp_dispatch_boxes_class_star_literal_actual_into_descriptor() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=tbp_dispatch_boxes_class_star_literal_actual_into_descriptor count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §15.5.2.4 + §7.3.2.3: a class(*) intent(in) dummy must
     // receive the actual as a polymorphic descriptor.  The plain-call
     // path detects this via callee_class_arg_mask and threads
@@ -14290,6 +16222,13 @@ fn tbp_dispatch_boxes_class_star_literal_actual_into_descriptor() {
 
 #[test]
 fn inline_transfer_array_call_actual_carries_correct_extent_into_callee() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=inline_transfer_array_call_actual_carries_correct_extent_into_callee count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §16.9.193: TRANSFER(SOURCE, MOLD [, SIZE]) at a call site
     // with an array MOLD must produce a rank-1 actual whose extent the
     // assumed-shape callee sees correctly.  Pre-fix lower_array_expr_-
@@ -14343,6 +16282,13 @@ fn inline_transfer_array_call_actual_carries_correct_extent_into_callee() {
 
 #[test]
 fn assumed_shape_lower_bound_override_rebases_dummy_descriptor() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=assumed_shape_lower_bound_override_rebases_dummy_descriptor count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §15.5.4.5(2): an assumed-shape dummy declared with a
     // non-default lower bound (e.g. `arr(0:)`) must have the lower
     // bound of each dimension overridden in the dummy's descriptor
@@ -14403,6 +16349,13 @@ fn assumed_shape_lower_bound_override_rebases_dummy_descriptor() {
 
 #[test]
 fn assumed_shape_lower_override_propagates_through_nested_calls() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=assumed_shape_lower_override_propagates_through_nested_calls count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // The rebased descriptor must keep the caller's base_addr so that
     // writes through deeper calls propagate back.  Chains the dummy
     // through three layers — the same pattern stdlib_sorting uses for
@@ -14436,6 +16389,13 @@ fn assumed_shape_lower_override_propagates_through_nested_calls() {
 
 #[test]
 fn default_assumed_shape_dummy_rebases_lower_to_one_per_f2018() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=default_assumed_shape_dummy_rebases_lower_to_one_per_f2018 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §15.5.2.4(13): a dummy declared `arr(:)` (no explicit
     // lower bound) must see lbound=1 inside the procedure regardless
     // of the caller's actual lower bound.  Pre-fix `install_assumed_
@@ -14474,6 +16434,13 @@ fn default_assumed_shape_dummy_rebases_lower_to_one_per_f2018() {
 
 #[test]
 fn optional_assumed_shape_dummy_rebases_lower_to_one_when_present() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=optional_assumed_shape_dummy_rebases_lower_to_one_when_present count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §15.5.2.4(13) applies to optional assumed-shape dummies
     // too: when the actual is present, the callee's view must rebase
     // to lbound=1 (or the declared lower) regardless of caller bounds.
@@ -14516,6 +16483,13 @@ fn optional_assumed_shape_dummy_rebases_lower_to_one_when_present() {
 
 #[test]
 fn rank_n_array_compare_yields_same_shape_logical_descriptor_per_f2018() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=rank_n_array_compare_yields_same_shape_logical_descriptor_per_f2018 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §10.1.5: a relational op over an array operand yields a
     // logical array of the SAME SHAPE — same rank, same extents — as
     // the operand. F2018 §6.5.3.5(2): every fresh array expression
@@ -14556,6 +16530,13 @@ fn rank_n_array_compare_yields_same_shape_logical_descriptor_per_f2018() {
 
 #[test]
 fn sum_with_dim_and_mask_filters_per_column_using_descriptor_strides() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=sum_with_dim_and_mask_filters_per_column_using_descriptor_strides count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §16.9.193: SUM(ARRAY, DIM, MASK) sums elements of ARRAY
     // along DIM where MASK is .true. — element-wise gather, not
     // unmasked-then-broadcast. Pre-fix `lower_array_sum_dim_descriptor`
@@ -14595,6 +16576,13 @@ fn sum_with_dim_and_mask_filters_per_column_using_descriptor_strides() {
 
 #[test]
 fn count_with_dim_over_expression_mask_returns_per_column_counts() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=count_with_dim_over_expression_mask_returns_per_column_counts count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // COUNT(MASK, DIM) is a rank-reducing array result even when MASK
     // is an expression such as `y > 0`. The descriptor path used to
     // recognize only bare named masks, so expression masks lowered to
@@ -14631,6 +16619,13 @@ fn count_with_dim_over_expression_mask_returns_per_column_counts() {
 
 #[test]
 fn ieee_is_nan_over_rank_n_array_dispatches_elementally() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=ieee_is_nan_over_rank_n_array_dispatches_elementally count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §17.11: ieee_is_nan is elemental — applied to a rank-N
     // numeric array it must yield a same-shape logical array. Without
     // dispatch the scalar `lower_intrinsic` arm emits `fcmp ne desc,
@@ -14674,6 +16669,13 @@ fn ieee_is_nan_over_rank_n_array_dispatches_elementally() {
 
 #[test]
 fn rank_n_section_scalar_broadcast_writes_every_element() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=rank_n_section_scalar_broadcast_writes_every_element count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §7.5.1.2: `a(:,:,:) = scalar` must assign the scalar to
     // EVERY element of the rank-N section.  `lower_multi_d_section_assign`
     // walks per-dim coords and accumulates `byte_off = Σ coord_k *
@@ -14715,6 +16717,13 @@ fn rank_n_section_scalar_broadcast_writes_every_element() {
 
 #[test]
 fn complex_module_function_result_routes_through_hidden_buffer() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=complex_module_function_result_routes_through_hidden_buffer count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §15.6: a complex(k) function result is a value of category
     // Complex(kind=k). Pre-fix, the IR-level return type was the
     // [Float x 2] aggregate value; codegen packed the 8 (sp) or 16 (dp)
@@ -14761,6 +16770,13 @@ fn complex_module_function_result_routes_through_hidden_buffer() {
 
 #[test]
 fn rank_remap_pointer_assignment_builds_2d_descriptor() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=rank_remap_pointer_assignment_builds_2d_descriptor count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §10.2.2.3: `pmat(L1:U1, L2:U2) => array1d` reinterprets a
     // contiguous 1-D target as a 2-D array. The destination descriptor
     // must record the requested rank, bounds, and stride=1, while
@@ -14800,6 +16816,13 @@ fn rank_remap_pointer_assignment_builds_2d_descriptor() {
 
 #[test]
 fn rank_remap_strided_sections_copy_in_to_explicit_shape_dummies() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=rank_remap_strided_sections_copy_in_to_explicit_shape_dummies count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // Surfaced in stdlib_linalg_norms: norm(a(::stride), 2) forwards an
     // assumed-shape section to an explicit-shape internal kernel. Rank-remap
     // pointer descriptors must carry column-major memory strides, descriptor
@@ -14870,6 +16893,13 @@ fn rank_remap_strided_sections_copy_in_to_explicit_shape_dummies() {
 
 #[test]
 fn assumed_size_dummy_skips_bounds_check_on_last_dim() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=assumed_size_dummy_skips_bounds_check_on_last_dim count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §8.5.8.5: an explicit-shape dummy with `*` last dim
     // (e.g. `a(lda, *)`) carries no upper bound on the last dim —
     // accesses past the actual's nominal extent are legal as long as
@@ -14909,6 +16939,13 @@ fn assumed_size_dummy_skips_bounds_check_on_last_dim() {
 
 #[test]
 fn array_element_actual_to_explicit_shape_dummy_rebases_dummy_descriptor() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=array_element_actual_to_explicit_shape_dummy_rebases_dummy_descriptor count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §15.5.2.4(13): when the actual argument is an array element
     // designator and the dummy is an explicit-shape array, the dummy is
     // associated with the designated element and the elements that
@@ -14953,6 +16990,13 @@ fn array_element_actual_to_explicit_shape_dummy_rebases_dummy_descriptor() {
 
 #[test]
 fn computed_goto_dispatches_to_indexed_label() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=computed_goto_dispatches_to_indexed_label count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §11.2.3: `GO TO (l1, l2, ..., ln) expr` evaluates the integer
     // expr; if 1 <= expr <= n, branches to label[expr]; otherwise falls
     // through. Pre-fix the lowering had NO case for Stmt::ComputedGoto,
@@ -14991,6 +17035,13 @@ fn computed_goto_dispatches_to_indexed_label() {
 
 #[test]
 fn epsilon_tiny_huge_fold_at_compile_time_for_module_parameters() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=epsilon_tiny_huge_fold_at_compile_time_for_module_parameters count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §16.9.81/§16.9.187/§16.9.92: numeric inquiry intrinsics
     // (EPSILON, TINY, HUGE) folded at compile time when the operand
     // is a literal of known kind. Module-level
@@ -15031,6 +17082,13 @@ fn epsilon_tiny_huge_fold_at_compile_time_for_module_parameters() {
 
 #[test]
 fn named_inquiry_parameter_constants_survive_cross_tu_import() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=named_inquiry_parameter_constants_survive_cross_tu_import count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // Mirrors stdlib_blas_constants_sp: named inquiry arguments like
     // `epsilon(zero)` and nested `real(radix(zero), sp)` must be folded
     // into the producing module global before consumers load the .amod.
@@ -15121,6 +17179,13 @@ fn named_inquiry_parameter_constants_survive_cross_tu_import() {
 
 #[test]
 fn cross_unit_char_array_result_uses_array_descriptor_abi() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=cross_unit_char_array_result_uses_array_descriptor_abi count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §15.5.2.13 (function results): a function with rank-1
     // character result like `character :: cstr(len(value)+1)` must use
     // the 384-byte ArrayDescriptor hidden-result ABI on both sides of a
@@ -15222,6 +17287,13 @@ fn cross_unit_char_array_result_uses_array_descriptor_abi() {
 
 #[test]
 fn contained_proc_call_resolves_to_caller_host_not_lexical_last() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=contained_proc_call_resolves_to_caller_host_not_lexical_last count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §11.2.1: a procedure reference inside a contained procedure
     // resolves through the calling procedure's host chain, not by global
     // last-match.  Pre-fix `find_procedure_scope_id` did
@@ -15276,6 +17348,13 @@ fn contained_proc_call_resolves_to_caller_host_not_lexical_last() {
 
 #[test]
 fn use_rename_survives_amod_round_trip_for_submodule_kind_lookup() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=use_rename_survives_amod_round_trip_for_submodule_kind_lookup count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §11.2.2 (renamed USE) + §11.2.3 (submodules see host's USEs).
     // Without `@use_rename` records, the .amod format collapses
     // `use stdlib_kinds, only: block_kind => int64` to just
@@ -15399,6 +17478,13 @@ fn use_rename_survives_amod_round_trip_for_submodule_kind_lookup() {
 
 #[test]
 fn allocatable_assignment_truncates_real_array_constructor_to_integer_lhs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_assignment_truncates_real_array_constructor_to_integer_lhs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // The reverse direction of the int→real fix: float → int allocatable
     // should truncate per element (Fortran §10.2.1.3 / §13.7.74 INT). The
     // converting helper takes the same path, dispatching on dest_kind=2
@@ -15434,6 +17520,13 @@ fn allocatable_assignment_truncates_real_array_constructor_to_integer_lhs() {
 
 #[test]
 fn inline_array_intrinsic_in_print_walks_descriptor_elements() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=inline_array_intrinsic_in_print_walks_descriptor_elements count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // `print *, transpose(a)` etc. previously fell through to the
     // scalar IO path because the array-descriptor dispatch only fired
     // for BinaryOp/UnaryOp/ParenExpr items. The intrinsic returned a
@@ -15490,6 +17583,13 @@ fn inline_array_intrinsic_in_print_walks_descriptor_elements() {
 
 #[test]
 fn scalar_returning_intrinsic_call_to_whole_array_routes_through_bulk_fill() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=scalar_returning_intrinsic_call_to_whole_array_routes_through_bulk_fill count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §10.2.1.3: a scalar RHS assigned to a whole array broadcasts
     // the value to every element. The literal-scalar case `x = 0.0` was
     // already handled, but a scalar from a function call (e.g.
@@ -15533,6 +17633,13 @@ fn scalar_returning_intrinsic_call_to_whole_array_routes_through_bulk_fill() {
 
 #[test]
 fn proc_pointer_component_call_passes_assumed_shape_array_as_descriptor() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=proc_pointer_component_call_passes_assumed_shape_array_as_descriptor count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §15.5.2.5: an assumed-shape dummy receives a descriptor.
     // The procedure-pointer component call dispatch in expr.rs was
     // using `lower_arg_by_ref_full` for every actual, regardless of
@@ -15576,6 +17683,13 @@ fn proc_pointer_component_call_passes_assumed_shape_array_as_descriptor() {
 
 #[test]
 fn merge_intrinsic_routes_array_operands_through_descriptor_path() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=merge_intrinsic_routes_array_operands_through_descriptor_path count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §16.9.135: MERGE is elemental and returns an array when any
     // of its operands is an array. The transformational-intrinsic table
     // in stmt.rs picks which calls go through `lower_array_assign`, and
@@ -15617,6 +17731,13 @@ fn merge_intrinsic_routes_array_operands_through_descriptor_path() {
 
 #[test]
 fn complex_merge_array_operand_materializes_descriptor() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=complex_merge_array_operand_materializes_descriptor count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "subroutine s(x, center, mask, out)\n  complex(4), intent(in) :: x(:), center(:)\n  logical, intent(in) :: mask(:)\n  complex(4), intent(out) :: out(:)\n  out = (0.0_4, 0.0_4)\n  out = out + merge((x - center)**2, cmplx(0.0_4, 0.0_4, kind=4), mask)\nend subroutine\nprogram p\n  complex(4) :: x(3), center(3), out(3)\n  logical :: mask(3)\n  x(1) = (2.0_4, 0.0_4)\n  x(2) = (3.0_4, 0.0_4)\n  x(3) = (4.0_4, 0.0_4)\n  center = (1.0_4, 0.0_4)\n  mask = [.true., .false., .true.]\n  call s(x, center, mask, out)\n  if (abs(real(out(1)) - 1.0_4) > 1.0e-5_4) error stop 1\n  if (abs(real(out(2))) > 1.0e-5_4) error stop 2\n  if (abs(real(out(3)) - 9.0_4) > 1.0e-5_4) error stop 3\n  if (abs(aimag(out(1))) > 1.0e-5_4) error stop 4\n  print *, 'ok'\nend program\n",
         "f90",
@@ -15650,6 +17771,13 @@ fn complex_merge_array_operand_materializes_descriptor() {
 
 #[test]
 fn generic_probe_for_aimag_array_mask_does_not_emit_external() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=generic_probe_for_aimag_array_mask_does_not_emit_external count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  interface take\n    module procedure take_mask\n  end interface\ncontains\n  subroutine take_mask(mask)\n    logical, intent(in) :: mask(:)\n    if (.not. mask(1)) error stop 1\n    if (mask(2)) error stop 2\n    if (.not. mask(3)) error stop 3\n  end subroutine\nend module\nprogram p\n  use m, only: take\n  implicit none\n  complex(4) :: z(3)\n  z(1) = (1.0_4, 0.0_4)\n  z(2) = (2.0_4, 3.0_4)\n  z(3) = (4.0_4, 0.0_4)\n  call take(aimag(z) == 0.0_4)\n  print *, 'ok'\nend program\n",
         "f90",
@@ -15680,6 +17808,13 @@ fn generic_probe_for_aimag_array_mask_does_not_emit_external() {
 
 #[test]
 fn complex_scalar_assigned_from_integer_promotes_via_buffer_not_pointer_cast() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=complex_scalar_assigned_from_integer_promotes_via_buffer_not_pointer_cast count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §10.2.1.3: complex variables can be assigned a scalar of
     // numeric type — the right-hand side is promoted to complex with
     // imag=0. Our complex-assign lowering used to memcpy the 8/16
@@ -15725,6 +17860,13 @@ fn complex_scalar_assigned_from_integer_promotes_via_buffer_not_pointer_cast() {
 
 #[test]
 fn int_intrinsic_of_complex_extracts_real_lane() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=int_intrinsic_of_complex_extracts_real_lane count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §16.9.109: INT(A) accepts complex A and converts its
     // real part. The scalar intrinsic path used to coerce the
     // ptr<[f32 x 2]> complex buffer directly to integer, so
@@ -15763,6 +17905,13 @@ fn int_intrinsic_of_complex_extracts_real_lane() {
 
 #[test]
 fn cmplx_kind_keyword_without_y_keeps_zero_or_source_imag_lane() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=cmplx_kind_keyword_without_y_keeps_zero_or_source_imag_lane count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §16.9.49: CMPLX(X, KIND=K) has no Y actual, so a real
     // X must get imag=0 and a complex X must preserve AIMAG(X).
     // The intrinsic lowering flattened keyword slots and treated
@@ -15801,6 +17950,13 @@ fn cmplx_kind_keyword_without_y_keeps_zero_or_source_imag_lane() {
 
 #[test]
 fn complex_dot_product_feeds_complex_sqrt_without_pointer_fsqrt() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=complex_dot_product_feeds_complex_sqrt_without_pointer_fsqrt count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program t\n  implicit none\n  complex :: a(2), z\n  a(1) = cmplx(1.0, 2.0)\n  a(2) = cmplx(3.0, -4.0)\n  z = dot_product(a, a) / sqrt(dot_product(a, a) * dot_product(a, a))\n  if (abs(real(z) - 1.0) > 1.0e-5) error stop 1\n  if (abs(aimag(z)) > 1.0e-5) error stop 2\n  print *, 'ok'\nend program\n",
         "f90",
@@ -15834,6 +17990,13 @@ fn complex_dot_product_feeds_complex_sqrt_without_pointer_fsqrt() {
 
 #[test]
 fn complex_unary_minus_negates_lanes_at_call_site() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=complex_unary_minus_negates_lanes_at_call_site count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §10.1.5: unary minus on a complex value negates both
     // real and imaginary parts. The scalar unary path only handled
     // integer/real values and returned complex operands unchanged,
@@ -15873,6 +18036,13 @@ fn complex_unary_minus_negates_lanes_at_call_site() {
 
 #[test]
 fn complex_dp_array_constructor_preserves_imaginary_lane_in_assignment() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=complex_dp_array_constructor_preserves_imaginary_lane_in_assignment count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §7.8: array-constructor element values for complex(dp)
     // are 16-byte aggregates (`[f64 x 2]`). The constructor lowering
     // used `b.store(coerced, p)` after coercing the cmplx() pointer
@@ -15915,6 +18085,13 @@ fn complex_dp_array_constructor_preserves_imaginary_lane_in_assignment() {
 
 #[test]
 fn nested_array_constructor_into_allocatable_rank1_flattens_full_size() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=nested_array_constructor_into_allocatable_rank1_flattens_full_size count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §7.8: nested array constructors flatten in declared
     // order, so `[[1,2,3],[4,5,6]]` is a 6-element rank-1 constructor.
     // `const_array_constructor_len` previously counted each
@@ -15960,6 +18137,13 @@ fn nested_array_constructor_into_allocatable_rank1_flattens_full_size() {
 
 #[test]
 fn huge_intrinsic_over_array_actual_folds_at_compile_time() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=huge_intrinsic_over_array_actual_folds_at_compile_time count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §16.9.96: HUGE(X) returns the largest representable value
     // of X's type/kind. The value-driven `lower_intrinsic("huge",
     // ...)` arm reads the lowered value's IR type, which for an array
@@ -16003,6 +18187,13 @@ fn huge_intrinsic_over_array_actual_folds_at_compile_time() {
 
 #[test]
 fn type_bound_procedure_target_with_uppercase_name_links_correctly() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=type_bound_procedure_target_with_uppercase_name_links_correctly count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // Fortran is case-insensitive but Mach-O is not. Module-procedure
     // body emission via `module_procedure_symbol_name` lowercases only
     // the module name and preserves the procedure's source case (see
@@ -16048,6 +18239,13 @@ fn type_bound_procedure_target_with_uppercase_name_links_correctly() {
 
 #[test]
 fn where_with_section_ref_to_allocatable_does_not_emit_external_bl() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=where_with_section_ref_to_allocatable_does_not_emit_external_bl count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §10.2.3.2: `where (lambda(1:m) > 0.0) ...` over an
     // allocatable `lambda` is lowered by per-element scalarization —
     // each array name in the mask/body is substituted to a per-iter
@@ -16090,6 +18288,13 @@ fn where_with_section_ref_to_allocatable_does_not_emit_external_bl() {
 
 #[test]
 fn pack_intrinsic_into_allocatable_routes_through_array_descriptor_path() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=pack_intrinsic_into_allocatable_routes_through_array_descriptor_path count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §16.9.144: PACK(ARRAY, MASK [, VECTOR]) is a transformational
     // intrinsic that materializes a fresh rank-1 descriptor — `x_tmp =
     // pack(x, mask)` for an allocatable LHS must route through
@@ -16136,6 +18341,13 @@ fn pack_intrinsic_into_allocatable_routes_through_array_descriptor_path() {
 
 #[test]
 fn pack_zero_size_mask_expression_returns_zero_size_allocatable() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=pack_zero_size_mask_expression_returns_zero_size_allocatable count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // stdlib `median(d0, d0 > 0)` reaches PACK with allocated zero-size
     // source and mask descriptors. Those descriptors legitimately carry a
     // null base pointer; the runtime still must allocate a rank-1 zero-size
@@ -16173,6 +18385,13 @@ fn pack_zero_size_mask_expression_returns_zero_size_allocatable() {
 
 #[test]
 fn pack_strided_row_section_uses_descriptor_strides() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=pack_strided_row_section_uses_descriptor_strides count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // stdlib median DIM+MASK paths call PACK on row sections like
     // `pack(x(j1, :), mask(j1, :))`. In column-major storage those sections
     // are strided descriptors, so PACK must use descriptor strides rather
@@ -16210,6 +18429,13 @@ fn pack_strided_row_section_uses_descriptor_strides() {
 
 #[test]
 fn all_over_int8_pack_compare_lowers_descriptor() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=all_over_int8_pack_compare_lowers_descriptor count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // stdlib_linalg compares byte-sized integer arrays against PACK
     // results inside ALL, e.g. `all(diag(a) == pack(a, mask))`. The
     // descriptor compare path must not reject `integer(int8)` as if it
@@ -16268,6 +18494,13 @@ fn all_over_int8_pack_compare_lowers_descriptor() {
 
 #[test]
 fn generic_logical_actual_with_all_array_expr_uses_probe_type_only() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=generic_logical_actual_with_all_array_expr_uses_probe_type_only count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // Generic call resolution probes must classify ALL(...) as a scalar
     // logical without lowering the reduction body. Lowering the probe
     // used to recurse into the array expression and produce invalid IR
@@ -16326,6 +18559,13 @@ fn generic_logical_actual_with_all_array_expr_uses_probe_type_only() {
 
 #[test]
 fn imported_defined_eq_does_not_hijack_numeric_array_compare() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_defined_eq_does_not_hijack_numeric_array_compare count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // stdlib_linalg imports a derived-type `operator(==)` for its
     // error-state type into the same test unit that compares numeric
     // array expressions inside ALL, e.g. `all(diag(3*a) == 3*v)`.
@@ -16407,6 +18647,13 @@ fn imported_defined_eq_does_not_hijack_numeric_array_compare() {
 
 #[test]
 fn imported_generic_all_does_not_block_intrinsic_reduction() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_generic_all_does_not_block_intrinsic_reduction count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // A USE-associated generic named `all` should not make the lowerer
     // skip the intrinsic reduction when the actual is a logical array
     // and no imported specific matches it. stdlib_linalg reaches this
@@ -16483,6 +18730,13 @@ fn imported_generic_all_does_not_block_intrinsic_reduction() {
 
 #[test]
 fn all_over_local_real_arrays_uses_descriptor_type_despite_name_collision() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=all_over_local_real_arrays_uses_descriptor_type_despite_name_collision count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // The scalar semantic helper is intentionally broad and can find a
     // same-named symbol in another procedure. Descriptor lowering has
     // the concrete element type from the local array, so it must trust
@@ -16537,6 +18791,13 @@ fn all_over_local_real_arrays_uses_descriptor_type_despite_name_collision() {
 
 #[test]
 fn repeated_name_tuple_subscript_flattens_for_generated_stdlib_tests() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=repeated_name_tuple_subscript_flattens_for_generated_stdlib_tests count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // stdlib_linalg_mnorm's fypp output indexes a rank-N result as
     // `bnrm((l,l,l))`. Treat that repeated-name parenthesized tuple as
     // the extension spelling `bnrm(l,l,l)` so generated tests parse
@@ -16572,6 +18833,13 @@ fn repeated_name_tuple_subscript_flattens_for_generated_stdlib_tests() {
 
 #[test]
 fn unpack_assignment_lowers_descriptor() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=unpack_assignment_lowers_descriptor count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §16.9.194: UNPACK returns an array shaped like MASK. The
     // stdlib_linalg integer diagonal tests assign UNPACK directly into
     // fixed matrices, so lowering must materialize a descriptor instead
@@ -16630,6 +18898,13 @@ fn unpack_assignment_lowers_descriptor() {
 
 #[test]
 fn scalar_spread_write_materializes_array_descriptor() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=scalar_spread_write_materializes_array_descriptor count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // Stdlib `test_io/test_npy.f90` writes `spread(0.0_dp, 1, 40)` as an
     // unformatted stream payload in its negative NPY-header tests. Without
     // a descriptor path for scalar-source SPREAD, inline WRITE lowering
@@ -16679,6 +18954,13 @@ fn scalar_spread_write_materializes_array_descriptor() {
 
 #[test]
 fn submodule_dispatching_private_parent_generic_interface_resolves_via_amod() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=submodule_dispatching_private_parent_generic_interface_resolves_via_amod count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §11.2.3: a submodule has full access to its parent module's
     // PRIVATE entities by host association. Previously `write_amod` only
     // emitted public NamedInterface symbols, so a submodule compiled in a
@@ -16756,6 +19038,13 @@ fn submodule_dispatching_private_parent_generic_interface_resolves_via_amod() {
 
 #[test]
 fn module_parameter_array_scalar_broadcast_init_keeps_array_global() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=module_parameter_array_scalar_broadcast_init_keeps_array_global count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §7.4.4: a scalar value initializing an array PARAMETER is
     // broadcast to every element. Two paths broke this for module-level
     // parameter arrays: (1) `collect_decl_param_consts_with_*` saw the
@@ -16804,6 +19093,13 @@ fn module_parameter_array_scalar_broadcast_init_keeps_array_global() {
 
 #[test]
 fn module_parameter_array_conversion_init_keeps_array_global() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=module_parameter_array_conversion_init_keeps_array_global count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // stdlib_stats_moment declares module globals like
     // `real(sp) :: x1(5) = real(d1, sp)` where d1 is a real(dp)
     // PARAMETER array. The constant-array folder used to recognize only
@@ -16843,6 +19139,13 @@ fn module_parameter_array_conversion_init_keeps_array_global() {
 
 #[test]
 fn user_function_call_with_section_arg_emits_one_section_descriptor_per_callsite() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=user_function_call_with_section_arg_emits_one_section_descriptor_per_callsite count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // Asm-level guard against re-introducing the resolution_arg_vals /
     // intrinsic_arg_vals probe duplication that compiled
     // stdlib_hash_32bit_water at a 26 GB peak: every
@@ -16898,6 +19201,13 @@ fn user_function_call_with_section_arg_emits_one_section_descriptor_per_callsite
 
 #[test]
 fn descriptor_actual_passed_to_assumed_size_dummy_extracts_base_addr() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=descriptor_actual_passed_to_assumed_size_dummy_extracts_base_addr count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §15.5.2.4: assumed-size dummies receive a bare element
     // pointer.  When the actual is an array section (`arr(:)`) — a
     // non-Name, non-all-Element shape — `lower_arg_by_ref_full`'s tail
@@ -16971,6 +19281,13 @@ end program
 
 #[test]
 fn internal_subprogram_call_under_intrinsic_under_user_call_keeps_mangled_name() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=internal_subprogram_call_under_intrinsic_under_user_call_keeps_mangled_name count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §15.6.2.2: internal subprograms (CONTAINS-block functions
     // inside another procedure) link under a host-prefixed mangled
     // symbol, not their bare Fortran name. Two of `generic_dispatch_
@@ -17020,6 +19337,13 @@ fn internal_subprogram_call_under_intrinsic_under_user_call_keeps_mangled_name()
 
 #[test]
 fn complex_local_minus_complex_function_call_compiles_through_complex_arith() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=complex_local_minus_complex_function_call_compiles_through_complex_arith count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §7.1.5: complex - complex is a complex-shape binary op.
     // The binop lowering's complex-arithmetic branch fires when at
     // least one operand satisfies `is_complex_ty` (`[fN x 2]` or
@@ -17057,6 +19381,13 @@ fn complex_local_minus_complex_function_call_compiles_through_complex_arith() {
 
 #[test]
 fn allocate_scalar_with_source_from_complex_returning_call_compiles_cleanly() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocate_scalar_with_source_from_complex_returning_call_compiles_cleanly count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §9.7.1.2: ALLOCATE(target, SOURCE = expr) initializes the
     // freshly allocated target with the value of expr.  When expr is
     // a scalar complex(sp/dp) function call, the callee returns its
@@ -17098,6 +19429,13 @@ fn allocate_scalar_with_source_from_complex_returning_call_compiles_cleanly() {
 
 #[test]
 fn transfer_with_constant_size_into_array_dest_byte_copies_source() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=transfer_with_constant_size_into_array_dest_byte_copies_source count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §16.9.193: TRANSFER(SRC, MOLD, SIZE) returns a rank-1
     // array of SIZE mold-typed elements, byte-equal to the SRC bytes.
     // Previously `vx16 = transfer(vx32, 0_int16, 2)` lowered the RHS
@@ -17141,6 +19479,13 @@ fn transfer_with_constant_size_into_array_dest_byte_copies_source() {
 
 #[test]
 fn scalar_transfer_from_assumed_shape_section_copies_section_data() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=scalar_transfer_from_assumed_shape_section_copies_section_data count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // stdlib_hash_32bit's nmh_readle16 receives an assumed-shape
     // byte dummy and computes `transfer(p(1:2), 0_int16)`. The section
     // source lowers to an array descriptor; scalar TRANSFER must memcpy
@@ -17178,6 +19523,13 @@ fn scalar_transfer_from_assumed_shape_section_copies_section_data() {
 
 #[test]
 fn transfer_from_runtime_section_into_array_section_copies_source_data() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=transfer_from_runtime_section_into_array_section_copies_source_data count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // stdlib_hash_64bit_pengy uses:
     //   b(0:3) = transfer(key(index:index+31), 0_int64, 4)
     // where key is an assumed-shape byte dummy and index is runtime.
@@ -17217,6 +19569,13 @@ fn transfer_from_runtime_section_into_array_section_copies_source_data() {
 
 #[test]
 fn array_binary_uses_array_valued_transfer_operand_lanes() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=array_binary_uses_array_valued_transfer_operand_lanes count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // stdlib_hash_32bit uses expressions like
     // `vx16 = vx16 * transfer(m1, 0_int16, 2)`. TRANSFER with SIZE
     // is an array result; if scalar lowering handles it, the first
@@ -17255,6 +19614,13 @@ fn array_binary_uses_array_valued_transfer_operand_lanes() {
 
 #[test]
 fn transfer_with_parameter_size_into_fixed_array_dest_byte_copies_source() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=transfer_with_parameter_size_into_fixed_array_dest_byte_copies_source count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // stdlib hash tests use `transfer(dummy, 0_int8, size_key_array)`,
     // where SIZE is a module parameter rather than a literal. The
     // TRANSFER-aware array assignment path must still take over; the
@@ -17293,6 +19659,13 @@ fn transfer_with_parameter_size_into_fixed_array_dest_byte_copies_source() {
 
 #[test]
 fn transfer_named_int32_parameter_is_visible_in_contained_body() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=transfer_named_int32_parameter_is_visible_in_contained_body count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // stdlib_hash_64bit_spookyv2 builds:
     //
     //   integer(int32), parameter :: sc_constsub = int(z'deadbeef', int32)
@@ -17350,6 +19723,13 @@ end program p
 
 #[test]
 fn transfer_named_int32_parameter_survives_submodule_amod_boundary() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=transfer_named_int32_parameter_survives_submodule_amod_boundary count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("transfer_named_param_submodule");
     let mod_src = write_program_in(
         &dir,
@@ -17492,6 +19872,13 @@ end program p
 
 #[test]
 fn transfer_logical_parameter_survives_amod_boundary() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=transfer_logical_parameter_survives_amod_boundary count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // stdlib_hash_32bit exposes:
     //   logical, parameter :: little_endian =
     //       1 == transfer([1_int8, 0_int8], 0_int16)
@@ -17586,6 +19973,13 @@ fn transfer_logical_parameter_survives_amod_boundary() {
 
 #[test]
 fn submodule_logical_parameter_hash_branch_is_constant() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=submodule_logical_parameter_hash_branch_is_constant count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // stdlib's nmhash32x submodule selects the low 32-bit length lane with
     // a parent-module logical PARAMETER:
     //
@@ -17861,6 +20255,13 @@ end program p
 
 #[test]
 fn pack_result_vector_subscript_assignment_lowers_intrinsic() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=pack_result_vector_subscript_assignment_lowers_intrinsic count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // PACK is array-valued and can appear directly as a vector
     // subscript. If that result is misclassified as scalar, lowering
     // emits an unresolved external `_pack` from the array-element path
@@ -17898,6 +20299,13 @@ fn pack_result_vector_subscript_assignment_lowers_intrinsic() {
 
 #[test]
 fn complex_dp_implied_do_constructor_preserves_imaginary_lane_per_iteration() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=complex_dp_implied_do_constructor_preserves_imaginary_lane_per_iteration count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §7.8 implied-do array constructor with complex(dp) elements:
     // the inner-loop body in store_ac_implied_do had the same scalar-store
     // bug as the flat path — only the real lane was overwritten per
@@ -17937,6 +20345,13 @@ fn complex_dp_implied_do_constructor_preserves_imaginary_lane_per_iteration() {
 
 #[test]
 fn array_reductions_with_mask_keyword_apply_mask_instead_of_ignoring_it() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=array_reductions_with_mask_keyword_apply_mask_instead_of_ignoring_it count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §16.9.231 (SUM), §16.9.196 (PRODUCT), §16.9.146 (MAXVAL),
     // §16.9.151 (MINVAL): MASK selects which elements participate.
     // Previously `sum(a, mask=m)` lowered identically to `sum(a)` (mask
@@ -17976,6 +20391,13 @@ fn array_reductions_with_mask_keyword_apply_mask_instead_of_ignoring_it() {
 
 #[test]
 fn sum_with_positional_logical_mask_applies_mask_instead_of_dim() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=sum_with_positional_logical_mask_applies_mask_instead_of_dim count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §16.9.231 permits SUM(ARRAY, MASK) when the second
     // positional actual is logical. stdlib_intrinsics uses this form in
     // its masked real sum accuracy checks; pre-fix the scalar reduction
@@ -18013,6 +20435,13 @@ fn sum_with_positional_logical_mask_applies_mask_instead_of_dim() {
 
 #[test]
 fn array_sum_and_maxval_over_real_kind4_array_uses_correct_element_width() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=array_sum_and_maxval_over_real_kind4_array_uses_correct_element_width count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // The real array reductions (`afs_array_sum_real8`,
     // `afs_array_maxval_real8`, `afs_array_minval_real8`,
     // `afs_array_product_real8`) used to read `*const f64` regardless
@@ -18055,6 +20484,13 @@ fn array_sum_and_maxval_over_real_kind4_array_uses_correct_element_width() {
 
 #[test]
 fn complex_sum_uses_complex_runtime_result_buffer() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=complex_sum_uses_complex_runtime_result_buffer count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // stdlib's complex Kahan checks compare masked Kahan sums against
     // the intrinsic SUM. Plain SUM(complex_array) was routed through
     // the integer reducer, then coerced into a by-value complex aggregate
@@ -18090,6 +20526,13 @@ fn complex_sum_uses_complex_runtime_result_buffer() {
 
 #[test]
 fn parameter_const_with_math_intrinsic_initializer_folds_in_smp_body() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=parameter_const_with_math_intrinsic_initializer_folds_in_smp_body count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §16.9: math intrinsics (sqrt, exp, log, sin/cos/...) are
     // permitted in initialization expressions for PARAMETERs.  Without
     // compile-time folding, an SMP body that references such a parameter
@@ -18134,6 +20577,13 @@ fn parameter_const_with_math_intrinsic_initializer_folds_in_smp_body() {
 
 #[test]
 fn cross_module_elemental_through_generic_interface_scalarizes_on_array_actual() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=cross_module_elemental_through_generic_interface_scalarizes_on_array_actual count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §16.2.7: an elemental procedure applied to an array actual
     // produces a conformable array result via element-wise scalarization.
     // stdlib's `gelu(x)` (rank-1 array x) dispatches through a generic
@@ -18179,6 +20629,13 @@ fn cross_module_elemental_through_generic_interface_scalarizes_on_array_actual()
 
 #[test]
 fn generic_elemental_subroutine_with_logical_array_actual_scalarizes_all_lanes() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=generic_elemental_subroutine_with_logical_array_actual_scalarizes_all_lanes count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // stdlib_sum_kahan calls the generic elemental subroutine
     // `kahan_kernel(a_section, s_section, c_section, mask_section)`.
     // The subroutine scalarizer already handled numeric array actuals,
@@ -18217,6 +20674,13 @@ fn generic_elemental_subroutine_with_logical_array_actual_scalarizes_all_lanes()
 
 #[test]
 fn explicit_shape_dummy_runtime_bound_materializes_descriptor_extent() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=explicit_shape_dummy_runtime_bound_materializes_descriptor_extent count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // stdlib_sum_3d_sp recasts an assumed-shape rank-3 array to a
     // contained rank-1 explicit-shape dummy (`real :: b(n)`) before
     // summing. The dummy is passed as a raw pointer, so the callee must
@@ -18255,6 +20719,13 @@ fn explicit_shape_dummy_runtime_bound_materializes_descriptor_extent() {
 
 #[test]
 fn same_name_contained_function_return_type_is_caller_relative() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=same_name_contained_function_return_type_is_caller_relative count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // stdlib_intrinsics_sum defines many contained helpers with the
     // same bare name under different kind/rank wrappers. The call
     // target was already caller-relative, but return-type lookup still
@@ -18329,6 +20800,13 @@ fn same_name_contained_function_return_type_is_caller_relative() {
 
 #[test]
 fn imported_generic_array_function_assignment_keeps_whole_array_actual() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_generic_array_function_assignment_keeps_whole_array_actual count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("imported_generic_array_assign");
     let mod_src = write_program_in(
         &dir,
@@ -18413,6 +20891,13 @@ fn imported_generic_array_function_assignment_keeps_whole_array_actual() {
 
 #[test]
 fn runtime_shape_array_function_result_auto_allocates_on_entry() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=runtime_shape_array_function_result_auto_allocates_on_entry count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §15.5.2.4: a function whose result is an explicit-shape
     // array with bounds depending on dummies (e.g.
     // `integer :: res(size(v),size(v))`) must auto-allocate the
@@ -18459,6 +20944,13 @@ fn runtime_shape_array_function_result_auto_allocates_on_entry() {
 
 #[test]
 fn fixed_shape_array_function_result_auto_allocates_on_entry() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_shape_array_function_result_auto_allocates_on_entry count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §15.5.2.4: a function whose result is an explicit-shape
     // array with constant bounds (e.g. `real :: res(3)`) flows through
     // the same `HiddenResultAbi::ArrayDescriptor` ABI as runtime-shape
@@ -18503,6 +20995,13 @@ fn fixed_shape_array_function_result_auto_allocates_on_entry() {
 
 #[test]
 fn sum_along_dim_returns_reduced_array() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=sum_along_dim_returns_reduced_array count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §16.9.231: SUM(arr, dim=k) reduces along dim k and
     // returns a rank-(N-1) array. For a 2x3 matrix [[1,3,5],[2,4,6]]
     // sum(y, 1) = [3, 7, 11], sum(y, 2) = [9, 12]. Pre-fix,
@@ -18542,6 +21041,13 @@ fn sum_along_dim_returns_reduced_array() {
 
 #[test]
 fn maxval_minval_with_dim_return_reduced_arrays() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=maxval_minval_with_dim_return_reduced_arrays count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 16.9.146 / 16.9.151: MAXVAL/MINVAL with DIM return
     // rank-(N-1) arrays. The scalar reduction path used to ignore DIM
     // for maxval(abs(array), dim=1), then passed the scalar result as a
@@ -18611,6 +21117,13 @@ fn maxval_minval_with_dim_return_reduced_arrays() {
 
 #[test]
 fn rank_reducing_section_arithmetic_uses_strided_descriptor() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=rank_reducing_section_arithmetic_uses_strided_descriptor count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §9.5.3.4: a subscript like `y(1,:)` is a *rank-reducing*
     // selection — the leading scalar index drops the first dim and
     // the result is rank-1 with column-major memory stride
@@ -18654,6 +21167,13 @@ fn rank_reducing_section_arithmetic_uses_strided_descriptor() {
 
 #[test]
 fn rank3_middle_section_arithmetic_uses_strided_descriptor() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=rank3_middle_section_arithmetic_uses_strided_descriptor count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // A rank-reducing section with a scalar subscript in the middle dimension
     // is rank 2 but non-contiguous: x(:, i, :) has memory strides (1, 12)
     // for x(4,3,3). Array-expression lowering must decompose the flat loop
@@ -18692,6 +21212,13 @@ fn rank3_middle_section_arithmetic_uses_strided_descriptor() {
 
 #[test]
 fn rank3_middle_section_real_conversion_uses_strided_descriptor() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=rank3_middle_section_real_conversion_uses_strided_descriptor count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // Elemental array calls also materialize descriptor-backed temporaries.
     // REAL(x(:, i, :), 8) over an integer rank-3 middle section must walk the
     // non-contiguous source descriptor with per-dim strides, not dim[0] only.
@@ -18728,6 +21255,13 @@ fn rank3_middle_section_real_conversion_uses_strided_descriptor() {
 
 #[test]
 fn rank3_middle_section_merge_mask_uses_strided_descriptor() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=rank3_middle_section_merge_mask_uses_strided_descriptor count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // MERGE has its own descriptor helper. The tsource and logical mask can
     // both be non-contiguous rank-reducing sections, so flat rank-1 indexing
     // reads the wrong mask element and leaks masked-off contributions.
@@ -18764,6 +21298,13 @@ fn rank3_middle_section_merge_mask_uses_strided_descriptor() {
 
 #[test]
 fn all_compare_mixed_kind_generic_rank2_returns_descriptors() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=all_compare_mixed_kind_generic_rank2_returns_descriptors count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §10.1.5 + §16.9.5: `all(eye(4) == diag([1,1,1,1]))` from
     // stdlib's example_eye2. Reproduces three issues at once: generic-
     // interface-call expr_type returns Unknown (gating used to reject),
@@ -18810,6 +21351,13 @@ fn all_compare_mixed_kind_generic_rank2_returns_descriptors() {
 
 #[test]
 fn derived_dummy_component_subscript_uses_updated_component_value() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=derived_dummy_component_subscript_uses_updated_component_value count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: control_block_t\n    integer :: block_type = 0\n    logical :: should_execute = .true.\n  end type control_block_t\n  type :: shell_state_t\n    type(control_block_t) :: control_stack(20)\n    integer :: control_depth = 0\n  end type shell_state_t\n  type(shell_state_t) :: shell\n  call push(shell)\n  if (shell%control_depth /= 1) error stop 1\n  if (shell%control_stack(1)%block_type /= 7) error stop 2\n  if (.not. shell%control_stack(1)%should_execute) error stop 3\n  print *, shell%control_depth, shell%control_stack(1)%block_type\ncontains\n  subroutine push(shell)\n    type(shell_state_t), intent(inout) :: shell\n    shell%control_depth = shell%control_depth + 1\n    shell%control_stack(shell%control_depth)%block_type = 7\n  end subroutine push\nend program\n",
         "f90",
@@ -18847,6 +21395,13 @@ fn derived_dummy_component_subscript_uses_updated_component_value() {
 
 #[test]
 fn shared_compile_emits_amod_and_links_cleanly() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=shared_compile_emits_amod_and_links_cleanly count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("shared_mod");
     let lib_src = write_program_in(
         &dir,
@@ -18918,6 +21473,13 @@ fn shared_compile_emits_amod_and_links_cleanly() {
 
 #[test]
 fn verbose_flag_streams_phase_lines_to_stderr() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=verbose_flag_streams_phase_lines_to_stderr count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program("program p\n  print *, 1\nend program\n", "f90");
     let out = unique_path("verbose", "bin");
     let result = Command::new(compiler("armfortas"))
@@ -18942,6 +21504,13 @@ fn verbose_flag_streams_phase_lines_to_stderr() {
 
 #[test]
 fn time_report_prints_phase_table() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=time_report_prints_phase_table count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program("program p\n  print *, 1\nend program\n", "f90");
     let out = unique_path("timer", "bin");
     let result = Command::new(compiler("armfortas"))
@@ -19118,6 +21687,13 @@ fn utf8_lexer_error_reports_character_and_caret() {
 
 #[test]
 fn bom_prefixed_source_compiles_cleanly() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=bom_prefixed_source_compiles_cleanly count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program("\u{feff}program p\n  print *, 1\nend program\n", "f90");
     let out = unique_path("bom", "o");
     let result = Command::new(compiler("armfortas"))
@@ -19263,6 +21839,13 @@ fn parameter_integer_literal_overflow_is_diagnosed() {
 
 #[test]
 fn symbolic_integer_kind_suffix_uses_imported_width() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=symbolic_integer_kind_suffix_uses_imported_width count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  use iso_c_binding, only: c_long\n  integer(c_long), parameter :: x = 9223372036854775807_c_long\n  if (x /= 9223372036854775807_c_long) error stop 1\n  print *, x\nend program\n",
         "f90",
@@ -19395,6 +21978,13 @@ fn fimplicit_none_rejects_implicitly_typed_use() {
 
 #[test]
 fn fimplicit_none_respects_explicit_implicit_rules() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fimplicit_none_respects_explicit_implicit_rules count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit integer (i-n)\n  i = 5\n  print *, i\nend program\n",
         "f90",
@@ -19427,6 +22017,13 @@ fn fimplicit_none_respects_explicit_implicit_rules() {
 
 #[test]
 fn fdefault_integer_8_changes_default_kind() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fdefault_integer_8_changes_default_kind count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  integer :: x\n  print *, kind(x)\nend program\n",
         "f90",
@@ -19459,6 +22056,13 @@ fn fdefault_integer_8_changes_default_kind() {
 
 #[test]
 fn fdefault_real_8_changes_default_kind() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fdefault_real_8_changes_default_kind count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  real :: y\n  print *, kind(y)\nend program\n",
         "f90",
@@ -19603,6 +22207,13 @@ fn coarray_sync_reports_not_implemented() {
 
 #[test]
 fn procedure_pointer_decl_compiles_through_wrapper_calls() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=procedure_pointer_decl_compiles_through_wrapper_calls count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  abstract interface\n    logical function pred(x)\n      integer, intent(in) :: x\n    end function pred\n    subroutine act(x)\n      integer, intent(in) :: x\n    end subroutine act\n  end interface\n  procedure(pred), pointer :: p => null()\n  procedure(act), pointer :: q => null()\ncontains\n  logical function ok(x)\n    integer, intent(in) :: x\n    ok = .false.\n    if (associated(p)) ok = p(x)\n  end function ok\n\n  subroutine run(x)\n    integer, intent(in) :: x\n    if (associated(q)) call q(x)\n  end subroutine run\nend module\n",
         "f90",
@@ -19624,6 +22235,13 @@ fn procedure_pointer_decl_compiles_through_wrapper_calls() {
 
 #[test]
 fn procedure_pointer_calls_and_assignment_run_indirectly() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=procedure_pointer_calls_and_assignment_run_indirectly count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  abstract interface\n    integer function pred(x)\n      integer, intent(in) :: x\n    end function pred\n    subroutine act(x)\n      integer, intent(inout) :: x\n    end subroutine act\n  end interface\n  procedure(pred), pointer :: p => null()\n  procedure(act), pointer :: q => null()\ncontains\n  integer function twice(x)\n    integer, intent(in) :: x\n    twice = x * 2\n  end function twice\n\n  subroutine bump(x)\n    integer, intent(inout) :: x\n    x = x + 1\n  end subroutine bump\n\n  subroutine init()\n    p => twice\n    q => bump\n  end subroutine init\nend module\n\nprogram main\n  use m\n  implicit none\n  integer :: x\n  call init()\n  x = p(3)\n  call q(x)\n  print *, x\nend program main\n",
         "f90",
@@ -19662,6 +22280,13 @@ fn procedure_pointer_calls_and_assignment_run_indirectly() {
 
 #[test]
 fn module_procedure_pointer_call_target_is_retained_for_linking() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=module_procedure_pointer_call_target_is_retained_for_linking count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  abstract interface\n    subroutine hook_iface(msg)\n      character(len=*), intent(in) :: msg\n    end subroutine hook_iface\n  end interface\n  procedure(hook_iface), pointer :: hook => null()\ncontains\n  subroutine init()\n    hook => impl\n  end subroutine init\n\n  subroutine run(msg)\n    character(len=*), intent(in) :: msg\n    call hook(msg)\n  end subroutine run\n\n  subroutine impl(msg)\n    character(len=*), intent(in) :: msg\n    if (trim(msg) /= 'ok') error stop 1\n    print *, trim(msg)\n  end subroutine impl\nend module\n\nprogram p\n  use m\n  implicit none\n  call init()\n  call run('ok')\nend program\n",
         "f90",
@@ -19700,6 +22325,13 @@ fn module_procedure_pointer_call_target_is_retained_for_linking() {
 
 #[test]
 fn procedure_dummy_actual_argument_round_trips_through_pointer_assignment() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=procedure_dummy_actual_argument_round_trips_through_pointer_assignment count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module modproc_m\n  implicit none\n  abstract interface\n    subroutine cb(command, exit_status)\n      character(len=*), intent(in) :: command\n      integer, intent(out) :: exit_status\n    end subroutine cb\n  end interface\n  procedure(cb), pointer :: p => null()\ncontains\n  subroutine set_cb(x)\n    procedure(cb) :: x\n    p => x\n  end subroutine\n\n  subroutine run(command, exit_status)\n    character(len=*), intent(in) :: command\n    integer, intent(out) :: exit_status\n    call p(command, exit_status)\n  end subroutine\n\n  subroutine cb_impl(command, exit_status)\n    character(len=*), intent(in) :: command\n    integer, intent(out) :: exit_status\n    exit_status = len_trim(command)\n  end subroutine\nend module\n\nprogram main\n  use modproc_m\n  implicit none\n  integer :: status\n  call set_cb(cb_impl)\n  call run('abc', status)\n  print *, status\nend program\n",
         "f90",
@@ -19736,6 +22368,13 @@ fn procedure_dummy_actual_argument_round_trips_through_pointer_assignment() {
 
 #[test]
 fn procedure_pointer_callback_with_derived_and_assumed_len_char_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=procedure_pointer_callback_with_derived_and_assumed_len_char_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: shell_state_t\n    integer :: marker = 0\n  end type\n  type :: parser_state_t\n    character(len=:), allocatable :: raw_input\n  end type\n  abstract interface\n    subroutine cb(shell, command, out_len)\n      import :: shell_state_t\n      type(shell_state_t), intent(inout) :: shell\n      character(len=*), intent(in) :: command\n      integer, intent(out) :: out_len\n    end subroutine cb\n  end interface\n  procedure(cb), pointer :: p => null()\ncontains\n  subroutine set_cb(x)\n    procedure(cb) :: x\n    p => x\n  end subroutine\n\n  subroutine invoke(shell, command, out_len)\n    type(shell_state_t), intent(inout) :: shell\n    character(len=*), intent(in) :: command\n    integer, intent(out) :: out_len\n    call p(shell, command, out_len)\n  end subroutine\n\n  subroutine impl(shell, command, out_len)\n    type(shell_state_t), intent(inout) :: shell\n    character(len=*), intent(in) :: command\n    integer, intent(out) :: out_len\n    type(parser_state_t) :: state\n    state%raw_input = command\n    shell%marker = len(state%raw_input)\n    out_len = len(state%raw_input)\n    print '(A)', state%raw_input\n  end subroutine\nend module\n\nprogram main\n  use m\n  implicit none\n  type(shell_state_t) :: shell\n  integer :: n\n  call set_cb(impl)\n  call invoke(shell, 'echo a b c', n)\n  print *, shell%marker, n\nend program\n",
         "f90",
@@ -19777,6 +22416,13 @@ fn procedure_pointer_callback_with_derived_and_assumed_len_char_runs() {
 
 #[test]
 fn c_funloc_bind_c_handler_uses_binding_label_symbol() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=c_funloc_bind_c_handler_uses_binding_label_symbol count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  use iso_c_binding\n  implicit none\n  interface\n    function c_signal(sig, handler) bind(C, name='signal') result(old)\n      import :: c_int, c_funptr\n      integer(c_int), value :: sig\n      type(c_funptr), value :: handler\n      type(c_funptr) :: old\n    end function\n  end interface\ncontains\n  subroutine setup()\n    type(c_funptr) :: old_handler\n    old_handler = c_signal(2, c_funloc(sig_handler))\n  end subroutine\n\n  subroutine sig_handler() bind(C)\n  end subroutine\nend module\n",
         "f90",
@@ -19810,6 +22456,13 @@ fn c_funloc_bind_c_handler_uses_binding_label_symbol() {
 
 #[test]
 fn c_funptr_component_assignment_round_trips_through_c_associated() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=c_funptr_component_assignment_round_trips_through_c_associated count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  use iso_c_binding\n  implicit none\n  type :: sigaction_t\n    type(c_funptr) :: sa_handler\n    integer(c_long) :: sa_mask(16)\n    integer(c_int) :: sa_flags\n    type(c_funptr) :: sa_restorer\n  end type\n  type(sigaction_t) :: sa\n  logical :: same\n  sa%sa_handler = c_funloc(handler)\n  same = c_associated(sa%sa_handler, c_funloc(handler))\n  print '(A,L1)', 'SAME=', same\ncontains\n  subroutine handler(signum) bind(C)\n    integer(c_int), value :: signum\n  end subroutine\nend program\n",
         "f90",
@@ -19850,6 +22503,13 @@ fn c_funptr_component_assignment_round_trips_through_c_associated() {
 
 #[test]
 fn imported_module_c_funptr_global_passes_value_not_storage_address() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_module_c_funptr_global_passes_value_not_storage_address count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("amod_imported_c_funptr_global");
     let c_src = write_program_in(
         &dir,
@@ -19951,6 +22611,13 @@ fn imported_module_c_funptr_global_passes_value_not_storage_address() {
 
 #[test]
 fn c_ptr_array_element_assignment_round_trips_through_c_associated() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=c_ptr_array_element_assignment_round_trips_through_c_associated count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  use iso_c_binding\n  implicit none\n  character(len=16), target, allocatable :: args(:)\n  type(c_ptr), allocatable, target :: argv(:)\n  allocate(args(2))\n  allocate(argv(3))\n  args(1) = 'echo' // c_null_char\n  args(2) = 'done' // c_null_char\n  argv(1) = c_loc(args(1))\n  argv(2) = c_loc(args(2))\n  argv(3) = c_null_ptr\n  if (.not. c_associated(argv(1), c_loc(args(1)))) error stop 1\n  if (.not. c_associated(argv(2), c_loc(args(2)))) error stop 2\n  if (c_associated(argv(3))) error stop 3\n  print *, 'ok'\nend program\n",
         "f90",
@@ -19989,6 +22656,13 @@ fn c_ptr_array_element_assignment_round_trips_through_c_associated() {
 
 #[test]
 fn sigaction_module_bind_c_struct_preserves_handler_component_for_self_signal() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=sigaction_module_bind_c_struct_preserves_handler_component_for_self_signal count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  use iso_c_binding\n  implicit none\n  integer(c_int), parameter :: SIGUSR1 = 10\n  logical, save :: pending(32) = .false.\n  type, bind(C) :: sigaction_t\n    type(c_funptr) :: sa_handler\n    integer(c_long) :: sa_mask(16)\n    integer(c_int) :: sa_flags\n    type(c_funptr) :: sa_restorer\n  end type\n  interface\n    function c_sigaction(signum, act, oldact) bind(C, name='sigaction')\n      import :: c_int, sigaction_t\n      integer(c_int), value :: signum\n      type(sigaction_t), intent(in) :: act\n      type(sigaction_t), intent(out) :: oldact\n      integer(c_int) :: c_sigaction\n    end function\n    function c_raise(sig) bind(C, name='raise')\n      import :: c_int\n      integer(c_int), value :: sig\n      integer(c_int) :: c_raise\n    end function\n  end interface\ncontains\n  subroutine handler(signum) bind(C)\n    integer(c_int), value :: signum\n    if (signum > 0 .and. signum <= 32) pending(signum) = .true.\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(sigaction_t) :: sa, old_sa\n  integer(c_int) :: rc\n  sa%sa_handler = c_funloc(handler)\n  sa%sa_mask = 0\n  sa%sa_flags = 0\n  sa%sa_restorer = c_null_funptr\n  rc = c_sigaction(SIGUSR1, sa, old_sa)\n  print '(A,I0)', 'SIGACTION=', rc\n  rc = c_raise(SIGUSR1)\n  print '(A,I0)', 'RAISE=', rc\n  print '(A,L1)', 'PENDING=', pending(SIGUSR1)\nend program\n",
         "f90",
@@ -20039,6 +22713,13 @@ fn sigaction_module_bind_c_struct_preserves_handler_component_for_self_signal() 
 
 #[test]
 fn procedure_pointer_module_export_survives_amod_import() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=procedure_pointer_module_export_survives_amod_import count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("procptr_amod");
     let mod_src = write_program_in(
         &dir,
@@ -20096,6 +22777,13 @@ fn procedure_pointer_module_export_survives_amod_import() {
 
 #[test]
 fn use_renamed_procedure_call_keeps_imported_target_even_with_local_name_collision() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=use_renamed_procedure_call_keeps_imported_target_even_with_local_name_collision count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("use_rename_call_target");
     let imported_src = write_program_in(
         &dir,
@@ -20216,6 +22904,13 @@ fn use_renamed_procedure_call_keeps_imported_target_even_with_local_name_collisi
 
 #[test]
 fn local_char_parameter_array_elements_preserve_runtime_bytes() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=local_char_parameter_array_elements_preserve_runtime_bytes count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\ncontains\n  subroutine identify(command_name, type_flag)\n    character(len=*), intent(in) :: command_name\n    logical, intent(in) :: type_flag\n    if (is_builtin_command(command_name)) then\n      if (type_flag) then\n        print *, 'builtin'\n      else\n        print *, trim(command_name)\n      end if\n    else\n      print *, 'missing'\n    end if\n  end subroutine\n\n  function is_builtin_command(command_name) result(is_builtin)\n    character(len=*), intent(in) :: command_name\n    logical :: is_builtin\n    character(len=16), parameter :: builtins(4) = [ &\n      'cd              ', 'pwd             ', 'echo            ', 'printf          ' ]\n    integer :: i\n    is_builtin = .false.\n    do i = 1, size(builtins)\n      if (trim(command_name) == trim(builtins(i))) then\n        is_builtin = .true.\n        return\n      end if\n    end do\n  end function\nend module\n\nprogram p\n  use m\n  implicit none\n  character(len=256) :: command_name\n  command_name = 'echo'\n  call identify(command_name, .true.)\n  call identify(command_name, .false.)\nend program\n",
         "f90",
@@ -20253,6 +22948,13 @@ fn local_char_parameter_array_elements_preserve_runtime_bytes() {
 
 #[test]
 fn fixed_char_array_constructor_assignment_preserves_runtime_bytes() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_char_array_constructor_assignment_preserves_runtime_bytes count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  character(len=20) :: builtins(3)\n  builtins = [ 'cd                  ', 'echo                ', 'printf              ' ]\n  print '(a)', trim(builtins(1))\n  print '(a)', trim(builtins(2))\n  print '(a)', trim(builtins(3))\nend program\n",
         "f90",
@@ -20295,6 +22997,13 @@ fn fixed_char_array_constructor_assignment_preserves_runtime_bytes() {
 
 #[test]
 fn fixed_char_array_element_actual_to_char_dummy_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_char_array_element_actual_to_char_dummy_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "subroutine install_single_trap(signal_name, command)\n  implicit none\n  character(len=*), intent(in) :: signal_name, command\n  print *, trim(signal_name), trim(command)\nend subroutine\n\nsubroutine parse_signal_list(signals, signal_names, count)\n  implicit none\n  character(len=*), intent(in) :: signals\n  character(len=32), intent(out) :: signal_names(20)\n  integer, intent(out) :: count\n  count = 1\n  signal_names(1) = signals\nend subroutine\n\nsubroutine install_trap(signals, command)\n  implicit none\n  character(len=*), intent(in) :: signals, command\n  character(len=32) :: signal_names(20)\n  integer :: signal_count, i\n  call parse_signal_list(signals, signal_names, signal_count)\n  do i = 1, signal_count\n    call install_single_trap(signal_names(i), command)\n  end do\nend subroutine\n\nprogram p\n  implicit none\n  call install_trap('INT', 'echo')\nend program\n",
         "f90",
@@ -20331,6 +23040,13 @@ fn fixed_char_array_element_actual_to_char_dummy_runs() {
 
 #[test]
 fn external_optional_dummy_absent_still_reserves_slot_before_hidden_char_lengths() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=external_optional_dummy_absent_still_reserves_slot_before_hidden_char_lengths count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("optional_hidden_char_len");
     let mod_src = write_program_in(
         &dir,
@@ -20422,6 +23138,13 @@ fn external_optional_dummy_absent_still_reserves_slot_before_hidden_char_lengths
 
 #[test]
 fn keyword_actual_preserves_skipped_optional_slot() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=keyword_actual_preserves_skipped_optional_slot count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: t\n    integer :: a = 0\n    logical :: b = .false.\n    integer :: c = 0\n  end type\ncontains\n  subroutine foo(x, a, b, c)\n    type(t), intent(inout) :: x\n    integer, intent(in) :: a\n    logical, intent(in), optional :: b\n    integer, intent(in), optional :: c\n    x%a = a\n    if (present(b)) then\n      x%b = b\n    else\n      x%b = .false.\n    end if\n    if (present(c)) then\n      x%c = c\n    else\n      x%c = -1\n    end if\n  end subroutine foo\nend module m\nprogram p\n  use m\n  implicit none\n  type(t) :: x\n  call foo(x, 11, c=77)\n  if (x%a /= 11) error stop 1\n  if (x%b) error stop 2\n  if (x%c /= 77) error stop 3\n  print *, 'ok'\nend program p\n",
         "f90",
@@ -20460,6 +23183,13 @@ fn keyword_actual_preserves_skipped_optional_slot() {
 
 #[test]
 fn use_renamed_subroutine_call_preserves_optional_slot_and_hidden_char_lengths() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=use_renamed_subroutine_call_preserves_optional_slot_and_hidden_char_lengths count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\ncontains\n  subroutine sink(name, value, value_length)\n    character(len=*), intent(in) :: name, value\n    integer, intent(in), optional :: value_length\n    write(*,'(A,L1)') 'PRESENT=', present(value_length)\n    write(*,'(A,I0)') 'NLEN=', len(name)\n    write(*,'(A,I0)') 'VLEN=', len(value)\n    write(*,'(A)') 'PAIR=' // trim(name) // ':' // trim(value)\n  end subroutine sink\nend module m\nprogram p\n  use m, only: alias_sink => sink\n  implicit none\n  character(len=8) :: a, b\n  a = 'X'\n  b = 'YZ'\n  call alias_sink(trim(a), trim(b))\nend program p\n",
         "f90",
@@ -20514,6 +23244,13 @@ fn use_renamed_subroutine_call_preserves_optional_slot_and_hidden_char_lengths()
 
 #[test]
 fn inquire_file_with_sparse_optional_string_outputs_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=inquire_file_with_sparse_optional_string_outputs_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  logical :: exists\n  character(len=16) :: access, action\n  inquire(file='fortsh_missing_config_marker', exist=exists, access=access, action=action)\n  print *, trim(access), trim(action)\nend program\n",
         "f90",
@@ -20550,6 +23287,13 @@ fn inquire_file_with_sparse_optional_string_outputs_runs() {
 
 #[test]
 fn inquire_unit_size_widens_through_runtime_and_stores_back() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=inquire_unit_size_widens_through_runtime_and_stores_back count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("inquire_unit_size");
     let input = dir.join("payload.txt");
     fs::write(&input, "hello").expect("write payload");
@@ -20592,6 +23336,13 @@ fn inquire_unit_size_widens_through_runtime_and_stores_back() {
 
 #[test]
 fn open_with_newunit_and_iostat_uses_keyword_specs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=open_with_newunit_and_iostat_uses_keyword_specs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("open_newunit_iostat");
     let input = dir.join("input.txt");
     fs::write(&input, "hello\n").expect("write input");
@@ -20635,6 +23386,13 @@ fn open_with_newunit_and_iostat_uses_keyword_specs() {
 
 #[test]
 fn char_concat_actual_to_assumed_len_dummy_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=char_concat_actual_to_assumed_len_dummy_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  character(len=16) :: home\n  home = 'abc'\n  call show(trim(home)//'/.fortshrc')\ncontains\n  subroutine show(path)\n    character(len=*), intent(in) :: path\n    print *, trim(path)\n  end subroutine show\nend program\n",
         "f90",
@@ -20671,6 +23429,13 @@ fn char_concat_actual_to_assumed_len_dummy_runs() {
 
 #[test]
 fn repeat_left_concat_assignment_preserves_leading_bytes() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=repeat_left_concat_assignment_preserves_leading_bytes count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  character(len=16) :: s\n  s = repeat(' ', 8) // 'hi'\n  print '(a)', '<' // s(1:10) // '>'\n  s = repeat('0', 3) // '42'\n  print '(a)', '<' // s(1:5) // '>'\nend program\n",
         "f90",
@@ -20707,6 +23472,13 @@ fn repeat_left_concat_assignment_preserves_leading_bytes() {
 
 #[test]
 fn internal_read_err_label_success_path_preserves_substring_store() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=internal_read_err_label_success_path_preserves_substring_store count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  integer :: pos, format_len, output_pos, octal_val, i\n  character(len=8) :: format_str\n  character(len=8) :: output\n  character :: escape_char\n  character(len=3) :: octal_str\n\n  format_str = '\\101'\n  output = ''\n  pos = 1\n  output_pos = 1\n  format_len = len_trim(format_str)\n\n  pos = pos + 1\n  escape_char = format_str(pos:pos)\n  select case (escape_char)\n  case ('0', '1', '2', '3', '4', '5', '6', '7')\n    octal_str = escape_char\n    do i = 2, 3\n      if (pos + i - 1 <= format_len) then\n        escape_char = format_str(pos + i - 1:pos + i - 1)\n        if (escape_char >= '0' .and. escape_char <= '7') then\n          octal_str(i:i) = escape_char\n        else\n          exit\n        end if\n      else\n        exit\n      end if\n    end do\n    read(octal_str, '(O3)', err=50) octal_val\n    output(output_pos:output_pos) = char(mod(octal_val, 256))\n    pos = pos + len_trim(octal_str) - 1\n    goto 60\n50  output(output_pos:output_pos) = format_str(pos:pos)\n60  continue\n  end select\n\n  if (output(1:1) /= 'A') error stop 1\n  print *, 'ok'\nend program p\n",
         "f90",
@@ -20743,6 +23515,13 @@ fn internal_read_err_label_success_path_preserves_substring_store() {
 
 #[test]
 fn if_else_assignment_to_dummy_argument_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=if_else_assignment_to_dummy_argument_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\ncontains\n  subroutine set_flag(flag)\n    integer, intent(out) :: flag\n    if (.true.) then\n      flag = 7\n    else\n      flag = -1\n    end if\n  end subroutine\nend module\n\nprogram main\n  use m\n  implicit none\n  integer :: flag\n  call set_flag(flag)\n  print *, flag\nend program\n",
         "f90",
@@ -20779,6 +23558,13 @@ fn if_else_assignment_to_dummy_argument_runs() {
 
 #[test]
 fn char_parameter_constants_preserve_bytes_and_concat() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=char_parameter_constants_preserve_bytes_and_concat count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module version_matrix\n  implicit none\n  character(len=*), parameter :: mod_star = '1.7.0'\ncontains\n  subroutine print_mod_star()\n    print '(a)', mod_star\n  end subroutine\n  subroutine print_mod_star_concat()\n    print '(a)', 'fortsh ' // mod_star\n  end subroutine\nend module\n\nprogram main\n  use version_matrix\n  implicit none\n  character(len=*), parameter :: local_star = '2.3.4'\n  print '(a)', local_star\n  call print_mod_star()\n  call print_mod_star_concat()\nend program\n",
         "f90",
@@ -20816,6 +23602,13 @@ fn char_parameter_constants_preserve_bytes_and_concat() {
 
 #[test]
 fn char_parameter_round_trips_through_amod_import() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=char_parameter_round_trips_through_amod_import count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("char_param_amod");
     let mod_src = write_program_in(
         &dir,
@@ -20899,6 +23692,13 @@ fn char_parameter_round_trips_through_amod_import() {
 
 #[test]
 fn char_parameter_substrings_keep_fixed_len_through_amod_import() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=char_parameter_substrings_keep_fixed_len_through_amod_import count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("char_param_substring_amod");
     let mod_src = write_program_in(
         &dir,
@@ -21012,6 +23812,13 @@ fn char_parameter_substrings_keep_fixed_len_through_amod_import() {
 
 #[test]
 fn char_parameter_concat_with_intrinsic_char_emits_runtime_bytes() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=char_parameter_concat_with_intrinsic_char_emits_runtime_bytes count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module colors\n  implicit none\n  character(len=*), parameter :: color_match = char(27) // '[01;31m'\n  character(len=*), parameter :: color_reset = char(27) // '[0m'\ncontains\n  subroutine check()\n    if (len(color_match) /= 8) error stop 1\n    if (iachar(color_match(1:1)) /= 27) error stop 2\n    if (color_match(2:8) /= '[01;31m') error stop 3\n    if (len(color_reset) /= 4) error stop 4\n    if (iachar(color_reset(1:1)) /= 27) error stop 5\n    if (color_reset(2:4) /= '[0m') error stop 6\n    write(*, '(a)') color_match // 'module' // color_reset\n  end subroutine\nend module\nprogram p\n  use colors\n  implicit none\n  call check()\nend program\n",
         "char_param_intrinsic_concat.f90",
@@ -21048,6 +23855,13 @@ fn char_parameter_concat_with_intrinsic_char_emits_runtime_bytes() {
 
 #[test]
 fn reexported_c_null_char_round_trips_through_amod_import() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=reexported_c_null_char_round_trips_through_amod_import count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("reexported_c_null_char_amod");
     let wrapper_src = write_program_in(
         &dir,
@@ -21139,6 +23953,13 @@ fn reexported_c_null_char_round_trips_through_amod_import() {
 
 #[test]
 fn empty_facade_module_reexports_public_use_associated_params_through_amod() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=empty_facade_module_reexports_public_use_associated_params_through_amod count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("empty_facade_reexport_amod");
     let constants_src = write_program_in(
         &dir,
@@ -21228,6 +24049,13 @@ fn empty_facade_module_reexports_public_use_associated_params_through_amod() {
 
 #[test]
 fn char_intrinsics_and_transfer_lower_without_raw_symbols() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=char_intrinsics_and_transfer_lower_without_raw_symbols count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  use iso_c_binding, only: c_funptr, c_intptr_t\ncontains\n  subroutine s(buf, mask, ok)\n    character(len=:), allocatable, intent(inout) :: buf\n    logical, intent(in) :: mask\n    logical, intent(out) :: ok\n    type(c_funptr) :: sig_ign\n    if (allocated(buf)) then\n      ok = lgt(trim(buf), 'a')\n    else\n      ok = .false.\n    end if\n    ok = ok .or. any(buf(1:1) == ['!', '?'])\n    buf = merge(buf // new_line('a'), '?', mask)\n    sig_ign = transfer(1_c_intptr_t, sig_ign)\n  end subroutine s\nend module m\n",
         "f90",
@@ -21272,6 +24100,13 @@ fn char_intrinsics_and_transfer_lower_without_raw_symbols() {
 
 #[test]
 fn deferred_char_allocatable_dummy_uses_descriptor_abi() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=deferred_char_allocatable_dummy_uses_descriptor_abi count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\ncontains\n  subroutine grow(buf, cap, content_len)\n    character(len=:), allocatable, intent(inout) :: buf\n    integer, intent(inout) :: cap\n    integer, intent(in) :: content_len\n    character(len=:), allocatable :: tmp\n    integer :: new_cap\n    new_cap = cap * 2\n    allocate(character(len=new_cap) :: tmp)\n    if (content_len > 0) tmp(1:content_len) = buf(1:content_len)\n    call move_alloc(tmp, buf)\n    cap = new_cap\n  end subroutine\nend module\n",
         "f90",
@@ -21310,6 +24145,13 @@ fn deferred_char_allocatable_dummy_uses_descriptor_abi() {
 
 #[test]
 fn deferred_char_allocatable_array_dummy_whole_and_element_assignment_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=deferred_char_allocatable_array_dummy_whole_and_element_assignment_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\ncontains\n  subroutine fill(tokens)\n    character(len=:), allocatable, intent(out) :: tokens(:)\n    allocate(character(len=32) :: tokens(2))\n    tokens = ''\n    tokens(1) = 'hello'\n    tokens(2) = 'world'\n  end subroutine\nend module\nprogram p\n  use m, only: fill\n  implicit none\n  character(len=:), allocatable :: tokens(:)\n  call fill(tokens)\n  print *, trim(tokens(1)), trim(tokens(2))\nend program\n",
         "f90",
@@ -21345,6 +24187,13 @@ fn deferred_char_allocatable_array_dummy_whole_and_element_assignment_runs() {
 
 #[test]
 fn fixed_len_allocatable_char_array_dummy_round_trips_through_amod_import_and_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_len_allocatable_char_array_dummy_round_trips_through_amod_import_and_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("fixed_len_char_array_dummy_amod");
     let mod_src = write_program_in(
         &dir,
@@ -21438,6 +24287,13 @@ fn fixed_len_allocatable_char_array_dummy_round_trips_through_amod_import_and_ru
 
 #[test]
 fn public_defined_assignment_in_private_module_round_trips_through_amod_and_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=public_defined_assignment_in_private_module_round_trips_through_amod_and_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("public_defined_assignment_amod");
     let mod_src = write_program_in(
         &dir,
@@ -21525,6 +24381,13 @@ fn public_defined_assignment_in_private_module_round_trips_through_amod_and_runs
 
 #[test]
 fn imported_fixed_logical_component_array_whole_assignment_clears_all_elements() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_fixed_logical_component_array_whole_assignment_clears_all_elements count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("imported_fixed_logical_component_clear");
     let mod_src = write_program_in(
         &dir,
@@ -21614,6 +24477,13 @@ fn imported_fixed_logical_component_array_whole_assignment_clears_all_elements()
 
 #[test]
 fn ichar_and_iachar_treat_high_bit_bytes_as_unsigned() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=ichar_and_iachar_treat_high_bit_bytes_as_unsigned count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  character(len=1) :: c\n  c = achar(255)\n  if (ichar(c) /= 255) error stop 1\n  if (iachar(c) /= 255) error stop 2\n  print *, ichar(c), iachar(c)\nend program\n",
         "f90",
@@ -21651,6 +24521,13 @@ fn ichar_and_iachar_treat_high_bit_bytes_as_unsigned() {
 
 #[test]
 fn imported_public_type_bound_private_target_preserves_absent_optional_slots() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_public_type_bound_private_target_preserves_absent_optional_slots count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("imported_type_bound_private_target_optional");
     let mod_src = dir.join("m.f90");
     let main_src = dir.join("p.f90");
@@ -21736,6 +24613,13 @@ fn imported_public_type_bound_private_target_preserves_absent_optional_slots() {
 
 #[test]
 fn imported_type_bound_function_returning_derived_value_round_trips_through_private_target() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_type_bound_function_returning_derived_value_round_trips_through_private_target count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("imported_type_bound_private_result");
     let mod_src = dir.join("m.f90");
     let main_src = dir.join("p.f90");
@@ -21821,6 +24705,13 @@ fn imported_type_bound_function_returning_derived_value_round_trips_through_priv
 
 #[test]
 fn enum_bind_c_enumerators_compile_and_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=enum_bind_c_enumerators_compile_and_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module colors\n  implicit none\n  enum, bind(c)\n    enumerator :: red = 1, blue = 2, green = 3\n  end enum\nend module\nprogram main\n  use colors\n  implicit none\n  integer, parameter :: color_kind = kind(red)\n  print *, red, blue, green, color_kind\nend program\n",
         "f90",
@@ -21859,6 +24750,13 @@ fn enum_bind_c_enumerators_compile_and_run() {
 
 #[test]
 fn complex_intrinsics_preserve_complex_storage_without_i128_backend_fallback() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=complex_intrinsics_preserve_complex_storage_without_i128_backend_fallback count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         r#"
 module complex_box_mod
@@ -21923,6 +24821,13 @@ end program
 
 #[test]
 fn complex_log_intrinsic_uses_complex_lanes() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=complex_log_intrinsic_uses_complex_lanes count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         r#"
 program main
@@ -21969,6 +24874,13 @@ end program
 
 #[test]
 fn complex_assignment_narrows_lanes_by_value() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=complex_assignment_narrows_lanes_by_value count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         r#"
 program main
@@ -22018,6 +24930,13 @@ end program
 
 #[test]
 fn complex_sin_cos_intrinsics_use_complex_lanes() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=complex_sin_cos_intrinsics_use_complex_lanes count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         r#"
 program main
@@ -22069,6 +24988,13 @@ end program
 
 #[test]
 fn real_intrinsic_preserves_complex_kind_without_explicit_kind_argument() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=real_intrinsic_preserves_complex_kind_without_explicit_kind_argument count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         r#"
 module m
@@ -22126,6 +25052,13 @@ end program
 
 #[test]
 fn mixed_scalar_complex_division_compiles_and_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=mixed_scalar_complex_division_compiles_and_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         r#"
 program main
@@ -22173,6 +25106,13 @@ end program
 
 #[test]
 fn extended_math_intrinsics_compile_and_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=extended_math_intrinsics_compile_and_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         r#"
 program main
@@ -22226,6 +25166,13 @@ end program
 
 #[test]
 fn use_renamed_procedure_call_uses_remote_symbol() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=use_renamed_procedure_call_uses_remote_symbol count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("use_rename_proc");
     let mod_src = write_program_in(
         &dir,
@@ -22297,6 +25244,13 @@ fn use_renamed_procedure_call_uses_remote_symbol() {
 
 #[test]
 fn linked_binary_carries_uuid_and_launches() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=linked_binary_carries_uuid_and_launches count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("linked_binary_uuid");
     let src = write_program_in(
         &dir,
@@ -22348,6 +25302,13 @@ fn linked_binary_carries_uuid_and_launches() {
 
 #[test]
 fn same_named_module_helpers_link_without_colliding() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=same_named_module_helpers_link_without_colliding count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("module_helper_link_names");
     let mod_a = write_program_in(
         &dir,
@@ -22449,6 +25410,13 @@ fn same_named_module_helpers_link_without_colliding() {
 
 #[test]
 fn contained_helpers_link_without_cross_object_internal_symbol_collisions() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=contained_helpers_link_without_cross_object_internal_symbol_collisions count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("contained_helper_link_names");
     let mod_a = write_program_in(
         &dir,
@@ -22550,6 +25518,13 @@ fn contained_helpers_link_without_cross_object_internal_symbol_collisions() {
 
 #[test]
 fn program_internal_char_helper_assignment_uses_internal_symbol() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=program_internal_char_helper_assignment_uses_internal_symbol count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("program_internal_char_helper");
     let src = write_program_in(
         &dir,
@@ -22581,6 +25556,13 @@ fn program_internal_char_helper_assignment_uses_internal_symbol() {
 
 #[test]
 fn runtime_sized_character_function_result_compiles_and_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=runtime_sized_character_function_result_compiles_and_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("runtime_char_function_result");
     let module_src = write_program_in(
         &dir,
@@ -22629,6 +25611,13 @@ fn runtime_sized_character_function_result_compiles_and_runs() {
 
 #[test]
 fn formatted_write_of_concat_string_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=formatted_write_of_concat_string_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  use iso_fortran_env, only: output_unit\n  implicit none\n  write(output_unit, '(a)') 'fortsh ' // '1.7.0'\nend program\n",
         "f90",
@@ -22664,6 +25653,13 @@ fn formatted_write_of_concat_string_runs() {
 
 #[test]
 fn formatted_write_of_concat_with_internal_char_function_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=formatted_write_of_concat_with_internal_char_function_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  write(*, '(a)') 'x=' // get_s()\ncontains\n  function get_s() result(str)\n    character(len=20) :: str\n    str = 'ok'\n  end function\nend program\n",
         "f90",
@@ -22699,6 +25695,13 @@ fn formatted_write_of_concat_with_internal_char_function_runs() {
 
 #[test]
 fn formatted_section_write_iterates_assumed_shape_dummy_section() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=formatted_section_write_iterates_assumed_shape_dummy_section count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // Regression: the descriptor-driven section iterator was lost in
     // the lower.rs split (orig fix 4986129). Without it, a write of a
     // multi-dim section through an assumed-shape dummy
@@ -22750,6 +25753,13 @@ fn formatted_section_write_iterates_assumed_shape_dummy_section() {
 
 #[test]
 fn formatted_1d_section_with_i64_bounds_compiles_and_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=formatted_1d_section_with_i64_bounds_compiles_and_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  integer :: a(0:3)\n  integer(kind=8) :: i\n  a(0) = 10\n  a(1) = 20\n  a(2) = 30\n  a(3) = 40\n  i = 2\n  write(*, '(2(i0,1x))') a(i-1:i)\nend program\n",
         "f90",
@@ -22785,6 +25795,13 @@ fn formatted_1d_section_with_i64_bounds_compiles_and_runs() {
 
 #[test]
 fn error_stop_with_character_message_prints_user_text_to_stderr() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=error_stop_with_character_message_prints_user_text_to_stderr count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // Regression: lower_stmt's Stmt::ErrorStop arm threw the stop-code
     // expression away and called afs_error_stop() (no-arg, prints just
     // "ERROR STOP"). stdlib's sort_adjoint / sort_index / linalg state
@@ -22825,6 +25842,13 @@ fn error_stop_with_character_message_prints_user_text_to_stderr() {
 
 #[test]
 fn error_stop_with_integer_code_uses_code_as_exit_status() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=error_stop_with_integer_code_uses_code_as_exit_status count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §11.4: integer stop-code becomes the exit status (clamped
     // to 1..=255 for Unix).  Verify `error stop 42` exits with 42 and
     // prints "ERROR STOP 42".
@@ -22863,6 +25887,13 @@ fn error_stop_with_integer_code_uses_code_as_exit_status() {
 
 #[test]
 fn formatted_section_read_iterates_allocatable_dummy_section() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=formatted_section_read_iterates_allocatable_dummy_section count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // Regression: stdlib's loadtxt allocates an `intent(out)` rank-2
     // allocatable inside the subroutine and reads each row via
     // `read(u, fmt_, iostat=ios) d(i, :)`. Two bugs combined to silently
@@ -22912,6 +25943,13 @@ fn formatted_section_read_iterates_allocatable_dummy_section() {
 
 #[test]
 fn list_directed_read_unit_real_returns_correct_f32_value() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=list_directed_read_unit_real_returns_correct_f32_value count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // Regression: lower_read_into_addr's IrType::Float(F32) arm allocated
     // an f64 temp and called afs_read_real (the f32 entry, *mut f32) on
     // it. The runtime wrote 4 bytes of f32 into the 8-byte alloca and the
@@ -22957,6 +25995,13 @@ fn list_directed_read_unit_real_returns_correct_f32_value() {
 
 #[test]
 fn internal_list_read_mixed_integer_and_character_token_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=internal_list_read_mixed_integer_and_character_token_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  character(len=64) :: line\n  character(len=16) :: command\n  integer :: pid, ios\n  line = '12345 fortsh'\n  pid = -1\n  command = ''\n  read(line, *, iostat=ios) pid, command\n  if (ios /= 0) error stop 1\n  if (pid /= 12345) error stop 2\n  if (trim(command) /= 'fortsh') error stop 3\n  print *, 'ok'\nend program\n",
         "f90",
@@ -22988,6 +26033,13 @@ fn internal_list_read_mixed_integer_and_character_token_runs() {
 
 #[test]
 fn list_directed_read_with_no_items_advances_one_record_and_sets_eof_iostat() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=list_directed_read_with_no_items_advances_one_record_and_sets_eof_iostat count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // Regression: `read(unit, *, iostat=ios)` with no items used to be
     // a silent no-op — neither the file position nor iostat was
     // touched, so stdlib's number_of_rows loop
@@ -23030,6 +26082,13 @@ fn list_directed_read_with_no_items_advances_one_record_and_sets_eof_iostat() {
 
 #[test]
 fn formatted_write_sets_iostat_zero_on_success_for_scalar_and_array() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=formatted_write_sets_iostat_zero_on_success_for_scalar_and_array count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // Regression: afs_fmt_begin / afs_fmt_end never wrote the
     // iostat= specifier on success, so a caller's
     // `if (ios /= 0) error_stop` always tripped on the pre-call
@@ -23075,6 +26134,13 @@ fn formatted_write_sets_iostat_zero_on_success_for_scalar_and_array() {
 
 #[test]
 fn formatted_write_iterates_whole_array_real_and_int() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=formatted_write_iterates_whole_array_real_and_int count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // Regression: lower_fmt_push used to drop array items into the
     // IrType::Ptr scalar arm and dispatch to afs_fmt_push_string with a
     // junk length, so `write(*, '(fmt)') array` produced no output for
@@ -23126,6 +26192,13 @@ fn formatted_write_iterates_whole_array_real_and_int() {
 
 #[test]
 fn contained_subroutine_forwards_derived_dummy_by_ref() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=contained_subroutine_forwards_derived_dummy_by_ref count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: t\n    integer :: pad(2000) = 0\n    integer :: x = 0\n  end type\ncontains\n  subroutine setx(a)\n    type(t), intent(inout) :: a\n    a%x = 7\n  end subroutine\nend module\n\nprogram p\n  use m\n  implicit none\n  type(t), allocatable :: v\n  allocate(v)\n  call init(v)\n  print *, v%x\ncontains\n  subroutine init(a)\n    type(t), intent(out) :: a\n    call setx(a)\n  end subroutine\nend program\n",
         "f90",
@@ -23161,6 +26234,13 @@ fn contained_subroutine_forwards_derived_dummy_by_ref() {
 
 #[test]
 fn allocatable_scalar_derived_intent_out_component_store_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_scalar_derived_intent_out_component_store_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: err_t\n    integer :: code = 0\n  end type\ncontains\n  subroutine fill(err)\n    type(err_t), allocatable, intent(out) :: err\n    allocate(err)\n    err%code = 7\n  end subroutine\nend module\n\nprogram p\n  use m\n  implicit none\n  type(err_t), allocatable :: err\n  call fill(err)\n  if (.not. allocated(err)) error stop 1\n  if (err%code /= 7) error stop 2\n  print *, 'ok'\nend program\n",
         "f90",
@@ -23196,6 +26276,13 @@ fn allocatable_scalar_derived_intent_out_component_store_runs() {
 
 #[test]
 fn optional_logical_present_guard_does_not_deref_absent_dummy() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=optional_logical_present_guard_does_not_deref_absent_dummy count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  call s()\n  print *, 'ok'\ncontains\n  subroutine s(rel)\n    logical, intent(in), optional :: rel\n    logical :: relative\n    if (present(rel)) then\n      relative = rel\n    else\n      relative = .false.\n    end if\n    if (relative) error stop 1\n  end subroutine s\nend program p\n",
         "f90",
@@ -23231,6 +26318,13 @@ fn optional_logical_present_guard_does_not_deref_absent_dummy() {
 
 #[test]
 fn elemental_optional_array_actual_reaches_scalar_present_check() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=elemental_optional_array_actual_reaches_scalar_present_check count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  use iso_fortran_env, only: real32\n  implicit none\n  interface optval\n    module procedure optval_rsp\n  end interface\ncontains\n  pure elemental function optval_rsp(x, default) result(y)\n    real(real32), intent(in), optional :: x\n    real(real32), intent(in) :: default\n    real(real32) :: y\n    if (present(x)) then\n      y = x\n    else\n      y = default\n    end if\n  end function optval_rsp\n\n  function foo_sp_arr(x) result(z)\n    real(real32), dimension(2), intent(in), optional :: x\n    real(real32), dimension(2) :: z\n    z = optval(x, [2.0_real32, -2.0_real32])\n  end function foo_sp_arr\nend module m\n\nprogram p\n  use iso_fortran_env, only: real32\n  use m, only: foo_sp_arr\n  implicit none\n  real(real32) :: a(2)\n  a = foo_sp_arr([1.0_real32, -1.0_real32])\n  if (any(a /= [1.0_real32, -1.0_real32])) error stop 1\n  a = foo_sp_arr()\n  if (any(a /= [2.0_real32, -2.0_real32])) error stop 2\n  print *, 'ok'\nend program p\n",
         "f90",
@@ -23267,6 +26361,13 @@ fn elemental_optional_array_actual_reaches_scalar_present_check() {
 
 #[test]
 fn imported_elemental_generic_optional_array_uses_descriptor_wrapper() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_elemental_generic_optional_array_uses_descriptor_wrapper count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("imported_elemental_optional_array");
     let mod_src = write_program_in(
         &dir,
@@ -23453,6 +26554,13 @@ end program p
 
 #[test]
 fn type_bound_generic_prefers_int8_array_wrapper_over_derived_specific() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=type_bound_generic_prefers_int8_array_wrapper_over_derived_specific count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         r#"module m
   use iso_fortran_env, only: int8, int32, int64
@@ -23581,6 +26689,13 @@ end program p
 
 #[test]
 fn default_integer_system_clock_runs_without_runtime_abi_crash() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=default_integer_system_clock_runs_without_runtime_abi_crash count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  integer :: count, rate, max_count\n  call system_clock(count, rate, max_count)\n  if (rate == 0) error stop 1\n  if (max_count == 0) error stop 2\n  print *, 'ok'\nend program\n",
         "f90",
@@ -23616,6 +26731,13 @@ fn default_integer_system_clock_runs_without_runtime_abi_crash() {
 
 #[test]
 fn system_clock_component_writeback_uses_component_width() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=system_clock_component_writeback_uses_component_width count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: clock_state\n    integer(8) :: count = 0\n    real(8) :: rate = 0.0_8\n    integer(8) :: max_count = 0\n  end type\n  type(clock_state) :: state\n  call system_clock(state%count, state%rate, state%max_count)\n  if (state%count < 1000000_8) error stop 1\n  if (state%rate <= 0.0_8) error stop 2\n  if (state%max_count == 0_8) error stop 3\n  print *, 'ok'\nend program\n",
         "f90",
@@ -23651,6 +26773,13 @@ fn system_clock_component_writeback_uses_component_width() {
 
 #[test]
 fn cpu_time_default_real_uses_runtime_f64_writeback() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=cpu_time_default_real_uses_runtime_f64_writeback count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  real :: t32\n  real(8) :: t64\n  call cpu_time(t32)\n  call cpu_time(t64)\n  if (t32 < 0.0) error stop 1\n  if (t64 < 0.0_8) error stop 2\n  print *, 'ok'\nend program\n",
         "f90",
@@ -23686,6 +26815,13 @@ fn cpu_time_default_real_uses_runtime_f64_writeback() {
 
 #[test]
 fn host_associated_large_explicit_array_sections_pass_descriptor() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=host_associated_large_explicit_array_sections_pass_descriptor count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  integer, parameter :: n = 70000\n  integer(1) :: values(n)\n  values = 0_1\n  values(1) = 11_1\n  values(n) = 22_1\n  call inner()\ncontains\n  subroutine inner()\n    if (first(values(1:1)) /= 11) error stop 1\n    if (first(values(n:n)) /= 22) error stop 2\n    print *, 'ok'\n  end subroutine\n  integer function first(x) result(y)\n    integer(1), intent(in) :: x(:)\n    y = x(1)\n  end function\nend program\n",
         "f90",
@@ -23721,6 +26857,13 @@ fn host_associated_large_explicit_array_sections_pass_descriptor() {
 
 #[test]
 fn use_only_generic_call_resolution_beats_private_reexport() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=use_only_generic_call_resolution_beats_private_reexport count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module hidden_error\n  implicit none\ncontains\n  subroutine check(condition, msg, code, warn)\n    logical, intent(in) :: condition\n    character(*), intent(in), optional :: msg\n    integer, intent(in), optional :: code\n    logical, intent(in), optional :: warn\n    if (.not. condition) error stop 1\n  end subroutine\nend module\nmodule private_carrier\n  use hidden_error, only: check\n  implicit none\n  private\nend module\nmodule local_testdrive\n  implicit none\n  type :: error_type\n    integer :: dummy = 0\n  end type\n  interface check\n    module procedure check_logical\n  end interface\ncontains\n  subroutine check_logical(error, expression, message)\n    type(error_type), allocatable, intent(out) :: error\n    logical, intent(in) :: expression\n    character(*), intent(in) :: message\n    if (.not. expression) allocate(error)\n  end subroutine\nend module\nprogram p\n  use local_testdrive, only: error_type, check\n  use private_carrier\n  implicit none\n  type(error_type), allocatable :: error\n  call check(error, .true., 'ok')\n  if (allocated(error)) error stop 2\n  print *, 'ok'\nend program\n",
         "f90",
@@ -23756,6 +26899,13 @@ fn use_only_generic_call_resolution_beats_private_reexport() {
 
 #[test]
 fn saved_derived_global_after_small_globals_keeps_descriptor_alignment() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=saved_derived_global_after_small_globals_keeps_descriptor_alignment count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  logical, save :: flag1 = .false.\n  logical, save :: flag2 = .false.\n  logical, save :: flag3 = .false.\n  type :: history_t\n    character(len=16), allocatable :: lines(:)\n    integer :: count = 0\n    integer :: current = 0\n    logical :: initialized = .false.\n  end type\n  type(history_t), save :: history\ncontains\n  subroutine init_history()\n    if (.not. history%initialized) then\n      allocate(history%lines(4))\n      history%lines = ''\n      history%count = 1\n      history%initialized = .true.\n    end if\n    print *, history%count, size(history%lines)\n  end subroutine\nend module\nprogram p\n  use m\n  call init_history()\nend program\n",
         "f90",
@@ -23791,6 +26941,13 @@ fn saved_derived_global_after_small_globals_keeps_descriptor_alignment() {
 
 #[test]
 fn allocatable_char_component_store_accepts_component_subscript_expr() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_char_component_store_accepts_component_subscript_expr count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module hist_mod\n  implicit none\n  integer, parameter :: max_line_len = 1024\n  integer, parameter :: max_history = 100\n  type :: history_t\n    character(len=max_line_len), allocatable :: lines(:)\n    integer :: count = 0\n    integer :: current = 0\n    logical :: initialized = .false.\n  end type\n  type(history_t), save :: history\ncontains\n  subroutine init_history()\n    if (.not. history%initialized) then\n      allocate(history%lines(max_history))\n      history%lines = ''\n      history%count = 0\n      history%current = 0\n      history%initialized = .true.\n    end if\n  end subroutine\n\n  subroutine fill()\n    character(len=max_line_len) :: line\n    call init_history()\n    line = 'abc'\n    history%count = 0\n    history%current = 0\n    history%count = history%count + 1\n    history%lines(history%count) = line\n    print *, history%count\n    print *, trim(history%lines(1))\n  end subroutine\nend module\nprogram p\n  use hist_mod\n  call fill()\nend program\n",
         "f90",
@@ -23826,6 +26983,13 @@ fn allocatable_char_component_store_accepts_component_subscript_expr() {
 
 #[test]
 fn derived_local_with_allocatable_component_and_trailing_scalar_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=derived_local_with_allocatable_component_and_trailing_scalar_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: t\n    integer, allocatable :: a(:)\n    integer :: n\n  end type\n  type(t) :: x\n  allocate(x%a(1))\n  x%n = 7\n  x%a(1) = 17\n  if (.not. allocated(x%a)) stop 1\n  if (size(x%a) /= 1) stop 2\n  if (x%n /= 7) stop 3\n  if (x%a(1) /= 17) stop 4\n  print *, 'ok'\nend program p\n",
         "f90",
@@ -23861,6 +27025,13 @@ fn derived_local_with_allocatable_component_and_trailing_scalar_runs() {
 
 #[test]
 fn allocatable_array_component_passes_descriptor_to_dummy() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_array_component_passes_descriptor_to_dummy count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: box_t\n    integer, allocatable :: xs(:)\n  end type\n  type(box_t) :: box\n  allocate(box%xs(3))\n  box%xs = [1, 2, 3]\n  call check(box%xs)\n  print *, 'ok'\ncontains\n  subroutine check(xs)\n    integer, intent(in) :: xs(:)\n    if (size(xs) /= 3) error stop 1\n    if (xs(2) /= 2) error stop 2\n  end subroutine check\nend program p\n",
         "f90",
@@ -23896,6 +27067,13 @@ fn allocatable_array_component_passes_descriptor_to_dummy() {
 
 #[test]
 fn allocatable_char_array_component_passes_descriptor_to_dummy() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_char_array_component_passes_descriptor_to_dummy count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: box_t\n    character(len=:), allocatable :: tokens(:)\n    integer :: num_tokens = 0\n  end type\n  type(box_t) :: box\n  call fill_tokens(box%tokens, box%num_tokens)\n  if (.not. allocated(box%tokens)) error stop 1\n  if (box%num_tokens /= 2) error stop 2\n  if (size(box%tokens) /= 2) error stop 3\n  if (trim(box%tokens(1)) /= 'echo') error stop 4\n  if (trim(box%tokens(2)) /= 'hello') error stop 5\n  print *, 'ok'\ncontains\n  subroutine fill_tokens(tokens, num_tokens)\n    character(len=:), allocatable, intent(out) :: tokens(:)\n    integer, intent(out) :: num_tokens\n    character(len=16), allocatable :: temp_tokens(:)\n    integer :: i\n    num_tokens = 2\n    allocate(temp_tokens(num_tokens))\n    temp_tokens(1) = 'echo'\n    temp_tokens(2) = 'hello'\n    allocate(character(len=16) :: tokens(num_tokens))\n    do i = 1, num_tokens\n      tokens(i) = temp_tokens(i)\n    end do\n    deallocate(temp_tokens)\n  end subroutine fill_tokens\nend program p\n",
         "f90",
@@ -23931,6 +27109,13 @@ fn allocatable_char_array_component_passes_descriptor_to_dummy() {
 
 #[test]
 fn contained_subroutine_uses_host_parameter_array_storage() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=contained_subroutine_uses_host_parameter_array_storage count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  integer, parameter :: block_size(4) = [1, 2, 4, 8]\n  integer :: total\n  call worker(total)\n  if (total /= 19) error stop 1\n  print *, 'ok'\ncontains\n  subroutine worker(total)\n    integer, intent(out) :: total\n    integer :: k\n    total = size(block_size)\n    do k = 1, size(block_size)\n      total = total + block_size(k)\n    end do\n  end subroutine worker\nend program\n",
         "f90",
@@ -23983,6 +27168,13 @@ fn contained_subroutine_uses_host_parameter_array_storage() {
 
 #[test]
 fn derived_array_dummy_uses_real_element_stride() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=derived_array_dummy_uses_real_element_stride count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  integer, parameter :: max_token_len = 16\n  type :: token_t\n    integer :: token_type\n    character(len=max_token_len) :: value\n    integer :: value_length = 0\n    integer :: start_pos = 0\n    integer :: end_pos = 0\n    integer :: line = 1\n    logical :: quoted = .false.\n    logical :: escaped = .false.\n    integer :: quote_type = 0\n  end type token_t\ncontains\n  subroutine add_token(tokens, num_tokens, tok_type, value)\n    type(token_t), intent(inout) :: tokens(:)\n    integer, intent(inout) :: num_tokens\n    integer, intent(in) :: tok_type\n    character(len=*), intent(in) :: value\n    if (num_tokens < size(tokens)) then\n      num_tokens = num_tokens + 1\n      tokens(num_tokens)%token_type = tok_type\n      tokens(num_tokens)%value = value\n      tokens(num_tokens)%value_length = len_trim(value)\n    end if\n  end subroutine add_token\nend module m\nprogram p\n  use m\n  implicit none\n  type(token_t), allocatable :: tokens(:)\n  integer :: num_tokens\n  allocate(tokens(4))\n  num_tokens = 0\n  call add_token(tokens, num_tokens, 1, 'echo')\n  call add_token(tokens, num_tokens, 2, 'ok')\n  if (num_tokens /= 2) error stop 1\n  if (tokens(1)%token_type /= 1) error stop 2\n  if (trim(tokens(1)%value) /= 'echo') error stop 3\n  if (tokens(1)%value_length /= 4) error stop 4\n  if (tokens(2)%token_type /= 2) error stop 5\n  if (trim(tokens(2)%value) /= 'ok') error stop 6\n  if (tokens(2)%value_length /= 2) error stop 7\n  print *, 'ok'\nend program p\n",
         "f90",
@@ -24018,6 +27210,13 @@ fn derived_array_dummy_uses_real_element_stride() {
 
 #[test]
 fn scalar_substring_actual_passes_runtime_len_to_len_star_dummy() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=scalar_substring_actual_passes_runtime_len_to_len_star_dummy count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  character(len=16) :: s\n  integer :: n\n  s = 'echo'\n  n = 4\n  call check(s(1:n))\n  print *, 'ok'\ncontains\n  subroutine check(value)\n    character(len=*), intent(in) :: value\n    if (len(value) /= 4) error stop 1\n    if (trim(value) /= 'echo') error stop 2\n  end subroutine check\nend program p\n",
         "f90",
@@ -24053,6 +27252,13 @@ fn scalar_substring_actual_passes_runtime_len_to_len_star_dummy() {
 
 #[test]
 fn parameter_actual_to_by_ref_dummy_materializes_temp_slot() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=parameter_actual_to_by_ref_dummy_materializes_temp_slot count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  integer, parameter :: eof_token = 6\n  call check(eof_token)\n  print *, 'ok'\ncontains\n  subroutine check(value)\n    integer, intent(in) :: value\n    if (value /= 6) error stop 1\n  end subroutine check\nend program p\n",
         "f90",
@@ -24088,6 +27294,13 @@ fn parameter_actual_to_by_ref_dummy_materializes_temp_slot() {
 
 #[test]
 fn pointer_function_result_can_forward_other_pointer_call() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=pointer_function_result_can_forward_other_pointer_call count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: node_t\n    integer :: value = 0\n  end type node_t\ncontains\n  function make_node(n) result(node)\n    integer, intent(in) :: n\n    type(node_t), pointer :: node\n    allocate(node)\n    node%value = n\n  end function make_node\n\n  function forward_node(n) result(node)\n    integer, intent(in) :: n\n    type(node_t), pointer :: node\n    node => make_node(n)\n  end function forward_node\nend module m\n\nprogram p\n  use m\n  implicit none\n  type(node_t), pointer :: root\n  root => forward_node(42)\n  if (.not. associated(root)) error stop 1\n  if (root%value /= 42) error stop 2\n  print *, 'ok'\nend program p\n",
         "f90",
@@ -24123,6 +27336,13 @@ fn pointer_function_result_can_forward_other_pointer_call() {
 
 #[test]
 fn pointer_function_result_forwarding_preserves_target_association() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=pointer_function_result_forwarding_preserves_target_association count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: node_t\n    integer :: value = 0\n  end type node_t\n  type(node_t), target, save :: pool\ncontains\n  subroutine init_pool(n)\n    integer, intent(in) :: n\n    pool%value = n\n  end subroutine init_pool\n\n  function leaf() result(node)\n    type(node_t), pointer :: node\n    node => pool\n  end function leaf\n\n  function forward() result(node)\n    type(node_t), pointer :: node\n    type(node_t), pointer :: tmp\n    node => leaf()\n    tmp => leaf()\n    if (.not. associated(tmp, pool)) error stop 3\n  end function forward\nend module m\n\nprogram p\n  use m\n  implicit none\n  type(node_t), pointer :: root\n  call init_pool(7)\n  root => forward()\n  if (.not. associated(root, pool)) error stop 1\n  root%value = 42\n  if (pool%value /= 42) error stop 2\n  print *, 'ok'\nend program p\n",
         "f90",
@@ -24158,6 +27378,13 @@ fn pointer_function_result_forwarding_preserves_target_association() {
 
 #[test]
 fn select_type_polymorphic_dummy_dispatches_via_descriptor_tag() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=select_type_polymorphic_dummy_dispatches_via_descriptor_tag count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type, abstract :: base_t\n  end type base_t\n  type, extends(base_t) :: float_box\n    real(8) :: raw = 0.0d0\n  end type float_box\ncontains\n  function cast_float(val) result(ptr)\n    class(base_t), intent(in), target :: val\n    real(8), pointer :: ptr\n    select type (val)\n    type is (float_box)\n      ptr => val%raw\n    class default\n      nullify(ptr)\n    end select\n  end function cast_float\nend module m\n\nprogram p\n  use m\n  implicit none\n  type(float_box), target :: box\n  real(8), pointer :: ptr\n  box%raw = 3.5d0\n  ptr => cast_float(box)\n  if (.not. associated(ptr)) error stop 1\n  if (abs(ptr - 3.5d0) > 1.0d-12) error stop 2\n  ptr = 9.25d0\n  if (abs(box%raw - 9.25d0) > 1.0d-12) error stop 3\n  print *, 'ok'\nend program p\n",
         "f90",
@@ -24193,6 +27420,13 @@ fn select_type_polymorphic_dummy_dispatches_via_descriptor_tag() {
 
 #[test]
 fn select_type_pointer_polymorphic_local_dispatches_via_descriptor_tag() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=select_type_pointer_polymorphic_local_dispatches_via_descriptor_tag count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type, abstract :: base_t\n  end type\n  type, extends(base_t) :: child_t\n    integer :: x = 0\n  end type\n  class(base_t), pointer :: tmp\n  type(child_t), target :: child\n  integer :: seen\n  nullify(tmp)\n  child%x = 17\n  tmp => child\n  seen = 0\n  select type (tmp)\n  type is (child_t)\n    seen = tmp%x\n  class default\n    error stop 1\n  end select\n  if (seen /= 17) error stop 2\n  print *, 'ok'\nend program p\n",
         "f90",
@@ -24228,6 +27462,13 @@ fn select_type_pointer_polymorphic_local_dispatches_via_descriptor_tag() {
 
 #[test]
 fn select_type_pointer_polymorphic_local_bound_function_uses_guarded_static_dispatch() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=select_type_pointer_polymorphic_local_bound_function_uses_guarded_static_dispatch count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type, abstract :: base_t\n  end type\n  type, extends(base_t) :: keyval_t\n  contains\n    procedure :: get_type\n  end type\ncontains\n  integer function get_type(self)\n    class(keyval_t), intent(in) :: self\n    get_type = 17\n  end function\nend module m\n\nprogram p\n  use m\n  implicit none\n  class(base_t), pointer :: ptr\n  type(keyval_t), target :: kv\n  ptr => kv\n  select type (ptr)\n  class is (keyval_t)\n    select case (ptr%get_type())\n    case (17)\n      print *, 'ok'\n    case default\n      error stop 1\n    end select\n  class default\n    error stop 2\n  end select\nend program p\n",
         "f90",
@@ -24263,6 +27504,13 @@ fn select_type_pointer_polymorphic_local_bound_function_uses_guarded_static_disp
 
 #[test]
 fn select_type_allocatable_polymorphic_component_dispatches_via_descriptor_tag() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=select_type_allocatable_polymorphic_component_dispatches_via_descriptor_tag count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type, abstract :: base_t\n  end type\n  type, extends(base_t) :: child_t\n    integer :: x = 0\n  end type\n  type :: holder_t\n    class(base_t), allocatable :: val\n  end type\n  type(holder_t) :: holder\n  integer :: seen\n  allocate(child_t :: holder%val)\n  select type (val => holder%val)\n  type is (child_t)\n    val%x = 23\n  class default\n    error stop 1\n  end select\n  seen = -1\n  select type (val => holder%val)\n  type is (child_t)\n    seen = val%x\n  class default\n    error stop 2\n  end select\n  if (seen /= 23) error stop 3\n  print *, 'ok'\nend program p\n",
         "f90",
@@ -24298,6 +27546,13 @@ fn select_type_allocatable_polymorphic_component_dispatches_via_descriptor_tag()
 
 #[test]
 fn imported_class_dummy_actual_to_concrete_type_dummy_mutates_real_storage() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_class_dummy_actual_to_concrete_type_dummy_mutates_real_storage count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("class_dummy_to_concrete_dummy");
     let type_src = write_program_in(
         &dir,
@@ -24382,6 +27637,13 @@ fn imported_class_dummy_actual_to_concrete_type_dummy_mutates_real_storage() {
 
 #[test]
 fn bound_pointer_dummy_prefers_unique_link_name_over_duplicate_scope_name() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=bound_pointer_dummy_prefers_unique_link_name_over_duplicate_scope_name count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("bound_pointer_dummy_abi");
     let other_src = write_program_in(
         &dir,
@@ -24474,6 +27736,13 @@ fn bound_pointer_dummy_prefers_unique_link_name_over_duplicate_scope_name() {
 
 #[test]
 fn pointer_dummy_select_type_assignment_updates_caller_slot() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=pointer_dummy_select_type_assignment_updates_caller_slot count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: base_t\n    integer :: x = 0\n  end type\n  type, extends(base_t) :: child_t\n  end type\n  type(child_t), target, save :: global_child\ncontains\n  subroutine get_poly(tmp)\n    class(base_t), pointer, intent(out) :: tmp\n    global_child%x = 42\n    tmp => global_child\n  end subroutine\n\n  subroutine narrow(ptr)\n    type(child_t), pointer, intent(out) :: ptr\n    class(base_t), pointer :: tmp\n    nullify(ptr)\n    call get_poly(tmp)\n    if (.not.associated(tmp)) error stop 10\n    select type(tmp)\n    type is(child_t)\n      ptr => tmp\n    class default\n      error stop 11\n    end select\n  end subroutine\nend module\n\nprogram p\n  use m\n  implicit none\n  type(child_t), pointer :: ptr\n  call narrow(ptr)\n  if (.not.associated(ptr)) error stop 1\n  if (ptr%x /= 42) error stop 2\n  print *, 'ok'\nend program\n",
         "pointer_dummy_select_type_assignment_updates_caller_slot",
@@ -24511,6 +27780,13 @@ fn pointer_dummy_select_type_assignment_updates_caller_slot() {
 
 #[test]
 fn select_type_class_default_is_lowered_as_fallback() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=select_type_class_default_is_lowered_as_fallback count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type, abstract :: base_t\n  end type\n  type, extends(base_t) :: child_t\n    integer :: x = 0\n  end type\n  type :: holder_t\n    class(base_t), allocatable :: val\n  end type\n  type(holder_t) :: holder\n  integer :: seen\n  allocate(child_t :: holder%val)\n  select type (val => holder%val)\n  class default\n    error stop 1\n  type is (child_t)\n    val%x = 23\n  end select\n  seen = -1\n  select type (val => holder%val)\n  class default\n    error stop 2\n  type is (child_t)\n    seen = val%x\n  end select\n  if (seen /= 23) error stop 3\n  print *, 'ok'\nend program p\n",
         "f90",
@@ -24546,6 +27822,13 @@ fn select_type_class_default_is_lowered_as_fallback() {
 
 #[test]
 fn imported_amod_type_tags_stay_stable_across_tus() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_amod_type_tags_stay_stable_across_tus count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("amod_type_tags_cross_tu");
     let types_src = write_program_in(
         &dir,
@@ -24685,6 +27968,13 @@ fn imported_amod_type_tags_stay_stable_across_tus() {
 
 #[test]
 fn sibling_extensions_keep_distinct_runtime_tags_across_tus() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=sibling_extensions_keep_distinct_runtime_tags_across_tus count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("amod_sibling_type_tags");
     let value_src = write_program_in(
         &dir,
@@ -24798,6 +28088,13 @@ fn sibling_extensions_keep_distinct_runtime_tags_across_tus() {
 
 #[test]
 fn descriptor_backed_class_pointer_accepts_pointer_function_result_without_verifier_ice() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=descriptor_backed_class_pointer_accepts_pointer_function_result_without_verifier_ice count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type, abstract :: base_t\n    integer :: origin = 0\n  end type\n  type, extends(base_t) :: child_t\n    integer :: x = 0\n    integer :: y = 0\n  end type\ncontains\n  function cast_to_child(ptr) result(p)\n    class(base_t), intent(in), target :: ptr\n    type(child_t), pointer :: p\n    nullify(p)\n    select type(ptr)\n    type is (child_t)\n      p => ptr\n    end select\n  end function cast_to_child\nend module\nprogram p\n  use m\n  implicit none\n  class(base_t), pointer :: src\n  class(base_t), allocatable :: tmp\n  class(child_t), pointer :: q\n  type(child_t), target :: child\n  child%origin = 5\n  child%x = 7\n  child%y = 9\n  src => child\n  allocate(tmp, source=src)\n  q => cast_to_child(tmp)\n  if (.not. associated(q)) error stop 1\n  if (q%origin /= 5) error stop 2\n  if (q%x /= 7) error stop 3\n  if (q%y /= 9) error stop 4\n  q%origin = 1\n  q%x = 11\n  if (q%origin /= 1) error stop 5\n  if (q%x /= 11) error stop 6\n  if (q%y /= 9) error stop 7\n  print *, 'ok'\nend program\n",
         "f90",
@@ -24833,6 +28130,13 @@ fn descriptor_backed_class_pointer_accepts_pointer_function_result_without_verif
 
 #[test]
 fn descriptor_backed_class_cast_preserves_object_base_with_unallocated_parent_allocatable() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=descriptor_backed_class_cast_preserves_object_base_with_unallocated_parent_allocatable count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type, abstract :: base_t\n    character(len=:), allocatable :: key\n    integer :: origin = 0\n  end type\n  type, extends(base_t) :: child_t\n    integer :: x = 0\n    integer :: y = 0\n  end type\ncontains\n  function cast_to_child(ptr) result(p)\n    class(base_t), intent(in), target :: ptr\n    type(child_t), pointer :: p\n    nullify(p)\n    select type(ptr)\n    type is (child_t)\n      p => ptr\n    end select\n  end function cast_to_child\nend module\nprogram p\n  use m\n  implicit none\n  class(base_t), pointer :: src\n  class(base_t), allocatable :: tmp\n  class(child_t), pointer :: q\n  type(child_t), target :: child\n  child%origin = 5\n  child%x = 7\n  child%y = 9\n  src => child\n  allocate(tmp, source=src)\n  q => cast_to_child(tmp)\n  if (.not. associated(q)) error stop 1\n  if (q%origin /= 5) error stop 2\n  if (q%x /= 7) error stop 3\n  if (q%y /= 9) error stop 4\n  print *, 'ok'\nend program\n",
         "f90",
@@ -24868,6 +28172,13 @@ fn descriptor_backed_class_cast_preserves_object_base_with_unallocated_parent_al
 
 #[test]
 fn polymorphic_allocate_source_uses_concrete_dynamic_layout() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=polymorphic_allocate_source_uses_concrete_dynamic_layout count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type, abstract :: base_t\n  end type\n  type, extends(base_t) :: child_t\n    integer :: x = 0\n    integer :: extra = 0\n  end type\nend module m\nprogram p\n  use m\n  implicit none\n  class(base_t), pointer :: src\n  class(base_t), allocatable :: tmp\n  type(child_t), target :: child\n  child%x = 7\n  child%extra = 9\n  src => child\n  allocate(tmp, source=src)\n  select type (tmp)\n  type is (child_t)\n    tmp%extra = 11\n    if (tmp%x /= 7) error stop 1\n    if (tmp%extra /= 11) error stop 2\n  class default\n    error stop 3\n  end select\n  print *, 'ok'\nend program p\n",
         "f90",
@@ -24903,6 +28214,13 @@ fn polymorphic_allocate_source_uses_concrete_dynamic_layout() {
 
 #[test]
 fn derived_array_element_assignment_deep_copies_allocatable_components() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=derived_array_element_assignment_deep_copies_allocatable_components count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: token_t\n    integer :: token_type = 0\n    character(len=:), allocatable :: text\n    integer :: position = 0\n  end type token_t\ncontains\n  function make_token(ttype, text, pos) result(token)\n    integer, intent(in) :: ttype, pos\n    character(len=*), intent(in) :: text\n    type(token_t) :: token\n    token%token_type = ttype\n    token%text = text\n    token%position = pos\n  end function make_token\nend module m\n\nprogram p\n  use m\n  implicit none\n  type(token_t), allocatable :: tokens(:)\n  type(token_t) :: current\n  allocate(tokens(4))\n  current = make_token(1, '2', 1)\n  tokens(1) = current\n  current = make_token(3, '+', 3)\n  tokens(2) = current\n  current = make_token(1, '3', 5)\n  tokens(3) = current\n  if (tokens(1)%token_type /= 1) error stop 1\n  if (trim(tokens(1)%text) /= '2') error stop 2\n  if (tokens(1)%position /= 1) error stop 3\n  if (tokens(2)%token_type /= 3) error stop 4\n  if (trim(tokens(2)%text) /= '+') error stop 5\n  if (tokens(2)%position /= 3) error stop 6\n  if (tokens(3)%token_type /= 1) error stop 7\n  if (trim(tokens(3)%text) /= '3') error stop 8\n  if (tokens(3)%position /= 5) error stop 9\n  print *, 'ok'\nend program p\n",
         "f90",
@@ -24938,6 +28256,13 @@ fn derived_array_element_assignment_deep_copies_allocatable_components() {
 
 #[test]
 fn deferred_character_pointer_function_result_compiles_and_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=deferred_character_pointer_function_result_compiles_and_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\ncontains\n  function maybe_ptr(flag) result(ptr)\n    logical, intent(in) :: flag\n    character(:), pointer :: ptr\n    character(len=4), target, save :: pool = 'okay'\n    if (flag) then\n      ptr => pool(1:4)\n    else\n      ptr => null()\n    end if\n  end function maybe_ptr\nend module m\n\nprogram p\n  use m, only: maybe_ptr\n  implicit none\n  character(len=:), allocatable :: s\n  s = maybe_ptr(.true.)\n  if (s /= 'okay') error stop 1\n  print *, trim(s)\nend program p\n",
         "f90",
@@ -24973,6 +28298,13 @@ fn deferred_character_pointer_function_result_compiles_and_runs() {
 
 #[test]
 fn allocatable_result_helper_assignment_uses_resolved_symbol() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_result_helper_assignment_uses_resolved_symbol count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("alloc_result_helper_symbol");
     let src = write_program_in(
         &dir,
@@ -25004,6 +28336,13 @@ fn allocatable_result_helper_assignment_uses_resolved_symbol() {
 
 #[test]
 fn allocatable_derived_array_function_result_assignment_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_derived_array_function_result_assignment_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: string_t\n    character(len=:), allocatable :: str\n  end type\ncontains\n  function clone(src, count) result(body)\n    type(string_t), intent(in) :: src(:)\n    integer, intent(in) :: count\n    type(string_t), allocatable :: body(:)\n    integer :: j\n    allocate(body(count))\n    do j = 1, count\n      body(j)%str = src(j)%str\n    end do\n  end function clone\nend module m\n\nprogram p\n  use m\n  implicit none\n  type(string_t), allocatable :: src(:), dst(:)\n  allocate(src(1))\n  src(1)%str = 'echo hello'\n  dst = clone(src, 1)\n  if (.not. allocated(dst)) error stop 1\n  if (size(dst) /= 1) error stop 2\n  if (trim(dst(1)%str) /= 'echo hello') error stop 3\n  print *, 'ok'\nend program p\n",
         "f90",
@@ -25039,6 +28378,13 @@ fn allocatable_derived_array_function_result_assignment_runs() {
 
 #[test]
 fn hidden_result_call_accepts_component_char_array_element_actual() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=hidden_result_call_accepts_component_char_array_element_actual count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("hidden_result_component_char_actual");
     let types_src = write_program_in(
         &dir,
@@ -25181,6 +28527,13 @@ fn hidden_result_call_accepts_component_char_array_element_actual() {
 
 #[test]
 fn deferred_char_function_result_round_trips_across_amod_and_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=deferred_char_function_result_round_trips_across_amod_and_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("deferred_char_result_runtime");
     let mod_src = write_program_in(
         &dir,
@@ -25269,6 +28622,13 @@ fn deferred_char_function_result_round_trips_across_amod_and_runs() {
 
 #[test]
 fn fixed_allocatable_character_substring_compiles_and_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_allocatable_character_substring_compiles_and_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  character(len=16), allocatable :: buffer\n  allocate(buffer)\n  buffer = ''\n  buffer(1:1) = 'A'\n  if (buffer(1:1) /= 'A') error stop 1\n  print *, trim(buffer)\nend program\n",
         "f90",
@@ -25304,6 +28664,13 @@ fn fixed_allocatable_character_substring_compiles_and_runs() {
 
 #[test]
 fn allocatable_fixed_char_array_element_substring_assignment_preserves_written_byte() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_fixed_char_array_element_substring_assignment_preserves_written_byte count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  character(len=8), allocatable :: temp(:)\n  allocate(temp(1))\n  temp(1) = 'hello'\n  temp(1)(6:6) = char(0)\n  if (iachar(temp(1)(6:6)) /= 0) error stop 1\n  print *, iachar(temp(1)(6:6))\nend program\n",
         "f90",
@@ -25339,6 +28706,13 @@ fn allocatable_fixed_char_array_element_substring_assignment_preserves_written_b
 
 #[test]
 fn allocatable_scalar_substring_actual_preserves_hidden_len() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_scalar_substring_actual_preserves_hidden_len count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  character(len=:), allocatable :: buf\n  allocate(character(len=3) :: buf)\n  buf = 'ok '\n  call check(buf(1:2))\n  print *, 'ok'\ncontains\n  subroutine check(value)\n    character(len=*), intent(in) :: value\n    if (len(value) /= 2) error stop 1\n    if (value /= 'ok') error stop 2\n  end subroutine check\nend program\n",
         "f90",
@@ -25374,6 +28748,13 @@ fn allocatable_scalar_substring_actual_preserves_hidden_len() {
 
 #[test]
 fn zero_length_allocatable_substring_in_and_chain_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=zero_length_allocatable_substring_in_and_chain_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  character(len=:), allocatable :: assign_value\n  integer :: value_len\n  allocate(character(len=0) :: assign_value)\n  value_len = 0\n  if (value_len >= 2 .and. assign_value(1:1) == '(' .and. &\n      assign_value(value_len:value_len) == ')') then\n    print *, 'array'\n  end if\n  print *, 'ok'\nend program\n",
         "f90",
@@ -25414,6 +28795,13 @@ fn zero_length_allocatable_substring_in_and_chain_runs() {
 
 #[test]
 fn local_array_element_does_not_fall_back_to_unrelated_char_symbol() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=local_array_element_does_not_fall_back_to_unrelated_char_symbol count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module helper_mod\ncontains\n  function values(i) result(out)\n    integer, intent(in) :: i\n    character(len=1) :: out\n    if (i > 0) then\n      out = 'x'\n    else\n      out = 'y'\n    end if\n  end function values\nend module helper_mod\n\nprogram p\n  implicit none\n  integer :: values(8)\n  values = 0\n  values(2) = 5\n  if (values(2) >= 1 .and. values(2) <= 12) print *, values(2)\nend program\n",
         "f90",
@@ -25449,6 +28837,13 @@ fn local_array_element_does_not_fall_back_to_unrelated_char_symbol() {
 
 #[test]
 fn pointer_component_rhs_pointer_component_association_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=pointer_component_rhs_pointer_component_association_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: node_t\n    integer :: node_type = 0\n    type(node_t), pointer :: body => null()\n  end type\n  type :: entry_t\n    type(node_t), pointer :: body => null()\n  end type\n  type(entry_t) :: cache\n  type(node_t), target :: root, leaf\n\n  leaf%node_type = 42\n  root%body => leaf\n  cache%body => root%body\n  if (.not. associated(cache%body)) error stop 1\n  if (cache%body%node_type /= 42) error stop 2\n  print *, 'ok'\nend program p\n",
         "f90",
@@ -25484,6 +28879,13 @@ fn pointer_component_rhs_pointer_component_association_runs() {
 
 #[test]
 fn pointer_dummy_rhs_name_component_assignment_preserves_pointee() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=pointer_dummy_rhs_name_component_assignment_preserves_pointee count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: node_t\n    integer :: node_type = 0\n    type(list_t), pointer :: list => null()\n  end type\n  type :: list_t\n    type(node_t), pointer :: left => null()\n    type(node_t), pointer :: right => null()\n  end type\n  type(node_t), pointer :: a, b, root\n\n  allocate(a)\n  a%node_type = 11\n  allocate(b)\n  b%node_type = 22\n\n  root => create_list(a, b)\n\n  if (.not. associated(root%list%left)) error stop 1\n  if (.not. associated(root%list%right)) error stop 2\n  if (root%list%left%node_type /= 11) error stop 3\n  if (root%list%right%node_type /= 22) error stop 4\n  print *, 'ok'\ncontains\n  function create_list(left, right) result(node)\n    type(node_t), pointer, intent(in) :: left, right\n    type(node_t), pointer :: node\n    allocate(node)\n    node%node_type = 33\n    allocate(node%list)\n    node%list%left => left\n    node%list%right => right\n  end function create_list\nend program p\n",
         "f90",
@@ -25519,6 +28921,13 @@ fn pointer_dummy_rhs_name_component_assignment_preserves_pointee() {
 
 #[test]
 fn allocate_pointer_intent_out_dummy_updates_caller_slot_and_components() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocate_pointer_intent_out_dummy_updates_caller_slot_and_components count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: node_t\n    integer :: value = 0\n    character(len=16) :: name = ''\n  end type\n  type(node_t), pointer :: root\n  call init(root)\n  if (.not. associated(root)) error stop 1\n  if (root%value /= 7) error stop 2\n  if (trim(root%name) /= 'root') error stop 3\n  print *, 'ok'\ncontains\n  subroutine init(root)\n    type(node_t), pointer, intent(out) :: root\n    allocate(root)\n    root%value = 7\n    root%name = 'root'\n  end subroutine\nend program p\n",
         "f90",
@@ -25554,6 +28963,13 @@ fn allocate_pointer_intent_out_dummy_updates_caller_slot_and_components() {
 
 #[test]
 fn pointer_array_component_element_actual_to_pointer_dummy_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=pointer_array_component_element_actual_to_pointer_dummy_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: node_t\n    integer :: node_type = 0\n    type(node_t), pointer :: child => null()\n  end type\n  type :: pipeline_t\n    type(node_t), pointer :: commands(:) => null()\n  end type\n  type :: wrapper_t\n    type(pipeline_t), pointer :: pipe => null()\n  end type\n  type(node_t), target :: storage(2)\n  type(node_t), pointer :: cmds(:)\n  type(wrapper_t) :: w\n\n  storage(1)%node_type = 11\n  storage(2)%node_type = 22\n  cmds => storage\n\n  allocate(w%pipe)\n  w%pipe%commands => cmds\n\n  call show_node(w%pipe%commands(1))\n  call show_node(w%pipe%commands(2))\ncontains\n  subroutine show_node(node)\n    type(node_t), pointer, intent(in) :: node\n    if (.not. associated(node)) error stop 1\n    print '(A,I0)', 'NODE=', node%node_type\n  end subroutine show_node\nend program p\n",
         "f90",
@@ -25589,6 +29005,13 @@ fn pointer_array_component_element_actual_to_pointer_dummy_runs() {
 
 #[test]
 fn single_char_array_constructor_actual_to_assumed_shape_dummy_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=single_char_array_constructor_actual_to_assumed_shape_dummy_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  character(len=:), allocatable :: s\n  s = 'echo hello'\n  call show([s], 1)\ncontains\n  subroutine show(body_lines, body_count)\n    character(len=*), intent(in) :: body_lines(:)\n    integer, intent(in) :: body_count\n    if (size(body_lines) /= 1) error stop 1\n    if (body_count /= 1) error stop 2\n    if (trim(body_lines(1)) /= 'echo hello') error stop 3\n    print *, 'ok'\n  end subroutine show\nend program p\n",
         "f90",
@@ -25624,6 +29047,13 @@ fn single_char_array_constructor_actual_to_assumed_shape_dummy_runs() {
 
 #[test]
 fn multi_char_array_constructor_actual_to_assumed_shape_dummy_survives_derived_result_assignment() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=multi_char_array_constructor_actual_to_assumed_shape_dummy_survives_derived_result_assignment count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module repro\n  implicit none\n  type :: command_t\n    character(len=:), allocatable :: argv(:)\n  end type\ncontains\n  function make(argv) result(out)\n    character(len=*), intent(in) :: argv(:)\n    type(command_t) :: out\n    integer :: i, n\n    n = len(argv(1))\n    allocate(character(len=n) :: out%argv(size(argv)))\n    do i = 1, size(argv)\n      out%argv(i) = argv(i)\n    end do\n  end function\nend module\nprogram p\n  use repro\n  implicit none\n  type(command_t) :: cmd\n  cmd = make([\"hello\", \"world\"])\n  if (.not. allocated(cmd%argv)) error stop 1\n  if (size(cmd%argv) /= 2) error stop 2\n  if (cmd%argv(1) /= \"hello\") error stop 3\n  if (cmd%argv(2) /= \"world\") error stop 4\n  print *, 'ok'\nend program\n",
         "f90",
@@ -25659,6 +29089,13 @@ fn multi_char_array_constructor_actual_to_assumed_shape_dummy_survives_derived_r
 
 #[test]
 fn derived_result_with_scalar_char_and_constructor_array_actual_survives() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=derived_result_with_scalar_char_and_constructor_array_actual_survives count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module repro\n  implicit none\n  type :: command_t\n    character(len=:), allocatable :: program\n    character(len=:), allocatable :: argv(:)\n  end type\ncontains\n  function make(program, argv) result(out)\n    character(len=*), intent(in) :: program\n    character(len=*), intent(in) :: argv(:)\n    type(command_t) :: out\n    integer :: i, n\n    out%program = program\n    n = len(argv(1))\n    allocate(character(len=n) :: out%argv(size(argv)))\n    do i = 1, size(argv)\n      out%argv(i) = argv(i)\n    end do\n  end function\nend module\nprogram p\n  use repro\n  implicit none\n  type(command_t) :: cmd\n  cmd = make(\"printf\", [\"hello\", \"world\"])\n  if (.not. allocated(cmd%program)) error stop 1\n  if (cmd%program /= \"printf\") error stop 2\n  if (.not. allocated(cmd%argv)) error stop 3\n  if (size(cmd%argv) /= 2) error stop 4\n  if (cmd%argv(1) /= \"hello\") error stop 5\n  if (cmd%argv(2) /= \"world\") error stop 6\n  print *, 'ok'\nend program\n",
         "f90",
@@ -25694,6 +29131,13 @@ fn derived_result_with_scalar_char_and_constructor_array_actual_survives() {
 
 #[test]
 fn derived_pointer_module_global_survives_amod_import() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=derived_pointer_module_global_survives_amod_import count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("derived_ptr_amod");
     let mod_src = write_program_in(
         &dir,
@@ -25751,6 +29195,13 @@ fn derived_pointer_module_global_survives_amod_import() {
 
 #[test]
 fn deferred_char_pointer_component_compiles_string_pool_style_ops() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=deferred_char_pointer_component_compiles_string_pool_style_ops count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: string_ref\n    integer :: str_len = 0\n    character(:), pointer :: data => null()\n  end type string_ref\n  character(len=16), target :: pool(1)\ncontains\n  subroutine bind_pool(ref, n)\n    type(string_ref), intent(inout) :: ref\n    integer, intent(in) :: n\n    ref%str_len = n\n    ref%data => pool(1)(1:n)\n    if (associated(ref%data)) then\n      ref%data = ' '\n      ref%data(1:1) = 'x'\n    end if\n  end subroutine bind_pool\n\n  subroutine own_alloc(ref, n)\n    type(string_ref), intent(inout) :: ref\n    integer, intent(in) :: n\n    if (associated(ref%data)) deallocate(ref%data)\n    allocate(character(len=n) :: ref%data)\n    ref%data = 'abc'\n  end subroutine own_alloc\nend module\n",
         "f90",
@@ -25772,6 +29223,13 @@ fn deferred_char_pointer_component_compiles_string_pool_style_ops() {
 
 #[test]
 fn deferred_char_pointer_component_can_bind_allocatable_char_array_element() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=deferred_char_pointer_component_can_bind_allocatable_char_array_element count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: string_ref\n    character(:), pointer :: data => null()\n  end type string_ref\n  type(string_ref) :: ref\n  character(len=32), target, allocatable :: pool(:)\n\n  allocate(pool(1))\n  pool = ''\n  ref%data => pool(1)(1:32)\n  if (.not. associated(ref%data)) error stop 1\n  ref%data = '/tmp'\n  if (trim(ref%data) /= '/tmp') error stop 2\n  print *, trim(ref%data)\nend program\n",
         "f90",
@@ -25807,6 +29265,13 @@ fn deferred_char_pointer_component_can_bind_allocatable_char_array_element() {
 
 #[test]
 fn nested_pooled_char_pointer_component_whole_assign_then_char_store_round_trips() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=nested_pooled_char_pointer_component_whole_assign_then_char_store_round_trips count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module string_pool_like\n  implicit none\n  type :: string_ref\n    integer :: pool_index = 0\n    integer :: ref_count = 0\n    integer :: str_len = 0\n    character(:), pointer :: data => null()\n  end type string_ref\n  character(len=32), target :: pool(1)\ncontains\n  function pool_get_string(length) result(ref)\n    integer, intent(in) :: length\n    type(string_ref) :: ref\n    pool = ''\n    ref%str_len = length\n    ref%data => pool(1)(1:length)\n  end function pool_get_string\nend module\nprogram p\n  use string_pool_like\n  implicit none\n  type :: input_state_t\n    type(string_ref) :: buffer_ref\n    integer :: length = 0\n  end type input_state_t\n  type(input_state_t) :: state\n  state%buffer_ref = pool_get_string(32)\n  if (.not. associated(state%buffer_ref%data)) error stop 2\n  state%buffer_ref%data = ''\n  call set_char(state, 1, 'e')\n  call set_char(state, 2, 'c')\n  call set_char(state, 3, 'h')\n  call set_char(state, 4, 'o')\n  state%length = 4\n  if (trim(state%buffer_ref%data) /= 'echo') error stop 1\n  print *, trim(state%buffer_ref%data)\ncontains\n  subroutine set_char(state, pos, ch)\n    type(input_state_t), intent(inout) :: state\n    integer, intent(in) :: pos\n    character(len=1), intent(in) :: ch\n    if (pos >= 1 .and. pos <= len(state%buffer_ref%data)) then\n      state%buffer_ref%data(pos:pos) = ch\n    end if\n  end subroutine set_char\nend program\n",
         "f90",
@@ -25844,6 +29309,13 @@ fn nested_pooled_char_pointer_component_whole_assign_then_char_store_round_trips
 
 #[test]
 fn get_environment_variable_literal_name_populates_value_and_status() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=get_environment_variable_literal_name_populates_value_and_status count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  character(len=16) :: home_buf\n  integer :: len_out, stat_out\n  home_buf = ''\n  len_out = -1\n  stat_out = -1\n  call get_environment_variable('HOME', home_buf, len_out, stat_out)\n  if (stat_out /= 0) error stop 1\n  if (len_out /= 4) error stop 2\n  if (trim(home_buf) /= '/tmp') error stop 3\n  print *, trim(home_buf)\nend program\n",
         "f90",
@@ -25882,6 +29354,13 @@ fn get_environment_variable_literal_name_populates_value_and_status() {
 
 #[test]
 fn get_environment_variable_status_keyword_preserves_length_hole() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=get_environment_variable_status_keyword_preserves_length_hole count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  character(len=16) :: test_mode\n  integer :: stat_out\n  test_mode = ''\n  stat_out = -1\n  call get_environment_variable('FORTSH_TEST_MODE', test_mode, status=stat_out)\n  if (stat_out /= 0) error stop 1\n  if (trim(test_mode) /= '1') error stop 2\n  print *, trim(test_mode)\nend program\n",
         "f90",
@@ -25920,6 +29399,13 @@ fn get_environment_variable_status_keyword_preserves_length_hole() {
 
 #[test]
 fn get_environment_variable_status_only_keyword_uses_correct_slot() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=get_environment_variable_status_only_keyword_uses_correct_slot count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  integer :: stat_out\n  stat_out = -1\n  call get_environment_variable('FORTSH_TEST_MODE', status=stat_out)\n  if (stat_out /= 0) error stop 1\n  print *, stat_out\nend program\n",
         "f90",
@@ -25958,6 +29444,13 @@ fn get_environment_variable_status_only_keyword_uses_correct_slot() {
 
 #[test]
 fn logical_allocatable_slice_assignment_compiles() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=logical_allocatable_slice_assignment_compiles count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  logical, allocatable :: a(:), b(:)\n  integer :: n\n  n = 4\n  allocate(a(n), b(n))\n  a = .false.\n  b = .true.\n  a(1:n) = b(1:n)\n  b(2:n-1) = .false.\nend program\n",
         "f90",
@@ -25979,6 +29472,13 @@ fn logical_allocatable_slice_assignment_compiles() {
 
 #[test]
 fn c_interop_opaque_pointer_values_compile() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=c_interop_opaque_pointer_values_compile count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  use iso_c_binding\n  implicit none\n  type(c_ptr) :: pbuf\n  type(c_funptr) :: fptr\n  pbuf = c_null_ptr\n  fptr = c_null_funptr\nend program\n",
         "f90",
@@ -26000,6 +29500,13 @@ fn c_interop_opaque_pointer_values_compile() {
 
 #[test]
 fn allocated_eqv_on_allocatables_compiles() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocated_eqv_on_allocatables_compiles count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  logical, allocatable :: a(:), b(:)\n  logical :: same\n  allocate(a(1), b(1))\n  same = allocated(a) .eqv. allocated(b)\nend program\n",
         "f90",
@@ -26021,6 +29528,13 @@ fn allocated_eqv_on_allocatables_compiles() {
 
 #[test]
 fn runtime_bound_local_c_ptr_array_accepts_final_null_slot() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=runtime_bound_local_c_ptr_array_accepts_final_null_slot count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  use iso_c_binding, only: c_ptr, c_null_ptr, c_associated\n  implicit none\n  call run(1)\ncontains\n  subroutine run(n)\n    integer, intent(in) :: n\n    type(c_ptr), target :: argv(n + 1)\n    argv(n + 1) = c_null_ptr\n    if (c_associated(argv(n + 1))) error stop 1\n    print *, 'ok'\n  end subroutine run\nend program\n",
         "f90",
@@ -26058,6 +29572,13 @@ fn runtime_bound_local_c_ptr_array_accepts_final_null_slot() {
 
 #[test]
 fn whole_component_char_array_actual_preserves_hidden_len() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=whole_component_char_array_actual_preserves_hidden_len count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: command_t\n    character(len=:), allocatable :: tokens(:)\n  end type command_t\n  type(command_t) :: cmd\n  allocate(character(len=8) :: cmd%tokens(1))\n  cmd%tokens(1) = 'true'\n  call check(cmd%tokens)\ncontains\n  subroutine check(tokens)\n    character(len=*), intent(in) :: tokens(:)\n    if (len(tokens(1)) /= 8) error stop 1\n    if (trim(tokens(1)) /= 'true') error stop 2\n    print *, trim(tokens(1))\n  end subroutine check\nend program\n",
         "f90",
@@ -26095,6 +29616,13 @@ fn whole_component_char_array_actual_preserves_hidden_len() {
 
 #[test]
 fn fixed_char_component_array_actual_preserves_bounds_in_assumed_shape_dummy() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_char_component_array_actual_preserves_bounds_in_assumed_shape_dummy count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  integer, parameter :: max_path_len = 32\n  type :: opts_t\n    character(len=max_path_len) :: globs(4) = ''\n    integer :: n = 0\n  end type opts_t\n  type(opts_t) :: opts\n  opts%globs(1) = 'foo'\n  opts%n = 1\n  call check(opts%globs, opts%n)\ncontains\n  subroutine check(globs, n)\n    character(len=max_path_len), intent(in) :: globs(:)\n    integer, intent(in) :: n\n    if (lbound(globs, 1) /= 1) error stop 1\n    if (ubound(globs, 1) /= 4) error stop 2\n    if (n > 0 .and. trim(globs(1)) /= 'foo') error stop 3\n    print *, trim(globs(1))\n  end subroutine check\nend program\n",
         "f90",
@@ -26132,6 +29660,13 @@ fn fixed_char_component_array_actual_preserves_bounds_in_assumed_shape_dummy() {
 
 #[test]
 fn deferred_char_component_array_copy_preserves_contents() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=deferred_char_component_array_copy_preserves_contents count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: command_t\n    character(len=:), allocatable :: tokens(:)\n  end type command_t\n  type(command_t) :: src_cmd, dst_cmd\n  allocate(character(len=4) :: src_cmd%tokens(2), dst_cmd%tokens(2))\n  src_cmd%tokens(1) = 'read'\n  src_cmd%tokens(2) = 'line'\n  dst_cmd%tokens = src_cmd%tokens\n  if (trim(dst_cmd%tokens(1)) /= 'read') error stop 1\n  if (trim(dst_cmd%tokens(2)) /= 'line') error stop 2\n  print *, trim(dst_cmd%tokens(1)), trim(dst_cmd%tokens(2))\nend program\n",
         "f90",
@@ -26169,6 +29704,13 @@ fn deferred_char_component_array_copy_preserves_contents() {
 
 #[test]
 fn derived_scalar_assignment_deep_copies_allocatable_char_component() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=derived_scalar_assignment_deep_copies_allocatable_char_component count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: redirect_t\n    integer :: kind = 0\n    integer :: fd = -1\n    integer :: target_fd = -1\n    character(len=:), allocatable :: filename\n    logical :: force_clobber = .false.\n  end type redirect_t\n  type(redirect_t) :: src_redir, dst_redir\n  src_redir%kind = 7\n  src_redir%fd = 0\n  src_redir%target_fd = -1\n  allocate(src_redir%filename, source='alpha')\n  src_redir%force_clobber = .true.\n  dst_redir = src_redir\n  src_redir%filename = 'omega'\n  if (.not. allocated(dst_redir%filename)) error stop 1\n  if (trim(dst_redir%filename) /= 'alpha') error stop 2\n  if (dst_redir%kind /= 7) error stop 3\n  if (dst_redir%fd /= 0) error stop 4\n  if (dst_redir%target_fd /= -1) error stop 5\n  if (.not. dst_redir%force_clobber) error stop 6\n  if (trim(src_redir%filename) /= 'omega') error stop 7\n  print *, trim(dst_redir%filename)\nend program\n",
         "f90",
@@ -26206,6 +29748,13 @@ fn derived_scalar_assignment_deep_copies_allocatable_char_component() {
 
 #[test]
 fn derived_section_assignment_deep_copies_allocatable_char_component() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=derived_section_assignment_deep_copies_allocatable_char_component count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: redirect_t\n    integer :: kind = 0\n    integer :: fd = -1\n    integer :: target_fd = -1\n    character(len=:), allocatable :: filename\n    logical :: force_clobber = .false.\n  end type redirect_t\n  type(redirect_t), allocatable :: src_redirs(:)\n  type(redirect_t) :: dst_redirs(1)\n  allocate(src_redirs(1))\n  src_redirs(1)%kind = 7\n  src_redirs(1)%fd = 0\n  src_redirs(1)%target_fd = -1\n  allocate(src_redirs(1)%filename, source='alpha')\n  src_redirs(1)%force_clobber = .true.\n  dst_redirs(1:1) = src_redirs(1:1)\n  src_redirs(1)%filename = 'omega'\n  if (.not. allocated(dst_redirs(1)%filename)) error stop 1\n  if (trim(dst_redirs(1)%filename) /= 'alpha') error stop 2\n  if (dst_redirs(1)%kind /= 7) error stop 3\n  if (dst_redirs(1)%fd /= 0) error stop 4\n  if (dst_redirs(1)%target_fd /= -1) error stop 5\n  if (.not. dst_redirs(1)%force_clobber) error stop 6\n  if (trim(src_redirs(1)%filename) /= 'omega') error stop 7\n  print *, trim(dst_redirs(1)%filename)\nend program\n",
         "f90",
@@ -26243,6 +29792,13 @@ fn derived_section_assignment_deep_copies_allocatable_char_component() {
 
 #[test]
 fn empty_allocatable_char_component_copy_stays_allocated() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=empty_allocatable_char_component_copy_stays_allocated count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: redirect_t\n    character(len=:), allocatable :: filename\n  end type redirect_t\n  type(redirect_t), allocatable :: src_redirs(:)\n  type(redirect_t) :: dst_redirs(1)\n  allocate(src_redirs(1))\n  src_redirs(1)%filename = ''\n  dst_redirs(1:1) = src_redirs(1:1)\n  if (.not. allocated(src_redirs(1)%filename)) error stop 1\n  if (.not. allocated(dst_redirs(1)%filename)) error stop 2\n  if (len(src_redirs(1)%filename) /= 0) error stop 3\n  if (len(dst_redirs(1)%filename) /= 0) error stop 4\n  print *, 'ok'\nend program\n",
         "f90",
@@ -26280,6 +29836,13 @@ fn empty_allocatable_char_component_copy_stays_allocated() {
 
 #[test]
 fn derived_function_result_keeps_unallocated_allocatable_char_components_unallocated() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=derived_function_result_keeps_unallocated_allocatable_char_components_unallocated count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: options_t\n    logical :: cleanup_on_close = .true.\n    character(len=:), allocatable :: prefix\n    character(len=:), allocatable :: suffix\n    character(len=:), allocatable :: parent_dir\n  end type options_t\ncontains\n  function clear_options() result(options)\n    type(options_t) :: options\n    options%cleanup_on_close = .true.\n  end function\nend module\n\nprogram p\n  use m\n  implicit none\n  type(options_t) :: options\n  options = clear_options()\n  if (.not. options%cleanup_on_close) error stop 1\n  if (allocated(options%prefix)) error stop 2\n  if (allocated(options%suffix)) error stop 3\n  if (allocated(options%parent_dir)) error stop 4\n  print *, 'ok'\nend program\n",
         "f90",
@@ -26317,6 +29880,13 @@ fn derived_function_result_keeps_unallocated_allocatable_char_components_unalloc
 
 #[test]
 fn derived_array_growth_keeps_unallocated_allocatable_components_clear() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=derived_array_growth_keeps_unallocated_allocatable_components_clear count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: trans_t\n    integer :: target = 0\n  end type\n  type :: state_t\n    type(trans_t), allocatable :: trans(:)\n    integer :: num_trans = 0\n  end type\n  type :: nfa_t\n    type(state_t), allocatable :: states(:)\n    integer :: num_states = 0\n  end type\n  type(nfa_t) :: nfa\n  type(trans_t) :: trans\n  integer :: i, start_state, accept_state, prev_accept, s2\n\n  call init(nfa)\n  start_state = add_state(nfa)\n  accept_state = add_state(nfa)\n  trans%target = accept_state\n  call add_trans(nfa%states(start_state), trans)\n\n  do i = 2, 8\n    prev_accept = accept_state\n    s2 = add_state(nfa)\n    trans%target = s2\n    call add_trans(nfa%states(prev_accept), trans)\n    accept_state = s2\n  end do\n\n  if (nfa%states(8)%num_trans /= 1) error stop 1\n  if (.not. allocated(nfa%states(8)%trans)) error stop 2\n  if (nfa%states(8)%trans(1)%target /= 9) error stop 3\n  print *, 'ok'\ncontains\n  subroutine add_trans(state, trans)\n    type(state_t), intent(inout) :: state\n    type(trans_t), intent(in) :: trans\n    type(trans_t), allocatable :: temp(:)\n    integer :: n\n    if (.not. allocated(state%trans)) then\n      allocate(state%trans(4))\n      state%num_trans = 0\n    end if\n    n = state%num_trans\n    if (n >= size(state%trans)) then\n      allocate(temp(size(state%trans) * 2))\n      temp(1:n) = state%trans(1:n)\n      call move_alloc(temp, state%trans)\n    end if\n    state%num_trans = n + 1\n    state%trans(state%num_trans) = trans\n  end subroutine\n\n  subroutine init(nfa)\n    type(nfa_t), intent(inout) :: nfa\n    allocate(nfa%states(8))\n    nfa%num_states = 0\n  end subroutine\n\n  integer function add_state(nfa) result(idx)\n    type(nfa_t), intent(inout) :: nfa\n    type(state_t), allocatable :: temp(:)\n    integer :: n\n    n = nfa%num_states\n    if (n >= size(nfa%states)) then\n      allocate(temp(size(nfa%states) * 2))\n      temp(1:n) = nfa%states(1:n)\n      call move_alloc(temp, nfa%states)\n    end if\n    nfa%num_states = n + 1\n    idx = nfa%num_states\n  end function\nend program\n",
         "f90",
@@ -26355,6 +29925,13 @@ fn derived_array_growth_keeps_unallocated_allocatable_components_clear() {
 
 #[test]
 fn module_global_derived_array_char_default_init_uses_blanks() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=module_global_derived_array_char_default_init_uses_blanks count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: entry_t\n    character(len=8) :: name = ''\n  end type\n  type(entry_t), save :: table(2)\ncontains\n  subroutine check()\n    if (len_trim(table(1)%name) /= 0) error stop 1\n    if (table(1)%name(1:1) /= ' ') error stop 2\n    print *, 'ok'\n  end subroutine\nend module\nprogram p\n  use m\n  call check()\nend program\n",
         "f90",
@@ -26392,6 +29969,13 @@ fn module_global_derived_array_char_default_init_uses_blanks() {
 
 #[test]
 fn internal_read_from_char_array_element_uses_internal_file_path() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=internal_read_from_char_array_element_uses_internal_file_path count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  character(len=16) :: words(2)\n  integer :: ios, fd\n  words(1) = '2'\n  ios = -99\n  fd = -1\n  read(words(1), *, iostat=ios) fd\n  if (ios /= 0) error stop 1\n  if (fd /= 2) error stop 2\n  print *, 'ok'\nend program\n",
         "f90",
@@ -26429,6 +30013,13 @@ fn internal_read_from_char_array_element_uses_internal_file_path() {
 
 #[test]
 fn formatted_internal_read_from_char_component_uses_internal_file_path() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=formatted_internal_read_from_char_component_uses_internal_file_path count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: token_t\n    character(len=16) :: value = ''\n  end type\n  type(token_t) :: tok\n  integer :: ios, fd\n  tok%value(1:1) = '3'\n  ios = -99\n  fd = -1\n  read(tok%value, '(I1)', iostat=ios) fd\n  if (ios /= 0) error stop 1\n  if (fd /= 3) error stop 2\n  print *, 'ok'\nend program\n",
         "f90",
@@ -26466,6 +30057,13 @@ fn formatted_internal_read_from_char_component_uses_internal_file_path() {
 
 #[test]
 fn formatted_octal_internal_io_round_trips_min_digits_and_values() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=formatted_octal_internal_io_round_trips_min_digits_and_values count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  use iso_c_binding\n  implicit none\n  integer(c_int) :: current_mask, new_mask\n  integer :: ios\n  character(len=16) :: mask_str\n  current_mask = int(o'0022', c_int)\n  write(mask_str, '(o4.4)') current_mask\n  if (trim(adjustl(mask_str)) /= '0022') error stop 1\n  mask_str = '077'\n  read(mask_str, '(o10)', iostat=ios) new_mask\n  if (ios /= 0 .or. new_mask /= 63_c_int) error stop 2\n  mask_str = '22'\n  read(mask_str, '(o10)', iostat=ios) new_mask\n  if (ios /= 0 .or. new_mask /= 18_c_int) error stop 3\n  print *, 'ok'\nend program\n",
         "f90",
@@ -26504,6 +30102,13 @@ fn formatted_octal_internal_io_round_trips_min_digits_and_values() {
 
 #[test]
 fn derived_assignment_deep_copies_allocatable_command_tokens() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=derived_assignment_deep_copies_allocatable_command_tokens count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module repro\n  implicit none\n  type :: shell_state_t\n    integer :: last_exit_status = -99\n  end type\n  type :: command_t\n    character(len=:), allocatable :: tokens(:)\n    integer :: num_tokens = 0\n    integer, allocatable :: token_lengths(:)\n    logical, allocatable :: token_quoted(:)\n    logical, allocatable :: token_escaped(:)\n    integer, allocatable :: token_quote_type(:)\n  end type\ncontains\n  recursive subroutine execute_test_command(cmd, shell)\n    type(command_t), intent(in) :: cmd\n    type(shell_state_t), intent(inout) :: shell\n    logical :: test_result\n    logical :: left_result, right_result\n    type(command_t) :: sub_cmd, left_cmd, right_cmd\n    integer :: i, j, logical_op_pos\n    integer :: paren_depth, check_pos\n    logical :: outer_parens_wrap_all\n    integer :: effective_num_tokens\n    logical :: is_bracket_cmd\n    character(len=16) :: op\n\n    if (cmd%num_tokens < 2) then\n      shell%last_exit_status = 1\n      return\n    end if\n\n    is_bracket_cmd = (trim(cmd%tokens(1)) == '[')\n    if (is_bracket_cmd) then\n      effective_num_tokens = cmd%num_tokens - 1\n    else\n      effective_num_tokens = cmd%num_tokens\n    end if\n\n    if (effective_num_tokens == 4) then\n      op = cmd%tokens(3)\n      select case (trim(op))\n      case ('-gt')\n        test_result = string_to_int(cmd%tokens(2)) > string_to_int(cmd%tokens(4))\n      case default\n        test_result = .false.\n      end select\n    else if (effective_num_tokens >= 5) then\n      if (trim(cmd%tokens(2)) == '(') then\n        paren_depth = 1\n        outer_parens_wrap_all = .false.\n        do check_pos = 3, effective_num_tokens\n          if (trim(cmd%tokens(check_pos)) == '(') then\n            paren_depth = paren_depth + 1\n          else if (trim(cmd%tokens(check_pos)) == ')') then\n            paren_depth = paren_depth - 1\n            if (paren_depth == 0) then\n              outer_parens_wrap_all = (check_pos == effective_num_tokens)\n              exit\n            end if\n          end if\n        end do\n        if (outer_parens_wrap_all) then\n          sub_cmd = cmd\n          sub_cmd%tokens(1) = cmd%tokens(1)\n          if (is_bracket_cmd) then\n            sub_cmd%num_tokens = cmd%num_tokens - 2\n            do i = 2, sub_cmd%num_tokens - 1\n              sub_cmd%tokens(i) = cmd%tokens(i + 1)\n            end do\n            sub_cmd%tokens(sub_cmd%num_tokens) = ']'\n          else\n            sub_cmd%num_tokens = cmd%num_tokens - 2\n            do i = 2, sub_cmd%num_tokens\n              sub_cmd%tokens(i) = cmd%tokens(i + 1)\n            end do\n          end if\n          call execute_test_command(sub_cmd, shell)\n          return\n        end if\n      end if\n\n      logical_op_pos = 0\n      paren_depth = 0\n      do i = 2, effective_num_tokens\n        if (trim(cmd%tokens(i)) == '(') then\n          paren_depth = paren_depth + 1\n        else if (trim(cmd%tokens(i)) == ')') then\n          paren_depth = paren_depth - 1\n        else if (paren_depth == 0) then\n          if (trim(cmd%tokens(i)) == '-o') then\n            logical_op_pos = i\n            exit\n          else if (trim(cmd%tokens(i)) == '-a') then\n            if (logical_op_pos == 0) logical_op_pos = i\n          end if\n        end if\n      end do\n\n      if (logical_op_pos > 0) then\n        left_cmd = cmd\n        left_cmd%tokens(1) = 'test'\n        left_cmd%num_tokens = logical_op_pos - 1\n        do j = 2, left_cmd%num_tokens\n          left_cmd%tokens(j) = cmd%tokens(j)\n        end do\n\n        right_cmd = cmd\n        right_cmd%tokens(1) = 'test'\n        right_cmd%num_tokens = effective_num_tokens + 1 - logical_op_pos\n        do j = 2, right_cmd%num_tokens\n          right_cmd%tokens(j) = cmd%tokens(j + logical_op_pos - 1)\n        end do\n\n        call execute_test_command(left_cmd, shell)\n        left_result = (shell%last_exit_status == 0)\n        call execute_test_command(right_cmd, shell)\n        right_result = (shell%last_exit_status == 0)\n\n        if (trim(cmd%tokens(logical_op_pos)) == '-a') then\n          test_result = left_result .and. right_result\n        else\n          test_result = left_result .or. right_result\n        end if\n      else\n        test_result = .false.\n      end if\n    else\n      test_result = .false.\n    end if\n\n    if (test_result) then\n      shell%last_exit_status = 0\n    else\n      shell%last_exit_status = 1\n    end if\n  end subroutine\n\n  integer function string_to_int(str) result(v)\n    character(len=*), intent(in) :: str\n    integer :: ios\n    read(str, *, iostat=ios) v\n    if (ios /= 0) v = 0\n  end function\nend module\nprogram p\n  use repro\n  implicit none\n  type(command_t) :: cmd\n  type(shell_state_t) :: shell\n\n  allocate(character(len=16) :: cmd%tokens(12))\n  allocate(cmd%token_lengths(12), cmd%token_quoted(12), cmd%token_escaped(12), cmd%token_quote_type(12))\n  cmd%num_tokens = 12\n  cmd%tokens = ''\n  cmd%token_lengths = 0\n  cmd%token_quoted = .false.\n  cmd%token_escaped = .false.\n  cmd%token_quote_type = 0\n  cmd%tokens(1) = 'test'\n  cmd%tokens(2) = '('\n  cmd%tokens(3) = '5'\n  cmd%tokens(4) = '-gt'\n  cmd%tokens(5) = '3'\n  cmd%tokens(6) = ')'\n  cmd%tokens(7) = '-a'\n  cmd%tokens(8) = '('\n  cmd%tokens(9) = '10'\n  cmd%tokens(10) = '-gt'\n  cmd%tokens(11) = '8'\n  cmd%tokens(12) = ')'\n\n  call execute_test_command(cmd, shell)\n  if (shell%last_exit_status /= 0) error stop 1\n  print *, 'ok'\nend program\n",
         "f90",
@@ -26542,6 +30147,13 @@ fn derived_assignment_deep_copies_allocatable_command_tokens() {
 
 #[test]
 fn fixed_char_component_substring_assignment_updates_field() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_char_component_substring_assignment_updates_field count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: token_t\n    character(len=16) :: value = ''\n  end type\n  type(token_t) :: tok\n  tok%value = ''\n  tok%value(1:1) = '3'\n  if (tok%value(1:1) /= '3') error stop 1\n  print *, 'ok'\nend program\n",
         "f90",
@@ -26579,6 +30191,13 @@ fn fixed_char_component_substring_assignment_updates_field() {
 
 #[test]
 fn fixed_char_component_substring_prints_contents() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_char_component_substring_prints_contents count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: token_t\n    character(len=16) :: value = ''\n  end type\n  type(token_t) :: tok\n  tok%value = 'echo'\n  print *, tok%value(1:4)\nend program p\n",
         "f90",
@@ -26616,6 +30235,13 @@ fn fixed_char_component_substring_prints_contents() {
 
 #[test]
 fn implicit_len1_char_component_assignment_preserves_bytes() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=implicit_len1_char_component_assignment_preserves_bytes count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: lexer_state_t\n    character(len=:), allocatable :: input\n    character :: current_char\n  end type\n  type(lexer_state_t) :: lexer\n  lexer%current_char = '2'\n  if (iachar(lexer%current_char) /= iachar('2')) error stop 1\n  lexer%input = trim(adjustl('2 + 3'))\n  lexer%current_char = lexer%input(1:1)\n  if (iachar(lexer%current_char) /= iachar('2')) error stop 2\n  print *, 'ok'\nend program\n",
         "f90",
@@ -26649,6 +30275,13 @@ fn implicit_len1_char_component_assignment_preserves_bytes() {
 
 #[test]
 fn logical_whole_array_copy_preserves_elements() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=logical_whole_array_copy_preserves_elements count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  logical :: src(3), dest(3)\n  src = .false.\n  src(3) = .true.\n  dest = src\n  if (dest(1)) error stop 1\n  if (dest(2)) error stop 2\n  if (.not. dest(3)) error stop 3\n  print *, 'ok'\nend program\n",
         "f90",
@@ -26686,6 +30319,13 @@ fn logical_whole_array_copy_preserves_elements() {
 
 #[test]
 fn logical_component_array_copy_preserves_elements() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=logical_component_array_copy_preserves_elements count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: token_t\n    logical :: bits(0:255)\n  end type\n  type :: node_t\n    logical :: bits(0:255)\n  end type\n  type(token_t) :: tok\n  type(node_t) :: node\n  tok%bits = .false.\n  tok%bits(iachar('a')) = .true.\n  node%bits = tok%bits\n  if (.not. node%bits(iachar('a'))) error stop 1\n  if (node%bits(iachar('z'))) error stop 2\n  print *, 'ok'\nend program\n",
         "f90",
@@ -26723,6 +30363,13 @@ fn logical_component_array_copy_preserves_elements() {
 
 #[test]
 fn component_array_section_bound_expr_preserves_derived_elements() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=component_array_section_bound_expr_preserves_derived_elements count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: token_t\n    integer :: t = 0\n    integer :: pos = 0\n    logical :: bits(0:255) = .false.\n  end type\n  type :: list_t\n    type(token_t), allocatable :: tokens(:)\n    integer :: count = 0\n    integer :: capacity = 0\n  end type\n  type(list_t) :: list\n  type(token_t), allocatable :: temp(:)\n  type(token_t) :: tok\n  integer :: i, idx\n  list%capacity = 32\n  allocate(list%tokens(list%capacity))\n  do i = 1, 32\n    tok = token_t()\n    tok%t = i\n    tok%pos = i\n    idx = mod(i, 256)\n    tok%bits(idx) = .true.\n    list%count = list%count + 1\n    list%tokens(list%count) = tok\n  end do\n  allocate(temp(list%count))\n  temp = list%tokens(1:list%count)\n  do i = 1, 32\n    idx = mod(i, 256)\n    if (temp(i)%t /= i) error stop 100 + i\n    if (temp(i)%pos /= i) error stop 200 + i\n    if (.not. temp(i)%bits(idx)) error stop 300 + i\n  end do\n  print *, 'ok'\nend program\n",
         "f90",
@@ -26760,6 +30407,13 @@ fn component_array_section_bound_expr_preserves_derived_elements() {
 
 #[test]
 fn logical_section_copy_preserves_elements() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=logical_section_copy_preserves_elements count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  logical :: src(3), dest(3)\n  src = .false.\n  src(3) = .true.\n  dest = .false.\n  dest(1:3) = src(1:3)\n  if (dest(1)) error stop 1\n  if (dest(2)) error stop 2\n  if (.not. dest(3)) error stop 3\n  print *, 'ok'\nend program\n",
         "f90",
@@ -26797,6 +30451,13 @@ fn logical_section_copy_preserves_elements() {
 
 #[test]
 fn local_logical_array_broadcast_does_not_clobber_prior_stack_local() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=local_logical_array_broadcast_does_not_clobber_prior_stack_local count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: payload_t\n    character(len=16) :: text = ''\n  end type\n  call wrapper()\n  print *, 'ok'\ncontains\n  subroutine fill(payload, flags, line)\n    type(payload_t), intent(in) :: payload\n    logical, intent(out) :: flags(256)\n    character(len=:), allocatable, intent(out) :: line\n    flags = .false.\n    line = payload%text\n  end subroutine\n\n  subroutine wrapper()\n    type(payload_t) :: payload\n    logical :: flags(256)\n    character(len=:), allocatable :: line\n    payload%text = 'hello'\n    call fill(payload, flags, line)\n    if (trim(line) /= 'hello') error stop 1\n  end subroutine\nend program\n",
         "f90",
@@ -26834,6 +30495,13 @@ fn local_logical_array_broadcast_does_not_clobber_prior_stack_local() {
 
 #[test]
 fn allocatable_dummy_realloc_section_assign_returns_with_live_descriptor() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_dummy_realloc_section_assign_returns_with_live_descriptor count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  integer, allocatable :: vals(:)\n  allocate(vals(16))\n  vals(1) = 2\n  call resize(vals)\n  if (.not. allocated(vals)) error stop 1\n  if (size(vals) /= 1) error stop 2\n  if (vals(1) /= 7) error stop 3\n  print *, 'ok'\ncontains\n  subroutine resize(vals)\n    integer, allocatable, intent(inout) :: vals(:)\n    integer, allocatable :: temp(:)\n    allocate(temp(1))\n    temp(1) = 7\n    deallocate(vals)\n    allocate(vals(1))\n    vals = temp(1:1)\n    deallocate(temp)\n  end subroutine\nend program\n",
         "f90",
@@ -26871,6 +30539,13 @@ fn allocatable_dummy_realloc_section_assign_returns_with_live_descriptor() {
 
 #[test]
 fn allocatable_integer_unary_section_assignment_reallocates_to_slice_shape() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_integer_unary_section_assignment_reallocates_to_slice_shape count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  integer, allocatable :: vals(:)\n  integer :: ii\n  allocate(vals(4))\n  vals = [1, 3, 5, 7]\n  ii = 3\n  vals = -vals(:ii)\n  if (size(vals) /= 3) error stop 1\n  if (vals(1) /= -1) error stop 2\n  if (vals(2) /= -3) error stop 3\n  if (vals(3) /= -5) error stop 4\n  print *, 'ok'\nend program\n",
         "f90",
@@ -26909,6 +30584,13 @@ fn allocatable_integer_unary_section_assignment_reallocates_to_slice_shape() {
 
 #[test]
 fn allocatable_logical_not_section_assignment_reallocates_to_slice_shape() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_logical_not_section_assignment_reallocates_to_slice_shape count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  logical, allocatable :: vals(:)\n  integer :: ii\n  allocate(vals(4))\n  vals = [.true., .false., .true., .false.]\n  ii = 3\n  vals = .not. vals(:ii)\n  if (size(vals) /= 3) error stop 1\n  if (vals(1)) error stop 2\n  if (.not. vals(2)) error stop 3\n  if (vals(3)) error stop 4\n  print *, 'ok'\nend program\n",
         "f90",
@@ -26947,6 +30629,13 @@ fn allocatable_logical_not_section_assignment_reallocates_to_slice_shape() {
 
 #[test]
 fn contained_subroutine_shadows_unrelated_global_generic_of_same_name() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=contained_subroutine_shadows_unrelated_global_generic_of_same_name count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: token_t\n    integer :: kind = 0\n  end type\n  interface resize\n    module procedure :: resize_token\n  end interface\ncontains\n  pure subroutine resize_token(var, n)\n    type(token_t), allocatable, intent(inout) :: var(:)\n    integer, intent(in), optional :: n\n    integer :: new_size\n    new_size = 1\n    if (present(n)) new_size = n\n    if (.not.allocated(var)) allocate(var(new_size))\n  end subroutine\nend module\nprogram p\n  use m, only : token_t\n  implicit none\n  integer, allocatable :: vals(:)\n  call outer(vals)\n  if (.not.allocated(vals)) error stop 1\n  if (size(vals) /= 2) error stop 2\n  if (any(vals /= 7)) error stop 3\n  print *, 'ok'\ncontains\n  subroutine outer(stack)\n    integer, allocatable, intent(out) :: stack(:)\n    allocate(stack(1))\n    stack = 1\n    call resize(stack)\n  contains\n    subroutine resize(stack, n)\n      integer, allocatable, intent(inout) :: stack(:)\n      integer, intent(in), optional :: n\n      integer, allocatable :: tmp(:)\n      integer :: new_size\n      new_size = 2\n      if (present(n)) new_size = n\n      allocate(tmp(new_size))\n      tmp = 7\n      call move_alloc(tmp, stack)\n    end subroutine\n  end subroutine\nend program\n",
         "f90",
@@ -26984,6 +30673,13 @@ fn contained_subroutine_shadows_unrelated_global_generic_of_same_name() {
 
 #[test]
 fn defined_assignment_generic_does_not_capture_intrinsic_assignment_of_other_derived_arrays() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=defined_assignment_generic_does_not_capture_intrinsic_assignment_of_other_derived_arrays count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: value_t\n    integer :: x = 0\n  end type\n  type :: token_t\n    integer :: token_type = 0\n    character(len=:), allocatable :: text\n    integer :: position = 0\n  end type\n  public :: assignment(=)\n  interface assignment(=)\n    module procedure assign_value\n  end interface\ncontains\n  subroutine assign_value(lhs, rhs)\n    type(value_t), intent(out) :: lhs\n    type(value_t), intent(in) :: rhs\n    lhs%x = rhs%x\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(token_t), allocatable :: a(:), b(:)\n  allocate(a(2), b(1))\n  a(1)%token_type = 1\n  a(1)%text = '2'\n  a(1)%position = 1\n  b = a(1:1)\n  if (b(1)%token_type /= 1) error stop 1\n  if (trim(b(1)%text) /= '2') error stop 2\n  if (b(1)%position /= 1) error stop 3\n  print *, 'ok'\nend program\n",
         "f90",
@@ -27021,6 +30717,13 @@ fn defined_assignment_generic_does_not_capture_intrinsic_assignment_of_other_der
 
 #[test]
 fn unrelated_defined_assignment_does_not_double_evaluate_intrinsic_scalar_assignment_rhs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=unrelated_defined_assignment_does_not_double_evaluate_intrinsic_scalar_assignment_rhs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  private\n  public :: token_t, lexer_state_t, tokenize, assignment(=), TOKEN_NUMBER, TOKEN_OPERATOR\n  integer, parameter :: TOKEN_EOF = 0, TOKEN_NUMBER = 1, TOKEN_OPERATOR = 3\n  type :: value_t\n    integer :: x = 0\n  end type\n  type :: token_t\n    integer :: token_type = TOKEN_EOF\n    character(len=:), allocatable :: text\n    integer :: position = 0\n  end type\n  type :: lexer_state_t\n    character(len=:), allocatable :: input\n    integer :: position\n    integer :: length\n    character :: current_char\n  end type\n  interface assignment(=)\n    module procedure assign_value\n  end interface\ncontains\n  subroutine assign_value(lhs, rhs)\n    type(value_t), intent(out) :: lhs\n    type(value_t), intent(in) :: rhs\n    lhs%x = rhs%x\n  end subroutine\n\n  function tokenize(expression) result(tokens)\n    character(len=*), intent(in) :: expression\n    type(token_t), allocatable :: tokens(:)\n    type(lexer_state_t) :: lexer\n    type(token_t) :: current_token\n    integer :: token_count\n    lexer%input = trim(adjustl(expression))\n    lexer%length = len_trim(lexer%input)\n    lexer%position = 1\n    lexer%current_char = lexer%input(1:1)\n    allocate(tokens(4))\n    token_count = 0\n    do\n      call skip_whitespace(lexer)\n      if (lexer%current_char == char(0) .or. lexer%position > lexer%length) exit\n      current_token = next_token(lexer)\n      token_count = token_count + 1\n      tokens(token_count) = current_token\n      if (current_token%token_type == TOKEN_EOF) exit\n    end do\n    token_count = token_count + 1\n    tokens(token_count)%token_type = TOKEN_EOF\n  end function\n\n  function next_token(lexer) result(token)\n    type(lexer_state_t), intent(inout) :: lexer\n    type(token_t) :: token\n    token%position = lexer%position\n    select case (lexer%current_char)\n    case ('0':'9')\n      token = read_number(lexer)\n    case ('+')\n      token%text = '+'\n      call advance(lexer)\n      token%token_type = TOKEN_OPERATOR\n    case default\n      token%text = lexer%current_char\n      call advance(lexer)\n      token%token_type = TOKEN_OPERATOR\n    end select\n  end function\n\n  function read_number(lexer) result(token)\n    type(lexer_state_t), intent(inout) :: lexer\n    type(token_t) :: token\n    integer :: start_pos\n    start_pos = lexer%position\n    do while (lexer%current_char >= '0' .and. lexer%current_char <= '9')\n      call advance(lexer)\n    end do\n    token%token_type = TOKEN_NUMBER\n    token%text = lexer%input(start_pos:lexer%position-1)\n  end function\n\n  subroutine skip_whitespace(lexer)\n    type(lexer_state_t), intent(inout) :: lexer\n    do while (lexer%current_char == ' ' .and. lexer%position <= lexer%length)\n      call advance(lexer)\n    end do\n  end subroutine\n\n  subroutine advance(lexer)\n    type(lexer_state_t), intent(inout) :: lexer\n    lexer%position = lexer%position + 1\n    if (lexer%position <= lexer%length) then\n      lexer%current_char = lexer%input(lexer%position:lexer%position)\n    else\n      lexer%current_char = char(0)\n    end if\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(token_t), allocatable :: tokens(:)\n  tokens = tokenize('2 + 3')\n  if (tokens(1)%token_type /= TOKEN_NUMBER) error stop 1\n  if (trim(tokens(1)%text) /= '2') error stop 2\n  if (tokens(2)%token_type /= TOKEN_OPERATOR) error stop 3\n  if (trim(tokens(2)%text) /= '+') error stop 4\n  if (tokens(3)%token_type /= TOKEN_NUMBER) error stop 5\n  if (trim(tokens(3)%text) /= '3') error stop 6\n  print *, 'ok'\nend program\n",
         "f90",
@@ -27058,6 +30761,13 @@ fn unrelated_defined_assignment_does_not_double_evaluate_intrinsic_scalar_assign
 
 #[test]
 fn direct_allocatable_array_function_actual_passes_live_descriptor() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=direct_allocatable_array_function_actual_passes_live_descriptor count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("direct_alloc_array_actual");
     let mod_src = write_program_in(
         &dir,
@@ -27144,6 +30854,13 @@ fn direct_allocatable_array_function_actual_passes_live_descriptor() {
 
 #[test]
 fn contained_subroutine_actual_to_procedure_dummy_links_and_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=contained_subroutine_actual_to_procedure_dummy_links_and_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module callbacks\n  implicit none\n  abstract interface\n    subroutine cb(value)\n      integer, intent(in) :: value\n    end subroutine\n  end interface\ncontains\n  subroutine remember(handler)\n    procedure(cb) :: handler\n  end subroutine\nend module\nprogram p\n  use callbacks\n  implicit none\n  call remember(local_handler)\n  print *, 'ok'\ncontains\n  subroutine local_handler(value)\n    integer, intent(in) :: value\n    if (value < 0) error stop 1\n  end subroutine\nend program\n",
         "f90",
@@ -27180,6 +30897,13 @@ fn contained_subroutine_actual_to_procedure_dummy_links_and_runs() {
 
 #[test]
 fn contained_subroutine_pointer_component_assignment_links_and_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=contained_subroutine_pointer_component_assignment_links_and_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module callbacks\n  implicit none\n  abstract interface\n    subroutine cb(value)\n      integer, intent(in) :: value\n    end subroutine\n  end interface\n  type :: holder_t\n    procedure(cb), pointer, nopass :: handler => null()\n  end type\ncontains\n  subroutine invoke(holder)\n    type(holder_t), intent(in) :: holder\n    call holder%handler(7)\n  end subroutine\nend module\nprogram p\n  use callbacks\n  implicit none\n  type(holder_t) :: holder\n  holder%handler => local_handler\n  call invoke(holder)\n  print *, 'ok'\ncontains\n  subroutine local_handler(value)\n    integer, intent(in) :: value\n    if (value /= 7) error stop 1\n  end subroutine\nend program\n",
         "f90",
@@ -27216,6 +30940,13 @@ fn contained_subroutine_pointer_component_assignment_links_and_runs() {
 
 #[test]
 fn o2_keeps_address_taken_contained_callback_symbols() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=o2_keeps_address_taken_contained_callback_symbols count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module callbacks\n  implicit none\n  abstract interface\n    subroutine cb(value)\n      integer, intent(in) :: value\n    end subroutine\n  end interface\ncontains\n  subroutine remember(handler)\n    procedure(cb) :: handler\n  end subroutine\nend module\nprogram p\n  use callbacks\n  implicit none\n  call remember(local_handler)\n  print *, 'ok'\ncontains\n  subroutine local_handler(value)\n    integer, intent(in) :: value\n    if (value < 0) error stop 1\n  end subroutine\nend program\n",
         "f90",
@@ -27252,6 +30983,13 @@ fn o2_keeps_address_taken_contained_callback_symbols() {
 
 #[test]
 fn contained_program_char_function_inside_adjustl_and_trim_links_and_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=contained_program_char_function_inside_adjustl_and_trim_links_and_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  call sleep_ms(25)\ncontains\n  subroutine sleep_ms(ms)\n    integer, intent(in) :: ms\n    real :: seconds\n\n    seconds = real(ms) / 1000.0\n    print '(A)', trim(adjustl(real_to_str(seconds)))\n  end subroutine sleep_ms\n\n  function real_to_str(r) result(str)\n    real, intent(in) :: r\n    character(len=32) :: str\n\n    write(str, '(F0.3)') r\n  end function real_to_str\nend program p\n",
         "f90",
@@ -27288,6 +31026,13 @@ fn contained_program_char_function_inside_adjustl_and_trim_links_and_runs() {
 
 #[test]
 fn contained_program_char_function_inside_execute_command_line_arg_links_and_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=contained_program_char_function_inside_execute_command_line_arg_links_and_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  call sleep_ms(25)\ncontains\n  subroutine sleep_ms(ms)\n    integer, intent(in) :: ms\n    real :: seconds\n\n    seconds = real(ms) / 1000.0\n    call execute_command_line('sleep ' // trim(adjustl(real_to_str(seconds))))\n  end subroutine sleep_ms\n\n  function real_to_str(r) result(str)\n    real, intent(in) :: r\n    character(len=32) :: str\n\n    write(str, '(F0.3)') r\n  end function real_to_str\nend program p\n",
         "f90",
@@ -27319,6 +31064,13 @@ fn contained_program_char_function_inside_execute_command_line_arg_links_and_run
 
 #[test]
 fn associate_alias_preserves_component_allocated_and_size_intrinsics() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=associate_alias_preserves_component_allocated_and_size_intrinsics count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: cursor_t\n    integer :: line = 0\n  end type\n  type :: pane_t\n    type(cursor_t), allocatable :: cursors(:)\n    character(len=:), allocatable :: filename\n  end type\ncontains\n  subroutine check(panes)\n    type(pane_t), intent(inout) :: panes(:)\n    associate (pane => panes(1))\n      if (.not. allocated(pane%cursors)) error stop 1\n      if (size(pane%cursors) /= 2) error stop 2\n      if (.not. allocated(pane%filename)) error stop 3\n      if (trim(pane%filename) /= 'abc') error stop 4\n    end associate\n    print *, 'ok'\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(pane_t), allocatable :: panes(:)\n  allocate(panes(1))\n  allocate(panes(1)%cursors(2))\n  allocate(character(len=3) :: panes(1)%filename)\n  panes(1)%filename = 'abc'\n  call check(panes)\nend program\n",
         "f90",
@@ -27355,6 +31107,13 @@ fn associate_alias_preserves_component_allocated_and_size_intrinsics() {
 
 #[test]
 fn deferred_char_array_component_size_with_dimension_attr_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=deferred_char_array_component_size_with_dimension_attr_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: item_t\n    character(len=:), allocatable, dimension(:) :: lines\n  end type\ncontains\n  subroutine show(total)\n    integer, intent(out) :: total\n    type(item_t) :: one\n    type(item_t) :: many(1)\n    allocate(character(len=8) :: one%lines(2))\n    allocate(character(len=8) :: many(1)%lines(3))\n    one%lines(1) = 'a'\n    one%lines(2) = 'b'\n    many(1)%lines(1) = 'x'\n    many(1)%lines(2) = 'y'\n    many(1)%lines(3) = 'z'\n    total = size(one%lines) + size(many(1)%lines)\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  integer :: total\n  call show(total)\n  if (total /= 5) error stop 1\n  print *, 'ok'\nend program\n",
         "f90",
@@ -27391,6 +31150,13 @@ fn deferred_char_array_component_size_with_dimension_attr_runs() {
 
 #[test]
 fn logical_reduction_intrinsics_scalarize_component_and_constructor_exprs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=logical_reduction_intrinsics_scalarize_component_and_constructor_exprs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: label_t\n    integer :: first\n  end type\n  type :: line_token\n    integer :: first\n    integer :: last\n  end type\n  type(line_token) :: token(2)\n  type(label_t) :: label\n  integer :: line(2)\n  integer :: total\n  character(len=2) :: input\n\n  token(1)%first = 1\n  token(1)%last = 1\n  token(2)%first = 2\n  token(2)%last = 2\n  label%first = 2\n  line = [1, 2]\n  input = 'aa'\n\n  total = count(token%first < label%first)\n  total = total + count(token%first <= label%first)\n  if (all([input(1:1), input(2:2)] == 'a')) total = total + 1\n  if (any(1 == line)) total = total + 1\n\n  if (total /= 5) error stop 1\n  print *, 'ok'\nend program\n",
         "f90",
@@ -27427,6 +31193,13 @@ fn logical_reduction_intrinsics_scalarize_component_and_constructor_exprs() {
 
 #[test]
 fn logical_reduction_intrinsics_on_logical_sections_compile_and_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=logical_reduction_intrinsics_on_logical_sections_compile_and_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  logical :: mask(4)\n  integer :: total\n\n  mask = [.true., .false., .true., .true.]\n  total = count(mask(2:4))\n  if (any(mask(2:3))) total = total + 10\n  if (all(mask(3:4))) total = total + 100\n\n  if (total /= 112) error stop 1\n  print *, 'ok'\nend program\n",
         "f90",
@@ -27463,6 +31236,13 @@ fn logical_reduction_intrinsics_on_logical_sections_compile_and_run() {
 
 #[test]
 fn complex_part_array_masks_keep_rank_for_reductions_and_dispatch() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=complex_part_array_masks_keep_rank_for_reductions_and_dispatch count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         r#"
 module m
@@ -27538,6 +31318,13 @@ end program
 
 #[test]
 fn all_over_integer_section_compared_to_array_function_result_lowers_descriptor() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=all_over_integer_section_compared_to_array_function_result_lowers_descriptor count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         r#"
 module m
@@ -27614,6 +31401,13 @@ end program
 
 #[test]
 fn all_over_real_section_compared_to_scalar_lowers_descriptor() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=all_over_real_section_compared_to_scalar_lowers_descriptor count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         r#"
 program p
@@ -27679,6 +31473,13 @@ end program
 
 #[test]
 fn all_over_complex_array_compare_lowers_descriptor() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=all_over_complex_array_compare_lowers_descriptor count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         r#"
 program p
@@ -27743,6 +31544,13 @@ end program
 
 #[test]
 fn generic_rank_dispatch_uses_symbol_rank_for_block_parameter_arrays() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=generic_rank_dispatch_uses_symbol_rank_for_block_parameter_arrays count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         r#"
 module m
@@ -27814,6 +31622,13 @@ end program
 
 #[test]
 fn nested_diag_generic_keeps_whole_array_actual_under_elementwise_compare() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=nested_diag_generic_keeps_whole_array_actual_under_elementwise_compare count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         r#"
 module diag_scalarize_m
@@ -27871,6 +31686,13 @@ end program
 
 #[test]
 fn rank_intrinsic_lowers_to_declared_rank() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=rank_intrinsic_lowers_to_declared_rank count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         r#"
 program p
@@ -27922,6 +31744,13 @@ end program
 
 #[test]
 fn imported_generic_complex_constructor_keeps_parameter_kind() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_generic_complex_constructor_keeps_parameter_kind count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("generic_complex_constructor_kind");
     let mod_src = write_program_in(
         &dir,
@@ -28047,6 +31876,13 @@ end program
 
 #[test]
 fn imported_generic_rank_dispatch_uses_symbol_rank_for_allocatable_matrix() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_generic_rank_dispatch_uses_symbol_rank_for_allocatable_matrix count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("generic_alloc_matrix_rank");
     let mod_src = write_program_in(
         &dir,
@@ -28166,6 +32002,13 @@ end program
 
 #[test]
 fn imported_generic_rank_dispatch_uses_symbol_rank_for_module_allocatable_cube() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_generic_rank_dispatch_uses_symbol_rank_for_module_allocatable_cube count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("generic_module_alloc_cube_rank");
     let mod_src = write_program_in(
         &dir,
@@ -28296,6 +32139,13 @@ end program
 
 #[test]
 fn imported_smp_generic_allocatable_array_literal_order_resolves_by_semantics() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_smp_generic_allocatable_array_literal_order_resolves_by_semantics count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // stdlib_linalg's norm interface is declared in a parent module,
     // implemented in a submodule, then consumed from a separate test
     // unit. For calls like `norm(a, 2)`, the actual types and ranks
@@ -28358,6 +32208,13 @@ fn imported_smp_generic_allocatable_array_literal_order_resolves_by_semantics() 
 
 #[test]
 fn imported_generic_scalar_local_rank_wins_over_wrong_scope_array_symbol() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_generic_scalar_local_rank_wins_over_wrong_scope_array_symbol count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("generic_scalar_rank_shadow");
     let mod_src = write_program_in(
         &dir,
@@ -28472,6 +32329,13 @@ end program
 
 #[test]
 fn nested_imported_generic_result_rank_dispatches_outer_call() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=nested_imported_generic_result_rank_dispatches_outer_call count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("nested_generic_result_rank");
     let mod_src = write_program_in(
         &dir,
@@ -28562,6 +32426,13 @@ end program
 
 #[test]
 fn logical_reduction_intrinsics_on_elemental_character_results_compile_and_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=logical_reduction_intrinsics_on_elemental_character_results_compile_and_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  integer :: pos(2)\n  character(len=1) :: kind(2)\n\n  pos = [1, 2]\n  kind = ['a', 'b']\n\n  if (.not. all(peek('ab', pos) == kind)) error stop 1\n  if (.not. any(match('ab', pos, ['x', 'b']))) error stop 2\n\n  print *, 'ok'\ncontains\n  elemental function peek(src, idx) result(ch)\n    character(len=*), intent(in) :: src\n    integer, intent(in) :: idx\n    character(len=1) :: ch\n    ch = src(idx:idx)\n  end function\n\n  elemental logical function match(src, idx, want) result(ok)\n    character(len=*), intent(in) :: src\n    integer, intent(in) :: idx\n    character(len=1), intent(in) :: want\n    ok = src(idx:idx) == want\n  end function\nend program\n",
         "f90",
@@ -28598,6 +32469,13 @@ fn logical_reduction_intrinsics_on_elemental_character_results_compile_and_run()
 
 #[test]
 fn logical_reduction_intrinsics_on_component_char_constructor_actuals_compile_and_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=logical_reduction_intrinsics_on_component_char_constructor_actuals_compile_and_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: chars_t\n    character(len=1) :: space\n    character(len=1) :: tab\n  end type\n  type(chars_t), parameter :: char_kind = chars_t(' ', achar(9))\n\n  if (.not. any(match(' \t', 1, [char_kind%space, char_kind%tab]))) error stop 1\n\n  print *, 'ok'\ncontains\n  elemental logical function match(src, idx, want) result(ok)\n    character(len=*), intent(in) :: src\n    integer, intent(in) :: idx\n    character(len=1), intent(in) :: want\n    ok = src(idx:idx) == want\n  end function\nend program\n",
         "f90",
@@ -28635,6 +32513,13 @@ fn logical_reduction_intrinsics_on_component_char_constructor_actuals_compile_an
 #[test]
 fn logical_reduction_intrinsics_on_nonmatching_component_char_constructor_actuals_compile_and_run()
 {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=logical_reduction_intrinsics_on_nonmatching_component_char_constructor_actuals_compile_and_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: chars_t\n    character(len=1) :: equal\n    character(len=1) :: space\n    character(len=1) :: tab\n  end type\n  type(chars_t), parameter :: char_kind = chars_t('=', ' ', achar(9))\n\n  if (any(match(char_kind%equal, 1, [char_kind%space, char_kind%tab]))) error stop 1\n\n  print *, 'ok'\ncontains\n  elemental logical function match(src, idx, want) result(ok)\n    character(len=*), intent(in) :: src\n    integer, intent(in) :: idx\n    character(len=1), intent(in) :: want\n    ok = src(idx:idx) == want\n  end function\nend program\n",
         "f90",
@@ -28671,6 +32556,13 @@ fn logical_reduction_intrinsics_on_nonmatching_component_char_constructor_actual
 
 #[test]
 fn derived_scalar_structure_constructor_initializer_sets_char_components() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=derived_scalar_structure_constructor_initializer_sets_char_components count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: chars_t\n    character(len=1) :: space\n    character(len=1) :: tab\n  end type\n  type(chars_t) :: char_kind = chars_t(' ', achar(9))\n  if (iachar(char_kind%space) /= 32) error stop 1\n  if (iachar(char_kind%tab) /= 9) error stop 2\n  print *, 'ok'\nend program\n",
         "f90",
@@ -28707,6 +32599,13 @@ fn derived_scalar_structure_constructor_initializer_sets_char_components() {
 
 #[test]
 fn procedure_dummy_with_explicit_interface_indirect_call_links_and_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=procedure_dummy_with_explicit_interface_indirect_call_links_and_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  abstract interface\n    logical function compare_less(lhs, rhs) result(less)\n      integer, intent(in) :: lhs, rhs\n    end function compare_less\n  end interface\ncontains\n  subroutine quickcheck(x, low, high, less)\n    integer, intent(inout) :: x(:)\n    integer, intent(in) :: low, high\n    procedure(compare_less) :: less\n    if (low < high) then\n      if (.not. less(x(low), x(high))) error stop 1\n    end if\n  end subroutine quickcheck\n\n  function compare_int(lhs, rhs) result(less)\n    integer, intent(in) :: lhs, rhs\n    logical :: less\n    less = lhs < rhs\n  end function compare_int\nend module m\nprogram p\n  use m\n  implicit none\n  integer :: x(2)\n  x = [1, 2]\n  call quickcheck(x, 1, 2, compare_int)\n  print *, 'ok'\nend program\n",
         "f90",
@@ -28743,6 +32642,13 @@ fn procedure_dummy_with_explicit_interface_indirect_call_links_and_runs() {
 
 #[test]
 fn new_line_intrinsic_links_and_runs_in_runtime_char_context() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=new_line_intrinsic_links_and_runs_in_runtime_char_context count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  character(len=:), allocatable :: text\n  text = 'a' // new_line('a') // 'b'\n  if (len(text) /= 3) error stop 1\n  if (iachar(text(2:2)) /= 10) error stop 2\n  print *, 'ok'\nend program\n",
         "f90",
@@ -28779,6 +32685,13 @@ fn new_line_intrinsic_links_and_runs_in_runtime_char_context() {
 
 #[test]
 fn sum_of_array_section_times_constructor_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=sum_of_array_section_times_constructor_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  integer, allocatable :: msec(:)\n  integer :: out\n  msec = [1, 2, 3, 4, 5, 6, 7]\n  out = sum(msec(1:6) * [100000, 10000, 1000, 100, 10, 1])\n  print *, out\nend program\n",
         "f90",
@@ -28812,6 +32725,13 @@ fn sum_of_array_section_times_constructor_runs() {
 
 #[test]
 fn bit_manipulation_intrinsics_lower_inline() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=bit_manipulation_intrinsics_lower_inline count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §16.9: BGE/BGT/BLE/BLT/POPPAR/MERGE_BITS/MASKL/MASKR/
     // DSHIFTL/DSHIFTR were recognised as elementals but not lowered as
     // expressions — they fell through to undefined external symbols at
@@ -28846,6 +32766,13 @@ fn bit_manipulation_intrinsics_lower_inline() {
 
 #[test]
 fn scalar_intrinsic_arguments_use_runtime_values_not_dispatch_probes() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=scalar_intrinsic_arguments_use_runtime_values_not_dispatch_probes count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // stdlib random uses shapes like `iz = iand(dist_rand(1_int32), 127)`.
     // A dispatch-probe value has the right type but a zero value; feeding
     // that to scalar intrinsic lowering made bit intrinsics collapse to zero.
@@ -28894,6 +32821,13 @@ end program
 
 #[test]
 fn dispatch_optional_logical_int8_array_through_descriptor() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=dispatch_optional_logical_int8_array_through_descriptor count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §15.5.2: dispatch on a generic with a `logical(int8),
     // optional, dimension(:)` formal must accept a `logical(int8)`
     // array actual carried via a 384-byte descriptor.  The IR matcher
@@ -28929,6 +32863,13 @@ fn dispatch_optional_logical_int8_array_through_descriptor() {
 
 #[test]
 fn norm2_handles_binary_array_expression() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=norm2_handles_binary_array_expression count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §16.9.158: NORM2 is a transformational intrinsic that
     // accepts any array-shaped argument, including binary expressions
     // like `b - matmul(A, x)`.  Without recognising NORM2 as an array
@@ -28963,6 +32904,13 @@ fn norm2_handles_binary_array_expression() {
 
 #[test]
 fn norm2_dim_returns_rank_one_descriptor() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=norm2_dim_returns_rank_one_descriptor count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  real :: a(2,2)\n  real :: got(2)\n  a = reshape([3.0, 4.0, 5.0, 12.0], [2,2])\n  got = norm2(a, dim=1)\n  if (abs(got(1) - 5.0) > 1.0e-5) error stop 1\n  if (abs(got(2) - 13.0) > 1.0e-5) error stop 2\n  if (.not. all(abs(got - [5.0, 13.0]) < 1.0e-5)) error stop 3\n  print *, 'ok'\nend program\n",
         "f90",
@@ -28992,6 +32940,13 @@ fn norm2_dim_returns_rank_one_descriptor() {
 
 #[test]
 fn scalar_array_constructor_values_coerce_to_complex_elements() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=scalar_array_constructor_values_coerce_to_complex_elements count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  complex :: zs(2)\n  complex(8) :: zd(2)\n  zs = [1, -1]\n  zd = [1, -1]\n  if (abs(real(zs(1)) - 1.0) > 1.0e-6 .or. abs(aimag(zs(1))) > 1.0e-6) error stop 1\n  if (abs(real(zs(2)) + 1.0) > 1.0e-6 .or. abs(aimag(zs(2))) > 1.0e-6) error stop 2\n  if (abs(real(zd(1)) - 1.0_8) > 1.0e-10_8 .or. abs(aimag(zd(1))) > 1.0e-10_8) error stop 3\n  if (abs(real(zd(2)) + 1.0_8) > 1.0e-10_8 .or. abs(aimag(zd(2))) > 1.0e-10_8) error stop 4\n  print *, 'ok'\nend program\n",
         "f90",
@@ -29021,6 +32976,13 @@ fn scalar_array_constructor_values_coerce_to_complex_elements() {
 
 #[test]
 fn submodule_helper_reads_parent_module_char_parameter() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=submodule_helper_reads_parent_module_char_parameter count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §11.2.3: a plain helper procedure contained in a submodule
     // has host-association access to the parent module's globals,
     // including character(*) parameter constants.  Previously the IR
@@ -29057,6 +33019,13 @@ fn submodule_helper_reads_parent_module_char_parameter() {
 
 #[test]
 fn smp_body_with_internal_procedure_links_under_parent_module() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=smp_body_with_internal_procedure_links_under_parent_module count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §11.2.3: a separate-module-procedure body declared in the
     // parent module's interface block links under the parent module's
     // name (`_afs_modproc_<parent>_<proc>`), not the submodule's. When
@@ -29094,6 +33063,13 @@ fn smp_body_with_internal_procedure_links_under_parent_module() {
 
 #[test]
 fn sum_and_product_dispatch_on_integer_kind() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=sum_and_product_dispatch_on_integer_kind count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  integer(8) :: a8(5) = [10_8, 200_8, 5_8, 99_8, 33_8]\n  integer(2) :: a2(5) = [1_2, 2_2, 3_2, 4_2, 5_2]\n  integer(8) :: r8\n  integer(2) :: r2\n  integer(8) :: p8, lo8, hi8\n  r8 = sum(a8)\n  r2 = sum(a2)\n  p8 = product([1_8, 2_8, 3_8, 4_8, 5_8])\n  hi8 = maxval(a8)\n  lo8 = minval(a8)\n  if (r8 /= 347_8) error stop 1\n  if (r2 /= 15_2) error stop 2\n  if (p8 /= 120_8) error stop 3\n  if (hi8 /= 200_8) error stop 4\n  if (lo8 /= 5_8) error stop 5\n  print *, 'ok'\nend program\n",
         "f90",
@@ -29123,6 +33099,13 @@ fn sum_and_product_dispatch_on_integer_kind() {
 
 #[test]
 fn is_iostat_intrinsics_compile_and_run_under_implicit_none() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=is_iostat_intrinsics_compile_and_run_under_implicit_none count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  use iso_fortran_env, only : iostat_end, iostat_eor\n  implicit none\n  logical :: a, b\n  a = is_iostat_end(iostat_end)\n  b = is_iostat_eor(iostat_eor)\n  if (.not. a) error stop 1\n  if (.not. b) error stop 2\n  print *, 'ok'\nend program\n",
         "f90",
@@ -29152,6 +33135,13 @@ fn is_iostat_intrinsics_compile_and_run_under_implicit_none() {
 
 #[test]
 fn generic_resolution_uses_scope_local_kind_aliases() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=generic_resolution_uses_scope_local_kind_aliases count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  integer, parameter :: i1 = selected_int_kind(2)\n  integer, parameter :: i4 = selected_int_kind(9)\n  interface to_string\n    module procedure :: integer_i1_to_string\n    module procedure :: integer_i4_to_string\n  end interface\ncontains\n  pure function integer_i1_to_string(val) result(string)\n    integer, parameter :: ik = i1\n    integer(ik), intent(in) :: val\n    character(len=:), allocatable :: string\n    string = 'i1'\n  end function\n  pure function integer_i4_to_string(val) result(string)\n    integer, parameter :: ik = i4\n    integer(ik), intent(in) :: val\n    character(len=:), allocatable :: string\n    string = 'i4'\n  end function\nend module m\nprogram p\n  use m\n  implicit none\n  integer :: it\n  it = 1\n  print *, to_string(it)\nend program\n",
         "f90",
@@ -29181,6 +33171,13 @@ fn generic_resolution_uses_scope_local_kind_aliases() {
 
 #[test]
 fn scope_local_named_kinds_do_not_bleed_across_sibling_functions() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=scope_local_named_kinds_do_not_bleed_across_sibling_functions count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  integer, parameter :: i1 = selected_int_kind(2)\n  integer, parameter :: i2 = selected_int_kind(4)\ncontains\n  pure integer function keep_i1(v) result(r)\n    integer, parameter :: ik = i1\n    integer(ik), intent(in) :: v\n    r = v\n  end function\n  pure integer function literal_i2() result(r)\n    integer, parameter :: ik = i2\n    integer(ik) :: tmp\n    tmp = 256_ik\n    r = tmp\n  end function\n  pure integer function halve_i2(v) result(r)\n    integer, parameter :: ik = i2\n    integer(ik), intent(in) :: v\n    r = v / 2_ik\n  end function\nend module m\nprogram p\n  use m\n  implicit none\n  if (keep_i1(7_i1) /= 7) error stop 1\n  if (literal_i2() /= 256) error stop 2\n  if (halve_i2(256_i2) /= 128) error stop 3\n  print *, 'ok'\nend program\n",
         "f90",
@@ -29210,6 +33207,13 @@ fn scope_local_named_kinds_do_not_bleed_across_sibling_functions() {
 
 #[test]
 fn generic_deferred_char_function_inside_concat_uses_hidden_result_abi() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=generic_deferred_char_function_inside_concat_uses_hidden_result_abi count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  integer, parameter :: i4 = selected_int_kind(9)\n  interface to_string\n    module procedure :: integer_i4_to_string\n  end interface\ncontains\n  pure function integer_i4_to_string(val) result(string)\n    integer(i4), intent(in) :: val\n    character(len=:), allocatable :: string\n    if (val == 1_i4) then\n      string = 'i4'\n    else\n      string = 'other'\n    end if\n  end function\nend module m\nprogram p\n  use m\n  implicit none\n  integer :: it\n  character(len=:), allocatable :: s\n  it = 1\n  s = '[' // to_string(it) // ']'\n  if (s /= '[i4]') error stop 1\n  print *, trim(s)\nend program\n",
         "f90",
@@ -29243,6 +33247,13 @@ fn generic_deferred_char_function_inside_concat_uses_hidden_result_abi() {
 
 #[test]
 fn generic_subroutine_resolution_allows_omitted_trailing_optional_args() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=generic_subroutine_resolution_allows_omitted_trailing_optional_args count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: t\n    integer :: x = 0\n  end type\n  interface resize\n    module procedure :: resize_t\n  end interface\ncontains\n  pure subroutine resize_t(var, n)\n    type(t), allocatable, intent(inout) :: var(:)\n    integer, intent(in), optional :: n\n    integer :: new_size\n    new_size = 1\n    if (present(n)) new_size = n\n    if (.not.allocated(var)) then\n      allocate(var(new_size))\n    end if\n    var(1)%x = new_size\n  end subroutine\nend module m\nprogram p\n  use m, only : t, resize\n  implicit none\n  type(t), allocatable :: a(:)\n  call resize(a)\n  if (.not.allocated(a)) error stop 1\n  if (size(a) /= 1) error stop 2\n  if (a(1)%x /= 1) error stop 3\n  print *, 'ok'\nend program\n",
         "f90",
@@ -29279,6 +33290,13 @@ fn generic_subroutine_resolution_allows_omitted_trailing_optional_args() {
 
 #[test]
 fn generic_subroutine_resolution_preserves_skipped_optional_keyword_slots() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=generic_subroutine_resolution_preserves_skipped_optional_keyword_slots count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: t\n    integer :: a = 0\n    logical :: b = .false.\n    integer :: c = 0\n  end type\n  interface foo\n    module procedure :: foo_t\n  end interface\ncontains\n  subroutine foo_t(x, a, b, c)\n    type(t), intent(inout) :: x\n    integer, intent(in) :: a\n    logical, intent(in), optional :: b\n    integer, intent(in), optional :: c\n    x%a = a\n    if (present(b)) then\n      x%b = b\n    else\n      x%b = .false.\n    end if\n    if (present(c)) then\n      x%c = c\n    else\n      x%c = -1\n    end if\n  end subroutine\nend module m\nprogram p\n  use m\n  implicit none\n  type(t) :: x\n  call foo(x, 11, c=77)\n  if (x%a /= 11) error stop 1\n  if (x%b) error stop 2\n  if (x%c /= 77) error stop 3\n  print *, 'ok'\nend program\n",
         "f90",
@@ -29315,6 +33333,13 @@ fn generic_subroutine_resolution_preserves_skipped_optional_keyword_slots() {
 
 #[test]
 fn generic_subroutine_resolution_rejects_keyword_overwrite_candidates() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=generic_subroutine_resolution_rejects_keyword_overwrite_candidates count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: t\n    integer :: which = 0\n  end type\n  interface set_value\n    module procedure :: set_elem_value_float_sp\n    module procedure :: set_array_value_int_i4\n  end interface\ncontains\n  subroutine set_elem_value_float_sp(array, pos, val, stat, origin)\n    type(t), intent(inout) :: array\n    integer, intent(in) :: pos\n    real, intent(in) :: val\n    integer, intent(out), optional :: stat\n    integer, intent(out), optional :: origin\n    array%which = pos\n    if (present(stat)) stat = 10\n    if (present(origin)) origin = nint(val)\n  end subroutine\n\n  subroutine set_array_value_int_i4(array, val, stat, origin)\n    type(t), intent(inout) :: array\n    integer, intent(in) :: val(:)\n    integer, intent(out), optional :: stat\n    integer, intent(out), optional :: origin\n    array%which = -99\n    if (present(stat)) stat = 20\n    if (present(origin)) origin = size(val)\n  end subroutine\nend module\nprogram p\n  use m, only : t, set_value\n  implicit none\n  type(t) :: array\n  integer :: stat\n  call set_value(array, 7, 3.5, stat=stat)\n  if (array%which /= 7) error stop 1\n  if (stat /= 10) error stop 2\n  print *, array%which, stat\nend program\n",
         "f90",
@@ -29354,6 +33379,13 @@ fn generic_subroutine_resolution_rejects_keyword_overwrite_candidates() {
 
 #[test]
 fn derived_constructor_keywords_preserve_parameter_component_defaults() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=derived_constructor_keywords_preserve_parameter_component_defaults count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: merge_policy_t\n    integer :: overwrite = 11\n    integer :: preserve = 22\n    integer :: append = 33\n  end type\n  type(merge_policy_t), parameter :: policy = merge_policy_t()\n  type :: cfg_t\n    integer :: table = policy%append\n    integer :: array = policy%preserve\n    integer :: keyval = policy%preserve\n  end type\n  interface cfg_t\n    module procedure :: new_cfg\n  end interface\ncontains\n  function new_cfg(table, array, keyval) result(cfg)\n    integer, intent(in), optional :: table, array, keyval\n    type(cfg_t) :: cfg\n    if (present(table)) cfg%table = table\n    if (present(array)) cfg%array = array\n    if (present(keyval)) cfg%keyval = keyval\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  type(cfg_t) :: cfg\n  cfg = cfg_t(keyval=policy%overwrite)\n  if (cfg%table /= 33) error stop 1\n  if (cfg%array /= 22) error stop 2\n  if (cfg%keyval /= 11) error stop 3\n  print *, cfg%table, cfg%array, cfg%keyval\nend program\n",
         "f90",
@@ -29393,6 +33425,13 @@ fn derived_constructor_keywords_preserve_parameter_component_defaults() {
 
 #[test]
 fn imported_generic_subroutine_resolution_uses_specific_keyword_slots() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_generic_subroutine_resolution_uses_specific_keyword_slots count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("generic_keyword_specific_slots");
     let mod_src = write_program_in(
         &dir,
@@ -29480,6 +33519,13 @@ fn imported_generic_subroutine_resolution_uses_specific_keyword_slots() {
 
 #[test]
 fn imported_generic_resolution_treats_complex_literals_as_scalar_rank() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_generic_resolution_treats_complex_literals_as_scalar_rank count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("imported_complex_literal_rank_generic");
     let mod_src = write_program_in(
         &dir,
@@ -29602,6 +33648,13 @@ fn imported_generic_resolution_treats_complex_literals_as_scalar_rank() {
 
 #[test]
 fn imported_array_function_actual_to_descriptor_dummy_keeps_nested_descriptor_abi() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_array_function_actual_to_descriptor_dummy_keeps_nested_descriptor_abi count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("imported_array_fn_descriptor_actual");
     let mod_src = write_program_in(
         &dir,
@@ -29694,6 +33747,13 @@ fn imported_array_function_actual_to_descriptor_dummy_keeps_nested_descriptor_ab
 
 #[test]
 fn imported_generic_subroutine_resolution_matches_int_intrinsic_kind_actuals() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_generic_subroutine_resolution_matches_int_intrinsic_kind_actuals count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("generic_int_kind_actuals");
     let kinds_src = write_program_in(
         &dir,
@@ -29808,6 +33868,13 @@ fn imported_generic_subroutine_resolution_matches_int_intrinsic_kind_actuals() {
 
 #[test]
 fn imported_generic_subroutine_prefers_character_intrinsic_actual_specific() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_generic_subroutine_prefers_character_intrinsic_actual_specific count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("generic_character_intrinsic_actual");
     let provider_src = write_program_in(
         &dir,
@@ -29895,6 +33962,13 @@ fn imported_generic_subroutine_prefers_character_intrinsic_actual_specific() {
 
 #[test]
 fn generic_subroutine_accepts_descriptor_backed_character_dummy_actuals() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=generic_subroutine_accepts_descriptor_backed_character_dummy_actuals count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = "module m\n  implicit none\n  integer, parameter :: dp = kind(1.0d0)\n  type :: error_type\n    integer :: code = 0\n  end type\n  interface check\n    module procedure :: check_complex_dp\n    module procedure :: check_complex_exceptional_dp\n    module procedure :: check_string\n    module procedure :: check_int_i1\n  end interface\ncontains\n  subroutine check_complex_dp(error, actual, expected, message, more)\n    type(error_type), allocatable, intent(out) :: error\n    complex(dp), intent(in) :: actual\n    complex(dp), intent(in) :: expected\n    character(len=*), intent(in), optional :: message\n    character(len=*), intent(in), optional :: more\n    call check(error, actual, message, more)\n    if (allocated(error)) error stop 1\n  end subroutine\n\n  subroutine check_complex_exceptional_dp(error, actual, message, more)\n    type(error_type), allocatable, intent(out) :: error\n    complex(dp), intent(in) :: actual\n    character(len=*), intent(in), optional :: message\n    character(len=*), intent(in), optional :: more\n    if (present(message)) then\n      if (message /= 'msg') error stop 2\n    end if\n    if (present(more)) then\n      if (more /= 'more') error stop 3\n    end if\n  end subroutine\n\n  subroutine check_string(error, actual, expected, message, more)\n    type(error_type), allocatable, intent(out) :: error\n    character(len=*), intent(in) :: actual\n    character(len=*), intent(in) :: expected\n    character(len=*), intent(in), optional :: message\n    character(len=*), intent(in), optional :: more\n    error stop 4\n  end subroutine\n\n  subroutine check_int_i1(error, actual, expected, message, more)\n    type(error_type), allocatable, intent(out) :: error\n    integer(1), intent(in) :: actual\n    integer(1), intent(in) :: expected\n    character(len=*), intent(in), optional :: message\n    character(len=*), intent(in), optional :: more\n    error stop 5\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(error_type), allocatable :: error\n  call check_complex_dp(error, (1.0_dp, 2.0_dp), (1.0_dp, 2.0_dp), 'msg', 'more')\n  if (allocated(error)) error stop 6\n  print *, 'ok'\nend program\n";
     let src = write_program(src, "f90");
     let out = unique_path("generic_char_dummy_actuals", "bin");
@@ -29927,6 +34001,13 @@ fn generic_subroutine_accepts_descriptor_backed_character_dummy_actuals() {
 
 #[test]
 fn generic_function_resolution_uses_local_scope_for_intrinsic_result_kinds() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=generic_function_resolution_uses_local_scope_for_intrinsic_result_kinds count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  integer, parameter :: sp = selected_real_kind(6)\n  integer, parameter :: dp = selected_real_kind(15)\n  interface is_nan\n    module procedure :: is_nan_sp\n    module procedure :: is_nan_dp\n  end interface\ncontains\n  subroutine earlier(actual)\n    complex(dp), intent(in) :: actual\n    if (is_nan(real(actual)) .or. is_nan(aimag(actual))) error stop 1\n  end subroutine\n\n  subroutine later(actual)\n    complex(sp), intent(in) :: actual\n    logical :: x\n    x = is_nan(real(actual)) .or. is_nan(aimag(actual))\n    if (x) error stop 2\n  end subroutine\n\n  elemental function is_nan_sp(val) result(is_nan)\n    real(sp), intent(in) :: val\n    logical :: is_nan\n    is_nan = val /= val\n  end function\n\n  elemental function is_nan_dp(val) result(is_nan)\n    real(dp), intent(in) :: val\n    logical :: is_nan\n    is_nan = val /= val\n  end function\nend module\nprogram p\n  use m\n  call later((1.0_sp, 2.0_sp))\n  print *, 'ok'\nend program\n",
         "f90",
@@ -29961,6 +34042,13 @@ fn generic_function_resolution_uses_local_scope_for_intrinsic_result_kinds() {
 
 #[test]
 fn generic_subroutine_accepts_generic_function_character_actuals() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=generic_subroutine_accepts_generic_function_character_actuals count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  interface to_string\n    module procedure :: to_string_i4\n    module procedure :: to_string_i8\n  end interface\n  interface accept\n    module procedure :: accept_string\n    module procedure :: accept_i8\n  end interface\ncontains\n  function to_string_i4(val) result(string)\n    integer(4), intent(in) :: val\n    character(len=:), allocatable :: string\n    if (val == 7) then\n      string = 'i4'\n    else\n      string = 'bad'\n    end if\n  end function\n\n  function to_string_i8(val) result(string)\n    integer(8), intent(in) :: val\n    character(len=:), allocatable :: string\n    if (val == 7_8) then\n      string = 'i8'\n    else\n      string = 'bad'\n    end if\n  end function\n\n  subroutine accept_string(val)\n    character(*), intent(in) :: val\n    if (val /= 'i4') error stop 2\n  end subroutine\n\n  subroutine accept_i8(val)\n    integer(8), intent(in) :: val\n    if (val /= 0_8) error stop 3\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  integer :: ii\n  ii = 7\n  call accept(to_string(ii))\n  print *, 'ok'\nend program\n",
         "f90",
@@ -29995,6 +34083,13 @@ fn generic_subroutine_accepts_generic_function_character_actuals() {
 
 #[test]
 fn generic_subroutine_accepts_non_boz_int_kind_actuals() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=generic_subroutine_accepts_non_boz_int_kind_actuals count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  integer, parameter :: i8 = selected_int_kind(18)\n  interface check\n    module procedure :: check_i4\n    module procedure :: check_i8\n  end interface\ncontains\n  subroutine check_i4(val)\n    integer(4), intent(in) :: val\n    if (val /= 0) error stop 1\n  end subroutine\n\n  subroutine check_i8(val)\n    integer(8), intent(in) :: val\n    if (val /= 7_i8) error stop 2\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  integer :: ii\n  ii = 7\n  call check(int(ii, i8))\n  print *, 'ok'\nend program\n",
         "f90",
@@ -30029,6 +34124,13 @@ fn generic_subroutine_accepts_non_boz_int_kind_actuals() {
 
 #[test]
 fn imported_generic_len_shadows_intrinsic_in_generic_dispatch() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_generic_len_shadows_intrinsic_in_generic_dispatch count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("generic_len_shadow_dispatch");
     let types_src = write_program_in(
         &dir,
@@ -30143,6 +34245,13 @@ fn imported_generic_len_shadows_intrinsic_in_generic_dispatch() {
 
 #[test]
 fn imported_same_name_generic_can_fall_back_to_structure_constructor_with_nested_actuals() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_same_name_generic_can_fall_back_to_structure_constructor_with_nested_actuals count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("imported_same_name_ctor_nested");
     let types_src = write_program_in(
         &dir,
@@ -30230,6 +34339,13 @@ fn imported_same_name_generic_can_fall_back_to_structure_constructor_with_nested
 
 #[test]
 fn imported_same_name_generic_constructor_inside_implied_do_array_constructor_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_same_name_generic_constructor_inside_implied_do_array_constructor_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("imported_same_name_ctor_implied_do");
     let types_src = write_program_in(
         &dir,
@@ -30317,6 +34433,13 @@ fn imported_same_name_generic_constructor_inside_implied_do_array_constructor_ru
 
 #[test]
 fn local_narrow_integer_parameter_keeps_kind_for_generic_dispatch() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=local_narrow_integer_parameter_keeps_kind_for_generic_dispatch count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  interface check\n    module procedure :: check_i1\n    module procedure :: check_i4\n  end interface\ncontains\n  subroutine check_i1(actual, expected)\n    integer(1), intent(in) :: actual, expected\n    if (actual /= expected) error stop 1\n    print *, 'ok'\n  end subroutine\n\n  subroutine check_i4(actual, expected)\n    integer(4), intent(in) :: actual, expected\n    error stop 2\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  integer, parameter :: i1 = selected_int_kind(2)\n  integer(i1), parameter :: expected = 7_i1\n  integer(i1) :: actual\n  actual = expected\n  call check(actual, expected)\nend program\n",
         "f90",
@@ -30353,6 +34476,13 @@ fn local_narrow_integer_parameter_keeps_kind_for_generic_dispatch() {
 
 #[test]
 fn imported_narrow_integer_literal_keeps_kind_for_generic_dispatch() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_narrow_integer_literal_keeps_kind_for_generic_dispatch count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("imported_narrow_literal_generic_dispatch");
     let mod_src = write_program_in(
         &dir,
@@ -30440,6 +34570,13 @@ fn imported_narrow_integer_literal_keeps_kind_for_generic_dispatch() {
 
 #[test]
 fn imported_same_name_generics_merge_specifics_across_modules() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_same_name_generics_merge_specifics_across_modules count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("merged_imported_generics");
     let num_src = write_program_in(
         &dir,
@@ -30554,6 +34691,13 @@ fn imported_same_name_generics_merge_specifics_across_modules() {
 
 #[test]
 fn generic_dispatch_accepts_class_dummy_forwarding_to_char_specific_compile_only() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=generic_dispatch_accepts_class_dummy_forwarding_to_char_specific_compile_only count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: key_t\n    character(len=:), allocatable :: key\n  end type\n  type :: node_t\n    integer :: tag = 0\n  end type\n  interface add_table\n    module procedure :: add_table_to_table\n    module procedure :: add_table_to_table_key\n  end interface\ncontains\n  subroutine add_table_to_table(table, key, ptr, stat)\n    class(node_t), target, intent(inout) :: table\n    character(len=*), intent(in) :: key\n    type(node_t), pointer, intent(out) :: ptr\n    integer, intent(out), optional :: stat\n    ptr => table\n    if (present(stat)) stat = len(key)\n  end subroutine\n\n  subroutine add_table_to_table_key(table, key, ptr, stat)\n    class(node_t), target, intent(inout) :: table\n    type(key_t), intent(in) :: key\n    type(node_t), pointer, intent(out) :: ptr\n    integer, intent(out), optional :: stat\n    call add_table(table, key%key, ptr, stat)\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(node_t), target :: table\n  type(key_t) :: key\n  type(node_t), pointer :: ptr\n  integer :: stat\n  key%key = 'abc'\n  call add_table(table, key, ptr, stat)\n  if (.not. associated(ptr)) error stop 1\n  if (stat /= 3) error stop 2\n  print *, 'ok'\nend program\n",
         "f90",
@@ -30575,6 +34719,13 @@ fn generic_dispatch_accepts_class_dummy_forwarding_to_char_specific_compile_only
 
 #[test]
 fn imported_generic_subroutine_with_optional_procedure_dummy_round_trips_through_amod() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_generic_subroutine_with_optional_procedure_dummy_round_trips_through_amod count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("imported_generic_optional_procedure_dummy");
     std::fs::create_dir_all(&dir).expect("create temp dir");
 
@@ -30698,6 +34849,13 @@ fn imported_generic_subroutine_with_optional_procedure_dummy_round_trips_through
 
 #[test]
 fn same_name_generic_constructor_accepts_character_and_derived_array_actuals_compile_only() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=same_name_generic_constructor_accepts_character_and_derived_array_actuals_compile_only count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module diag_mod\n  implicit none\n  type :: label_t\n    integer :: level = 0\n  end type\n  interface label_t\n    module procedure :: new_label\n  end interface\n  type :: diagnostic_t\n    integer :: level = 0\n    character(len=:), allocatable :: message\n    type(label_t), allocatable :: labels(:)\n  end type\n  interface diagnostic_t\n    module procedure :: new_diagnostic\n  end interface\ncontains\n  pure function new_label(level) result(new)\n    integer, intent(in) :: level\n    type(label_t) :: new\n    new%level = level\n  end function\n  pure function new_diagnostic(level, message, labels) result(new)\n    integer, intent(in) :: level\n    character(len=*), intent(in), optional :: message\n    type(label_t), intent(in), optional :: labels(:)\n    type(diagnostic_t) :: new\n    new%level = level\n    if (present(message)) new%message = message\n    if (present(labels)) new%labels = labels\n  end function\nend module\nprogram p\n  use diag_mod, only : diagnostic_t, label_t\n  implicit none\n  type(diagnostic_t) :: diag\n  diag = diagnostic_t(1, 'hello', [label_t(2)])\n  if (diag%level /= 1) error stop 1\n  if (diag%message /= 'hello') error stop 2\n  if (.not. allocated(diag%labels)) error stop 3\n  if (size(diag%labels) /= 1) error stop 4\n  if (diag%labels(1)%level /= 2) error stop 5\n  print *, 'ok'\nend program\n",
         "f90",
@@ -30719,6 +34877,13 @@ fn same_name_generic_constructor_accepts_character_and_derived_array_actuals_com
 
 #[test]
 fn same_name_generic_interface_can_fall_back_to_structure_constructor() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=same_name_generic_interface_can_fall_back_to_structure_constructor count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: path_t\n    integer, allocatable :: path(:)\n  end type\n  interface path_t\n    module procedure :: new_path2\n    module procedure :: new_path3\n  end interface\ncontains\n  pure function new_path2(a, b) result(value)\n    character(*), intent(in) :: a, b\n    type(path_t) :: value\n    allocate(value%path(2))\n    value%path = [len_trim(a), len_trim(b)]\n  end function\n  pure function new_path3(a, b, c) result(value)\n    character(*), intent(in) :: a, b, c\n    type(path_t) :: value\n    allocate(value%path(3))\n    value%path = [len_trim(a), len_trim(b), len_trim(c)]\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  type(path_t) :: path\n  path = path_t([1, 2])\n  if (.not. allocated(path%path)) error stop 1\n  if (size(path%path) /= 2) error stop 2\n  print *, 'ok'\nend program\n",
         "f90",
@@ -30740,6 +34905,13 @@ fn same_name_generic_interface_can_fall_back_to_structure_constructor() {
 
 #[test]
 fn named_kind_prefixed_character_literal_compiles_and_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=named_kind_prefixed_character_literal_compiles_and_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  integer, parameter :: tfc = 1\n  character(1, tfc) :: squote\n  squote = tfc_\"'\"\n  if (squote /= tfc_\"'\") error stop 1\n  print *, 'ok'\nend program\n",
         "f90",
@@ -30776,6 +34948,13 @@ fn named_kind_prefixed_character_literal_compiles_and_runs() {
 
 #[test]
 fn generic_interface_with_same_name_as_type_beats_structure_constructor() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=generic_interface_with_same_name_as_type_beats_structure_constructor count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module dt\n  implicit none\n  type :: pair\n    integer :: a = 0\n    integer :: b = 0\n  end type\n  interface pair\n    module procedure :: new_pair\n  end interface\ncontains\n  pure function new_pair(x) result(p)\n    integer, intent(in) :: x\n    type(pair) :: p\n    p%a = x\n    p%b = x + 1\n  end function\nend module\nprogram p\n  use dt\n  implicit none\n  type(pair) :: v\n  v = pair(7)\n  if (v%a /= 7) error stop 1\n  if (v%b /= 8) error stop 2\n  print *, 'ok'\nend program\n",
         "f90",
@@ -30812,6 +34991,13 @@ fn generic_interface_with_same_name_as_type_beats_structure_constructor() {
 
 #[test]
 fn associated_on_procedure_pointer_component_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=associated_on_procedure_pointer_component_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  abstract interface\n    subroutine cb(value)\n      integer, intent(in) :: value\n    end subroutine\n  end interface\n  type :: holder_t\n    procedure(cb), pointer, nopass :: handler => null()\n  end type\ncontains\n  subroutine assign_handler(holder)\n    type(holder_t), intent(inout) :: holder\n    holder%handler => target_handler\n  end subroutine\n\n  logical function has_handler(holder)\n    type(holder_t), intent(in) :: holder\n    has_handler = associated(holder%handler)\n  end function\n\n  subroutine target_handler(value)\n    integer, intent(in) :: value\n    if (value < 0) error stop 3\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(holder_t) :: holder\n  if (has_handler(holder)) error stop 1\n  call assign_handler(holder)\n  if (.not. has_handler(holder)) error stop 2\n  print *, 'ok'\nend program\n",
         "f90",
@@ -30848,6 +35034,13 @@ fn associated_on_procedure_pointer_component_runs() {
 
 #[test]
 fn procedure_pointer_component_call_updates_integer_argument() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=procedure_pointer_component_call_updates_integer_argument count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  abstract interface\n    subroutine cb(value)\n      integer, intent(inout) :: value\n    end subroutine\n  end interface\n  type :: holder_t\n    procedure(cb), pointer, nopass :: handler => null()\n  end type\ncontains\n  subroutine inc(value)\n    integer, intent(inout) :: value\n    value = value + 1\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(holder_t) :: holder\n  integer :: value\n  value = 0\n  holder%handler => inc\n  call holder%handler(value)\n  if (value /= 1) error stop 1\n  print *, 'ok'\nend program\n",
         "f90",
@@ -30884,6 +35077,13 @@ fn procedure_pointer_component_call_updates_integer_argument() {
 
 #[test]
 fn imported_procptr_component_call_passes_assumed_shape_descriptors() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_procptr_component_call_passes_assumed_shape_descriptors count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("imported_procptr_component_descriptors");
     let mod_src = write_program_in(
         &dir,
@@ -30971,6 +35171,13 @@ fn imported_procptr_component_call_passes_assumed_shape_descriptors() {
 
 #[test]
 fn imported_procptr_component_function_preserves_return_type() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_procptr_component_function_preserves_return_type count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("imported_procptr_component_function_return");
     let mod_src = write_program_in(
         &dir,
@@ -31058,6 +35265,13 @@ fn imported_procptr_component_function_preserves_return_type() {
 
 #[test]
 fn contained_procptr_component_preserves_host_derived_dummy() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=contained_procptr_component_preserves_host_derived_dummy count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: matrix_t\n    integer :: n = 0\n    real(8), allocatable :: data(:)\n  end type\n  abstract interface\n    subroutine cb(x, y, alpha, beta, op)\n      real(8), intent(in) :: x(:)\n      real(8), intent(inout) :: y(:)\n      real(8), intent(in) :: alpha, beta\n      character(1), intent(in) :: op\n    end subroutine\n  end interface\n  type :: holder_t\n    procedure(cb), pointer, nopass :: apply => null()\n  end type\n  type :: workspace_t\n    real(8), allocatable :: tmp(:,:)\n  end type\ncontains\n  subroutine apply_matrix(matrix, x, y, alpha, beta, op)\n    type(matrix_t), intent(in) :: matrix\n    real(8), intent(in) :: x(:)\n    real(8), intent(inout) :: y(:)\n    real(8), intent(in) :: alpha, beta\n    character(1), intent(in) :: op\n    if (op /= 'N') error stop 9\n    if (matrix%n /= 5) error stop 10\n    if (size(matrix%data) /= 5) error stop 11\n    y(1) = beta * y(1) + alpha * matrix%data(1) * x(1)\n  end subroutine\n\n  subroutine kernel(holder, x, workspace)\n    class(holder_t), intent(in) :: holder\n    real(8), intent(in) :: x(:)\n    type(workspace_t), intent(inout) :: workspace\n    associate (r => workspace%tmp(:,1))\n      r = 10.0_8\n      call holder%apply(x, r, alpha=-1.0_8, beta=1.0_8, op='N')\n      if (abs(r(1) - 4.0_8) > 1.0e-12_8) error stop 12\n    end associate\n  end subroutine\n\n  subroutine solve(matrix, x)\n    type(matrix_t), intent(in) :: matrix\n    real(8), intent(in) :: x(:)\n    type(holder_t) :: holder\n    type(workspace_t) :: workspace\n    allocate(workspace%tmp(size(x), 4))\n    holder%apply => local_apply\n    call kernel(holder, x, workspace)\n  contains\n    subroutine local_apply(x, y, alpha, beta, op)\n      real(8), intent(in) :: x(:)\n      real(8), intent(inout) :: y(:)\n      real(8), intent(in) :: alpha, beta\n      character(1), intent(in) :: op\n      call apply_matrix(matrix, x, y, alpha, beta, op)\n    end subroutine\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(matrix_t) :: matrix\n  real(8) :: x(5)\n  matrix%n = 5\n  allocate(matrix%data(5))\n  matrix%data = [3.0_8, 0.0_8, 0.0_8, 0.0_8, 0.0_8]\n  x = [2.0_8, 3.0_8, 4.0_8, 5.0_8, 6.0_8]\n  call solve(matrix, x)\n  print *, 'ok'\nend program\n",
         "f90",
@@ -31094,6 +35308,13 @@ fn contained_procptr_component_preserves_host_derived_dummy() {
 
 #[test]
 fn contained_proc_does_not_deallocate_host_allocatable_array() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=contained_proc_does_not_deallocate_host_allocatable_array count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  real(8), allocatable :: scale(:)\n  real(8) :: x(3), y(3)\n  allocate(scale(3))\n  scale = [2.0_8, 3.0_8, 4.0_8]\n  x = [1.0_8, 2.0_8, 3.0_8]\n  y = 0.0_8\n  call apply(x, y)\n  if (abs(y(1) - 2.0_8) > 1.0e-12_8) error stop 1\n  if (abs(y(2) - 6.0_8) > 1.0e-12_8) error stop 2\n  if (abs(y(3) - 12.0_8) > 1.0e-12_8) error stop 3\n  if (.not. allocated(scale)) error stop 4\n  if (abs(scale(2) - 3.0_8) > 1.0e-12_8) error stop 5\n  print *, 'ok'\ncontains\n  subroutine apply(x, y)\n    real(8), intent(in) :: x(:)\n    real(8), intent(out) :: y(:)\n    y = scale * x\n  end subroutine\nend program\n",
         "f90",
@@ -31130,6 +35351,13 @@ fn contained_proc_does_not_deallocate_host_allocatable_array() {
 
 #[test]
 fn procedure_pointer_component_actual_to_procedure_dummy_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=procedure_pointer_component_actual_to_procedure_dummy_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  abstract interface\n    subroutine cb(value)\n      integer, intent(inout) :: value\n    end subroutine\n  end interface\n  type :: holder_t\n    procedure(cb), pointer, nopass :: handler => null()\n  end type\n  type(holder_t) :: holder\n  integer :: value\n  value = 0\n  holder%handler => inc\n  call run(holder%handler, value)\n  if (value /= 1) error stop 1\n  print *, 'ok'\ncontains\n  subroutine run(proc, value)\n    procedure(cb) :: proc\n    integer, intent(inout) :: value\n    call proc(value)\n  end subroutine\n\n  subroutine inc(value)\n    integer, intent(inout) :: value\n    value = value + 1\n  end subroutine\nend program\n",
         "f90",
@@ -31166,6 +35394,13 @@ fn procedure_pointer_component_actual_to_procedure_dummy_runs() {
 
 #[test]
 fn structure_constructor_preserves_procptr_char_and_trailing_defaults() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=structure_constructor_preserves_procptr_char_and_trailing_defaults count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  abstract interface\n    subroutine cb()\n    end subroutine\n  end interface\n  type :: result_t\n    logical :: passed = .true.\n    character(len=16) :: message = ''\n  end type\n  type :: case_t\n    character(len=32) :: name = ''\n    procedure(cb), pointer, nopass :: proc => null()\n    type(result_t) :: result\n  end type\n  type(case_t) :: test\n  test = case_t('hello', local)\n  if (trim(test%name) /= 'hello') error stop 1\n  if (.not. associated(test%proc)) error stop 2\n  if (.not. test%result%passed) error stop 3\n  if (len_trim(test%result%message) /= 0) error stop 4\n  call test%proc()\n  print *, 'ok'\ncontains\n  subroutine local()\n  end subroutine\nend program\n",
         "f90",
@@ -31202,6 +35437,13 @@ fn structure_constructor_preserves_procptr_char_and_trailing_defaults() {
 
 #[test]
 fn array_constructor_of_function_results_preserves_procptr_components() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=array_constructor_of_function_results_preserves_procptr_components count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  abstract interface\n    subroutine cb(value)\n      integer, intent(inout) :: value\n    end subroutine\n  end interface\n  type :: suite_t\n    character(len=:), allocatable :: name\n    procedure(cb), pointer, nopass :: collect => null()\n  end type\n  type(suite_t), allocatable :: suites(:)\n  integer :: value\n\n  value = 0\n  allocate(suites(0))\n  suites = [new_suite('build', inc), new_suite('lexer', inc)]\n  if (.not. associated(suites(1)%collect)) error stop 1\n  if (.not. associated(suites(2)%collect)) error stop 2\n  if (trim(suites(1)%name) /= 'build') error stop 3\n  if (trim(suites(2)%name) /= 'lexer') error stop 4\n  call suites(1)%collect(value)\n  call suites(2)%collect(value)\n  if (value /= 2) error stop 5\n  print *, 'ok'\ncontains\n  function new_suite(name, proc) result(suite)\n    character(len=*), intent(in) :: name\n    procedure(cb) :: proc\n    type(suite_t) :: suite\n    suite%name = name\n    suite%collect => proc\n  end function\n\n  subroutine inc(value)\n    integer, intent(inout) :: value\n    value = value + 1\n  end subroutine\nend program\n",
         "f90",
@@ -31239,6 +35481,13 @@ fn array_constructor_of_function_results_preserves_procptr_components() {
 
 #[test]
 fn imported_function_result_procptr_array_constructor_round_trips_and_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_function_result_procptr_array_constructor_round_trips_and_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("imported_procptr_array_ctor");
     let callbacks_src = write_program_in(
         &dir,
@@ -31355,6 +35604,13 @@ fn imported_function_result_procptr_array_constructor_round_trips_and_runs() {
 
 #[test]
 fn imported_finalizable_procptr_array_constructor_round_trips_and_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_finalizable_procptr_array_constructor_round_trips_and_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("imported_finalizable_procptr_array_ctor");
     let callbacks_src = write_program_in(
         &dir,
@@ -31471,6 +35727,13 @@ fn imported_finalizable_procptr_array_constructor_round_trips_and_runs() {
 
 #[test]
 fn imported_finalizable_procptr_result_survives_finalizer_that_nulls_component() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_finalizable_procptr_result_survives_finalizer_that_nulls_component count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("imported_finalizer_nulls_procptr_result");
     let callbacks_src = write_program_in(
         &dir,
@@ -31587,6 +35850,13 @@ fn imported_finalizable_procptr_result_survives_finalizer_that_nulls_component()
 
 #[test]
 fn derived_component_structure_constructor_defaults_initialize_locally() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=derived_component_structure_constructor_defaults_initialize_locally count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  integer, parameter :: i1 = selected_int_kind(2)\n  type :: color_code\n    integer(i1) :: style = -1_i1\n    integer(i1) :: bg = -1_i1\n    integer(i1) :: fg = -1_i1\n  end type\n  type :: color_output\n    type(color_code) :: bold = color_code(style=1_i1)\n    type(color_code) :: blue = color_code(fg=4_i1)\n  end type\n  type(color_output) :: color\n  if (color%bold%style /= 1_i1) error stop 1\n  if (color%bold%bg /= -1_i1) error stop 2\n  if (color%blue%fg /= 4_i1) error stop 3\n  if (.not. anycolor(color%bold)) error stop 4\n  if (.not. anycolor(color%blue)) error stop 5\n  print *, 'ok'\ncontains\n  pure function anycolor(code) result(flag)\n    type(color_code), intent(in) :: code\n    logical :: flag\n    flag = code%fg >= 0 .or. code%bg >= 0 .or. code%style >= 0\n  end function\nend program\n",
         "f90",
@@ -31621,6 +35891,13 @@ fn derived_component_structure_constructor_defaults_initialize_locally() {
 
 #[test]
 fn runtime_structure_constructor_keyword_args_preserve_named_fields_and_defaults() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=runtime_structure_constructor_keyword_args_preserve_named_fields_and_defaults count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  integer, parameter :: i1 = selected_int_kind(2)\n  type :: color_code\n    integer(i1) :: style = -1_i1\n    integer(i1) :: bg = -1_i1\n    integer(i1) :: fg = -1_i1\n  end type\n  type(color_code) :: code\n  code = color_code(style=8_i1)\n  if (code%style /= 8_i1) error stop 1\n  if (code%bg /= -1_i1) error stop 2\n  if (code%fg /= -1_i1) error stop 3\n  code = color_code(fg=3_i1)\n  if (code%style /= -1_i1) error stop 4\n  if (code%bg /= -1_i1) error stop 5\n  if (code%fg /= 3_i1) error stop 6\n  print *, 'ok'\nend program\n",
         "f90",
@@ -31655,6 +35932,13 @@ fn runtime_structure_constructor_keyword_args_preserve_named_fields_and_defaults
 
 #[test]
 fn imported_derived_component_structure_constructor_defaults_round_trip_through_amod_and_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_derived_component_structure_constructor_defaults_round_trip_through_amod_and_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("derived_component_ctor_defaults_amod");
     let mod_src = write_program_in(
         &dir,
@@ -31750,6 +36034,13 @@ fn imported_derived_component_structure_constructor_defaults_round_trip_through_
 
 #[test]
 fn imported_descriptor_callback_procptr_array_constructor_round_trips_and_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_descriptor_callback_procptr_array_constructor_round_trips_and_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("imported_descriptor_procptr_array_ctor");
     let callbacks_src = write_program_in(
         &dir,
@@ -31876,6 +36167,13 @@ fn imported_descriptor_callback_procptr_array_constructor_round_trips_and_runs()
 
 #[test]
 fn imported_descriptor_callback_many_array_constructor_entries_preserve_procptr_components() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_descriptor_callback_many_array_constructor_entries_preserve_procptr_components count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("imported_descriptor_procptr_many_ctor");
     let callbacks_src = write_program_in(
         &dir,
@@ -31999,6 +36297,13 @@ fn imported_descriptor_callback_many_array_constructor_entries_preserve_procptr_
 
 #[test]
 fn imported_cross_module_descriptor_callback_array_constructor_preserves_procptr_components() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_cross_module_descriptor_callback_array_constructor_preserves_procptr_components count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("imported_cross_module_descriptor_procptr_ctor");
     let iface_src = write_program_in(
         &dir,
@@ -32149,6 +36454,13 @@ fn imported_cross_module_descriptor_callback_array_constructor_preserves_procptr
 
 #[test]
 fn imported_framework_testsuite_array_constructor_reallocates_zero_len_target() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_framework_testsuite_array_constructor_reallocates_zero_len_target count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("imported_framework_testsuite_zero_len");
     let framework_src = write_program_in(
         &dir,
@@ -32393,6 +36705,13 @@ fn imported_framework_testsuite_array_constructor_reallocates_zero_len_target() 
 
 #[test]
 fn allocatable_intent_out_testsuite_array_constructor_keeps_procptr_elements() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_intent_out_testsuite_array_constructor_keeps_procptr_elements count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module framework\n  implicit none\n  type :: error_type\n    integer :: stat = 0\n  end type error_type\n  abstract interface\n    subroutine test_interface(error)\n      import :: error_type\n      type(error_type), allocatable, intent(out) :: error\n    end subroutine test_interface\n  end interface\n  type :: unittest_type\n    character(len=:), allocatable :: name\n    procedure(test_interface), pointer, nopass :: test => null()\n    logical :: should_fail = .false.\n  end type unittest_type\ncontains\n  function new_unittest(name, test) result(self)\n    character(len=*), intent(in) :: name\n    procedure(test_interface) :: test\n    type(unittest_type) :: self\n    self%name = name\n    self%test => test\n  end function new_unittest\n  subroutine collect_tests(testsuite)\n    type(unittest_type), allocatable, intent(out) :: testsuite(:)\n    testsuite = [new_unittest('t1', test_1)]\n  end subroutine collect_tests\n  subroutine test_1(error)\n    type(error_type), allocatable, intent(out) :: error\n  end subroutine test_1\nend module framework\nprogram p\n  use framework\n  implicit none\n  type(unittest_type), allocatable :: testsuite(:)\n  call collect_tests(testsuite)\n  if (.not. allocated(testsuite)) error stop 1\n  if (size(testsuite) /= 1) error stop 2\n  if (.not. allocated(testsuite(1)%name)) error stop 3\n  if (testsuite(1)%name /= 't1') error stop 4\n  if (.not. associated(testsuite(1)%test)) error stop 5\n  print *, 'ok'\nend program p\n",
         "f90",
@@ -32430,6 +36749,13 @@ fn allocatable_intent_out_testsuite_array_constructor_keeps_procptr_elements() {
 
 #[test]
 fn public_type_emits_private_nested_type_layouts_needed_cross_tu() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=public_type_emits_private_nested_type_layouts_needed_cross_tu count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("private_nested_layout");
     let mod_src = write_program_in(
         &dir,
@@ -32525,6 +36851,13 @@ fn public_type_emits_private_nested_type_layouts_needed_cross_tu() {
 
 #[test]
 fn module_procedure_actual_is_not_mislowered_as_internal_proc() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=module_procedure_actual_is_not_mislowered_as_internal_proc count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module callbacks\n  implicit none\n  abstract interface\n    subroutine cb(value)\n      integer, intent(in) :: value\n    end subroutine\n  end interface\ncontains\n  subroutine register_only(handler)\n    procedure(cb) :: handler\n  end subroutine\n\n  subroutine drive()\n    call register_only(wrapper)\n    print *, 'ok'\n  end subroutine\n\n  subroutine wrapper(value)\n    integer, intent(in) :: value\n    if (value < 0) error stop 1\n  end subroutine\nend module\nprogram p\n  use callbacks\n  implicit none\n  call drive()\nend program\n",
         "f90",
@@ -32561,6 +36894,13 @@ fn module_procedure_actual_is_not_mislowered_as_internal_proc() {
 
 #[test]
 fn overloaded_concat_with_char_dummy_and_hidden_string_result_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=overloaded_concat_with_char_dummy_and_hidden_string_result_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module colors\n  implicit none\n  type :: color_t\n    integer :: code = 0\n  end type\n  interface operator(//)\n    module procedure concat_color_left\n  end interface\ncontains\n  pure logical function anycolor(code)\n    type(color_t), intent(in) :: code\n    anycolor = code%code > 0\n  end function\n\n  pure function escape_color(code) result(str)\n    type(color_t), intent(in) :: code\n    character(len=:), allocatable :: str\n    if (anycolor(code)) then\n      str = '[X]'\n    else\n      str = ''\n    end if\n  end function\n\n  pure function concat_color_left(lval, code) result(str)\n    character(len=*), intent(in) :: lval\n    type(color_t), intent(in) :: code\n    character(len=:), allocatable :: str\n    str = lval // escape_color(code)\n  end function\nend module\nprogram p\n  use colors\n  implicit none\n  type(color_t) :: color\n  character(len=:), allocatable :: msg\n  color%code = 1\n  msg = 'A' // color\n  if (msg /= 'A[X]') error stop 1\n  print *, trim(msg)\nend program\n",
         "f90",
@@ -32597,6 +36937,13 @@ fn overloaded_concat_with_char_dummy_and_hidden_string_result_runs() {
 
 #[test]
 fn overloaded_concat_with_color_on_left_preserves_char_rhs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=overloaded_concat_with_color_on_left_preserves_char_rhs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module colors\n  implicit none\n  type :: color_t\n    integer :: code = 0\n  end type\n  interface operator(//)\n    module procedure concat_color_left\n    module procedure concat_color_right\n  end interface\ncontains\n  pure function concat_color_left(lval, code) result(str)\n    character(len=*), intent(in) :: lval\n    type(color_t), intent(in) :: code\n    character(len=:), allocatable :: str\n    if (code%code > 0) then\n      str = lval // '[X]'\n    else\n      str = lval\n    end if\n  end function\n\n  pure function concat_color_right(code, rval) result(str)\n    type(color_t), intent(in) :: code\n    character(len=*), intent(in) :: rval\n    character(len=:), allocatable :: str\n    if (code%code > 0) then\n      str = '[X]' // rval\n    else\n      str = rval\n    end if\n  end function\nend module\nprogram p\n  use colors\n  implicit none\n  type(color_t) :: color\n  character(len=:), allocatable :: msg, plain\n  color%code = 1\n  plain = 'A'\n  msg = color // plain\n  if (msg /= '[X]A') error stop 1\n  msg = plain // color\n  if (msg /= 'A[X]') error stop 2\n  print *, 'ok'\nend program\n",
         "f90",
@@ -32633,6 +36980,13 @@ fn overloaded_concat_with_color_on_left_preserves_char_rhs() {
 
 #[test]
 fn overloaded_concat_with_component_char_actual_preserves_rhs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=overloaded_concat_with_component_char_actual_preserves_rhs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module colors\n  implicit none\n  type :: color_t\n    integer :: code = 0\n  end type\n  type :: palette_t\n    type(color_t) :: blue = color_t(1)\n    type(color_t) :: reset = color_t(0)\n  end type\n  type :: label_t\n    character(len=:), allocatable :: text\n  end type\n  type(palette_t), save :: palette\n  interface operator(//)\n    module procedure concat_color_left\n    module procedure concat_color_right\n  end interface\ncontains\n  pure function concat_color_left(lval, code) result(str)\n    character(len=*), intent(in) :: lval\n    type(color_t), intent(in) :: code\n    character(len=:), allocatable :: str\n    if (code%code > 0) then\n      str = lval // '[X]'\n    else\n      str = lval\n    end if\n  end function\n\n  pure function concat_color_right(code, rval) result(str)\n    type(color_t), intent(in) :: code\n    character(len=*), intent(in) :: rval\n    character(len=:), allocatable :: str\n    if (code%code > 0) then\n      str = '[X]' // rval\n    else\n      str = rval\n    end if\n  end function\nend module\nprogram p\n  use colors\n  implicit none\n  type(label_t) :: label\n  character(len=:), allocatable :: msg\n  label%text = 'A'\n  msg = palette%blue // label%text\n  if (msg /= '[X]A') error stop 1\n  msg = label%text // palette%reset\n  if (msg /= 'A') error stop 2\n  print *, 'ok'\nend program\n",
         "f90",
@@ -32669,6 +37023,13 @@ fn overloaded_concat_with_component_char_actual_preserves_rhs() {
 
 #[test]
 fn module_character_parameter_still_uses_intrinsic_concat_with_user_defined_slash_slash() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=module_character_parameter_still_uses_intrinsic_concat_with_user_defined_slash_slash count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: color_code\n    integer :: style = -1\n  end type\n  interface operator(//)\n    module procedure :: concat_color_left\n  end interface\n  character(len=*), parameter :: newline = new_line('a')\ncontains\n  pure function concat_color_left(lval, code) result(str)\n    character(len=*), intent(in) :: lval\n    type(color_code), intent(in) :: code\n    character(len=:), allocatable :: str\n    if (code%style >= 0) then\n      str = lval // 'X'\n    else\n      str = lval // 'Y'\n    end if\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  character(len=:), allocatable :: s\n  s = 'A' // newline // 'B'\n  if (len(s) /= 3) error stop 1\n  if (s /= 'A' // new_line('a') // 'B') error stop 2\n  print *, 'ok'\nend program\n",
         "f90",
@@ -32703,6 +37064,13 @@ fn module_character_parameter_still_uses_intrinsic_concat_with_user_defined_slas
 
 #[test]
 fn module_global_component_overloaded_concat_preserves_nested_character_actual_len() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=module_global_component_overloaded_concat_preserves_nested_character_actual_len count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  integer, parameter :: i1 = selected_int_kind(2)\n  type :: color_code\n    integer(i1) :: style = -1_i1\n    integer(i1) :: bg = -1_i1\n    integer(i1) :: fg = -1_i1\n  end type\n  type :: color_output\n    type(color_code) :: dim = color_code(style=2_i1)\n    type(color_code) :: reset = color_code()\n    type(color_code) :: blue = color_code(fg=4_i1)\n  end type\n  type(color_output), protected :: color\n  interface operator(//)\n    module procedure :: concat_color_left\n    module procedure :: concat_color_right\n  end interface\ncontains\n  pure function concat_color_left(lval, code) result(str)\n    character(len=*), intent(in) :: lval\n    type(color_code), intent(in) :: code\n    character(len=:), allocatable :: str\n    if (anycolor(code)) then\n      str = lval // 'X'\n    else\n      str = lval // 'Y'\n    end if\n  end function\n  pure function concat_color_right(code, rval) result(str)\n    type(color_code), intent(in) :: code\n    character(len=*), intent(in) :: rval\n    character(len=:), allocatable :: str\n    if (anycolor(code)) then\n      str = 'Z' // rval\n    else\n      str = 'W' // rval\n    end if\n  end function\n  pure function anycolor(code) result(flag)\n    type(color_code), intent(in) :: code\n    logical :: flag\n    flag = code%fg >= 0 .or. code%bg >= 0 .or. code%style >= 0\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  character(len=:), allocatable :: s\n  s = 'A' // color%dim // 'B' // color%reset // 'C' // color%blue\n  if (s /= 'AXBYCX') error stop 1\n  print *, 'ok'\nend program\n",
         "f90",
@@ -32742,6 +37110,13 @@ fn module_global_component_overloaded_concat_preserves_nested_character_actual_l
 
 #[test]
 fn chained_hidden_result_concat_with_stub_ansi_codes_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=chained_hidden_result_concat_with_stub_ansi_codes_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  integer, parameter :: i1 = selected_int_kind(2)\n  type :: ansi_code\n    integer(i1) :: style = -1_i1\n    integer(i1) :: bg = -1_i1\n    integer(i1) :: fg = -1_i1\n  end type\n  type :: term\n    type(ansi_code) :: reset = ansi_code()\n    type(ansi_code) :: bold = ansi_code()\n    type(ansi_code) :: blue = ansi_code(fg=4_i1)\n  end type\n  interface operator(+)\n    module procedure :: add\n  end interface\n  interface operator(//)\n    module procedure :: concat_left\n    module procedure :: concat_right\n  end interface\ncontains\n  pure function add(lval, rval) result(code)\n    type(ansi_code), intent(in) :: lval, rval\n    type(ansi_code) :: code\n    code%style = merge(rval%style, lval%style, rval%style >= 0)\n    code%fg = merge(rval%fg, lval%fg, rval%fg >= 0)\n    code%bg = merge(rval%bg, lval%bg, rval%bg >= 0)\n  end function\n  pure function anycolor(code) result(flag)\n    type(ansi_code), intent(in) :: code\n    logical :: flag\n    flag = code%fg >= 0 .or. code%bg >= 0 .or. code%style >= 0\n  end function\n  pure function escape(code) result(str)\n    type(ansi_code), intent(in) :: code\n    character(len=:), allocatable :: str\n    if (anycolor(code)) then\n      str = '[C]'\n    else\n      str = ''\n    end if\n  end function\n  pure function concat_left(lval, code) result(str)\n    character(len=*), intent(in) :: lval\n    type(ansi_code), intent(in) :: code\n    character(len=:), allocatable :: str\n    str = lval // escape(code)\n  end function\n  pure function concat_right(code, rval) result(str)\n    type(ansi_code), intent(in) :: code\n    character(len=*), intent(in) :: rval\n    character(len=:), allocatable :: str\n    str = escape(code) // rval\n  end function\n  pure function level_name(level, color) result(string)\n    integer, intent(in) :: level\n    type(term), intent(in) :: color\n    character(len=:), allocatable :: string\n    if (level == 0) then\n      string = color%bold + color%blue // 'error' // color%reset\n    else\n      string = color%bold + color%blue // 'unknown' // color%reset\n    end if\n  end function\n  pure function render_message(level, message, color) result(string)\n    integer, intent(in) :: level\n    character(len=*), intent(in) :: message\n    type(term), intent(in) :: color\n    character(len=:), allocatable :: string\n    string = level_name(level, color) // color%bold // ': ' // message // color%reset\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  type(term) :: color\n  character(len=:), allocatable :: msg\n  msg = render_message(0, 'Invalid syntax', color)\n  if (msg /= '[C]error: Invalid syntax') error stop 1\n  print *, trim(msg)\nend program\n",
         "f90",
@@ -32778,6 +37153,13 @@ fn chained_hidden_result_concat_with_stub_ansi_codes_runs() {
 
 #[test]
 fn generic_type_bound_subroutine_dispatch_uses_matching_specific() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=generic_type_bound_subroutine_dispatch_uses_matching_specific count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type :: datetime_t\n    integer :: year = 0\n    integer :: month = 0\n    integer :: day = 0\n  end type\n  type :: keyval_t\n    real :: as_float = -1.0\n    type(datetime_t) :: as_datetime\n  contains\n    procedure :: set_float\n    procedure :: set_datetime\n    procedure :: get_float\n    procedure :: get_datetime\n    generic :: set => set_float, set_datetime\n    generic :: get => get_float, get_datetime\n  end type\ncontains\n  subroutine set_float(self, x)\n    class(keyval_t), intent(inout) :: self\n    real, intent(in) :: x\n    self%as_float = x\n  end subroutine\n  subroutine set_datetime(self, x)\n    class(keyval_t), intent(inout) :: self\n    type(datetime_t), intent(in) :: x\n    self%as_datetime = x\n  end subroutine\n  subroutine get_float(self, x)\n    class(keyval_t), intent(in) :: self\n    real, intent(out) :: x\n    x = self%as_float\n  end subroutine\n  subroutine get_datetime(self, x)\n    class(keyval_t), intent(in) :: self\n    type(datetime_t), intent(out) :: x\n    x = self%as_datetime\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(keyval_t) :: kv\n  type(datetime_t) :: in_dt, out_dt\n  real :: out_float\n  in_dt = datetime_t(2022, 7, 31)\n  call kv%set(in_dt)\n  call kv%get(out_dt)\n  if (out_dt%year /= 2022) error stop 1\n  if (out_dt%month /= 7) error stop 2\n  if (out_dt%day /= 31) error stop 3\n  call kv%set(3.5)\n  call kv%get(out_float)\n  if (abs(out_float - 3.5) > 1.0e-6) error stop 4\n  print *, out_dt%year, out_dt%month, out_dt%day, out_float\nend program\n",
         "f90",
@@ -32821,6 +37203,13 @@ fn generic_type_bound_subroutine_dispatch_uses_matching_specific() {
 
 #[test]
 fn generic_type_bound_dispatch_uses_character_intrinsic_actual_specific() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=generic_type_bound_dispatch_uses_character_intrinsic_actual_specific count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  type, abstract :: generic_value\n  end type\n  type :: datetime_t\n    integer :: year = 0\n  end type\n  type, extends(generic_value) :: datetime_value\n    type(datetime_t) :: raw\n  end type\n  type, extends(generic_value) :: string_value\n    character(:), allocatable :: raw\n  end type\n  type :: keyval_t\n    class(generic_value), allocatable :: val\n  contains\n    procedure :: set_datetime\n    procedure :: set_string\n    procedure :: get_datetime\n    procedure :: get_string\n    procedure :: get_type\n    generic :: set => set_datetime, set_string\n    generic :: get => get_datetime, get_string\n  end type\ncontains\n  subroutine set_datetime(self, x)\n    class(keyval_t), intent(inout) :: self\n    type(datetime_t), intent(in) :: x\n    type(datetime_value), allocatable :: tmp\n    allocate(tmp)\n    tmp%raw = x\n    call move_alloc(tmp, self%val)\n  end subroutine\n\n  subroutine set_string(self, x)\n    class(keyval_t), intent(inout) :: self\n    character(*), intent(in) :: x\n    type(string_value), allocatable :: tmp\n    allocate(tmp)\n    tmp%raw = x\n    call move_alloc(tmp, self%val)\n  end subroutine\n\n  subroutine get_datetime(self, x)\n    class(keyval_t), intent(in) :: self\n    type(datetime_t), pointer, intent(out) :: x\n    nullify(x)\n    select type(v => self%val)\n    type is(datetime_value)\n      x => v%raw\n    end select\n  end subroutine\n\n  subroutine get_string(self, x)\n    class(keyval_t), intent(in) :: self\n    character(:), pointer, intent(out) :: x\n    nullify(x)\n    select type(v => self%val)\n    type is(string_value)\n      x => v%raw\n    end select\n  end subroutine\n\n  pure function get_type(self) result(code)\n    class(keyval_t), intent(in) :: self\n    integer :: code\n    select type(v => self%val)\n    class default\n      code = 0\n    type is(datetime_value)\n      code = 105\n    type is(string_value)\n      code = 101\n    end select\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  type(keyval_t) :: kv\n  character(:), pointer :: sp\n  call kv%set(repeat('a', 3))\n  if (kv%get_type() /= 101) error stop 1\n  call kv%get(sp)\n  if (.not.associated(sp)) error stop 2\n  if (len(sp) /= 3) error stop 3\n  if (sp /= 'aaa') error stop 4\n  print *, kv%get_type(), len(sp), sp\nend program\n",
         "f90",
@@ -32859,6 +37248,13 @@ fn generic_type_bound_dispatch_uses_character_intrinsic_actual_specific() {
 
 #[test]
 fn imported_derived_parameter_constructor_defaults_preserve_component_values() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_derived_parameter_constructor_defaults_preserve_component_values count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module constants_m\n  implicit none\n  private\n  public :: enum_type, toml_type\n  type :: enum_type\n    integer :: invalid = 100\n    integer :: string = 101\n    integer :: boolean = 102\n  end type\n  type(enum_type), parameter :: toml_type = enum_type()\nend module\nmodule use_m\n  use constants_m, only : toml_type\n  implicit none\ncontains\n  integer function string_tag() result(v)\n    v = toml_type%string\n  end function\n  integer function invalid_tag() result(v)\n    v = toml_type%invalid\n  end function\nend module\nprogram p\n  use use_m\n  implicit none\n  if (string_tag() /= 101) error stop 1\n  if (invalid_tag() /= 100) error stop 2\n  print *, string_tag(), invalid_tag()\nend program\n",
         "f90",
@@ -32896,6 +37292,13 @@ fn imported_derived_parameter_constructor_defaults_preserve_component_values() {
 
 #[test]
 fn select_type_branch_keeps_imported_derived_parameter_component_constants() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=select_type_branch_keeps_imported_derived_parameter_component_constants count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("select_type_imported_derived_param");
     let constants_src = write_program_in(
         &dir,
@@ -32978,6 +37381,13 @@ fn select_type_branch_keeps_imported_derived_parameter_component_constants() {
 
 #[test]
 fn polymorphic_component_array_indexing_is_not_misread_as_tbp_dispatch() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=polymorphic_component_array_indexing_is_not_misread_as_tbp_dispatch count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module repro\n  implicit none\n  type :: token_t\n    integer :: x = 0\n  end type token_t\n  type :: base_t\n    integer :: pos = 0\n  contains\n    procedure :: noop\n  end type base_t\n  type, extends(base_t) :: child_t\n    type(token_t), allocatable :: token(:)\n  contains\n    procedure :: next\n  end type child_t\ncontains\n  subroutine noop(self)\n    class(base_t), intent(inout) :: self\n    self%pos = self%pos\n  end subroutine noop\n  subroutine next(self, token)\n    class(child_t), intent(inout) :: self\n    type(token_t), intent(out) :: token\n    self%pos = self%pos + 1\n    token = self%token(self%pos)\n  end subroutine next\nend module repro\nprogram p\n  use repro\n  implicit none\n  type(child_t) :: child\n  type(token_t) :: tok\n  allocate(child%token(1))\n  child%token(1)%x = 7\n  call child%next(tok)\n  if (tok%x /= 7) error stop 1\n  print *, 'ok'\nend program p\n",
         "f90",
@@ -33015,6 +37425,13 @@ fn polymorphic_component_array_indexing_is_not_misread_as_tbp_dispatch() {
 
 #[test]
 fn renamed_imported_abstract_tbp_dispatch_uses_canonical_type_layout() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=renamed_imported_abstract_tbp_dispatch_uses_canonical_type_layout count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module base_mod\n  implicit none\n  type, abstract :: abstract_lexer\n  contains\n    procedure(get_info_i), deferred :: get_info\n  end type\n  abstract interface\n    subroutine get_info_i(lexer, meta, output)\n      import :: abstract_lexer\n      class(abstract_lexer), intent(in) :: lexer\n      character(*), intent(in) :: meta\n      character(:), allocatable, intent(out) :: output\n    end subroutine\n  end interface\nend module\nmodule concrete_mod\n  use base_mod, only : abstract_lexer\n  implicit none\n  type, extends(abstract_lexer) :: concrete_lexer\n  contains\n    procedure :: get_info\n  end type\ncontains\n  subroutine get_info(lexer, meta, output)\n    class(concrete_lexer), intent(in) :: lexer\n    character(*), intent(in) :: meta\n    character(:), allocatable, intent(out) :: output\n    if (len(meta) == 0) then\n      output = 'empty'\n    else\n      output = meta\n    end if\n  end subroutine\nend module\nmodule parser_mod\n  use base_mod, only : lexer_t => abstract_lexer\n  implicit none\ncontains\n  subroutine parse(lexer, output)\n    class(lexer_t), intent(in) :: lexer\n    character(:), allocatable, intent(out) :: output\n    call lexer%get_info('ok', output)\n  end subroutine\nend module\nprogram p\n  use concrete_mod, only : concrete_lexer\n  use parser_mod, only : parse\n  implicit none\n  type(concrete_lexer) :: lexer\n  character(:), allocatable :: output\n  call parse(lexer, output)\n  if (.not. allocated(output)) error stop 1\n  if (output /= 'ok') error stop 2\n  print *, trim(output)\nend program\n",
         "f90",
@@ -33052,6 +37469,13 @@ fn renamed_imported_abstract_tbp_dispatch_uses_canonical_type_layout() {
 
 #[test]
 fn extended_type_allocatable_component_array_assignment_handles_default_inited_elements() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=extended_type_allocatable_component_array_assignment_handles_default_inited_elements count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module repro\n  implicit none\n  type :: token_t\n    integer :: x = 0\n  end type token_t\n  type, abstract :: abstract_lexer\n  contains\n    procedure(next_i), deferred :: next\n  end type abstract_lexer\n  abstract interface\n    subroutine next_i(self, tok)\n      import :: abstract_lexer, token_t\n      class(abstract_lexer), intent(inout) :: self\n      type(token_t), intent(out) :: tok\n    end subroutine next_i\n  end interface\n  type, extends(abstract_lexer) :: lexer_t\n    character(len=:), allocatable :: filename\n    integer :: pos = 0\n    character(len=:), allocatable :: chunk\n  contains\n    procedure :: next => lexer_noop\n  end type lexer_t\n  type, extends(lexer_t) :: mocked_lexer_t\n    type(token_t), allocatable :: token(:)\n  contains\n    procedure :: next => mocked_next\n  end type mocked_lexer_t\ncontains\n  subroutine lexer_noop(self, tok)\n    class(lexer_t), intent(inout) :: self\n    type(token_t), intent(out) :: tok\n    self%pos = self%pos\n    tok%x = -1\n  end subroutine lexer_noop\n  subroutine mocked_next(self, tok)\n    class(mocked_lexer_t), intent(inout) :: self\n    type(token_t), intent(out) :: tok\n    self%pos = self%pos + 1\n    tok = self%token(self%pos)\n  end subroutine mocked_next\n  subroutine init_all(lexer, string, token)\n    type(mocked_lexer_t), intent(out) :: lexer\n    character(len=*), intent(in) :: string\n    type(token_t), intent(in) :: token(:)\n    lexer%filename = 'mocked'\n    lexer%pos = 0\n    lexer%chunk = string\n    lexer%token = token\n  end subroutine init_all\nend module repro\nprogram p\n  use repro\n  implicit none\n  type(mocked_lexer_t) :: lex\n  type(token_t) :: tok(1)\n  tok(1)%x = 7\n  call init_all(lex, '}', tok)\n  if (.not. allocated(lex%filename)) error stop 1\n  if (.not. allocated(lex%chunk)) error stop 2\n  if (.not. allocated(lex%token)) error stop 3\n  if (trim(lex%filename) /= 'mocked') error stop 4\n  if (lex%chunk /= '}') error stop 5\n  if (size(lex%token) /= 1) error stop 6\n  if (lex%token(1)%x /= 7) error stop 7\n  print *, 'ok'\nend program p\n",
         "f90",
@@ -33089,6 +37513,13 @@ fn extended_type_allocatable_component_array_assignment_handles_default_inited_e
 
 #[test]
 fn extended_type_allocatable_component_array_assignment_deep_copies_nested_allocatables() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=extended_type_allocatable_component_array_assignment_deep_copies_nested_allocatables count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module repro\n  implicit none\n  type :: token_t\n    character(len=:), allocatable :: text\n  end type token_t\n  type, abstract :: abstract_lexer\n  contains\n    procedure(next_i), deferred :: next\n  end type abstract_lexer\n  abstract interface\n    subroutine next_i(self, tok)\n      import :: abstract_lexer, token_t\n      class(abstract_lexer), intent(inout) :: self\n      type(token_t), intent(out) :: tok\n    end subroutine next_i\n  end interface\n  type, extends(abstract_lexer) :: lexer_t\n    character(len=:), allocatable :: filename\n    integer :: pos = 0\n    character(len=:), allocatable :: chunk\n  contains\n    procedure :: next => lexer_noop\n  end type lexer_t\n  type, extends(lexer_t) :: mocked_lexer_t\n    type(token_t), allocatable :: token(:)\n  contains\n    procedure :: next => mocked_next\n  end type mocked_lexer_t\ncontains\n  subroutine lexer_noop(self, tok)\n    class(lexer_t), intent(inout) :: self\n    type(token_t), intent(out) :: tok\n    self%pos = self%pos\n    tok%text = ''\n  end subroutine lexer_noop\n  subroutine mocked_next(self, tok)\n    class(mocked_lexer_t), intent(inout) :: self\n    type(token_t), intent(out) :: tok\n    self%pos = self%pos + 1\n    tok = self%token(self%pos)\n  end subroutine mocked_next\n  subroutine init_all(lexer, string, token)\n    type(mocked_lexer_t), intent(out) :: lexer\n    character(len=*), intent(in) :: string\n    type(token_t), intent(in) :: token(:)\n    lexer%filename = 'mocked'\n    lexer%pos = 0\n    lexer%chunk = string\n    lexer%token = token\n  end subroutine init_all\nend module repro\nprogram p\n  use repro\n  implicit none\n  type(mocked_lexer_t) :: lex\n  type(token_t), allocatable :: tok(:)\n  allocate(tok(1))\n  tok(1)%text = 'abc'\n  call init_all(lex, '}', tok)\n  tok(1)%text = 'zzz'\n  if (.not. allocated(lex%token)) error stop 1\n  if (.not. allocated(lex%token(1)%text)) error stop 2\n  if (lex%token(1)%text /= 'abc') error stop 3\n  print *, trim(lex%token(1)%text)\nend program p\n",
         "f90",
@@ -33126,6 +37557,13 @@ fn extended_type_allocatable_component_array_assignment_deep_copies_nested_alloc
 
 #[test]
 fn allocated_scalar_derived_structure_constructor_assignment_preserves_allocatable_fields() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocated_scalar_derived_structure_constructor_assignment_preserves_allocatable_fields count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module repro\n  implicit none\n  type :: label_t\n    integer :: level = 0\n    logical :: primary = .false.\n    integer :: first = 0\n    integer :: last = 0\n    character(len=:), allocatable :: text\n    character(len=:), allocatable :: source\n  end type label_t\n  interface label_t\n    module procedure new_label\n  end interface\n  type :: diagnostic_t\n    integer :: level = 0\n    character(len=:), allocatable :: message\n    character(len=:), allocatable :: source\n    type(label_t), allocatable :: label(:)\n  end type diagnostic_t\n  interface diagnostic_t\n    module procedure new_diagnostic\n  end interface\ncontains\n  pure function new_label(level, first, last, text, primary) result(new)\n    integer, intent(in) :: level, first, last\n    character(len=*), intent(in), optional :: text\n    logical, intent(in), optional :: primary\n    type(label_t) :: new\n    new%level = level\n    new%first = first\n    new%last = last\n    if (present(text)) new%text = text\n    if (present(primary)) new%primary = primary\n  end function new_label\n  pure function new_diagnostic(level, message, source, label) result(new)\n    integer, intent(in) :: level\n    character(len=*), intent(in), optional :: message, source\n    type(label_t), intent(in), optional :: label(:)\n    type(diagnostic_t) :: new\n    new%level = level\n    if (present(message)) new%message = message\n    if (present(source)) new%source = source\n    if (present(label)) new%label = label\n  end function new_diagnostic\nend module repro\nprogram p\n  use repro\n  implicit none\n  type(diagnostic_t), allocatable :: diagnostic\n  allocate(diagnostic)\n  diagnostic = diagnostic_t(0, 'Invalid expression', 'mocked', [label_t(0, 1, 1, 'unexpected token', .true.)])\n  if (.not. allocated(diagnostic)) error stop 1\n  if (.not. allocated(diagnostic%message)) error stop 2\n  if (.not. allocated(diagnostic%source)) error stop 3\n  if (.not. allocated(diagnostic%label)) error stop 4\n  if (diagnostic%message /= 'Invalid expression') error stop 5\n  if (diagnostic%source /= 'mocked') error stop 6\n  if (size(diagnostic%label) /= 1) error stop 7\n  if (.not. allocated(diagnostic%label(1)%text)) error stop 8\n  if (diagnostic%label(1)%text /= 'unexpected token') error stop 9\n  print *, 'ok'\nend program p\n",
         "f90",
@@ -33163,6 +37601,13 @@ fn allocated_scalar_derived_structure_constructor_assignment_preserves_allocatab
 
 #[test]
 fn allocatable_intent_out_scalar_structure_constructor_assignment_preserves_allocatable_fields() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_intent_out_scalar_structure_constructor_assignment_preserves_allocatable_fields count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module repro\n  implicit none\n  type :: label_t\n    integer :: level = 0\n    logical :: primary = .false.\n    integer :: first = 0\n    integer :: last = 0\n    character(len=:), allocatable :: text\n    character(len=:), allocatable :: source\n  end type label_t\n  interface label_t\n    module procedure new_label\n  end interface\n  type :: diagnostic_t\n    integer :: level = 0\n    character(len=:), allocatable :: message\n    character(len=:), allocatable :: source\n    type(label_t), allocatable :: label(:)\n  end type diagnostic_t\n  interface diagnostic_t\n    module procedure new_diagnostic\n  end interface\ncontains\n  pure function new_label(level, first, last, text, primary) result(new)\n    integer, intent(in) :: level, first, last\n    character(len=*), intent(in), optional :: text\n    logical, intent(in), optional :: primary\n    type(label_t) :: new\n    new%level = level\n    new%first = first\n    new%last = last\n    if (present(text)) new%text = text\n    if (present(primary)) new%primary = primary\n  end function new_label\n  pure function new_diagnostic(level, message, source, label) result(new)\n    integer, intent(in) :: level\n    character(len=*), intent(in), optional :: message, source\n    type(label_t), intent(in), optional :: label(:)\n    type(diagnostic_t) :: new\n    new%level = level\n    if (present(message)) new%message = message\n    if (present(source)) new%source = source\n    if (present(label)) new%label = label\n  end function new_diagnostic\n  subroutine syntax_error(diagnostic, message, source)\n    type(diagnostic_t), allocatable, intent(out) :: diagnostic\n    character(len=*), intent(in) :: message, source\n    allocate(diagnostic)\n    diagnostic = diagnostic_t(0, message, source, [label_t(0, 1, 1, 'unexpected token', .true.)])\n  end subroutine syntax_error\nend module repro\nprogram p\n  use repro\n  implicit none\n  type(diagnostic_t), allocatable :: diagnostic\n  call syntax_error(diagnostic, 'Invalid expression', 'mocked')\n  if (.not. allocated(diagnostic)) error stop 1\n  if (.not. allocated(diagnostic%message)) error stop 2\n  if (.not. allocated(diagnostic%source)) error stop 3\n  if (.not. allocated(diagnostic%label)) error stop 4\n  if (diagnostic%message /= 'Invalid expression') error stop 5\n  if (diagnostic%source /= 'mocked') error stop 6\n  if (size(diagnostic%label) /= 1) error stop 7\n  if (.not. allocated(diagnostic%label(1)%text)) error stop 8\n  if (diagnostic%label(1)%text /= 'unexpected token') error stop 9\n  print *, 'ok'\nend program p\n",
         "f90",
@@ -33200,6 +37645,13 @@ fn allocatable_intent_out_scalar_structure_constructor_assignment_preserves_allo
 
 #[test]
 fn allocatable_scalar_function_result_assignment_preserves_class_dispatch() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_scalar_function_result_assignment_preserves_class_dispatch count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module repro\n  implicit none\n  type, abstract :: base_t\n  contains\n    procedure(accept_i), deferred :: accept\n  end type base_t\n  type, abstract :: visitor_t\n  contains\n    procedure(visit_i), deferred :: visit\n  end type visitor_t\n  type, extends(base_t) :: child_t\n    integer :: x = 0\n  contains\n    procedure :: accept => child_accept\n  end type child_t\n  type, extends(visitor_t) :: printer_t\n    integer :: seen = -1\n  contains\n    procedure :: visit => printer_visit\n  end type printer_t\n  abstract interface\n    subroutine accept_i(self, vis)\n      import :: base_t, visitor_t\n      class(base_t), intent(in) :: self\n      class(visitor_t), intent(inout) :: vis\n    end subroutine accept_i\n    subroutine visit_i(self, val)\n      import :: visitor_t, base_t\n      class(visitor_t), intent(inout) :: self\n      class(base_t), intent(in) :: val\n    end subroutine visit_i\n  end interface\ncontains\n  subroutine child_accept(self, vis)\n    class(child_t), intent(in) :: self\n    class(visitor_t), intent(inout) :: vis\n    call vis%visit(self)\n  end subroutine child_accept\n  subroutine printer_visit(self, val)\n    class(printer_t), intent(inout) :: self\n    class(base_t), intent(in) :: val\n    select type(val)\n    type is(child_t)\n      self%seen = val%x\n    class default\n      self%seen = -99\n    end select\n  end subroutine printer_visit\n  function make_child() result(out)\n    type(child_t) :: out\n    out%x = 7\n  end function make_child\nend module repro\nprogram p\n  use repro\n  implicit none\n  type(child_t), allocatable :: x\n  type(printer_t) :: vis\n  x = make_child()\n  call x%accept(vis)\n  if (vis%seen /= 7) error stop 1\n  print *, 'ok'\nend program p\n",
         "f90",
@@ -33237,6 +37689,13 @@ fn allocatable_scalar_function_result_assignment_preserves_class_dispatch() {
 
 #[test]
 fn allocatable_scalar_structure_constructor_assignment_preserves_class_dispatch() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_scalar_structure_constructor_assignment_preserves_class_dispatch count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module repro\n  implicit none\n  type, abstract :: base_t\n  contains\n    procedure(accept_i), deferred :: accept\n  end type base_t\n  type, abstract :: visitor_t\n  contains\n    procedure(visit_i), deferred :: visit\n  end type visitor_t\n  type, extends(base_t) :: child_t\n    integer :: x = 0\n  contains\n    procedure :: accept => child_accept\n  end type child_t\n  type, extends(visitor_t) :: printer_t\n    integer :: seen = -1\n  contains\n    procedure :: visit => printer_visit\n  end type printer_t\n  abstract interface\n    subroutine accept_i(self, vis)\n      import :: base_t, visitor_t\n      class(base_t), intent(in) :: self\n      class(visitor_t), intent(inout) :: vis\n    end subroutine accept_i\n    subroutine visit_i(self, val)\n      import :: visitor_t, base_t\n      class(visitor_t), intent(inout) :: self\n      class(base_t), intent(in) :: val\n    end subroutine visit_i\n  end interface\ncontains\n  subroutine child_accept(self, vis)\n    class(child_t), intent(in) :: self\n    class(visitor_t), intent(inout) :: vis\n    call vis%visit(self)\n  end subroutine child_accept\n  subroutine printer_visit(self, val)\n    class(printer_t), intent(inout) :: self\n    class(base_t), intent(in) :: val\n    select type(val)\n    type is(child_t)\n      self%seen = val%x\n    class default\n      self%seen = -99\n    end select\n  end subroutine printer_visit\nend module repro\nprogram p\n  use repro\n  implicit none\n  type(child_t), allocatable :: x\n  type(printer_t) :: vis\n  x = child_t(7)\n  call x%accept(vis)\n  if (vis%seen /= 7) error stop 1\n  print *, 'ok'\nend program p\n",
         "f90",
@@ -33274,6 +37733,13 @@ fn allocatable_scalar_structure_constructor_assignment_preserves_class_dispatch(
 
 #[test]
 fn allocate_source_implied_do_constructor_initializes_runtime_elements() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocate_source_implied_do_constructor_initializes_runtime_elements count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  integer, allocatable :: indexarray(:)\n  integer :: i, low, high\n  low = 1\n  high = 10\n  allocate(indexarray(high), source=[(i, i=low, high)])\n  do i = 1, high\n    if (indexarray(i) /= i) error stop 1\n  end do\n  print *, 'ok'\nend program p\n",
         "f90",
@@ -33311,6 +37777,13 @@ fn allocate_source_implied_do_constructor_initializes_runtime_elements() {
 
 #[test]
 fn allocate_source_derived_array_deep_copies_allocatable_character_fields() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocate_source_derived_array_deep_copies_allocatable_character_fields count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  type :: key_t\n    character(:), allocatable :: key\n  end type key_t\n  type(key_t), allocatable :: list(:)\n  type(key_t), allocatable :: sorted(:)\n  integer :: i\n  allocate(list(0))\n  list = [key_t('0'), key_t('1'), key_t('2'), key_t('3')]\n  allocate(sorted, source=list)\n  do i = 1, size(sorted)\n    if (.not. allocated(sorted(i)%key)) error stop 1\n    if (sorted(i)%key /= achar(iachar('0') + i - 1)) error stop 2\n  end do\n  print *, 'ok'\nend program p\n",
         "f90",
@@ -33348,6 +37821,13 @@ fn allocate_source_derived_array_deep_copies_allocatable_character_fields() {
 
 #[test]
 fn intent_out_derived_dummy_resets_allocatable_components_between_calls() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=intent_out_derived_dummy_resets_allocatable_components_between_calls count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module repro\n  implicit none\n  type :: lexer_t\n    character(len=:), allocatable :: filename\n    integer, allocatable :: stack(:)\n  end type lexer_t\ncontains\n  subroutine init_all(lexer, string)\n    type(lexer_t), intent(out) :: lexer\n    character(len=*), intent(in) :: string\n    if (allocated(lexer%filename)) print *, 'STALE_NAME'\n    if (allocated(lexer%stack)) print *, 'STALE_STACK', size(lexer%stack)\n    lexer%filename = string\n    allocate(lexer%stack(8))\n    print *, 'OK'\n  end subroutine init_all\nend module repro\nprogram p\n  use repro\n  implicit none\n  type(lexer_t) :: lexer\n  call init_all(lexer, 'first')\n  call init_all(lexer, 'second')\n  call init_all(lexer, 'third')\n  if (.not. allocated(lexer%filename)) error stop 1\n  if (.not. allocated(lexer%stack)) error stop 2\n  if (lexer%filename /= 'third') error stop 3\n  if (size(lexer%stack) /= 8) error stop 4\nend program p\n",
         "f90",
@@ -33395,6 +37875,13 @@ fn intent_out_derived_dummy_resets_allocatable_components_between_calls() {
 
 #[test]
 fn optional_intent_out_derived_dummy_absent_does_not_touch_null_storage() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=optional_intent_out_derived_dummy_absent_does_not_touch_null_storage count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module repro\n  implicit none\n  type :: box_t\n    character(len=:), allocatable :: name\n  end type box_t\ncontains\n  subroutine reset(box)\n    type(box_t), intent(out), optional :: box\n    if (.not. present(box)) then\n      print *, 'absent'\n      return\n    end if\n    box%name = 'fresh'\n  end subroutine reset\nend module repro\nprogram p\n  use repro\n  implicit none\n  type(box_t) :: box\n  box%name = 'stale'\n  call reset()\n  if (.not. allocated(box%name)) error stop 1\n  if (box%name /= 'stale') error stop 2\n  call reset(box)\n  if (.not. allocated(box%name)) error stop 3\n  if (box%name /= 'fresh') error stop 4\n  print *, 'ok'\nend program p\n",
         "f90",
@@ -33432,6 +37919,13 @@ fn optional_intent_out_derived_dummy_absent_does_not_touch_null_storage() {
 
 #[test]
 fn allocatable_derived_component_actual_passes_base_storage_to_value_dummy() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_derived_component_actual_passes_base_storage_to_value_dummy count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module repro\n  implicit none\n  type :: diagnostic_t\n    character(len=:), allocatable :: message\n  end type diagnostic_t\ncontains\n  function render(diag) result(n)\n    type(diagnostic_t), intent(in) :: diag\n    integer :: n\n    if (.not. allocated(diag%message)) then\n      n = -1\n    else\n      n = len(diag%message)\n    end if\n  end function render\nend module repro\nprogram p\n  use repro\n  implicit none\n  type :: parser_t\n    type(diagnostic_t), allocatable :: diagnostic\n  end type parser_t\n  type(parser_t) :: parser\n  call syntax_error(parser%diagnostic, 'Invalid syntax')\n  if (render(parser%diagnostic) /= 14) error stop 1\n  print *, 'ok'\ncontains\n  subroutine syntax_error(diagnostic, message)\n    type(diagnostic_t), allocatable, intent(out) :: diagnostic\n    character(len=*), intent(in) :: message\n    allocate(diagnostic)\n    diagnostic%message = message\n  end subroutine syntax_error\nend program p\n",
         "f90",
@@ -33469,6 +37963,13 @@ fn allocatable_derived_component_actual_passes_base_storage_to_value_dummy() {
 
 #[test]
 fn allocatable_array_result_append_preserves_declared_rank() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_array_result_append_preserves_declared_rank count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module repro\n  implicit none\n  type :: line_token\n    integer :: first = 0\n    integer :: last = 0\n  end type line_token\n  character(len=*), parameter :: nl = new_line('a')\ncontains\n  pure function line_tokens(input) result(token)\n    character(len=*), intent(in) :: input\n    type(line_token), allocatable :: token(:)\n    integer :: first, last\n    first = 1\n    last = 1\n    allocate(token(0))\n    do while (last <= len(input))\n      if (input(last:last) /= nl) then\n        last = last + 1\n        cycle\n      end if\n      token = [token, line_token(first, last - 1)]\n      first = last + 1\n      last = first\n    end do\n    if (first <= len(input)) then\n      token = [token, line_token(first, len(input))]\n    end if\n  end function line_tokens\nend module repro\nprogram p\n  use repro\n  implicit none\n  type(line_token), allocatable :: token(:)\n  token = line_tokens('}')\n  if (size(token) /= 1) error stop 1\n  if (token(1)%first /= 1) error stop 2\n  if (token(1)%last /= 1) error stop 3\n  print *, 'ok'\nend program p\n",
         "f90",
@@ -33506,6 +38007,13 @@ fn allocatable_array_result_append_preserves_declared_rank() {
 
 #[test]
 fn f77_statement_function_inlines_without_emitting_external_call() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=f77_statement_function_inlines_without_emitting_external_call count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F77 §15.4 statement function: `f(x) = x**2 + 1` defined in the
     // declaration prologue. The call site `f(3.0)` must inline the
     // body rather than emit an external `_f` reference (which the
@@ -33547,6 +38055,13 @@ fn f77_statement_function_inlines_without_emitting_external_call() {
 
 #[test]
 fn f77_complex_statement_function_matches_blas_abssq_semantics() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=f77_complex_statement_function_matches_blas_abssq_semantics count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // BLAS-style statement function from stdlib_blas_level1.f90:
     //   abssq(t) = real(t)**2 + aimag(t)**2
     // For t=(3.0, 4.0) the result is 9 + 16 = 25.
@@ -33587,6 +38102,13 @@ fn f77_complex_statement_function_matches_blas_abssq_semantics() {
 
 #[test]
 fn nested_array_constructor_reshape_lowers_through_descriptor_path() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=nested_array_constructor_reshape_lowers_through_descriptor_path count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §7.8: nested array constructors flatten into the parent.
     // Stdlib's `example_cholesky` writes `reshape([[6,15,55], [15,55,225],
     // [55,225,979]], [3,3])` — without nested-AC support the lowering
@@ -33630,6 +38152,13 @@ fn nested_array_constructor_reshape_lowers_through_descriptor_path() {
 
 #[test]
 fn array_constructor_whole_array_expressions_flatten_full_size() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=array_constructor_whole_array_expressions_flatten_full_size count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §7.8: array-valued ac-values flatten into the parent
     // constructor. Stdlib_stats builds rank-3 fixtures with
     // `reshape([s, s * 2, s * 4], shape(s3))`; previously only `s`
@@ -33672,6 +38201,13 @@ fn array_constructor_whole_array_expressions_flatten_full_size() {
 
 #[test]
 fn mixed_numeric_array_binary_exprs_coerce_array_lanes() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=mixed_numeric_array_binary_exprs_coerce_array_lanes count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // Stdlib var_mask computes `res / (n - merge(1, 0, mask))`,
     // where `n` is real(:) and MERGE yields integer(:). Elemental
     // array arithmetic must load each operand with its own element
@@ -33713,6 +38249,13 @@ fn mixed_numeric_array_binary_exprs_coerce_array_lanes() {
 
 #[test]
 fn f77_statement_function_in_subroutine_inlines_per_scope() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=f77_statement_function_in_subroutine_inlines_per_scope count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // Statement function defined inside a CONTAINS subroutine. The
     // sub-scope's `cabs1` must not escape into a homonymous
     // statement function in another scope, and the call site must
@@ -33754,6 +38297,13 @@ fn f77_statement_function_in_subroutine_inlines_per_scope() {
 
 #[test]
 fn complex_re_im_designators_lower_to_correct_lane_and_dispatch_real_kind() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=complex_re_im_designators_lower_to_correct_lane_and_dispatch_real_kind count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2008 §6.2: c%re / c%im on a complex(k) value yield real(k).
     // Prior behavior:
     //   - lower_expr_full's ComponentAccess arm fell through to
@@ -33794,6 +38344,13 @@ fn complex_re_im_designators_lower_to_correct_lane_and_dispatch_real_kind() {
 
 #[test]
 fn f2008_submodule_explicit_iface_smp_body_split_file_runtime_shape_result() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=f2008_submodule_explicit_iface_smp_body_split_file_runtime_shape_result count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // Same logspace pattern as the single-file test but with the
     // submodule body in a SEPARATE compilation unit from the parent
     // module — the case stdlib actually uses (stdlib_math.F90 declares
@@ -33882,6 +38439,13 @@ fn f2008_submodule_explicit_iface_smp_body_split_file_runtime_shape_result() {
 
 #[test]
 fn amod_result_name_prefers_header_result_over_same_typed_locals() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=amod_result_name_prefers_header_result_over_same_typed_locals count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // Fortsh's expansion module has an allocatable character function
     // `expand_braces(...) result(expanded)` plus local allocatable
     // character scratch variables such as `start_str`. The .amod writer
@@ -34003,6 +38567,13 @@ fn amod_result_name_prefers_header_result_over_same_typed_locals() {
 
 #[test]
 fn f2008_submodule_explicit_iface_smp_body_with_runtime_shape_result() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=f2008_submodule_explicit_iface_smp_body_with_runtime_shape_result count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // Stdlib pattern (logspace, linspace, lapack/blas wrappers): parent
     // module has an `interface ... end interface` declaring a function
     // with explicit-shape result whose size depends on a dummy arg, and
@@ -34051,6 +38622,13 @@ fn f2008_submodule_explicit_iface_smp_body_with_runtime_shape_result() {
 
 #[test]
 fn user_op_dispatch_rank_filters_scalar_actual_to_scalar_specific() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=user_op_dispatch_rank_filters_scalar_actual_to_scalar_specific count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §12.4.4 / §15.5.2: when a user-defined operator has both a
     // scalar specific and a rank-1 array specific differing only in
     // the operand rank, dispatch must select the scalar specific for a
@@ -34128,6 +38706,13 @@ fn user_op_dispatch_rank_filters_scalar_actual_to_scalar_specific() {
 
 #[test]
 fn user_op_dispatch_recognises_derived_type_constructor_as_scalar() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=user_op_dispatch_recognises_derived_type_constructor_as_scalar count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2008 §4.5.10: a structure constructor `T(args)` always yields a
     // scalar of type T. The rank-aware specific dispatcher inspects the
     // actual argument's rank to discriminate between scalar and array
@@ -34208,6 +38793,13 @@ fn user_op_dispatch_recognises_derived_type_constructor_as_scalar() {
 
 #[test]
 fn defined_assignment_routes_constructor_and_literal_to_correct_specific() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=defined_assignment_routes_constructor_and_literal_to_correct_specific count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §10.2.1.4: defined-assignment dispatch is by declared TYPE
     // (and kind) of the dummies. Pre-fix the type-information used to
     // pick a specific had two holes:
@@ -34262,6 +38854,13 @@ fn defined_assignment_routes_constructor_and_literal_to_correct_specific() {
 
 #[test]
 fn defined_assignment_routes_generic_function_result_to_typed_specific() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=defined_assignment_routes_generic_function_result_to_typed_specific count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2008 §12.5.1: a generic function call resolves to a specific
     // by argument matching, and its return type is that specific's
     // result type. `assignment_expr_type_info` previously returned
@@ -34333,6 +38932,13 @@ fn defined_assignment_routes_generic_function_result_to_typed_specific() {
 
 #[test]
 fn type_bound_generic_dispatch_disambiguates_by_rank() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=type_bound_generic_dispatch_disambiguates_by_rank count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2008 §12.4.4.1: distinguishable specifics in a generic must
     // differ by rank or type of at least one passed-object argument.
     // `resolve_bound_proc_actuals` checks TypeInfo + IR-shape but
@@ -34383,6 +38989,13 @@ fn type_bound_generic_dispatch_disambiguates_by_rank() {
 
 #[test]
 fn substring_write_with_inline_ichar_of_same_component_substring() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=substring_write_with_inline_ichar_of_same_component_substring count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // Regression: `a%raw(i:i) = char(ichar(a%raw(i:i)) - 32)` for
     // `a%raw : character(:), allocatable` produced 5 garbage bytes
     // instead of "HELLO". `lower_string_expr_ctx`'s `char` arm called
@@ -34430,6 +39043,13 @@ fn substring_write_with_inline_ichar_of_same_component_substring() {
 
 #[test]
 fn char_intrinsic_not_captured_by_unrelated_character_dummy() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=char_intrinsic_not_captured_by_unrelated_character_dummy count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // `char(1)` in character context parses with the same AST shape as
     // `some_string(1)`. A wrong-scope character dummy named `char`
     // must not make substring lowering steal the intrinsic call.
@@ -34463,6 +39083,13 @@ fn char_intrinsic_not_captured_by_unrelated_character_dummy() {
 
 #[test]
 fn ishft_negative_shift_on_negative_int16_returns_logical_shift() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=ishft_negative_shift_on_negative_int16_returns_logical_shift count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §16.9.95: ISHFT does a *logical* shift on the bit
     // representation of the integer. For a negative int8/int16 value
     // sign-extended into the AArch64 32-bit register
@@ -34510,6 +39137,13 @@ fn ishft_negative_shift_on_negative_int16_returns_logical_shift() {
 
 #[test]
 fn int64_array_scalar_broadcast_init_clears_upper_half() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=int64_array_scalar_broadcast_init_clears_upper_half count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // Regression: `integer(int64) :: counts(-128:127); counts(:) = 0`
     // emitted a broadcast loop that stored an i32 zero at every
     // 8-byte stride, leaving the upper 4 bytes of each i64 slot with
@@ -34556,6 +39190,13 @@ fn int64_array_scalar_broadcast_init_clears_upper_half() {
 
 #[test]
 fn nested_call_chain_with_array_section_args_keeps_frame_bounded() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=nested_call_chain_with_array_section_args_keeps_frame_bounded count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // Regression: `array_function_result_elem_type` called
     // `generic_dispatch_probe_value` on every argument before
     // checking whether the callee even returns an array.  Each
@@ -34645,6 +39286,13 @@ fn nested_call_chain_with_array_section_args_keeps_frame_bounded() {
 
 #[test]
 fn allocate_deferred_char_writes_zero_to_stat() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocate_deferred_char_writes_zero_to_stat count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §9.7.1.3: after a successful ALLOCATE the stat-variable
     // must equal zero. The deferred-length character paths in
     // lower_allocate (both the bare-name and the
@@ -34696,6 +39344,13 @@ fn allocate_deferred_char_writes_zero_to_stat() {
 
 #[test]
 fn user_generic_named_char_shadows_intrinsic_in_string_context() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=user_generic_named_char_shadows_intrinsic_in_string_context count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2008 §13.7: a user-defined function or generic interface with
     // the same name as an intrinsic shadows the intrinsic. The
     // integer-context dispatch already gated `lower_char_intrinsic`
@@ -34742,6 +39397,13 @@ fn user_generic_named_char_shadows_intrinsic_in_string_context() {
 
 #[test]
 fn strided_section_scalar_broadcast_writes_every_strided_slot() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=strided_section_scalar_broadcast_writes_every_strided_slot count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // Regression: `arr(1::7) = SCALAR` for a fixed-shape integer
     // array only wrote arr(1), leaving arr(8), arr(15) untouched.
     // Same family across allocatable real/integer/logical arrays.
@@ -34797,6 +39459,13 @@ fn strided_section_scalar_broadcast_writes_every_strided_slot() {
 
 #[test]
 fn declared_init_reshape_populates_fixed_shape_stack_array() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=declared_init_reshape_populates_fixed_shape_stack_array count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §16.9.169 RESHAPE used as a declared initializer for a
     // fixed-shape rank-2+ stack array. Pre-fix `init_decls` only
     // handled `Expr::ArrayConstructor` and bare scalar literal
@@ -34843,6 +39512,13 @@ fn declared_init_reshape_populates_fixed_shape_stack_array() {
 
 #[test]
 fn use_only_does_not_leak_unrelated_generic_specifics_into_user_scope() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=use_only_does_not_leak_unrelated_generic_specifics_into_user_scope count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2008 §11.2.3: `use M, only: x` brings only `x` into scope. It
     // must NOT make M's same-named generic interfaces visible — even
     // implicitly via transitive USE-chain walks. Pre-fix
@@ -34934,6 +39610,13 @@ fn use_only_does_not_leak_unrelated_generic_specifics_into_user_scope() {
 
 #[test]
 fn defined_assignment_class_lhs_loads_descriptor_pointer_through_slot() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=defined_assignment_class_lhs_loads_descriptor_pointer_through_slot count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2008 §7.2.1 / §15.5.2: a defined-assignment specific receiving
     // `class(T), intent(inout) :: to` expects the caller to pass the
     // 384-byte descriptor pointer for `to`. `try_defined_assignment`
@@ -34979,6 +39662,13 @@ fn defined_assignment_class_lhs_loads_descriptor_pointer_through_slot() {
 
 #[test]
 fn print_tbp_returning_allocatable_char_writes_full_string() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=print_tbp_returning_allocatable_char_writes_full_string count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2008 §4.5.4 TBP call inline in PRINT: `print *, e%method()` where
     // method returns `character(len=:), allocatable :: r`. Pre-fix the
     // print-path's char-expression check (`expr_is_character_expr`)
@@ -35020,6 +39710,13 @@ fn print_tbp_returning_allocatable_char_writes_full_string() {
 
 #[test]
 fn amod_proc_attrs_split_preserves_result_array_bounds_with_inner_comma() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=amod_proc_attrs_split_preserves_result_array_bounds_with_inner_comma count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // Regression: stdlib_math_linspace's `linspace_n_1_cdp_cdp` is the
     // abbreviated SMP body form
     //   module procedure gen_cdp
@@ -35114,6 +39811,13 @@ fn amod_proc_attrs_split_preserves_result_array_bounds_with_inner_comma() {
 
 #[test]
 fn cmplx_whole_array_with_kind_keyword_returns_correct_kind_descriptor() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=cmplx_whole_array_with_kind_keyword_returns_correct_kind_descriptor count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §16.9.43: CMPLX(re, im, kind) is elemental — applied to
     // real arrays it yields a complex array of the requested kind.
     // Prior behavior: the assignment `res = cmplx(x, y, kind=dp)`
@@ -35155,6 +39859,13 @@ fn cmplx_whole_array_with_kind_keyword_returns_correct_kind_descriptor() {
 
 #[test]
 fn stdlib_style_complex_arg_preserves_literal_and_array_kinds() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=stdlib_style_complex_arg_preserves_literal_and_array_kinds count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // Stdlib's arg/argd/argpi implementations combine two edge cases:
     // `(0.0_dp, 0.5_dp)` must lower as complex(dp), and
     // `exp(cmplx(0.0_kind, theta(:), kind=kind))` must materialize the
@@ -35227,6 +39938,13 @@ end program
 
 #[test]
 fn default_cmplx_array_assignment_converts_lanes_to_complex_dp() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=default_cmplx_array_assignment_converts_lanes_to_complex_dp count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // Stdlib's `test_swap_cdp` initializes complex(dp) arrays from
     // default-kind CMPLX array expressions before calling the generic
     // elemental `swap`. The descriptor assignment must widen each real
@@ -35267,6 +39985,13 @@ fn default_cmplx_array_assignment_converts_lanes_to_complex_dp() {
 
 #[test]
 fn elemental_character_array_swap_and_constructor_equality_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=elemental_character_array_swap_and_constructor_equality_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // Stdlib's `test_swap_str` calls an elemental character(*) swap over
     // character arrays, then checks the result with ALL(array == constructor).
     // The elemental wrapper must copy fixed-length character elements through
@@ -35302,6 +40027,13 @@ fn elemental_character_array_swap_and_constructor_equality_runs() {
 
 #[test]
 fn elemental_derived_string_array_swap_uses_defined_assignment_and_operator() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=elemental_derived_string_array_swap_uses_defined_assignment_and_operator count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // Stdlib's `test_swap_stt` initializes string_type arrays from
     // character constructors, swaps them through an elemental generic
     // subroutine, and validates with ALL(array == character-constructor).
@@ -35338,6 +40070,13 @@ fn elemental_derived_string_array_swap_uses_defined_assignment_and_operator() {
 
 #[test]
 fn block_use_defined_assignment_survives_prior_generic_import_from_amod() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=block_use_defined_assignment_survives_prior_generic_import_from_amod count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("block_use_assignment_import_order");
     let string_src = write_program_in(
         &dir,
@@ -35418,6 +40157,13 @@ fn block_use_defined_assignment_survives_prior_generic_import_from_amod() {
 
 #[test]
 fn stdlib_style_string_array_swap_routes_nested_defined_gt() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=stdlib_style_string_array_swap_routes_nested_defined_gt count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // stdlib_string_type's `operator(==)` is written in terms of its
     // user-defined `operator(>)` overloads. Lowering must resolve those nested
     // derived/character comparisons before the intrinsic character shortcut,
@@ -35452,6 +40198,13 @@ fn stdlib_style_string_array_swap_routes_nested_defined_gt() {
 
 #[test]
 fn complex_array_power_loads_exponent_elements_not_descriptor() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=complex_array_power_loads_exponent_elements_not_descriptor count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // Surfaced by stdlib_math's logspace_1_cdp_n_rbase:
     //   res = base ** exponents
     // where `base` is a real scalar and `exponents` is complex(dp)(:).
@@ -35490,6 +40243,13 @@ fn complex_array_power_loads_exponent_elements_not_descriptor() {
 
 #[test]
 fn allocate_source_from_strided_section_walks_per_element() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocate_source_from_strided_section_walks_per_element count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §9.7.1.2: ALLOCATE(dest, source = strided_section) must
     // populate dest by reading the source per-element via the
     // section's per-dim memory stride, not by a flat memcpy of
@@ -35529,6 +40289,13 @@ fn allocate_source_from_strided_section_walks_per_element() {
 
 #[test]
 fn random_number_on_array_fills_every_element() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=random_number_on_array_fills_every_element count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §16.9.171: RANDOM_NUMBER(harvest) fills harvest with
     // independent draws from [0,1). The intrinsic-subroutine lowering
     // dispatched all real-kind harvests to the scalar runtime
@@ -35567,6 +40334,13 @@ fn random_number_on_array_fills_every_element() {
 
 #[test]
 fn allocatable_array_component_passed_to_assumed_size_unwraps_descriptor() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_array_component_passed_to_assumed_size_unwraps_descriptor count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §15.5.2.4: when an allocatable rank-N array component
     // (e.g. `c%idx` where `idx` is `integer, allocatable :: idx(:,:)`)
     // is passed to a by-ref dummy declared assumed-size or
@@ -35608,6 +40382,13 @@ fn allocatable_array_component_passed_to_assumed_size_unwraps_descriptor() {
 
 #[test]
 fn allocatable_rank2_section_row_assignment_uses_columnmajor_stride() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_rank2_section_row_assignment_uses_columnmajor_stride count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §6.5.3: section assignment to a "row" of a column-major
     // allocatable matrix (e.g. `a(1,:) = [...]`) must step through
     // memory by the column extent, not contiguously. The compiler
@@ -35651,6 +40432,13 @@ fn allocatable_rank2_section_row_assignment_uses_columnmajor_stride() {
 
 #[test]
 fn negative_stride_section_assignment_snapshots_overlapping_rhs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=negative_stride_section_assignment_snapshots_overlapping_rhs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // stdlib_selection initializes its quickselect fixture with negative-stride
     // overlapping assignments such as `x(5:2:-1) = x(2:5)`. Fortran assignment
     // semantics require the RHS values to be evaluated before the LHS section
@@ -35686,6 +40474,13 @@ fn negative_stride_section_assignment_snapshots_overlapping_rhs() {
 
 #[test]
 fn allocate_stat_int64_writes_back_to_user_variable() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocate_stat_int64_writes_back_to_user_variable count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §9.7.1.3: STAT= variable receives the allocate status.
     // Runtime writes an i32; when the user's variable is a wider
     // integer kind (e.g. integer(int64), as in stdlib_sorting where
@@ -35725,6 +40520,13 @@ fn allocate_stat_int64_writes_back_to_user_variable() {
 
 #[test]
 fn rank2_section_with_vector_subscript_gathers_into_fresh_descriptor() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=rank2_section_with_vector_subscript_gathers_into_fresh_descriptor count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // F2018 §9.5.3.3: a section like `A(:, pivots)` where one subscript
     // is a range and another is a rank-1 integer array (vector subscript)
     // must produce a rank-2 result whose dim 1 is permuted/gathered by
@@ -35764,6 +40566,13 @@ fn rank2_section_with_vector_subscript_gathers_into_fresh_descriptor() {
 
 #[test]
 fn rank2_vector_subscript_assignment_scatters_array_rhs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=rank2_vector_subscript_assignment_scatters_array_rhs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  integer :: connectivity(3,3), locdof(3), i\n  real :: dense(5,5), mat(3,3)\n  connectivity(1:3,1) = [1,2,3]\n  connectivity(1:3,2) = [2,3,4]\n  connectivity(1:3,3) = [3,4,5]\n  mat(:,1) = [1,2,3]\n  mat(:,2) = [2,1,4]\n  mat(:,3) = [3,4,1]\n  dense = 0.0\n  do i = 1, 3\n    locdof(1:3) = connectivity(1:3,i)\n    dense(locdof,locdof) = dense(locdof,locdof) + mat\n  end do\n  if (abs(dense(1,1) - 1.0) > 1.0e-6) error stop 1\n  if (abs(dense(2,2) - 2.0) > 1.0e-6) error stop 2\n  if (abs(dense(3,3) - 3.0) > 1.0e-6) error stop 3\n  if (abs(dense(3,2) - 6.0) > 1.0e-6) error stop 4\n  print *, 'ok'\nend program\n",
         "f90",
@@ -35794,6 +40603,13 @@ fn rank2_vector_subscript_assignment_scatters_array_rhs() {
 
 #[test]
 fn rank1_vector_subscript_assignment_scatters_array_rhs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=rank1_vector_subscript_assignment_scatters_array_rhs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  integer(8), parameter :: dim_range(3) = [1_8, 2_8, 3_8]\n  integer(8) :: iperm(3), perm(3), spack(3), s(3)\n  s = [3_8, 2_8, 4_8]\n  perm = [2_8, pack(dim_range, dim_range /= 2_8)]\n  iperm = -9_8\n  iperm(perm) = dim_range\n  spack = s(perm)\n  if (any(iperm /= [2_8, 1_8, 3_8])) error stop 1\n  if (any(spack /= [2_8, 3_8, 4_8])) error stop 2\n  print *, 'ok'\nend program\n",
         "f90",
@@ -35824,6 +40640,13 @@ fn rank1_vector_subscript_assignment_scatters_array_rhs() {
 
 #[test]
 fn generic_literal_kind_suffix_uses_current_block_parameter() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=generic_literal_kind_suffix_uses_current_block_parameter count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  private\n  public :: is_close\n  interface is_close\n    module procedure is_close_rsp\n    module procedure is_close_rdp\n  end interface\ncontains\n  elemental logical function is_close_rsp(a, b) result(close)\n    real(4), intent(in) :: a, b\n    close = abs(a - b) < 1.0e-5_4\n  end function\n  elemental logical function is_close_rdp(a, b) result(close)\n    real(8), intent(in) :: a, b\n    close = abs(a - b) < 1.0e-12_8\n  end function\nend module\nprogram p\n  use m, only: is_close\n  implicit none\n  integer, parameter :: sp = 4\n  integer, parameter :: dp = 8\n  block\n    integer, parameter :: wp = sp\n    real(sp), allocatable :: amat(:,:)\n    allocate(amat(1,1))\n    amat(1,1) = 5.0_wp\n    if (.not. is_close(amat(1,1), 5.0_wp)) error stop 1\n  end block\n  block\n    integer, parameter :: wp = dp\n    real(dp), allocatable :: amat(:,:)\n    allocate(amat(1,1))\n    amat(1,1) = 5.0_wp\n    if (.not. is_close(amat(1,1), 5.0_wp)) error stop 2\n  end block\n  print *, 'ok'\nend program\n",
         "f90",
@@ -35854,6 +40677,13 @@ fn generic_literal_kind_suffix_uses_current_block_parameter() {
 
 #[test]
 fn generic_character_substring_actual_uses_local_character_type() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=generic_character_substring_actual_uses_local_character_type count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  private\n  public :: run\n  interface swap\n    module procedure swap_int8\n    module procedure swap_str\n  end interface\ncontains\n  elemental subroutine swap_int8(lhs, rhs)\n    integer(1), intent(inout) :: lhs, rhs\n    integer(1) :: tmp\n    tmp = lhs; lhs = rhs; rhs = tmp\n  end subroutine\n  elemental subroutine swap_str(lhs, rhs)\n    character(*), intent(inout) :: lhs, rhs\n    character(len=max(len(lhs), len(rhs))) :: tmp\n    tmp = lhs; lhs = rhs; rhs = tmp\n  end subroutine\n  subroutine pollute\n    integer(1) :: x(2), y(2)\n    x = [1_1, 2_1]\n    y = [3_1, 4_1]\n    call swap(x, y)\n  end subroutine\n  subroutine run\n    character(4) :: x\n    character(6) :: y\n    x = 'abcd'\n    y = 'efghij'\n    call swap(x, y(1:4))\n    if (x /= 'efgh') error stop 1\n    if (y /= 'abcdij') error stop 2\n  end subroutine\nend module\nprogram p\n  use m, only: run\n  call run\n  print *, 'ok'\nend program\n",
         "f90",
@@ -35874,6 +40704,13 @@ fn generic_character_substring_actual_uses_local_character_type() {
 
 #[test]
 fn generic_actual_all_of_defined_operator_has_logical_type() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=generic_actual_all_of_defined_operator_has_logical_type count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  private\n  public :: run\n  type :: string_type\n    character(5) :: raw\n  end type\n  interface operator(==)\n    module procedure eq_string_char\n  end interface\n  interface check\n    module procedure check_logical\n    module procedure check_integer\n  end interface\ncontains\n  elemental logical function eq_string_char(lhs, rhs) result(ok)\n    type(string_type), intent(in) :: lhs\n    character(*), intent(in) :: rhs\n    ok = lhs%raw == rhs\n  end function\n  subroutine check_logical(ok)\n    logical, intent(in) :: ok\n    if (.not. ok) error stop 10\n  end subroutine\n  subroutine check_integer(value)\n    integer, intent(in) :: value\n    error stop value\n  end subroutine\n  subroutine run\n    type(string_type) :: x(2)\n    x(1)%raw = 'abcde'\n    x(2)%raw = 'fghij'\n    call check(all(x == ['abcde','fghij']))\n  end subroutine\nend module\nprogram p\n  use m, only: run\n  call run\n  print *, 'ok'\nend program\n",
         "f90",
@@ -35894,6 +40731,13 @@ fn generic_actual_all_of_defined_operator_has_logical_type() {
 
 #[test]
 fn imported_generic_all_of_ranked_function_comparison_is_scalar() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_generic_all_of_ranked_function_comparison_is_scalar count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("generic_all_ranked_result");
     let stats = write_program_in(
         &dir,
@@ -35940,6 +40784,13 @@ fn imported_generic_all_of_ranked_function_comparison_is_scalar() {
 
 #[test]
 fn imported_generic_keyword_actual_does_not_skip_required_formal() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_generic_keyword_actual_does_not_skip_required_formal count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("generic_keyword_required_slot");
     let stats = write_program_in(
         &dir,
@@ -36017,6 +40868,13 @@ fn local_generic_gamma_falls_back_to_intrinsic_for_real_actual() {
 
 #[test]
 fn generic_callee_type_ignores_unrelated_same_name_data_symbol() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=generic_callee_type_ignores_unrelated_same_name_data_symbol count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  private\n  public :: run\n  interface arg\n    module procedure arg_sp\n    module procedure arg_dp\n  end interface\n  interface check\n    module procedure check_logical\n    module procedure check_integer\n  end interface\ncontains\n  elemental real(4) function arg_sp(z) result(result)\n    complex(4), intent(in) :: z\n    result = 0.5_4\n  end function\n  elemental real(8) function arg_dp(z) result(result)\n    complex(8), intent(in) :: z\n    result = 0.5_8\n  end function\n  subroutine check_logical(ok, message)\n    logical, intent(in) :: ok\n    character(*), intent(in), optional :: message\n    if (.not. ok) error stop 10\n  end subroutine\n  subroutine check_integer(value, message)\n    integer, intent(in) :: value\n    character(*), intent(in), optional :: message\n    error stop value\n  end subroutine\n  subroutine pollute\n    character(:), allocatable :: arg\n    arg = 'not the generic'\n  end subroutine\n  subroutine run\n    real(4), parameter :: tol = 1.0e-4_4\n    call check(abs(arg(2*exp((0.0_4, 0.5_4))) - 0.5_4) < tol, 'test_nonzero_scalar')\n  end subroutine\nend module\nprogram p\n  use m, only: run\n  call run\n  print *, 'ok'\nend program\n",
         "f90",
@@ -36047,6 +40905,13 @@ fn generic_callee_type_ignores_unrelated_same_name_data_symbol() {
 
 #[test]
 fn callable_generic_not_treated_as_character_substring_by_unrelated_data_symbol() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=callable_generic_not_treated_as_character_substring_by_unrelated_data_symbol count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module polluter\n  implicit none\n  character(:), allocatable :: arg\n  integer :: keep = 0\nend module\nmodule math_like\n  implicit none\n  private\n  public :: arg\n  interface arg\n    module procedure arg_sp\n  end interface\ncontains\n  elemental real(4) function arg_sp(z) result(result)\n    complex(4), intent(in) :: z\n    result = 0.5_4\n  end function\nend module\nmodule check_like\n  implicit none\n  private\n  public :: check\n  interface check\n    module procedure check_logical\n  end interface\ncontains\n  subroutine check_logical(ok, message)\n    logical, intent(in) :: ok\n    character(*), intent(in), optional :: message\n    if (.not. ok) error stop 10\n  end subroutine\nend module\nmodule run_mod\n  use polluter, only: keep\n  use math_like, only: arg\n  use check_like, only: check\n  implicit none\ncontains\n  subroutine run\n    real(4), parameter :: tol = 1.0e-4_4\n    call check(abs(arg(2*exp((0.0_4, 0.5_4))) - 0.5_4) < tol, 'test_nonzero_scalar')\n  end subroutine\nend module\nprogram p\n  use run_mod, only: run\n  call run\n  print *, 'ok'\nend program\n",
         "f90",
@@ -36077,6 +40942,13 @@ fn callable_generic_not_treated_as_character_substring_by_unrelated_data_symbol(
 
 #[test]
 fn generic_optional_character_concat_probe_matches_character_dummy() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=generic_optional_character_concat_probe_matches_character_dummy count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  private\n  public :: run\n  type :: error_type\n    integer :: code = 0\n  end type\n  type :: bitset_like\n  contains\n    procedure :: bits\n  end type\n  interface check\n    module procedure check_int\n    module procedure check_logical\n  end interface\ncontains\n  integer function bits(self) result(n)\n    class(bitset_like), intent(in) :: self\n    n = 0\n  end function\n  subroutine check_int(error, actual, expected, message)\n    type(error_type), allocatable, intent(out) :: error\n    integer, intent(in) :: actual, expected\n    character(*), intent(in), optional :: message\n    if (actual /= expected) allocate(error)\n  end subroutine\n  subroutine check_logical(error, expression, message)\n    type(error_type), allocatable, intent(out) :: error\n    logical, intent(in) :: expression\n    character(*), intent(in), optional :: message\n    if (.not. expression) allocate(error)\n  end subroutine\n  subroutine run\n    type(error_type), allocatable :: error\n    type(bitset_like) :: set\n    call check(error, set%bits(), 0, 'bit count ' // 'message')\n    if (allocated(error)) error stop 1\n  end subroutine\nend module\nprogram p\n  use m, only: run\n  call run\n  print *, 'ok'\nend program\n",
         "f90",
@@ -36107,6 +40979,13 @@ fn generic_optional_character_concat_probe_matches_character_dummy() {
 
 #[test]
 fn size_kind_argument_drives_generic_integer_kind() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=size_kind_argument_drives_generic_integer_kind count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  private\n  public :: run\n  interface take\n    module procedure take_i1\n    module procedure take_i4\n  end interface\ncontains\n  subroutine take_i1(k, out)\n    integer(1), intent(in) :: k\n    integer(1), intent(out) :: out\n    out = k\n  end subroutine\n  subroutine take_i4(k, out)\n    integer(4), intent(in) :: k\n    integer(4), intent(out) :: out\n    out = k\n  end subroutine\n  subroutine run\n    integer, parameter :: ip = 1\n    integer(1) :: a(5), out\n    call take(size(a, kind=ip) + 1_ip - 4_ip, out)\n    if (out /= 2_1) error stop 1\n  end subroutine\nend module\nprogram p\n  use m, only: run\n  call run\n  print *, 'ok'\nend program\n",
         "f90",
@@ -36137,6 +41016,13 @@ fn size_kind_argument_drives_generic_integer_kind() {
 
 #[test]
 fn imported_generic_subroutine_shadows_intrinsic_subroutine() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_generic_subroutine_shadows_intrinsic_subroutine count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module m\n  implicit none\n  interface random_seed\n    module procedure seed_i1\n    module procedure seed_i4\n  end interface\ncontains\n  subroutine seed_i1(put, get)\n    integer(1), intent(in) :: put\n    integer(1), intent(out) :: get\n    get = -9_1\n  end subroutine\n\n  subroutine seed_i4(put, get)\n    integer, intent(in) :: put\n    integer, intent(out) :: get\n    get = put + 7\n  end subroutine\nend module\nprogram p\n  use m, only: random_seed\n  implicit none\n  integer :: seed, got\n  seed = 5\n  got = -1\n  call random_seed(seed, got)\n  if (got /= 12) error stop 1\n  print *, 'ok'\nend program\n",
         "f90",
@@ -36267,7 +41153,11 @@ fn target_flag_x86_64_frontend_modes_still_work() {
         String::from_utf8_lossy(&out.stderr)
     );
     let ir_text = fs::read_to_string(&ir).expect("cannot read emitted IR");
-    assert!(ir_text.contains("module"), "IR output looks wrong: {}", ir_text);
+    assert!(
+        ir_text.contains("module"),
+        "IR output looks wrong: {}",
+        ir_text
+    );
 
     let _ = fs::remove_file(&src);
     let _ = fs::remove_file(&ir);
@@ -36275,6 +41165,13 @@ fn target_flag_x86_64_frontend_modes_still_work() {
 
 #[test]
 fn shadowed_intrinsic_fallback_lowers_real_actual_not_generic_probe() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=shadowed_intrinsic_fallback_lowers_real_actual_not_generic_probe count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "module special_like\n  implicit none\n  private\n  public :: real_log_gamma\n  interface log_gamma\n    module procedure l_gamma_iint32\n  end interface\ncontains\n  elemental real(8) function l_gamma_iint32(z) result(res)\n    integer, intent(in) :: z\n    res = real(z, 8) + 0.25_8\n  end function\n  real(4) function real_log_gamma(x) result(res)\n    real(4), intent(in) :: x\n    res = log_gamma(x)\n  end function\nend module\nprogram p\n  use special_like, only: real_log_gamma\n  implicit none\n  real(4) :: got\n  got = real_log_gamma(2.5_4)\n  if (abs(got - 0.28468287_4) > 1.0e-5_4) error stop 1\n  print *, 'ok'\nend program\n",
         "f90",
@@ -36314,7 +41211,10 @@ fn std_f2023_accepted_and_compiles_like_default() {
 
     for (flags, out) in [
         (vec!["--target", "arm64-macos", "-S"], &asm_default),
-        (vec!["--target", "arm64-macos", "-S", "--std=f2023"], &asm_f2023),
+        (
+            vec!["--target", "arm64-macos", "-S", "--std=f2023"],
+            &asm_f2023,
+        ),
     ] {
         let r = Command::new(compiler("armfortas"))
             .args(&flags)

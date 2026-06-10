@@ -3,20 +3,22 @@
 Pre-existing failure surfaced during sprint-gate runs on nomad
 (2026-06-10), NOT caused by x00/l00 (reproduces on a trunk+x00 tree):
 
-- `cargo test -p afs-as --test clang_probe_dashboard` fails on nomad
-  (macOS 26.4.1, Apple clang 21.0.0): case `ext_byte_ptr` at O2 links
-  but **runs with the wrong value** (`run` column `--`; the driver's
-  `read_ext_byte3() != 77` check fails). clang 21 emits
-  `.loh AdrpLdrGotLdr` for the adrp/ldr-got/ldrb chain
+- `cargo test -p afs-as --test clang_probe_dashboard` is **flaky** on
+  nomad (macOS 26.4.1, Apple clang 21.0.0): observed 2-of-3 over serial
+  runs on 2026-06-10 (failed on the l00 tree and on a trunk+x00 tree,
+  then passed in a full `--no-fail-fast` workspace run). Failing case:
+  `ext_byte_ptr` at O2 links but **runs with the wrong value** (`run`
+  column `--`; the driver's `read_ext_byte3() != 77` check fails).
+  clang 21 emits `.loh AdrpLdrGotLdr` for the adrp/ldr-got/ldrb chain
   (`_ext_bytes@GOTPAGE` → deref → `ldrb w0, [x8, #3]`). Working
-  hypothesis: afs-as forwards the LOH with wrong instruction offsets and
-  the macOS 26 `ld` applies the optimization to the wrong instructions —
-  a silent miscompile of exactly the class the differential suite
-  exists to catch. Needs an afs-as reduction (assemble nomad's clang-21
-  .s with afs-as vs system `as`, diff the `__DATA,__loh`/LC linkedit LOH
-  payload, and run both). Until fixed, the full workspace gate on nomad
-  reports this one suite red; CI's macos-latest clang may or may not
-  reproduce depending on its clang version.
+  hypothesis: afs-as forwards the LOH with wrong instruction offsets
+  and the macOS 26 `ld` applies the optimization to the wrong
+  instructions; intermittence suggests layout/address-dependence
+  (ASLR, ld section ordering) or a probe-harness race. A flaky
+  wrong-value differential is the worst failure class — needs an
+  afs-as reduction (assemble nomad's clang-21 .s with afs-as vs system
+  `as`, diff the LOH linkedit payload, run both, repeatedly). Not
+  caused by x00/l00.
 
 Deferred items from the l00 F2023 inventory (2026-06-10):
 

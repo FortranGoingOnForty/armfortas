@@ -86,6 +86,13 @@ fn call_arg_counts_for(func_section: &str, callee_name: &str) -> Vec<usize> {
 
 #[test]
 fn o2_specializes_constant_dummy_and_trims_internal_calls() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=ipo_const_arg test=o2_specializes_constant_dummy_and_trims_internal_calls count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let source = fixture("ipo_const_arg.f90");
 
     let raw_ir = capture_text(

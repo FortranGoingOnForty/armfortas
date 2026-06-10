@@ -64,6 +64,13 @@ fn run_with_timeout(path: &std::path::Path) -> Output {
 
 #[test]
 fn named_exit_and_cycle_target_nested_constructs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=control_flow_runtime test=named_exit_and_cycle_target_nested_constructs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  integer :: i, j, sum\n  sum = 0\nouter: do i = 1, 4\n  inner: do j = 1, 4\n    if (j == 2) cycle inner\n    if (i == 3 .and. j == 4) exit outer\n    sum = sum + i * 10 + j\n  end do inner\nend do outer\nprint *, sum\nend program\n",
         "f90",
@@ -102,6 +109,13 @@ fn named_exit_and_cycle_target_nested_constructs() {
 
 #[test]
 fn character_select_case_matches_expected_arm() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=control_flow_runtime test=character_select_case_matches_expected_arm count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  integer :: code\n  character(len=8) :: cmd\n  cmd = 'help'\n  code = dispatch(cmd)\n  if (code /= 2) error stop 1\n  cmd = 'exit'\n  code = dispatch(cmd)\n  if (code /= 1) error stop 2\n  cmd = 'other'\n  code = dispatch(cmd)\n  if (code /= 3) error stop 3\n  print *, 99\ncontains\n  integer function dispatch(cmd) result(code)\n    character(len=*), intent(in) :: cmd\n    select case (trim(cmd))\n    case ('quit', 'exit')\n      code = 1\n    case ('help')\n      code = 2\n    case default\n      code = 3\n    end select\n  end function dispatch\nend program\n",
         "f90",
@@ -140,6 +154,13 @@ fn character_select_case_matches_expected_arm() {
 
 #[test]
 fn logical_and_or_short_circuit_in_expression_values() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=control_flow_runtime test=logical_and_or_short_circuit_in_expression_values count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  logical :: x, y\n  x = .false. .and. boom()\n  y = .true. .or. boom()\n  if (x) error stop 1\n  if (.not. y) error stop 2\n  print *, 77\ncontains\n  logical function boom()\n    error stop 7\n  end function boom\nend program\n",
         "f90",
@@ -178,6 +199,13 @@ fn logical_and_or_short_circuit_in_expression_values() {
 
 #[test]
 fn runtime_zero_step_do_fails_loudly_instead_of_hanging() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=control_flow_runtime test=runtime_zero_step_do_fails_loudly_instead_of_hanging count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  integer :: i, step\n  step = 0\n  do i = 1, 10, step\n    print *, i\n  end do\n  print *, 88\nend program\n",
         "f90",
@@ -211,6 +239,13 @@ fn runtime_zero_step_do_fails_loudly_instead_of_hanging() {
 
 #[test]
 fn case_default_runs_only_after_other_cases_fail() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=control_flow_runtime test=case_default_runs_only_after_other_cases_fail count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
         "program p\n  implicit none\n  integer :: x\n  x = 2\n  select case (x)\n  case default\n    print *, 0\n  case (2)\n    print *, 2\n  end select\nend program\n",
         "f90",
