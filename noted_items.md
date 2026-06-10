@@ -1,5 +1,54 @@
 # Noted Items
 
+Pre-existing failure surfaced during sprint-gate runs on nomad
+(2026-06-10), NOT caused by x00/l00 (reproduces on a trunk+x00 tree):
+
+- `cargo test -p afs-as --test clang_probe_dashboard` fails on nomad
+  (macOS 26.4.1, Apple clang 21.0.0): case `ext_byte_ptr` at O2 links
+  but **runs with the wrong value** (`run` column `--`; the driver's
+  `read_ext_byte3() != 77` check fails). clang 21 emits
+  `.loh AdrpLdrGotLdr` for the adrp/ldr-got/ldrb chain
+  (`_ext_bytes@GOTPAGE` → deref → `ldrb w0, [x8, #3]`). Working
+  hypothesis: afs-as forwards the LOH with wrong instruction offsets and
+  the macOS 26 `ld` applies the optimization to the wrong instructions —
+  a silent miscompile of exactly the class the differential suite
+  exists to catch. Needs an afs-as reduction (assemble nomad's clang-21
+  .s with afs-as vs system `as`, diff the `__DATA,__loh`/LC linkedit LOH
+  payload, and run both). Until fixed, the full workspace gate on nomad
+  reports this one suite red; CI's macos-latest clang may or may not
+  reproduce depending on its clang version.
+
+Deferred items from the l00 F2023 inventory (2026-06-10):
+
+- `! FLAGS:` landed in the root harness (run_programs) but is not yet
+  consumed by bencch; per the one-dialect rule bencch must either apply
+  it or clearly report it unsupported. Today bencch only parses
+  `! CHECK:` (`bencch/bench/src/lib.rs:4866`), so a shared fixture with
+  FLAGS would compile without its flags and could silently diverge.
+- `USE <intrinsic-module>, ONLY: name` does not validate `name`:
+  `use iso_fortran_env, only: zzz_not_a_thing` compiles silently.
+- Implicit external function calls are accepted in constant contexts:
+  `integer, parameter :: lk = selected_logical_kind(8)` compiled to a
+  runtime call in a parameter initializer before l04 lands the
+  intrinsic. Should be a hard error independent of F2023.
+- OPEN/WRITE specifier keywords are not validated against the supported
+  set (`open(..., leading_zero='suppress')` accepted with no
+  implementation behind it).
+- `lbound` on a rank-remapped pointer lowered to an external
+  `call @lbound` instead of descriptor reads (l00 probe 22); confirmed on
+  nomad — links fail with `_lbound` undefined. Needs a reduction
+  independent of F2023.
+- The runtime format parser accepts unknown edit-descriptor sequences
+  without raising an I/O error: `'(at)'` printed untrimmed text,
+  `'(lzs, f6.2)'` printed nothing, both exit 0 (nomad, 2026-06-10).
+  Bites typo'd formats today; l05 makes unknown descriptors a runtime
+  error as part of the AT/LZ work.
+- F2023-syntax collisions producing silent wrong answers today (accepted
+  and mis-lowered, garbage at runtime): `real :: a([2,3])` (R818),
+  `allocate(x([2,3]))` (R937), pointer rank-remapping with array bounds.
+  Details in `.docs/audits/f2023-feature-matrix.md`; owned by l01 —
+  until then these spellings corrupt silently rather than erroring.
+
 Deferred items that came up while finishing Sprint 29.10 cleanup work and
 starting the full Sprint 29 audit:
 
