@@ -135,6 +135,7 @@ pub fn regalloc_naive(f: &mut X86Function) {
             // Mem{base: scratch} instead of Reg(scratch) — a Reg there
             // would print a register move, not a memory access.
             let addr_position = addr_operand_position(&inst);
+            let (xmm_use_width, xmm_def_width) = xmm_width_override(inst.opcode);
             for (i, op) in inst.operands.iter_mut().enumerate() {
                 if tied && i == 0 {
                     continue;
@@ -147,6 +148,8 @@ pub fn regalloc_naive(f: &mut X86Function) {
                         // of the instruction's operand size.
                         let load_size = if Some(i) == addr_position {
                             OpSize::Q
+                        } else if v.class == X86RegClass::Xmm {
+                            xmm_use_width.unwrap_or(inst.size)
                         } else {
                             inst.size
                         };
@@ -204,10 +207,35 @@ pub fn regalloc_naive(f: &mut X86Function) {
             let size = inst.size;
             out.push(inst);
             if let Some((scratch, class, slot)) = def_store {
-                out.push(store(scratch, class, mem_for_slot(slot), size));
+                let store_size = if class == X86RegClass::Xmm {
+                    xmm_def_width.unwrap_or(size)
+                } else {
+                    size
+                };
+                out.push(store(scratch, class, mem_for_slot(slot), store_size));
             }
         }
         f.blocks[block_idx].insts = out;
+    }
+}
+
+/// Conversion opcodes carry the GP-side width in `inst.size` (that is
+/// what the l/q suffix describes); the XMM side has a fixed width of
+/// its own. Without this override the spill code sizes the FP slot
+/// traffic off the GP suffix: `cvtsi2sdl` stored its double def with
+/// movss (top 4 bytes of the slot stale) and `cvttsd2sil` loaded its
+/// double source with movss (top half zeroed) — both silent wrong
+/// answers at runtime. Returns (use_width, def_width) for XMM-class
+/// operands.
+fn xmm_width_override(opcode: X86Opcode) -> (Option<OpSize>, Option<OpSize>) {
+    match opcode {
+        X86Opcode::Cvtsi2ss => (None, Some(OpSize::L)),
+        X86Opcode::Cvtsi2sd => (None, Some(OpSize::Q)),
+        X86Opcode::Cvttss2si => (Some(OpSize::L), None),
+        X86Opcode::Cvttsd2si => (Some(OpSize::Q), None),
+        X86Opcode::Cvtss2sd => (Some(OpSize::L), Some(OpSize::Q)),
+        X86Opcode::Cvtsd2ss => (Some(OpSize::Q), Some(OpSize::L)),
+        _ => (None, None),
     }
 }
 
