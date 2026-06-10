@@ -40781,8 +40781,16 @@ pub(super) fn type_info_to_ir_type(ti: &crate::sema::symtab::TypeInfo) -> IrType
     if matches!(ti, TypeInfo::Derived(_) | TypeInfo::Class(_)) {
         return IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)));
     }
-    let (size, _) =
-        crate::sema::type_layout::size_of_scalar_kind(ti).expect("Derived/Class handled above");
+    // CLASS(*) / TYPE(*) values carry a {data_ptr, type_tag} descriptor.
+    // Pre-x02 they flowed through size_of_type's 16-byte answer into the
+    // I128 arm below; keep that mapping explicit. (x02 regression: the
+    // scalar-kind split turned this path into an ICE — caught by the
+    // class_star_* fixtures on macOS CI.)
+    if matches!(ti, TypeInfo::ClassStar | TypeInfo::TypeStar) {
+        return IrType::Int(IntWidth::I128);
+    }
+    let (size, _) = crate::sema::type_layout::size_of_scalar_kind(ti)
+        .expect("derived/class/unlimited-polymorphic handled above");
     match size {
         1 => IrType::Int(IntWidth::I8),
         2 => IrType::Int(IntWidth::I16),
