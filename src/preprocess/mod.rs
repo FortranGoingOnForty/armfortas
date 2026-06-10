@@ -284,7 +284,11 @@ impl Preprocessor {
             // Skip for preprocessor directives (#if, #define, etc.) where ! and &
             // have C semantics, not Fortran semantics.
             if !self.fixed_form && !logical_line.trim_start().starts_with('#') {
-                while has_trailing_continuation(&logical_line) {
+                // Incremental: scan only the newly appended piece per
+                // join, carrying string state — the full-line rescan
+                // was O(N^2) on many-continuation statements.
+                let mut scan = scan_trailing_ampersand(&logical_line, 0, None);
+                while let Some(amp_pos) = scan.amp {
                     if i < raw_lines.len() {
                         let next = raw_lines[i].trim_start();
                         if next.starts_with('#') {
@@ -298,11 +302,12 @@ impl Preprocessor {
                             i += 1;
                             continue;
                         }
-                        let amp_pos = find_code_trailing_ampersand(&logical_line).unwrap();
                         logical_line.truncate(amp_pos);
                         let next = next.strip_prefix('&').unwrap_or(next);
+                        let base = logical_line.len();
                         logical_line.push_str(next);
                         i += 1;
+                        scan = scan_trailing_ampersand(&logical_line[base..], base, scan.in_string);
                     } else {
                         break;
                     }
@@ -1231,19 +1236,36 @@ fn replace_undefined_idents(expr: &str) -> String {
     result
 }
 
-/// Check if a line has a trailing `&` in the code portion (not inside a string or comment).
-fn has_trailing_continuation(line: &str) -> bool {
-    find_code_trailing_ampersand(line).is_some()
-}
-
 /// Find the position of a trailing `&` continuation marker on this line.
 /// Recognises both code continuations (`&` outside strings) and the string
 /// continuation case where the `&` sits inside an unterminated literal —
 /// `'hello &\n      &world'` is one logical literal and the line still
 /// needs to be joined to the next.  Returns None if no `&` qualifies.
 fn find_code_trailing_ampersand(line: &str) -> Option<usize> {
+    scan_trailing_ampersand(line, 0, None).amp
+}
+
+/// Result of scanning one piece of a logical line: the trailing-`&`
+/// position (absolute, via `base`) and the string state at the end of
+/// the piece, so the NEXT appended piece can be scanned alone. The
+/// join loop used to rescan the whole accumulated line per appended
+/// continuation — O(N^2) on long statements (a 100k-continuation
+/// statement preprocessed in ~25s, all of it in this rescan).
+struct AmpScan {
+    amp: Option<usize>,
+    in_string: Option<u8>,
+}
+
+/// Scan `piece` (a suffix of the logical line starting at byte
+/// `base`) with `in_string` carried from the previous piece. A
+/// trailing `&` is only ever separated from the end by whitespace, so
+/// the string state at the reported `&` equals the state at the end
+/// of the piece — truncating there and appending the next piece keeps
+/// the carried state valid.
+fn scan_trailing_ampersand(piece: &str, base: usize, carried: Option<u8>) -> AmpScan {
+    let line = piece;
     let bytes = line.as_bytes();
-    let mut in_string: Option<u8> = None;
+    let mut in_string: Option<u8> = carried;
     let mut last_amp: Option<usize> = None;
 
     let mut i = 0;
@@ -1294,7 +1316,10 @@ fn find_code_trailing_ampersand(line: &str) -> Option<usize> {
         i += 1;
     }
 
-    last_amp
+    AmpScan {
+        amp: last_amp.map(|pos| base + pos),
+        in_string,
+    }
 }
 
 fn split_first_word(s: &str) -> (&str, &str) {
