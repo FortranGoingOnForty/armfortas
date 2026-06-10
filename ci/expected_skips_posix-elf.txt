@@ -80,3 +80,4 @@ vectorize_where_int
 vectorize_where_invariant
 vectorize_where_unary
 vectorize_where_unary_on_b
+abi_differential

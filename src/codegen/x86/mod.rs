@@ -2,5 +2,6 @@
 //! emitter. Instruction selection lands in x05, the SysV ABI
 //! classifier in x04.
 
+pub mod abi;
 pub mod emit;
 pub mod mir;
