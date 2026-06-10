@@ -29,6 +29,13 @@ fn capture_run_stdout(request: CaptureRequest) -> String {
 
 #[test]
 fn o3_vectorizes_f32_body_and_assembles_clean() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=vectorize_f32 test=o3_vectorizes_f32_body_and_assembles_clean count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let source = fixture("do_loop_vectorize_f32.f90");
 
     // The IR should contain v-ops over <4 x f32>.

@@ -20,6 +20,13 @@ fn capture_run_stdout(request: CaptureRequest) -> String {
 
 #[test]
 fn o2_partial_unrolls_reduction_loop_correctly_threads_accumulator() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=loop_partial_unroll_reduction test=o2_partial_unrolls_reduction_loop_correctly_threads_accumulator count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let source = fixture("loop_partial_unroll_reduction.f90");
     let stdout = capture_run_stdout(CaptureRequest {
         input: source,

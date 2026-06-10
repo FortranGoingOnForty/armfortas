@@ -105,6 +105,13 @@ fn raw_ir_module_procedure_sees_shared_module_global() {
 
 #[test]
 fn module_global_host_assoc_runs_across_opt_levels_and_keeps_o2_object_deterministic() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=module_host_audit test=module_global_host_assoc_runs_across_opt_levels_and_keeps_o2_object_deterministic count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let source = fixture();
 
     for level in [

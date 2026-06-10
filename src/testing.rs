@@ -1180,7 +1180,7 @@ mod inspector_tests {
     fn macho_snapshot_matches_pre_sprint_pipeline() {
         if native_e2e_support().is_err() {
             eprintln!(
-                "HARNESS_SKIP suite=testing test=macho_snapshot_matches_pre_sprint_pipeline count=1 reason=\"Mach-O tools need the native toolchain\""
+                "\nHARNESS_SKIP suite=testing test=macho_snapshot_matches_pre_sprint_pipeline count=1 reason=\"Mach-O tools need the native toolchain\""
             );
             return;
         }
@@ -1223,7 +1223,10 @@ mod inspector_tests {
             normalize_tool_output(&tool_output("otool", &["-rv", p]).unwrap()),
             normalize_tool_output(&tool_output("nm", &["-m", p]).unwrap()),
         );
-        assert_eq!(new, old, "inspector must be byte-compatible with the pre-x01 snapshot");
+        assert_eq!(
+            new, old,
+            "inspector must be byte-compatible with the pre-x01 snapshot"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

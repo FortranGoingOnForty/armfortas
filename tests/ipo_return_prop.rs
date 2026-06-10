@@ -72,6 +72,13 @@ fn call_arg_counts_for(func_section: &str, callee_name: &str) -> Vec<usize> {
 
 #[test]
 fn o2_propagates_trivial_return_and_deletes_helper() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=ipo_return_prop test=o2_propagates_trivial_return_and_deletes_helper count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let source = fixture("ipo_return_prop.f90");
 
     let raw_ir = capture_text(

@@ -350,66 +350,157 @@ fn deterministic_cross_object_case(opt_level: OptLevel) {
 
 #[test]
 fn external_i128_call_runs_across_objects_at_o0() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_cross_object test=external_i128_call_runs_across_objects_at_o0 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     run_cross_object_case(OptLevel::O0);
 }
 
 #[test]
 fn external_i128_call_runs_across_objects_at_o1() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_cross_object test=external_i128_call_runs_across_objects_at_o1 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     run_cross_object_case(OptLevel::O1);
 }
 
 #[test]
 fn external_i128_call_runs_across_objects_at_o2() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_cross_object test=external_i128_call_runs_across_objects_at_o2 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     run_cross_object_case(OptLevel::O2);
 }
 
 #[test]
 fn external_i128_call_runs_across_objects_at_o3() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_cross_object test=external_i128_call_runs_across_objects_at_o3 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     run_cross_object_case(OptLevel::O3);
 }
 
 #[test]
 fn external_i128_call_runs_across_objects_at_os() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_cross_object test=external_i128_call_runs_across_objects_at_os count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     run_cross_object_case(OptLevel::Os);
 }
 
 #[test]
 fn external_i128_call_runs_across_objects_at_ofast() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_cross_object test=external_i128_call_runs_across_objects_at_ofast count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     run_cross_object_case(OptLevel::Ofast);
 }
 
 #[test]
 fn linked_external_i128_binary_is_deterministic_at_o0() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_cross_object test=linked_external_i128_binary_is_deterministic_at_o0 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     deterministic_cross_object_case(OptLevel::O0);
 }
 
 #[test]
 fn linked_external_i128_binary_is_deterministic_at_o1() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_cross_object test=linked_external_i128_binary_is_deterministic_at_o1 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     deterministic_cross_object_case(OptLevel::O1);
 }
 
 #[test]
 fn linked_external_i128_binary_is_deterministic_at_o2() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_cross_object test=linked_external_i128_binary_is_deterministic_at_o2 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     deterministic_cross_object_case(OptLevel::O2);
 }
 
 #[test]
 fn linked_external_i128_binary_is_deterministic_at_o3() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_cross_object test=linked_external_i128_binary_is_deterministic_at_o3 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     deterministic_cross_object_case(OptLevel::O3);
 }
 
 #[test]
 fn linked_external_i128_binary_is_deterministic_at_os() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_cross_object test=linked_external_i128_binary_is_deterministic_at_os count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     deterministic_cross_object_case(OptLevel::Os);
 }
 
 #[test]
 fn linked_external_i128_binary_is_deterministic_at_ofast() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_cross_object test=linked_external_i128_binary_is_deterministic_at_ofast count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     deterministic_cross_object_case(OptLevel::Ofast);
 }
 
 #[test]
 fn external_stack_i128_call_runs_across_objects_at_o0() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_cross_object test=external_stack_i128_call_runs_across_objects_at_o0 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     run_cross_object_case_named(
         "integer16_external_stack_call.f90",
         "integer16_external_stack_call_helper.c",
@@ -420,6 +511,13 @@ fn external_stack_i128_call_runs_across_objects_at_o0() {
 
 #[test]
 fn external_stack_i128_call_runs_across_objects_at_o1() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_cross_object test=external_stack_i128_call_runs_across_objects_at_o1 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     run_cross_object_case_named(
         "integer16_external_stack_call.f90",
         "integer16_external_stack_call_helper.c",
@@ -430,6 +528,13 @@ fn external_stack_i128_call_runs_across_objects_at_o1() {
 
 #[test]
 fn external_stack_i128_call_runs_across_objects_at_o2() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_cross_object test=external_stack_i128_call_runs_across_objects_at_o2 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     run_cross_object_case_named(
         "integer16_external_stack_call.f90",
         "integer16_external_stack_call_helper.c",
@@ -440,6 +545,13 @@ fn external_stack_i128_call_runs_across_objects_at_o2() {
 
 #[test]
 fn external_stack_i128_call_runs_across_objects_at_o3() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_cross_object test=external_stack_i128_call_runs_across_objects_at_o3 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     run_cross_object_case_named(
         "integer16_external_stack_call.f90",
         "integer16_external_stack_call_helper.c",
@@ -450,6 +562,13 @@ fn external_stack_i128_call_runs_across_objects_at_o3() {
 
 #[test]
 fn external_stack_i128_call_runs_across_objects_at_os() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_cross_object test=external_stack_i128_call_runs_across_objects_at_os count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     run_cross_object_case_named(
         "integer16_external_stack_call.f90",
         "integer16_external_stack_call_helper.c",
@@ -460,6 +579,13 @@ fn external_stack_i128_call_runs_across_objects_at_os() {
 
 #[test]
 fn external_stack_i128_call_runs_across_objects_at_ofast() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_cross_object test=external_stack_i128_call_runs_across_objects_at_ofast count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     run_cross_object_case_named(
         "integer16_external_stack_call.f90",
         "integer16_external_stack_call_helper.c",
@@ -470,6 +596,13 @@ fn external_stack_i128_call_runs_across_objects_at_ofast() {
 
 #[test]
 fn linked_external_stack_i128_binary_is_deterministic_at_o0() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_cross_object test=linked_external_stack_i128_binary_is_deterministic_at_o0 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     deterministic_cross_object_case_named(
         "integer16_external_stack_call.f90",
         "integer16_external_stack_call_helper.c",
@@ -479,6 +612,13 @@ fn linked_external_stack_i128_binary_is_deterministic_at_o0() {
 
 #[test]
 fn linked_external_stack_i128_binary_is_deterministic_at_o1() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_cross_object test=linked_external_stack_i128_binary_is_deterministic_at_o1 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     deterministic_cross_object_case_named(
         "integer16_external_stack_call.f90",
         "integer16_external_stack_call_helper.c",
@@ -488,6 +628,13 @@ fn linked_external_stack_i128_binary_is_deterministic_at_o1() {
 
 #[test]
 fn linked_external_stack_i128_binary_is_deterministic_at_o2() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_cross_object test=linked_external_stack_i128_binary_is_deterministic_at_o2 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     deterministic_cross_object_case_named(
         "integer16_external_stack_call.f90",
         "integer16_external_stack_call_helper.c",
@@ -497,6 +644,13 @@ fn linked_external_stack_i128_binary_is_deterministic_at_o2() {
 
 #[test]
 fn linked_external_stack_i128_binary_is_deterministic_at_o3() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_cross_object test=linked_external_stack_i128_binary_is_deterministic_at_o3 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     deterministic_cross_object_case_named(
         "integer16_external_stack_call.f90",
         "integer16_external_stack_call_helper.c",
@@ -506,6 +660,13 @@ fn linked_external_stack_i128_binary_is_deterministic_at_o3() {
 
 #[test]
 fn linked_external_stack_i128_binary_is_deterministic_at_os() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_cross_object test=linked_external_stack_i128_binary_is_deterministic_at_os count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     deterministic_cross_object_case_named(
         "integer16_external_stack_call.f90",
         "integer16_external_stack_call_helper.c",
@@ -515,6 +676,13 @@ fn linked_external_stack_i128_binary_is_deterministic_at_os() {
 
 #[test]
 fn linked_external_stack_i128_binary_is_deterministic_at_ofast() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_cross_object test=linked_external_stack_i128_binary_is_deterministic_at_ofast count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     deterministic_cross_object_case_named(
         "integer16_external_stack_call.f90",
         "integer16_external_stack_call_helper.c",

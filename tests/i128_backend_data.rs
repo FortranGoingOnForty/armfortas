@@ -59,6 +59,13 @@ fn globals_only_i128_backend_emits_expected_words_in_asm() {
 
 #[test]
 fn globals_only_i128_object_snapshot_is_deterministic_at_o2() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_backend_data test=globals_only_i128_object_snapshot_is_deterministic_at_o2 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let source = fixture("integer16_globals_backend.f90");
     let first = capture_text(
         CaptureRequest {

@@ -64,6 +64,13 @@ fn bce_removes_canonical_loop_bounds_checks_at_o2() {
 
 #[test]
 fn runtime_bounds_checks_trap_out_of_range_accesses() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=bounds_checks test=runtime_bounds_checks_trap_out_of_range_accesses count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let run = capture_run(CaptureRequest {
         input: fixture("tests/fixtures/bounds_check_oob.f90"),
         requested: BTreeSet::from([Stage::Run]),

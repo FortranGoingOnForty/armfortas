@@ -29,6 +29,13 @@ fn capture_run_stdout(request: CaptureRequest) -> String {
 
 #[test]
 fn o3_vectorizes_head_and_peels_scalar_tail() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=vectorize_scalar_tail test=o3_vectorizes_head_and_peels_scalar_tail count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let source = fixture("do_loop_vectorize_scalar_tail.f90");
 
     let o3_ir = capture_text(

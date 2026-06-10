@@ -21,6 +21,13 @@ fn capture_text(request: CaptureRequest, stage: Stage) -> String {
 
 #[test]
 fn o3_vectorizes_full_extent_do_loop_and_keeps_objects_deterministic() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=vectorize_do_loop test=o3_vectorizes_full_extent_do_loop_and_keeps_objects_deterministic count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let source = fixture("do_loop_vectorize.f90");
 
     let raw_ir = capture_text(

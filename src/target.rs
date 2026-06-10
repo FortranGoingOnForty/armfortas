@@ -144,9 +144,7 @@ impl TargetSpec {
             (Arch::X86_64, Os::Linux, _) => "x86_64-linux-gnu",
             // Unreachable through parse()/host(); spelled out so a new
             // variant fails to compile until it gets a canonical name.
-            (Arch::Arm64, Os::FreeBsd, _) | (Arch::Arm64, Os::Linux, _) => {
-                "arm64-unsupported"
-            }
+            (Arch::Arm64, Os::FreeBsd, _) | (Arch::Arm64, Os::Linux, _) => "arm64-unsupported",
             (Arch::X86_64, Os::MacOs, _) => "x86_64-unsupported",
         }
     }
@@ -204,9 +202,9 @@ mod tests {
             "garbage",
             "arm64",
             "x86_64",
-            "arm64-linux",       // x15, not yet
-            "arm64-freebsd",     // not planned
-            "x86_64-macos",      // not planned
+            "arm64-linux",   // x15, not yet
+            "arm64-freebsd", // not planned
+            "x86_64-macos",  // not planned
             "x86_64-freebsd-gnu",
             "arm64-macos-gnu",
             "x86_64-linux-uclibc",
@@ -247,7 +245,9 @@ mod tests {
             ObjectFormat::Elf
         );
         assert_eq!(
-            TargetSpec::parse("x86_64-linux-musl").unwrap().object_format(),
+            TargetSpec::parse("x86_64-linux-musl")
+                .unwrap()
+                .object_format(),
             ObjectFormat::Elf
         );
     }

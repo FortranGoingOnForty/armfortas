@@ -110,6 +110,13 @@ fn link_program(objects: &[&std::path::Path], output: &std::path::Path) {
 
 #[test]
 fn bind_c_mixed_gp_fp_value_args_match_c_peer() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=calling_convention_runtime test=bind_c_mixed_gp_fp_value_args_match_c_peer count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("mixed_gp_fp");
     let c_src = write_program_in(
         &dir,
@@ -151,6 +158,13 @@ fn bind_c_mixed_gp_fp_value_args_match_c_peer() {
 
 #[test]
 fn bind_c_ninth_integer_arg_spills_with_fp_args_still_in_registers() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=calling_convention_runtime test=bind_c_ninth_integer_arg_spills_with_fp_args_still_in_registers count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("gp_spill");
     let c_src = write_program_in(
         &dir,
@@ -192,6 +206,13 @@ fn bind_c_ninth_integer_arg_spills_with_fp_args_still_in_registers() {
 
 #[test]
 fn bind_c_ninth_float_arg_spills_with_integer_args_still_in_registers() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=calling_convention_runtime test=bind_c_ninth_float_arg_spills_with_integer_args_still_in_registers count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("fp_spill");
     let c_src = write_program_in(
         &dir,
@@ -233,6 +254,13 @@ fn bind_c_ninth_float_arg_spills_with_integer_args_still_in_registers() {
 
 #[test]
 fn bind_c_signed_char_value_args_keep_narrow_stack_widths() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=calling_convention_runtime test=bind_c_signed_char_value_args_keep_narrow_stack_widths count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("i8_stack");
     let c_src = write_program_in(
         &dir,
@@ -274,6 +302,13 @@ fn bind_c_signed_char_value_args_keep_narrow_stack_widths() {
 
 #[test]
 fn bind_c_short_value_args_keep_narrow_stack_widths() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=calling_convention_runtime test=bind_c_short_value_args_keep_narrow_stack_widths count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("i16_stack");
     let c_src = write_program_in(
         &dir,
@@ -315,6 +350,13 @@ fn bind_c_short_value_args_keep_narrow_stack_widths() {
 
 #[test]
 fn contained_hidden_result_optional_gap_preserves_host_and_char_ordering() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=calling_convention_runtime test=contained_hidden_result_optional_gap_preserves_host_and_char_ordering count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("contained_hidden_result_gap");
     let src = write_program_in(
         &dir,
@@ -346,6 +388,13 @@ fn contained_hidden_result_optional_gap_preserves_host_and_char_ordering() {
 
 #[test]
 fn recursive_contained_helper_preserves_host_closure_and_hidden_lengths() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=calling_convention_runtime test=recursive_contained_helper_preserves_host_closure_and_hidden_lengths count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("recursive_hidden_lengths");
     let src = write_program_in(
         &dir,
@@ -377,6 +426,13 @@ fn recursive_contained_helper_preserves_host_closure_and_hidden_lengths() {
 
 #[test]
 fn bind_c_keyword_reordering_preserves_mixed_value_and_byref_slots() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=calling_convention_runtime test=bind_c_keyword_reordering_preserves_mixed_value_and_byref_slots count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("keyword_mix");
     let c_src = write_program_in(
         &dir,
@@ -418,6 +474,13 @@ fn bind_c_keyword_reordering_preserves_mixed_value_and_byref_slots() {
 
 #[test]
 fn bind_c_keyword_reordering_preserves_gp_spill_with_pointer_args() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=calling_convention_runtime test=bind_c_keyword_reordering_preserves_gp_spill_with_pointer_args count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("keyword_gp_spill");
     let c_src = write_program_in(
         &dir,
@@ -459,6 +522,13 @@ fn bind_c_keyword_reordering_preserves_gp_spill_with_pointer_args() {
 
 #[test]
 fn recursive_non_bindc_calls_preserve_hidden_lengths_host_closure_and_gp_spills() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=calling_convention_runtime test=recursive_non_bindc_calls_preserve_hidden_lengths_host_closure_and_gp_spills count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("recursive_non_bindc_gp_spill");
     let src = write_program_in(
         &dir,
@@ -490,6 +560,13 @@ fn recursive_non_bindc_calls_preserve_hidden_lengths_host_closure_and_gp_spills(
 
 #[test]
 fn non_bindc_keyword_reordering_preserves_mixed_gp_fp_spills() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=calling_convention_runtime test=non_bindc_keyword_reordering_preserves_mixed_gp_fp_spills count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("non_bindc_keyword_spills");
     let src = write_program_in(
         &dir,
@@ -521,6 +598,13 @@ fn non_bindc_keyword_reordering_preserves_mixed_gp_fp_spills() {
 
 #[test]
 fn cross_tu_character_result_with_spills_survives_amod_import() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=calling_convention_runtime test=cross_tu_character_result_with_spills_survives_amod_import count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("cross_tu_char_result_spills");
     let mod_src = write_program_in(
         &dir,
@@ -598,6 +682,13 @@ fn cross_tu_character_result_with_spills_survives_amod_import() {
 
 #[test]
 fn cross_tu_bindc_keyword_spills_survive_amod_import() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=calling_convention_runtime test=cross_tu_bindc_keyword_spills_survive_amod_import count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("cross_tu_bindc_keyword_spills");
     let c_src = write_program_in(
         &dir,
@@ -683,6 +774,13 @@ fn cross_tu_bindc_keyword_spills_survive_amod_import() {
 
 #[test]
 fn character_result_actual_preserves_scalar_spills_in_nested_calls() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=calling_convention_runtime test=character_result_actual_preserves_scalar_spills_in_nested_calls count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("char_result_nested_actual");
     let src = write_program_in(
         &dir,
@@ -714,6 +812,13 @@ fn character_result_actual_preserves_scalar_spills_in_nested_calls() {
 
 #[test]
 fn hidden_result_builder_preserves_scalar_helper_spills() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=calling_convention_runtime test=hidden_result_builder_preserves_scalar_helper_spills count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("hidden_result_builder_spills");
     let src = write_program_in(
         &dir,
@@ -745,6 +850,13 @@ fn hidden_result_builder_preserves_scalar_helper_spills() {
 
 #[test]
 fn generic_character_function_dispatches_to_character_specific() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=calling_convention_runtime test=generic_character_function_dispatches_to_character_specific count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("generic_character_dispatch");
     let src = write_program_in(
         &dir,
@@ -776,6 +888,13 @@ fn generic_character_function_dispatches_to_character_specific() {
 
 #[test]
 fn generic_hidden_result_character_dispatches_to_character_specific() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=calling_convention_runtime test=generic_hidden_result_character_dispatches_to_character_specific count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("generic_hidden_result_character_dispatch");
     let src = write_program_in(
         &dir,

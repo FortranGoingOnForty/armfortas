@@ -119,6 +119,13 @@ fn o2_binomial_blend_scalarizes_taps_and_removes_safe_stencil_checks() {
 
 #[test]
 fn realworld_shape_guard_uses_runtime_shape_queries_and_stays_deterministic() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=sroa_shape_audit_29_11 test=realworld_shape_guard_uses_runtime_shape_queries_and_stays_deterministic count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let source = fixture("realworld_shape_guard.f90");
 
     let raw_ir = capture_text(

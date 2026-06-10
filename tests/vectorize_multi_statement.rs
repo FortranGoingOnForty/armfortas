@@ -29,6 +29,13 @@ fn capture_run_stdout(request: CaptureRequest) -> String {
 
 #[test]
 fn o3_vectorizes_two_statement_do_body() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=vectorize_multi_statement test=o3_vectorizes_two_statement_do_body count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let source = fixture("do_loop_vectorize_multi.f90");
 
     let o3_ir = capture_text(

@@ -87,7 +87,6 @@ fn should_skip(source_text: &str) -> bool {
 
 #[test]
 fn all_programs_deterministic_at_o2() {
-    let compiler = find_compiler();
     let test_dir = find_test_programs();
 
     let mut sources: Vec<PathBuf> = fs::read_dir(&test_dir)
@@ -97,6 +96,21 @@ fn all_programs_deterministic_at_o2() {
         .filter(|p| p.extension().map(|e| e == "f90").unwrap_or(false))
         .collect();
     sources.sort();
+    assert!(
+        !sources.is_empty(),
+        "no .f90 sources discovered in {} — discovery must stay a hard failure even when skipping",
+        test_dir.display()
+    );
+
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=determinism_sweep test=all_programs_deterministic_at_o2 count={} reason=\"{}\"",
+            sources.len(),
+            reason
+        );
+        return;
+    }
+    let compiler = find_compiler();
 
     let mut checked = 0;
     let mut skipped = 0;

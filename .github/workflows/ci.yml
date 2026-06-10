@@ -224,7 +224,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --workspace
       - run: cargo test -p armfortas --lib
-      - run: cargo test -p armfortas --tests -- --nocapture 2>&1 | tee /tmp/tests.log
+      - run: cargo test -p armfortas --tests -- --nocapture --test-threads=1 2>&1 | tee /tmp/tests.log
       - run: ci/check_skips.sh /tmp/tests.log posix-elf
 
   build-linux-musl:
@@ -239,7 +239,7 @@ jobs:
       - run: apk add --no-cache binutils musl-dev grep
       - run: cargo build --workspace
       - run: cargo test -p armfortas --lib
-      - run: cargo test -p armfortas --tests -- --nocapture 2>&1 | tee /tmp/tests.log
+      - run: cargo test -p armfortas --tests -- --nocapture --test-threads=1 2>&1 | tee /tmp/tests.log
       - run: ci/check_skips.sh /tmp/tests.log posix-elf
 
   build-freebsd:

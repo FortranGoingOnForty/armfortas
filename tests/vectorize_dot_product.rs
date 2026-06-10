@@ -29,6 +29,13 @@ fn capture_run_stdout(request: CaptureRequest) -> String {
 
 #[test]
 fn o3_vectorizes_manual_dot_product_loop() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=vectorize_dot_product test=o3_vectorizes_manual_dot_product_loop count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let source = fixture("do_loop_vectorize_dot.f90");
 
     let o3_ir = capture_text(

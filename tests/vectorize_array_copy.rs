@@ -29,6 +29,13 @@ fn capture_run_stdout(request: CaptureRequest) -> String {
 
 #[test]
 fn o3_vectorizes_pure_array_copy_loop() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=vectorize_array_copy test=o3_vectorizes_pure_array_copy_loop count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let source = fixture("do_loop_vectorize_copy.f90");
 
     let o3_ir = capture_text(

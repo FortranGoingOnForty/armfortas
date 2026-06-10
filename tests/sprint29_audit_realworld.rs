@@ -119,6 +119,13 @@ fn normalize_lc_uuid(mut bytes: Vec<u8>) -> Vec<u8> {
 
 #[test]
 fn realworld_object_snapshots_stay_deterministic_at_o2() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=sprint29_audit_realworld test=realworld_object_snapshots_stay_deterministic_at_o2 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     for name in [
         "realworld_tridiag_spmv.f90",
         "realworld_axpy_reduce.f90",
@@ -209,6 +216,13 @@ fn realworld_opt_ir_differs_from_raw_ir_at_o2() {
 
 #[test]
 fn linked_realworld_binaries_are_deterministic_modulo_uuid() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=sprint29_audit_realworld test=linked_realworld_binaries_are_deterministic_modulo_uuid count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let compiler = find_compiler();
 
     for name in [

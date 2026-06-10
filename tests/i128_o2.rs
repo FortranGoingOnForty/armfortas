@@ -93,6 +93,13 @@ fn o2_optir_promotes_branchy_integer16_local() {
 
 #[test]
 fn o2_backend_runs_internal_integer16_call() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_o2 test=o2_backend_runs_internal_integer16_call count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let result = capture_from_path(&CaptureRequest {
         input: fixture("integer16_internal_call.f90"),
         requested: BTreeSet::from([Stage::Run]),
@@ -119,6 +126,13 @@ fn o2_backend_runs_internal_integer16_call() {
 
 #[test]
 fn o2_integer16_object_snapshot_is_deterministic() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_o2 test=o2_integer16_object_snapshot_is_deterministic count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let source = fixture("integer16_mul.f90");
     let first = capture_text(
         CaptureRequest {

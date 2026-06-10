@@ -112,6 +112,13 @@ fn bare_allocate_component_array_requires_shape_or_source_or_mold() {
 
 #[test]
 fn bare_allocate_scalar_allocatable_still_works() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=allocate_validation test=bare_allocate_scalar_allocatable_still_works count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("bare_scalar");
     let src = write_program_in(
         &dir,
@@ -148,6 +155,13 @@ fn bare_allocate_scalar_allocatable_still_works() {
 
 #[test]
 fn imported_allocatable_component_array_requires_shape_or_source_or_mold() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=allocate_validation test=imported_allocatable_component_array_requires_shape_or_source_or_mold count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("imported_component_array");
     let mod_src = write_program_in(
         &dir,
@@ -201,6 +215,13 @@ fn imported_allocatable_component_array_requires_shape_or_source_or_mold() {
 
 #[test]
 fn imported_allocatable_component_scalar_still_works() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=allocate_validation test=imported_allocatable_component_scalar_still_works count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("imported_component_scalar");
     let mod_src = write_program_in(
         &dir,

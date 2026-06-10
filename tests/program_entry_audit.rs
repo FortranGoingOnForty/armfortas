@@ -61,6 +61,13 @@ fn capture_main_wrapper_calls_program_body_not_first_helper() {
 
 #[test]
 fn capture_program_entry_fixture_runs_at_o2() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=program_entry_audit test=capture_program_entry_fixture_runs_at_o2 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let run = capture_run(CaptureRequest {
         input: fixture("program_entry_helper.f90"),
         requested: BTreeSet::from([Stage::Run]),
@@ -80,6 +87,13 @@ fn capture_program_entry_fixture_runs_at_o2() {
 
 #[test]
 fn capture_program_entry_object_snapshot_is_deterministic_at_o2() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=program_entry_audit test=capture_program_entry_object_snapshot_is_deterministic_at_o2 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let source = fixture("program_entry_helper.f90");
     let first = capture_text(
         CaptureRequest {

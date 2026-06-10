@@ -2377,14 +2377,14 @@ deep
             names.sort();
             names
         };
-        let base = ["__ARMFORTAS_MAJOR__", "__ARMFORTAS_MINOR__", "__ARMFORTAS__"];
+        let base = [
+            "__ARMFORTAS_MAJOR__",
+            "__ARMFORTAS_MINOR__",
+            "__ARMFORTAS__",
+        ];
 
         let golden = |extra: &[&str]| -> Vec<String> {
-            let mut v: Vec<String> = base
-                .iter()
-                .chain(extra)
-                .map(|s| s.to_string())
-                .collect();
+            let mut v: Vec<String> = base.iter().chain(extra).map(|s| s.to_string()).collect();
             v.sort();
             v
         };
@@ -2410,7 +2410,8 @@ deep
     fn target_defines_select_ifdef_branches() {
         use crate::target::TargetSpec;
 
-        let src = "#ifdef __FreeBSD__\nx = 1\n#elif defined(__APPLE__)\nx = 2\n#else\nx = 3\n#endif\n";
+        let src =
+            "#ifdef __FreeBSD__\nx = 1\n#elif defined(__APPLE__)\nx = 2\n#else\nx = 3\n#endif\n";
         let run = |triple: &str| -> String {
             let target = TargetSpec::parse(triple).unwrap();
             let config = PreprocConfig::for_target(&target);

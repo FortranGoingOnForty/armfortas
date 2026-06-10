@@ -108,6 +108,13 @@ fn o0_realworld_elemental_stage_proves_elemental_and_concurrent_lowering() {
 
 #[test]
 fn o2_realworld_ipo_chain_trims_dead_arg_and_removes_trivial_wrapper() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=claims_audit_29_11 test=o2_realworld_ipo_chain_trims_dead_arg_and_removes_trivial_wrapper count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let source = fixture("realworld_ipo_chain.f90");
 
     let raw_ir = capture_text(
@@ -223,6 +230,13 @@ fn o2_unrolls_realworld_small_do_concurrent_kernel() {
 
 #[test]
 fn o3_vectorizes_realworld_explicit_do_stage() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=claims_audit_29_11 test=o3_vectorizes_realworld_explicit_do_stage count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let source = fixture("realworld_vector_stage.f90");
 
     let o2_ir = capture_text(

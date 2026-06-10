@@ -50,6 +50,13 @@ fn compile_program(source: &Path, output: &Path) -> std::process::Output {
 
 #[test]
 fn allocate_source_array_constructor_infers_shape_and_copies_values() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=allocate_constructor_runtime test=allocate_source_array_constructor_infers_shape_and_copies_values count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("source_array_ctor");
     let src = write_program_in(
         &dir,
@@ -90,6 +97,13 @@ fn allocate_source_array_constructor_infers_shape_and_copies_values() {
 
 #[test]
 fn allocate_mold_array_constructor_infers_shape() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=allocate_constructor_runtime test=allocate_mold_array_constructor_infers_shape count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("mold_array_ctor");
     let src = write_program_in(
         &dir,
@@ -127,6 +141,13 @@ fn allocate_mold_array_constructor_infers_shape() {
 
 #[test]
 fn allocate_component_source_array_constructor_infers_shape_and_copies_values() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=allocate_constructor_runtime test=allocate_component_source_array_constructor_infers_shape_and_copies_values count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("component_source_array_ctor");
     let src = write_program_in(
         &dir,

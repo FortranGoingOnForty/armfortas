@@ -108,6 +108,13 @@ fn high_opt_promotes_branchy_integer16_local() {
 
 #[test]
 fn high_opt_backend_runs_internal_integer16_call() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_high_opt test=high_opt_backend_runs_internal_integer16_call count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     for (level, label) in high_levels() {
         let result = capture_from_path(&CaptureRequest {
             input: fixture("integer16_internal_call.f90"),
@@ -137,6 +144,13 @@ fn high_opt_backend_runs_internal_integer16_call() {
 
 #[test]
 fn high_opt_integer16_object_snapshot_is_deterministic() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=i128_high_opt test=high_opt_integer16_object_snapshot_is_deterministic count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     for (level, label) in high_levels() {
         let source = fixture("integer16_mul.f90");
         let first = capture_text(

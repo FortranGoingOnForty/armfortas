@@ -50,6 +50,13 @@ fn compile_program(source: &std::path::Path, output: &std::path::Path) -> std::p
 
 #[test]
 fn allocate_stat_errmsg_populates_fixed_character_target() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=memory_runtime test=allocate_stat_errmsg_populates_fixed_character_target count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("alloc_fixed_errmsg");
     let src = write_program_in(
         &dir,
@@ -91,6 +98,13 @@ fn allocate_stat_errmsg_populates_fixed_character_target() {
 
 #[test]
 fn allocate_stat_errmsg_populates_deferred_character_target() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=memory_runtime test=allocate_stat_errmsg_populates_deferred_character_target count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("alloc_deferred_errmsg");
     let src = write_program_in(
         &dir,
@@ -158,6 +172,13 @@ fn allocate_errmsg_requires_scalar_character_target() {
 
 #[test]
 fn deallocate_stat_errmsg_leaves_message_unchanged_on_success() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=memory_runtime test=deallocate_stat_errmsg_leaves_message_unchanged_on_success count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("dealloc_fixed_errmsg");
     let src = write_program_in(
         &dir,
@@ -199,6 +220,13 @@ fn deallocate_stat_errmsg_leaves_message_unchanged_on_success() {
 
 #[test]
 fn allocate_source_array_infers_shape_and_copies_values() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=memory_runtime test=allocate_source_array_infers_shape_and_copies_values count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("alloc_source_array");
     let src = write_program_in(
         &dir,
@@ -240,6 +268,13 @@ fn allocate_source_array_infers_shape_and_copies_values() {
 
 #[test]
 fn allocate_mold_array_infers_shape_without_source_copy() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=memory_runtime test=allocate_mold_array_infers_shape_without_source_copy count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("alloc_mold_array");
     let src = write_program_in(
         &dir,
@@ -276,6 +311,13 @@ fn allocate_mold_array_infers_shape_without_source_copy() {
 
 #[test]
 fn allocate_source_scalar_initializes_allocatable_scalar() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=memory_runtime test=allocate_source_scalar_initializes_allocatable_scalar count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("alloc_source_scalar");
     let src = write_program_in(
         &dir,
@@ -312,6 +354,13 @@ fn allocate_source_scalar_initializes_allocatable_scalar() {
 
 #[test]
 fn scalar_allocatable_value_loads_from_allocated_payload() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=memory_runtime test=scalar_allocatable_value_loads_from_allocated_payload count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("scalar_alloc_payload_load");
     let src = write_program_in(
         &dir,
@@ -348,6 +397,13 @@ fn scalar_allocatable_value_loads_from_allocated_payload() {
 
 #[test]
 fn allocate_component_source_array_infers_shape_and_copies_values() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=memory_runtime test=allocate_component_source_array_infers_shape_and_copies_values count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("alloc_component_source_array");
     let src = write_program_in(
         &dir,
@@ -389,6 +445,13 @@ fn allocate_component_source_array_infers_shape_and_copies_values() {
 
 #[test]
 fn allocate_source_with_explicit_bounds_preserves_destination_shape() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=memory_runtime test=allocate_source_with_explicit_bounds_preserves_destination_shape count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let dir = unique_dir("alloc_source_explicit_shape");
     let src = write_program_in(
         &dir,
