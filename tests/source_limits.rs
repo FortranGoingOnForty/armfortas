@@ -9,7 +9,18 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn compiler() -> PathBuf {
-    for dir in ["target/debug", "../target/debug"] {
+    // CARGO_BIN_EXE_armfortas points at the profile-correct binary
+    // (release on CI); the path probes are the fallback for direct
+    // `cargo test --test source_limits` runs.
+    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_armfortas") {
+        return PathBuf::from(path);
+    }
+    for dir in [
+        "target/debug",
+        "../target/debug",
+        "target/release",
+        "../target/release",
+    ] {
         let p = Path::new(dir).join("armfortas");
         if p.exists() {
             return p;
@@ -82,5 +93,89 @@ fn million_char_statement_compiles_and_warns_only_under_f2023() {
         stderr
     );
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The explosion boundary (l01 follow-up): a maximal-depth chain
+/// inside the statement cap must compile — no stack fault at any
+/// depth the cap admits. Minimal 3-char continuation lines give the
+/// deepest tree per character.
+#[test]
+fn deep_chain_within_cap_compiles() {
+    let n = 600_000;
+    let mut src = String::with_capacity(4 * n);
+    src.push_str("program p\nimplicit none\ninteger :: total\ntotal=0&\n");
+    for _ in 0..n - 1 {
+        src.push_str("+1&\n");
+    }
+    src.push_str("+1\nprint *, total\nend program p\n");
+    let dir = std::env::temp_dir().join(format!("afs_deepchain_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let f90 = dir.join("deep.f90");
+    std::fs::write(&f90, src).unwrap();
+    let r = compile_s(&f90, &dir.join("deep.s"), "--std=f2023");
+    assert!(
+        r.status.success(),
+        "a {}-term chain inside the cap must compile (status {:?}):\n{}",
+        n,
+        r.status,
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Past the cap: a clean diagnostic and exit 1 — never a stack fault.
+#[test]
+fn over_cap_statement_errors_cleanly() {
+    let n = 800_000;
+    let mut src = String::with_capacity(8 * n);
+    src.push_str("program p\nimplicit none\ninteger :: total\ntotal=0&\n");
+    for _ in 0..n {
+        src.push_str("+1     &\n"); // fat lines: past 2M chars
+    }
+    src.push_str("+1\nprint *, total\nend program p\n");
+    let dir = std::env::temp_dir().join(format!("afs_overcap_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let f90 = dir.join("overcap.f90");
+    std::fs::write(&f90, src).unwrap();
+    let r = compile_s(&f90, &dir.join("overcap.s"), "--std=f2023");
+    assert_eq!(
+        r.status.code(),
+        Some(1),
+        "over-cap statement must exit 1 (a None code means a signal — the stack fault this gate exists to prevent)"
+    );
+    let stderr = String::from_utf8_lossy(&r.stderr);
+    assert!(
+        stderr.contains("compiler limit"),
+        "expected the statement-cap diagnostic, got:\n{}",
+        stderr
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Pathological paren nesting stops at the parser's nesting limit with
+/// a clean error (pre-existing guard, locked here alongside the cap).
+#[test]
+fn deep_paren_nesting_errors_cleanly() {
+    let depth = 5_000;
+    let src = format!(
+        "program p\nimplicit none\ninteger :: x\nx = {}1{}\nprint *, x\nend program p\n",
+        "(".repeat(depth),
+        ")".repeat(depth)
+    );
+    let dir = std::env::temp_dir().join(format!("afs_deepparen_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let f90 = dir.join("paren.f90");
+    std::fs::write(&f90, src).unwrap();
+    let r = compile_s(&f90, &dir.join("paren.s"), "--std=f2023");
+    assert_eq!(
+        r.status.code(),
+        Some(1),
+        "deep nesting must exit 1, not fault"
+    );
+    assert!(
+        String::from_utf8_lossy(&r.stderr).contains("nesting exceeds parser limit"),
+        "expected the parser nesting diagnostic"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
