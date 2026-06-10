@@ -226,7 +226,11 @@ pub enum X86Opcode {
     // ---- Moves ----
     MovRR,
     MovRI,
-    /// reg <- mem
+    /// reg <- mem. Address forms: a `Mem{..}` operand, a `FrameSlot`
+    /// (resolved by frame layout), or — pre-regalloc only — a single
+    /// `VReg` of class Gp64 meaning "the address lives in this vreg";
+    /// regalloc rewrites that form to `Mem { base: assigned_reg, .. }`.
+    /// `MovMR` and the scalar SSE moves use the same convention.
     MovRM,
     /// mem <- reg
     MovMR,
@@ -302,6 +306,10 @@ pub enum X86Opcode {
     Cvtsd2ss,
     Xorps,
     Xorpd,
+    Andps,
+    Andpd,
+    Sqrtss,
+    Sqrtsd,
 }
 
 impl X86Opcode {
@@ -314,7 +322,11 @@ impl X86Opcode {
         use X86Opcode::*;
         match self {
             Add | Sub | Imul | And | Or | Xor | Neg | Not | Shl | Shr | Sar | Addss | Addsd
-            | Subss | Subsd | Mulss | Mulsd | Divss | Divsd | Xorps | Xorpd => Some(0),
+            | Subss | Subsd | Mulss | Mulsd | Divss | Divsd | Xorps | Xorpd | Andps | Andpd => {
+                Some(0)
+            }
+            // Sqrtss/Sqrtsd are two-operand non-destructive
+            // (`sqrtsd %src, %dst`) — deliberately not tied.
             _ => None,
         }
     }
@@ -339,12 +351,38 @@ pub struct X86Block {
     pub insts: Vec<X86Inst>,
 }
 
+/// A stack-slot request from instruction selection. `FrameSlot(id)`
+/// operands index this table; frame layout (x05 regalloc) assigns the
+/// rbp-relative displacement. Mirrors the shape of ARM's
+/// `StackFrame`/`FrameSlot` minus the eager offset assignment — a
+/// disp32 reaches any offset, so layout can run after spill slots are
+/// known.
+#[derive(Debug, Clone)]
+pub struct X86FrameSlot {
+    pub id: i32,
+    pub size: u64,
+    pub align: u64,
+}
+
 /// A machine function.
 #[derive(Debug, Clone)]
 pub struct X86Function {
     /// Symbol name, unmangled: ELF symbols carry no underscore prefix.
     pub name: String,
     pub blocks: Vec<X86Block>,
+    /// Per-function `.rodata` constants as (label, raw bits): FP
+    /// immediates and the sign/abs masks isel references through
+    /// `RipLabel`. The x86 analog of ARM's `const_pool`; bits-only
+    /// because everything x05 selects fits one `.quad` (f32 bits sit
+    /// in the low four bytes — `movss` reads only those).
+    pub rodata: Vec<(String, u64)>,
+    /// Frame slots requested by isel (allocas).
+    pub frame_slots: Vec<X86FrameSlot>,
+    /// Largest rsp-relative outgoing stack-argument area any call site
+    /// in this function needs.
+    pub outgoing_arg_bytes: i64,
+    next_vreg: u32,
+    next_block: u32,
 }
 
 impl X86Function {
@@ -355,6 +393,68 @@ impl X86Function {
                 id: MBlockId(0),
                 insts: Vec::new(),
             }],
+            rodata: Vec::new(),
+            frame_slots: Vec::new(),
+            outgoing_arg_bytes: 0,
+            next_vreg: 0,
+            next_block: 1,
+        }
+    }
+
+    /// Allocate a fresh virtual register.
+    pub fn new_vreg(&mut self, class: X86RegClass) -> X86VReg {
+        let vreg = X86VReg {
+            id: VRegId(self.next_vreg),
+            class,
+        };
+        self.next_vreg += 1;
+        vreg
+    }
+
+    /// Create a new machine block.
+    pub fn new_block(&mut self) -> MBlockId {
+        let id = MBlockId(self.next_block);
+        self.next_block += 1;
+        self.blocks.push(X86Block {
+            id,
+            insts: Vec::new(),
+        });
+        id
+    }
+
+    /// Get a mutable block by ID.
+    pub fn block_mut(&mut self, id: MBlockId) -> &mut X86Block {
+        self.blocks
+            .iter_mut()
+            .find(|b| b.id == id)
+            .expect("machine block not found")
+    }
+
+    /// Add (or reuse) a `.rodata` quad, returning its rip label.
+    /// Dedup by bits is value-correct for both `movss` (reads the low
+    /// four bytes) and `movsd` (reads all eight) consumers.
+    pub fn add_rodata(&mut self, bits: u64) -> String {
+        if let Some((label, _)) = self.rodata.iter().find(|(_, b)| *b == bits) {
+            return label.clone();
+        }
+        let label = format!(".LC{}_{}", self.name, self.rodata.len());
+        self.rodata.push((label.clone(), bits));
+        label
+    }
+
+    /// Allocate a frame slot; the returned id goes in `FrameSlot`
+    /// operands.
+    pub fn alloc_frame_slot(&mut self, size: u64, align: u64) -> i32 {
+        let id = self.frame_slots.len() as i32;
+        self.frame_slots.push(X86FrameSlot { id, size, align });
+        id
+    }
+
+    /// Reserve outgoing stack-argument space for calls made by this
+    /// function.
+    pub fn reserve_outgoing_args(&mut self, bytes: i64) {
+        if bytes > self.outgoing_arg_bytes {
+            self.outgoing_arg_bytes = bytes;
         }
     }
 }

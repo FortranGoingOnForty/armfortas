@@ -1,0 +1,2283 @@
+//! x86_64 instruction selection (sprint x05).
+//!
+//! Translates SSA IR into x86 MIR over virtual registers, mirroring
+//! the ARM64 isel architecture (phased vreg pre-allocation, block
+//! maps, edge copies). Output stays three-address: destructive-operand
+//! ties are NOT satisfied here — `twoaddr::convert_to_two_address`
+//! rewrites `d = op a, b` into `mov d, a; d = op d, b` before register
+//! allocation. Fixed-register instructions (idiv, variable shifts) and
+//! call arguments are modeled with explicit `Reg(..)` operands, the
+//! same precedent ARM isel set with `PhysReg` call-argument moves.
+//!
+//! Scope is what -O0 Fortran integer/FP scalar programs need; vector
+//! ops, i128 values, indirect calls, and aggregate ABI shapes panic
+//! with "x05 scope" messages.
+//!
+//! Not wired into `codegen::emit_module` yet — regalloc and frame
+//! layout (later in x05) must run before the printer accepts this
+//! output (it panics on VReg/FrameSlot operands by design).
+//!
+//! Width convention, mirroring ARM's Gp32: i8/i16/i32 and Bool values
+//! live sign-extended (Bool/zero) in 32-bit registers and ALU ops run
+//! at `OpSize::L`; only loads/stores touch memory at the narrow width.
+
+use super::abi::{
+    classify_abi_arg, classify_return, AbiField, AbiTy, X86AbiArgLoc, X86AbiState, X86RetLoc,
+};
+use super::mir::*;
+use crate::ir::inst::*;
+use crate::ir::types::*;
+use std::collections::HashMap;
+
+/// Select machine instructions for an entire IR module.
+pub fn select_module(module: &Module) -> Vec<X86Function> {
+    let func_names: Vec<String> = module.functions.iter().map(|f| f.name.clone()).collect();
+    module
+        .functions
+        .iter()
+        .map(|f| select_function(f, &func_names, module.layout))
+        .collect()
+}
+
+/// Select machine instructions for one IR function. `func_names`
+/// resolves `FuncRef::Internal` indices — ELF symbol naming is
+/// identity, so the name goes straight into an `Extern` operand
+/// (no `_func_N` placeholder pass like ARM's Mach-O path needs).
+pub fn select_function(
+    func: &Function,
+    func_names: &[String],
+    layout: crate::target::TargetLayout,
+) -> X86Function {
+    let mut mf = X86Function::new(func.name.clone());
+    let mut ctx = X86ISelCtx::new(layout);
+
+    // Phase 1: frame slots for every IR alloca.
+    for block in &func.blocks {
+        for inst in &block.insts {
+            if let InstKind::Alloca(ty) = &inst.kind {
+                let size = alloca_size(ty, layout);
+                let align = slot_align(size);
+                let slot = mf.alloc_frame_slot(size, align);
+                ctx.alloca_slots.insert(inst.id, slot);
+            }
+        }
+    }
+
+    // Phase 2: machine blocks for IR blocks. Entry is MBlockId(0).
+    ctx.block_map.insert(func.entry, MBlockId(0));
+    for block in &func.blocks {
+        if block.id != func.entry {
+            let mb_id = mf.new_block();
+            ctx.block_map.insert(block.id, mb_id);
+        }
+    }
+
+    // Phase 2.5: classify incoming parameters and reserve their vregs.
+    let mut abi_state = X86AbiState::new();
+    let mut param_info: Vec<(X86VReg, X86AbiArgLoc, IrType)> = Vec::new();
+    for param in &func.params {
+        let loc = classify_abi_arg(&abi_ty_of(&param.ty), &mut abi_state);
+        let vreg = mf.new_vreg(type_to_class(&param.ty));
+        ctx.value_map.insert(param.id, vreg);
+        param_info.push((vreg, loc, param.ty.clone()));
+    }
+
+    // Phase 3: receive incoming arguments into param vregs. No
+    // prologue here — frame layout (later in x05) inserts it.
+    for (vreg, loc, ty) in &param_info {
+        match loc {
+            X86AbiArgLoc::Gp(r) => {
+                let size = gp_move_size(vreg.class);
+                push(
+                    &mut mf,
+                    MBlockId(0),
+                    X86Opcode::MovRR,
+                    size,
+                    vec![X86Operand::Reg(*r)],
+                    Some(X86Operand::VReg(*vreg)),
+                );
+            }
+            X86AbiArgLoc::Xmm(r) => {
+                push(
+                    &mut mf,
+                    MBlockId(0),
+                    fp_move(ty),
+                    fp_size(ty),
+                    vec![X86Operand::Reg(*r)],
+                    Some(X86Operand::VReg(*vreg)),
+                );
+            }
+            X86AbiArgLoc::Stack { offset, .. } => {
+                // After the (future) `push rbp; mov rsp, rbp` prologue:
+                // saved rbp at rbp+0, return address at rbp+8, first
+                // stack argument at rbp+16.
+                let mem = X86Operand::Mem {
+                    base: Some(X86Reg::Rbp),
+                    index: None,
+                    scale: 1,
+                    disp: 16 + offset,
+                };
+                emit_load(&mut mf, MBlockId(0), *vreg, ty, mem);
+            }
+            other => panic!(
+                "isel: unexpected ABI loc {:?} for incoming scalar param",
+                other
+            ),
+        }
+    }
+
+    // Phase 4a: reserve vregs for every block param and instruction
+    // result before walking any instructions — branch terminators need
+    // target-param vregs, and SSA dominance allows uses that precede
+    // the defining block in vec order (same rationale as ARM isel).
+    for block in &func.blocks {
+        for bp in &block.params {
+            reject_unsupported(&bp.ty);
+            let vreg = mf.new_vreg(type_to_class(&bp.ty));
+            ctx.value_map.insert(bp.id, vreg);
+        }
+        for inst in &block.insts {
+            if matches!(inst.ty, IrType::Void) {
+                continue;
+            }
+            reject_unsupported(&inst.ty);
+            let vreg = mf.new_vreg(type_to_class(&inst.ty));
+            ctx.value_map.insert(inst.id, vreg);
+        }
+    }
+
+    // Snapshot block params so terminator selection can read each
+    // target's params while holding &mut X86Function.
+    for block in &func.blocks {
+        ctx.block_params.insert(block.id, block.params.clone());
+    }
+
+    // Phase 4b: select instructions and terminators. `mb` is a cursor:
+    // Select lowers to a diamond and leaves the cursor on its join
+    // block, so the rest of the IR block continues there.
+    for block in &func.blocks {
+        let mut mb = ctx.block_map[&block.id];
+        for inst in &block.insts {
+            mb = select_inst(&mut mf, &mut ctx, mb, inst, func, func_names);
+        }
+        if let Some(term) = &block.terminator {
+            select_terminator(&mut mf, &mut ctx, mb, term, func);
+        }
+    }
+
+    mf
+}
+
+/// Instruction selection context.
+struct X86ISelCtx {
+    /// Target layout of the module being selected (x02).
+    layout: crate::target::TargetLayout,
+    /// IR ValueId → MIR vreg.
+    value_map: HashMap<ValueId, X86VReg>,
+    /// IR BlockId → MIR MBlockId.
+    block_map: HashMap<BlockId, MBlockId>,
+    /// IR alloca ValueId → frame slot id.
+    alloca_slots: HashMap<ValueId, i32>,
+    /// IR BlockId → its block params, snapshotted before phase 4b.
+    block_params: HashMap<BlockId, Vec<BlockParam>>,
+}
+
+impl X86ISelCtx {
+    fn new(layout: crate::target::TargetLayout) -> Self {
+        Self {
+            layout,
+            value_map: HashMap::new(),
+            block_map: HashMap::new(),
+            alloca_slots: HashMap::new(),
+            block_params: HashMap::new(),
+        }
+    }
+
+    /// Get the vreg for an IR value, assuming phase 4a mapped it.
+    fn lookup_vreg(&self, val: ValueId) -> X86VReg {
+        *self.value_map.get(&val).unwrap_or_else(|| {
+            panic!(
+                "isel: unmapped IR value %{} — phase 4a should have allocated \
+                 a vreg for every IR value before phase 4b runs",
+                val.0
+            )
+        })
+    }
+
+    /// Get machine block for an IR block.
+    fn lookup_block(&self, block: BlockId) -> MBlockId {
+        *self.block_map.get(&block).unwrap_or(&MBlockId(0))
+    }
+
+    /// Address operand for a Load/Store/Lea base: allocas become
+    /// `FrameSlot`, anything else is the documented address-in-vreg
+    /// form (see `X86Opcode::MovRM`).
+    fn addr_operand(&self, addr: ValueId) -> X86Operand {
+        if let Some(&slot) = self.alloca_slots.get(&addr) {
+            X86Operand::FrameSlot(slot)
+        } else {
+            X86Operand::VReg(self.lookup_vreg(addr))
+        }
+    }
+}
+
+fn push(
+    mf: &mut X86Function,
+    mb: MBlockId,
+    opcode: X86Opcode,
+    size: OpSize,
+    operands: Vec<X86Operand>,
+    def: Option<X86Operand>,
+) {
+    mf.block_mut(mb).insts.push(X86Inst {
+        opcode,
+        size,
+        operands,
+        def,
+    });
+}
+
+/// How one IR FP comparison maps onto `ucomis{s,d}` + flags (the
+/// sprint-doc condition table, fixed here once and unit-tested below).
+/// Unordered (NaN) comparison sets ZF=PF=CF=1, so:
+///  - `>` / `>=` use A/AE — CF-based, false on NaN.
+///  - `<` / `<=` SWAP the ucomi operands then use A/AE; B/BE read CF
+///    and would come out true on NaN.
+///  - `==` is `sete` AND `setnp` (NP masks the unordered case);
+///    `/=` is `setne` OR `setp`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FpCmpPlan {
+    Direct {
+        swap_operands: bool,
+        cond: X86Cond,
+    },
+    Equality {
+        cond: X86Cond,
+        parity: X86Cond,
+        combine: X86Opcode,
+    },
+}
+
+pub(crate) fn fp_cond_plan(op: CmpOp) -> FpCmpPlan {
+    match op {
+        CmpOp::Gt => FpCmpPlan::Direct {
+            swap_operands: false,
+            cond: X86Cond::A,
+        },
+        CmpOp::Ge => FpCmpPlan::Direct {
+            swap_operands: false,
+            cond: X86Cond::Ae,
+        },
+        CmpOp::Lt => FpCmpPlan::Direct {
+            swap_operands: true,
+            cond: X86Cond::A,
+        },
+        CmpOp::Le => FpCmpPlan::Direct {
+            swap_operands: true,
+            cond: X86Cond::Ae,
+        },
+        CmpOp::Eq => FpCmpPlan::Equality {
+            cond: X86Cond::E,
+            parity: X86Cond::Np,
+            combine: X86Opcode::And,
+        },
+        CmpOp::Ne => FpCmpPlan::Equality {
+            cond: X86Cond::Ne,
+            parity: X86Cond::P,
+            combine: X86Opcode::Or,
+        },
+    }
+}
+
+/// IR CmpOp → integer condition code. Fortran integers are signed, and
+/// IR CmpOp is the signed comparison (same mapping ARM's
+/// `cmp_to_arm_cond` makes).
+fn int_cond(op: CmpOp) -> X86Cond {
+    match op {
+        CmpOp::Eq => X86Cond::E,
+        CmpOp::Ne => X86Cond::Ne,
+        CmpOp::Lt => X86Cond::L,
+        CmpOp::Le => X86Cond::Le,
+        CmpOp::Gt => X86Cond::G,
+        CmpOp::Ge => X86Cond::Ge,
+    }
+}
+
+/// Select machine instructions for a single IR instruction. Returns
+/// the machine block selection should continue in (changes only when
+/// Select opens a diamond).
+fn select_inst(
+    mf: &mut X86Function,
+    ctx: &mut X86ISelCtx,
+    mb: MBlockId,
+    inst: &Inst,
+    func: &Function,
+    func_names: &[String],
+) -> MBlockId {
+    match &inst.kind {
+        // ---- Constants ----
+        InstKind::ConstInt(val, width) => {
+            let dest = ctx.lookup_vreg(inst.id);
+            let size = match width {
+                IntWidth::I64 => OpSize::Q,
+                IntWidth::I128 => panic!("x05 scope: i128 constants deferred"),
+                _ => OpSize::L,
+            };
+            // i64 immediates that need movabs are still MovRI with Q;
+            // the printer handles the spelling.
+            push(
+                mf,
+                mb,
+                X86Opcode::MovRI,
+                size,
+                vec![X86Operand::Imm(*val as i64)],
+                Some(X86Operand::VReg(dest)),
+            );
+        }
+
+        InstKind::ConstFloat(val, width) => {
+            let dest = ctx.lookup_vreg(inst.id);
+            let bits = match width {
+                FloatWidth::F32 => (*val as f32).to_bits() as u64,
+                FloatWidth::F64 => val.to_bits(),
+            };
+            let label = mf.add_rodata(bits);
+            push(
+                mf,
+                mb,
+                fp_move_w(*width),
+                fp_size_w(*width),
+                vec![X86Operand::RipLabel(label)],
+                Some(X86Operand::VReg(dest)),
+            );
+        }
+
+        InstKind::ConstBool(val) => {
+            let dest = ctx.lookup_vreg(inst.id);
+            push(
+                mf,
+                mb,
+                X86Opcode::MovRI,
+                OpSize::L,
+                vec![X86Operand::Imm(if *val { 1 } else { 0 })],
+                Some(X86Operand::VReg(dest)),
+            );
+        }
+
+        InstKind::ConstString(_) => {
+            panic!("x05 scope: string constants deferred (need a bytes rodata form)")
+        }
+
+        InstKind::Undef(_) => {
+            // Deterministic zero, same rationale as ARM isel: a truly
+            // undefined vreg leaks whatever was in the assigned
+            // register, making opt-level diffs nondeterministic.
+            let dest = ctx.lookup_vreg(inst.id);
+            match dest.class {
+                X86RegClass::Xmm => {
+                    let label = mf.add_rodata(0);
+                    push(
+                        mf,
+                        mb,
+                        X86Opcode::Movsd,
+                        OpSize::Q,
+                        vec![X86Operand::RipLabel(label)],
+                        Some(X86Operand::VReg(dest)),
+                    );
+                }
+                _ => {
+                    let size = gp_move_size(dest.class);
+                    push(
+                        mf,
+                        mb,
+                        X86Opcode::MovRI,
+                        size,
+                        vec![X86Operand::Imm(0)],
+                        Some(X86Operand::VReg(dest)),
+                    );
+                }
+            }
+        }
+
+        // ---- Integer arithmetic (three-address; twoaddr ties later) ----
+        InstKind::IAdd(a, b) => emit_int_binop(mf, ctx, mb, inst, X86Opcode::Add, *a, *b),
+        InstKind::ISub(a, b) => emit_int_binop(mf, ctx, mb, inst, X86Opcode::Sub, *a, *b),
+        InstKind::IMul(a, b) => emit_int_binop(mf, ctx, mb, inst, X86Opcode::Imul, *a, *b),
+        InstKind::IDiv(a, b) => emit_div_mod(mf, ctx, mb, inst, *a, *b, X86Reg::Rax),
+        InstKind::IMod(a, b) => {
+            // The idiv remainder takes the dividend's sign — exactly
+            // Fortran MOD's semantics, so %rdx is the result directly.
+            emit_div_mod(mf, ctx, mb, inst, *a, *b, X86Reg::Rdx)
+        }
+        InstKind::INeg(a) => {
+            let dest = ctx.lookup_vreg(inst.id);
+            let va = ctx.lookup_vreg(*a);
+            push(
+                mf,
+                mb,
+                X86Opcode::Neg,
+                op_size(&inst.ty),
+                vec![X86Operand::VReg(va)],
+                Some(X86Operand::VReg(dest)),
+            );
+        }
+
+        // ---- Float arithmetic ----
+        InstKind::FAdd(a, b) => emit_fp_binop(
+            mf,
+            ctx,
+            mb,
+            inst,
+            *a,
+            *b,
+            (X86Opcode::Addss, X86Opcode::Addsd),
+        ),
+        InstKind::FSub(a, b) => emit_fp_binop(
+            mf,
+            ctx,
+            mb,
+            inst,
+            *a,
+            *b,
+            (X86Opcode::Subss, X86Opcode::Subsd),
+        ),
+        InstKind::FMul(a, b) => emit_fp_binop(
+            mf,
+            ctx,
+            mb,
+            inst,
+            *a,
+            *b,
+            (X86Opcode::Mulss, X86Opcode::Mulsd),
+        ),
+        InstKind::FDiv(a, b) => emit_fp_binop(
+            mf,
+            ctx,
+            mb,
+            inst,
+            *a,
+            *b,
+            (X86Opcode::Divss, X86Opcode::Divsd),
+        ),
+        InstKind::FNeg(a) => {
+            // Flip the sign bit with a packed xor against a rodata
+            // mask. The mask is loaded with movss/movsd, which zero
+            // the upper lanes, so the packed op only changes the live
+            // low lane of the (scalar-only) Xmm vreg.
+            let (bits, opcode) = match float_width(&inst.ty) {
+                FloatWidth::F32 => (0x8000_0000u64, X86Opcode::Xorps),
+                FloatWidth::F64 => (0x8000_0000_0000_0000u64, X86Opcode::Xorpd),
+            };
+            emit_fp_mask_op(mf, ctx, mb, inst, *a, bits, opcode);
+        }
+        InstKind::FAbs(a) => {
+            // Clear the sign bit; same mask-load reasoning as FNeg
+            // (upper lanes AND with 0 → stay irrelevant zeros).
+            let (bits, opcode) = match float_width(&inst.ty) {
+                FloatWidth::F32 => (0x7fff_ffffu64, X86Opcode::Andps),
+                FloatWidth::F64 => (0x7fff_ffff_ffff_ffffu64, X86Opcode::Andpd),
+            };
+            emit_fp_mask_op(mf, ctx, mb, inst, *a, bits, opcode);
+        }
+        InstKind::FSqrt(a) => {
+            let dest = ctx.lookup_vreg(inst.id);
+            let va = ctx.lookup_vreg(*a);
+            let opcode = match float_width(&inst.ty) {
+                FloatWidth::F32 => X86Opcode::Sqrtss,
+                FloatWidth::F64 => X86Opcode::Sqrtsd,
+            };
+            push(
+                mf,
+                mb,
+                opcode,
+                fp_size(&inst.ty),
+                vec![X86Operand::VReg(va)],
+                Some(X86Operand::VReg(dest)),
+            );
+        }
+        InstKind::FPow(a, b) => {
+            // libm call, mirroring ARM isel's pow/powf lowering. Two
+            // xmm argument registers → AL=2 per the blanket external
+            // policy.
+            let dest = ctx.lookup_vreg(inst.id);
+            let va = ctx.lookup_vreg(*a);
+            let vb = ctx.lookup_vreg(*b);
+            let width = float_width(&inst.ty);
+            let callee = match width {
+                FloatWidth::F32 => "powf",
+                FloatWidth::F64 => "pow",
+            };
+            let (mv, sz) = (fp_move_w(width), fp_size_w(width));
+            push(
+                mf,
+                mb,
+                mv,
+                sz,
+                vec![X86Operand::VReg(va)],
+                Some(X86Operand::Reg(X86Reg::Xmm0)),
+            );
+            push(
+                mf,
+                mb,
+                mv,
+                sz,
+                vec![X86Operand::VReg(vb)],
+                Some(X86Operand::Reg(X86Reg::Xmm1)),
+            );
+            push(
+                mf,
+                mb,
+                X86Opcode::MovRI,
+                OpSize::B,
+                vec![X86Operand::Imm(2)],
+                Some(X86Operand::Reg(X86Reg::Rax)),
+            );
+            push(
+                mf,
+                mb,
+                X86Opcode::Call,
+                OpSize::Q,
+                vec![X86Operand::Extern(callee.into())],
+                None,
+            );
+            push(
+                mf,
+                mb,
+                mv,
+                sz,
+                vec![X86Operand::Reg(X86Reg::Xmm0)],
+                Some(X86Operand::VReg(dest)),
+            );
+        }
+
+        // ---- Comparisons ----
+        InstKind::ICmp(op, a, b) => {
+            let dest = ctx.lookup_vreg(inst.id);
+            let wide = needs_wide_icmp(func.value_type(*a).as_ref())
+                || needs_wide_icmp(func.value_type(*b).as_ref());
+            let va = cmp_operand_vreg(mf, ctx, mb, func, *a, wide);
+            let vb = cmp_operand_vreg(mf, ctx, mb, func, *b, wide);
+            let size = if wide { OpSize::Q } else { OpSize::L };
+            push(
+                mf,
+                mb,
+                X86Opcode::Cmp,
+                size,
+                vec![X86Operand::VReg(va), X86Operand::VReg(vb)],
+                None,
+            );
+            emit_setcc_movzx(mf, mb, int_cond(*op), dest);
+        }
+
+        InstKind::FCmp(op, a, b) => {
+            let dest = ctx.lookup_vreg(inst.id);
+            let va = ctx.lookup_vreg(*a);
+            let vb = ctx.lookup_vreg(*b);
+            let operand_ty = func
+                .value_type(*a)
+                .unwrap_or_else(|| panic!("isel: missing type for fcmp operand %{}", a.0));
+            let width = float_width(&operand_ty);
+            let ucomi = match width {
+                FloatWidth::F32 => X86Opcode::Ucomiss,
+                FloatWidth::F64 => X86Opcode::Ucomisd,
+            };
+            let size = fp_size_w(width);
+            match fp_cond_plan(*op) {
+                FpCmpPlan::Direct {
+                    swap_operands,
+                    cond,
+                } => {
+                    let (l, r) = if swap_operands { (vb, va) } else { (va, vb) };
+                    push(
+                        mf,
+                        mb,
+                        ucomi,
+                        size,
+                        vec![X86Operand::VReg(l), X86Operand::VReg(r)],
+                        None,
+                    );
+                    emit_setcc_movzx(mf, mb, cond, dest);
+                }
+                FpCmpPlan::Equality {
+                    cond,
+                    parity,
+                    combine,
+                } => {
+                    push(
+                        mf,
+                        mb,
+                        ucomi,
+                        size,
+                        vec![X86Operand::VReg(va), X86Operand::VReg(vb)],
+                        None,
+                    );
+                    // Two setcc reads of the same flags (setcc writes
+                    // no flags), combined at byte width, then widened.
+                    let t1 = mf.new_vreg(X86RegClass::Gp8);
+                    let t2 = mf.new_vreg(X86RegClass::Gp8);
+                    let t3 = mf.new_vreg(X86RegClass::Gp8);
+                    push(
+                        mf,
+                        mb,
+                        X86Opcode::Setcc,
+                        OpSize::B,
+                        vec![X86Operand::Cond(cond)],
+                        Some(X86Operand::VReg(t1)),
+                    );
+                    push(
+                        mf,
+                        mb,
+                        X86Opcode::Setcc,
+                        OpSize::B,
+                        vec![X86Operand::Cond(parity)],
+                        Some(X86Operand::VReg(t2)),
+                    );
+                    push(
+                        mf,
+                        mb,
+                        combine,
+                        OpSize::B,
+                        vec![X86Operand::VReg(t1), X86Operand::VReg(t2)],
+                        Some(X86Operand::VReg(t3)),
+                    );
+                    push(
+                        mf,
+                        mb,
+                        X86Opcode::Movzx { src: OpSize::B },
+                        OpSize::L,
+                        vec![X86Operand::VReg(t3)],
+                        Some(X86Operand::VReg(dest)),
+                    );
+                }
+            }
+        }
+
+        // ---- Logic (Bool values are materialized 0/1 in Gp32) ----
+        InstKind::And(a, b) | InstKind::BitAnd(a, b) => {
+            emit_int_binop(mf, ctx, mb, inst, X86Opcode::And, *a, *b)
+        }
+        InstKind::Or(a, b) | InstKind::BitOr(a, b) => {
+            emit_int_binop(mf, ctx, mb, inst, X86Opcode::Or, *a, *b)
+        }
+        InstKind::BitXor(a, b) => emit_int_binop(mf, ctx, mb, inst, X86Opcode::Xor, *a, *b),
+        InstKind::Not(a) => {
+            // Logical not of a 0/1 bool: xor with 1 flips exactly the
+            // value bit (a full `not` would set the unused high bits).
+            let dest = ctx.lookup_vreg(inst.id);
+            let va = ctx.lookup_vreg(*a);
+            push(
+                mf,
+                mb,
+                X86Opcode::Xor,
+                OpSize::L,
+                vec![X86Operand::VReg(va), X86Operand::Imm(1)],
+                Some(X86Operand::VReg(dest)),
+            );
+        }
+        InstKind::BitNot(a) => {
+            let dest = ctx.lookup_vreg(inst.id);
+            let va = ctx.lookup_vreg(*a);
+            push(
+                mf,
+                mb,
+                X86Opcode::Not,
+                op_size(&inst.ty),
+                vec![X86Operand::VReg(va)],
+                Some(X86Operand::VReg(dest)),
+            );
+        }
+
+        // ---- Shifts (variable count through %cl) ----
+        InstKind::Shl(a, b) => emit_shift(mf, ctx, mb, inst, X86Opcode::Shl, *a, *b),
+        InstKind::LShr(a, b) => emit_shift(mf, ctx, mb, inst, X86Opcode::Shr, *a, *b),
+        InstKind::AShr(a, b) => emit_shift(mf, ctx, mb, inst, X86Opcode::Sar, *a, *b),
+
+        InstKind::CountLeadingZeros(_)
+        | InstKind::CountTrailingZeros(_)
+        | InstKind::PopCount(_) => {
+            panic!("x05 scope: bit-count ops deferred (no lzcnt/tzcnt/popcnt opcodes yet)")
+        }
+
+        // ---- Select: simple diamond over new machine blocks ----
+        InstKind::Select(cond, tv, fv) => {
+            let dest = ctx.lookup_vreg(inst.id);
+            let vcond = ctx.lookup_vreg(*cond);
+            let vt = ctx.lookup_vreg(*tv);
+            let vf = ctx.lookup_vreg(*fv);
+            let false_mb = mf.new_block();
+            let join_mb = mf.new_block();
+            push(
+                mf,
+                mb,
+                X86Opcode::Test,
+                OpSize::L,
+                vec![X86Operand::VReg(vcond), X86Operand::VReg(vcond)],
+                None,
+            );
+            push(
+                mf,
+                mb,
+                X86Opcode::Jcc,
+                OpSize::Q,
+                vec![X86Operand::Cond(X86Cond::E), X86Operand::BlockRef(false_mb)],
+                None,
+            );
+            // True arm stays inline; both arms end in explicit jumps so
+            // physical block order never matters.
+            emit_vreg_move(mf, mb, dest, vt);
+            push(
+                mf,
+                mb,
+                X86Opcode::Jmp,
+                OpSize::Q,
+                vec![X86Operand::BlockRef(join_mb)],
+                None,
+            );
+            emit_vreg_move(mf, false_mb, dest, vf);
+            push(
+                mf,
+                false_mb,
+                X86Opcode::Jmp,
+                OpSize::Q,
+                vec![X86Operand::BlockRef(join_mb)],
+                None,
+            );
+            return join_mb;
+        }
+
+        // ---- Conversions ----
+        InstKind::IntToFloat(a, fw) => {
+            let dest = ctx.lookup_vreg(inst.id);
+            let src_ty = func.value_type(*a);
+            let mut src = ctx.lookup_vreg(*a);
+            // cvtsi2 has no 8/16-bit source forms; sign-extend narrow
+            // ints to 32 bits first. Bool is already a zero-extended
+            // 0/1 in its Gp32 vreg.
+            let isz = match src_ty.as_ref() {
+                Some(IrType::Int(IntWidth::I64)) => OpSize::Q,
+                Some(IrType::Int(IntWidth::I8)) => {
+                    src = emit_movsx_to_gp32(mf, mb, src, OpSize::B);
+                    OpSize::L
+                }
+                Some(IrType::Int(IntWidth::I16)) => {
+                    src = emit_movsx_to_gp32(mf, mb, src, OpSize::W);
+                    OpSize::L
+                }
+                _ => OpSize::L,
+            };
+            let opcode = match fw {
+                FloatWidth::F32 => X86Opcode::Cvtsi2ss,
+                FloatWidth::F64 => X86Opcode::Cvtsi2sd,
+            };
+            push(
+                mf,
+                mb,
+                opcode,
+                isz,
+                vec![X86Operand::VReg(src)],
+                Some(X86Operand::VReg(dest)),
+            );
+        }
+
+        InstKind::FloatToInt(a, iw) => {
+            let dest = ctx.lookup_vreg(inst.id);
+            let src = ctx.lookup_vreg(*a);
+            let src_ty = func
+                .value_type(*a)
+                .unwrap_or_else(|| panic!("isel: missing type for float-to-int operand"));
+            let opcode = match float_width(&src_ty) {
+                FloatWidth::F32 => X86Opcode::Cvttss2si,
+                FloatWidth::F64 => X86Opcode::Cvttsd2si,
+            };
+            // Narrow targets truncate from the 32-bit conversion.
+            let size = match iw {
+                IntWidth::I64 => OpSize::Q,
+                _ => OpSize::L,
+            };
+            push(
+                mf,
+                mb,
+                opcode,
+                size,
+                vec![X86Operand::VReg(src)],
+                Some(X86Operand::VReg(dest)),
+            );
+        }
+
+        InstKind::FloatExtend(a, _) => {
+            let dest = ctx.lookup_vreg(inst.id);
+            let src = ctx.lookup_vreg(*a);
+            push(
+                mf,
+                mb,
+                X86Opcode::Cvtss2sd,
+                OpSize::Q,
+                vec![X86Operand::VReg(src)],
+                Some(X86Operand::VReg(dest)),
+            );
+        }
+
+        InstKind::FloatTrunc(a, _) => {
+            let dest = ctx.lookup_vreg(inst.id);
+            let src = ctx.lookup_vreg(*a);
+            push(
+                mf,
+                mb,
+                X86Opcode::Cvtsd2ss,
+                OpSize::Q,
+                vec![X86Operand::VReg(src)],
+                Some(X86Operand::VReg(dest)),
+            );
+        }
+
+        InstKind::IntExtend(a, _, signed) => {
+            let dest = ctx.lookup_vreg(inst.id);
+            let src = ctx.lookup_vreg(*a);
+            let src_ty = func.value_type(*a);
+            let src_bits = match src_ty.as_ref() {
+                Some(IrType::Int(IntWidth::I8)) => 8,
+                Some(IrType::Int(IntWidth::I16)) => 16,
+                Some(IrType::Int(IntWidth::I64)) => 64,
+                _ => 32, // i32, Bool, conservative default
+            };
+            let dst_bits = if dest.class == X86RegClass::Gp64 {
+                64
+            } else {
+                32
+            };
+            let dst_size = if dst_bits == 64 { OpSize::Q } else { OpSize::L };
+            if !*signed || src_bits >= dst_bits {
+                match src_bits {
+                    8 if src_bits < dst_bits || !*signed => {
+                        // movzbl zero-extends through bit 63.
+                        push(
+                            mf,
+                            mb,
+                            X86Opcode::Movzx { src: OpSize::B },
+                            OpSize::L,
+                            vec![X86Operand::VReg(src)],
+                            Some(X86Operand::VReg(dest)),
+                        );
+                    }
+                    16 if src_bits < dst_bits || !*signed => {
+                        push(
+                            mf,
+                            mb,
+                            X86Opcode::Movzx { src: OpSize::W },
+                            OpSize::L,
+                            vec![X86Operand::VReg(src)],
+                            Some(X86Operand::VReg(dest)),
+                        );
+                    }
+                    _ => {
+                        // 32→64 zero extension is `movl` (implicit
+                        // upper-half zeroing, the printer's documented
+                        // rule); same-width/wider sources degrade to a
+                        // plain move like ARM isel does.
+                        push(
+                            mf,
+                            mb,
+                            X86Opcode::MovRR,
+                            OpSize::L,
+                            vec![X86Operand::VReg(src)],
+                            Some(X86Operand::VReg(dest)),
+                        );
+                    }
+                }
+            } else {
+                let src_size = match src_bits {
+                    8 => OpSize::B,
+                    16 => OpSize::W,
+                    _ => OpSize::L,
+                };
+                push(
+                    mf,
+                    mb,
+                    X86Opcode::Movsx { src: src_size },
+                    dst_size,
+                    vec![X86Operand::VReg(src)],
+                    Some(X86Operand::VReg(dest)),
+                );
+            }
+        }
+
+        InstKind::IntTrunc(a, _) => {
+            // A 32-bit move truncates and keeps the value's low bits;
+            // narrow ints live in Gp32 anyway.
+            let dest = ctx.lookup_vreg(inst.id);
+            let src = ctx.lookup_vreg(*a);
+            push(
+                mf,
+                mb,
+                X86Opcode::MovRR,
+                OpSize::L,
+                vec![X86Operand::VReg(src)],
+                Some(X86Operand::VReg(dest)),
+            );
+        }
+
+        InstKind::PtrToInt(a) | InstKind::IntToPtr(a, _) => {
+            let dest = ctx.lookup_vreg(inst.id);
+            let src = ctx.lookup_vreg(*a);
+            push(
+                mf,
+                mb,
+                X86Opcode::MovRR,
+                OpSize::Q,
+                vec![X86Operand::VReg(src)],
+                Some(X86Operand::VReg(dest)),
+            );
+        }
+
+        // ---- Memory ----
+        InstKind::Alloca(_) => {
+            // Phase 1 reserved the slot; the SSA value is its address.
+            let slot = ctx.alloca_slots[&inst.id];
+            let dest = ctx.lookup_vreg(inst.id);
+            push(
+                mf,
+                mb,
+                X86Opcode::Lea,
+                OpSize::Q,
+                vec![X86Operand::FrameSlot(slot)],
+                Some(X86Operand::VReg(dest)),
+            );
+        }
+
+        InstKind::Load(addr) => {
+            let dest = ctx.lookup_vreg(inst.id);
+            let addr_op = ctx.addr_operand(*addr);
+            emit_load(mf, mb, dest, &inst.ty, addr_op);
+        }
+
+        InstKind::Store(val, addr) => {
+            let src = ctx.lookup_vreg(*val);
+            let val_ty = func
+                .value_type(*val)
+                .unwrap_or_else(|| panic!("isel: missing type for stored value %{}", val.0));
+            let addr_op = ctx.addr_operand(*addr);
+            emit_store(mf, mb, src, &val_ty, addr_op);
+        }
+
+        InstKind::GetElementPtr(base, indices) => {
+            let dest = ctx.lookup_vreg(inst.id);
+            let base_v = ctx.lookup_vreg(*base);
+            debug_assert_eq!(
+                base_v.class,
+                X86RegClass::Gp64,
+                "GEP base must be a pointer"
+            );
+            // Element size from the result type Ptr<elem> — same
+            // derivation ARM isel uses.
+            let elem_size = match &inst.ty {
+                IrType::Ptr(inner) => match inner.as_ref() {
+                    IrType::Struct(_) => alloca_size(inner, ctx.layout) as i64,
+                    _ => inner.size_bytes(&ctx.layout) as i64,
+                },
+                _ => 4,
+            };
+            if let Some(idx) = indices.first() {
+                let idx_src = ctx.lookup_vreg(*idx);
+                let idx64 = if idx_src.class == X86RegClass::Gp64 {
+                    idx_src
+                } else {
+                    let widened = mf.new_vreg(X86RegClass::Gp64);
+                    let (opcode, size) = if matches!(func.value_type(*idx), Some(IrType::Bool)) {
+                        (X86Opcode::MovRR, OpSize::L) // zero-extend
+                    } else {
+                        (X86Opcode::Movsx { src: OpSize::L }, OpSize::Q)
+                    };
+                    push(
+                        mf,
+                        mb,
+                        opcode,
+                        size,
+                        vec![X86Operand::VReg(idx_src)],
+                        Some(X86Operand::VReg(widened)),
+                    );
+                    widened
+                };
+                // Byte offset = index * elem_size via plain imul
+                // (always — lea/shift strength reduction is x09 work),
+                // then add to the base. Both ops are three-address
+                // here; twoaddr satisfies the ties.
+                let size_v = mf.new_vreg(X86RegClass::Gp64);
+                push(
+                    mf,
+                    mb,
+                    X86Opcode::MovRI,
+                    OpSize::Q,
+                    vec![X86Operand::Imm(elem_size)],
+                    Some(X86Operand::VReg(size_v)),
+                );
+                let scaled = mf.new_vreg(X86RegClass::Gp64);
+                push(
+                    mf,
+                    mb,
+                    X86Opcode::Imul,
+                    OpSize::Q,
+                    vec![X86Operand::VReg(idx64), X86Operand::VReg(size_v)],
+                    Some(X86Operand::VReg(scaled)),
+                );
+                push(
+                    mf,
+                    mb,
+                    X86Opcode::Add,
+                    OpSize::Q,
+                    vec![X86Operand::VReg(base_v), X86Operand::VReg(scaled)],
+                    Some(X86Operand::VReg(dest)),
+                );
+            } else {
+                push(
+                    mf,
+                    mb,
+                    X86Opcode::MovRR,
+                    OpSize::Q,
+                    vec![X86Operand::VReg(base_v)],
+                    Some(X86Operand::VReg(dest)),
+                );
+            }
+        }
+
+        InstKind::GlobalAddr(name) => {
+            let dest = ctx.lookup_vreg(inst.id);
+            // Always rip-relative: works in every code model and is
+            // what x06's link step expects.
+            push(
+                mf,
+                mb,
+                X86Opcode::Lea,
+                OpSize::Q,
+                vec![X86Operand::RipLabel(name.clone())],
+                Some(X86Operand::VReg(dest)),
+            );
+        }
+
+        // ---- Calls ----
+        InstKind::Call(..) | InstKind::RuntimeCall(..) => {
+            select_call_inst(mf, ctx, mb, inst, func, func_names);
+        }
+
+        InstKind::ExtractField(..) | InstKind::InsertField(..) => {
+            panic!("x05 scope: aggregate field ops deferred")
+        }
+
+        InstKind::VAdd(..)
+        | InstKind::VSub(..)
+        | InstKind::VMul(..)
+        | InstKind::VDiv(..)
+        | InstKind::VNeg(..)
+        | InstKind::VAbs(..)
+        | InstKind::VSqrt(..)
+        | InstKind::VFma(..)
+        | InstKind::VSelect(..)
+        | InstKind::VMin(..)
+        | InstKind::VMax(..)
+        | InstKind::VICmp(..)
+        | InstKind::VFCmp(..)
+        | InstKind::VLoad(..)
+        | InstKind::VStore(..)
+        | InstKind::VBitcast(..)
+        | InstKind::VExtract(..)
+        | InstKind::VInsert(..)
+        | InstKind::VBroadcast(..)
+        | InstKind::VReduceSum(..)
+        | InstKind::VReduceMin(..)
+        | InstKind::VReduceMax(..) => {
+            panic!("x05 scope: vector ops deferred (x10 brings SSE vectors)")
+        }
+    }
+    mb
+}
+
+/// Three-address integer binop; twoaddr satisfies the tie later.
+fn emit_int_binop(
+    mf: &mut X86Function,
+    ctx: &mut X86ISelCtx,
+    mb: MBlockId,
+    inst: &Inst,
+    opcode: X86Opcode,
+    a: ValueId,
+    b: ValueId,
+) {
+    let dest = ctx.lookup_vreg(inst.id);
+    let va = ctx.lookup_vreg(a);
+    let vb = ctx.lookup_vreg(b);
+    push(
+        mf,
+        mb,
+        opcode,
+        op_size(&inst.ty),
+        vec![X86Operand::VReg(va), X86Operand::VReg(vb)],
+        Some(X86Operand::VReg(dest)),
+    );
+}
+
+/// `ops` is the (ss, sd) opcode pair; the result width picks one.
+fn emit_fp_binop(
+    mf: &mut X86Function,
+    ctx: &mut X86ISelCtx,
+    mb: MBlockId,
+    inst: &Inst,
+    a: ValueId,
+    b: ValueId,
+    ops: (X86Opcode, X86Opcode),
+) {
+    let dest = ctx.lookup_vreg(inst.id);
+    let va = ctx.lookup_vreg(a);
+    let vb = ctx.lookup_vreg(b);
+    let opcode = match float_width(&inst.ty) {
+        FloatWidth::F32 => ops.0,
+        FloatWidth::F64 => ops.1,
+    };
+    push(
+        mf,
+        mb,
+        opcode,
+        fp_size(&inst.ty),
+        vec![X86Operand::VReg(va), X86Operand::VReg(vb)],
+        Some(X86Operand::VReg(dest)),
+    );
+}
+
+/// FNeg/FAbs: packed bit op against a rodata mask loaded into a fresh
+/// Xmm vreg (see the call sites for the lane-zeroing argument).
+fn emit_fp_mask_op(
+    mf: &mut X86Function,
+    ctx: &mut X86ISelCtx,
+    mb: MBlockId,
+    inst: &Inst,
+    a: ValueId,
+    mask_bits: u64,
+    opcode: X86Opcode,
+) {
+    let dest = ctx.lookup_vreg(inst.id);
+    let va = ctx.lookup_vreg(a);
+    let width = float_width(&inst.ty);
+    let label = mf.add_rodata(mask_bits);
+    let mask_v = mf.new_vreg(X86RegClass::Xmm);
+    push(
+        mf,
+        mb,
+        fp_move_w(width),
+        fp_size_w(width),
+        vec![X86Operand::RipLabel(label)],
+        Some(X86Operand::VReg(mask_v)),
+    );
+    push(
+        mf,
+        mb,
+        opcode,
+        fp_size_w(width),
+        vec![X86Operand::VReg(va), X86Operand::VReg(mask_v)],
+        Some(X86Operand::VReg(dest)),
+    );
+}
+
+/// IDiv/IMod fixed-register sequence. `result_reg` is Rax (quotient)
+/// or Rdx (remainder).
+fn emit_div_mod(
+    mf: &mut X86Function,
+    ctx: &mut X86ISelCtx,
+    mb: MBlockId,
+    inst: &Inst,
+    a: ValueId,
+    b: ValueId,
+    result_reg: X86Reg,
+) {
+    let dest = ctx.lookup_vreg(inst.id);
+    let va = ctx.lookup_vreg(a);
+    let vb = ctx.lookup_vreg(b);
+    let size = op_size(&inst.ty);
+    // The divisor must end up in neither rax nor rdx (both are
+    // clobbered by cltd/cqto + idiv). Always copy it to a fresh vreg
+    // whose interval crosses the clobbers, so the allocator keeps it
+    // clear of them.
+    let divisor = mf.new_vreg(dest.class);
+    push(
+        mf,
+        mb,
+        X86Opcode::MovRR,
+        size,
+        vec![X86Operand::VReg(vb)],
+        Some(X86Operand::VReg(divisor)),
+    );
+    push(
+        mf,
+        mb,
+        X86Opcode::MovRR,
+        size,
+        vec![X86Operand::VReg(va)],
+        Some(X86Operand::Reg(X86Reg::Rax)),
+    );
+    let extend = match size {
+        OpSize::Q => X86Opcode::Cqto,
+        _ => X86Opcode::Cltd,
+    };
+    push(mf, mb, extend, size, vec![], None);
+    push(
+        mf,
+        mb,
+        X86Opcode::Idiv,
+        size,
+        vec![X86Operand::VReg(divisor)],
+        None,
+    );
+    push(
+        mf,
+        mb,
+        X86Opcode::MovRR,
+        size,
+        vec![X86Operand::Reg(result_reg)],
+        Some(X86Operand::VReg(dest)),
+    );
+}
+
+/// Variable shift: count through %rcx (printed as %cl).
+fn emit_shift(
+    mf: &mut X86Function,
+    ctx: &mut X86ISelCtx,
+    mb: MBlockId,
+    inst: &Inst,
+    opcode: X86Opcode,
+    a: ValueId,
+    b: ValueId,
+) {
+    let dest = ctx.lookup_vreg(inst.id);
+    let va = ctx.lookup_vreg(a);
+    let vb = ctx.lookup_vreg(b);
+    push(
+        mf,
+        mb,
+        X86Opcode::MovRR,
+        gp_move_size(vb.class),
+        vec![X86Operand::VReg(vb)],
+        Some(X86Operand::Reg(X86Reg::Rcx)),
+    );
+    push(
+        mf,
+        mb,
+        opcode,
+        op_size(&inst.ty),
+        vec![X86Operand::VReg(va), X86Operand::Reg(X86Reg::Rcx)],
+        Some(X86Operand::VReg(dest)),
+    );
+}
+
+/// setcc into a fresh Gp8 vreg + movzx to the Gp32 dest. ALWAYS
+/// paired: setcc writes 8 bits and leaves bits 8–63 stale.
+fn emit_setcc_movzx(mf: &mut X86Function, mb: MBlockId, cond: X86Cond, dest: X86VReg) {
+    let t = mf.new_vreg(X86RegClass::Gp8);
+    push(
+        mf,
+        mb,
+        X86Opcode::Setcc,
+        OpSize::B,
+        vec![X86Operand::Cond(cond)],
+        Some(X86Operand::VReg(t)),
+    );
+    push(
+        mf,
+        mb,
+        X86Opcode::Movzx { src: OpSize::B },
+        OpSize::L,
+        vec![X86Operand::VReg(t)],
+        Some(X86Operand::VReg(dest)),
+    );
+}
+
+fn emit_movsx_to_gp32(mf: &mut X86Function, mb: MBlockId, src: X86VReg, from: OpSize) -> X86VReg {
+    let dest = mf.new_vreg(X86RegClass::Gp32);
+    push(
+        mf,
+        mb,
+        X86Opcode::Movsx { src: from },
+        OpSize::L,
+        vec![X86Operand::VReg(src)],
+        Some(X86Operand::VReg(dest)),
+    );
+    dest
+}
+
+fn needs_wide_icmp(ty: Option<&IrType>) -> bool {
+    matches!(
+        ty,
+        Some(IrType::Int(IntWidth::I64) | IrType::Ptr(_) | IrType::FuncPtr(_))
+    )
+}
+
+/// Widen one icmp operand to 64 bits when the comparison is wide.
+fn cmp_operand_vreg(
+    mf: &mut X86Function,
+    ctx: &X86ISelCtx,
+    mb: MBlockId,
+    func: &Function,
+    value: ValueId,
+    wide: bool,
+) -> X86VReg {
+    let src = ctx.lookup_vreg(value);
+    if !wide || src.class == X86RegClass::Gp64 {
+        return src;
+    }
+    let dest = mf.new_vreg(X86RegClass::Gp64);
+    let (opcode, size) = if matches!(func.value_type(value), Some(IrType::Bool)) {
+        (X86Opcode::MovRR, OpSize::L) // 32→64 zero extension
+    } else {
+        (X86Opcode::Movsx { src: OpSize::L }, OpSize::Q)
+    };
+    push(
+        mf,
+        mb,
+        opcode,
+        size,
+        vec![X86Operand::VReg(src)],
+        Some(X86Operand::VReg(dest)),
+    );
+    dest
+}
+
+/// Register-to-register move dispatched by the destination's class.
+/// Xmm copies use movsd (low 64 bits) regardless of scalar width —
+/// the upper bits of an f32 scalar vreg are never read.
+fn emit_vreg_move(mf: &mut X86Function, mb: MBlockId, dst: X86VReg, src: X86VReg) {
+    let (opcode, size) = match dst.class {
+        X86RegClass::Xmm => (X86Opcode::Movsd, OpSize::Q),
+        class => (X86Opcode::MovRR, gp_move_size(class)),
+    };
+    push(
+        mf,
+        mb,
+        opcode,
+        size,
+        vec![X86Operand::VReg(src)],
+        Some(X86Operand::VReg(dst)),
+    );
+}
+
+/// Typed load into a vreg. Narrow integers extend to the Gp32
+/// convention width (sign for i8/i16, zero for Bool).
+fn emit_load(mf: &mut X86Function, mb: MBlockId, dest: X86VReg, ty: &IrType, addr: X86Operand) {
+    let (opcode, size) = match ty {
+        IrType::Bool => (X86Opcode::Movzx { src: OpSize::B }, OpSize::L),
+        IrType::Int(IntWidth::I8) => (X86Opcode::Movsx { src: OpSize::B }, OpSize::L),
+        IrType::Int(IntWidth::I16) => (X86Opcode::Movsx { src: OpSize::W }, OpSize::L),
+        IrType::Int(IntWidth::I32) => (X86Opcode::MovRM, OpSize::L),
+        IrType::Int(IntWidth::I64) | IrType::Ptr(_) | IrType::FuncPtr(_) => {
+            (X86Opcode::MovRM, OpSize::Q)
+        }
+        IrType::Float(FloatWidth::F32) => (X86Opcode::Movss, OpSize::L),
+        IrType::Float(FloatWidth::F64) => (X86Opcode::Movsd, OpSize::Q),
+        other => panic!("x05 scope: load of {:?} deferred", other),
+    };
+    push(
+        mf,
+        mb,
+        opcode,
+        size,
+        vec![addr],
+        Some(X86Operand::VReg(dest)),
+    );
+}
+
+/// Typed store. Integer stores are `MovMR [value, addr]` with no def;
+/// FP stores reuse Movss/Movsd with the address as the def operand
+/// (the printer's `movss %src, dst` shape — `mov{l,q}` can't move
+/// from an xmm register).
+fn emit_store(mf: &mut X86Function, mb: MBlockId, src: X86VReg, ty: &IrType, addr: X86Operand) {
+    match ty {
+        IrType::Bool | IrType::Int(IntWidth::I8) => push(
+            mf,
+            mb,
+            X86Opcode::MovMR,
+            OpSize::B,
+            vec![X86Operand::VReg(src), addr],
+            None,
+        ),
+        IrType::Int(IntWidth::I16) => panic!(
+            "x05 scope: i16 stores deferred (16-bit register names not wired in the printer)"
+        ),
+        IrType::Int(IntWidth::I32) => push(
+            mf,
+            mb,
+            X86Opcode::MovMR,
+            OpSize::L,
+            vec![X86Operand::VReg(src), addr],
+            None,
+        ),
+        IrType::Int(IntWidth::I64) | IrType::Ptr(_) | IrType::FuncPtr(_) => push(
+            mf,
+            mb,
+            X86Opcode::MovMR,
+            OpSize::Q,
+            vec![X86Operand::VReg(src), addr],
+            None,
+        ),
+        IrType::Float(w) => push(
+            mf,
+            mb,
+            fp_move_w(*w),
+            fp_size_w(*w),
+            vec![X86Operand::VReg(src)],
+            Some(addr),
+        ),
+        other => panic!("x05 scope: store of {:?} deferred", other),
+    }
+}
+
+fn select_call_inst(
+    mf: &mut X86Function,
+    ctx: &mut X86ISelCtx,
+    mb: MBlockId,
+    inst: &Inst,
+    func: &Function,
+    func_names: &[String],
+) {
+    let (label, args, is_internal) = match &inst.kind {
+        InstKind::Call(FuncRef::External(name), args) => (name.clone(), args.as_slice(), false),
+        InstKind::Call(FuncRef::Internal(idx), args) => {
+            let name = func_names
+                .get(*idx as usize)
+                .unwrap_or_else(|| panic!("isel: internal func index {} out of range", idx))
+                .clone();
+            (name, args.as_slice(), true)
+        }
+        InstKind::Call(FuncRef::Indirect(_), _) => {
+            panic!("x05 scope: indirect calls deferred")
+        }
+        InstKind::RuntimeCall(rf, args) => {
+            (runtime_func_symbol(rf, args, func), args.as_slice(), false)
+        }
+        _ => unreachable!(),
+    };
+
+    let mut state = X86AbiState::new();
+    let mut arg_locs: Vec<(ValueId, X86AbiArgLoc, IrType)> = Vec::with_capacity(args.len());
+    for &arg in args {
+        let ty = func
+            .value_type(arg)
+            .unwrap_or_else(|| panic!("isel: missing type for call arg %{}", arg.0));
+        let loc = classify_abi_arg(&abi_ty_of(&ty), &mut state);
+        arg_locs.push((arg, loc, ty));
+    }
+    if state.stack_bytes() > 0 {
+        mf.reserve_outgoing_args(state.stack_bytes());
+    }
+
+    // Stack stores go out first; register moves are batched last so no
+    // later argument computation can clobber an argument register.
+    let mut pending: Vec<X86Inst> = Vec::new();
+    for (arg, loc, ty) in &arg_locs {
+        let v = ctx.lookup_vreg(*arg);
+        match loc {
+            X86AbiArgLoc::Gp(r) => pending.push(X86Inst {
+                opcode: X86Opcode::MovRR,
+                size: gp_move_size(v.class),
+                operands: vec![X86Operand::VReg(v)],
+                def: Some(X86Operand::Reg(*r)),
+            }),
+            X86AbiArgLoc::Xmm(r) => pending.push(X86Inst {
+                opcode: fp_move(ty),
+                size: fp_size(ty),
+                operands: vec![X86Operand::VReg(v)],
+                def: Some(X86Operand::Reg(*r)),
+            }),
+            X86AbiArgLoc::Stack { offset, .. } => {
+                let mem = X86Operand::Mem {
+                    base: Some(X86Reg::Rsp),
+                    index: None,
+                    scale: 1,
+                    disp: *offset,
+                };
+                match v.class {
+                    X86RegClass::Xmm => push(
+                        mf,
+                        mb,
+                        fp_move(ty),
+                        fp_size(ty),
+                        vec![X86Operand::VReg(v)],
+                        Some(mem),
+                    ),
+                    // Slots are eightbyte-rounded; narrow ints write
+                    // their Gp32 form (the significant bytes land at
+                    // the slot's base, little-endian).
+                    class => push(
+                        mf,
+                        mb,
+                        X86Opcode::MovMR,
+                        gp_move_size(class),
+                        vec![X86Operand::VReg(v), mem],
+                        None,
+                    ),
+                }
+            }
+            other => panic!("isel: unexpected ABI loc {:?} for scalar arg", other),
+        }
+    }
+    for m in pending {
+        mf.block_mut(mb).insts.push(m);
+    }
+
+    if !is_internal {
+        // AL = xmm argument registers used, before every external call
+        // (x04's blanket policy: exact count beats auditing which
+        // externals are variadic; afs_* runtime calls are external for
+        // AL purposes even though none is variadic).
+        push(
+            mf,
+            mb,
+            X86Opcode::MovRI,
+            OpSize::B,
+            vec![X86Operand::Imm(state.xmm_used() as i64)],
+            Some(X86Operand::Reg(X86Reg::Rax)),
+        );
+    }
+    push(
+        mf,
+        mb,
+        X86Opcode::Call,
+        OpSize::Q,
+        vec![X86Operand::Extern(label)],
+        None,
+    );
+
+    if inst.ty != IrType::Void {
+        let dest = ctx.lookup_vreg(inst.id);
+        match classify_return(&abi_ty_of(&inst.ty)) {
+            X86RetLoc::Regs(regs) if regs.len() == 1 => {
+                emit_phys_to_vreg(mf, mb, dest, regs[0], &inst.ty);
+            }
+            other => panic!("x05 scope: call return shape {:?} deferred", other),
+        }
+    }
+}
+
+fn emit_phys_to_vreg(mf: &mut X86Function, mb: MBlockId, dest: X86VReg, reg: X86Reg, ty: &IrType) {
+    let (opcode, size) = match dest.class {
+        X86RegClass::Xmm => (fp_move(ty), fp_size(ty)),
+        class => (X86Opcode::MovRR, gp_move_size(class)),
+    };
+    push(
+        mf,
+        mb,
+        opcode,
+        size,
+        vec![X86Operand::Reg(reg)],
+        Some(X86Operand::VReg(dest)),
+    );
+}
+
+fn select_terminator(
+    mf: &mut X86Function,
+    ctx: &mut X86ISelCtx,
+    mb: MBlockId,
+    term: &Terminator,
+    func: &Function,
+) {
+    match term {
+        Terminator::Return(None) => {
+            push(mf, mb, X86Opcode::Ret, OpSize::Q, vec![], None);
+        }
+        Terminator::Return(Some(val)) => {
+            let src = ctx.lookup_vreg(*val);
+            let ty = func
+                .value_type(*val)
+                .unwrap_or_else(|| panic!("isel: missing type for return value %{}", val.0));
+            match classify_return(&abi_ty_of(&ty)) {
+                X86RetLoc::Regs(regs) if regs.len() == 1 => {
+                    let r = regs[0];
+                    let (opcode, size) = match src.class {
+                        X86RegClass::Xmm => (fp_move(&ty), fp_size(&ty)),
+                        class => (X86Opcode::MovRR, gp_move_size(class)),
+                    };
+                    push(
+                        mf,
+                        mb,
+                        opcode,
+                        size,
+                        vec![X86Operand::VReg(src)],
+                        Some(X86Operand::Reg(r)),
+                    );
+                }
+                other => panic!("x05 scope: return shape {:?} deferred", other),
+            }
+            push(mf, mb, X86Opcode::Ret, OpSize::Q, vec![], None);
+        }
+        Terminator::Branch(dest, args) => {
+            emit_branch_arg_copies(mf, ctx, mb, *dest, args);
+            let target = ctx.lookup_block(*dest);
+            push(
+                mf,
+                mb,
+                X86Opcode::Jmp,
+                OpSize::Q,
+                vec![X86Operand::BlockRef(target)],
+                None,
+            );
+        }
+        Terminator::CondBranch {
+            cond,
+            true_dest,
+            true_args,
+            false_dest,
+            false_args,
+        } => {
+            let vcond = ctx.lookup_vreg(*cond);
+            let true_mb = ctx.lookup_block(*true_dest);
+            let false_mb = ctx.lookup_block(*false_dest);
+
+            push(
+                mf,
+                mb,
+                X86Opcode::Test,
+                OpSize::L,
+                vec![X86Operand::VReg(vcond), X86Operand::VReg(vcond)],
+                None,
+            );
+
+            // Edge copies must run only on the taken edge: an arm that
+            // carries args gets a shim block (copies + jump), same
+            // structure ARM isel uses.
+            let true_target = if true_args.is_empty() {
+                true_mb
+            } else {
+                let shim = mf.new_block();
+                emit_branch_arg_copies(mf, ctx, shim, *true_dest, true_args);
+                push(
+                    mf,
+                    shim,
+                    X86Opcode::Jmp,
+                    OpSize::Q,
+                    vec![X86Operand::BlockRef(true_mb)],
+                    None,
+                );
+                shim
+            };
+            push(
+                mf,
+                mb,
+                X86Opcode::Jcc,
+                OpSize::Q,
+                vec![
+                    X86Operand::Cond(X86Cond::Ne),
+                    X86Operand::BlockRef(true_target),
+                ],
+                None,
+            );
+
+            let false_target = if false_args.is_empty() {
+                false_mb
+            } else {
+                let shim = mf.new_block();
+                emit_branch_arg_copies(mf, ctx, shim, *false_dest, false_args);
+                push(
+                    mf,
+                    shim,
+                    X86Opcode::Jmp,
+                    OpSize::Q,
+                    vec![X86Operand::BlockRef(false_mb)],
+                    None,
+                );
+                shim
+            };
+            push(
+                mf,
+                mb,
+                X86Opcode::Jmp,
+                OpSize::Q,
+                vec![X86Operand::BlockRef(false_target)],
+                None,
+            );
+        }
+        Terminator::Switch {
+            selector,
+            cases,
+            default,
+        } => {
+            let sel = ctx.lookup_vreg(*selector);
+            let size = match func.value_type(*selector) {
+                Some(IrType::Int(IntWidth::I64)) => OpSize::Q,
+                _ => OpSize::L,
+            };
+            let default_mb = ctx.lookup_block(*default);
+            for (val, dest) in cases {
+                let dest_mb = ctx.lookup_block(*dest);
+                push(
+                    mf,
+                    mb,
+                    X86Opcode::Cmp,
+                    size,
+                    vec![X86Operand::VReg(sel), X86Operand::Imm(*val)],
+                    None,
+                );
+                push(
+                    mf,
+                    mb,
+                    X86Opcode::Jcc,
+                    OpSize::Q,
+                    vec![X86Operand::Cond(X86Cond::E), X86Operand::BlockRef(dest_mb)],
+                    None,
+                );
+            }
+            push(
+                mf,
+                mb,
+                X86Opcode::Jmp,
+                OpSize::Q,
+                vec![X86Operand::BlockRef(default_mb)],
+                None,
+            );
+        }
+        Terminator::Unreachable => {
+            // Follows a STOP/ERROR STOP runtime call that never
+            // returns; `ret` keeps the assembler happy without
+            // inventing a trap opcode (ARM uses brk here).
+            push(mf, mb, X86Opcode::Ret, OpSize::Q, vec![], None);
+        }
+    }
+}
+
+/// Materialize branch arguments into the target block's param vregs.
+/// IR semantics are a parallel copy; staging every source through a
+/// fresh temp vreg first means all reads complete before any param is
+/// written, so overlapping/swapped args can't clobber each other.
+/// Simple and safe at -O0 — the coalescer-friendly safe-order walk
+/// ARM uses is an optimization, not a correctness requirement.
+fn emit_branch_arg_copies(
+    mf: &mut X86Function,
+    ctx: &X86ISelCtx,
+    mb: MBlockId,
+    target_block: BlockId,
+    args: &[ValueId],
+) {
+    if args.is_empty() {
+        return;
+    }
+    let target_params = ctx
+        .block_params
+        .get(&target_block)
+        .expect("isel: branch target not in block_params snapshot");
+    assert_eq!(
+        target_params.len(),
+        args.len(),
+        "isel: branch arg count ≠ target block param count"
+    );
+
+    let mut staged: Vec<(X86VReg, X86VReg)> = Vec::with_capacity(args.len());
+    for (arg, bp) in args.iter().zip(target_params.iter()) {
+        let dst = ctx.lookup_vreg(bp.id);
+        let src = ctx.lookup_vreg(*arg);
+        if dst == src {
+            continue;
+        }
+        let tmp = mf.new_vreg(dst.class);
+        emit_vreg_move(mf, mb, tmp, src);
+        staged.push((dst, tmp));
+    }
+    for (dst, tmp) in staged {
+        emit_vreg_move(mf, mb, dst, tmp);
+    }
+}
+
+// ---- Type helpers ----
+
+fn type_to_class(ty: &IrType) -> X86RegClass {
+    match ty {
+        IrType::Float(_) => X86RegClass::Xmm,
+        IrType::Int(IntWidth::I128) => panic!("x05 scope: i128 values deferred"),
+        IrType::Int(IntWidth::I64) | IrType::Ptr(_) | IrType::FuncPtr(_) => X86RegClass::Gp64,
+        IrType::Int(_) | IrType::Bool => X86RegClass::Gp32,
+        IrType::Vector { .. } => panic!("x05 scope: vector values deferred"),
+        other => panic!("x05 scope: no register class for {:?}", other),
+    }
+}
+
+fn reject_unsupported(ty: &IrType) {
+    // type_to_class panics with the scoped message; calling it for the
+    // side effect keeps the rejection list in one place.
+    let _ = type_to_class(ty);
+}
+
+/// ALU operand size for a value's type (narrow ints run at L).
+fn op_size(ty: &IrType) -> OpSize {
+    match ty {
+        IrType::Int(IntWidth::I64) | IrType::Ptr(_) | IrType::FuncPtr(_) => OpSize::Q,
+        IrType::Float(FloatWidth::F64) => OpSize::Q,
+        _ => OpSize::L,
+    }
+}
+
+fn gp_move_size(class: X86RegClass) -> OpSize {
+    match class {
+        X86RegClass::Gp64 => OpSize::Q,
+        X86RegClass::Gp8 => OpSize::B,
+        _ => OpSize::L,
+    }
+}
+
+fn float_width(ty: &IrType) -> FloatWidth {
+    match ty {
+        IrType::Float(w) => *w,
+        other => panic!("isel: expected a float type, got {:?}", other),
+    }
+}
+
+fn fp_move_w(width: FloatWidth) -> X86Opcode {
+    match width {
+        FloatWidth::F32 => X86Opcode::Movss,
+        FloatWidth::F64 => X86Opcode::Movsd,
+    }
+}
+
+fn fp_size_w(width: FloatWidth) -> OpSize {
+    match width {
+        FloatWidth::F32 => OpSize::L,
+        FloatWidth::F64 => OpSize::Q,
+    }
+}
+
+fn fp_move(ty: &IrType) -> X86Opcode {
+    fp_move_w(float_width(ty))
+}
+
+fn fp_size(ty: &IrType) -> OpSize {
+    fp_size_w(float_width(ty))
+}
+
+/// IrType → ABI scalar for the x04 classifier. Scalars only — x05's
+/// call scope.
+fn abi_ty_of(ty: &IrType) -> AbiTy {
+    match ty {
+        IrType::Bool => AbiTy::Scalar(AbiField::Bool),
+        IrType::Int(IntWidth::I8) => AbiTy::Scalar(AbiField::I8),
+        IrType::Int(IntWidth::I16) => AbiTy::Scalar(AbiField::I16),
+        IrType::Int(IntWidth::I32) => AbiTy::Scalar(AbiField::I32),
+        IrType::Int(IntWidth::I64) => AbiTy::Scalar(AbiField::I64),
+        IrType::Int(IntWidth::I128) => panic!("x05 scope: i128 calls deferred"),
+        IrType::Float(FloatWidth::F32) => AbiTy::Scalar(AbiField::F32),
+        IrType::Float(FloatWidth::F64) => AbiTy::Scalar(AbiField::F64),
+        IrType::Ptr(_) | IrType::FuncPtr(_) => AbiTy::Scalar(AbiField::Ptr),
+        other => panic!("x05 scope: non-scalar ABI type {:?} deferred", other),
+    }
+}
+
+/// Stack-slot size for an alloca. Mirrors ARM isel's `alloca_size`
+/// (Bool slots stay 4 bytes wide; loads/stores still touch 1).
+fn alloca_size(ty: &IrType, layout: crate::target::TargetLayout) -> u64 {
+    match ty {
+        IrType::Void => 0,
+        IrType::Bool => 4,
+        IrType::Int(w) => w.bytes() as u64,
+        IrType::Float(w) => w.bytes() as u64,
+        IrType::Ptr(_) | IrType::FuncPtr(_) => 8,
+        IrType::Array(elem, count) => {
+            let elem_size = match elem.as_ref() {
+                IrType::Bool => 4,
+                IrType::Struct(_) => alloca_size(elem, layout),
+                _ => elem.size_bytes(&layout),
+            };
+            elem_size * count
+        }
+        IrType::Struct(_) => 8, // placeholder, mirrors ARM
+        IrType::Vector { .. } => 16,
+    }
+}
+
+/// Alignment ladder 4 → 8 → 16 by size, same as ARM's frame slots.
+fn slot_align(size: u64) -> u64 {
+    if size >= 16 {
+        16
+    } else if size >= 8 {
+        8
+    } else {
+        4
+    }
+}
+
+/// C-level symbol for a runtime function. Same table as ARM isel,
+/// minus the i128 print variant (x05 scope gates i128 earlier).
+fn runtime_func_symbol(rf: &RuntimeFunc, args: &[ValueId], func: &Function) -> String {
+    match rf {
+        RuntimeFunc::PrintInt => {
+            if args
+                .first()
+                .and_then(|a| func.value_type(*a))
+                .is_some_and(|ty| matches!(ty, IrType::Int(IntWidth::I64)))
+            {
+                "afs_print_int64".into()
+            } else {
+                "afs_print_int".into()
+            }
+        }
+        RuntimeFunc::PrintReal => "afs_print_real".into(),
+        RuntimeFunc::PrintString => "afs_print_string".into(),
+        RuntimeFunc::PrintLogical => "afs_print_logical".into(),
+        RuntimeFunc::PrintNewline => "afs_print_newline".into(),
+        RuntimeFunc::Allocate => "afs_allocate".into(),
+        RuntimeFunc::Deallocate => "afs_deallocate".into(),
+        RuntimeFunc::StringConcat => "afs_string_concat".into(),
+        RuntimeFunc::StringCopy => "afs_string_copy".into(),
+        RuntimeFunc::StringCompare => "afs_string_compare".into(),
+        RuntimeFunc::Stop => "afs_stop".into(),
+        RuntimeFunc::ErrorStop => "afs_error_stop".into(),
+        RuntimeFunc::CheckBounds => "afs_check_bounds".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::builder::FuncBuilder;
+
+    fn select_simple(build: impl FnOnce(&mut FuncBuilder)) -> X86Function {
+        let mut func = Function::new("test".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+            build(&mut b);
+        }
+        select_function(
+            &func,
+            &["test".to_string()],
+            crate::target::TargetLayout::LP64,
+        )
+    }
+
+    fn all_insts(mf: &X86Function) -> Vec<&X86Inst> {
+        mf.blocks.iter().flat_map(|b| b.insts.iter()).collect()
+    }
+
+    // ---- The FP condition table, row by row (sprint deliverable 4).
+    // `>`/`>=` are A/AE direct; `<`/`<=` swap then A/AE (never B/BE,
+    // which are true on NaN); `==` is E∧NP; `/=` is NE∨P.
+
+    #[test]
+    fn fp_cond_gt_is_a_unswapped() {
+        assert_eq!(
+            fp_cond_plan(CmpOp::Gt),
+            FpCmpPlan::Direct {
+                swap_operands: false,
+                cond: X86Cond::A
+            }
+        );
+    }
+
+    #[test]
+    fn fp_cond_ge_is_ae_unswapped() {
+        assert_eq!(
+            fp_cond_plan(CmpOp::Ge),
+            FpCmpPlan::Direct {
+                swap_operands: false,
+                cond: X86Cond::Ae
+            }
+        );
+    }
+
+    #[test]
+    fn fp_cond_lt_swaps_then_a() {
+        assert_eq!(
+            fp_cond_plan(CmpOp::Lt),
+            FpCmpPlan::Direct {
+                swap_operands: true,
+                cond: X86Cond::A
+            }
+        );
+    }
+
+    #[test]
+    fn fp_cond_le_swaps_then_ae() {
+        assert_eq!(
+            fp_cond_plan(CmpOp::Le),
+            FpCmpPlan::Direct {
+                swap_operands: true,
+                cond: X86Cond::Ae
+            }
+        );
+    }
+
+    #[test]
+    fn fp_cond_eq_is_e_and_np() {
+        assert_eq!(
+            fp_cond_plan(CmpOp::Eq),
+            FpCmpPlan::Equality {
+                cond: X86Cond::E,
+                parity: X86Cond::Np,
+                combine: X86Opcode::And
+            }
+        );
+    }
+
+    #[test]
+    fn fp_cond_ne_is_ne_or_p() {
+        assert_eq!(
+            fp_cond_plan(CmpOp::Ne),
+            FpCmpPlan::Equality {
+                cond: X86Cond::Ne,
+                parity: X86Cond::P,
+                combine: X86Opcode::Or
+            }
+        );
+    }
+
+    #[test]
+    fn fcmp_eq_emits_sete_setnp_and_movzx() {
+        let mf = select_simple(|b| {
+            let x = b.const_f64(1.0);
+            let y = b.const_f64(2.0);
+            b.fcmp(CmpOp::Eq, x, y);
+            b.ret_void();
+        });
+        let insts = all_insts(&mf);
+        let conds: Vec<X86Cond> = insts
+            .iter()
+            .filter(|i| i.opcode == X86Opcode::Setcc)
+            .map(|i| match i.operands[0] {
+                X86Operand::Cond(c) => c,
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(conds, vec![X86Cond::E, X86Cond::Np]);
+        assert!(insts.iter().any(|i| i.opcode == X86Opcode::And));
+        assert!(insts
+            .iter()
+            .any(|i| matches!(i.opcode, X86Opcode::Movzx { src: OpSize::B })));
+    }
+
+    #[test]
+    fn fcmp_lt_swaps_ucomi_operands() {
+        let mf = select_simple(|b| {
+            let x = b.const_f64(1.0);
+            let y = b.const_f64(2.0);
+            b.fcmp(CmpOp::Lt, x, y);
+            b.ret_void();
+        });
+        let insts = all_insts(&mf);
+        let ucomi = insts
+            .iter()
+            .find(|i| i.opcode == X86Opcode::Ucomisd)
+            .expect("ucomisd emitted");
+        // x → v0, y → v1 (phase 4a order); Lt compares swapped: y vs x.
+        let ids: Vec<u32> = ucomi
+            .operands
+            .iter()
+            .map(|o| match o {
+                X86Operand::VReg(v) => v.id.0,
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(ids, vec![1, 0]);
+        // Direct plan: exactly one setcc, with the A condition.
+        let setccs: Vec<&&X86Inst> = insts
+            .iter()
+            .filter(|i| i.opcode == X86Opcode::Setcc)
+            .collect();
+        assert_eq!(setccs.len(), 1);
+        assert_eq!(setccs[0].operands[0], X86Operand::Cond(X86Cond::A));
+    }
+
+    #[test]
+    fn icmp_pairs_setcc_with_movzx() {
+        let mf = select_simple(|b| {
+            let x = b.const_i32(1);
+            let y = b.const_i32(2);
+            b.icmp(CmpOp::Lt, x, y);
+            b.ret_void();
+        });
+        let insts = all_insts(&mf);
+        let pos = insts
+            .iter()
+            .position(|i| i.opcode == X86Opcode::Setcc)
+            .expect("setcc emitted");
+        assert_eq!(insts[pos].operands[0], X86Operand::Cond(X86Cond::L));
+        // Stale-high-bits pitfall: the very next instruction widens.
+        assert!(matches!(
+            insts[pos + 1].opcode,
+            X86Opcode::Movzx { src: OpSize::B }
+        ));
+    }
+
+    #[test]
+    fn idiv_runs_through_rax_with_vreg_divisor() {
+        let mf = select_simple(|b| {
+            let x = b.const_i32(7);
+            let y = b.const_i32(2);
+            b.idiv(x, y);
+            b.ret_void();
+        });
+        let insts = all_insts(&mf);
+        assert!(insts
+            .iter()
+            .any(|i| i.opcode == X86Opcode::MovRR && i.def == Some(X86Operand::Reg(X86Reg::Rax))));
+        assert!(insts.iter().any(|i| i.opcode == X86Opcode::Cltd));
+        let idiv = insts
+            .iter()
+            .find(|i| i.opcode == X86Opcode::Idiv)
+            .expect("idiv emitted");
+        // Divisor copied to a fresh vreg — never a phys reg operand.
+        assert!(matches!(idiv.operands[0], X86Operand::VReg(_)));
+        // Quotient comes out of rax.
+        assert!(insts.iter().any(|i| i.opcode == X86Opcode::MovRR
+            && i.operands[0] == X86Operand::Reg(X86Reg::Rax)
+            && matches!(i.def, Some(X86Operand::VReg(_)))));
+    }
+
+    #[test]
+    fn imod_reads_remainder_from_rdx() {
+        let mf = select_simple(|b| {
+            let x = b.const_i64(7);
+            let y = b.const_i64(2);
+            b.imod(x, y);
+            b.ret_void();
+        });
+        let insts = all_insts(&mf);
+        assert!(insts.iter().any(|i| i.opcode == X86Opcode::Cqto));
+        assert!(insts.iter().any(|i| i.opcode == X86Opcode::MovRR
+            && i.operands[0] == X86Operand::Reg(X86Reg::Rdx)
+            && matches!(i.def, Some(X86Operand::VReg(_)))));
+    }
+
+    #[test]
+    fn shift_count_moves_through_rcx() {
+        let mf = select_simple(|b| {
+            let x = b.const_i32(1);
+            let n = b.const_i32(3);
+            b.shl(x, n);
+            b.ret_void();
+        });
+        let insts = all_insts(&mf);
+        assert!(insts
+            .iter()
+            .any(|i| i.opcode == X86Opcode::MovRR && i.def == Some(X86Operand::Reg(X86Reg::Rcx))));
+        let shl = insts
+            .iter()
+            .find(|i| i.opcode == X86Opcode::Shl)
+            .expect("shl emitted");
+        assert_eq!(shl.operands[1], X86Operand::Reg(X86Reg::Rcx));
+    }
+
+    #[test]
+    fn const_float_lands_in_rodata() {
+        let mf = select_simple(|b| {
+            b.const_f64(3.25);
+            b.ret_void();
+        });
+        assert_eq!(mf.rodata.len(), 1);
+        assert_eq!(mf.rodata[0].1, 3.25f64.to_bits());
+        let insts = all_insts(&mf);
+        assert!(insts
+            .iter()
+            .any(|i| i.opcode == X86Opcode::Movsd
+                && matches!(i.operands[0], X86Operand::RipLabel(_))));
+    }
+
+    #[test]
+    fn fneg_xors_against_sign_mask() {
+        let mf = select_simple(|b| {
+            let x = b.const_f64(1.5);
+            b.fneg(x);
+            b.ret_void();
+        });
+        assert!(mf
+            .rodata
+            .iter()
+            .any(|(_, bits)| *bits == 0x8000_0000_0000_0000));
+        assert!(all_insts(&mf).iter().any(|i| i.opcode == X86Opcode::Xorpd));
+    }
+
+    #[test]
+    fn fabs_ands_against_abs_mask() {
+        let mf = select_simple(|b| {
+            let x = b.const_f32(-1.5);
+            b.fabs(x);
+            b.ret_void();
+        });
+        assert!(mf.rodata.iter().any(|(_, bits)| *bits == 0x7fff_ffff));
+        assert!(all_insts(&mf).iter().any(|i| i.opcode == X86Opcode::Andps));
+    }
+
+    #[test]
+    fn external_call_sets_al_internal_skips_it() {
+        let al_mov = |mf: &X86Function| {
+            all_insts(mf)
+                .iter()
+                .any(|i| {
+                    i.opcode == X86Opcode::MovRI
+                        && i.size == OpSize::B
+                        && i.def == Some(X86Operand::Reg(X86Reg::Rax))
+                })
+                .to_owned()
+        };
+        let ext = select_simple(|b| {
+            let x = b.const_f64(1.0);
+            b.call(
+                FuncRef::External("sin".into()),
+                vec![x],
+                IrType::Float(FloatWidth::F64),
+            );
+            b.ret_void();
+        });
+        let al = all_insts(&ext)
+            .into_iter()
+            .find(|i| {
+                i.opcode == X86Opcode::MovRI
+                    && i.size == OpSize::B
+                    && i.def == Some(X86Operand::Reg(X86Reg::Rax))
+            })
+            .expect("external call must set AL");
+        assert_eq!(al.operands[0], X86Operand::Imm(1)); // one xmm arg
+
+        let int = select_simple(|b| {
+            b.call(FuncRef::Internal(0), vec![], IrType::Void);
+            b.ret_void();
+        });
+        assert!(!al_mov(&int), "internal call must not set AL");
+    }
+
+    #[test]
+    fn branch_args_copy_through_fresh_temps() {
+        let mut func = Function::new("test".into(), vec![], IrType::Void);
+        let (param_id, arg_id);
+        {
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+            let next = b.create_block("next");
+            param_id = b.add_block_param(next, IrType::Int(IntWidth::I32));
+            arg_id = b.const_i32(7);
+            b.branch(next, vec![arg_id]);
+            b.set_block(next);
+            b.ret_void();
+        }
+        let mf = select_function(
+            &func,
+            &["test".to_string()],
+            crate::target::TargetLayout::LP64,
+        );
+        let _ = (param_id, arg_id);
+        // One arg → two moves (src→temp, temp→param) before the jmp.
+        let entry = &mf.blocks[0].insts;
+        let movs: Vec<&X86Inst> = entry
+            .iter()
+            .filter(|i| i.opcode == X86Opcode::MovRR)
+            .collect();
+        assert_eq!(movs.len(), 2);
+        assert_eq!(movs[1].operands[0], movs[0].def.clone().unwrap());
+        assert_eq!(entry.last().unwrap().opcode, X86Opcode::Jmp);
+    }
+
+    #[test]
+    fn select_lowers_to_diamond_with_join_cursor() {
+        let mf = select_simple(|b| {
+            let c = b.const_bool(true);
+            let x = b.const_i32(1);
+            let y = b.const_i32(2);
+            let s = b.select(c, x, y);
+            let _ = b.iadd(s, s); // must land in the join block
+            b.ret_void();
+        });
+        // entry + false arm + join.
+        assert_eq!(mf.blocks.len(), 3);
+        let entry = &mf.blocks[0].insts;
+        assert!(entry.iter().any(|i| i.opcode == X86Opcode::Test));
+        assert!(entry.iter().any(|i| i.opcode == X86Opcode::Jcc));
+        let join = mf.blocks.last().unwrap();
+        assert!(join.insts.iter().any(|i| i.opcode == X86Opcode::Add));
+        assert!(join.insts.iter().any(|i| i.opcode == X86Opcode::Ret));
+    }
+}

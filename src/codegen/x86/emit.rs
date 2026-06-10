@@ -236,7 +236,8 @@ fn emit_inst(inst: &X86Inst, func: &X86Function) -> String {
         Pop => format!("popq {}", opq(0)),
         Movss => format!("movss {}, {}", op(0), def()),
         Movsd => format!("movsd {}, {}", op(0), def()),
-        Addss | Addsd | Subss | Subsd | Mulss | Mulsd | Divss | Divsd | Xorps | Xorpd => {
+        Addss | Addsd | Subss | Subsd | Mulss | Mulsd | Divss | Divsd | Xorps | Xorpd | Andps
+        | Andpd => {
             let mn = match inst.opcode {
                 Addss => "addss",
                 Addsd => "addsd",
@@ -247,10 +248,15 @@ fn emit_inst(inst: &X86Inst, func: &X86Function) -> String {
                 Divss => "divss",
                 Divsd => "divsd",
                 Xorps => "xorps",
-                _ => "xorpd",
+                Xorpd => "xorpd",
+                Andps => "andps",
+                _ => "andpd",
             };
             format!("{} {}, {}", mn, op(1), def())
         }
+        // Non-destructive two-operand form: `sqrtsd %src, %dst`.
+        Sqrtss => format!("sqrtss {}, {}", op(0), def()),
+        Sqrtsd => format!("sqrtsd {}, {}", op(0), def()),
         Ucomiss => format!("ucomiss {}, {}", op(1), op(0)),
         Ucomisd => format!("ucomisd {}, {}", op(1), op(0)),
         // The integer side of cvt carries the suffix (cvtsi2sdq for a
