@@ -1,0 +1,4 @@
+# Suites expected to skip on hosts without the native toolchain
+# (posix-elf profile). One suite name per line. Regenerate when the
+# e2e gate (native_e2e_support) reaches new suites.
+run_programs
