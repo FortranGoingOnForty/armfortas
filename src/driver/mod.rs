@@ -1118,8 +1118,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     // source, before either continuation joiner runs. Explicit-std
     // runs only — the default std is permissive (gfortran's -std=gnu
     // model); a default build's stderr stays pristine.
-    if opts.std_explicit && opts.std.is_some() {
-        let std = opts.std.unwrap();
+    if let (true, Some(std)) = (opts.std_explicit, opts.std) {
         for w in conformance::check_source_limits(
             &source,
             std,
