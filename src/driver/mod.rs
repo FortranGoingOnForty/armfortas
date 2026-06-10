@@ -117,6 +117,12 @@ pub struct Options {
 
     // ---- Language ----
     pub std: Option<crate::sema::validate::FortranStandard>,
+    /// True when the user passed `--std`/`-std` explicitly. Conformance
+    /// warnings (source limits, l01) fire only in explicit-std runs —
+    /// the gfortran model, where the default std is permissive and
+    /// `-std=` opts into conformance mode. Acceptance is identical
+    /// either way.
+    pub std_explicit: bool,
     pub source_form_override: Option<SourceFormOverride>,
     pub default_integer_8: bool,
     pub default_real_8: bool,
@@ -195,6 +201,7 @@ impl Default for Options {
             preprocessor_defines: Vec::new(),
             cpp_compat: false,
             std: Some(crate::sema::validate::FortranStandard::F2018),
+            std_explicit: false,
             source_form_override: None,
             default_integer_8: false,
             default_real_8: false,
@@ -414,6 +421,7 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
                     crate::sema::validate::FortranStandard::parse_flag(val)
                         .ok_or_else(|| format!("unknown -std value: {}", val))?,
                 );
+                opts.std_explicit = true;
             }
             "-std" => {
                 i += 1;
@@ -422,6 +430,7 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
                     crate::sema::validate::FortranStandard::parse_flag(val)
                         .ok_or_else(|| format!("unknown -std value: {}", val))?,
                 );
+                opts.std_explicit = true;
             }
             arg if arg.starts_with("--std=") => {
                 let val = &arg["--std=".len()..];
@@ -429,6 +438,7 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
                     crate::sema::validate::FortranStandard::parse_flag(val)
                         .ok_or_else(|| format!("unknown --std value: {}", val))?,
                 );
+                opts.std_explicit = true;
             }
             "--std" => {
                 i += 1;
@@ -437,6 +447,7 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
                     crate::sema::validate::FortranStandard::parse_flag(val)
                         .ok_or_else(|| format!("unknown --std value: {}", val))?,
                 );
+                opts.std_explicit = true;
             }
             "-ffree-form" => opts.source_form_override = Some(SourceFormOverride::Free),
             "-ffixed-form" => opts.source_form_override = Some(SourceFormOverride::Fixed),
@@ -1104,8 +1115,11 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         eprintln!(" preprocessing: {} ({})", opts.input.display(), form);
     }
     // Source-limit conformance warnings (l01): one scan over the raw
-    // source, before either continuation joiner runs.
-    if let Some(std) = opts.std {
+    // source, before either continuation joiner runs. Explicit-std
+    // runs only — the default std is permissive (gfortran's -std=gnu
+    // model); a default build's stderr stays pristine.
+    if opts.std_explicit && opts.std.is_some() {
+        let std = opts.std.unwrap();
         for w in conformance::check_source_limits(
             &source,
             std,
