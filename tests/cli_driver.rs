@@ -41121,9 +41121,11 @@ fn target_flag_x86_64_fails_at_codegen_boundary_writing_nothing() {
     // Exit code 1: compile error convention (lib.rs exit-code table).
     assert_eq!(out.status.code(), Some(1), "status: {:?}", out.status);
     let stderr = String::from_utf8_lossy(&out.stderr);
+    // The boundary advances sprint by sprint: x00 errored at the backend
+    // (x03's message), x03 errors at instruction selection (x05's).
     assert!(
-        stderr.contains("x86_64 backend is not implemented yet (sprint x03)"),
-        "expected the x03 boundary diagnostic, got: {}",
+        stderr.contains("x86_64 instruction selection is not implemented yet (sprint x05)"),
+        "expected the x05 boundary diagnostic, got: {}",
         stderr
     );
     assert!(
