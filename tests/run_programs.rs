@@ -524,6 +524,13 @@ fn extract_stderr_checks(source: &str) -> Vec<Check> {
     extract_prefixed_checks(source, "! STDERR_CHECK:")
 }
 
+/// `! WARN_CHECK:` — ordered substring checks against the COMPILER's
+/// stderr (STDERR_CHECK matches the program's runtime stderr). Added
+/// in l01 for conformance warnings; compilation must still succeed.
+fn extract_warn_checks(source: &str) -> Vec<Check> {
+    extract_prefixed_checks(source, "! WARN_CHECK:")
+}
+
 /// Target selector inside a directive qualifier (sprint x01). Closed
 /// set reusing x00's triple grammar plus arch/OS shorthands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2222,6 +2229,7 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
     };
     let checks = extract_checks(&source_text);
     let stderr_checks = extract_stderr_checks(&source_text);
+    let warn_checks = extract_warn_checks(&source_text);
     let expected_exit_code = match extract_exit_code(&source_text, filename) {
         Ok(code) => code,
         Err(e) => return TestOutcome::Fail(e),
@@ -2280,11 +2288,12 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
         && error_span.is_none()
         && xfail_reason.is_none()
         && error_expected.is_none()
+        && warn_checks.is_empty()
     {
         // Programs with no runtime or shape assertions, no XFAIL marker,
         // and no ERROR marker are mis-configured tests, not test failures.
         return TestOutcome::Fail(format!(
-            "{}: no CHECK / STDERR_CHECK / EXIT_CODE / IR_CHECK / ASM_CHECK / FILE_CHECK / FILE_EXISTS / FILE_MISSING / FILE_LINE_COUNT / FILE_RERUN_MODE / FILE_SET_EXACT / REPRO_CHECK / XFAIL / ERROR_EXPECTED / ERROR_SPAN annotations",
+            "{}: no CHECK / STDERR_CHECK / WARN_CHECK / EXIT_CODE / IR_CHECK / ASM_CHECK / FILE_CHECK / FILE_EXISTS / FILE_MISSING / FILE_LINE_COUNT / FILE_RERUN_MODE / FILE_SET_EXACT / REPRO_CHECK / XFAIL / ERROR_EXPECTED / ERROR_SPAN annotations",
             filename,
         ));
     }
@@ -2473,6 +2482,15 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
                     "{} [{}]: compilation failed:\n{}",
                     filename, opt_flag, stderr,
                 ));
+            }
+            if !warn_checks.is_empty() {
+                let stderr = String::from_utf8_lossy(&compile.stderr).into_owned();
+                let label = format!("{} [{}]", filename, opt_flag);
+                if let Err(e) = match_checks(&warn_checks, &stderr, &label, "WARN_CHECK") {
+                    let _ = fs::remove_dir_all(&compile_sandbox);
+                    let _ = fs::remove_file(&binary);
+                    return Err(e);
+                }
             }
             let _ = fs::remove_dir_all(&compile_sandbox);
         }
