@@ -1084,7 +1084,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         // resolver searches relative-to-current-file first, then this
         // list — both gfortran and flang do the same.
         include_paths: opts.module_search_paths.clone(),
-        ..crate::preprocess::PreprocConfig::default()
+        ..crate::preprocess::PreprocConfig::for_target(&opts.target)
     };
     for (name, value) in &opts.preprocessor_defines {
         pp_config
