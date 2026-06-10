@@ -1353,6 +1353,16 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         );
     }
 
+    // x00: the codegen boundary. Frontend modes (-E, --emit-ir/ast/tokens)
+    // work for every target; instruction selection exists only for ARM64
+    // until sprint x03. Loud error, never a silent fallback.
+    if opts.target.arch != crate::target::Arch::Arm64 {
+        return Err(format!(
+            "cannot generate code for target '{}': the x86_64 backend is not implemented yet (sprint x03)",
+            opts.target
+        ));
+    }
+
     // 7. Instruction selection.
     let phase = phases.start("codegen");
     let machine_funcs = isel::select_module(&ir_module);
@@ -1494,6 +1504,17 @@ _main:
 
     fs::write(&asm_path, &asm_text).map_err(|e| format!("cannot write temp assembly: {}", e))?;
 
+    // x00: the assemble step knows Mach-O only; ELF assembly lands in
+    // sprint x06. Unreachable today (the codegen guard fires first) but the
+    // boundary is explicit so x03 cannot silently assemble for the wrong
+    // format.
+    if opts.target.object_format() != crate::target::ObjectFormat::MachO {
+        return Err(format!(
+            "cannot assemble for target '{}': ELF toolchain support is not implemented yet (sprint x06)",
+            opts.target
+        ));
+    }
+
     let phase = phases.start("assemble");
     let as_result = if let Some(assembler) = env_override("AFS_AS_PATH") {
         Command::new(assembler)
@@ -1598,6 +1619,15 @@ fn link(obj: &Path, output: &Path, opts: &Options) -> Result<(), String> {
 /// Link prebuilt objects and archives with the runtime to produce a
 /// binary or shared library, preserving the user-supplied input order.
 fn link_inputs(inputs: &[PathBuf], output: &Path, opts: &Options) -> Result<(), String> {
+    // x00: both link paths (system ld and afs-ld) are Mach-O only; the ELF
+    // link path lands in sprint x06. Live today for link-artifact inputs
+    // (`armfortas --target x86_64-freebsd foo.o`), which skip codegen.
+    if opts.target.object_format() != crate::target::ObjectFormat::MachO {
+        return Err(format!(
+            "cannot link for target '{}': ELF toolchain support is not implemented yet (sprint x06)",
+            opts.target
+        ));
+    }
     if let Some(linker) = afs_ld_override() {
         return link_inputs_with_afs_ld(&linker, inputs, output, opts);
     }
