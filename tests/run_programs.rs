@@ -4366,3 +4366,86 @@ fn flags_annotation_applies_to_compile() {
     }
     let _ = fs::remove_dir_all(&dir);
 }
+
+// ---- Sprint l00: imported gfortran.dg F2023 fixtures ----
+
+/// Locate tests/fixtures/gfortran-dg/ from the test working directory.
+fn find_gfortran_dg_fixtures() -> PathBuf {
+    let candidates = [
+        "tests/fixtures/gfortran-dg",
+        "../tests/fixtures/gfortran-dg",
+    ];
+    for c in &candidates {
+        let p = PathBuf::from(c);
+        if p.is_dir() {
+            return p;
+        }
+    }
+    panic!("cannot find tests/fixtures/gfortran-dg/ directory");
+}
+
+/// Run the gfortran.dg F2023 imports (see tests/fixtures/gfortran-dg/README.md
+/// for provenance and per-file conversion notes). Same oracle as the
+/// test_programs sweep: run_test honors FLAGS / EXIT_CODE / ERROR_EXPECTED /
+/// XFAIL annotations; XFAIL'd fixtures count as passing until their feature
+/// lands, then report XPASS so the annotation gets removed.
+#[test]
+fn gfortran_dg_fixtures() {
+    let compiler = find_compiler();
+    let fixture_dir = find_gfortran_dg_fixtures();
+
+    let mut sources: Vec<PathBuf> = fs::read_dir(&fixture_dir)
+        .expect("cannot read tests/fixtures/gfortran-dg/")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|ext| ext.to_str()) == Some("f90"))
+        .collect();
+    sources.sort();
+
+    assert!(
+        !sources.is_empty(),
+        "no .f90 fixtures found in tests/fixtures/gfortran-dg/"
+    );
+
+    let mut failures = Vec::new();
+    let mut passed = 0;
+    let mut xfailed = 0;
+
+    for source in &sources {
+        let name = source.file_name().unwrap().to_str().unwrap();
+        match run_test(&compiler, source, "-O0") {
+            TestOutcome::Pass => {
+                passed += 1;
+                eprintln!("  PASS  [-O0]: {}", name);
+            }
+            TestOutcome::Xfail(detail) => {
+                xfailed += 1;
+                let one_line = detail.lines().next().unwrap_or("");
+                eprintln!("  XFAIL [-O0]: {} — {}", name, one_line);
+            }
+            TestOutcome::Xpass(msg) => {
+                eprintln!("  XPASS [-O0]: {}", name);
+                failures.push(msg);
+            }
+            TestOutcome::Fail(msg) => {
+                eprintln!("  FAIL  [-O0]: {}", name);
+                failures.push(msg);
+            }
+        }
+    }
+
+    eprintln!(
+        "\n[gfortran-dg -O0] {} passed, {} xfailed, {} failed out of {} fixtures",
+        passed,
+        xfailed,
+        failures.len(),
+        sources.len(),
+    );
+
+    if !failures.is_empty() {
+        panic!(
+            "gfortran-dg fixture failures at -O0:\n\n{}",
+            failures.join("\n\n")
+        );
+    }
+}
