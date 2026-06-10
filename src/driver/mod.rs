@@ -1624,11 +1624,20 @@ fn link_inputs_elf(inputs: &[PathBuf], output: &Path, opts: &Options) -> Result<
 
     let pie = !opts.no_pie;
     let mut override_dirs = opts.crt_search_dirs.clone();
-    if let Some(dir) = env_override("AFS_CRT_DIR") {
-        override_dirs.push(PathBuf::from(dir));
+    // Colon-separated, PATH-style: NixOS needs two crt roots (crt1/
+    // crti/crtn from glibc, crtbegin/crtend from the gcc store path).
+    if let Some(dirs) = env_override("AFS_CRT_DIR") {
+        override_dirs.extend(dirs.split(':').filter(|d| !d.is_empty()).map(PathBuf::from));
     }
     let crt = elf_crt::find_crt(&opts.target, &override_dirs, pie)?;
     let rt_path = find_runtime_lib()?;
+    // LIBRARY_PATH: the cc-compatible -L env knob. On NixOS libgcc_s
+    // lives in a third store path (gcc's -libgcc output) that no crt
+    // root covers.
+    let mut lib_paths = opts.library_search_paths.clone();
+    if let Some(dirs) = env_override("LIBRARY_PATH") {
+        lib_paths.extend(dirs.split(':').filter(|d| !d.is_empty()).map(PathBuf::from));
+    }
     let args = elf_crt::elf_link_args(
         &opts.target,
         &crt,
@@ -1636,7 +1645,7 @@ fn link_inputs_elf(inputs: &[PathBuf], output: &Path, opts: &Options) -> Result<
         Path::new(&rt_path),
         output,
         pie,
-        &opts.library_search_paths,
+        &lib_paths,
         &opts.link_libs,
     )?;
 

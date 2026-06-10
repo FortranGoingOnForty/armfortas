@@ -40,12 +40,28 @@ fn programs_dir() -> PathBuf {
 }
 
 /// x86_64 ELF host whose libc the link step supports this sprint —
-/// musl hosts (Alpine CI) wait for x11.
+/// musl hosts (Alpine CI) wait for x11 — and whose crt objects are
+/// discoverable. The crt probe mirrors the driver: on layouts without
+/// an FHS crt location (NixOS) these tests need AFS_CRT_DIR (and
+/// LIBRARY_PATH for libgcc_s) in the environment, which the spawned
+/// compiler inherits.
 fn host_can_link() -> bool {
     let host = TargetSpec::host();
-    host.arch == Arch::X86_64
-        && host.object_format() == ObjectFormat::Elf
-        && host.libc != Libc::Musl
+    if host.arch != Arch::X86_64
+        || host.object_format() != ObjectFormat::Elf
+        || host.libc == Libc::Musl
+    {
+        return false;
+    }
+    let override_dirs: Vec<PathBuf> = std::env::var("AFS_CRT_DIR")
+        .map(|v| {
+            v.split(':')
+                .filter(|d| !d.is_empty())
+                .map(PathBuf::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    armfortas::driver::elf_crt::find_crt(&host, &override_dirs, true).is_ok()
 }
 
 fn skip(test: &str, count: usize) -> bool {
@@ -53,7 +69,7 @@ fn skip(test: &str, count: usize) -> bool {
         return false;
     }
     eprintln!(
-        "\nHARNESS_SKIP suite=elf_link_e2e test={} count={} reason=\"needs an x86_64 ELF glibc or FreeBSD host (musl linking lands in x11)\"",
+        "\nHARNESS_SKIP suite=elf_link_e2e test={} count={} reason=\"needs an x86_64 ELF glibc or FreeBSD host with discoverable crt objects (musl: x11; NixOS: set AFS_CRT_DIR and LIBRARY_PATH)\"",
         test, count
     );
     true

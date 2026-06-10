@@ -8,11 +8,16 @@
 //! override covers the same ground deterministically.
 //!
 //! Override (first-class configuration, not an escape hatch):
-//! `-B <dir>` or `AFS_CRT_DIR` is searched before the built-in list.
-//! On NixOS there is no FHS crt location at all — crt1.o lives at a
-//! nix-store glibc path — so the override IS the configuration there:
-//! `armfortas -B "$(dirname "$(realpath /run/current-system/sw/lib/crt1.o 2>/dev/null || echo /nix/store/.../crt1.o)")"`,
-//! or simply `-B "$(nix eval ...)"`-style resolution by the user.
+//! `-B <dir>` (repeatable) or `AFS_CRT_DIR` (colon-separated) is
+//! searched before the built-in list, and `LIBRARY_PATH` (the
+//! cc-compatible env knob) adds `-L` dirs. On NixOS there is no FHS
+//! crt location at all and the pieces live in three store paths —
+//! verified recipe (hasu, 2026-06-10):
+//!
+//! ```sh
+//! armfortas -B <glibc>/lib -B <gcc>/lib/gcc/x86_64-unknown-linux-gnu/<ver> \
+//!           -L <gcc-libgcc>/lib hello.f90 -o hello   # or the env forms
+//! ```
 //!
 //! musl paths (`/lib/ld-musl-x86_64.so.1`, crt from the musl sysroot)
 //! are wired in x11; `Libc::Musl` errors cleanly until then.
