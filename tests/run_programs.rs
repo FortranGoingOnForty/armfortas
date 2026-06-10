@@ -389,13 +389,36 @@ fn find_runtime() -> PathBuf {
     panic!("libarmfortas_rt.a not found — run `cargo build` first");
 }
 
-/// Get the macOS SDK path for linking.
-fn sdk_path() -> String {
+/// Get the macOS SDK path for linking. Only reachable behind the
+/// native_e2e_support gate (x01), so the error path is defensive.
+fn sdk_path() -> Result<String, String> {
     let out = Command::new("xcrun")
         .args(["--sdk", "macosx", "--show-sdk-path"])
         .output()
-        .expect("xcrun failed");
-    String::from_utf8(out.stdout).unwrap().trim().to_string()
+        .map_err(|e| format!("cannot run xcrun: {}", e))?;
+    if !out.status.success() {
+        return Err(format!(
+            "xcrun failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Print the machine-readable skip line and return true when this host
+/// cannot run the native toolchain path (sprint x01). `count` must come
+/// from real discovery, never a literal.
+fn skip_native_e2e(test_name: &str, count: usize) -> bool {
+    match armfortas::testing::native_e2e_support() {
+        Ok(()) => false,
+        Err(reason) => {
+            eprintln!(
+                "HARNESS_SKIP suite=run_programs test={} count={} reason=\"{}\"",
+                test_name, count, reason
+            );
+            true
+        }
+    }
 }
 
 /// Compile a single .f90 to .o with -c.
@@ -433,7 +456,7 @@ fn compile_to_object(
 /// Link object files with the runtime into a binary.
 fn link_objects(objects: &[PathBuf], output: &Path) -> Result<(), String> {
     let runtime = find_runtime();
-    let sdk = sdk_path();
+    let sdk = sdk_path()?;
     let mut args: Vec<String> = vec!["-o".into(), output.to_str().unwrap().into()];
     for o in objects {
         args.push(o.to_str().unwrap().into());
@@ -2719,7 +2742,7 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
 /// Discover the test programs and run each at every supported opt level.
 /// This enforces the correctness invariant: same source must produce
 /// the same output regardless of optimization level.
-fn run_all_at(opt_flag: &str) -> Result<(), String> {
+fn run_all_at(opt_flag: &str, test_name: &str) -> Result<(), String> {
     let compiler = find_compiler();
     let test_dir = find_test_programs();
 
@@ -2731,10 +2754,17 @@ fn run_all_at(opt_flag: &str) -> Result<(), String> {
         .collect();
     sources.sort();
 
+    // Discovery runs (and its non-empty assert fires) BEFORE the skip
+    // gate: a skip with count=0 from a wrong CWD would report "nothing
+    // hidden" while hiding everything (x01 pitfall).
     assert!(
         !sources.is_empty(),
         "no Fortran sources found in test_programs/"
     );
+
+    if skip_native_e2e(test_name, sources.len()) {
+        return Ok(());
+    }
 
     let mut failures = Vec::new();
     let mut passed = 0;
@@ -2784,42 +2814,42 @@ fn run_all_at(opt_flag: &str) -> Result<(), String> {
 
 #[test]
 fn test_programs_end_to_end() {
-    if let Err(msg) = run_all_at("-O0") {
+    if let Err(msg) = run_all_at("-O0", "test_programs_end_to_end") {
         panic!("Test failures at -O0:\n\n{}", msg);
     }
 }
 
 #[test]
 fn test_programs_end_to_end_o1() {
-    if let Err(msg) = run_all_at("-O1") {
+    if let Err(msg) = run_all_at("-O1", "test_programs_end_to_end_o1") {
         panic!("Test failures at -O1:\n\n{}", msg);
     }
 }
 
 #[test]
 fn test_programs_end_to_end_o2() {
-    if let Err(msg) = run_all_at("-O2") {
+    if let Err(msg) = run_all_at("-O2", "test_programs_end_to_end_o2") {
         panic!("Test failures at -O2:\n\n{}", msg);
     }
 }
 
 #[test]
 fn test_programs_end_to_end_o3() {
-    if let Err(msg) = run_all_at("-O3") {
+    if let Err(msg) = run_all_at("-O3", "test_programs_end_to_end_o3") {
         panic!("Test failures at -O3:\n\n{}", msg);
     }
 }
 
 #[test]
 fn test_programs_end_to_end_os() {
-    if let Err(msg) = run_all_at("-Os") {
+    if let Err(msg) = run_all_at("-Os", "test_programs_end_to_end_os") {
         panic!("Test failures at -Os:\n\n{}", msg);
     }
 }
 
 #[test]
 fn test_programs_end_to_end_ofast() {
-    if let Err(msg) = run_all_at("-Ofast") {
+    if let Err(msg) = run_all_at("-Ofast", "test_programs_end_to_end_ofast") {
         panic!("Test failures at -Ofast:\n\n{}", msg);
     }
 }
@@ -2851,6 +2881,10 @@ fn compile_to_asm(compiler: &Path, source: &Path, opt: &str) -> Vec<u8> {
             source.to_str().unwrap(),
             opt,
             "-S",
+            // Pinned since x01: determinism is asserted on the ARM64
+            // backend's text output, which -S can produce on any host.
+            "--target",
+            "arm64-macos",
             "-o",
             asm_path.to_str().unwrap(),
         ])
@@ -4568,6 +4602,10 @@ fn gfortran_dg_fixtures() {
         !sources.is_empty(),
         "no .f90 fixtures found in tests/fixtures/gfortran-dg/"
     );
+
+    if skip_native_e2e("gfortran_dg_fixtures", sources.len()) {
+        return;
+    }
 
     let mut failures = Vec::new();
     let mut passed = 0;

@@ -25,6 +25,23 @@ use crate::opt::{build_i128_pipeline, build_pipeline};
 use crate::parser::Parser;
 use crate::sema::{resolve, validate};
 
+/// Whether this host can assemble, link, and run armfortas-produced
+/// binaries natively (sprint x01). Today only arm64-macos qualifies;
+/// x06 widens this per-target. E2e suites call this before compiling
+/// anything; on `Err` they print one `HARNESS_SKIP` line per `#[test]`
+/// and return. The error text is the skip reason.
+pub fn native_e2e_support() -> Result<(), String> {
+    let host = crate::target::TargetSpec::host();
+    if host == crate::target::TargetSpec::parse("arm64-macos").unwrap() {
+        Ok(())
+    } else {
+        Err(format!(
+            "host {} has no native toolchain path; native link arrives in x06",
+            host
+        ))
+    }
+}
+
 static CAPTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Capturable compiler stages for the bench.
