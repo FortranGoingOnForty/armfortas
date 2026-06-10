@@ -277,7 +277,7 @@ fn caller_source(row: &Row) -> String {
         r#"#include <stdint.h>
 {decls}
 extern {ret} callee({params}, int *ok);
-#define callee(...) callee(__VA_ARGS__, &okp)
+#define callee(...) callee(__VA_ARGS__, okp)
 int main(void) {{
     int ok = 1;
     int okp_storage = 1;
