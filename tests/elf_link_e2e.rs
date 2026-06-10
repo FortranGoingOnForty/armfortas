@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use armfortas::target::{Arch, ObjectFormat, Os, TargetSpec};
+use armfortas::target::{Arch, Libc, ObjectFormat, Os, TargetSpec};
 
 const PROGRAMS: &[&str] = &[
     "hello",
@@ -39,17 +39,21 @@ fn programs_dir() -> PathBuf {
     panic!("cannot find test_programs/");
 }
 
-fn host_is_x86_elf() -> bool {
+/// x86_64 ELF host whose libc the link step supports this sprint —
+/// musl hosts (Alpine CI) wait for x11.
+fn host_can_link() -> bool {
     let host = TargetSpec::host();
-    host.arch == Arch::X86_64 && host.object_format() == ObjectFormat::Elf
+    host.arch == Arch::X86_64
+        && host.object_format() == ObjectFormat::Elf
+        && host.libc != Libc::Musl
 }
 
 fn skip(test: &str, count: usize) -> bool {
-    if host_is_x86_elf() {
+    if host_can_link() {
         return false;
     }
     eprintln!(
-        "\nHARNESS_SKIP suite=elf_link_e2e test={} count={} reason=\"needs an x86_64 ELF host with system as and ld\"",
+        "\nHARNESS_SKIP suite=elf_link_e2e test={} count={} reason=\"needs an x86_64 ELF glibc or FreeBSD host (musl linking lands in x11)\"",
         test, count
     );
     true

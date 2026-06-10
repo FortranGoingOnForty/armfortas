@@ -245,7 +245,7 @@ jobs:
       - run: cargo build --workspace
       - run: cargo test -p armfortas --lib
       - run: cargo test -p armfortas --tests -- --nocapture --test-threads=1 2>&1 | tee /tmp/tests.log
-      - run: ci/check_skips.sh /tmp/tests.log posix-elf
+      - run: ci/check_skips.sh /tmp/tests.log posix-elf-musl
 
   build-freebsd:
     name: "FreeBSD 15: build + lib tests (VM)"
