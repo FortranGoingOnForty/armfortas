@@ -50,7 +50,7 @@ pub fn emit_module(
             }
             if !ir_module.globals.is_empty() {
                 return Err(
-                    "x86_64 module globals (SAVE/module variables) land in x06 with the link step"
+                    "x86_64 module globals (SAVE/module variables) are not emitted yet (sprint x07)"
                         .to_string(),
                 );
             }
