@@ -128,9 +128,9 @@ impl<'a> Parser<'a> {
         &mut self,
         cond: SpannedExpr,
     ) -> Result<SpannedExpr, ParseError> {
-        let then_val = self.parse_expr()?;
+        let then_val = self.parse_conditional_arm()?;
         self.expect(&TokenKind::Colon)?;
-        let mut else_val = self.parse_expr()?;
+        let mut else_val = self.parse_conditional_arm()?;
         if self.eat(&TokenKind::Question) {
             else_val = self.parse_conditional_after_question(else_val)?;
         }
@@ -143,6 +143,22 @@ impl<'a> Parser<'a> {
             },
             span,
         ))
+    }
+
+    /// One arm of a conditional: an expression, or `.NIL.` (legal only
+    /// when the conditional is an actual argument — sema enforces the
+    /// context, the parser just represents it).
+    fn parse_conditional_arm(&mut self) -> Result<SpannedExpr, ParseError> {
+        // `.nil.` is not in the known dot-operator set, so the lexer
+        // produces DefinedOp("nil") for it.
+        if let TokenKind::DefinedOp(op) = self.peek() {
+            if op == "nil" {
+                let span = self.current_span();
+                self.advance();
+                return Ok(Spanned::new(Expr::NilArgument, span));
+            }
+        }
+        self.parse_expr()
     }
 
     fn parse_prefix(&mut self) -> Result<SpannedExpr, ParseError> {

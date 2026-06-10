@@ -66,6 +66,10 @@ pub enum Expr {
     /// Parenthesized expression: `(x + y)`
     ParenExpr { inner: Box<SpannedExpr> },
 
+    /// `.NIL.` — only legal as a conditional-argument arm (F2023);
+    /// selects the absent-argument association for an OPTIONAL dummy.
+    NilArgument,
+
     // ---- Conditional (F2023, l02) ----
     /// Conditional expression: `( cond ? then : else )`. Chained
     /// else-parts (`c1 ? v1 : c2 ? v2 : v3`) nest right-recursively in
@@ -159,6 +163,7 @@ impl SpannedExpr {
             Expr::ParenExpr { inner } => {
                 format!("({})", inner.to_sexpr())
             }
+            Expr::NilArgument => ".nil.".to_string(),
             Expr::ConditionalExpr {
                 cond,
                 then_val,
