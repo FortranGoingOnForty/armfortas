@@ -10,7 +10,7 @@
 //! (`.align` means bytes on x86 gas), `.type`/`.size` on every
 //! function and object, constant pools in `.rodata`.
 
-use super::mir::{OpSize, X86Block, X86Cond, X86Function, X86Inst, X86Opcode, X86Operand, X86Reg};
+use super::mir::{OpSize, X86Function, X86Inst, X86Opcode, X86Operand, X86Reg};
 use std::fmt::Write;
 
 /// ELF symbol naming is identity — centralized anyway so the Mach-O

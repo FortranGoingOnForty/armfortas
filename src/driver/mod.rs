@@ -12,8 +12,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
 
-use crate::codegen::mir::MachineFunction;
-use crate::codegen::{emit, isel, linearscan, peephole};
 use crate::ir::inst::{InstKind, Module, RuntimeFunc};
 use crate::ir::{lower, printer as ir_printer, verify};
 use crate::lexer::{detect_source_form, tokenize, SourceForm};
@@ -946,7 +944,6 @@ impl PhaseGuard {
     }
 }
 
-use crate::codegen::arm64::main_wrapper_target;
 
 fn all_input_paths(opts: &Options) -> Vec<PathBuf> {
     let mut inputs = vec![opts.input.clone()];
@@ -2401,12 +2398,12 @@ mod tests {
     #[test]
     fn main_wrapper_prefers_program_body_over_earlier_helpers() {
         let allocated = vec![
-            MachineFunction::new("bump".into()),
-            MachineFunction::new("__prog_audit_entry".into()),
+            crate::codegen::mir::MachineFunction::new("bump".into()),
+            crate::codegen::mir::MachineFunction::new("__prog_audit_entry".into()),
         ];
 
         assert_eq!(
-            main_wrapper_target(&allocated),
+            crate::codegen::arm64::main_wrapper_target(&allocated),
             Some("__prog_audit_entry"),
             "main wrapper should call the lowered program body, not the first helper"
         );
