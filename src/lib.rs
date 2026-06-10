@@ -78,7 +78,21 @@ pub fn cli_entry() -> ! {
             // compile thunk so we can include it in any ICE report.
             let input_for_ice = opts.input.display().to_string();
             install_ice_hook();
-            let result = catch_unwind(AssertUnwindSafe(|| driver::execute(&opts)));
+            // Compile on a thread with a large stack reservation. IR
+            // lowering (like other tree visitors here) recurses per
+            // expression node, and an F2023-conforming million-
+            // character statement is a ~7,000-term chain — enough to
+            // overflow the default main stack. The reservation is
+            // address space, not committed memory; rustc spawns its
+            // compile thread the same way for the same reason.
+            const COMPILE_STACK_BYTES: usize = 512 * 1024 * 1024;
+            let result = std::thread::Builder::new()
+                .name("compile".into())
+                .stack_size(COMPILE_STACK_BYTES)
+                .spawn(move || catch_unwind(AssertUnwindSafe(|| driver::execute(&opts))))
+                .expect("cannot spawn compile thread")
+                .join()
+                .unwrap_or_else(Err);
             match result {
                 Ok(Ok(())) => process::exit(0),
                 Ok(Err(e)) => {
