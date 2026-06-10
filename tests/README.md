@@ -32,8 +32,31 @@ The canonical leaf-assertion language lives in source comments inside
   (`-O*`, `-o`, `-S`, `-c`, `-E`, `--emit-*`, `--target`) are rejected as
   test-configuration errors. Typical use: `! FLAGS: --std=f2023`.
 
+Target qualifiers (sprint x01): `XFAIL`, `ASM_CHECK`, and `ASM_NOT`
+accept an optional parenthesized selector list before the colon —
+`! XFAIL(x86_64-linux): reason`, `! ASM_CHECK(arm64): ldp x29, x30`.
+The directive is active iff any selector matches the target the harness
+is compiling for (the host, until x07). Bare forms keep their
+all-targets meaning. Selectors are a closed set reusing the `--target`
+triple grammar plus shorthands: `arm64`/`aarch64`, `x86_64`/`amd64`,
+`macos`, `freebsd`, `linux`, `x86_64-linux` (both libcs), or a full
+triple. An inactive qualified `XFAIL` behaves as if absent — the
+program must pass. Unknown selectors are test-configuration errors on
+every target: a typo'd selector silently matching nothing would convert
+a tracked bug into a green test.
+
+Skip discipline (sprint x01): suites that assemble, link, or run native
+binaries call `armfortas::testing::native_e2e_support()` before
+compiling anything and, on hosts without the native toolchain, print
+one machine-readable line per `#[test]` —
+`HARNESS_SKIP suite=<s> test=<t> count=<n> reason="..."` — with `count`
+computed from discovery, never a literal. `ci/check_skips.sh` gates CI
+on these lines: zero allowed on macOS, exactly the expected set on ELF
+hosts.
+
 That source comment language is meant to converge with `bencch`, not drift from
-it. (`! FLAGS:` is not consumed by bencch yet — see noted_items.md.)
+it. (`! FLAGS:` and target qualifiers are not consumed by bencch yet —
+see noted_items.md.)
 
 When a stdlib/fpm drill creates scratch Fortran probes, review them during the
 drill wrapup. Keep the probes that capture a real compiler edge by moving them
