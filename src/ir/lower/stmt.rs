@@ -135,8 +135,6 @@ fn lower_external_io_pos_seek(
     );
 }
 
-/// Lower a single statement.
-
 /// Make a conditional-argument arm value match the merge slot type.
 /// The only legitimate mismatch is the absent-argument null (i64 0)
 /// flowing into a pointer-typed slot, and pointee differences between
@@ -257,6 +255,7 @@ fn lower_call_arg_maybe_conditional(
     }
 }
 
+/// Lower a single statement.
 pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
     match &stmt.node {
         Stmt::Assignment { target, value } => {
