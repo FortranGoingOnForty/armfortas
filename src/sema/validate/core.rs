@@ -459,8 +459,94 @@ fn eval_const_int_expr_checked(
     }
 }
 
+/// Syntactic + symbol-table probe for an array-valued conditional arm:
+/// a whole-array name, an array constructor, or a section (a call-form
+/// expression with a range subscript). Conservative — anything it
+/// misses is caught by the same garbage-descriptor class this guards,
+/// so keep it in sync with the lowering when array merges land.
+fn conditional_arm_is_arraylike(ctx: &Ctx<'_>, expr: &crate::ast::expr::SpannedExpr) -> bool {
+    match &expr.node {
+        Expr::ArrayConstructor { .. } => true,
+        Expr::Name { name } => ctx
+            .lookup(name)
+            .is_some_and(|sym| !sym.attrs.array_spec.is_empty()),
+        Expr::FunctionCall { callee, args } => {
+            // A range subscript makes it a section; an array-returning
+            // function (declared result_rank > 0) is array-valued even
+            // with scalar args.
+            args.iter()
+                .any(|arg| !matches!(arg.value, crate::ast::expr::SectionSubscript::Element(_)))
+                || matches!(
+                    &callee.node,
+                    Expr::Name { name } if ctx
+                        .lookup(name)
+                        .is_some_and(|sym| sym.attrs.result_rank > 0)
+                )
+        }
+        Expr::ParenExpr { inner } => conditional_arm_is_arraylike(ctx, inner),
+        _ => false,
+    }
+}
+
 fn validate_const_int_expr_tree(ctx: &mut Ctx<'_>, expr: &crate::ast::expr::SpannedExpr) {
     match &expr.node {
+        Expr::ConditionalExpr {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            ctx.require_std(expr.span, FortranStandard::F2023, "conditional expression");
+            let cond_ty = crate::sema::types::expr_type(cond, ctx.st);
+            if !matches!(
+                cond_ty,
+                crate::sema::types::FortranType::Logical { .. }
+                    | crate::sema::types::FortranType::Unknown
+            ) {
+                ctx.error(
+                    cond.span,
+                    "condition in a conditional expression must be a scalar LOGICAL",
+                );
+            }
+            // Arms must share declared type and kind; character lengths
+            // may differ (gfortran conditional_1.f90 assigns mixed-length
+            // arms to a deferred-length allocatable).
+            let t_ty = crate::sema::types::expr_type(then_val, ctx.st);
+            let e_ty = crate::sema::types::expr_type(else_val, ctx.st);
+            let compatible = match (&t_ty, &e_ty) {
+                (crate::sema::types::FortranType::Unknown, _)
+                | (_, crate::sema::types::FortranType::Unknown) => true,
+                (
+                    crate::sema::types::FortranType::Character { kind: k1, .. },
+                    crate::sema::types::FortranType::Character { kind: k2, .. },
+                ) => k1 == k2,
+                (a, b) => a == b,
+            };
+            if !compatible {
+                ctx.error(
+                    else_val.span,
+                    format!(
+                        "arms of a conditional expression must have the same declared \
+                         type and kind (then-arm is {:?}, else-arm is {:?})",
+                        t_ty, e_ty
+                    ),
+                );
+            }
+            // Array-valued arms are not lowered yet — they built a
+            // corrupt merge before this check existed. Error loudly
+            // until descriptor-merge lowering lands (matrix-noted).
+            for arm in [then_val, else_val] {
+                if conditional_arm_is_arraylike(ctx, arm) {
+                    ctx.error(
+                        arm.span,
+                        "conditional expressions with array-valued arms are not \
+                         supported yet; assign through an IF construct instead",
+                    );
+                }
+            }
+            validate_const_int_expr_tree(ctx, cond);
+            validate_const_int_expr_tree(ctx, then_val);
+            validate_const_int_expr_tree(ctx, else_val);
+        }
         Expr::IntegerLiteral { .. } => {
             if let Err(diag) = eval_const_int_expr_checked(ctx, expr) {
                 ctx.error(diag.span, diag.msg);
