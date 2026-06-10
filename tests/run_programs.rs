@@ -197,6 +197,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use armfortas::target::{Arch, Os, TargetSpec};
+
 static NEXT_TEMP_ID: AtomicUsize = AtomicUsize::new(0);
 
 /// A single expected check.
@@ -499,18 +501,136 @@ fn extract_stderr_checks(source: &str) -> Vec<Check> {
     extract_prefixed_checks(source, "! STDERR_CHECK:")
 }
 
-/// Extract `! XFAIL:` reason text. Returns the first reason found, or
-/// `None` if the program has no XFAIL annotation. Multiple XFAIL lines
-/// are allowed (only the first is reported); a typical pattern is one
-/// audit ID per line for findings of the same class.
-fn extract_xfail(source: &str) -> Option<String> {
-    for line in source.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("! XFAIL:") {
-            return Some(rest.trim().to_string());
+/// Target selector inside a directive qualifier (sprint x01). Closed
+/// set reusing x00's triple grammar plus arch/OS shorthands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetSelector {
+    Arch(Arch),
+    Os(Os),
+    Triple(TargetSpec),
+    /// `x86_64-linux` — matches both -gnu and -musl.
+    LinuxAnyLibc,
+}
+
+impl TargetSelector {
+    fn matches(&self, t: &TargetSpec) -> bool {
+        match self {
+            TargetSelector::Arch(a) => t.arch == *a,
+            TargetSelector::Os(o) => t.os == *o,
+            TargetSelector::Triple(spec) => spec == t,
+            TargetSelector::LinuxAnyLibc => t.arch == Arch::X86_64 && t.os == Os::Linux,
         }
     }
-    None
+}
+
+/// Parse one selector token. `x86_64-linux` is handled before the
+/// triple grammar because `TargetSpec::parse` would resolve it to the
+/// -gnu triple, but as a selector it must match both libcs.
+fn parse_target_selector(token: &str) -> Option<TargetSelector> {
+    match token {
+        "arm64" | "aarch64" => Some(TargetSelector::Arch(Arch::Arm64)),
+        "x86_64" | "amd64" => Some(TargetSelector::Arch(Arch::X86_64)),
+        "macos" | "darwin" => Some(TargetSelector::Os(Os::MacOs)),
+        "freebsd" => Some(TargetSelector::Os(Os::FreeBsd)),
+        "linux" => Some(TargetSelector::Os(Os::Linux)),
+        "x86_64-linux" | "amd64-linux" => Some(TargetSelector::LinuxAnyLibc),
+        other => TargetSpec::parse(other).ok().map(TargetSelector::Triple),
+    }
+}
+
+/// Match an optionally target-qualified directive line: `! NAME: rest`
+/// (active on every target) or `! NAME(sel[,sel...]): rest` (active iff
+/// any selector matches `active`). Returns `Ok(None)` when the line is
+/// not this directive at all. Unknown/empty selectors are errors on
+/// EVERY target — a typo'd selector silently matching nothing would
+/// convert a tracked bug into a green test (x01 pitfall).
+fn match_qualified_directive<'a>(
+    line: &'a str,
+    name: &str,
+    active: &TargetSpec,
+    filename: &str,
+    line_num: usize,
+) -> Result<Option<(bool, &'a str)>, String> {
+    let trimmed = line.trim();
+    let Some(after_bang) = trimmed.strip_prefix("! ") else {
+        return Ok(None);
+    };
+    let Some(after_name) = after_bang.strip_prefix(name) else {
+        return Ok(None);
+    };
+    if let Some(rest) = after_name.strip_prefix(':') {
+        return Ok(Some((true, rest)));
+    }
+    let Some(after_paren) = after_name.strip_prefix('(') else {
+        return Ok(None); // some other directive sharing the prefix
+    };
+    let Some(close) = after_paren.find(')') else {
+        return Err(format!(
+            "{}:{}: {} target qualifier is missing ')'",
+            filename, line_num, name,
+        ));
+    };
+    let selector_list = &after_paren[..close];
+    let Some(rest) = after_paren[close + 1..].strip_prefix(':') else {
+        return Err(format!(
+            "{}:{}: expected ':' after {} target qualifier",
+            filename, line_num, name,
+        ));
+    };
+    let mut is_active = false;
+    let mut seen_any = false;
+    for token in selector_list.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        seen_any = true;
+        let selector = parse_target_selector(token).ok_or_else(|| {
+            format!(
+                "{}:{}: unknown target selector '{}' in {} qualifier; \
+                 selectors: arm64, x86_64, macos, freebsd, linux, \
+                 x86_64-linux, or a triple ({})",
+                filename,
+                line_num,
+                token,
+                name,
+                armfortas::target::SUPPORTED_TARGETS.join(", "),
+            )
+        })?;
+        if selector.matches(active) {
+            is_active = true;
+        }
+    }
+    if !seen_any {
+        return Err(format!(
+            "{}:{}: empty {} target qualifier",
+            filename, line_num, name,
+        ));
+    }
+    Ok(Some((is_active, rest)))
+}
+
+/// Extract `! XFAIL:` / `! XFAIL(<selectors>):` reason text. The first
+/// *active* XFAIL line wins; a file may carry both bare and qualified
+/// lines. A qualified line whose selectors do not match the active
+/// target behaves as if absent (the program must pass), but its
+/// selector spelling is validated regardless.
+fn extract_xfail(
+    source: &str,
+    filename: &str,
+    active: &TargetSpec,
+) -> Result<Option<String>, String> {
+    let mut first_active: Option<String> = None;
+    for (i, line) in source.lines().enumerate() {
+        if let Some((is_active, rest)) =
+            match_qualified_directive(line, "XFAIL", active, filename, i + 1)?
+        {
+            if is_active && first_active.is_none() {
+                first_active = Some(rest.trim().to_string());
+            }
+        }
+    }
+    Ok(first_active)
 }
 
 /// Extract `! ERROR_EXPECTED:` substring text. Returns the expected
@@ -1115,9 +1235,42 @@ fn extract_ir_checks(source: &str) -> Vec<ShapeCheck> {
     extract_shape_checks(source, "! IR_CHECK:", "! IR_NOT:")
 }
 
-/// Extract `! ASM_CHECK:` and `! ASM_NOT:` annotations from a source.
-fn extract_asm_checks(source: &str) -> Vec<ShapeCheck> {
-    extract_shape_checks(source, "! ASM_CHECK:", "! ASM_NOT:")
+/// Extract `! ASM_CHECK:` / `! ASM_NOT:` annotations, honoring target
+/// qualifiers (`! ASM_CHECK(arm64): ...`). An inactive qualified check
+/// is simply not asserted on this target; selector spelling is
+/// validated on every target.
+fn extract_asm_checks(
+    source: &str,
+    filename: &str,
+    active: &TargetSpec,
+) -> Result<Vec<ShapeCheck>, String> {
+    let mut checks = Vec::new();
+    for (i, line) in source.lines().enumerate() {
+        if let Some((is_active, rest)) =
+            match_qualified_directive(line, "ASM_CHECK", active, filename, i + 1)?
+        {
+            if is_active {
+                checks.push(ShapeCheck {
+                    line_num: i + 1,
+                    pattern: rest.trim().to_string(),
+                    negative: false,
+                });
+            }
+            continue;
+        }
+        if let Some((is_active, rest)) =
+            match_qualified_directive(line, "ASM_NOT", active, filename, i + 1)?
+        {
+            if is_active {
+                checks.push(ShapeCheck {
+                    line_num: i + 1,
+                    pattern: rest.trim().to_string(),
+                    negative: true,
+                });
+            }
+        }
+    }
+    Ok(checks)
 }
 
 /// Apply IR shape assertions against an --emit-ir text dump.
@@ -2028,7 +2181,13 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
         Err(e) => return TestOutcome::Fail(format!("{}: cannot read: {}", filename, e)),
     };
 
-    let xfail_reason = extract_xfail(&source_text);
+    // The harness compiles for the host (no --target yet; x07 widens
+    // this), so the host is the active target for directive qualifiers.
+    let active_target = TargetSpec::host();
+    let xfail_reason = match extract_xfail(&source_text, filename, &active_target) {
+        Ok(reason) => reason,
+        Err(e) => return TestOutcome::Fail(e),
+    };
     let error_expected = extract_error_expected(&source_text);
     let extra_flags = match extract_flags(&source_text, filename) {
         Ok(flags) => flags,
@@ -2045,7 +2204,10 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
         Err(e) => return TestOutcome::Fail(e),
     };
     let ir_checks = extract_ir_checks(&source_text);
-    let asm_checks = extract_asm_checks(&source_text);
+    let asm_checks = match extract_asm_checks(&source_text, filename, &active_target) {
+        Ok(checks) => checks,
+        Err(e) => return TestOutcome::Fail(e),
+    };
     let file_checks =
         match extract_file_checks(&source_text, filename, "! FILE_CHECK:", "! FILE_NOT:") {
             Ok(checks) => checks,
@@ -4448,4 +4610,86 @@ fn gfortran_dg_fixtures() {
             failures.join("\n\n")
         );
     }
+}
+
+// ---- Sprint x01: target qualifiers ----
+
+#[test]
+fn qualifier_bare_directive_is_active_everywhere() {
+    let host = TargetSpec::host();
+    let (active, rest) =
+        match_qualified_directive("! XFAIL: some reason", "XFAIL", &host, "t.f90", 1)
+            .unwrap()
+            .expect("directive should match");
+    assert!(active);
+    assert_eq!(rest.trim(), "some reason");
+}
+
+#[test]
+fn qualifier_selector_matching() {
+    let mac = TargetSpec::parse("arm64-macos").unwrap();
+    let fbsd = TargetSpec::parse("x86_64-freebsd").unwrap();
+    let musl = TargetSpec::parse("x86_64-linux-musl").unwrap();
+
+    let active_on = |line: &str, t: &TargetSpec| -> bool {
+        match_qualified_directive(line, "XFAIL", t, "t.f90", 1)
+            .unwrap()
+            .expect("directive should match")
+            .0
+    };
+
+    assert!(active_on("! XFAIL(arm64): r", &mac));
+    assert!(!active_on("! XFAIL(arm64): r", &fbsd));
+    assert!(active_on("! XFAIL(aarch64): r", &mac), "alias spelling");
+    assert!(active_on("! XFAIL(freebsd): r", &fbsd));
+    assert!(active_on("! XFAIL(x86_64-linux): r", &musl), "libc-agnostic");
+    assert!(!active_on("! XFAIL(x86_64-linux-gnu): r", &musl));
+    assert!(active_on("! XFAIL(macos, x86_64-linux): r", &mac), "multi-selector");
+    assert!(
+        active_on("! XFAIL(freebsd): reason (with parens)", &fbsd),
+        "parens in reason text are fine — qualifier sits before the colon"
+    );
+}
+
+#[test]
+fn qualifier_unknown_selector_is_loud_even_when_inactive() {
+    let mac = TargetSpec::parse("arm64-macos").unwrap();
+    for bad in [
+        "! XFAIL(x86-64-linux): r",  // typo'd arch
+        "! XFAIL(windows): r",
+        "! XFAIL(): r",
+        "! XFAIL(arm64: r",          // missing close paren
+    ] {
+        assert!(
+            match_qualified_directive(bad, "XFAIL", &mac, "t.f90", 1).is_err(),
+            "must reject: {}",
+            bad
+        );
+    }
+}
+
+#[test]
+fn qualifier_first_active_xfail_wins() {
+    let mac = TargetSpec::parse("arm64-macos").unwrap();
+    let src = "! XFAIL(x86_64-linux): linux reason\n! XFAIL: everywhere reason\nprogram t\nend\n";
+    assert_eq!(
+        extract_xfail(src, "t.f90", &mac).unwrap().as_deref(),
+        Some("everywhere reason")
+    );
+    let musl = TargetSpec::parse("x86_64-linux-musl").unwrap();
+    assert_eq!(
+        extract_xfail(src, "t.f90", &musl).unwrap().as_deref(),
+        Some("linux reason")
+    );
+}
+
+#[test]
+fn qualifier_inactive_asm_check_not_asserted() {
+    let fbsd = TargetSpec::parse("x86_64-freebsd").unwrap();
+    let src = "! ASM_CHECK(arm64): ldp x29, x30\n! ASM_NOT(arm64): bl _memcpy\nprogram t\nend\n";
+    let checks = extract_asm_checks(src, "t.f90", &fbsd).unwrap();
+    assert!(checks.is_empty(), "arm64-qualified checks inactive on freebsd");
+    let mac = TargetSpec::parse("arm64-macos").unwrap();
+    let checks = extract_asm_checks(src, "t.f90", &mac).unwrap();
+    assert_eq!(checks.len(), 2);
 }
