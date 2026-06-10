@@ -152,7 +152,10 @@ fn ir_type_table() -> Vec<(String, IrType)> {
     for w in [FloatWidth::F32, FloatWidth::F64] {
         rows.push((format!("f{}", w.bits()), IrType::Float(w)));
     }
-    rows.push(("ptr(i64)".into(), IrType::Ptr(Box::new(IrType::Int(IntWidth::I64)))));
+    rows.push((
+        "ptr(i64)".into(),
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I64))),
+    ));
     rows.push((
         "funcptr".into(),
         IrType::FuncPtr(Box::new(FuncSig {
@@ -188,7 +191,7 @@ fn ir_type_table() -> Vec<(String, IrType)> {
     rows
 }
 
-fn generate_dump() -> String {
+fn generate_dump(target_layout: armfortas::target::TargetLayout) -> String {
     // The kind defaults are thread-local state consulted by
     // size_of_type; reset so a sibling test's -fdefault-integer-8 run
     // cannot poison the dump (x02 pitfall).
@@ -198,14 +201,13 @@ fn generate_dump() -> String {
 
     out.push_str("[type_info]\n");
     for (name, ti) in type_info_matrix() {
-        let (size, align) = size_of_type(&ti);
+        let (size, align) = size_of_type(&ti, target_layout);
         writeln!(out, "{}\t{}\t{}", name, size, align).unwrap();
     }
 
-    let lp64 = armfortas::target::TargetLayout::LP64;
     out.push_str("\n[ir_type]\n");
     for (name, ty) in ir_type_table() {
-        writeln!(out, "{}\t{}", name, ty.size_bytes(&lp64)).unwrap();
+        writeln!(out, "{}\t{}", name, ty.size_bytes(&target_layout)).unwrap();
     }
 
     out.push_str("\n[derived]\n");
@@ -247,6 +249,7 @@ fn generate_dump() -> String {
                     &registry,
                     &empty_params,
                     &empty_inits,
+                    target_layout,
                 );
                 writeln!(out, "{}\t{}\t{}", layout.name, layout.size, layout.align).unwrap();
                 for field in &layout.fields {
@@ -277,11 +280,16 @@ fn golden_path() -> PathBuf {
 }
 
 #[test]
-fn layout_dump_matches_golden() {
-    let dump = generate_dump();
+fn layout_dump_matches_golden_on_every_target() {
+    // One golden, four targets, on purpose: the LP64 coincidence of the
+    // layouts is the tested claim (sprint x02). A real future divergence
+    // gets its own golden only after an index-level decision.
     let path = golden_path();
 
     if std::env::var_os("AFS_UPDATE_GOLDEN").is_some() {
+        let dump = generate_dump(armfortas::target::TargetLayout::of(
+            &armfortas::target::TargetSpec::parse("arm64-macos").unwrap(),
+        ));
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, &dump).unwrap();
         eprintln!("layout golden regenerated at {}", path.display());
@@ -295,8 +303,15 @@ fn layout_dump_matches_golden() {
             e
         )
     });
-    assert_eq!(
-        dump, golden,
-        "layout dump diverged from the committed golden — a layout-affecting change escaped"
-    );
+    for triple in armfortas::target::SUPPORTED_TARGETS {
+        let layout = armfortas::target::TargetLayout::of(
+            &armfortas::target::TargetSpec::parse(triple).unwrap(),
+        );
+        assert_eq!(
+            generate_dump(layout),
+            golden,
+            "layout dump for {} diverged from the committed LP64 golden",
+            triple
+        );
+    }
 }

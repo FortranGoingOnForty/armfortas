@@ -1214,15 +1214,17 @@ pub fn compile(opts: &Options) -> Result<(), String> {
 
     // 5. Semantic analysis.
     let phase = phases.start("sema");
-    let resolve_result = resolve::resolve_file(&units, &opts.module_search_paths).map_err(|e| {
-        format!(
-            "{}:{}:{}: {}",
-            opts.input.display(),
-            e.span.start.line,
-            e.span.start.col,
-            e.msg
-        )
-    })?;
+    let target_layout = crate::target::TargetLayout::of(&opts.target);
+    let resolve_result = resolve::resolve_file(&units, &opts.module_search_paths, target_layout)
+        .map_err(|e| {
+            format!(
+                "{}:{}:{}: {}",
+                opts.input.display(),
+                e.span.start.line,
+                e.span.start.col,
+                e.msg
+            )
+        })?;
     let mut st = resolve_result.st;
     if opts.force_implicit_none {
         st.force_implicit_none_all_units();
@@ -1293,7 +1295,6 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         external_char_len_star.extend(crate::sema::amod::extract_char_len_star_params(ext_mod));
     }
 
-    let target_layout = crate::target::TargetLayout::of(&opts.target);
     let (mut ir_module, module_globals) = lower::lower_file(
         &units,
         &st,

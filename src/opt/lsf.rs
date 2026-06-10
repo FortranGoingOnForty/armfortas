@@ -85,7 +85,10 @@ fn lsf_in_function(func: &mut Function, layout: crate::target::TargetLayout) -> 
                     let eff_ptr = resolve(&all_rewrites, *ptr);
                     let eff_val = resolve(&all_rewrites, *val);
                     available.retain(|entry| {
-                        matches!(alias::query(func, entry.ptr, eff_ptr, layout), AliasResult::NoAlias)
+                        matches!(
+                            alias::query(func, entry.ptr, eff_ptr, layout),
+                            AliasResult::NoAlias
+                        )
                     });
                     available.push(AvailableStore {
                         ptr: eff_ptr,
@@ -128,9 +131,9 @@ fn lsf_in_function(func: &mut Function, layout: crate::target::TargetLayout) -> 
                         // so a precise "different GEP offset →
                         // NoAlias" answer is unsound here.
                         available.retain(|entry| {
-                            pointer_args
-                                .iter()
-                                .all(|arg| !may_reach_through_call_arg(func, entry.ptr, *arg, layout))
+                            pointer_args.iter().all(|arg| {
+                                !may_reach_through_call_arg(func, entry.ptr, *arg, layout)
+                            })
                         });
                     }
                 }

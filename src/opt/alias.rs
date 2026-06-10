@@ -158,11 +158,7 @@ impl PtrBase {
 }
 
 /// Trace a pointer value back to its base allocation.
-fn trace_base(
-    func: &Function,
-    ptr: ValueId,
-    layout: crate::target::TargetLayout,
-) -> PtrBase {
+fn trace_base(func: &Function, ptr: ValueId, layout: crate::target::TargetLayout) -> PtrBase {
     // Check if this is a function parameter (pointer arg).
     for param in &func.params {
         if param.id == ptr {
@@ -187,11 +183,7 @@ fn trace_base(
 }
 
 /// Trace a pointer to its constant byte offset from the base, if possible.
-fn trace_offset(
-    func: &Function,
-    ptr: ValueId,
-    layout: crate::target::TargetLayout,
-) -> Option<i64> {
+fn trace_offset(func: &Function, ptr: ValueId, layout: crate::target::TargetLayout) -> Option<i64> {
     if func.params.iter().any(|param| param.id == ptr) {
         return Some(0);
     }
@@ -320,7 +312,10 @@ mod tests {
         });
         f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
 
-        assert_eq!(query(&f, a, b, crate::target::TargetLayout::LP64), AliasResult::NoAlias);
+        assert_eq!(
+            query(&f, a, b, crate::target::TargetLayout::LP64),
+            AliasResult::NoAlias
+        );
     }
 
     #[test]
@@ -336,7 +331,10 @@ mod tests {
         });
         f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
 
-        assert_eq!(query(&f, a, a, crate::target::TargetLayout::LP64), AliasResult::MustAlias);
+        assert_eq!(
+            query(&f, a, a, crate::target::TargetLayout::LP64),
+            AliasResult::MustAlias
+        );
     }
 
     #[test]
@@ -381,7 +379,10 @@ mod tests {
 
         f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
 
-        assert_eq!(query(&f, gep_i32, gep_i64, crate::target::TargetLayout::LP64), AliasResult::NoAlias);
+        assert_eq!(
+            query(&f, gep_i32, gep_i64, crate::target::TargetLayout::LP64),
+            AliasResult::NoAlias
+        );
     }
 
     #[test]
@@ -431,7 +432,10 @@ mod tests {
         });
         f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
 
-        assert_eq!(query(&f, gep0, gep1, crate::target::TargetLayout::LP64), AliasResult::NoAlias);
+        assert_eq!(
+            query(&f, gep0, gep1, crate::target::TargetLayout::LP64),
+            AliasResult::NoAlias
+        );
     }
 
     #[test]
@@ -474,7 +478,10 @@ mod tests {
         });
         f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
 
-        assert_eq!(query(&f, base, gep1, crate::target::TargetLayout::LP64), AliasResult::MayAlias);
+        assert_eq!(
+            query(&f, base, gep1, crate::target::TargetLayout::LP64),
+            AliasResult::MayAlias
+        );
     }
 
     #[test]
@@ -498,7 +505,10 @@ mod tests {
         });
         f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
 
-        assert_eq!(query(&f, ga, gb, crate::target::TargetLayout::LP64), AliasResult::NoAlias);
+        assert_eq!(
+            query(&f, ga, gb, crate::target::TargetLayout::LP64),
+            AliasResult::NoAlias
+        );
     }
 
     #[test]
@@ -520,7 +530,15 @@ mod tests {
         let mut f = Function::new("test".into(), params, IrType::Void);
         f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
 
-        assert_eq!(query(&f, ValueId(0), ValueId(1), crate::target::TargetLayout::LP64), AliasResult::NoAlias);
+        assert_eq!(
+            query(
+                &f,
+                ValueId(0),
+                ValueId(1),
+                crate::target::TargetLayout::LP64
+            ),
+            AliasResult::NoAlias
+        );
     }
 
     #[test]
@@ -597,6 +615,9 @@ mod tests {
         });
         f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
 
-        assert_eq!(query(&f, load_a, load_b, crate::target::TargetLayout::LP64), AliasResult::NoAlias);
+        assert_eq!(
+            query(&f, load_a, load_b, crate::target::TargetLayout::LP64),
+            AliasResult::NoAlias
+        );
     }
 }

@@ -3608,7 +3608,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             };
                             let elem_size_bytes = dynamic_layout
                                 .map(|layout| layout.size as i64)
-                                .unwrap_or_else(|| descriptor_element_size_bytes(&field_info, ctx.layout));
+                                .unwrap_or_else(|| {
+                                    descriptor_element_size_bytes(&field_info, ctx.layout)
+                                });
                             let es = allocated_array_elem_size(
                                 b,
                                 &field_info,
@@ -3934,7 +3936,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             }
                             continue;
                         }
-                        let elem_size_bytes = local_storage_size_bytes(&info, ctx.type_layouts, ctx.layout);
+                        let elem_size_bytes =
+                            local_storage_size_bytes(&info, ctx.type_layouts, ctx.layout);
 
                         if info.allocatable || info.descriptor_arg {
                             let rank = args.len();
@@ -6000,7 +6003,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 // base_addr: base + (lo - 1) * elem_size
                                 let one = b.const_i64(1);
                                 let lo_0 = b.isub(lo, one);
-                                let elem_bytes = b.const_i64(ir_scalar_byte_size(&arr_info.ty, ctx.layout));
+                                let elem_bytes =
+                                    b.const_i64(ir_scalar_byte_size(&arr_info.ty, ctx.layout));
                                 let byte_off = b.imul(lo_0, elem_bytes);
                                 let slice_base =
                                     b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));

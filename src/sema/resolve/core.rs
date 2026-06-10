@@ -61,6 +61,7 @@ pub struct ResolveResult {
 pub fn resolve_file(
     units: &[SpannedUnit],
     module_search_paths: &[std::path::PathBuf],
+    target_layout: crate::target::TargetLayout,
 ) -> Result<ResolveResult, SemaError> {
     let mut st = SymbolTable::new();
     let mut layouts = crate::sema::type_layout::TypeLayoutRegistry::new();
@@ -88,7 +89,7 @@ pub fn resolve_file(
     });
 
     // Third pass: compute layouts for all derived types.
-    compute_all_layouts(units, &st, &mut layouts);
+    compute_all_layouts(target_layout, units, &st, &mut layouts);
 
     Ok(ResolveResult {
         st,
@@ -628,6 +629,7 @@ pub(super) fn resolve_unit(
 
 /// Walk all program units and compute layouts for derived types.
 fn compute_all_layouts(
+    target_layout: crate::target::TargetLayout,
     units: &[SpannedUnit],
     st: &SymbolTable,
     layouts: &mut crate::sema::type_layout::TypeLayoutRegistry,
@@ -638,6 +640,7 @@ fn compute_all_layouts(
     for unit in units {
         let scope_id = find_unit_scope(st, 0, &unit.node).unwrap_or(0);
         collect_derived_type_layouts(
+            target_layout,
             &unit.node,
             scope_id,
             st,
@@ -933,6 +936,7 @@ fn visible_const_int_params(
 }
 
 fn collect_derived_type_layouts(
+    target_layout: crate::target::TargetLayout,
     unit: &ProgramUnit,
     scope_id: ScopeId,
     st: &SymbolTable,
@@ -974,6 +978,7 @@ fn collect_derived_type_layouts(
     let const_params = collect_const_int_params(decls, &seed_params);
     let empty_derived_field_inits = HashMap::new();
     register_local_type_layouts(
+        target_layout,
         decls,
         host_module,
         layouts,
@@ -983,6 +988,7 @@ fn collect_derived_type_layouts(
     let const_derived_field_inits =
         collect_const_derived_field_inits(decls, layouts, &const_params);
     register_local_type_layouts(
+        target_layout,
         decls,
         host_module,
         layouts,
@@ -993,6 +999,7 @@ fn collect_derived_type_layouts(
     for sub in contains {
         let sub_scope_id = find_unit_scope(st, scope_id, &sub.node).unwrap_or(scope_id);
         collect_derived_type_layouts(
+            target_layout,
             &sub.node,
             sub_scope_id,
             st,
@@ -1266,6 +1273,7 @@ fn collect_const_derived_field_inits(
 }
 
 fn register_local_type_layouts(
+    target_layout: crate::target::TargetLayout,
     decls: &[SpannedDecl],
     host_module: Option<&str>,
     layouts: &mut crate::sema::type_layout::TypeLayoutRegistry,
@@ -1298,6 +1306,7 @@ fn register_local_type_layouts(
                 layouts,
                 const_params,
                 const_derived_field_inits,
+                target_layout,
             );
             // Don't overwrite a layout that has bound_procs or final_procs with one that doesn't.
             // This handles the case where a subroutine redefines a type without CONTAINS.
@@ -2005,14 +2014,16 @@ mod tests {
         let tokens = Lexer::tokenize(src, 0).unwrap();
         let mut parser = Parser::new(&tokens);
         let units = parser.parse_file().unwrap();
-        resolve_file(&units, &[]).unwrap().st
+        resolve_file(&units, &[], crate::target::TargetLayout::LP64)
+            .unwrap()
+            .st
     }
 
     fn resolve_source_with_layouts(src: &str) -> ResolveResult {
         let tokens = Lexer::tokenize(src, 0).unwrap();
         let mut parser = Parser::new(&tokens);
         let units = parser.parse_file().unwrap();
-        resolve_file(&units, &[]).unwrap()
+        resolve_file(&units, &[], crate::target::TargetLayout::LP64).unwrap()
     }
 
     // ---- Integration tests ----

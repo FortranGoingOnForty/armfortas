@@ -4145,9 +4145,18 @@ mod tests {
 
     #[test]
     fn logical_arrays_use_default_kind_storage_for_stack_slots() {
-        assert_eq!(alloca_size(&IrType::Array(Box::new(IrType::Bool), 3), crate::target::TargetLayout::LP64), 12);
         assert_eq!(
-            alloca_size(&IrType::Array(Box::new(IrType::Int(IntWidth::I32)), 3), crate::target::TargetLayout::LP64),
+            alloca_size(
+                &IrType::Array(Box::new(IrType::Bool), 3),
+                crate::target::TargetLayout::LP64
+            ),
+            12
+        );
+        assert_eq!(
+            alloca_size(
+                &IrType::Array(Box::new(IrType::Int(IntWidth::I32)), 3),
+                crate::target::TargetLayout::LP64
+            ),
             12
         );
     }

@@ -67,7 +67,10 @@ fn dse_block(func: &mut Function, block_idx: usize, layout: crate::target::Targe
 
             InstKind::Load(ptr) => {
                 pending.retain(|entry| {
-                    matches!(alias::query(func, entry.ptr, *ptr, layout), AliasResult::NoAlias)
+                    matches!(
+                        alias::query(func, entry.ptr, *ptr, layout),
+                        AliasResult::NoAlias
+                    )
                 });
             }
 
@@ -89,9 +92,9 @@ fn dse_block(func: &mut Function, block_idx: usize, layout: crate::target::Targe
                     .collect();
                 if !pointer_args.is_empty() {
                     pending.retain(|entry| {
-                        pointer_args
-                            .iter()
-                            .all(|arg| !alias::may_reach_through_call_arg(func, entry.ptr, *arg, layout))
+                        pointer_args.iter().all(|arg| {
+                            !alias::may_reach_through_call_arg(func, entry.ptr, *arg, layout)
+                        })
                     });
                 }
             }

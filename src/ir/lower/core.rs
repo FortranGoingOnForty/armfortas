@@ -5331,7 +5331,9 @@ pub(super) fn apply_field_default_init_const_bytes(
             true
         }
         crate::sema::type_layout::FieldDefaultInit::Integer(value) => {
-            let field_size = crate::sema::type_layout::size_of_type(&field.type_info).0;
+            let field_size = crate::sema::type_layout::size_of_scalar_kind(&field.type_info)
+                .expect("integer/logical field is a scalar kind")
+                .0;
             let Some(encoded) = encode_const_scalar_bytes(*value, field_size) else {
                 return false;
             };
@@ -5343,7 +5345,9 @@ pub(super) fn apply_field_default_init_const_bytes(
             true
         }
         crate::sema::type_layout::FieldDefaultInit::Logical(value) => {
-            let field_size = crate::sema::type_layout::size_of_type(&field.type_info).0;
+            let field_size = crate::sema::type_layout::size_of_scalar_kind(&field.type_info)
+                .expect("integer/logical field is a scalar kind")
+                .0;
             let Some(encoded) = encode_const_scalar_bytes(if *value { 1 } else { 0 }, field_size)
             else {
                 return false;
@@ -5426,7 +5430,9 @@ pub(super) fn apply_const_expr_to_derived_field_bytes(
             let ConstScalar::Int(value) = clamped else {
                 return None;
             };
-            let field_size = crate::sema::type_layout::size_of_type(&field.type_info).0;
+            let field_size = crate::sema::type_layout::size_of_scalar_kind(&field.type_info)
+                .expect("integer/logical field is a scalar kind")
+                .0;
             let encoded = encode_const_scalar_bytes(value, field_size)?;
             let end = field_offset + encoded.len();
             if end > bytes.len() {
@@ -5444,7 +5450,9 @@ pub(super) fn apply_const_expr_to_derived_field_bytes(
                 },
                 _ => return None,
             };
-            let field_size = crate::sema::type_layout::size_of_type(&field.type_info).0;
+            let field_size = crate::sema::type_layout::size_of_scalar_kind(&field.type_info)
+                .expect("integer/logical field is a scalar kind")
+                .0;
             let encoded = encode_const_scalar_bytes(if value { 1 } else { 0 }, field_size)?;
             let end = field_offset + encoded.len();
             if end > bytes.len() {
@@ -21698,7 +21706,8 @@ pub(super) fn lower_type_spec_with_param_consts(
         }
         TypeSpec::Character(_) => IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
         TypeSpec::Type(name) | TypeSpec::Class(name) => {
-            // c_ptr and c_funptr are opaque address types — i64 on ARM64.
+            // c_ptr and c_funptr are opaque address types — pointer-sized
+            // integers on every supported (LP64) target.
             let lower_name = name.to_lowercase();
             if lower_name == "c_ptr" || lower_name == "c_funptr" {
                 IrType::Int(IntWidth::I64)
@@ -22998,7 +23007,10 @@ fn scalar_runtime_write_func(ty: &IrType) -> &'static str {
     }
 }
 
-pub(super) fn descriptor_element_size_bytes(info: &LocalInfo, layout: crate::target::TargetLayout) -> i64 {
+pub(super) fn descriptor_element_size_bytes(
+    info: &LocalInfo,
+    layout: crate::target::TargetLayout,
+) -> i64 {
     match &info.ty {
         IrType::Array(_, _) => info.ty.size_bytes(&layout) as i64,
         IrType::Int(IntWidth::I8) => 1,
@@ -40769,7 +40781,8 @@ pub(super) fn type_info_to_ir_type(ti: &crate::sema::symtab::TypeInfo) -> IrType
     if matches!(ti, TypeInfo::Derived(_) | TypeInfo::Class(_)) {
         return IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)));
     }
-    let (size, _) = crate::sema::type_layout::size_of_type(ti);
+    let (size, _) =
+        crate::sema::type_layout::size_of_scalar_kind(ti).expect("Derived/Class handled above");
     match size {
         1 => IrType::Int(IntWidth::I8),
         2 => IrType::Int(IntWidth::I16),
@@ -45644,7 +45657,7 @@ mod tests {
         let mut parser = Parser::new(&tokens);
         let units = parser.parse_file().unwrap();
         let (st, layouts) = {
-            let rr = resolve::resolve_file(&units, &[]).unwrap();
+            let rr = resolve::resolve_file(&units, &[], crate::target::TargetLayout::LP64).unwrap();
             (rr.st, rr.type_layouts)
         };
         lower_file(

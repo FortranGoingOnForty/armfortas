@@ -788,7 +788,8 @@ mod tests {
         let mut parser = Parser::new(&tokens);
         let units = parser.parse_file().expect("parse fixture");
         let (st, type_layouts) = {
-            let rr = resolve::resolve_file(&units, &[]).expect("resolve fixture");
+            let rr = resolve::resolve_file(&units, &[], crate::target::TargetLayout::LP64)
+                .expect("resolve fixture");
             (rr.st, rr.type_layouts)
         };
         let diags = validate::validate_file(&units, &st);

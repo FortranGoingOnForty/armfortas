@@ -1,7 +1,9 @@
 //! Derived type memory layout computation.
 //!
 //! Computes field offsets, alignment, and total size for derived types
-//! using natural alignment rules (same as C struct layout on ARM64).
+//! using natural alignment rules (C struct layout; sizes and
+//! alignments come from `TargetLayout`, identical across the LP64
+//! targets we support).
 
 use super::symtab::TypeInfo;
 use std::borrow::Cow;
@@ -184,8 +186,14 @@ impl TypeLayoutRegistry {
     }
 }
 
-/// Compute the size and alignment of a Fortran type on ARM64.
-pub fn size_of_type(ti: &TypeInfo) -> (usize, usize) {
+/// Size and alignment for types whose footprint derives entirely from
+/// the Fortran KIND (or character length) — no target-layout input.
+/// Returns `None` for Derived/Class/unlimited-polymorphic entities,
+/// whose size is a pointer or descriptor and therefore a
+/// `TargetLayout` question. Callers that have already excluded those
+/// variants (e.g. `type_info_to_ir_type`) use this directly instead of
+/// threading a layout they cannot consume.
+pub fn size_of_scalar_kind(ti: &TypeInfo) -> Option<(usize, usize)> {
     match ti {
         TypeInfo::Integer { kind } => {
             // No explicit kind selector → honour the driver's
@@ -194,29 +202,43 @@ pub fn size_of_type(ti: &TypeInfo) -> (usize, usize) {
             let k = kind
                 .map(|k| k as usize)
                 .unwrap_or_else(|| crate::driver::defaults::default_int_kind() as usize);
-            (k, k)
+            Some((k, k))
         }
         TypeInfo::Real { kind } => {
             let k = kind
                 .map(|k| k as usize)
                 .unwrap_or_else(|| crate::driver::defaults::default_real_kind() as usize);
-            (k, k)
+            Some((k, k))
         }
-        TypeInfo::DoublePrecision => (8, 8),
+        TypeInfo::DoublePrecision => Some((8, 8)),
         TypeInfo::Complex { kind } => {
             let k = kind.unwrap_or(4) as usize;
-            (k * 2, k) // complex(4) = 8 bytes, aligned to 4
+            Some((k * 2, k)) // complex(4) = 8 bytes, aligned to 4
         }
         TypeInfo::Logical { kind } => {
             let k = kind.unwrap_or(4) as usize;
-            (k, k)
+            Some((k, k))
         }
         TypeInfo::Character { len, kind: _ } => {
             let l = len.unwrap_or(1) as usize;
-            (l, 1)
+            Some((l, 1))
         }
-        TypeInfo::Derived(_) => (8, 8), // resolved by caller via registry
-        TypeInfo::Class(_) | TypeInfo::ClassStar | TypeInfo::TypeStar => (16, 8),
+        TypeInfo::Derived(_) | TypeInfo::Class(_) | TypeInfo::ClassStar | TypeInfo::TypeStar => {
+            None
+        }
+    }
+}
+
+/// Compute the size and alignment of a Fortran type under the given
+/// target layout.
+pub fn size_of_type(ti: &TypeInfo, layout: crate::target::TargetLayout) -> (usize, usize) {
+    if let Some(scalar) = size_of_scalar_kind(ti) {
+        return scalar;
+    }
+    match ti {
+        TypeInfo::Derived(_) => (layout.ptr_bytes, layout.ptr_align), // resolved by caller via registry
+        TypeInfo::Class(_) | TypeInfo::ClassStar | TypeInfo::TypeStar => layout.class_descriptor(),
+        _ => unreachable!("scalar kinds handled by size_of_scalar_kind"),
     }
 }
 
@@ -681,6 +703,7 @@ pub fn compute_layout(
     parent_layout: Option<&TypeLayout>,
     registry: &TypeLayoutRegistry,
     const_params: &HashMap<String, i64>,
+    layout: crate::target::TargetLayout,
 ) -> TypeLayout {
     let const_derived_field_inits = HashMap::new();
     compute_layout_with_attrs(
@@ -694,6 +717,7 @@ pub fn compute_layout(
         registry,
         const_params,
         &const_derived_field_inits,
+        layout,
     )
 }
 
@@ -708,6 +732,7 @@ pub fn compute_layout_with_attrs(
     registry: &TypeLayoutRegistry,
     const_params: &HashMap<String, i64>,
     const_derived_field_inits: &HashMap<String, FieldDefaultInit>,
+    layout: crate::target::TargetLayout,
 ) -> TypeLayout {
     let mut offset: usize = 0;
     let mut max_align: usize = 1;
@@ -768,20 +793,20 @@ pub fn compute_layout_with_attrs(
                         && (is_allocatable || is_pointer)
                         && !declared_array
                     {
-                        (32, 8) // StringDescriptor for deferred-length scalar char components
+                        layout.string_descriptor() // deferred-length scalar char component
                     } else if is_proc_pointer_component {
-                        (PROC_PTR_COMPONENT_SIZE, 8)
+                        (layout.proc_ptr_component(), layout.ptr_align)
                     } else if is_pointer && !declared_array && !matches!(ti, TypeInfo::Class(_)) {
-                        (8, 8) // Scalar POINTER components are pointer slots, not descriptors
+                        (layout.ptr_bytes, layout.ptr_align) // scalar POINTER component: a pointer slot, not a descriptor
                     } else if is_allocatable || is_pointer {
-                        (384, 8) // ArrayDescriptor size for allocatable/pointer array components
+                        layout.array_descriptor() // allocatable/pointer array component
                     } else if let TypeInfo::Derived(ref dname) = ti {
                         registry
                             .get(dname)
                             .map(|l| (l.size, l.align))
-                            .unwrap_or((8, 8))
+                            .unwrap_or((layout.ptr_bytes, layout.ptr_align))
                     } else {
-                        size_of_type(&ti)
+                        size_of_type(&ti, layout)
                     };
                 // Pad to alignment.
                 let padding = (elem_align - (offset % elem_align)) % elem_align;
@@ -999,20 +1024,65 @@ mod tests {
 
     #[test]
     fn size_of_basic_types() {
-        assert_eq!(size_of_type(&TypeInfo::Integer { kind: Some(4) }), (4, 4));
-        assert_eq!(size_of_type(&TypeInfo::Integer { kind: Some(8) }), (8, 8));
-        assert_eq!(size_of_type(&TypeInfo::Real { kind: Some(4) }), (4, 4));
-        assert_eq!(size_of_type(&TypeInfo::Real { kind: Some(8) }), (8, 8));
-        assert_eq!(size_of_type(&TypeInfo::Logical { kind: Some(4) }), (4, 4));
         assert_eq!(
-            size_of_type(&TypeInfo::Character {
-                len: Some(10),
-                kind: None
-            }),
+            size_of_type(
+                &TypeInfo::Integer { kind: Some(4) },
+                crate::target::TargetLayout::LP64
+            ),
+            (4, 4)
+        );
+        assert_eq!(
+            size_of_type(
+                &TypeInfo::Integer { kind: Some(8) },
+                crate::target::TargetLayout::LP64
+            ),
+            (8, 8)
+        );
+        assert_eq!(
+            size_of_type(
+                &TypeInfo::Real { kind: Some(4) },
+                crate::target::TargetLayout::LP64
+            ),
+            (4, 4)
+        );
+        assert_eq!(
+            size_of_type(
+                &TypeInfo::Real { kind: Some(8) },
+                crate::target::TargetLayout::LP64
+            ),
+            (8, 8)
+        );
+        assert_eq!(
+            size_of_type(
+                &TypeInfo::Logical { kind: Some(4) },
+                crate::target::TargetLayout::LP64
+            ),
+            (4, 4)
+        );
+        assert_eq!(
+            size_of_type(
+                &TypeInfo::Character {
+                    len: Some(10),
+                    kind: None
+                },
+                crate::target::TargetLayout::LP64
+            ),
             (10, 1)
         );
-        assert_eq!(size_of_type(&TypeInfo::Complex { kind: Some(4) }), (8, 4));
-        assert_eq!(size_of_type(&TypeInfo::Complex { kind: Some(8) }), (16, 8));
+        assert_eq!(
+            size_of_type(
+                &TypeInfo::Complex { kind: Some(4) },
+                crate::target::TargetLayout::LP64
+            ),
+            (8, 4)
+        );
+        assert_eq!(
+            size_of_type(
+                &TypeInfo::Complex { kind: Some(8) },
+                crate::target::TargetLayout::LP64
+            ),
+            (16, 8)
+        );
     }
 
     #[test]
@@ -1284,6 +1354,7 @@ mod tests {
             None,
             &reg,
             &empty_params(),
+            crate::target::TargetLayout::LP64,
         );
         assert_eq!(layout.name, "pair");
         assert_eq!(layout.size, 8); // 4 + 4, no padding needed
@@ -1326,6 +1397,7 @@ mod tests {
             None,
             &reg,
             &empty_params(),
+            crate::target::TargetLayout::LP64,
         );
         assert_eq!(layout.field("a").unwrap().offset, 0);
         assert_eq!(layout.field("a").unwrap().size, 1);
@@ -1353,6 +1425,7 @@ mod tests {
             None,
             &reg,
             &empty_params(),
+            crate::target::TargetLayout::LP64,
         );
         assert_eq!(base_layout.size, 4);
 
@@ -1366,6 +1439,7 @@ mod tests {
             Some(&base_layout),
             &reg,
             &empty_params(),
+            crate::target::TargetLayout::LP64,
         );
         assert_eq!(child_layout.fields.len(), 2); // x + y
         assert_eq!(child_layout.field("x").unwrap().offset, 0); // inherited
@@ -1403,6 +1477,7 @@ mod tests {
             None,
             &reg,
             &empty_params(),
+            crate::target::TargetLayout::LP64,
         );
         let field = layout.field("left").expect("missing left field");
 
@@ -1438,6 +1513,7 @@ mod tests {
             None,
             &reg,
             &empty_params(),
+            crate::target::TargetLayout::LP64,
         );
         let field = layout.field("lines").expect("missing lines field");
 
@@ -1505,6 +1581,7 @@ mod tests {
             None,
             &reg,
             &empty_params(),
+            crate::target::TargetLayout::LP64,
         );
 
         assert_eq!(
@@ -1576,6 +1653,7 @@ mod tests {
             None,
             &reg,
             &empty_params(),
+            crate::target::TargetLayout::LP64,
         ));
 
         let components = vec![
@@ -1634,6 +1712,7 @@ mod tests {
             None,
             &reg,
             &empty_params(),
+            crate::target::TargetLayout::LP64,
         );
 
         assert_eq!(
@@ -1684,7 +1763,17 @@ mod tests {
         let mut params = std::collections::HashMap::new();
         params.insert("max_token_len".into(), 8);
 
-        let layout = compute_layout("token_t", None, &[], &[], &components, None, &reg, &params);
+        let layout = compute_layout(
+            "token_t",
+            None,
+            &[],
+            &[],
+            &components,
+            None,
+            &reg,
+            &params,
+            crate::target::TargetLayout::LP64,
+        );
         let field = layout.field("value").expect("missing value field");
 
         assert_eq!(field.size, 8);

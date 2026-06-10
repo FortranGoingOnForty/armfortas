@@ -93,7 +93,10 @@ fn load_is_loop_invariant(
             }
             match &inst.kind {
                 InstKind::Store(_, ptr)
-                    if !matches!(alias::query(func, *ptr, load_ptr, layout), AliasResult::NoAlias) =>
+                    if !matches!(
+                        alias::query(func, *ptr, load_ptr, layout),
+                        AliasResult::NoAlias
+                    ) =>
                 {
                     return false;
                 }
@@ -194,7 +197,9 @@ fn licm_function(func: &mut Function, layout: crate::target::TargetLayout) -> bo
                         continue;
                     }
                     let hoistable = match &inst.kind {
-                        InstKind::Load(ptr) => load_is_loop_invariant(layout, func, lp, inst.id, *ptr),
+                        InstKind::Load(ptr) => {
+                            load_is_loop_invariant(layout, func, lp, inst.id, *ptr)
+                        }
                         _ => is_non_memory_hoist_candidate(&inst.kind),
                     };
                     if !hoistable {

@@ -174,7 +174,7 @@ pub(super) fn coerce_to_type(b: &mut FuncBuilder, val: ValueId, target: &IrType)
         // Ptr<Array<T, N>> → Ptr<T>: pointer to array used as pointer to element.
         // Common for character arrays (Ptr<[i8 x 20]> → Ptr<i8>).
         (IrType::Ptr(_), IrType::Ptr(_)) => {
-            // Pointers are all the same size on ARM64 — pass through.
+            // Pointers are all the same size on LP64 targets — pass through.
             val
         }
         // Int → Ptr: value used in pointer context (e.g., byte as char*).

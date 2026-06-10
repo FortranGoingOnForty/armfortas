@@ -138,7 +138,14 @@ fn scan_block_before_load(
         if inst.id == load_inst {
             break;
         }
-        update_memory_state(func, layout, &inst.kind, load_ptr, &mut last_store, &mut clobbered);
+        update_memory_state(
+            func,
+            layout,
+            &inst.kind,
+            load_ptr,
+            &mut last_store,
+            &mut clobbered,
+        );
     }
 
     if let Some(val) = last_store {
@@ -161,7 +168,14 @@ fn scan_block(
     let mut clobbered = false;
 
     for inst in &block.insts {
-        update_memory_state(func, layout, &inst.kind, load_ptr, &mut last_store, &mut clobbered);
+        update_memory_state(
+            func,
+            layout,
+            &inst.kind,
+            load_ptr,
+            &mut last_store,
+            &mut clobbered,
+        );
     }
 
     if let Some(val) = last_store {
@@ -267,7 +281,10 @@ fn paths_to_load_are_clean(
             continue;
         }
 
-        if !matches!(scan_block(layout, func, block_id, load_ptr), MemoryState::Clean) {
+        if !matches!(
+            scan_block(layout, func, block_id, load_ptr),
+            MemoryState::Clean
+        ) {
             return false;
         }
 
