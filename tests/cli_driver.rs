@@ -41121,11 +41121,14 @@ fn target_flag_x86_64_fails_at_codegen_boundary_writing_nothing() {
     // Exit code 1: compile error convention (lib.rs exit-code table).
     assert_eq!(out.status.code(), Some(1), "status: {:?}", out.status);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    // The boundary advances sprint by sprint: x00 errored at the backend
-    // (x03's message), x03 errors at instruction selection (x05's).
+    // The boundary advances sprint by sprint: x00 errored at the
+    // backend, x03 at instruction selection, x05 at the link step.
+    // (On non-x86 hosts the assemble step's cross-assembly guard fires
+    // first instead — both name the sprint that unblocks them.)
     assert!(
-        stderr.contains("x86_64 instruction selection is not implemented yet (sprint x05)"),
-        "expected the x05 boundary diagnostic, got: {}",
+        stderr.contains("the ELF link step is not implemented yet (sprint x06)")
+            || stderr.contains("cross-assembly needs the afs-as x86 encoder (sprint x14)"),
+        "expected the x06 link (or x14 cross-assembly) diagnostic, got: {}",
         stderr
     );
     assert!(

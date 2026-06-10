@@ -2,3 +2,4 @@
 # an x86_64 ELF host. Everything else must run — zero other skips.
 x86_emit_golden
 abi_differential
+x86_object_smoke

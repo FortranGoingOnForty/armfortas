@@ -944,7 +944,6 @@ impl PhaseGuard {
     }
 }
 
-
 fn all_input_paths(opts: &Options) -> Vec<PathBuf> {
     let mut inputs = vec![opts.input.clone()];
     inputs.extend(opts.extra_inputs.iter().cloned());
@@ -1424,13 +1423,42 @@ pub fn compile(opts: &Options) -> Result<(), String> {
 
     fs::write(&asm_path, &asm_text).map_err(|e| format!("cannot write temp assembly: {}", e))?;
 
-    // x00: the assemble step knows Mach-O only; ELF assembly lands in
-    // sprint x06. Unreachable today (the codegen guard fires first) but the
-    // boundary is explicit so x03 cannot silently assemble for the wrong
-    // format.
-    if opts.target.object_format() != crate::target::ObjectFormat::MachO {
+    // x05: ELF targets assemble with the system assembler when the
+    // host arch matches (gas on FreeBSD/Linux; `as --64`). Cross-
+    // assembly from a non-x86 host waits for afs-as's x86 encoder
+    // (x14). Mach-O keeps the existing as/AFS_AS routing below.
+    if opts.target.object_format() == crate::target::ObjectFormat::Elf {
+        let host = crate::target::TargetSpec::host();
+        if host.arch != opts.target.arch || host.object_format() != crate::target::ObjectFormat::Elf
+        {
+            return Err(format!(
+                "cannot assemble for target '{}' on this host: cross-assembly needs the afs-as x86 encoder (sprint x14)",
+                opts.target
+            ));
+        }
+        let phase = phases.start("assemble");
+        let as_result = Command::new(env_override("AFS_AS_PATH").unwrap_or_else(|| "as".into()))
+            .args(["--64", "-o"])
+            .arg(&obj_path)
+            .arg(&asm_path)
+            .output()
+            .map_err(|e| format!("cannot run assembler: {}", e))?;
+        phase.end(&mut phases);
+        if !as_result.status.success() {
+            return Err(format!(
+                "assembler failed:\n{}",
+                String::from_utf8_lossy(&as_result.stderr)
+            ));
+        }
+        if opts.emit_obj {
+            let _ = fs::remove_file(&asm_path);
+            if opts.verbose {
+                eprintln!(" assembled: {}", obj_path.display());
+            }
+            return Ok(());
+        }
         return Err(format!(
-            "cannot assemble for target '{}': ELF toolchain support is not implemented yet (sprint x06)",
+            "cannot link for target '{}': the ELF link step is not implemented yet (sprint x06)",
             opts.target
         ));
     }
