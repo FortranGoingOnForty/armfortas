@@ -384,6 +384,50 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
+        // F2023 R818 explicit-shape-bounds-spec: `a([2, 3])` (and the
+        // `a([l1, l2]:[u1, u2])` form) gives all bounds in rank-1
+        // constant arrays. Desugar to per-dimension explicit bounds so
+        // downstream never sees an array-valued extent — before l01
+        // this form was accepted and built a corrupt rank-1 descriptor
+        // (silent wrong answers from size/shape at runtime).
+        if specs.len() == 1 {
+            if let ArraySpec::Explicit { lower, upper } = &specs[0] {
+                let uppers = bounds_vector_elements(upper);
+                if let Some(uppers) = uppers {
+                    let lowers = match lower {
+                        Some(l) => match bounds_vector_elements(l) {
+                            Some(ls) => Some(ls),
+                            None => {
+                                return Err(self.error(
+                                    "explicit-shape-bounds-spec: lower bounds must also be \
+                                     a constant array when upper bounds are (R818)"
+                                        .into(),
+                                ))
+                            }
+                        },
+                        None => None,
+                    };
+                    if let Some(ls) = &lowers {
+                        if ls.len() != uppers.len() {
+                            return Err(self.error(format!(
+                                "explicit-shape-bounds-spec: lower bounds give rank {} but \
+                                 upper bounds give rank {} (R818)",
+                                ls.len(),
+                                uppers.len()
+                            )));
+                        }
+                    }
+                    specs = uppers
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, u)| ArraySpec::Explicit {
+                            lower: lowers.as_ref().map(|ls| ls[i].clone()),
+                            upper: u,
+                        })
+                        .collect();
+                }
+            }
+        }
         Ok(specs)
     }
 
@@ -1931,5 +1975,33 @@ mod tests {
         } else {
             panic!("not TypeDecl");
         }
+    }
+}
+
+/// If `e` is a bracketed constant vector usable as an R818 bounds
+/// array (`[2, 3]` — plain expression elements, no implied-do, no
+/// type-spec), return its elements. Constancy is enforced downstream
+/// by the usual explicit-shape validation of each desugared bound.
+fn bounds_vector_elements(
+    e: &crate::ast::expr::SpannedExpr,
+) -> Option<Vec<crate::ast::expr::SpannedExpr>> {
+    if let crate::ast::expr::Expr::ArrayConstructor {
+        type_spec: None,
+        values,
+    } = &e.node
+    {
+        let mut out = Vec::with_capacity(values.len());
+        for v in values {
+            match v {
+                crate::ast::expr::AcValue::Expr(item) => out.push(item.clone()),
+                crate::ast::expr::AcValue::ImpliedDo(_) => return None,
+            }
+        }
+        if out.is_empty() {
+            return None;
+        }
+        Some(out)
+    } else {
+        None
     }
 }
