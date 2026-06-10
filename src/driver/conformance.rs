@@ -43,6 +43,66 @@ fn line_limit(std: FortranStandard) -> usize {
 
 const STMT_LIMIT: usize = 1_000_000;
 
+/// Unconditional statement-size cap, enforced at every `--std` level
+/// (unlike the conformance warnings). Every recursive walker in the
+/// pipeline (parser nesting, sema, IR lowering) has depth bounded by
+/// the statement's token count, which is bounded by its character
+/// count — so capping statement size makes stack overflow structurally
+/// unreachable: the compile thread's reservation covers ~1.8M frames
+/// (measured), and a capped statement admits at most ~1M. Twice the
+/// F2023 limit, so every conforming program is unaffected; past the
+/// cap the compiler errors cleanly instead of ever faulting.
+pub const STMT_HARD_CAP: usize = 2 * STMT_LIMIT;
+
+/// Scan for a statement exceeding [`STMT_HARD_CAP`]. Both source
+/// forms: free-form joins on trailing `&`, fixed form on a nonblank
+/// column 6 of the following line.
+pub fn find_over_cap_statement(source: &str, form: SourceForm) -> Option<(Span, usize)> {
+    let mut stmt_start: u32 = 0;
+    let mut stmt_chars: usize = 0;
+    let mut in_string: Option<char> = None;
+    let lines: Vec<&str> = source.lines().collect();
+    for (idx, line) in lines.iter().enumerate() {
+        let line_no = idx as u32 + 1;
+        if stmt_chars == 0 {
+            stmt_start = line_no;
+        }
+        stmt_chars += line.chars().count();
+        let continued = match form {
+            SourceForm::FreeForm => line_continues(line, &mut in_string),
+            SourceForm::FixedForm => lines.get(idx + 1).is_some_and(|next| {
+                let mut chars = next.chars();
+                let c6 = chars.nth(5);
+                // Continuation line: nonblank, non-'0' in column 6 of a
+                // non-comment line.
+                !matches!(
+                    next.chars().next(),
+                    Some('c') | Some('C') | Some('*') | Some('!')
+                ) && matches!(c6, Some(ch) if ch != ' ' && ch != '0')
+            }),
+        };
+        if !continued {
+            if stmt_chars > STMT_HARD_CAP {
+                let at = Span {
+                    file_id: 0,
+                    start: Position {
+                        line: stmt_start,
+                        col: 1,
+                    },
+                    end: Position {
+                        line: stmt_start,
+                        col: 1,
+                    },
+                };
+                return Some((at, stmt_chars));
+            }
+            stmt_chars = 0;
+            in_string = None;
+        }
+    }
+    None
+}
+
 /// Scan `source` for F2023 source-limit conformance violations.
 /// `suppress_line_limit` is `-ffree-line-length-none`: gfortran's
 /// meaning of that flag is "no line-length conformance concern", so it
@@ -180,6 +240,60 @@ fn line_continues(line: &str, in_string: &mut Option<char>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hard_cap_finds_oversized_statements_in_both_forms() {
+        // Free form: fat continuation lines past the cap.
+        let line = format!(
+            "  x = x {} &
+",
+            "+ 1".repeat(400)
+        );
+        let mut src = String::from(
+            "x = 0 &
+",
+        );
+        for _ in 0..2_000 {
+            src.push_str(&line);
+        }
+        src.push_str(
+            "  + 1
+",
+        );
+        let hit = find_over_cap_statement(&src, SourceForm::FreeForm);
+        assert!(
+            hit.is_some(),
+            "2.4M-char free-form statement must trip the cap"
+        );
+        assert_eq!(hit.unwrap().0.start.line, 1);
+
+        // Fixed form: column-6 continuation marks.
+        let mut src = String::from(
+            "      x = 0
+",
+        );
+        let cont = format!(
+            "     + {}
+",
+            "+ 1 ".repeat(300)
+        );
+        for _ in 0..2_000 {
+            src.push_str(&cont);
+        }
+        assert!(
+            find_over_cap_statement(&src, SourceForm::FixedForm).is_some(),
+            "fixed-form continuation chain past the cap must trip"
+        );
+
+        // Under the cap: nothing fires.
+        assert!(find_over_cap_statement(
+            "x = 1
+y = 2
+",
+            SourceForm::FreeForm
+        )
+        .is_none());
+    }
 
     fn check(src: &str, std: FortranStandard) -> Vec<LimitWarning> {
         check_source_limits(src, std, SourceForm::FreeForm, false)

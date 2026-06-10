@@ -1128,6 +1128,28 @@ pub fn compile(opts: &Options) -> Result<(), String> {
             diag::render(&file_str, &source, w.span, diag::Level::Warning, &w.msg, 1);
         }
     }
+    // Unconditional cap (all --std levels): keeps every recursive
+    // walker's depth under the compile-thread stack reservation, so an
+    // oversized statement gets this diagnostic, never a stack fault.
+    if let Some((span, chars)) = conformance::find_over_cap_statement(&source, source_form) {
+        diag::render(
+            &file_str,
+            &source,
+            span,
+            diag::Level::Error,
+            &format!(
+                "statement is {} characters long, over the {}-character compiler limit \
+                 (the F2023 standard caps statements at 1,000,000 characters)",
+                chars,
+                conformance::STMT_HARD_CAP
+            ),
+            1,
+        );
+        return Err(format!(
+            "aborting due to errors in {}",
+            opts.input.display()
+        ));
+    }
 
     let phase = phases.start("preprocess");
     let mut pp_config = crate::preprocess::PreprocConfig {

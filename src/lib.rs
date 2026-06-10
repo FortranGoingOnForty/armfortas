@@ -80,12 +80,15 @@ pub fn cli_entry() -> ! {
             install_ice_hook();
             // Compile on a thread with a large stack reservation. IR
             // lowering (like other tree visitors here) recurses per
-            // expression node, and an F2023-conforming million-
-            // character statement is a ~7,000-term chain — enough to
-            // overflow the default main stack. The reservation is
-            // address space, not committed memory; rustc spawns its
-            // compile thread the same way for the same reason.
-            const COMPILE_STACK_BYTES: usize = 512 * 1024 * 1024;
+            // expression node; an F2023-conforming million-character
+            // statement can be a ~500,000-term chain. The reservation
+            // is address space, not committed memory (rustc spawns its
+            // compile thread the same way). Sized so the measured
+            // cliff (~1.1KB/frame debug -> ~1.8M frames) sits well
+            // past the depth the statement-size cap admits (~1M; see
+            // STMT_HARD_CAP in driver::conformance) — the cap's clean
+            // diagnostic always fires before the guard page can.
+            const COMPILE_STACK_BYTES: usize = 2 * 1024 * 1024 * 1024;
             let result = std::thread::Builder::new()
                 .name("compile".into())
                 .stack_size(COMPILE_STACK_BYTES)
