@@ -35768,3 +35768,56 @@ fn target_flag_x86_64_frontend_modes_still_work() {
     let _ = fs::remove_file(&src);
     let _ = fs::remove_file(&ir);
 }
+
+// ---- Sprint l00: --std=f2023 wiring ----
+
+#[test]
+fn std_f2023_accepted_and_compiles_like_default() {
+    let src = unique_path("l00_std", "f90");
+    fs::write(&src, "program p\n  print *, 1 + 1\nend program p\n").unwrap();
+    let asm_default = unique_path("l00_std_default", "s");
+    let asm_f2023 = unique_path("l00_std_f2023", "s");
+
+    for (flags, out) in [
+        (vec!["--target", "arm64-macos", "-S"], &asm_default),
+        (vec!["--target", "arm64-macos", "-S", "--std=f2023"], &asm_f2023),
+    ] {
+        let r = Command::new(compiler("armfortas"))
+            .args(&flags)
+            .arg(&src)
+            .arg("-o")
+            .arg(out)
+            .output()
+            .expect("failed to spawn armfortas");
+        assert!(
+            r.status.success(),
+            "compile failed for {:?}: {}",
+            flags,
+            String::from_utf8_lossy(&r.stderr)
+        );
+    }
+    assert_eq!(
+        fs::read(&asm_default).unwrap(),
+        fs::read(&asm_f2023).unwrap(),
+        "--std=f2023 must not change codegen for std-neutral source"
+    );
+
+    let _ = fs::remove_file(&src);
+    let _ = fs::remove_file(&asm_default);
+    let _ = fs::remove_file(&asm_f2023);
+}
+
+#[test]
+fn std_f2024_rejected_with_unknown_value_diagnostic() {
+    let out = Command::new(compiler("armfortas"))
+        .args(["--std=f2024", "hello.f90"])
+        .output()
+        .expect("failed to spawn armfortas");
+    assert_eq!(out.status.code(), Some(1), "status: {:?}", out.status);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unknown --std value: f2024"),
+        "expected the unknown-std diagnostic, got: {}",
+        stderr
+    );
+}

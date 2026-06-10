@@ -26,9 +26,14 @@ The canonical leaf-assertion language lives in source comments inside
 - `! PHASE_TRIANGULATE:`
 - `! IR_CHECK:`
 - `! IR_NOT:`
+- `! FLAGS:` — extra compiler flags for this test, one line, whitespace-
+  split, appended to every compiler invocation the harness makes for the
+  test (run, IR, ASM, REPRO, OPT_EQ, helper objects). Harness-owned flags
+  (`-O*`, `-o`, `-S`, `-c`, `-E`, `--emit-*`, `--target`) are rejected as
+  test-configuration errors. Typical use: `! FLAGS: --std=f2023`.
 
 That source comment language is meant to converge with `bencch`, not drift from
-it.
+it. (`! FLAGS:` is not consumed by bencch yet — see noted_items.md.)
 
 When a stdlib/fpm drill creates scratch Fortran probes, review them during the
 drill wrapup. Keep the probes that capture a real compiler edge by moving them
