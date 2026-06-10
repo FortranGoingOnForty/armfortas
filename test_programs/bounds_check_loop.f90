@@ -11,4 +11,4 @@ program bounds_check_loop
   print *, s
 end program bounds_check_loop
 ! CHECK: 10
-! IR_CHECK: rt_call @__afs_check_bounds
+! IR_NOT: rt_call @__afs_check_bounds

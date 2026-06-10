@@ -14,6 +14,7 @@ use std::time::SystemTime;
 
 use crate::codegen::mir::MachineFunction;
 use crate::codegen::{emit, isel, linearscan, peephole};
+use crate::ir::inst::{InstKind, Module, RuntimeFunc};
 use crate::ir::{lower, printer as ir_printer, verify};
 use crate::lexer::{detect_source_form, tokenize, SourceForm};
 use crate::parser::Parser;
@@ -685,11 +686,7 @@ fn collect_cli_warnings(opts: &mut Options, unknown_warning_flags: &[String]) {
 
     if opts.check_all {
         opts.cli_warnings.push(
-            "-fcheck=all is accepted, but only array bounds checks exist today and those are already always enabled".into(),
-        );
-    } else if opts.check_bounds {
-        opts.cli_warnings.push(
-            "-fcheck=bounds currently has no effect because array bounds checks are already always enabled".into(),
+            "-fcheck=all is accepted, but only array bounds checks are implemented today".into(),
         );
     }
 
@@ -739,6 +736,25 @@ fn collect_cli_warnings(opts: &mut Options, unknown_warning_flags: &[String]) {
         for flag in unknown_warning_flags {
             opts.cli_warnings
                 .push(format!("unrecognized warning option '{}'", flag));
+        }
+    }
+}
+
+fn strip_bounds_check_calls(module: &mut Module) {
+    for func in &mut module.functions {
+        let mut changed = false;
+        for block in &mut func.blocks {
+            let before = block.insts.len();
+            block.insts.retain(|inst| {
+                !matches!(
+                    inst.kind,
+                    InstKind::RuntimeCall(RuntimeFunc::CheckBounds, _)
+                )
+            });
+            changed |= block.insts.len() != before;
+        }
+        if changed {
+            func.rebuild_type_cache();
         }
     }
 }
@@ -1287,6 +1303,9 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         external_descriptor_params,
         external_char_len_star,
     );
+    if !opts.check_bounds {
+        strip_bounds_check_calls(&mut ir_module);
+    }
     let ir_errors = verify::verify_module(&ir_module);
     if !ir_errors.is_empty() {
         if std::env::var_os("AFS_DUMP_BAD_IR").is_some() {
@@ -1375,7 +1394,8 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         }
     }
 
-    let use_naive_regalloc = std::env::var_os("ARMFORTAS_USE_NAIVE_REGALLOC").is_some();
+    let use_naive_regalloc = opts.opt_level == OptLevel::O0
+        || std::env::var_os("ARMFORTAS_USE_NAIVE_REGALLOC").is_some();
 
     // 8. Register allocation.
     for mf in &mut allocated {
@@ -1395,12 +1415,12 @@ pub fn compile(opts: &Options) -> Result<(), String> {
             if opts.opt_level >= OptLevel::O1 {
                 crate::codegen::tailcall::tail_call_opt(mf);
             }
-            // 8.6. Branch relaxation: any B.cond whose target lies
-            // outside the ±1MB conditional-branch window is expanded
-            // to a `B.{!cond} skip; B far_target; skip:` trampoline
-            // so the assembler doesn't choke on the encoding.
-            crate::codegen::relax_branches::relax_branches(mf);
         }
+        // 8.6. Branch relaxation: any B.cond whose target lies
+        // outside the ±1MB conditional-branch window is expanded
+        // to a `B.{!cond} skip; B far_target; skip:` trampoline
+        // so the assembler doesn't choke on the encoding.
+        crate::codegen::relax_branches::relax_branches(mf);
     }
 
     // 9. Emit assembly.

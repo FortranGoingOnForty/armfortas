@@ -563,6 +563,64 @@ fn stream_unformatted_char_write_preserves_exact_bytes() {
 }
 
 #[test]
+fn character_star_parameter_concat_with_char_len_writes_stream_header() {
+    let output_file = unique_path("stream_unformatted_npy_header", "bin");
+    let src = write_program(
+        &format!(
+            "program p\n  implicit none\n  integer :: unit_num\n  character(len=*), parameter :: dict = &\n      \"{{'descr': '<f8', 'fortran_order': True, 'shape': (10, 4, ), }}        \" // char(10)\n  character(len=*), parameter :: header = &\n      char(int(z\"93\")) // \"NUMPY\" // char(1) // char(0) // char(len(dict)) // char(0) // dict\n  real(8) :: payload(10, 4)\n  payload = 0.0d0\n  if (len(dict) /= 70) error stop 1\n  if (len(header) /= 80) error stop 2\n  open(newunit=unit_num, file='{}', status='replace', access='stream', form='unformatted')\n  write(unit_num) header\n  write(unit_num) payload\n  close(unit_num)\n  write(*,'(A,I0)') 'LEN=', len(header)\nend program\n",
+            output_file.display()
+        ),
+        "stream_unformatted_npy_header.f90",
+    );
+    let out = unique_path("stream_unformatted_npy_header", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("stream unformatted NPY header compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "stream unformatted NPY header compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("stream unformatted NPY header run failed");
+    assert!(
+        run.status.success(),
+        "stream unformatted NPY header run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("LEN=80"),
+        "expected fixed header length, got: {}",
+        stdout
+    );
+
+    let bytes = std::fs::read(&output_file).expect("cannot read stream NPY header output");
+    assert_eq!(
+        bytes.len(),
+        400,
+        "expected 80-byte header plus 320-byte payload, got {} bytes",
+        bytes.len()
+    );
+    assert_eq!(
+        &bytes[..10],
+        &[0x93, b'N', b'U', b'M', b'P', b'Y', 1, 0, 70, 0],
+        "unexpected NPY header prefix: {:?}",
+        &bytes[..bytes.len().min(10)]
+    );
+    assert_eq!(bytes[79], b'\n', "header should end with newline");
+
+    let _ = std::fs::remove_file(&output_file);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn stream_unformatted_narrow_integer_io_preserves_raw_widths() {
     let input = unique_path("stream_unformatted_narrow_integer_read", "bin");
     std::fs::write(&input, [0x32u8, 0x00, 0x09, 0xde, 0x34, 0x12, 0xfe, 0xff])
@@ -3097,6 +3155,47 @@ fn allocatable_c_char_array_result_assigns_into_intent_out_dummy() {
     assert!(
         stdout.contains("ok"),
         "unexpected allocatable c_char intent(out) output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn optional_deferred_char_intent_out_deallocates_actual_on_entry() {
+    let dir = unique_dir("optional_deferred_char_intent_out");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "module m\n  implicit none\ncontains\n  subroutine maybe_clear(msg)\n    character(len=:), allocatable, intent(out), optional :: msg\n    if (present(msg)) then\n      if (allocated(msg)) error stop 11\n    end if\n  end subroutine maybe_clear\nend module m\n\nprogram p\n  use m\n  implicit none\n  character(len=:), allocatable :: msg\n  msg = 'seed'\n  call maybe_clear(msg)\n  if (allocated(msg)) error stop 1\n  call maybe_clear()\n  msg = 'again'\n  call maybe_clear(msg)\n  if (allocated(msg)) error stop 2\n  print *, 'ok'\nend program p\n",
+    );
+
+    let exe = dir.join("optional_deferred_char_intent_out.bin");
+    let compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([src.to_str().unwrap(), "-o", exe.to_str().unwrap()])
+        .output()
+        .expect("optional deferred char intent(out) compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "optional deferred char intent(out) should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("optional deferred char intent(out) run failed");
+    assert!(
+        run.status.success(),
+        "optional deferred char intent(out) should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected optional deferred char intent(out) output: {}",
         stdout
     );
 
@@ -9100,7 +9199,6 @@ fn accepted_but_unimplemented_flags_emit_warnings() {
         .args([
             "-c",
             "-g",
-            "-fcheck=bounds",
             "-fmax-stack-var-size=64",
             "-frecursive",
             "-fbackslash",
@@ -9122,7 +9220,6 @@ fn accepted_but_unimplemented_flags_emit_warnings() {
     let stderr = String::from_utf8_lossy(&result.stderr);
     for needle in [
         "-g is accepted, but debug info emission is not yet implemented",
-        "-fcheck=bounds currently has no effect",
         "-fmax-stack-var-size is recognized but not yet implemented",
         "-frecursive is recognized but not yet implemented",
         "-fbackslash is recognized but string escape processing is not yet implemented",
@@ -9170,12 +9267,71 @@ fn fcheck_all_warns_about_partial_support() {
     assert!(result.status.success());
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
-        stderr.contains("-fcheck=all is accepted, but only array bounds checks exist today"),
+        stderr.contains(
+            "-fcheck=all is accepted, but only array bounds checks are implemented today"
+        ),
         "expected -fcheck=all warning: {}",
         stderr
     );
     let _ = std::fs::remove_file(&src);
     let _ = std::fs::remove_file(&out);
+}
+
+#[test]
+fn fcheck_bounds_controls_emitted_bounds_checks() {
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: i, a(4), s\n  a = [1, 2, 3, 4]\n  s = 0\n  do i = 1, 4\n    s = s + a(i)\n  end do\n  print *, s\nend program\n",
+        "f90",
+    );
+    let unchecked_ir = unique_path("bounds_policy_unchecked", "ir");
+    let checked_ir = unique_path("bounds_policy_checked", "ir");
+
+    let unchecked = Command::new(compiler("armfortas"))
+        .args([
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-o",
+            unchecked_ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("unchecked emit-ir spawn failed");
+    assert!(
+        unchecked.status.success(),
+        "unchecked emit-ir should succeed: {}",
+        String::from_utf8_lossy(&unchecked.stderr)
+    );
+    let unchecked_text = fs::read_to_string(&unchecked_ir).expect("read unchecked IR");
+    assert!(
+        !unchecked_text.contains("rt_call @__afs_check_bounds"),
+        "default CLI IR should not retain runtime bounds checks:\n{}",
+        unchecked_text
+    );
+
+    let checked = Command::new(compiler("armfortas"))
+        .args([
+            "-fcheck=bounds",
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-o",
+            checked_ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("checked emit-ir spawn failed");
+    assert!(
+        checked.status.success(),
+        "checked emit-ir should succeed: {}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    let checked_text = fs::read_to_string(&checked_ir).expect("read checked IR");
+    assert!(
+        checked_text.contains("rt_call @__afs_check_bounds"),
+        "-fcheck=bounds CLI IR should retain runtime bounds checks:\n{}",
+        checked_text
+    );
+
+    let _ = std::fs::remove_file(&checked_ir);
+    let _ = std::fs::remove_file(&unchecked_ir);
+    let _ = std::fs::remove_file(&src);
 }
 
 #[test]
@@ -21766,6 +21922,152 @@ end program
 }
 
 #[test]
+fn complex_log_intrinsic_uses_complex_lanes() {
+    let src = write_program(
+        r#"
+program main
+  use iso_fortran_env, only: real64
+  implicit none
+  complex(real64) :: z, got
+  z = cmplx(10.650511_real64, 0.25_real64, kind=real64)
+  got = log(z)
+  if (abs(real(got, kind=real64) - 2.3658832884453433_real64) > 1.0e-12_real64) error stop 1
+  if (abs(aimag(got) - 2.3468742469272174e-2_real64) > 1.0e-12_real64) error stop 2
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("complex_log_lanes", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("complex log compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "complex log program should compile cleanly: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("complex log run failed");
+    assert!(
+        run.status.success(),
+        "complex log runtime failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected complex log smoke output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn complex_assignment_narrows_lanes_by_value() {
+    let src = write_program(
+        r#"
+program main
+  use iso_fortran_env, only: real32, real64
+  implicit none
+  complex(real64) :: wide
+  complex(real32) :: narrow
+  wide = cmplx(1.651133280388921_real64, -1.837875874994789_real64, kind=real64)
+  narrow = wide
+  if (abs(real(narrow) - 1.6511333_real32) > 1.0e-5_real32) error stop 1
+  if (abs(aimag(narrow) + 1.8378758_real32) > 1.0e-5_real32) error stop 2
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("complex_assignment_narrows_lanes", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("complex assignment narrowing compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "complex assignment narrowing should compile cleanly: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("complex assignment narrowing run failed");
+    assert!(
+        run.status.success(),
+        "complex assignment narrowing failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected complex assignment narrowing output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn complex_sin_cos_intrinsics_use_complex_lanes() {
+    let src = write_program(
+        r#"
+program main
+  use iso_fortran_env, only: real64
+  implicit none
+  complex(real64) :: z, s, c
+  z = cmplx(0.25_real64, 0.5_real64, kind=real64)
+  s = sin(z)
+  c = cos(z)
+  if (abs(real(s, kind=real64) - 0.2789791283502615_real64) > 1.0e-12_real64) error stop 1
+  if (abs(aimag(s) - 0.5048957143879950_real64) > 1.0e-12_real64) error stop 2
+  if (abs(real(c, kind=real64) - 1.0925708047319176_real64) > 1.0e-12_real64) error stop 3
+  if (abs(aimag(c) + 0.12892104172809826_real64) > 1.0e-12_real64) error stop 4
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("complex_sin_cos_lanes", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("complex sin/cos compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "complex sin/cos program should compile cleanly: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("complex sin/cos run failed");
+    assert!(
+        run.status.success(),
+        "complex sin/cos runtime failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected complex sin/cos output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn real_intrinsic_preserves_complex_kind_without_explicit_kind_argument() {
     let src = write_program(
         r#"
@@ -29177,6 +29479,128 @@ fn imported_generic_subroutine_resolution_uses_specific_keyword_slots() {
 }
 
 #[test]
+fn imported_generic_resolution_treats_complex_literals_as_scalar_rank() {
+    let dir = unique_dir("imported_complex_literal_rank_generic");
+    let mod_src = write_program_in(
+        &dir,
+        "m.f90",
+        "module m\n  implicit none\n  interface pick\n    module procedure :: pick_scalar\n    module procedure :: pick_array\n  end interface\ncontains\n  integer function pick_scalar(x, center) result(res)\n    complex, intent(in) :: x(:,:)\n    complex, intent(in) :: center\n    res = 1\n  end function\n\n  integer function pick_array(x, center) result(res)\n    complex, intent(in) :: x(:,:)\n    complex, intent(in) :: center(:)\n    res = 2\n  end function\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use m, only : pick\n  implicit none\n  complex :: x(2,2)\n  integer :: v\n  x = (1.0, 2.0)\n  v = pick(x, center=(0.0, 0.0))\n  if (v /= 1) error stop v\n  print *, 'ok'\nend program\n",
+    );
+
+    let mod_obj = dir.join("m.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            mod_src.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("complex generic provider compile failed to spawn");
+    assert!(
+        compile_mod.status.success(),
+        "complex generic provider should compile: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let ir = dir.join("main.ir");
+    let emit_ir = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "--emit-ir",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            main_src.to_str().unwrap(),
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("complex generic consumer emit-ir failed to spawn");
+    assert!(
+        emit_ir.status.success(),
+        "consumer should emit IR through imported .amod: {}",
+        String::from_utf8_lossy(&emit_ir.stderr)
+    );
+    let ir_text = std::fs::read_to_string(&ir).expect("read complex generic consumer IR");
+    assert!(
+        ir_text.contains("pick_scalar"),
+        "complex scalar literal should dispatch to scalar specific:\n{}",
+        ir_text
+    );
+    assert!(
+        !ir_text.contains("pick_array"),
+        "complex scalar literal must not dispatch to array specific:\n{}",
+        ir_text
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_main = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            main_src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("complex generic consumer compile failed to spawn");
+    assert!(
+        compile_main.status.success(),
+        "complex generic consumer should compile: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let out = dir.join("p");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            mod_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("complex generic link failed to spawn");
+    assert!(
+        link.status.success(),
+        "complex generic binary should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("complex generic binary run failed");
+    assert!(
+        run.status.success(),
+        "complex generic binary should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn imported_array_function_actual_to_descriptor_dummy_keeps_nested_descriptor_abi() {
     let dir = unique_dir("imported_array_fn_descriptor_actual");
     let mod_src = write_program_in(
@@ -34913,6 +35337,86 @@ fn elemental_derived_string_array_swap_uses_defined_assignment_and_operator() {
 }
 
 #[test]
+fn block_use_defined_assignment_survives_prior_generic_import_from_amod() {
+    let dir = unique_dir("block_use_assignment_import_order");
+    let string_src = write_program_in(
+        &dir,
+        "string_m.f90",
+        "module string_m\n  implicit none\n  type :: string_type\n    character(len=:), allocatable :: raw\n  end type\n  interface assignment(=)\n    module procedure assign_string_char\n  end interface\ncontains\n  elemental subroutine assign_string_char(lhs, rhs)\n    type(string_type), intent(inout) :: lhs\n    character(len=*), intent(in) :: rhs\n    lhs%raw = rhs\n  end subroutine\nend module\n",
+    );
+    let math_src = write_program_in(
+        &dir,
+        "math_m.f90",
+        "module math_m\n  use string_m, only: string_type\n  implicit none\n  private\n  public :: swap\n  interface swap\n    module procedure swap_stt\n  end interface\ncontains\n  elemental subroutine swap_stt(lhs, rhs)\n    type(string_type), intent(inout) :: lhs, rhs\n    type(string_type) :: temp\n    temp = lhs\n    lhs = rhs\n    rhs = temp\n  end subroutine\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use math_m, only: swap\n  implicit none\n  block\n    use string_m\n    type(string_type) :: x, y\n    x = 'abcde'\n    y = 'fghij'\n    call swap(x, y)\n    if (x%raw /= 'fghij') error stop 1\n    if (y%raw /= 'abcde') error stop 2\n  end block\n  print *, 'ok'\nend program\n",
+    );
+
+    let string_obj = dir.join("string_m.o");
+    let math_obj = dir.join("math_m.o");
+    let main_obj = dir.join("main.o");
+    for (src, obj) in [
+        (&string_src, &string_obj),
+        (&math_src, &math_obj),
+        (&main_src, &main_obj),
+    ] {
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                "-c",
+                src.to_str().unwrap(),
+                "-I",
+                dir.to_str().unwrap(),
+                "-J",
+                dir.to_str().unwrap(),
+                "-o",
+                obj.to_str().unwrap(),
+            ])
+            .output()
+            .expect("block-use assignment compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "block-use assignment compile failed for {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let exe = dir.join("block_use_assignment_import_order.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            string_obj.to_str().unwrap(),
+            math_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("block-use assignment link failed to spawn");
+    assert!(
+        link.status.success(),
+        "block-use assignment link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = run_binary_with_timeout(&exe, std::time::Duration::from_secs(5))
+        .expect("block-use assignment run timed out");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "block-use assignment run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn stdlib_style_string_array_swap_routes_nested_defined_gt() {
     // stdlib_string_type's `operator(==)` is written in terms of its
     // user-defined `operator(>)` overloads. Lowering must resolve those nested
@@ -35767,6 +36271,36 @@ fn target_flag_x86_64_frontend_modes_still_work() {
 
     let _ = fs::remove_file(&src);
     let _ = fs::remove_file(&ir);
+}
+
+#[test]
+fn shadowed_intrinsic_fallback_lowers_real_actual_not_generic_probe() {
+    let src = write_program(
+        "module special_like\n  implicit none\n  private\n  public :: real_log_gamma\n  interface log_gamma\n    module procedure l_gamma_iint32\n  end interface\ncontains\n  elemental real(8) function l_gamma_iint32(z) result(res)\n    integer, intent(in) :: z\n    res = real(z, 8) + 0.25_8\n  end function\n  real(4) function real_log_gamma(x) result(res)\n    real(4), intent(in) :: x\n    res = log_gamma(x)\n  end function\nend module\nprogram p\n  use special_like, only: real_log_gamma\n  implicit none\n  real(4) :: got\n  got = real_log_gamma(2.5_4)\n  if (abs(got - 0.28468287_4) > 1.0e-5_4) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("shadowed_intrinsic_real_actual", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("shadowed intrinsic fallback compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "shadowed intrinsic fallback compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("shadowed intrinsic fallback run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "shadowed intrinsic fallback run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
 }
 
 // ---- Sprint l00: --std=f2023 wiring ----

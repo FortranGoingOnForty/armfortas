@@ -28,6 +28,45 @@ fn capture_run_stdout(request: CaptureRequest) -> String {
 }
 
 #[test]
+fn o0_scalar_minmax_binary_fixture_runs_correctly() {
+    let source = fixture("do_loop_vectorize_minmax_binary.f90");
+
+    let stdout = capture_run_stdout(CaptureRequest {
+        input: source,
+        requested: BTreeSet::from([Stage::Run]),
+        opt_level: OptLevel::O0,
+    });
+    let trimmed: Vec<&str> = stdout
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(trimmed.len(), 6, "expected six output lines:\n{}", stdout);
+    assert_eq!(trimmed[0], "32 17 17 32", "i32 max wrong: {:?}", trimmed[0]);
+    assert_eq!(trimmed[1], "1 16 16 1", "i32 min wrong: {:?}", trimmed[1]);
+    assert!(
+        trimmed[2].contains("1.7000000E1"),
+        "f32 max center lane wrong: {:?}",
+        trimmed[2]
+    );
+    assert!(
+        trimmed[3].contains("1.6000000E1"),
+        "f32 min center lane wrong: {:?}",
+        trimmed[3]
+    );
+    assert!(
+        trimmed[4].contains("1.700000000000000E1"),
+        "f64 max center lane wrong: {:?}",
+        trimmed[4]
+    );
+    assert!(
+        trimmed[5].contains("1.600000000000000E1"),
+        "f64 min center lane wrong: {:?}",
+        trimmed[5]
+    );
+}
+
+#[test]
 fn o3_vectorizes_elementwise_minmax_binary() {
     let source = fixture("do_loop_vectorize_minmax_binary.f90");
 

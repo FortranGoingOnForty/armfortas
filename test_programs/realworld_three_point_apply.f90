@@ -1,7 +1,7 @@
 ! stdlib iterative-solver-inspired three-point apply kernel.
 ! CHECK: 14 28 49 973
 ! IR_CHECK: alloca [i32 x 3]
-! IR_CHECK: rt_call @__afs_check_bounds
+! IR_NOT: rt_call @__afs_check_bounds
 ! REPRO_CHECK: asm
 ! REPRO_CHECK: obj
 ! REPRO_CHECK: run

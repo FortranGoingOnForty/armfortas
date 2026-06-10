@@ -471,19 +471,21 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
         }
     }
     for mf in &mut allocated {
-        let liveness = crate::codegen::liveness::compute_liveness(mf);
-        let result = linearscan::linear_scan(mf);
-        linearscan::apply_allocation(mf, &result, &liveness);
-        // Post-allocation passes — must mirror the driver pipeline so
-        // captured asm matches the binary the user actually ships.
-        // parallelize_call_arg_moves in particular fixes a w0/w1
-        // clobber pattern visible at high register pressure.
-        linearscan::parallelize_entry_arg_moves(mf);
-        linearscan::parallelize_call_arg_moves(mf);
-        linearscan::insert_split_bridges(mf, &result.split_records);
-        linearscan::insert_callee_saves(mf, &result.callee_saved_used);
-        linearscan::coalesce_moves(mf);
-        if request.opt_level >= OptLevel::O1 {
+        if request.opt_level == OptLevel::O0 {
+            crate::codegen::regalloc::regalloc_naive(mf);
+        } else {
+            let liveness = crate::codegen::liveness::compute_liveness(mf);
+            let result = linearscan::linear_scan(mf);
+            linearscan::apply_allocation(mf, &result, &liveness);
+            // Post-allocation passes — must mirror the driver pipeline so
+            // captured asm matches the binary the user actually ships.
+            // parallelize_call_arg_moves in particular fixes a w0/w1
+            // clobber pattern visible at high register pressure.
+            linearscan::parallelize_entry_arg_moves(mf);
+            linearscan::parallelize_call_arg_moves(mf);
+            linearscan::insert_split_bridges(mf, &result.split_records);
+            linearscan::insert_callee_saves(mf, &result.callee_saved_used);
+            linearscan::coalesce_moves(mf);
             crate::codegen::tailcall::tail_call_opt(mf);
         }
         crate::codegen::relax_branches::relax_branches(mf);
