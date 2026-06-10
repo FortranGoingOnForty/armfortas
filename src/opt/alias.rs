@@ -44,12 +44,17 @@ pub enum AliasResult {
 /// are considered call-reachable aliases regardless of offset.
 /// Distinct allocations remain NoAlias by Fortran's strong
 /// aliasing guarantee.
-pub fn may_reach_through_call_arg(func: &Function, entry_ptr: ValueId, call_arg: ValueId) -> bool {
+pub fn may_reach_through_call_arg(
+    func: &Function,
+    entry_ptr: ValueId,
+    call_arg: ValueId,
+    layout: crate::target::TargetLayout,
+) -> bool {
     if entry_ptr == call_arg {
         return true;
     }
-    let base_entry = trace_base(func, entry_ptr);
-    let base_arg = trace_base(func, call_arg);
+    let base_entry = trace_base(func, entry_ptr, layout);
+    let base_arg = trace_base(func, call_arg, layout);
     match (&base_entry, &base_arg) {
         (PtrBase::Alloca(a), PtrBase::Alloca(b)) => a == b,
         (PtrBase::Global(a), PtrBase::Global(b)) => a == b,
@@ -69,15 +74,20 @@ pub fn may_reach_through_call_arg(func: &Function, entry_ptr: ValueId, call_arg:
 ///
 /// Both `a` and `b` should be pointer-typed values (results of Alloca,
 /// GlobalAddr, GetElementPtr, or function parameters).
-pub fn query(func: &Function, a: ValueId, b: ValueId) -> AliasResult {
+pub fn query(
+    func: &Function,
+    a: ValueId,
+    b: ValueId,
+    layout: crate::target::TargetLayout,
+) -> AliasResult {
     // Same value → must alias.
     if a == b {
         return AliasResult::MustAlias;
     }
 
     // Trace both pointers to their base + offset.
-    let base_a = trace_base(func, a);
-    let base_b = trace_base(func, b);
+    let base_a = trace_base(func, a, layout);
+    let base_b = trace_base(func, b, layout);
 
     // Different base pointers → no alias (Fortran guarantee).
     match (&base_a, &base_b) {
@@ -105,8 +115,8 @@ pub fn query(func: &Function, a: ValueId, b: ValueId) -> AliasResult {
 
     // Same base, different constant offsets → no alias.
     if base_a.base_id() == base_b.base_id() {
-        let off_a = trace_offset(func, a);
-        let off_b = trace_offset(func, b);
+        let off_a = trace_offset(func, a, layout);
+        let off_b = trace_offset(func, b, layout);
         if let (Some(oa), Some(ob)) = (off_a, off_b) {
             if oa != ob {
                 if pointer_points_to_aggregate(func, a) || pointer_points_to_aggregate(func, b) {
@@ -148,7 +158,11 @@ impl PtrBase {
 }
 
 /// Trace a pointer value back to its base allocation.
-fn trace_base(func: &Function, ptr: ValueId) -> PtrBase {
+fn trace_base(
+    func: &Function,
+    ptr: ValueId,
+    layout: crate::target::TargetLayout,
+) -> PtrBase {
     // Check if this is a function parameter (pointer arg).
     for param in &func.params {
         if param.id == ptr {
@@ -164,8 +178,8 @@ fn trace_base(func: &Function, ptr: ValueId) -> PtrBase {
     match &inst.kind {
         InstKind::Alloca(_) => PtrBase::Alloca(ptr),
         InstKind::GlobalAddr(name) => PtrBase::Global(name.clone()),
-        InstKind::GetElementPtr(base, _) => trace_base(func, *base),
-        InstKind::Load(addr) => trace_param_wrapper(func, *addr)
+        InstKind::GetElementPtr(base, _) => trace_base(func, *base, layout),
+        InstKind::Load(addr) => trace_param_wrapper(func, *addr, layout)
             .map(PtrBase::Param)
             .unwrap_or(PtrBase::Unknown),
         _ => PtrBase::Unknown,
@@ -173,22 +187,26 @@ fn trace_base(func: &Function, ptr: ValueId) -> PtrBase {
 }
 
 /// Trace a pointer to its constant byte offset from the base, if possible.
-fn trace_offset(func: &Function, ptr: ValueId) -> Option<i64> {
+fn trace_offset(
+    func: &Function,
+    ptr: ValueId,
+    layout: crate::target::TargetLayout,
+) -> Option<i64> {
     if func.params.iter().any(|param| param.id == ptr) {
         return Some(0);
     }
     let inst = find_inst(func, ptr)?;
     match &inst.kind {
         InstKind::Alloca(_) | InstKind::GlobalAddr(_) => Some(0),
-        InstKind::Load(addr) => trace_param_wrapper(func, *addr).map(|_| 0),
+        InstKind::Load(addr) => trace_param_wrapper(func, *addr, layout).map(|_| 0),
         InstKind::GetElementPtr(base, indices) => {
-            let base_offset = trace_offset(func, *base)?;
+            let base_offset = trace_offset(func, *base, layout)?;
             if indices.len() != 1 {
                 return None;
             }
             let idx = resolve_const_int(func, indices[0])?;
             let step = match &inst.ty {
-                IrType::Ptr(inner) => inner.size_bytes() as i64,
+                IrType::Ptr(inner) => inner.size_bytes(&layout) as i64,
                 _ => return None,
             };
             Some(base_offset + idx * step)
@@ -205,11 +223,15 @@ fn param_is_fortran_noalias(func: &Function, param_id: ValueId) -> bool {
         .unwrap_or(false)
 }
 
-fn trace_param_wrapper(func: &Function, addr: ValueId) -> Option<ValueId> {
+fn trace_param_wrapper(
+    func: &Function,
+    addr: ValueId,
+    layout: crate::target::TargetLayout,
+) -> Option<ValueId> {
     let slot = match find_inst(func, addr).map(|inst| &inst.kind) {
         Some(InstKind::Alloca(_)) => addr,
-        Some(InstKind::GetElementPtr(base, _)) if trace_offset(func, addr)? == 0 => {
-            match trace_base(func, *base) {
+        Some(InstKind::GetElementPtr(base, _)) if trace_offset(func, addr, layout)? == 0 => {
+            match trace_base(func, *base, layout) {
                 PtrBase::Alloca(slot) => slot,
                 _ => return None,
             }
@@ -298,7 +320,7 @@ mod tests {
         });
         f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
 
-        assert_eq!(query(&f, a, b), AliasResult::NoAlias);
+        assert_eq!(query(&f, a, b, crate::target::TargetLayout::LP64), AliasResult::NoAlias);
     }
 
     #[test]
@@ -314,7 +336,7 @@ mod tests {
         });
         f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
 
-        assert_eq!(query(&f, a, a), AliasResult::MustAlias);
+        assert_eq!(query(&f, a, a, crate::target::TargetLayout::LP64), AliasResult::MustAlias);
     }
 
     #[test]
@@ -359,7 +381,7 @@ mod tests {
 
         f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
 
-        assert_eq!(query(&f, gep_i32, gep_i64), AliasResult::NoAlias);
+        assert_eq!(query(&f, gep_i32, gep_i64, crate::target::TargetLayout::LP64), AliasResult::NoAlias);
     }
 
     #[test]
@@ -409,7 +431,7 @@ mod tests {
         });
         f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
 
-        assert_eq!(query(&f, gep0, gep1), AliasResult::NoAlias);
+        assert_eq!(query(&f, gep0, gep1, crate::target::TargetLayout::LP64), AliasResult::NoAlias);
     }
 
     #[test]
@@ -452,7 +474,7 @@ mod tests {
         });
         f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
 
-        assert_eq!(query(&f, base, gep1), AliasResult::MayAlias);
+        assert_eq!(query(&f, base, gep1, crate::target::TargetLayout::LP64), AliasResult::MayAlias);
     }
 
     #[test]
@@ -476,7 +498,7 @@ mod tests {
         });
         f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
 
-        assert_eq!(query(&f, ga, gb), AliasResult::NoAlias);
+        assert_eq!(query(&f, ga, gb, crate::target::TargetLayout::LP64), AliasResult::NoAlias);
     }
 
     #[test]
@@ -498,7 +520,7 @@ mod tests {
         let mut f = Function::new("test".into(), params, IrType::Void);
         f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
 
-        assert_eq!(query(&f, ValueId(0), ValueId(1)), AliasResult::NoAlias);
+        assert_eq!(query(&f, ValueId(0), ValueId(1), crate::target::TargetLayout::LP64), AliasResult::NoAlias);
     }
 
     #[test]
@@ -575,6 +597,6 @@ mod tests {
         });
         f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
 
-        assert_eq!(query(&f, load_a, load_b), AliasResult::NoAlias);
+        assert_eq!(query(&f, load_a, load_b, crate::target::TargetLayout::LP64), AliasResult::NoAlias);
     }
 }

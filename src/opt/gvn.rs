@@ -807,6 +807,7 @@ mod tests {
             std::collections::HashMap::new(),
             std::collections::HashMap::new(),
             std::collections::HashMap::new(),
+            crate::target::TargetLayout::LP64,
         )
         .0
     }
@@ -845,7 +846,7 @@ mod tests {
         // r2 = a + (b + c)
         // After GVN, r2 should be replaced by r1 (or vice versa) — the
         // pass should detect at least one redundancy.
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("test".into(), vec![], IrType::Int(IntWidth::I32));
         let entry = f.entry;
         let i32t = IrType::Int(IntWidth::I32);
@@ -888,7 +889,7 @@ mod tests {
 
     #[test]
     fn gvn_no_op_on_empty() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("test".into(), vec![], IrType::Void);
         f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
         m.add_function(f);
@@ -898,7 +899,7 @@ mod tests {
 
     #[test]
     fn gvn_handles_max_i128_constant_keys() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("test".into(), vec![], IrType::Int(IntWidth::I128));
         let entry = f.entry;
         let wide = push_inst(
@@ -918,7 +919,7 @@ mod tests {
 
     #[test]
     fn gvn_reuses_pure_by_value_calls() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
 
         let param = Param {
             name: "x".into(),
@@ -988,7 +989,7 @@ mod tests {
 
     #[test]
     fn gvn_reuses_pure_calls_after_operand_canonicalization() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
 
         let param = Param {
             name: "x".into(),
@@ -1112,7 +1113,7 @@ mod tests {
 
     #[test]
     fn wrapper_alloca_values_accept_scalar_by_ref_call_pattern() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
 
         let param = Param {
             name: "n".into(),
@@ -1187,7 +1188,7 @@ mod tests {
 
     #[test]
     fn gvn_reuses_pure_calls_through_scalar_wrapper_allocas() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
 
         let param = Param {
             name: "n".into(),
@@ -1388,7 +1389,7 @@ mod tests {
 
     #[test]
     fn gvn_reuses_pure_calls_for_recursive_factorial_shape() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
 
         let param = Param {
             name: "n".into(),
@@ -1644,7 +1645,7 @@ mod tests {
 
     #[test]
     fn gvn_reuses_pure_calls_when_callee_follows_caller() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
 
         let mut caller = Function::new("main".into(), vec![], IrType::Int(IntWidth::I32));
         let entry = caller.entry;
@@ -1794,7 +1795,7 @@ mod tests {
 
     #[test]
     fn gvn_does_not_reuse_pure_calls_with_pointer_args() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
 
         let param = Param {
             name: "p".into(),

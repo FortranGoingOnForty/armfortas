@@ -1293,6 +1293,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         external_char_len_star.extend(crate::sema::amod::extract_char_len_star_params(ext_mod));
     }
 
+    let target_layout = crate::target::TargetLayout::of(&opts.target);
     let (mut ir_module, module_globals) = lower::lower_file(
         &units,
         &st,
@@ -1301,6 +1302,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         external_optional_params,
         external_descriptor_params,
         external_char_len_star,
+        target_layout,
     );
     if !opts.check_bounds {
         strip_bounds_check_calls(&mut ir_module);
@@ -1437,7 +1439,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     // into a __DATA,__data section. Must come before _main so the
     // labels are defined when functions reference them.
     if !ir_module.globals.is_empty() {
-        asm_text.push_str(&emit::emit_globals(&ir_module.globals));
+        asm_text.push_str(&emit::emit_globals(&ir_module.globals, &ir_module.layout));
         asm_text.push('\n');
     }
 

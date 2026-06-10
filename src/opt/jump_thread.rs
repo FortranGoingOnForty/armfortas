@@ -346,7 +346,7 @@ mod tests {
     /// Expect: pred1 → A, pred2 → B, join becomes unreachable.
     #[test]
     fn threads_two_const_preds_through_join() {
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Void);
         let bb_pre1 = f.create_block("pre1");
         let bb_pre2 = f.create_block("pre2");
@@ -436,7 +436,7 @@ mod tests {
     /// not thread.
     #[test]
     fn does_not_thread_non_const_pred() {
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let params = vec![Param {
             name: "x".into(),
             ty: IrType::Bool,
@@ -485,7 +485,7 @@ mod tests {
     /// — threading would skip the side-effecting work.
     #[test]
     fn does_not_thread_when_join_has_inst() {
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Void);
         let bb_join = f.create_block("join");
         let bb_a = f.create_block("a");
@@ -532,7 +532,7 @@ mod tests {
     /// forwarded value no longer dominating its use.
     #[test]
     fn does_not_thread_when_join_forwards_local_const() {
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Void);
         let bb_join = f.create_block("join");
         let bb_after = f.create_block("after");
@@ -582,7 +582,7 @@ mod tests {
     /// merge must not be bypassed unless those later uses are also rewritten.
     #[test]
     fn does_not_thread_when_join_param_is_used_later() {
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Bool);
         let bb_join = f.create_block("join");
         let bb_after = f.create_block("after");

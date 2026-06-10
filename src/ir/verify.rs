@@ -678,10 +678,10 @@ mod tests {
 
     #[test]
     fn valid_simple_function() {
-        let mut module = Module::new("test".into());
+        let mut module = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut func = Function::new("main".into(), vec![], IrType::Void);
         {
-            let mut b = FuncBuilder::new(&mut func);
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
             let x = b.const_i32(10);
             let y = b.const_i32(20);
             let _z = b.iadd(x, y);
@@ -704,7 +704,7 @@ mod tests {
     fn undefined_value() {
         let mut func = Function::new("test".into(), vec![], IrType::Void);
         {
-            let mut b = FuncBuilder::new(&mut func);
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
             // Use a ValueId that doesn't exist.
             let fake = ValueId(999);
             let real = b.const_i32(1);
@@ -747,7 +747,7 @@ mod tests {
     fn branch_arg_mismatch() {
         let mut func = Function::new("test".into(), vec![], IrType::Void);
         {
-            let mut b = FuncBuilder::new(&mut func);
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
             let target = b.create_block("target");
             b.add_block_param(target, IrType::Int(IntWidth::I32));
             // Branch to target with 0 args — but target expects 1.
@@ -766,7 +766,7 @@ mod tests {
     fn integer_op_on_float_errors() {
         let mut func = Function::new("test".into(), vec![], IrType::Void);
         {
-            let mut b = FuncBuilder::new(&mut func);
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
             let a = b.const_f32(1.0);
             let c = b.const_f32(2.0);
             // Force an iadd on float values (bypass builder type checking).
@@ -784,7 +784,7 @@ mod tests {
         // and would silently truncate.
         let mut func = Function::new("test".into(), vec![], IrType::Void);
         {
-            let mut b = FuncBuilder::new(&mut func);
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
             let val = b.const_i64(123);
             let addr = b.alloca(IrType::Int(IntWidth::I32));
             b.store(val, addr);
@@ -806,7 +806,7 @@ mod tests {
         // line of defense before mismatched widths reach isel.
         let mut func = Function::new("test".into(), vec![], IrType::Void);
         {
-            let mut b = FuncBuilder::new(&mut func);
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
             let a = b.const_i32(1);
             let c = b.const_i64(2);
             b.emit_bogus_iadd(a, c);
@@ -869,7 +869,7 @@ mod tests {
     fn valid_branch_with_args() {
         let mut func = Function::new("test".into(), vec![], IrType::Void);
         {
-            let mut b = FuncBuilder::new(&mut func);
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
             let target = b.create_block("target");
             let _p = b.add_block_param(target, IrType::Int(IntWidth::I32));
             let val = b.const_i32(42);
@@ -886,7 +886,7 @@ mod tests {
     fn valid_cond_branch() {
         let mut func = Function::new("test".into(), vec![], IrType::Void);
         {
-            let mut b = FuncBuilder::new(&mut func);
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
             let cond = b.const_bool(true);
             let bb_t = b.create_block("then");
             let bb_f = b.create_block("else");
@@ -905,7 +905,7 @@ mod tests {
     fn store_to_non_pointer_errors() {
         let mut func = Function::new("test".into(), vec![], IrType::Void);
         {
-            let mut b = FuncBuilder::new(&mut func);
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
             let val = b.const_i32(42);
             let not_ptr = b.const_i32(0); // not a pointer
                                           // Force a store to non-pointer.
@@ -921,7 +921,7 @@ mod tests {
         // Value defined in block B used in block A that B doesn't dominate.
         let mut func = Function::new("test".into(), vec![], IrType::Void);
         {
-            let mut b = FuncBuilder::new(&mut func);
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
             let bb_a = b.create_block("block_a");
             let bb_b = b.create_block("block_b");
 
@@ -1004,7 +1004,7 @@ mod tests {
         // A valid loop: entry → header → body → header. Block params carry the value.
         let mut func = Function::new("test".into(), vec![], IrType::Void);
         {
-            let mut b = FuncBuilder::new(&mut func);
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
             let header = b.create_block("header");
             let i_param = b.add_block_param(header, IrType::Int(IntWidth::I32));
             let init = b.const_i32(0);
@@ -1107,6 +1107,6 @@ mod tests {
             lanes: 2,
             elem: Box::new(IrType::Float(FloatWidth::F64)),
         };
-        assert_eq!(ty.size_bytes(), 16);
+        assert_eq!(ty.size_bytes(&crate::target::TargetLayout::LP64), 16);
     }
 }

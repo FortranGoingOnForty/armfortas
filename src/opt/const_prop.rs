@@ -204,7 +204,7 @@ mod tests {
 
     #[test]
     fn condbranch_with_true_const_folds_to_branch_true() {
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Void);
 
         // Build: entry { cond=const(true); cond_branch cond, then, else }
@@ -239,7 +239,7 @@ mod tests {
 
     #[test]
     fn condbranch_with_false_const_folds_to_branch_false() {
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Void);
         let bb_t = f.create_block("then");
         let bb_e = f.create_block("else");
@@ -270,7 +270,7 @@ mod tests {
 
     #[test]
     fn switch_with_const_selector_picks_case() {
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Void);
         let case_a = f.create_block("a");
         let case_b = f.create_block("b");
@@ -301,7 +301,7 @@ mod tests {
 
     #[test]
     fn switch_with_unmatched_const_selector_picks_default() {
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Void);
         let case_a = f.create_block("a");
         let default = f.create_block("default");
@@ -333,7 +333,7 @@ mod tests {
         // entry { cond=const(true); cond_branch -> then or dead }
         // then { ret }
         // dead { ret }   // should be removed
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Void);
         let bb_t = f.create_block("then");
         let bb_d = f.create_block("dead");
@@ -365,7 +365,7 @@ mod tests {
     #[test]
     fn condbranch_with_unknown_cond_left_alone() {
         // Operand is not a constant — must not transform.
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let params = vec![Param {
             name: "p".into(),
             ty: IrType::Bool,

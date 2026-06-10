@@ -734,7 +734,7 @@ mod tests {
         // entry: cond = const(true); cond_branch cond, then, else
         // then:  ret
         // else:  ret
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Void);
         let bb_t = f.create_block("then");
         let bb_e = f.create_block("else");
@@ -776,7 +776,7 @@ mod tests {
         // Plain const_prop can't fold this — `p` has two distinct
         // incoming arg values, and const_prop doesn't know `b` is
         // unreachable. SCCP does.
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
 
         let bb_a = f.create_block("a");
@@ -857,7 +857,7 @@ mod tests {
         // merge: ret param
         //
         // Both arms reachable, two distinct constants → param stays.
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let params = vec![Param {
             name: "c".into(),
             ty: IrType::Bool,
@@ -915,7 +915,7 @@ mod tests {
 
     #[test]
     fn unknown_cond_left_alone() {
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let params = vec![Param {
             name: "p".into(),
             ty: IrType::Bool,

@@ -2456,7 +2456,7 @@ mod tests {
     /// The latch stores a constant to a fixed alloca (simulating a(i) = 42
     /// where the GEP is not yet computed — we just store to a fixed addr).
     fn build_counted_loop_with_prefix(lo: i64, hi: i64, prefix: &str) -> Module {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("loop_test".into(), vec![], IrType::Void);
 
         // Allocate block IDs.
@@ -2566,7 +2566,7 @@ mod tests {
     /// (1 store keeps the multi-store regalloc-pressure heuristic
     /// happy) and increments by 1 in the latch.
     fn build_runtime_counted_loop(lo: i64) -> Module {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         // Reserve %0 for the n_param so the function params line up.
         let n_param = ValueId(0);
         let params = vec![Param {
@@ -2662,7 +2662,7 @@ mod tests {
     /// br to latch) + latch (with iadd + br header). Trip is statically
     /// known (`hi`); body_block stores `42` to a local alloca.
     fn build_3block_counted_loop(lo: i64, hi: i64) -> Module {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("loop_3block".into(), vec![], IrType::Void);
 
         let header_id = f.create_block("do_check");
@@ -2952,7 +2952,7 @@ mod tests {
         // reads `acc_init`, iter 1 reads iter 0's `new_acc`, etc. The
         // final branch to `exit` passes the last iteration's
         // accumulator value to the exit block param.
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("reduce".into(), vec![], IrType::Void);
         let header_id = f.create_block("header");
         let latch_id = f.create_block("latch");
@@ -3103,7 +3103,7 @@ mod tests {
 
     #[test]
     fn does_not_unroll_load_bearing_loop() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("load_loop".into(), vec![], IrType::Void);
 
         let header_id = f.create_block("header");
@@ -3267,7 +3267,7 @@ mod tests {
         // Build: inner loop (entry → header(%iv) → latch → header, | → exit)
         //        plus an outer_latch block that passes %iv to outer_dest.
         // outer_latch is not part of the inner nl.body but references %iv.
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("escape_test".into(), vec![], IrType::Void);
 
         let header_id = f.create_block("header");

@@ -435,7 +435,7 @@ mod tests {
     }
 
     fn make_fn() -> (Module, Function) {
-        let m = Module::new("t".into());
+        let m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let f = Function::new("f".into(), vec![], IrType::Void);
         (m, f)
     }
@@ -727,7 +727,7 @@ mod tests {
     #[test]
     fn no_rewrite_when_no_constant_operand() {
         // imul of two non-const values: should not change.
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let params = vec![
             Param {
                 name: "a".into(),

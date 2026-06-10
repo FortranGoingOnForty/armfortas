@@ -189,6 +189,19 @@ pub struct TargetLayout {
 const PROC_PTR_CLOSURE_SLOTS: usize = 8;
 
 impl TargetLayout {
+    /// The LP64 layout every supported target shares (the coincidence
+    /// asserted by `layouts_coincide_across_supported_targets`). For
+    /// unit tests building IR modules directly; production code derives
+    /// layout from the selected target via `of()`.
+    pub const LP64: TargetLayout = TargetLayout {
+        ptr_bytes: 8,
+        ptr_align: 8,
+        bool_bytes: 1,
+        i128_align: 16,
+        vector_bytes: 16,
+        max_scalar_align: 16,
+    };
+
     pub fn of(spec: &TargetSpec) -> TargetLayout {
         match spec.arch {
             // Identical on purpose; see the struct doc.

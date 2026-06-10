@@ -3228,7 +3228,7 @@ pub(crate) fn lower_expr_full(
             let buf = b.alloca(arr_ty);
             if derived_type.is_some() {
                 let zero32 = b.const_i32(0);
-                let total_bytes = b.const_i64(ir_scalar_byte_size(&elem_ty) * n.max(1) as i64);
+                let total_bytes = b.const_i64(ir_scalar_byte_size(&elem_ty, b.layout) * n.max(1) as i64);
                 b.call(
                     FuncRef::External("memset".into()),
                     vec![buf, zero32, total_bytes],

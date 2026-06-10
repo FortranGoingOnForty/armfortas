@@ -630,7 +630,7 @@ mod tests {
     }
 
     fn make_module_with(insts: Vec<(InstKind, IrType)>) -> (Module, Vec<ValueId>) {
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Void);
         let entry = f.entry;
         let mut ids = Vec::new();

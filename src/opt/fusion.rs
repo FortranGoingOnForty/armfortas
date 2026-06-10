@@ -442,7 +442,7 @@ mod tests {
 
     #[test]
     fn fusion_no_op_on_empty() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("test".into(), vec![], IrType::Void);
         f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
         m.add_function(f);

@@ -278,7 +278,7 @@ mod tests {
 
     #[test]
     fn trims_unused_param_and_call_arg_for_internal_only_function() {
-        let mut module = Module::new("t".into());
+        let mut module = Module::new("t".into(), crate::target::TargetLayout::LP64);
 
         let params = vec![
             Param {
@@ -332,7 +332,7 @@ mod tests {
 
     #[test]
     fn preserves_abi_for_non_internal_function() {
-        let mut module = Module::new("t".into());
+        let mut module = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let params = vec![
             Param {
                 name: "x".into(),
@@ -358,7 +358,7 @@ mod tests {
 
     #[test]
     fn preserves_non_internal_call_args_when_trimming_other_function() {
-        let mut module = Module::new("t".into());
+        let mut module = Module::new("t".into(), crate::target::TargetLayout::LP64);
 
         let exported_params = vec![
             Param {

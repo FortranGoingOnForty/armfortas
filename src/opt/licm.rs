@@ -77,6 +77,7 @@ fn is_non_memory_hoist_candidate(kind: &InstKind) -> bool {
 }
 
 fn load_is_loop_invariant(
+    layout: crate::target::TargetLayout,
     func: &Function,
     lp: &NaturalLoop,
     load_id: ValueId,
@@ -92,7 +93,7 @@ fn load_is_loop_invariant(
             }
             match &inst.kind {
                 InstKind::Store(_, ptr)
-                    if !matches!(alias::query(func, *ptr, load_ptr), AliasResult::NoAlias) =>
+                    if !matches!(alias::query(func, *ptr, load_ptr, layout), AliasResult::NoAlias) =>
                 {
                     return false;
                 }
@@ -126,7 +127,7 @@ struct Hoist {
 }
 
 /// Run LICM on one function. Returns true if anything was hoisted.
-fn licm_function(func: &mut Function) -> bool {
+fn licm_function(func: &mut Function, layout: crate::target::TargetLayout) -> bool {
     // Audit N-6 (originally load-bearing, now defensive): drop
     // unreachable blocks before running loop analysis. Earlier
     // versions of `compute_dominators` assigned "all blocks dominate
@@ -193,7 +194,7 @@ fn licm_function(func: &mut Function) -> bool {
                         continue;
                     }
                     let hoistable = match &inst.kind {
-                        InstKind::Load(ptr) => load_is_loop_invariant(func, lp, inst.id, *ptr),
+                        InstKind::Load(ptr) => load_is_loop_invariant(layout, func, lp, inst.id, *ptr),
                         _ => is_non_memory_hoist_candidate(&inst.kind),
                     };
                     if !hoistable {
@@ -265,7 +266,7 @@ impl Pass for Licm {
     fn run(&self, module: &mut Module) -> bool {
         let mut changed = false;
         for func in &mut module.functions {
-            if licm_function(func) {
+            if licm_function(func, module.layout) {
                 changed = true;
             }
         }
@@ -321,7 +322,7 @@ mod tests {
     ///     ret
     /// ```
     fn build_loop_module() -> (Module, BlockId, BlockId, BlockId) {
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Void);
         // Build entry first.
         let limit = f.next_value_id();
@@ -458,7 +459,7 @@ mod tests {
     #[test]
     fn no_loop_no_change() {
         // Straight-line function with no loop.
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Void);
         let _x = f.next_value_id();
         let entry = f.entry;
@@ -484,7 +485,7 @@ mod tests {
         // Store(i_param, addr) in the header.  The alias oracle sees
         // the same pointer for both, so LICM must leave the load in
         // place.
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Void);
 
         let addr = f.next_value_id();
@@ -570,7 +571,7 @@ mod tests {
         // into the preheader.  This is the mirror image of
         // does_not_hoist_load_with_aliasing_store_in_loop: remove
         // the store from the header and assert the load moved out.
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Void);
 
         let addr = f.next_value_id();
@@ -688,7 +689,7 @@ mod tests {
                 fortran_noalias: true,
             },
         ];
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), params, IrType::Void);
 
         let init = push(
@@ -789,7 +790,7 @@ mod tests {
     /// LICM, not just the trivial "constant in header" case.
     #[test]
     fn hoists_invariant_imul_with_operands_from_entry() {
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Void);
 
         // Entry: build two const operands a=3, b=4 and an init value 0.

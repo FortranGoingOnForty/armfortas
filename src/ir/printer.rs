@@ -461,10 +461,10 @@ mod tests {
 
     #[test]
     fn print_simple_function() {
-        let mut module = Module::new("test".into());
+        let mut module = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut func = Function::new("main".into(), vec![], IrType::Void);
         {
-            let mut b = FuncBuilder::new(&mut func);
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
             let x = b.const_i32(10);
             let y = b.const_i32(20);
             let z = b.iadd(x, y);
@@ -487,7 +487,7 @@ mod tests {
     fn print_branch() {
         let mut func = Function::new("test".into(), vec![], IrType::Void);
         {
-            let mut b = FuncBuilder::new(&mut func);
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
             let cond = b.const_bool(true);
             let bb_true = b.create_block("then");
             let bb_false = b.create_block("else");
@@ -506,7 +506,7 @@ mod tests {
     fn print_alloca_load_store() {
         let mut func = Function::new("test".into(), vec![], IrType::Void);
         {
-            let mut b = FuncBuilder::new(&mut func);
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
             let addr = b.alloca(IrType::Int(IntWidth::I32));
             let val = b.const_i32(42);
             b.store(val, addr);
@@ -523,7 +523,7 @@ mod tests {
     fn print_block_params() {
         let mut func = Function::new("test".into(), vec![], IrType::Void);
         {
-            let mut b = FuncBuilder::new(&mut func);
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
             let header = b.create_block("header");
             let _p = b.add_block_param(header, IrType::Int(IntWidth::I32));
             let init = b.const_i32(0);
@@ -544,7 +544,7 @@ mod tests {
 
     #[test]
     fn print_internal_calls_with_function_names() {
-        let mut module = Module::new("test".into());
+        let mut module = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let callee_idx = module.add_function(Function::new(
             "callee".into(),
             vec![Param {
@@ -558,7 +558,7 @@ mod tests {
 
         let mut caller = Function::new("caller".into(), vec![], IrType::Void);
         {
-            let mut b = FuncBuilder::new(&mut caller);
+            let mut b = FuncBuilder::new(&mut caller, crate::target::TargetLayout::LP64);
             let arg = b.const_i32(7);
             let _ = b.call(
                 FuncRef::Internal(callee_idx),

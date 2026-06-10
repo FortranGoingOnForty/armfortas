@@ -388,7 +388,7 @@ mod tests {
 
     #[test]
     fn collapses_nested_float_constant_chain() {
-        let mut module = Module::new("t".into());
+        let mut module = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let params = vec![Param {
             name: "x".into(),
             ty: IrType::Float(FloatWidth::F64),
@@ -447,7 +447,7 @@ mod tests {
 
     #[test]
     fn cancels_rounding_sensitive_add_sub_chain_to_base() {
-        let mut module = Module::new("t".into());
+        let mut module = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let params = vec![Param {
             name: "x".into(),
             ty: IrType::Float(FloatWidth::F64),
@@ -488,7 +488,7 @@ mod tests {
 
     #[test]
     fn preserves_small_constant_when_large_terms_cancel_under_ofast() {
-        let mut module = Module::new("t".into());
+        let mut module = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let params = vec![Param {
             name: "x".into(),
             ty: IrType::Float(FloatWidth::F64),

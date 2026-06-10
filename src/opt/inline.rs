@@ -317,7 +317,7 @@ mod tests {
 
     #[test]
     fn inline_no_op_at_o0() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("main".into(), vec![], IrType::Void);
         f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
         m.add_function(f);
@@ -327,7 +327,7 @@ mod tests {
 
     #[test]
     fn inline_no_op_without_internal_calls() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("main".into(), vec![], IrType::Void);
         f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
         m.add_function(f);
@@ -337,7 +337,7 @@ mod tests {
 
     #[test]
     fn inline_rewrites_result_uses_in_successor_blocks() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
 
         let mut callee = Function::new("callee".into(), vec![], IrType::Int(IntWidth::I32));
         let then_b = callee.create_block("then");
@@ -422,7 +422,7 @@ mod tests {
 
     #[test]
     fn inline_preallocates_defs_for_later_vector_blocks() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
 
         let mut callee = Function::new("callee".into(), vec![], IrType::Int(IntWidth::I32));
         let use_b = callee.create_block("use");

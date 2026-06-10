@@ -176,7 +176,7 @@ mod tests {
 
     #[test]
     fn merges_empty_chain() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("test".into(), vec![], IrType::Void);
         let b = f.create_block("middle");
         let c = f.create_block("end");
@@ -203,7 +203,7 @@ mod tests {
 
     #[test]
     fn no_op_on_non_empty_blocks() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("test".into(), vec![], IrType::Void);
         let b = f.create_block("body");
         f.block_mut(f.entry).terminator = Some(Terminator::Branch(b, vec![]));

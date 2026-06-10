@@ -276,7 +276,7 @@ mod tests {
 
     #[test]
     fn sroa_no_op_on_scalars() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("test".into(), vec![], IrType::Void);
         let a = f.next_value_id();
         f.register_type(a, IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))));
@@ -294,7 +294,7 @@ mod tests {
 
     #[test]
     fn sroa_rejects_gep_address_escape() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("test".into(), vec![], IrType::Void);
         let arr_ty = IrType::Array(
             Box::new(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)))),

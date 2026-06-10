@@ -57,7 +57,10 @@ fn byte_array_align_log2(byte_count: u64) -> u8 {
 /// `.globl` so other translation units can reference them via USE.
 /// Non-module globals (SAVE-promoted locals) stay `.private_extern`
 /// to prevent cross-TU collisions (audit Maj-1).
-pub fn emit_globals(globals: &[crate::ir::inst::Global]) -> String {
+pub fn emit_globals(
+    globals: &[crate::ir::inst::Global],
+    layout: &crate::target::TargetLayout,
+) -> String {
     use crate::ir::inst::GlobalInit;
     use crate::ir::types::{FloatWidth, IntWidth, IrType};
 
@@ -139,7 +142,7 @@ pub fn emit_globals(globals: &[crate::ir::inst::Global]) -> String {
                 }
                 Some(GlobalInit::String(bytes)) => {
                     emit_byte_values(&mut out, bytes);
-                    let total_bytes = g.ty.size_bytes() as usize;
+                    let total_bytes = g.ty.size_bytes(layout) as usize;
                     if bytes.len() < total_bytes {
                         writeln!(out, "    .space {}", total_bytes - bytes.len()).unwrap();
                     }
@@ -149,7 +152,7 @@ pub fn emit_globals(globals: &[crate::ir::inst::Global]) -> String {
                     // values) don't have a scalar element directive. Emit their
                     // zero-initialized storage using the full IR type size
                     // instead of falling back to a bogus ".quad * count" size.
-                    let byte_size = g.ty.size_bytes();
+                    let byte_size = g.ty.size_bytes(layout);
                     writeln!(out, "    .space {}", byte_size).unwrap();
                 }
             }
@@ -1524,6 +1527,10 @@ fn const_pool_label(func: &str, idx: u32) -> String {
 
 #[cfg(test)]
 mod tests {
+    fn emit_globals_lp64_test(globals: &[Global]) -> String {
+        emit_globals(globals, &crate::target::TargetLayout::LP64)
+    }
+
     use super::*;
     use crate::codegen::isel::select_function;
     use crate::ir::builder::FuncBuilder;
@@ -1533,10 +1540,10 @@ mod tests {
     fn emit_simple(build: impl FnOnce(&mut FuncBuilder)) -> String {
         let mut func = Function::new("test".into(), vec![], IrType::Void);
         {
-            let mut b = FuncBuilder::new(&mut func);
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
             build(&mut b);
         }
-        let mf = select_function(&func);
+        let mf = select_function(&func, crate::target::TargetLayout::LP64);
         emit_function(&mf)
     }
 
@@ -1655,7 +1662,7 @@ mod tests {
 
     #[test]
     fn emit_i128_scalar_global_as_two_quads() {
-        let asm = emit_globals(&[Global {
+        let asm = emit_globals_lp64_test(&[Global {
             name: "big".into(),
             ty: IrType::Int(IntWidth::I128),
             initializer: Some(GlobalInit::Int(18_446_744_073_709_551_616i128)),
@@ -1691,7 +1698,7 @@ mod tests {
 
     #[test]
     fn emit_i128_array_global_as_word_pairs() {
-        let asm = emit_globals(&[Global {
+        let asm = emit_globals_lp64_test(&[Global {
             name: "arr".into(),
             ty: IrType::Array(Box::new(IrType::Int(IntWidth::I128)), 2),
             initializer: Some(GlobalInit::IntArray(vec![1, -1])),
@@ -1717,7 +1724,7 @@ mod tests {
 
     #[test]
     fn emit_byte_array_global_uses_natural_alignment() {
-        let asm = emit_globals(&[Global {
+        let asm = emit_globals_lp64_test(&[Global {
             name: "history".into(),
             ty: IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 400),
             initializer: Some(GlobalInit::Zero),
@@ -1732,7 +1739,7 @@ mod tests {
 
     #[test]
     fn emit_nested_byte_array_global_uses_full_storage_size() {
-        let asm = emit_globals(&[Global {
+        let asm = emit_globals_lp64_test(&[Global {
             name: "command_cache".into(),
             ty: IrType::Array(
                 Box::new(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 264)),

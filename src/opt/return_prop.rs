@@ -371,7 +371,7 @@ mod tests {
 
     #[test]
     fn propagates_loaded_scalar_dummy_through_wrapper_callsite() {
-        let mut module = Module::new("t".into());
+        let mut module = Module::new("t".into(), crate::target::TargetLayout::LP64);
 
         let params = vec![Param {
             name: "x".into(),
@@ -427,7 +427,7 @@ mod tests {
 
     #[test]
     fn propagates_constant_result_helper() {
-        let mut module = Module::new("t".into());
+        let mut module = Module::new("t".into(), crate::target::TargetLayout::LP64);
 
         let mut callee = Function::new("const_fn".into(), vec![], IrType::Int(IntWidth::I32));
         callee.internal_only = true;

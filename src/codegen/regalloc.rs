@@ -189,13 +189,13 @@ mod tests {
     fn regalloc_replaces_vregs() {
         let mut func = Function::new("test".into(), vec![], IrType::Void);
         {
-            let mut b = FuncBuilder::new(&mut func);
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
             let x = b.const_i32(42);
             let y = b.const_i32(10);
             let _z = b.iadd(x, y);
             b.ret_void();
         }
-        let mut mf = select_function(&func);
+        let mut mf = select_function(&func, crate::target::TargetLayout::LP64);
         regalloc_naive(&mut mf);
 
         // After regalloc, no VReg operands should remain.
@@ -216,13 +216,13 @@ mod tests {
     fn regalloc_frame_grows() {
         let mut func = Function::new("test".into(), vec![], IrType::Void);
         {
-            let mut b = FuncBuilder::new(&mut func);
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
             b.const_i32(1);
             b.const_i32(2);
             b.const_i32(3);
             b.ret_void();
         }
-        let mut mf = select_function(&func);
+        let mut mf = select_function(&func, crate::target::TargetLayout::LP64);
         let before = mf.frame.size;
         regalloc_naive(&mut mf);
         assert!(
@@ -235,13 +235,13 @@ mod tests {
     fn regalloc_uses_scratch_registers() {
         let mut func = Function::new("test".into(), vec![], IrType::Void);
         {
-            let mut b = FuncBuilder::new(&mut func);
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
             let x = b.const_i32(10);
             let y = b.const_i32(20);
             let _z = b.iadd(x, y);
             b.ret_void();
         }
-        let mut mf = select_function(&func);
+        let mut mf = select_function(&func, crate::target::TargetLayout::LP64);
         regalloc_naive(&mut mf);
 
         // Should use x9, x10, x11 as scratch registers.

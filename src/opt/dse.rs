@@ -33,7 +33,7 @@ use std::collections::HashSet;
 
 /// Eliminate dead stores within a single basic block.
 /// Returns true if any instructions were removed.
-fn dse_block(func: &mut Function, block_idx: usize) -> bool {
+fn dse_block(func: &mut Function, block_idx: usize, layout: crate::target::TargetLayout) -> bool {
     #[derive(Clone, Copy)]
     struct PendingStore {
         ptr: ValueId,
@@ -49,7 +49,7 @@ fn dse_block(func: &mut Function, block_idx: usize) -> bool {
             InstKind::Store(_, ptr) => {
                 let mut next_pending = Vec::with_capacity(pending.len() + 1);
                 for entry in pending {
-                    match alias::query(func, entry.ptr, *ptr) {
+                    match alias::query(func, entry.ptr, *ptr, layout) {
                         AliasResult::MustAlias => {
                             dead.insert(entry.inst_idx);
                         }
@@ -67,7 +67,7 @@ fn dse_block(func: &mut Function, block_idx: usize) -> bool {
 
             InstKind::Load(ptr) => {
                 pending.retain(|entry| {
-                    matches!(alias::query(func, entry.ptr, *ptr), AliasResult::NoAlias)
+                    matches!(alias::query(func, entry.ptr, *ptr, layout), AliasResult::NoAlias)
                 });
             }
 
@@ -91,7 +91,7 @@ fn dse_block(func: &mut Function, block_idx: usize) -> bool {
                     pending.retain(|entry| {
                         pointer_args
                             .iter()
-                            .all(|arg| !alias::may_reach_through_call_arg(func, entry.ptr, *arg))
+                            .all(|arg| !alias::may_reach_through_call_arg(func, entry.ptr, *arg, layout))
                     });
                 }
             }
@@ -121,10 +121,10 @@ fn dse_block(func: &mut Function, block_idx: usize) -> bool {
     true
 }
 
-fn dse_function(func: &mut Function) -> bool {
+fn dse_function(func: &mut Function, layout: crate::target::TargetLayout) -> bool {
     let mut changed = false;
     for block_idx in 0..func.blocks.len() {
-        if dse_block(func, block_idx) {
+        if dse_block(func, block_idx, layout) {
             changed = true;
         }
     }
@@ -140,7 +140,7 @@ impl Pass for Dse {
     fn run(&self, module: &mut Module) -> bool {
         let mut changed = false;
         for func in &mut module.functions {
-            if dse_function(func) {
+            if dse_function(func, module.layout) {
                 changed = true;
             }
         }
@@ -191,7 +191,7 @@ mod tests {
     /// load  %ptr
     #[test]
     fn double_store_kills_first() {
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Void);
         let ptr = push(&mut f, InstKind::Alloca(alloca_ty()), ptr_ty());
         let v1 = push(&mut f, InstKind::ConstInt(1, IntWidth::I32), i32_ty());
@@ -219,7 +219,7 @@ mod tests {
     /// store then load: first store is live (must not be removed).
     #[test]
     fn store_then_load_is_live() {
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], i32_ty());
         let ptr = push(&mut f, InstKind::Alloca(alloca_ty()), ptr_ty());
         let v1 = push(&mut f, InstKind::ConstInt(42, IntWidth::I32), i32_ty());
@@ -236,7 +236,7 @@ mod tests {
     /// Same base + same offset through distinct GEP values still aliases.
     #[test]
     fn same_offset_geps_kill_earlier_store() {
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Void);
         let arr_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I32)), 4);
         let arr_ptr_ty = IrType::Ptr(Box::new(arr_ty.clone()));
@@ -278,7 +278,7 @@ mod tests {
     /// Three consecutive stores to the same address: only the last is live.
     #[test]
     fn triple_store_keeps_last() {
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Void);
         let ptr = push(&mut f, InstKind::Alloca(alloca_ty()), ptr_ty());
         let v1 = push(&mut f, InstKind::ConstInt(1, IntWidth::I32), i32_ty());

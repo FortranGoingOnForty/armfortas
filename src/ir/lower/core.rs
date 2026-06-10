@@ -51,8 +51,9 @@ pub fn lower_file(
     external_optional_params: HashMap<String, Vec<bool>>,
     external_descriptor_params: HashMap<String, Vec<bool>>,
     external_char_len_star: HashMap<String, Vec<bool>>,
+    layout: crate::target::TargetLayout,
 ) -> (Module, HashMap<(String, String), ModuleGlobalInfo>) {
-    let mut module = Module::new("main".into());
+    let mut module = Module::new("main".into(), layout);
     let mut globals: HashMap<(String, String), ModuleGlobalInfo> = external_globals;
     let ambiguous_use_warnings: AmbiguousUseWarnings = Rc::new(RefCell::new(HashSet::new()));
 
@@ -375,7 +376,7 @@ pub(super) fn emit_type_bound_lookup_thunks(
             IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
         );
         {
-            let mut b = FuncBuilder::new(&mut func);
+            let mut b = FuncBuilder::new(&mut func, module.layout);
             let default_bb = b.create_block("tbp_lookup_default");
             let mut cases = Vec::with_capacity(layout.bound_procs.len());
             let mut case_blocks = Vec::with_capacity(layout.bound_procs.len());
@@ -2010,7 +2011,7 @@ pub(super) fn install_equivalence_locals(
                             let key = name.to_lowercase();
                             let ty = arg_type_from_decls(&key, decls, Some(st));
                             let dims = arg_dims_from_decls(&key, decls, visible_param_consts, st);
-                            let elem_size = ir_scalar_byte_size(&ty);
+                            let elem_size = ir_scalar_byte_size(&ty, b.layout);
                             let nelems: i64 = if dims.is_empty() {
                                 1
                             } else {
@@ -2035,7 +2036,7 @@ pub(super) fn install_equivalence_locals(
                                 // For dims [(lo1, ext1), (lo2, ext2), ...] and
                                 // subscripts [s1, s2, ...]:
                                 //   linear = (s1 - lo1) + (s2 - lo2) * ext1 + ...
-                                let elem_size = ir_scalar_byte_size(&ty);
+                                let elem_size = ir_scalar_byte_size(&ty, b.layout);
                                 let mut linear: i64 = 0;
                                 let mut stride: i64 = 1;
                                 let mut all_const = true;
@@ -2104,7 +2105,7 @@ pub(super) fn install_equivalence_locals(
                         continue;
                     }
                     let first_elem_byte = anchor - m.byte_off;
-                    let elem_size = ir_scalar_byte_size(&m.elem_ty);
+                    let elem_size = ir_scalar_byte_size(&m.elem_ty, b.layout);
                     let gep_idx = if elem_size > 0 {
                         first_elem_byte / elem_size
                     } else {
@@ -9363,7 +9364,7 @@ fn lower_logical_reduction_char_array_ctor_compare(
         contained_host_refs,
         descriptor_params,
     )?;
-    if ir_scalar_byte_size(&elem_ty) < char_len {
+    if ir_scalar_byte_size(&elem_ty, b.layout) < char_len {
         return None;
     }
 
@@ -14029,7 +14030,7 @@ fn try_defined_array_constructor_assignment(
     let dest_base = b.gep(dest_base_typed, vec![zero], IrType::Int(IntWidth::I8));
     let off_slot = b.alloca(IrType::Int(IntWidth::I64));
     b.store(zero, off_slot);
-    let step_bytes = b.const_i64(ir_scalar_byte_size(&lhs_info.ty));
+    let step_bytes = b.const_i64(ir_scalar_byte_size(&lhs_info.ty, ctx.layout));
 
     lower_defined_assignment_array_constructor_values(
         b, ctx, dest_base, off_slot, step_bytes, func_ref, mask, values,
@@ -14056,7 +14057,7 @@ fn lower_elemental_defined_assignment_array_broadcast(
     } else {
         b.const_i64(1)
     };
-    let elem_bytes = b.const_i64(ir_scalar_byte_size(&lhs_info.ty));
+    let elem_bytes = b.const_i64(ir_scalar_byte_size(&lhs_info.ty, ctx.layout));
     let rhs_len = mask.as_ref().and_then(|flags| {
         flags.get(1).copied().unwrap_or(false).then(|| {
             actual_char_arg_runtime_len(
@@ -18436,7 +18437,7 @@ pub(super) fn allocate_runtime_shape_array_result(
         b.store(one64, p_st);
     }
 
-    let elem_size = b.const_i64(ir_scalar_byte_size(elem_ty));
+    let elem_size = b.const_i64(ir_scalar_byte_size(elem_ty, b.layout));
     let rank_v = b.const_i32(rank as i32);
     let stat = b.alloca(IrType::Int(IntWidth::I32));
     let zero32 = b.const_i32(0);
@@ -19032,6 +19033,7 @@ pub(super) fn arg_is_assumed_len_char(
 /// free SSA value id after any other params (normal + hidden-length).
 pub(super) fn build_host_ref_params(
     callee_name: &str,
+    layout: crate::target::TargetLayout,
     host_decls: &[crate::ast::decl::SpannedDecl],
     host_param_consts: &HashMap<String, ConstScalar>,
     contained_host_refs: &HashMap<String, Vec<String>>,
@@ -19058,7 +19060,7 @@ pub(super) fn build_host_ref_params(
         let alloc = decl_is_allocatable(hname, host_decls);
         let ptr_is_pointer = decl_is_pointer(hname, host_decls);
         let dims = arg_dims_from_decls(hname, host_decls, &host_visible, st);
-        let large_explicit_shape = host_ref_explicit_array_uses_descriptor(&dims, &elem_ty);
+        let large_explicit_shape = host_ref_explicit_array_uses_descriptor(&dims, &elem_ty, layout);
         let descriptor_arg =
             (uses_desc || alloc || large_explicit_shape) && !uses_string_descriptor;
         let derived_type = arg_derived_type_name(hname, host_decls);
@@ -19110,7 +19112,11 @@ pub(super) fn build_host_ref_params(
     infos
 }
 
-fn host_ref_explicit_array_uses_descriptor(dims: &[(i64, i64)], elem_ty: &IrType) -> bool {
+fn host_ref_explicit_array_uses_descriptor(
+    dims: &[(i64, i64)],
+    elem_ty: &IrType,
+    layout: crate::target::TargetLayout,
+) -> bool {
     if dims.is_empty() {
         return false;
     }
@@ -19120,7 +19126,7 @@ fn host_ref_explicit_array_uses_descriptor(dims: &[(i64, i64)], elem_ty: &IrType
     else {
         return true;
     };
-    let Some(total_bytes) = total_elems.checked_mul(ir_scalar_byte_size(elem_ty)) else {
+    let Some(total_bytes) = total_elems.checked_mul(ir_scalar_byte_size(elem_ty, layout)) else {
         return true;
     };
     total_bytes >= 64 * 1024
@@ -22954,9 +22960,9 @@ pub(super) fn lower_alloc_bounds(
 /// buffer. Defaults to 8 for unknown/wide types so we never
 /// under-step (a wrong-direction error would silently scribble
 /// over adjacent elements).
-pub(super) fn ir_scalar_byte_size(ty: &IrType) -> i64 {
+pub(super) fn ir_scalar_byte_size(ty: &IrType, layout: crate::target::TargetLayout) -> i64 {
     match ty {
-        IrType::Array(elem, count) => (elem.size_bytes() * count) as i64,
+        IrType::Array(elem, count) => (elem.size_bytes(&layout) * count) as i64,
         IrType::Int(IntWidth::I8) => 1,
         IrType::Int(IntWidth::I16) => 2,
         IrType::Int(IntWidth::I32) | IrType::Float(FloatWidth::F32) => 4,
@@ -22992,9 +22998,9 @@ fn scalar_runtime_write_func(ty: &IrType) -> &'static str {
     }
 }
 
-pub(super) fn descriptor_element_size_bytes(info: &LocalInfo) -> i64 {
+pub(super) fn descriptor_element_size_bytes(info: &LocalInfo, layout: crate::target::TargetLayout) -> i64 {
     match &info.ty {
-        IrType::Array(_, _) => info.ty.size_bytes() as i64,
+        IrType::Array(_, _) => info.ty.size_bytes(&layout) as i64,
         IrType::Int(IntWidth::I8) => 1,
         IrType::Int(IntWidth::I16) => 2,
         IrType::Int(IntWidth::I32) | IrType::Float(FloatWidth::F32) => 4,
@@ -23011,13 +23017,14 @@ pub(super) fn descriptor_element_size_bytes(info: &LocalInfo) -> i64 {
 pub(super) fn local_storage_size_bytes(
     info: &LocalInfo,
     type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+    layout: crate::target::TargetLayout,
 ) -> i64 {
     if let Some(type_name) = &info.derived_type {
         if let Some(layout) = type_layouts.get(type_name) {
             return layout.size as i64;
         }
     }
-    descriptor_element_size_bytes(info)
+    descriptor_element_size_bytes(info, layout)
 }
 
 /// Recognize a transformational intrinsic call (PACK/RESHAPE/TRANSPOSE/
@@ -23530,7 +23537,7 @@ pub(super) fn lower_runtime_array_constructor_descriptor(
 
     let stat = b.alloca(IrType::Int(IntWidth::I32));
     b.store(zero32, stat);
-    let elem_size = b.const_i64(ir_scalar_byte_size(elem_ty));
+    let elem_size = b.const_i64(ir_scalar_byte_size(elem_ty, b.layout));
     let rank = b.const_i32(1);
     b.call(
         FuncRef::External("afs_allocate_array".into()),
@@ -23777,7 +23784,7 @@ pub(super) fn store_ac_values_at_off(
     contained_host_refs: Option<&HashMap<String, Vec<String>>>,
     descriptor_params: Option<&HashMap<String, Vec<bool>>>,
 ) {
-    let elem_bytes = ir_scalar_byte_size(elem_ty);
+    let elem_bytes = ir_scalar_byte_size(elem_ty, b.layout);
     let zero64 = b.const_i64(0);
     let step_bytes = b.const_i64(elem_bytes);
 
@@ -24249,7 +24256,7 @@ pub(super) fn lower_array_store(
         .filter(|name| !is_opaque_c_handle_name(name))
         .is_some()
     {
-        let elem_bytes = b.const_i64(ir_scalar_byte_size(&info.ty));
+        let elem_bytes = b.const_i64(ir_scalar_byte_size(&info.ty, b.layout));
         let byte_offset = b.imul(idx64, elem_bytes);
         let dest_ptr = b.gep(base, vec![byte_offset], IrType::Int(IntWidth::I8));
         emit_derived_value_copy(
@@ -24549,7 +24556,7 @@ pub(super) fn lower_write_items_adv(
                     if is_complex_elem {
                         // Complex writers expect a pointer to the
                         // [f32/f64 x 2] buffer, not a loaded aggregate.
-                        let elem_size = b.const_i64(ir_scalar_byte_size(&elem_ty));
+                        let elem_size = b.const_i64(ir_scalar_byte_size(&elem_ty, ctx.layout));
                         let elem_ptr = rank1_desc_element_byte_ptr(b, desc, i_val, elem_size);
                         b.call(
                             FuncRef::External(writer.into()),
@@ -26571,7 +26578,7 @@ fn fmt_push_emit_complex(b: &mut FuncBuilder, lane_f64: bool, ptr: ValueId) {
 /// afs_fmt_push_*. Mirrors `lower_whole_array_write` minus the unit arg.
 fn fmt_push_whole_array(b: &mut FuncBuilder, info: &LocalInfo) {
     let base = array_base_addr(b, info);
-    let elem_bytes = ir_scalar_byte_size(&info.ty);
+    let elem_bytes = ir_scalar_byte_size(&info.ty, b.layout);
 
     let char_fixed_len: Option<i64> = match info.char_kind {
         CharKind::Fixed(n) => Some(n),
@@ -26662,7 +26669,7 @@ fn fmt_push_1d_slice(
     };
 
     let base = array_base_addr(b, info);
-    let elem_bytes = ir_scalar_byte_size(&info.ty);
+    let elem_bytes = ir_scalar_byte_size(&info.ty, ctx.layout);
     let is_complex_elem = matches!(
         &info.ty,
         IrType::Array(inner, 2) if matches!(inner.as_ref(), IrType::Float(_))
@@ -26738,7 +26745,7 @@ fn fmt_push_section_nd(
     use crate::ast::expr::SectionSubscript;
 
     let base = array_base_addr(b, info);
-    let elem_bytes = ir_scalar_byte_size(&info.ty);
+    let elem_bytes = ir_scalar_byte_size(&info.ty, ctx.layout);
     let is_complex_elem = matches!(
         &info.ty,
         IrType::Array(inner, 2) if matches!(inner.as_ref(), IrType::Float(_))
@@ -26915,7 +26922,7 @@ fn fmt_push_alloc_section_nd(
         cum_extent: ValueId,
     }
 
-    let elem_bytes = ir_scalar_byte_size(&info.ty);
+    let elem_bytes = ir_scalar_byte_size(&info.ty, ctx.layout);
     let base = array_base_addr(b, info);
     let desc_ptr = array_descriptor_addr(b, info);
     let one64 = b.const_i64(1);
@@ -27110,7 +27117,7 @@ fn fmt_push_array_desc_loop(b: &mut FuncBuilder, desc: ValueId, elem_ty: &IrType
     b.set_block(bb_body);
     let i_val = b.load(i_addr);
     if is_complex_elem {
-        let elem_size = b.const_i64(ir_scalar_byte_size(elem_ty));
+        let elem_size = b.const_i64(ir_scalar_byte_size(elem_ty, b.layout));
         let elem_ptr = rank1_desc_element_byte_ptr(b, desc, i_val, elem_size);
         fmt_push_emit_complex(b, complex_lane_f64, elem_ptr);
     } else {
@@ -27175,7 +27182,7 @@ pub(super) fn lower_1d_slice_write(
     };
 
     let base = array_base_addr(b, info);
-    let elem_bytes = ir_scalar_byte_size(&info.ty);
+    let elem_bytes = ir_scalar_byte_size(&info.ty, ctx.layout);
     // F2018 §13.10.2: list-directed output of complex slice prints
     // each element as `(re, im)`. Without the complex check below,
     // `print *, c(1:3)` for a complex array fell through to the
@@ -27302,7 +27309,7 @@ pub(super) fn lower_1d_slice_read(
     };
 
     let base = array_base_addr(b, info);
-    let elem_bytes = ir_scalar_byte_size(&info.ty);
+    let elem_bytes = ir_scalar_byte_size(&info.ty, ctx.layout);
     let char_fixed_len = match info.char_kind {
         CharKind::Fixed(n) => Some(n),
         _ => None,
@@ -27366,7 +27373,7 @@ pub(super) fn lower_section_read_nd(
     use crate::ast::expr::SectionSubscript;
 
     let base = array_base_addr(b, info);
-    let elem_bytes = ir_scalar_byte_size(&info.ty);
+    let elem_bytes = ir_scalar_byte_size(&info.ty, ctx.layout);
     let char_fixed_len = match info.char_kind {
         CharKind::Fixed(n) => Some(n),
         _ => None,
@@ -27943,7 +27950,7 @@ pub(super) fn lower_alloc_section_read(
         cum_extent: ValueId,
     }
 
-    let elem_bytes = ir_scalar_byte_size(&info.ty);
+    let elem_bytes = ir_scalar_byte_size(&info.ty, ctx.layout);
     let base = array_base_addr(b, info);
     let char_fixed_len = match info.char_kind {
         CharKind::Fixed(n) => Some(n),
@@ -28139,7 +28146,7 @@ pub(super) fn lower_section_write_nd(
     use crate::ast::expr::SectionSubscript;
 
     let base = array_base_addr(b, info);
-    let elem_bytes = ir_scalar_byte_size(&info.ty);
+    let elem_bytes = ir_scalar_byte_size(&info.ty, ctx.layout);
     // F2018 §13.10.2: complex section write — emit per-element
     // (re, im) via afs_write_complex_*, mirroring 1-D and
     // whole-array paths above. Without the complex branch, a
@@ -28417,7 +28424,7 @@ pub(super) fn lower_alloc_section_write_nd(
         cum_extent: ValueId,
     }
 
-    let elem_bytes = ir_scalar_byte_size(&info.ty);
+    let elem_bytes = ir_scalar_byte_size(&info.ty, ctx.layout);
     let base = array_base_addr(b, info);
     let desc_ptr = array_descriptor_addr(b, info);
     let one64 = b.const_i64(1);
@@ -28610,7 +28617,7 @@ pub(super) fn lower_whole_array_write(
     unit: ValueId,
 ) {
     let base = array_base_addr(b, info);
-    let elem_bytes = ir_scalar_byte_size(&info.ty);
+    let elem_bytes = ir_scalar_byte_size(&info.ty, b.layout);
     // Fixed-length CHARACTER arrays must dispatch to afs_write_string
     // with (ptr, len). Without this, the element load was treated as a
     // packed-integer chunk and fed to afs_write_int — `print *, c` for
@@ -28701,7 +28708,7 @@ pub(super) fn lower_whole_array_write(
 
 pub(super) fn lower_whole_array_read(b: &mut FuncBuilder, info: &LocalInfo, mode: ReadMode) {
     let base = array_base_addr(b, info);
-    let elem_bytes = ir_scalar_byte_size(&info.ty);
+    let elem_bytes = ir_scalar_byte_size(&info.ty, b.layout);
     let char_fixed_len = match info.char_kind {
         CharKind::Fixed(n) => Some(n),
         _ => None,
@@ -28844,7 +28851,7 @@ pub(super) fn store_byte_aggregate_field(
     field_ty: IrType,
     val: ValueId,
 ) {
-    let field_bytes = field_ty.size_bytes() as i64;
+    let field_bytes = field_ty.size_bytes(&b.layout) as i64;
     debug_assert!(field_bytes > 0 && offset % field_bytes == 0);
     let slot = b.const_i64(offset / field_bytes);
     let ptr = b.gep(base, vec![slot], field_ty.clone());
@@ -28896,7 +28903,7 @@ pub(super) fn lower_rank_remap_pointer_assignment(
             }
             (
                 array_data_ptr_for_call(b, &src_info),
-                ir_scalar_byte_size(&src_info.ty),
+                ir_scalar_byte_size(&src_info.ty, ctx.layout),
             )
         }
         Expr::FunctionCall {
@@ -28946,7 +28953,7 @@ pub(super) fn lower_rank_remap_pointer_assignment(
                 ctx.st,
                 Some(ctx.type_layouts),
             );
-            (base, ir_scalar_byte_size(&src_info.ty))
+            (base, ir_scalar_byte_size(&src_info.ty, ctx.layout))
         }
         _ => return false,
     };
@@ -29102,7 +29109,7 @@ pub(super) fn materialize_array_descriptor_for_info(
 
     let base_ptr = array_data_ptr_for_call(b, info);
     store_byte_aggregate_field(b, desc, 0, IrType::Ptr(Box::new(info.ty.clone())), base_ptr);
-    let elem_size = b.const_i64(ir_scalar_byte_size(&info.ty));
+    let elem_size = b.const_i64(ir_scalar_byte_size(&info.ty, b.layout));
     store_byte_aggregate_field(b, desc, 8, IrType::Int(IntWidth::I64), elem_size);
     let rank = b.const_i32(info.dims.len() as i32);
     store_byte_aggregate_field(b, desc, 16, IrType::Int(IntWidth::I32), rank);
@@ -29237,7 +29244,7 @@ pub(super) fn lower_descriptor_actual_from_info(
             .as_ref()
             .and_then(|name| type_layouts.and_then(|layouts| layouts.get(name)))
             .map(|layout| b.const_i64(layout.size as i64))
-            .or_else(|| Some(b.const_i64(descriptor_element_size_bytes(info))));
+            .or_else(|| Some(b.const_i64(descriptor_element_size_bytes(info, b.layout))));
         let tbp_lookup = info
             .derived_type
             .as_ref()
@@ -29269,7 +29276,7 @@ pub(super) fn materialize_scalar_element_descriptor_from_info(
         .as_ref()
         .and_then(|name| type_layouts.and_then(|layouts| layouts.get(name)))
         .map(|layout| b.const_i64(layout.size as i64))
-        .or_else(|| Some(b.const_i64(descriptor_element_size_bytes(info))));
+        .or_else(|| Some(b.const_i64(descriptor_element_size_bytes(info, b.layout))));
     let tag = info
         .derived_type
         .as_ref()
@@ -29511,7 +29518,7 @@ pub(super) fn box_actual_into_class_star_descriptor(
 
     let (base_ptr, elem_size_bytes): (ValueId, i64) = if let Expr::Name { name } = &expr.node {
         if let Some(info) = locals.get(&name.to_lowercase()) {
-            let bytes = descriptor_element_size_bytes(info).max(1);
+            let bytes = descriptor_element_size_bytes(info, b.layout).max(1);
             let addr = if info.is_pointer {
                 let load_ty = if info.ty.is_ptr() {
                     info.ty.clone()
@@ -29554,7 +29561,7 @@ pub(super) fn box_actual_into_class_star_descriptor(
                     .try_into()
                     .ok()
                     .filter(|size: &i64| *size > 0)
-                    .unwrap_or_else(|| ir_scalar_byte_size(&storage_ty).max(1));
+                    .unwrap_or_else(|| ir_scalar_byte_size(&storage_ty, b.layout).max(1));
                 let addr = if field.pointer {
                     let load_ty = if storage_ty.is_ptr() {
                         storage_ty
@@ -29636,9 +29643,9 @@ pub(super) fn box_value_into_addr(
     if matches!(ty, IrType::Ptr(_)) {
         let raw = b.ptr_to_int(value);
         let i8_ptr = b.int_to_ptr(raw, IrType::Int(IntWidth::I8));
-        return (i8_ptr, ir_scalar_byte_size(ty).max(1));
+        return (i8_ptr, ir_scalar_byte_size(ty, b.layout).max(1));
     }
-    let bytes = ir_scalar_byte_size(ty).max(1);
+    let bytes = ir_scalar_byte_size(ty, b.layout).max(1);
     let slot = b.alloca(ty.clone());
     b.store(value, slot);
     let raw = b.ptr_to_int(slot);
@@ -31534,7 +31541,7 @@ pub(super) fn lower_transfer_array_expr_descriptor(
             contained_host_refs,
             descriptor_params,
         ) {
-            let elem_bytes = ir_scalar_byte_size(&src_elem_ty);
+            let elem_bytes = ir_scalar_byte_size(&src_elem_ty, b.layout);
             if elem_bytes <= 0 {
                 return None;
             }
@@ -31593,7 +31600,7 @@ pub(super) fn lower_transfer_array_expr_descriptor(
             if !matches!(src_ty, IrType::Int(_) | IrType::Float(_) | IrType::Bool) {
                 return None;
             }
-            let src_bytes = ir_scalar_byte_size(&src_ty);
+            let src_bytes = ir_scalar_byte_size(&src_ty, b.layout);
             let tmp = b.alloca(IrType::Array(
                 Box::new(IrType::Int(IntWidth::I8)),
                 src_bytes as u64,
@@ -32325,7 +32332,7 @@ pub(super) fn lower_scalar_spread_array_expr_descriptor(
     let stride_dst = b.gep(dim_buf, vec![stride_idx], IrType::Int(IntWidth::I64));
     b.store(one64, stride_dst);
 
-    let elem_size = b.const_i64(ir_scalar_byte_size(&elem_ty));
+    let elem_size = b.const_i64(ir_scalar_byte_size(&elem_ty, b.layout));
     let rank = b.const_i32(1);
     let stat = b.alloca(IrType::Int(IntWidth::I32));
     b.store(zero32, stat);
@@ -32566,7 +32573,7 @@ fn lower_complex_part_array_descriptor(
     );
     let stat = b.alloca(IrType::Int(IntWidth::I32));
     b.store(zero32, stat);
-    let elem_size = b.const_i64(ir_scalar_byte_size(&lane_ty));
+    let elem_size = b.const_i64(ir_scalar_byte_size(&lane_ty, b.layout));
     b.call(
         FuncRef::External("afs_allocate_like_with_elem_size".into()),
         vec![result_desc, src_desc, elem_size, stat],
@@ -32598,7 +32605,7 @@ fn lower_complex_part_array_descriptor(
     b.set_block(bb_body);
     let idx = b.load(i_addr);
     let lane_offset = if lc_component == "im" {
-        ir_scalar_byte_size(&lane_ty)
+        ir_scalar_byte_size(&lane_ty, b.layout)
     } else {
         0
     };
@@ -33307,7 +33314,7 @@ pub(super) fn try_lower_elemental_subroutine_call(
                 emit_derived_value_copy(b, ctx.type_layouts, type_name, *addr, src_ptr);
             } else if is_complex_ty(elem_ty) {
                 let src_ptr = rank1_array_desc_elem_ptr(b, *desc, elem_ty, cur_idx);
-                let bytes = b.const_i64(ir_scalar_byte_size(elem_ty));
+                let bytes = b.const_i64(ir_scalar_byte_size(elem_ty, ctx.layout));
                 b.call(
                     FuncRef::External("memcpy".into()),
                     vec![*addr, src_ptr, bytes],
@@ -33366,7 +33373,7 @@ pub(super) fn try_lower_elemental_subroutine_call(
                 emit_derived_value_copy(b, ctx.type_layouts, type_name, dest_ptr, *addr);
             } else if is_complex_ty(elem_ty) {
                 let dest_ptr = rank1_array_desc_elem_ptr(b, *desc, elem_ty, cur_idx);
-                let bytes = b.const_i64(ir_scalar_byte_size(elem_ty));
+                let bytes = b.const_i64(ir_scalar_byte_size(elem_ty, ctx.layout));
                 b.call(
                     FuncRef::External("memcpy".into()),
                     vec![dest_ptr, *addr, bytes],
@@ -33884,7 +33891,7 @@ pub(super) fn lower_rank1_elemental_call_descriptor(
     // same-shape allocator so callees see the full rank-N descriptor.
     let elem_size = result_char_len
         .map(|len| b.const_i64(len))
-        .unwrap_or_else(|| b.const_i64(ir_scalar_byte_size(&result_elem_ty)));
+        .unwrap_or_else(|| b.const_i64(ir_scalar_byte_size(&result_elem_ty, b.layout)));
     let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
     let zero32_for_alloc = b.const_i32(0);
     let sz384 = b.const_i64(384);
@@ -33946,7 +33953,7 @@ pub(super) fn lower_rank1_elemental_call_descriptor(
             // especially complex(real64), so copy their storage bytes too.
             let src_ptr =
                 array_desc_elem_ptr_rank(b, *actual_desc, actual_elem_ty, cur_idx, *actual_rank);
-            let elem_bytes = b.const_i64(ir_scalar_byte_size(actual_elem_ty));
+            let elem_bytes = b.const_i64(ir_scalar_byte_size(actual_elem_ty, b.layout));
             b.call(
                 FuncRef::External("memcpy".into()),
                 vec![temp_info.addr, src_ptr, elem_bytes],
@@ -34152,7 +34159,7 @@ pub(super) fn lower_vector_subscript_gather_descriptor(
         vec![result_desc, zero32, sz384],
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
     );
-    let elem_bytes_v = b.const_i64(ir_scalar_byte_size(&elem_ty));
+    let elem_bytes_v = b.const_i64(ir_scalar_byte_size(&elem_ty, b.layout));
     b.call(
         FuncRef::External("afs_allocate_1d".into()),
         vec![result_desc, elem_bytes_v, n],
@@ -34232,7 +34239,7 @@ pub(super) fn allocate_like_array_temp_descriptor_with_elem_type(
     );
     let stat = b.alloca(IrType::Int(IntWidth::I32));
     b.store(zero32, stat);
-    let elem_size = b.const_i64(ir_scalar_byte_size(elem_ty));
+    let elem_size = b.const_i64(ir_scalar_byte_size(elem_ty, b.layout));
     b.call(
         FuncRef::External("afs_allocate_like_with_elem_size".into()),
         vec![desc, source_desc, elem_size, stat],
@@ -34249,7 +34256,7 @@ pub(super) fn load_rank1_array_desc_elem(
 ) -> ValueId {
     let base = b.load_typed(desc, IrType::Ptr(Box::new(elem_ty.clone())));
     let stride = load_array_desc_i64_field(b, desc, 24 + 16);
-    let elem_size = b.const_i64(ir_scalar_byte_size(elem_ty));
+    let elem_size = b.const_i64(ir_scalar_byte_size(elem_ty, b.layout));
     let logical_index = b.imul(index, stride);
     let byte_off = b.imul(logical_index, elem_size);
     let ptr = b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
@@ -34268,7 +34275,7 @@ pub(super) fn array_desc_elem_ptr_rank(
     }
 
     let base = b.load_typed(desc, IrType::Ptr(Box::new(elem_ty.clone())));
-    let elem_size = b.const_i64(ir_scalar_byte_size(elem_ty));
+    let elem_size = b.const_i64(ir_scalar_byte_size(elem_ty, b.layout));
     let one = b.const_i64(1);
     let mut rem = index;
     let mut byte_off = b.const_i64(0);
@@ -34316,7 +34323,7 @@ pub(super) fn store_array_desc_elem_rank(
 ) {
     let ptr = array_desc_elem_ptr_rank(b, desc, elem_ty, index, rank);
     if is_complex_ty(elem_ty) {
-        let elem_size = b.const_i64(ir_scalar_byte_size(elem_ty));
+        let elem_size = b.const_i64(ir_scalar_byte_size(elem_ty, b.layout));
         let src_ptr = match b.func().value_type(value) {
             Some(IrType::Ptr(inner)) if inner.as_ref() == elem_ty => value,
             _ => {
@@ -34344,7 +34351,7 @@ pub(super) fn store_rank1_array_desc_elem(
 ) {
     let base = b.load_typed(desc, IrType::Ptr(Box::new(elem_ty.clone())));
     let stride = load_array_desc_i64_field(b, desc, 24 + 16);
-    let elem_size = b.const_i64(ir_scalar_byte_size(elem_ty));
+    let elem_size = b.const_i64(ir_scalar_byte_size(elem_ty, b.layout));
     let logical_index = b.imul(index, stride);
     let byte_off = b.imul(logical_index, elem_size);
     let ptr = b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
@@ -34615,7 +34622,7 @@ pub(super) fn lower_rank1_array_compare_descriptor(
     );
     let stat = b.alloca(IrType::Int(IntWidth::I32));
     b.store(zero32, stat);
-    let bool_elem_size = b.const_i64(ir_scalar_byte_size(&IrType::Bool));
+    let bool_elem_size = b.const_i64(ir_scalar_byte_size(&IrType::Bool, b.layout));
     b.call(
         FuncRef::External("afs_allocate_like_with_elem_size".into()),
         vec![result_desc, source_desc, bool_elem_size, stat],
@@ -35337,7 +35344,7 @@ pub(super) fn rank1_array_desc_elem_ptr(
 ) -> ValueId {
     let base = b.load_typed(desc, IrType::Ptr(Box::new(elem_ty.clone())));
     let stride = load_array_desc_i64_field(b, desc, 24 + 16);
-    let elem_size = b.const_i64(ir_scalar_byte_size(elem_ty));
+    let elem_size = b.const_i64(ir_scalar_byte_size(elem_ty, b.layout));
     let logical_index = b.imul(index, stride);
     let byte_off = b.imul(logical_index, elem_size);
     b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8))
@@ -36147,7 +36154,7 @@ pub(super) fn lower_array_expr_descriptor(
             let base = b.gep(buf, vec![zero], elem_ty.clone());
             if derived_type.is_some() {
                 let zero32 = b.const_i32(0);
-                let total_bytes = b.const_i64(ir_scalar_byte_size(&elem_ty) * n.max(1));
+                let total_bytes = b.const_i64(ir_scalar_byte_size(&elem_ty, b.layout) * n.max(1));
                 b.call(
                     FuncRef::External("memset".into()),
                     vec![buf, zero32, total_bytes],
@@ -36177,7 +36184,7 @@ pub(super) fn lower_array_expr_descriptor(
                 IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
             );
             store_byte_aggregate_field(b, desc, 0, IrType::Ptr(Box::new(elem_ty.clone())), base);
-            let elem_size = b.const_i64(ir_scalar_byte_size(&elem_ty));
+            let elem_size = b.const_i64(ir_scalar_byte_size(&elem_ty, b.layout));
             store_byte_aggregate_field(b, desc, 8, IrType::Int(IntWidth::I64), elem_size);
             let rank = b.const_i32(1);
             store_byte_aggregate_field(b, desc, 16, IrType::Int(IntWidth::I32), rank);
@@ -36356,7 +36363,7 @@ pub(super) fn lower_dynamic_vector_subscript_assign(
     // Convert from Fortran 1-based (or array's lower bound) to a
     // 0-based linear offset.
     let zero_off = b.isub(idx_val, dest_lower);
-    let elem_size = b.const_i64(ir_scalar_byte_size(&dest_info.ty));
+    let elem_size = b.const_i64(ir_scalar_byte_size(&dest_info.ty, ctx.layout));
     let byte_off = b.imul(zero_off, elem_size);
     let dst_ptr = b.gep(dest_base, vec![byte_off], IrType::Int(IntWidth::I8));
     let (stored, complex_src_ptr) = if let Some((src_desc, src_elem_ty)) = src_desc.as_ref() {
@@ -36378,7 +36385,7 @@ pub(super) fn lower_dynamic_vector_subscript_assign(
         (rhs_val, rhs_complex_src)
     };
     if let Some(src_ptr) = complex_src_ptr {
-        let copy_bytes = b.const_i64(ir_scalar_byte_size(&dest_info.ty));
+        let copy_bytes = b.const_i64(ir_scalar_byte_size(&dest_info.ty, ctx.layout));
         b.call(
             FuncRef::External("memcpy".into()),
             vec![dst_ptr, src_ptr, copy_bytes],
@@ -36452,7 +36459,7 @@ pub(super) fn lower_vector_subscript_section_assign(
     let zero64 = b.const_i64(0);
     let one64 = b.const_i64(1);
     let elem_ty = dest_info.ty.clone();
-    let elem_bytes = ir_scalar_byte_size(&elem_ty);
+    let elem_bytes = ir_scalar_byte_size(&elem_ty, ctx.layout);
     let mut dim_kinds: Vec<DimKind> = Vec::with_capacity(dest_args.len());
     let mut result_extents: Vec<ValueId> = Vec::new();
     let mut has_vector = false;
@@ -36641,7 +36648,7 @@ pub(super) fn lower_vector_subscript_section_assign(
 
     let (stored, complex_src_ptr) = if let Some((sd, src_ty)) = src_desc.as_ref() {
         let src_base = b.load_typed(*sd, IrType::Ptr(Box::new(src_ty.clone())));
-        let src_elem_size = b.const_i64(ir_scalar_byte_size(src_ty));
+        let src_elem_size = b.const_i64(ir_scalar_byte_size(src_ty, ctx.layout));
         let mut src_off = b.const_i64(0);
         for (k, coord) in coords.iter().copied().enumerate() {
             let src_dim_off = 24 + (k as i64) * 24;
@@ -36742,7 +36749,7 @@ pub(super) fn lower_multi_d_section_assign(
     );
 
     let elem_ty = dest_info.ty.clone();
-    let elem_bytes = ir_scalar_byte_size(&elem_ty);
+    let elem_bytes = ir_scalar_byte_size(&elem_ty, ctx.layout);
 
     // Snapshot per-dim extent and stride from dest descriptor.
     let mut extents: Vec<ValueId> = Vec::with_capacity(n_dims);
@@ -36821,7 +36828,7 @@ pub(super) fn lower_multi_d_section_assign(
         // strides may differ from the destination's).
         let mut src_rem = b.load(i_addr);
         let mut src_off = b.const_i64(0);
-        let src_elem_size = b.const_i64(ir_scalar_byte_size(src_ty));
+        let src_elem_size = b.const_i64(ir_scalar_byte_size(src_ty, ctx.layout));
         for (k, &ext) in extents.iter().enumerate().take(n_dims) {
             let src_dim_off = 24 + (k as i64) * 24;
             let src_stride = load_array_desc_i64_field(b, *sd, src_dim_off + 16);
@@ -37045,7 +37052,7 @@ pub(super) fn lower_1d_section_assign(
         );
     } else {
         let dest_base = b.load_typed(dest_desc, IrType::Ptr(Box::new(dest_info.ty.clone())));
-        let elem_bytes = b.const_i64(ir_scalar_byte_size(&dest_info.ty));
+        let elem_bytes = b.const_i64(ir_scalar_byte_size(&dest_info.ty, ctx.layout));
         let dest_is_complex = is_complex_ty(&dest_info.ty);
         let (scalar, scalar_complex_src) = if let Some((_, mapped)) = scalarized_value.as_ref() {
             let raw = super::expr::lower_expr_ctx_tl(b, ctx, mapped);
@@ -37090,7 +37097,7 @@ pub(super) fn lower_1d_section_assign(
                 (src_base, src_stride, src_ty)
             {
                 let src_index = b.imul(i_val, src_stride);
-                let src_elem_bytes = b.const_i64(ir_scalar_byte_size(&src_ty));
+                let src_elem_bytes = b.const_i64(ir_scalar_byte_size(&src_ty, ctx.layout));
                 let src_off = b.imul(src_index, src_elem_bytes);
                 let src_ptr = b.gep(src_base, vec![src_off], IrType::Int(IntWidth::I8));
                 if is_complex_ty(&src_ty)
@@ -38076,7 +38083,7 @@ pub(super) fn lower_array_assign(
 
         // Compute byte count: size(a) * storage size of each element.
         let n = array_total_elems_value(b, dest_info);
-        let elem_bytes = b.const_i64(ir_scalar_byte_size(&dest_info.ty));
+        let elem_bytes = b.const_i64(ir_scalar_byte_size(&dest_info.ty, ctx.layout));
         let byte_count = b.imul(n, elem_bytes);
         b.call(
             FuncRef::External("memcpy".into()),
@@ -38171,7 +38178,7 @@ pub(super) fn lower_array_assign(
                 };
                 let dest_base = array_base_addr(b, dest_info);
                 let n = array_total_elems_value(b, dest_info);
-                let dest_elem_bytes = b.const_i64(ir_scalar_byte_size(&dest_info.ty));
+                let dest_elem_bytes = b.const_i64(ir_scalar_byte_size(&dest_info.ty, ctx.layout));
                 // For descriptor-backed dests, use the destination's stride;
                 // for fixed-size dests, just use elem_bytes.
                 let dest_stride = if local_uses_array_descriptor(dest_info) {
@@ -38283,10 +38290,10 @@ pub(super) fn lower_array_assign(
         let i_val = b.load(i_addr);
         // Compute byte offset: i * elem_size. Use byte-level GEP to avoid double multiplication.
         // The catch-all used to assume 4 bytes per slot, which broke `logical :: a(N)`
-        // broadcasts after `ir_scalar_byte_size(Bool) = 1` started matching the
+        // broadcasts after `ir_scalar_byte_size(Bool, ctx.layout) = 1` started matching the
         // storage layout — every iteration jumped 3 bytes past its slot, leaving
         // src(2..N) full of stack garbage.
-        let elem_bytes = b.const_i64(ir_scalar_byte_size(&dest_info.ty));
+        let elem_bytes = b.const_i64(ir_scalar_byte_size(&dest_info.ty, ctx.layout));
         let byte_offset = b.imul(i_val, elem_bytes);
         let elem_ptr = b.gep(dest_base, vec![byte_offset], IrType::Int(IntWidth::I8));
         if let Some(src_ptr) = complex_scalar_src {
@@ -38724,7 +38731,7 @@ pub(super) fn lower_array_section_with_vector_subscripts(
     };
 
     let elem_ty = info.ty.clone();
-    let elem_bytes = ir_scalar_byte_size(&elem_ty);
+    let elem_bytes = ir_scalar_byte_size(&elem_ty, b.layout);
     let zero32 = b.const_i32(0);
     let zero64 = b.const_i64(0);
     let one64 = b.const_i64(1);
@@ -43854,11 +43861,11 @@ pub(super) fn emit_array_allocate_scalar_source_init_on_success(
         ctx.type_layouts
             .get(type_name)
             .map(|layout| layout.size as i64)
-            .unwrap_or_else(|| ir_scalar_byte_size(dest_ty))
+            .unwrap_or_else(|| ir_scalar_byte_size(dest_ty, ctx.layout))
     } else if is_complex_ty(dest_ty) {
         complex_byte_size(dest_ty)
     } else {
-        ir_scalar_byte_size(dest_ty)
+        ir_scalar_byte_size(dest_ty, ctx.layout)
     };
     let elem_bytes_val = b.const_i64(elem_bytes);
 
@@ -45003,7 +45010,7 @@ pub(super) fn try_lower_transfer_into_array(
             whole_array_expr_local_info(b, &ctx.locals, src_expr, ctx.st, ctx.type_layouts)
         {
             let src_total_elems = array_total_elems_value(b, &src_info);
-            let src_elem_size_const = descriptor_element_size_bytes(&src_info);
+            let src_elem_size_const = descriptor_element_size_bytes(&src_info, ctx.layout);
             if src_elem_size_const <= 0 {
                 return false;
             }
@@ -45176,7 +45183,7 @@ pub(super) fn try_lower_transfer_into_array(
         match &vty {
             IrType::Ptr(_) => v,
             IrType::Int(_) | IrType::Float(_) | IrType::Bool => {
-                let sz = ir_scalar_byte_size(&vty);
+                let sz = ir_scalar_byte_size(&vty, ctx.layout);
                 let tmp = b.alloca(IrType::Array(
                     Box::new(IrType::Int(IntWidth::I8)),
                     sz as u64,
@@ -45320,7 +45327,7 @@ fn lower_transfer_to_character_expr(
         match &vty {
             IrType::Ptr(_) => v,
             IrType::Int(_) | IrType::Float(_) | IrType::Bool => {
-                let sz = ir_scalar_byte_size(&vty);
+                let sz = ir_scalar_byte_size(&vty, b.layout);
                 let tmp = b.alloca(IrType::Array(
                     Box::new(IrType::Int(IntWidth::I8)),
                     sz as u64,
@@ -45394,7 +45401,7 @@ pub(super) fn lower_transfer_intrinsic(
     // Using mold size is sufficient when source ≥ mold (only mold-sized
     // bytes are read). For source < mold, F2018 says undefined trailing
     // bits — we zero-init for safety.
-    let buf_bytes = ir_scalar_byte_size(&mold_ty);
+    let buf_bytes = ir_scalar_byte_size(&mold_ty, b.layout);
     let buf_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), buf_bytes as u64);
     let buf = b.alloca(buf_ty);
     let zero_byte = b.const_i32(0);
@@ -45436,7 +45443,7 @@ pub(super) fn lower_transfer_intrinsic(
                 .func()
                 .value_type(elem_val)
                 .unwrap_or(IrType::Int(IntWidth::I32));
-            let elem_size = ir_scalar_byte_size(&elem_ty);
+            let elem_size = ir_scalar_byte_size(&elem_ty, b.layout);
             let off_val = b.const_i64(byte_off);
             let dst = b.gep(buf, vec![off_val], IrType::Int(IntWidth::I8));
             b.store(elem_val, dst);
@@ -45648,6 +45655,7 @@ mod tests {
             HashMap::new(),
             HashMap::new(),
             HashMap::new(),
+            crate::target::TargetLayout::LP64,
         )
         .0
     }

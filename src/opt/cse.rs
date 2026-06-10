@@ -346,7 +346,7 @@ mod tests {
         // %2 = iadd %0, %1
         // %3 = iadd %0, %1   ; same as %2
         // ret %3 → after CSE → ret %2 (and %3 is dead)
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
         let a = push(
             &mut f,
@@ -377,7 +377,7 @@ mod tests {
         // %2 = iadd %0, %1
         // %3 = iadd %1, %0
         // Should canonicalize to the same key.
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
         let a = push(
             &mut f,
@@ -405,7 +405,7 @@ mod tests {
 
     #[test]
     fn non_commutative_isub_does_not_dedupe_swapped() {
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
         let a = push(
             &mut f,
@@ -430,7 +430,7 @@ mod tests {
     #[test]
     fn keeps_load_pair_intact() {
         // Loads must NOT be deduplicated by local CSE.
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Void);
         let addr = push(
             &mut f,
@@ -448,7 +448,7 @@ mod tests {
 
     #[test]
     fn fmul_dedupes() {
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Float(FloatWidth::F64));
         let a = push(
             &mut f,
@@ -476,7 +476,7 @@ mod tests {
     #[test]
     fn icmp_lt_not_canonicalized() {
         // Lt is not commutative — must not collapse.
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Bool);
         let a = push(
             &mut f,

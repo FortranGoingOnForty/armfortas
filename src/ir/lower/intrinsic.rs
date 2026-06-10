@@ -1265,11 +1265,11 @@ pub(crate) fn lower_intrinsic(
                     IrType::Int(IntWidth::I32) | IrType::Float(FloatWidth::F32) => 4,
                     IrType::Int(IntWidth::I64) | IrType::Float(FloatWidth::F64) => 8,
                     IrType::Int(IntWidth::I128) => 16,
-                    IrType::Ptr(_) => 8, // pointers are 8 bytes on ARM64
+                    IrType::Ptr(_) => b.layout.ptr_bytes as i64,
                     // Arrays use element size * count, but we don't have shape info here.
                     // For now, return element size. Proper impl needs descriptor access.
                     IrType::Array(elem, count) => {
-                        let elem_size = ir_scalar_byte_size(elem.as_ref());
+                        let elem_size = ir_scalar_byte_size(elem.as_ref(), b.layout);
                         elem_size * (*count as i64)
                     }
                     _ => 8, // default to pointer size for unknown types

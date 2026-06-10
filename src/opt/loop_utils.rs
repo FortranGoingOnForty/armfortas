@@ -160,7 +160,7 @@ mod tests {
     #[test]
     fn clone_loop_remaps_values_defined_in_later_blocks() {
         let mut func = Function::new("test".into(), vec![], IrType::Void);
-        let mut b = FuncBuilder::new(&mut func);
+        let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
 
         let preheader = b.create_block("preheader");
         let header = b.create_block("header");

@@ -202,9 +202,10 @@ fn generate_dump() -> String {
         writeln!(out, "{}\t{}\t{}", name, size, align).unwrap();
     }
 
+    let lp64 = armfortas::target::TargetLayout::LP64;
     out.push_str("\n[ir_type]\n");
     for (name, ty) in ir_type_table() {
-        writeln!(out, "{}\t{}", name, ty.size_bytes()).unwrap();
+        writeln!(out, "{}\t{}", name, ty.size_bytes(&lp64)).unwrap();
     }
 
     out.push_str("\n[derived]\n");

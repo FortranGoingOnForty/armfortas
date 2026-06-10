@@ -172,7 +172,7 @@ mod tests {
 
     #[test]
     fn detects_self_recursion() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("factorial".into(), vec![], IrType::Int(IntWidth::I32));
         // Self-call: factorial calls factorial.
         let call_id = f.next_value_id();
@@ -195,7 +195,7 @@ mod tests {
 
     #[test]
     fn non_recursive_detected() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         // Function 0: "callee" — no calls.
         let mut callee = Function::new("callee".into(), vec![], IrType::Int(IntWidth::I32));
         callee.block_mut(callee.entry).terminator = Some(Terminator::Return(None));
@@ -223,7 +223,7 @@ mod tests {
 
     #[test]
     fn bottom_up_order_callees_first() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         // callee (idx 0) — no calls
         let mut callee = Function::new("callee".into(), vec![], IrType::Void);
         callee.block_mut(callee.entry).terminator = Some(Terminator::Return(None));

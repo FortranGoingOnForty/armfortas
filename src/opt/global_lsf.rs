@@ -29,7 +29,7 @@ impl Pass for GlobalLsf {
     fn run(&self, module: &mut Module) -> bool {
         let mut changed = false;
         for func in &mut module.functions {
-            if global_lsf_function(func) {
+            if global_lsf_function(func, module.layout) {
                 changed = true;
             }
         }
@@ -37,7 +37,7 @@ impl Pass for GlobalLsf {
     }
 }
 
-fn global_lsf_function(func: &mut Function) -> bool {
+fn global_lsf_function(func: &mut Function, layout: crate::target::TargetLayout) -> bool {
     let idoms = compute_immediate_dominators(func);
     let preds = predecessors(func);
 
@@ -47,7 +47,7 @@ fn global_lsf_function(func: &mut Function) -> bool {
         for inst in &block.insts {
             if let InstKind::Load(ptr) = &inst.kind {
                 if let Some(forwarded_val) =
-                    find_reaching_store(func, &idoms, &preds, block.id, inst.id, *ptr)
+                    find_reaching_store(layout, func, &idoms, &preds, block.id, inst.id, *ptr)
                 {
                     if func
                         .value_type(forwarded_val)
@@ -88,6 +88,7 @@ enum MemoryState {
 
 /// Find the nearest store that safely reaches the given load.
 fn find_reaching_store(
+    layout: crate::target::TargetLayout,
     func: &Function,
     idoms: &HashMap<BlockId, BlockId>,
     preds: &HashMap<BlockId, Vec<BlockId>>,
@@ -95,7 +96,7 @@ fn find_reaching_store(
     load_inst: ValueId,
     load_ptr: ValueId,
 ) -> Option<ValueId> {
-    match scan_block_before_load(func, load_block, load_inst, load_ptr) {
+    match scan_block_before_load(layout, func, load_block, load_inst, load_ptr) {
         MemoryState::Forward(val) => return Some(val),
         MemoryState::Clobbered => return None,
         MemoryState::Clean => {}
@@ -108,11 +109,11 @@ fn find_reaching_store(
         } // entry
         current = idom;
 
-        if !paths_to_load_are_clean(func, preds, current, load_block, load_ptr) {
+        if !paths_to_load_are_clean(layout, func, preds, current, load_block, load_ptr) {
             return None;
         }
 
-        match scan_block(func, current, load_ptr) {
+        match scan_block(layout, func, current, load_ptr) {
             MemoryState::Forward(val) => return Some(val),
             MemoryState::Clobbered => return None,
             MemoryState::Clean => {}
@@ -123,6 +124,7 @@ fn find_reaching_store(
 }
 
 fn scan_block_before_load(
+    layout: crate::target::TargetLayout,
     func: &Function,
     block_id: BlockId,
     load_inst: ValueId,
@@ -136,7 +138,7 @@ fn scan_block_before_load(
         if inst.id == load_inst {
             break;
         }
-        update_memory_state(func, &inst.kind, load_ptr, &mut last_store, &mut clobbered);
+        update_memory_state(func, layout, &inst.kind, load_ptr, &mut last_store, &mut clobbered);
     }
 
     if let Some(val) = last_store {
@@ -148,13 +150,18 @@ fn scan_block_before_load(
     }
 }
 
-fn scan_block(func: &Function, block_id: BlockId, load_ptr: ValueId) -> MemoryState {
+fn scan_block(
+    layout: crate::target::TargetLayout,
+    func: &Function,
+    block_id: BlockId,
+    load_ptr: ValueId,
+) -> MemoryState {
     let block = func.block(block_id);
     let mut last_store = None;
     let mut clobbered = false;
 
     for inst in &block.insts {
-        update_memory_state(func, &inst.kind, load_ptr, &mut last_store, &mut clobbered);
+        update_memory_state(func, layout, &inst.kind, load_ptr, &mut last_store, &mut clobbered);
     }
 
     if let Some(val) = last_store {
@@ -168,13 +175,14 @@ fn scan_block(func: &Function, block_id: BlockId, load_ptr: ValueId) -> MemorySt
 
 fn update_memory_state(
     func: &Function,
+    layout: crate::target::TargetLayout,
     kind: &InstKind,
     load_ptr: ValueId,
     last_store: &mut Option<ValueId>,
     clobbered: &mut bool,
 ) {
     match kind {
-        InstKind::Store(val, ptr) => match alias::query(func, *ptr, load_ptr) {
+        InstKind::Store(val, ptr) => match alias::query(func, *ptr, load_ptr, layout) {
             AliasResult::MustAlias => {
                 *last_store = Some(*val);
                 *clobbered = false;
@@ -198,7 +206,7 @@ fn update_memory_state(
                 .collect();
             if pointer_args
                 .iter()
-                .any(|arg| alias::may_reach_through_call_arg(func, load_ptr, *arg))
+                .any(|arg| alias::may_reach_through_call_arg(func, load_ptr, *arg, layout))
             {
                 *last_store = None;
                 *clobbered = true;
@@ -228,6 +236,7 @@ fn value_is_pointer(func: &Function, value: ValueId) -> bool {
 }
 
 fn paths_to_load_are_clean(
+    layout: crate::target::TargetLayout,
     func: &Function,
     preds: &HashMap<BlockId, Vec<BlockId>>,
     start_block: BlockId,
@@ -258,7 +267,7 @@ fn paths_to_load_are_clean(
             continue;
         }
 
-        if !matches!(scan_block(func, block_id, load_ptr), MemoryState::Clean) {
+        if !matches!(scan_block(layout, func, block_id, load_ptr), MemoryState::Clean) {
             return false;
         }
 
@@ -339,7 +348,7 @@ mod tests {
 
     #[test]
     fn global_lsf_no_op_on_empty() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("test".into(), vec![], IrType::Void);
         f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
         m.add_function(f);
@@ -349,7 +358,7 @@ mod tests {
 
     #[test]
     fn forwards_across_straight_line_dominator_edge() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("test".into(), vec![], IrType::Int(IntWidth::I32));
         let span = crate::lexer::Span {
             file_id: 0,
@@ -410,7 +419,7 @@ mod tests {
 
     #[test]
     fn does_not_forward_across_clobbering_side_path() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("test".into(), vec![], IrType::Int(IntWidth::I32));
         let span = crate::lexer::Span {
             file_id: 0,
@@ -499,7 +508,7 @@ mod tests {
 
     #[test]
     fn does_not_forward_into_revisitable_loop_header() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("test".into(), vec![], IrType::Int(IntWidth::I32));
         let span = crate::lexer::Span {
             file_id: 0,
@@ -590,7 +599,7 @@ mod tests {
 
     #[test]
     fn forwards_across_noalias_calling_side_path() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new(
             "f".into(),
             vec![
@@ -697,7 +706,7 @@ mod tests {
         // correct answer at a call boundary is that the callee can
         // walk to any offset within the allocation, so the store
         // must be considered clobbered.
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
         let span = crate::lexer::Span {
             file_id: 0,
@@ -806,7 +815,7 @@ mod tests {
 
     #[test]
     fn does_not_forward_scalar_store_into_aggregate_load() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Void);
         let span = crate::lexer::Span {
             file_id: 0,

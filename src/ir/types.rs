@@ -92,22 +92,22 @@ pub struct StructDef {
 }
 
 impl IrType {
-    /// Size in bytes on ARM64.
-    pub fn size_bytes(&self) -> u64 {
+    /// Size in bytes under the given target layout.
+    pub fn size_bytes(&self, layout: &crate::target::TargetLayout) -> u64 {
         match self {
             Self::Void => 0,
-            Self::Bool => 1,
+            Self::Bool => layout.bool_bytes as u64,
             Self::Int(w) => w.bytes() as u64,
             Self::Float(w) => w.bytes() as u64,
-            Self::Ptr(_) => 8, // 64-bit pointers
-            Self::Array(elem, count) => elem.size_bytes() * count,
+            Self::Ptr(_) => layout.ptr_bytes as u64,
+            Self::Array(elem, count) => elem.size_bytes(layout) * count,
             Self::Struct(_) => {
                 panic!("Struct size requires struct_defs; use Module::struct_size()")
             }
-            Self::FuncPtr(_) => 8,
-            // 128-bit NEON: every supported lane combo lands at 16
-            // bytes. The verifier rejects shapes that don't.
-            Self::Vector { .. } => 16,
+            Self::FuncPtr(_) => layout.ptr_bytes as u64,
+            // Every supported lane combo fills one vector register.
+            // The verifier rejects shapes that don't.
+            Self::Vector { .. } => layout.vector_bytes as u64,
         }
     }
 

@@ -410,7 +410,7 @@ mod tests {
 
     #[test]
     fn specializes_by_value_constant_dummy_and_enables_arg_elision() {
-        let mut module = Module::new("t".into());
+        let mut module = Module::new("t".into(), crate::target::TargetLayout::LP64);
 
         let params = vec![
             Param {
@@ -498,7 +498,7 @@ mod tests {
 
     #[test]
     fn does_not_specialize_when_callsite_constants_disagree() {
-        let mut module = Module::new("t".into());
+        let mut module = Module::new("t".into(), crate::target::TargetLayout::LP64);
 
         let params = vec![
             Param {

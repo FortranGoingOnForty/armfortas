@@ -273,7 +273,7 @@ mod tests {
     ///
     /// `flag` is defined in entry (loop-invariant).
     fn build_unswitchable_loop() -> Module {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("test".into(), vec![], IrType::Void);
 
         let preheader = f.create_block("preheader");
@@ -399,7 +399,7 @@ mod tests {
     #[test]
     fn does_not_unswitch_variant_conditional() {
         // Build a loop where the condition IS loop-defined (the IV).
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("test".into(), vec![], IrType::Void);
 
         let header = f.create_block("header");
@@ -486,7 +486,7 @@ mod tests {
 
     #[test]
     fn does_not_unswitch_when_loop_values_escape_directly() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("test".into(), vec![], IrType::Void);
 
         let preheader = f.create_block("preheader");
