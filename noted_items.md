@@ -1,5 +1,25 @@
 # Noted Items
 
+Deferred items from the l00 F2023 inventory (2026-06-10):
+
+- `! FLAGS:` landed in the root harness (run_programs) but is not yet
+  consumed by bencch; per the one-dialect rule bencch must either apply
+  it or clearly report it unsupported. Today bencch only parses
+  `! CHECK:` (`bencch/bench/src/lib.rs:4866`), so a shared fixture with
+  FLAGS would compile without its flags and could silently diverge.
+- `USE <intrinsic-module>, ONLY: name` does not validate `name`:
+  `use iso_fortran_env, only: zzz_not_a_thing` compiles silently.
+- Implicit external function calls are accepted in constant contexts:
+  `integer, parameter :: lk = selected_logical_kind(8)` compiled to a
+  runtime call in a parameter initializer before l04 lands the
+  intrinsic. Should be a hard error independent of F2023.
+- OPEN/WRITE specifier keywords are not validated against the supported
+  set (`open(..., leading_zero='suppress')` accepted with no
+  implementation behind it).
+- `lbound` on a rank-remapped pointer lowered to an external
+  `call @lbound` instead of descriptor reads (l00 probe 22); needs a
+  reduction independent of F2023.
+
 Deferred items that came up while finishing Sprint 29.10 cleanup work and
 starting the full Sprint 29 audit:
 
