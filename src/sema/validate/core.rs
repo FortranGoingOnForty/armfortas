@@ -118,6 +118,10 @@ pub(super) struct Ctx<'a> {
     block_decl_frames: Vec<HashMap<String, BlockBindingAttrs>>,
     pub(super) warn_pedantic: bool,
     pub(super) warn_deprecated: bool,
+    /// Lowercase dummy-argument names of the unit currently being
+    /// validated (empty for PROGRAM/MODULE scope). Used by the
+    /// RANK(n) C-constraint check.
+    pub(super) current_args: HashSet<String>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -150,6 +154,7 @@ impl<'a> Ctx<'a> {
             block_decl_frames: Vec::new(),
             warn_pedantic,
             warn_deprecated,
+            current_args: HashSet::new(),
         }
     }
 
@@ -1064,6 +1069,15 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
                     "CONTAINS/internal procedures",
                 );
             }
+            let saved_args = std::mem::replace(
+                &mut ctx.current_args,
+                args.iter()
+                    .filter_map(|a| match a {
+                        crate::ast::unit::DummyArg::Name(n) => Some(n.to_lowercase()),
+                        crate::ast::unit::DummyArg::Star => None,
+                    })
+                    .collect(),
+            );
             validate_decls(ctx, decls);
             check_implicit_none(ctx, body, decls);
             validate_stmts(ctx, body);
@@ -1071,6 +1085,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             for sub in contains {
                 validate_unit(ctx, sub);
             }
+            ctx.current_args = saved_args;
             ctx.in_pure = saved_pure;
             ctx.in_elemental = saved_elemental;
         }
@@ -1130,6 +1145,15 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
                     "CONTAINS/internal procedures",
                 );
             }
+            let saved_args = std::mem::replace(
+                &mut ctx.current_args,
+                args.iter()
+                    .filter_map(|a| match a {
+                        crate::ast::unit::DummyArg::Name(n) => Some(n.to_lowercase()),
+                        crate::ast::unit::DummyArg::Star => None,
+                    })
+                    .collect(),
+            );
             validate_decls(ctx, decls);
             check_implicit_none(ctx, body, decls);
             validate_stmts(ctx, body);
@@ -1137,6 +1161,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             for sub in contains {
                 validate_unit(ctx, sub);
             }
+            ctx.current_args = saved_args;
             ctx.in_pure = saved_pure;
             ctx.in_elemental = saved_elemental;
         }
@@ -1211,6 +1236,31 @@ fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
         {
             let has_alloc = attrs.iter().any(|a| matches!(a, Attribute::Allocatable));
             let has_pointer = attrs.iter().any(|a| matches!(a, Attribute::Pointer));
+
+            // RANK(n) (F2023 8.5.17). The parser already desugared the
+            // shape to a deferred-shape Dimension; here the marker
+            // drives conformance and the C-constraint: a rank>0 entity
+            // must be a dummy argument or carry ALLOCATABLE/POINTER.
+            if let Some(n) = attrs.iter().find_map(|a| match a {
+                Attribute::Rank(n) => Some(*n),
+                _ => None,
+            }) {
+                ctx.require_std(decl.span, FortranStandard::F2023, "the RANK(n) attribute");
+                if n > 0 && !has_alloc && !has_pointer {
+                    for entity in entities {
+                        if !ctx.current_args.contains(&entity.name.to_lowercase()) {
+                            ctx.error(
+                                decl.span,
+                                format!(
+                                    "RANK({}) entity '{}' must be a dummy argument or have \
+                                     ALLOCATABLE or POINTER",
+                                    n, entity.name
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
             let is_scalar_decl = entities.iter().all(|entity| entity.array_spec.is_none());
             let has_dimension_attr = attrs.iter().any(|a| matches!(a, Attribute::Dimension(_)));
 
@@ -1359,6 +1409,24 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
             }
         }
         Stmt::PointerAssignment { target, value, .. } => {
+            // F2023 10.2.2.2: bounds-spec / bounds-remapping written as
+            // one array expression (`q([2, 3]) => t`). Unimplemented in
+            // lowering — was a silent wrong answer (shape(q) read 0).
+            // Reject loudly until the remap lowering lands.
+            if let Expr::FunctionCall { args, .. } = &target.node {
+                for arg in args {
+                    if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
+                        if matches!(e.node, Expr::ArrayConstructor { .. }) {
+                            ctx.error(
+                                stmt.span,
+                                "pointer bounds remapping from an array expression \
+                                 (F2023 10.2.2.2) is not implemented yet; use the \
+                                 per-dimension form (`q(1:2, 1:3) => t`)",
+                            );
+                        }
+                    }
+                }
+            }
             validate_pointer_assignment(ctx, target, value, stmt.span);
             reject_pure_nonlocal_definition(ctx, target, stmt.span, "pointer assignment");
         }
@@ -1388,6 +1456,26 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
                 validate_allocatable_item(ctx, item, "allocate");
                 if !has_source && !has_mold && allocate_item_needs_explicit_shape(ctx, item) {
                     ctx.error(item.span, "array ALLOCATE requires bounds or SOURCE=/MOLD=");
+                }
+                // F2023 R936-R937 lets one array expression supply all
+                // bounds (`allocate(x([2, 3]))`). The lowering cannot
+                // build that descriptor yet; before l01 this compiled
+                // into garbage extents. Reject loudly until the
+                // vector-bounds lowering lands (tracked in the f2023
+                // matrix).
+                if let Expr::FunctionCall { args, .. } = &item.node {
+                    for arg in args {
+                        if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
+                            if matches!(e.node, Expr::ArrayConstructor { .. }) {
+                                ctx.error(
+                                    item.span,
+                                    "ALLOCATE bounds from an array expression (F2023 R937) \
+                                     are not implemented yet; spell the bounds per dimension \
+                                     (`allocate(x(2, 3))`)",
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }

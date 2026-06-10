@@ -328,6 +328,10 @@ impl<'a> Parser<'a> {
                 self.advance();
                 Some(self.parse_dimension_spec().map(Attribute::Dimension))
             }
+            "rank" => {
+                self.advance();
+                Some(self.parse_rank_spec().map(Attribute::Rank))
+            }
             "intent" => {
                 self.advance();
                 Some(self.parse_intent_spec().map(Attribute::Intent))
@@ -338,6 +342,31 @@ impl<'a> Parser<'a> {
             }
             _ => None,
         }
+    }
+
+    /// `RANK(n)` attribute bound (F2023 8.5.17). The bound must be a
+    /// nonnegative integer literal no larger than the descriptor's
+    /// 15-dimension capacity. The standard allows any constant
+    /// expression; named-constant bounds are not folded yet and error
+    /// loudly (recorded in the f2023 matrix) rather than mis-compile.
+    fn parse_rank_spec(&mut self) -> Result<u8, ParseError> {
+        self.expect(&TokenKind::LParen)?;
+        let expr = self.parse_expr()?;
+        let n = match &expr.node {
+            crate::ast::expr::Expr::IntegerLiteral { text, .. } => {
+                text.parse::<u8>().ok().filter(|n| *n <= 15)
+            }
+            _ => None,
+        };
+        let Some(n) = n else {
+            return Err(self.error(
+                "RANK bound must be an integer literal in 0..=15 \
+                 (general constant expressions are not folded here yet)"
+                    .into(),
+            ));
+        };
+        self.expect(&TokenKind::RParen)?;
+        Ok(n)
     }
 
     fn parse_dimension_spec(&mut self) -> Result<Vec<ArraySpec>, ParseError> {
@@ -353,6 +382,50 @@ impl<'a> Parser<'a> {
             specs.push(self.parse_one_array_spec()?);
             if !self.eat(&TokenKind::Comma) {
                 break;
+            }
+        }
+        // F2023 R818 explicit-shape-bounds-spec: `a([2, 3])` (and the
+        // `a([l1, l2]:[u1, u2])` form) gives all bounds in rank-1
+        // constant arrays. Desugar to per-dimension explicit bounds so
+        // downstream never sees an array-valued extent — before l01
+        // this form was accepted and built a corrupt rank-1 descriptor
+        // (silent wrong answers from size/shape at runtime).
+        if specs.len() == 1 {
+            if let ArraySpec::Explicit { lower, upper } = &specs[0] {
+                let uppers = bounds_vector_elements(upper);
+                if let Some(uppers) = uppers {
+                    let lowers = match lower {
+                        Some(l) => match bounds_vector_elements(l) {
+                            Some(ls) => Some(ls),
+                            None => {
+                                return Err(self.error(
+                                    "explicit-shape-bounds-spec: lower bounds must also be \
+                                     a constant array when upper bounds are (R818)"
+                                        .into(),
+                                ))
+                            }
+                        },
+                        None => None,
+                    };
+                    if let Some(ls) = &lowers {
+                        if ls.len() != uppers.len() {
+                            return Err(self.error(format!(
+                                "explicit-shape-bounds-spec: lower bounds give rank {} but \
+                                 upper bounds give rank {} (R818)",
+                                ls.len(),
+                                uppers.len()
+                            )));
+                        }
+                    }
+                    specs = uppers
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, u)| ArraySpec::Explicit {
+                            lower: lowers.as_ref().map(|ls| ls[i].clone()),
+                            upper: u,
+                        })
+                        .collect();
+                }
             }
         }
         Ok(specs)
@@ -494,6 +567,28 @@ impl<'a> Parser<'a> {
 
         // Parse entity list.
         let entities = self.parse_entity_list()?;
+
+        // RANK(n) desugars to a deferred-shape spec with n colons so
+        // every downstream consumer sees an ordinary Dimension (sema
+        // reclassifies deferred to assumed-shape for non-allocatable
+        // dummies, exactly as it does for `dimension(:)`). The Rank
+        // marker stays for conformance validation. C-constraint: RANK
+        // conflicts with DIMENSION and with per-entity array specs.
+        if let Some(n) = attrs.iter().find_map(|a| match a {
+            Attribute::Rank(n) => Some(*n),
+            _ => None,
+        }) {
+            if attrs.iter().any(|a| matches!(a, Attribute::Dimension(_))) {
+                return Err(self.error("RANK and DIMENSION cannot both be specified".into()));
+            }
+            if entities.iter().any(|e| e.array_spec.is_some()) {
+                return Err(self
+                    .error("an entity declared with RANK cannot also have an array-spec".into()));
+            }
+            if n > 0 {
+                attrs.push(Attribute::Dimension(vec![ArraySpec::Deferred; n as usize]));
+            }
+        }
 
         let span = crate::parser::expr::span_from_to(start, self.prev_span());
         Ok(Spanned::new(
@@ -1880,5 +1975,33 @@ mod tests {
         } else {
             panic!("not TypeDecl");
         }
+    }
+}
+
+/// If `e` is a bracketed constant vector usable as an R818 bounds
+/// array (`[2, 3]` — plain expression elements, no implied-do, no
+/// type-spec), return its elements. Constancy is enforced downstream
+/// by the usual explicit-shape validation of each desugared bound.
+fn bounds_vector_elements(
+    e: &crate::ast::expr::SpannedExpr,
+) -> Option<Vec<crate::ast::expr::SpannedExpr>> {
+    if let crate::ast::expr::Expr::ArrayConstructor {
+        type_spec: None,
+        values,
+    } = &e.node
+    {
+        let mut out = Vec::with_capacity(values.len());
+        for v in values {
+            match v {
+                crate::ast::expr::AcValue::Expr(item) => out.push(item.clone()),
+                crate::ast::expr::AcValue::ImpliedDo(_) => return None,
+            }
+        }
+        if out.is_empty() {
+            return None;
+        }
+        Some(out)
+    } else {
+        None
     }
 }

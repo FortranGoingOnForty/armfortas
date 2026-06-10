@@ -132,6 +132,11 @@ pub enum LenSpec {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Attribute {
     Dimension(Vec<ArraySpec>),
+    /// `RANK(n)` (F2023 8.5.17). Kept as a conformance marker for
+    /// sema (`--std` gating, C-constraint checks); the parser also
+    /// appends the desugared `Dimension` so lowering sees a normal
+    /// deferred/assumed-shape array.
+    Rank(u8),
     Allocatable,
     Pointer,
     Target,

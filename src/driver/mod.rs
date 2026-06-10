@@ -3,6 +3,7 @@
 //! CLI argument parsing, phase orchestration, multi-file compilation,
 //! dependency resolution, and linker invocation.
 
+pub mod conformance;
 pub mod defaults;
 pub mod dep_scan;
 pub mod diag;
@@ -116,6 +117,12 @@ pub struct Options {
 
     // ---- Language ----
     pub std: Option<crate::sema::validate::FortranStandard>,
+    /// True when the user passed `--std`/`-std` explicitly. Conformance
+    /// warnings (source limits, l01) fire only in explicit-std runs —
+    /// the gfortran model, where the default std is permissive and
+    /// `-std=` opts into conformance mode. Acceptance is identical
+    /// either way.
+    pub std_explicit: bool,
     pub source_form_override: Option<SourceFormOverride>,
     pub default_integer_8: bool,
     pub default_real_8: bool,
@@ -194,6 +201,7 @@ impl Default for Options {
             preprocessor_defines: Vec::new(),
             cpp_compat: false,
             std: Some(crate::sema::validate::FortranStandard::F2018),
+            std_explicit: false,
             source_form_override: None,
             default_integer_8: false,
             default_real_8: false,
@@ -413,6 +421,7 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
                     crate::sema::validate::FortranStandard::parse_flag(val)
                         .ok_or_else(|| format!("unknown -std value: {}", val))?,
                 );
+                opts.std_explicit = true;
             }
             "-std" => {
                 i += 1;
@@ -421,6 +430,7 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
                     crate::sema::validate::FortranStandard::parse_flag(val)
                         .ok_or_else(|| format!("unknown -std value: {}", val))?,
                 );
+                opts.std_explicit = true;
             }
             arg if arg.starts_with("--std=") => {
                 let val = &arg["--std=".len()..];
@@ -428,6 +438,7 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
                     crate::sema::validate::FortranStandard::parse_flag(val)
                         .ok_or_else(|| format!("unknown --std value: {}", val))?,
                 );
+                opts.std_explicit = true;
             }
             "--std" => {
                 i += 1;
@@ -436,6 +447,7 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
                     crate::sema::validate::FortranStandard::parse_flag(val)
                         .ok_or_else(|| format!("unknown --std value: {}", val))?,
                 );
+                opts.std_explicit = true;
             }
             "-ffree-form" => opts.source_form_override = Some(SourceFormOverride::Free),
             "-ffixed-form" => opts.source_form_override = Some(SourceFormOverride::Fixed),
@@ -712,7 +724,7 @@ fn collect_cli_warnings(opts: &mut Options, unknown_warning_flags: &[String]) {
     }
     if opts.free_line_length_none_compat {
         opts.cli_warnings.push(
-            "-ffree-line-length-none is accepted for compatibility; free-form inputs already have no line-length limit".into(),
+            "-ffree-line-length-none is accepted for compatibility; it silences the line-length conformance warning (free-form lines always compile in full regardless)".into(),
         );
     }
     if opts.recursive_default {
@@ -1102,6 +1114,43 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         };
         eprintln!(" preprocessing: {} ({})", opts.input.display(), form);
     }
+    // Source-limit conformance warnings (l01): one scan over the raw
+    // source, before either continuation joiner runs. Explicit-std
+    // runs only — the default std is permissive (gfortran's -std=gnu
+    // model); a default build's stderr stays pristine.
+    if let (true, Some(std)) = (opts.std_explicit, opts.std) {
+        for w in conformance::check_source_limits(
+            &source,
+            std,
+            source_form,
+            opts.free_line_length_none_compat,
+        ) {
+            diag::render(&file_str, &source, w.span, diag::Level::Warning, &w.msg, 1);
+        }
+    }
+    // Unconditional cap (all --std levels): keeps every recursive
+    // walker's depth under the compile-thread stack reservation, so an
+    // oversized statement gets this diagnostic, never a stack fault.
+    if let Some((span, chars)) = conformance::find_over_cap_statement(&source, source_form) {
+        diag::render(
+            &file_str,
+            &source,
+            span,
+            diag::Level::Error,
+            &format!(
+                "statement is {} characters long, over the {}-character compiler limit \
+                 (the F2023 standard caps statements at 1,000,000 characters)",
+                chars,
+                conformance::STMT_HARD_CAP
+            ),
+            1,
+        );
+        return Err(format!(
+            "aborting due to errors in {}",
+            opts.input.display()
+        ));
+    }
+
     let phase = phases.start("preprocess");
     let mut pp_config = crate::preprocess::PreprocConfig {
         filename: opts.input.to_str().unwrap_or("<input>").to_string(),

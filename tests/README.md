@@ -11,6 +11,10 @@ The canonical leaf-assertion language lives in source comments inside
 
 - `! CHECK:`
 - `! STDERR_CHECK:`
+- `! WARN_CHECK:` — ordered substring checks against the COMPILER's
+  stderr (STDERR_CHECK matches the program's runtime stderr).
+  Compilation must still succeed; use for conformance warnings
+  (l01). Typically paired with `! FLAGS: --std=...`.
 - `! EXIT_CODE:`
 - `! XFAIL:`
 - `! ERROR_EXPECTED:`
