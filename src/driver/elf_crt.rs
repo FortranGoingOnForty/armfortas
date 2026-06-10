@@ -257,10 +257,17 @@ pub fn elf_link_args(
     // System search dirs after user -L: ld resolves -l left-to-right
     // through the -L list in argv order, so user dirs win. The crt1
     // dir rides along so a -B/AFS_CRT_DIR root (NixOS) also resolves
-    // its libc.
+    // its libc; the crtbegin dir because on Debian/Ubuntu (and in nix
+    // gcc store paths) the unversioned libgcc_s.so linker script lives
+    // in the GCC dir, nowhere on the standard -L path.
     let mut lib_dirs: Vec<PathBuf> = Vec::new();
     if let Some(parent) = crt.crt1.parent() {
         lib_dirs.push(parent.to_path_buf());
+    }
+    if let Some(parent) = crt.crtbegin.parent() {
+        if !lib_dirs.contains(&parent.to_path_buf()) {
+            lib_dirs.push(parent.to_path_buf());
+        }
     }
     lib_dirs.extend(system_lib_dirs(target).iter().map(PathBuf::from));
     lib_dirs.dedup();
