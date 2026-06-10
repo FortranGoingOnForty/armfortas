@@ -5,14 +5,14 @@
 
 use std::collections::HashMap;
 
-use crate::ast::decl::Decl;
+use crate::ast::decl::{Attribute, Decl, TypeSpec};
 use crate::ast::expr::Expr;
 use crate::ir::builder::FuncBuilder;
 use crate::ir::inst::*;
 use crate::ir::types::*;
-use crate::sema::symtab::SymbolTable;
+use crate::sema::symtab::{ScopeId, ScopeKind, SymbolTable};
 
-use super::const_scalar::{materialize_const_scalar, ConstScalar};
+use super::const_scalar::{eval_const_scalar, materialize_const_scalar, ConstScalar};
 use super::core::*;
 use super::ctx::{CharKind, LocalInfo};
 use super::helpers::coerce_to_type;
@@ -43,14 +43,100 @@ pub(crate) fn init_decls(
     locals: &HashMap<String, LocalInfo>,
     decls: &[crate::ast::decl::SpannedDecl],
     st: &SymbolTable,
+    proc_scope_id: Option<ScopeId>,
     type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
 ) {
     // Pre-collect the set of GlobalAddr-defining ValueIds so the
     // inner skip check is O(1). Audit Maj-3.
     let global_addr_ids = collect_global_addr_values(b);
     let param_consts = collect_decl_param_consts_with_scope(decls, &HashMap::new(), st);
-    let param_array_consts: HashMap<String, Vec<ConstScalar>> = HashMap::new();
-    let param_array_elem_tys: HashMap<String, IrType> = HashMap::new();
+    let mut param_array_consts: HashMap<String, Vec<ConstScalar>> = HashMap::new();
+    let mut param_array_elem_tys: HashMap<String, IrType> = HashMap::new();
+    let mut parameter_inits: HashMap<String, &crate::ast::expr::SpannedExpr> = HashMap::new();
+    for decl in decls {
+        if let Decl::ParameterStmt { pairs } = &decl.node {
+            for (name, expr) in pairs {
+                parameter_inits.insert(name.to_lowercase(), expr);
+            }
+        }
+    }
+    for decl in decls {
+        let Decl::TypeDecl {
+            type_spec,
+            attrs,
+            entities,
+        } = &decl.node
+        else {
+            continue;
+        };
+        if matches!(type_spec, TypeSpec::Character(_) | TypeSpec::Type(_)) {
+            continue;
+        }
+        let attr_dims: Option<&Vec<crate::ast::decl::ArraySpec>> = attrs.iter().find_map(|a| {
+            if let Attribute::Dimension(specs) = a {
+                Some(specs)
+            } else {
+                None
+            }
+        });
+        let is_parameter_decl = attrs.iter().any(|a| matches!(a, Attribute::Parameter));
+        let elem_ty = lower_type_spec_with_param_consts(type_spec, Some(&param_consts), Some(st));
+        for entity in entities {
+            let key = entity.name.to_lowercase();
+            let init_expr = entity
+                .init
+                .as_ref()
+                .or_else(|| parameter_inits.get(&key).copied());
+            let is_parameter = is_parameter_decl || parameter_inits.contains_key(&key);
+            let Some(init_expr) = init_expr else {
+                continue;
+            };
+            let Some(specs) = entity.array_spec.as_ref().or(attr_dims) else {
+                continue;
+            };
+            if !is_parameter {
+                continue;
+            }
+            let dims =
+                extract_array_dims_with_init(specs, Some(init_expr), &param_consts, Some(st));
+            let total: i64 = dims.iter().map(|(_, size)| *size).product();
+            if total <= 0 {
+                continue;
+            }
+            let Some(mut scalars) = collect_const_array_scalars(
+                init_expr,
+                &elem_ty,
+                &param_consts,
+                &param_array_consts,
+                &param_array_elem_tys,
+            )
+            .or_else(|| {
+                eval_const_scalar(init_expr, &param_consts)
+                    .map(|s| coerce_scalar_to_array_lanes(s, &elem_ty))
+            }) else {
+                continue;
+            };
+            let storage_total = const_array_storage_scalar_count(&elem_ty, total).unwrap_or(total);
+            if (scalars.len() as i64) > storage_total {
+                continue;
+            }
+            let lanes_per_element =
+                const_array_storage_scalar_count(&elem_ty, 1).unwrap_or(1) as usize;
+            if scalars.len() == lanes_per_element && total > 1 {
+                let element = scalars.clone();
+                scalars.clear();
+                for _ in 0..total {
+                    scalars.extend_from_slice(&element);
+                }
+            } else {
+                while (scalars.len() as i64) < storage_total {
+                    scalars.push(zero_const_for_array_lane(&elem_ty));
+                }
+            }
+            param_array_consts.insert(key, scalars);
+            param_array_elem_tys.insert(entity.name.to_lowercase(), elem_ty.clone());
+        }
+    }
     for decl in decls {
         match &decl.node {
             Decl::TypeDecl { entities, .. } => {
@@ -174,7 +260,17 @@ pub(crate) fn init_decls(
                                     b.store(val, slot);
                                 }
                             }
-                        } else if !is_complex_ty(&info.ty) {
+                        } else if is_complex_ty(&info.ty) {
+                            let _ = store_named_parameter_array_init(
+                                b,
+                                locals,
+                                info,
+                                init_expr,
+                                st,
+                                proc_scope_id,
+                                &param_consts,
+                            );
+                        } else {
                             if let Some(mut scalars) = collect_const_array_scalars(
                                 init_expr,
                                 &info.ty,
@@ -196,6 +292,16 @@ pub(crate) fn init_decls(
                                         b.store(val, slot);
                                     }
                                 }
+                            } else {
+                                let _ = store_named_parameter_array_init(
+                                    b,
+                                    locals,
+                                    info,
+                                    init_expr,
+                                    st,
+                                    proc_scope_id,
+                                    &param_consts,
+                                );
                             }
                         }
                         continue;
@@ -421,6 +527,127 @@ pub(crate) fn init_decls(
                 }
             }
             _ => {}
+        }
+    }
+}
+
+fn named_initializer_key(expr: &crate::ast::expr::SpannedExpr) -> Option<String> {
+    match &expr.node {
+        Expr::Name { name } => Some(name.to_lowercase()),
+        Expr::ParenExpr { inner } => named_initializer_key(inner),
+        _ => None,
+    }
+}
+
+fn store_named_parameter_array_init(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    dest: &LocalInfo,
+    init_expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    proc_scope_id: Option<ScopeId>,
+    param_consts: &HashMap<String, ConstScalar>,
+) -> bool {
+    let Some(source_key) = named_initializer_key(init_expr) else {
+        return false;
+    };
+    let Some(source_sym) = proc_scope_id
+        .and_then(|scope_id| st.lookup_in(scope_id, &source_key))
+        .or_else(|| st.find_symbol_any_scope(&source_key))
+    else {
+        return false;
+    };
+    if !source_sym.attrs.parameter || source_sym.attrs.array_spec.is_empty() {
+        return false;
+    }
+
+    let total: i64 = dest.dims.iter().map(|(_, n)| *n).product();
+    if total <= 0 {
+        return false;
+    }
+
+    if let Some(source) = locals.get(&source_key) {
+        if !source.dims.is_empty()
+            && !source.allocatable
+            && !source.is_pointer
+            && matches!(source.char_kind, CharKind::None)
+            && source.derived_type.is_none()
+        {
+            let source_total: i64 = source.dims.iter().map(|(_, n)| *n).product();
+            if source_total >= total {
+                copy_parameter_array_init(b, dest, source.addr, &source.ty, total);
+                return true;
+            }
+        }
+    }
+
+    let module_name = match &st.scope(source_sym.scope).kind {
+        ScopeKind::Module(name) | ScopeKind::Submodule(name) => name,
+        _ => return false,
+    };
+    let source_ty = source_sym
+        .type_info
+        .as_ref()
+        .map(type_info_to_ir_type)
+        .unwrap_or_else(|| dest.ty.clone());
+
+    let source_dims = extract_array_dims(&source_sym.attrs.array_spec, param_consts, Some(st));
+    let source_total: i64 = source_dims.iter().map(|(_, n)| *n).product();
+    if source_total > 0 && source_total < total {
+        return false;
+    }
+
+    let symbol = format!("afs_mod_{}_{}", module_name.to_lowercase(), source_key);
+    let source_addr = b.global_addr(&symbol, source_ty.clone());
+    copy_parameter_array_init(b, dest, source_addr, &source_ty, total);
+    true
+}
+
+fn copy_parameter_array_init(
+    b: &mut FuncBuilder,
+    dest: &LocalInfo,
+    source_addr: crate::ir::inst::ValueId,
+    source_ty: &IrType,
+    total: i64,
+) {
+    let dest_is_complex = is_complex_ty(&dest.ty);
+    let source_is_complex = is_complex_ty(source_ty);
+    let complex_bytes = if dest_is_complex {
+        Some(b.const_i64(ir_scalar_byte_size(&dest.ty)))
+    } else {
+        None
+    };
+    let complex_fw = if dest_is_complex {
+        Some(complex_float_width(&dest.ty))
+    } else {
+        None
+    };
+    for i in 0..total {
+        let idx = b.const_i64(i);
+        let source_slot = b.gep(source_addr, vec![idx], source_ty.clone());
+        let dest_slot = b.gep(dest.addr, vec![idx], dest.ty.clone());
+        if let (Some(bytes), Some(fw)) = (complex_bytes, complex_fw) {
+            let source_ptr = if source_is_complex
+                && complex_float_width(source_ty) == complex_float_width(&dest.ty)
+            {
+                source_slot
+            } else {
+                let raw = if source_is_complex {
+                    source_slot
+                } else {
+                    b.load_typed(source_slot, source_ty.clone())
+                };
+                materialize_complex_operand(b, raw, fw)
+            };
+            b.call(
+                FuncRef::External("memcpy".into()),
+                vec![dest_slot, source_ptr, bytes],
+                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+            );
+        } else {
+            let raw = b.load_typed(source_slot, source_ty.clone());
+            let val = coerce_to_type(b, raw, &dest.ty);
+            b.store(val, dest_slot);
         }
     }
 }
