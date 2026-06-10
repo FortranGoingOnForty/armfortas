@@ -1048,16 +1048,82 @@ fn find_workspace_root() -> Option<PathBuf> {
     None
 }
 
-fn object_snapshot(path: &Path) -> Result<String, String> {
-    let text = normalize_tool_output(&tool_output("otool", &["-t", path.to_str().unwrap()])?);
-    let load = normalize_tool_output(&tool_output("otool", &["-l", path.to_str().unwrap()])?);
-    let relocs = normalize_tool_output(&tool_output("otool", &["-rv", path.to_str().unwrap()])?);
-    let symbols = normalize_tool_output(&tool_output("nm", &["-m", path.to_str().unwrap()])?);
+/// Object-file inspection dispatched on object format (sprint x01).
+/// Mach-O goes through Apple's otool/nm; ELF through objdump/readelf/nm.
+/// llvm-prefixed tool names are preferred on ELF so FreeBSD base and
+/// Alpine resolve to the same implementation. Snapshots are compared
+/// within a single host run only — never across tools or platforms — so
+/// cross-tool formatting differences are harmless and no cross-tool
+/// golden files may be introduced on top of this.
+pub struct ObjectInspector {
+    format: crate::target::ObjectFormat,
+    objdump: String,
+    readelf: String,
+}
 
-    Ok(format!(
-        "== text ==\n{}\n\n== load_commands ==\n{}\n\n== relocations ==\n{}\n\n== symbols ==\n{}",
-        text, load, relocs, symbols
-    ))
+impl ObjectInspector {
+    pub fn for_format(format: crate::target::ObjectFormat) -> Self {
+        ObjectInspector {
+            format,
+            objdump: find_inspection_tool("AFS_OBJDUMP_BIN", &["llvm-objdump", "objdump"]),
+            readelf: find_inspection_tool("AFS_READELF_BIN", &["llvm-readelf", "readelf"]),
+        }
+    }
+
+    /// Four named captures: text, load commands/headers, relocations,
+    /// symbols. The Mach-O argv is byte-compatible with the pre-x01
+    /// `object_snapshot`. `nm -m` is Apple-nm-only; the ELF side uses
+    /// plain `nm`.
+    pub fn snapshot(&self, path: &Path) -> Result<String, String> {
+        let p = path.to_str().unwrap();
+        let (text, load, relocs, symbols) = match self.format {
+            crate::target::ObjectFormat::MachO => (
+                tool_output("otool", &["-t", p])?,
+                tool_output("otool", &["-l", p])?,
+                tool_output("otool", &["-rv", p])?,
+                tool_output("nm", &["-m", p])?,
+            ),
+            crate::target::ObjectFormat::Elf => (
+                tool_output(&self.objdump, &["-d", p])?,
+                tool_output(&self.readelf, &["-lSW", p])?,
+                tool_output(&self.objdump, &["-r", p])?,
+                tool_output("nm", &[p])?,
+            ),
+        };
+        Ok(format!(
+            "== text ==\n{}\n\n== load_commands ==\n{}\n\n== relocations ==\n{}\n\n== symbols ==\n{}",
+            normalize_tool_output(&text),
+            normalize_tool_output(&load),
+            normalize_tool_output(&relocs),
+            normalize_tool_output(&symbols),
+        ))
+    }
+}
+
+/// Resolve an ELF inspection tool: env override first, then the first
+/// candidate on PATH that answers `--version`.
+fn find_inspection_tool(env_key: &str, candidates: &[&str]) -> String {
+    if let Some(over) = std::env::var_os(env_key) {
+        return over.to_string_lossy().into_owned();
+    }
+    for candidate in candidates {
+        let probe = Command::new(candidate)
+            .arg("--version")
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false);
+        if probe {
+            return candidate.to_string();
+        }
+    }
+    // Fall through to the last candidate; the eventual spawn error
+    // names the missing tool, which beats failing here without context.
+    candidates.last().unwrap().to_string()
+}
+
+fn object_snapshot(path: &Path) -> Result<String, String> {
+    // Captures remain Mach-O until x06 threads the capture target.
+    ObjectInspector::for_format(crate::target::ObjectFormat::MachO).snapshot(path)
 }
 
 fn tool_output(tool: &str, args: &[&str]) -> Result<String, String> {
@@ -1082,4 +1148,82 @@ fn normalize_tool_output(text: &str) -> String {
         .map(str::trim_end)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod inspector_tests {
+    use super::*;
+
+    #[test]
+    fn tool_resolution_env_override_wins() {
+        // Env overrides are read at construction; use a process-unique
+        // key value and restore afterwards (tests share the process).
+        std::env::set_var("AFS_OBJDUMP_BIN", "/nonexistent/custom-objdump");
+        let tool = find_inspection_tool("AFS_OBJDUMP_BIN", &["llvm-objdump", "objdump"]);
+        std::env::remove_var("AFS_OBJDUMP_BIN");
+        assert_eq!(tool, "/nonexistent/custom-objdump");
+    }
+
+    #[test]
+    fn tool_resolution_falls_back_to_last_candidate() {
+        let tool = find_inspection_tool(
+            "AFS_TEST_NO_SUCH_ENV_KEY",
+            &["definitely-not-a-real-tool-xyz", "also-not-real-abc"],
+        );
+        assert_eq!(tool, "also-not-real-abc");
+    }
+
+    /// DoD golden (x01): on a host with the native toolchain, a fixed
+    /// .o produces byte-identical snapshots from the new inspector and
+    /// the pre-sprint otool/nm pipeline spelled out literally.
+    #[test]
+    fn macho_snapshot_matches_pre_sprint_pipeline() {
+        if native_e2e_support().is_err() {
+            eprintln!(
+                "HARNESS_SKIP suite=testing test=macho_snapshot_matches_pre_sprint_pipeline count=1 reason=\"Mach-O tools need the native toolchain\""
+            );
+            return;
+        }
+        let req = CaptureRequest::new("tests/fixtures/integer16_add.f90")
+            .with_stage(Stage::Obj)
+            .with_opt_level(OptLevel::O0);
+        // Stage::Obj capture itself calls the new path; what we need is
+        // the .o on disk, so assemble via the capture pipeline's
+        // internals: compile to asm, then system as.
+        let result = capture_from_path(&req).expect("Obj capture should succeed on macOS");
+        let _ = result; // capture proves the new path runs; now compare on a fresh object
+        let dir = std::env::temp_dir().join(format!("afs_inspector_golden_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let asm = dir.join("g.s");
+        let obj = dir.join("g.o");
+        let cap = CaptureRequest::new("tests/fixtures/integer16_add.f90")
+            .with_stage(Stage::Asm)
+            .with_opt_level(OptLevel::O0);
+        let asm_text = capture_from_path(&cap)
+            .expect("asm capture")
+            .get(Stage::Asm)
+            .and_then(|s| s.as_text().map(str::to_string))
+            .expect("asm text");
+        fs::write(&asm, asm_text).unwrap();
+        let status = Command::new("as")
+            .args(["-o", obj.to_str().unwrap(), asm.to_str().unwrap()])
+            .status()
+            .expect("system as");
+        assert!(status.success());
+
+        let new = ObjectInspector::for_format(crate::target::ObjectFormat::MachO)
+            .snapshot(&obj)
+            .expect("inspector snapshot");
+        // Pre-sprint pipeline, verbatim.
+        let p = obj.to_str().unwrap();
+        let old = format!(
+            "== text ==\n{}\n\n== load_commands ==\n{}\n\n== relocations ==\n{}\n\n== symbols ==\n{}",
+            normalize_tool_output(&tool_output("otool", &["-t", p]).unwrap()),
+            normalize_tool_output(&tool_output("otool", &["-l", p]).unwrap()),
+            normalize_tool_output(&tool_output("otool", &["-rv", p]).unwrap()),
+            normalize_tool_output(&tool_output("nm", &["-m", p]).unwrap()),
+        );
+        assert_eq!(new, old, "inspector must be byte-compatible with the pre-x01 snapshot");
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
