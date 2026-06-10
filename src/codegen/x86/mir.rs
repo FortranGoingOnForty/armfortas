@@ -377,10 +377,15 @@ pub struct X86Function {
     /// in the low four bytes — `movss` reads only those).
     pub rodata: Vec<(String, u64)>,
     /// Frame slots requested by isel (allocas).
+    /// Byte-blob constants (string literals): label → contents.
+    pub rodata_bytes: Vec<(String, Vec<u8>)>,
     pub frame_slots: Vec<X86FrameSlot>,
     /// Largest rsp-relative outgoing stack-argument area any call site
     /// in this function needs.
     pub outgoing_arg_bytes: i64,
+    /// Total prologue rsp subtraction (locals + outgoing, 16-aligned).
+    /// Set by frame layout in regalloc (x05); 0 until then.
+    pub frame_bytes: i64,
     next_vreg: u32,
     next_block: u32,
 }
@@ -394,8 +399,10 @@ impl X86Function {
                 insts: Vec::new(),
             }],
             rodata: Vec::new(),
+            rodata_bytes: Vec::new(),
             frame_slots: Vec::new(),
             outgoing_arg_bytes: 0,
+            frame_bytes: 0,
             next_vreg: 0,
             next_block: 1,
         }
@@ -439,6 +446,17 @@ impl X86Function {
         }
         let label = format!(".LC{}_{}", self.name, self.rodata.len());
         self.rodata.push((label.clone(), bits));
+        label
+    }
+
+    /// Intern a byte blob in `.rodata`; duplicate contents share one
+    /// label (same policy as `add_rodata`).
+    pub fn add_rodata_bytes(&mut self, bytes: &[u8]) -> String {
+        if let Some((label, _)) = self.rodata_bytes.iter().find(|(_, b)| b == bytes) {
+            return label.clone();
+        }
+        let label = format!(".Lstr{}_{}", self.name, self.rodata_bytes.len());
+        self.rodata_bytes.push((label.clone(), bytes.to_vec()));
         label
     }
 

@@ -364,8 +364,18 @@ fn select_inst(
             );
         }
 
-        InstKind::ConstString(_) => {
-            panic!("x05 scope: string constants deferred (need a bytes rodata form)")
+        InstKind::ConstString(bytes) => {
+            // Address of an interned .rodata blob; the consuming
+            // runtime call carries the length separately (same shape
+            // as ARM's AdrpAdd const-pool lowering).
+            let dest = ctx.lookup_vreg(inst.id);
+            let label = mf.add_rodata_bytes(bytes);
+            mf.block_mut(mb).insts.push(X86Inst {
+                opcode: X86Opcode::Lea,
+                size: OpSize::Q,
+                operands: vec![X86Operand::RipLabel(label)],
+                def: Some(X86Operand::VReg(dest)),
+            });
         }
 
         InstKind::Undef(_) => {

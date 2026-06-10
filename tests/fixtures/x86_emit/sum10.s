@@ -3,6 +3,8 @@
 .p2align 4
 .type sum10,@function
 sum10:
+    pushq %rbp
+    movq %rsp, %rbp
     movq $0, %rax
     movq $1, %rcx
     jmp .Lsum10_1
@@ -13,5 +15,7 @@ sum10:
     jle .Lsum10_1
     jmp .Lsum10_2
 .Lsum10_2:
+    movq %rbp, %rsp
+    popq %rbp
     ret
 .size sum10, .-sum10

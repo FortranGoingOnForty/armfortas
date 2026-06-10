@@ -7,4 +7,5 @@ pub mod abi;
 pub mod emit;
 pub mod isel;
 pub mod mir;
+pub mod regalloc;
 pub mod twoaddr;

@@ -37,6 +37,33 @@ pub fn emit_function(func: &X86Function) -> String {
     writeln!(out, ".p2align 4").unwrap();
     writeln!(out, ".type {},@function", name).unwrap();
     writeln!(out, "{}:", name).unwrap();
+    // Prologue: rbp-based frames unconditionally (x04 red-zone policy:
+    // rsp always moves; uniform frames keep call-site alignment honest
+    // — entry rsp ≡ 8 (mod 16), after push rbp ≡ 0, and frame_bytes is
+    // 16-aligned by layout, so rsp ≡ 0 at every call).
+    writeln!(out, "    pushq %rbp").unwrap();
+    writeln!(out, "    movq %rsp, %rbp").unwrap();
+    if func.frame_bytes > 0 {
+        debug_assert_eq!(func.frame_bytes % 16, 0, "frame layout must 16-align");
+        if func.frame_bytes <= 4096 {
+            writeln!(out, "    subq ${}, %rsp", func.frame_bytes).unwrap();
+        } else {
+            // Stack probes: never move rsp past a guard page without
+            // touching it. Page-sized strides, touch after each sub,
+            // residual last — sub-then-touch order is the point
+            // (mirrors arm64 fmt_stack_alloc; -fstack-clash-protection
+            // emits the same shape). Our hardening policy, not psABI.
+            let pages = func.frame_bytes / 4096;
+            let residual = func.frame_bytes % 4096;
+            for _ in 0..pages {
+                writeln!(out, "    subq $4096, %rsp").unwrap();
+                writeln!(out, "    orq $0, (%rsp)").unwrap();
+            }
+            if residual > 0 {
+                writeln!(out, "    subq ${}, %rsp", residual).unwrap();
+            }
+        }
+    }
     for (idx, block) in func.blocks.iter().enumerate() {
         if idx != 0 {
             writeln!(out, "{}:", block_label(func, idx)).unwrap();
@@ -58,6 +85,19 @@ pub fn emit_rodata_f64(label: &str, value: f64) -> String {
     writeln!(out, ".p2align 3").unwrap();
     writeln!(out, "{}:", label).unwrap();
     writeln!(out, "    .quad 0x{:016x}", value.to_bits()).unwrap();
+    out
+}
+
+/// `.rodata` byte blob (string literals). `.byte` lists sidestep every
+/// escaping question `.ascii` would raise.
+pub fn emit_rodata_bytes(label: &str, bytes: &[u8]) -> String {
+    let mut out = String::new();
+    writeln!(out, ".section .rodata").unwrap();
+    writeln!(out, "{}:", label).unwrap();
+    for chunk in bytes.chunks(16) {
+        let list: Vec<String> = chunk.iter().map(|b| b.to_string()).collect();
+        writeln!(out, "    .byte {}", list.join(",")).unwrap();
+    }
     out
 }
 
@@ -231,7 +271,10 @@ fn emit_inst(inst: &X86Inst, func: &X86Function) -> String {
         Jcc => format!("j{} {}", cond(0).mnemonic(), block(1)),
         // Bare name for now; @PLT decoration is link-policy (x06).
         Call => format!("call {}", opq(0)),
-        Ret => "ret".to_string(),
+        // Epilogue folded into every return: restoring rsp from rbp
+        // makes the epilogue frame-size-independent (no encoding paths
+        // that vary with N — the anti-32KB-bug property).
+        Ret => "movq %rbp, %rsp\n    popq %rbp\n    ret".to_string(),
         Push => format!("pushq {}", opq(0)),
         Pop => format!("popq {}", opq(0)),
         Movss => format!("movss {}, {}", op(0), def()),

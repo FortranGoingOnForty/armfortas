@@ -33,9 +33,52 @@ pub fn emit_module(
 ) -> Result<String, String> {
     match opts.target.arch {
         crate::target::Arch::Arm64 => Ok(arm64::emit_module(ir_module, opts)),
-        crate::target::Arch::X86_64 => Err(format!(
-            "cannot select instructions for target '{}': x86_64 instruction selection is not implemented yet (sprint x05)",
-            opts.target
-        )),
+        crate::target::Arch::X86_64 => {
+            let mut funcs = x86::isel::select_module(ir_module);
+            let mut text = String::new();
+            for f in &mut funcs {
+                x86::twoaddr::convert_to_two_address(f);
+                x86::regalloc::regalloc_naive(f);
+                text.push_str(&x86::emit::emit_function(f));
+                for (label, bits) in &f.rodata {
+                    text.push_str(&x86::emit::emit_rodata_f64(label, f64::from_bits(*bits)));
+                }
+                for (label, bytes) in &f.rodata_bytes {
+                    text.push_str(&x86::emit::emit_rodata_bytes(label, bytes));
+                }
+                text.push('\n');
+            }
+            if !ir_module.globals.is_empty() {
+                return Err(
+                    "x86_64 module globals (SAVE/module variables) land in x06 with the link step"
+                        .to_string(),
+                );
+            }
+            // ELF entry wrapper: main → runtime init, program body,
+            // finalize (the Mach-O twin lives in arm64::emit_module).
+            if let Some(prog) = funcs.iter().find(|f| f.name.starts_with("__prog_")) {
+                text.push_str(&format!(
+                    "\
+.text
+.globl main
+.p2align 4
+.type main,@function
+main:
+    pushq %rbp
+    movq %rsp, %rbp
+    callq afs_program_init
+    callq {0}
+    callq afs_program_finalize
+    xorl %eax, %eax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+.size main, .-main
+",
+                    prog.name
+                ));
+            }
+            Ok(text)
+        }
     }
 }

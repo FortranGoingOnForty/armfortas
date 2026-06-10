@@ -3,10 +3,14 @@
 .p2align 4
 .type scale_counter,@function
 scale_counter:
+    pushq %rbp
+    movq %rsp, %rbp
     movsd .Lc_half(%rip), %xmm0
     movq counter(%rip), %rax
     cvtsi2sdq %rax, %xmm1
     mulsd %xmm1, %xmm0
+    movq %rbp, %rsp
+    popq %rbp
     ret
 .size scale_counter, .-scale_counter
 
