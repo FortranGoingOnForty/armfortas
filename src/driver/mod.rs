@@ -160,6 +160,10 @@ pub struct Options {
     pub static_link: bool,
     /// `-rpath` entries passed to `ld`.
     pub rpath: Vec<PathBuf>,
+
+    // ---- Target ----
+    /// What we compile for (`--target <triple>`; defaults to the host).
+    pub target: crate::target::TargetSpec,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,6 +217,7 @@ impl Default for Options {
             shared: false,
             static_link: false,
             rpath: Vec::new(),
+            target: crate::target::TargetSpec::host(),
         }
     }
 }
@@ -303,6 +308,17 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
             "--emit-ir" => opts.emit_ir = true,
             "--emit-ast" => opts.emit_ast = true,
             "--emit-tokens" => opts.emit_tokens = true,
+
+            // ---- Target ----
+            "--target" => {
+                i += 1;
+                let triple = args.get(i).ok_or("--target requires a triple")?;
+                opts.target = crate::target::TargetSpec::parse(triple)?;
+            }
+            arg if arg.starts_with("--target=") => {
+                opts.target =
+                    crate::target::TargetSpec::parse(&arg["--target=".len()..])?;
+            }
 
             // ---- Optimization ----
             "-O" => opts.opt_level = OptLevel::O0,
@@ -739,6 +755,9 @@ COMPILATION:
   -cpp                        Accept GNU-style preprocessing flag
   -D<name>[=<value>]          Define a preprocessor macro
   -o <file>                   Output file name
+  --target <triple>           Target to compile for (default: this machine).
+                              Supported: arm64-macos, x86_64-freebsd,
+                              x86_64-linux-gnu, x86_64-linux-musl
 
 LANGUAGE:
   -std=<standard>             GNU-compatible alias for --std=<standard>
@@ -2035,6 +2054,42 @@ mod tests {
         let opts = Options::from_args(&args).expect("driver should accept -Os");
         assert_eq!(opts.opt_level, OptLevel::Os);
         assert_eq!(opts.input, PathBuf::from("hello.f90"));
+    }
+
+    #[test]
+    fn default_target_is_host() {
+        assert_eq!(Options::default().target, crate::target::TargetSpec::host());
+    }
+
+    #[test]
+    fn options_from_args_accepts_target_flag() {
+        for args in [
+            vec![
+                "--target".to_string(),
+                "x86_64-freebsd".to_string(),
+                "hello.f90".to_string(),
+            ],
+            vec![
+                "--target=x86_64-freebsd".to_string(),
+                "hello.f90".to_string(),
+            ],
+        ] {
+            let opts = Options::from_args(&args).expect("driver should accept --target");
+            assert_eq!(opts.target.triple(), "x86_64-freebsd");
+        }
+    }
+
+    #[test]
+    fn options_from_args_rejects_unknown_target() {
+        let args = vec!["--target=riscv64-linux".to_string(), "hello.f90".to_string()];
+        let err = Options::from_args(&args)
+            .err()
+            .expect("unknown target must be rejected");
+        assert!(
+            err.contains("supported targets: arm64-macos"),
+            "diagnostic must list supported targets, got: {}",
+            err
+        );
     }
 
     #[test]
