@@ -6100,6 +6100,7 @@ pub(super) fn check_filtered_in_expr(
     filtered: &HashSet<String>,
 ) {
     match &expr.node {
+        Expr::NilArgument => {}
         Expr::ConditionalExpr {
             cond,
             then_val,
@@ -11475,6 +11476,7 @@ pub(super) fn actual_expr_rank(
 ) -> Option<usize> {
     use crate::ast::expr::Expr;
     match &expr.node {
+        Expr::NilArgument => None,
         // Arms of a conditional agree in rank (sema-enforced); take
         // the then-arm's.
         Expr::ConditionalExpr { then_val, .. } => {
@@ -12869,6 +12871,7 @@ pub(super) fn operator_expr_type_info(
     use crate::sema::symtab::TypeInfo;
 
     match &expr.node {
+        Expr::NilArgument => None,
         // Arms of a conditional share a declared type (sema-enforced).
         Expr::ConditionalExpr { then_val, .. } => {
             operator_expr_type_info(then_val, locals, st, type_layouts)

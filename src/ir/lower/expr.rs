@@ -649,6 +649,12 @@ pub(crate) fn lower_expr_full(
             }
         }
 
+        Expr::NilArgument => {
+            // Sema rejects .NIL. outside conditional-argument arms, and
+            // the call-argument lowering consumes legal ones before
+            // reaching the generic expression path.
+            unreachable!("NilArgument survived to value lowering — sema gate failed");
+        }
         Expr::ConditionalExpr {
             cond,
             then_val,
