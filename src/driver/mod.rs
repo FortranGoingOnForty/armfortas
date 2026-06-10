@@ -3,6 +3,7 @@
 //! CLI argument parsing, phase orchestration, multi-file compilation,
 //! dependency resolution, and linker invocation.
 
+pub mod conformance;
 pub mod defaults;
 pub mod dep_scan;
 pub mod diag;
@@ -712,7 +713,7 @@ fn collect_cli_warnings(opts: &mut Options, unknown_warning_flags: &[String]) {
     }
     if opts.free_line_length_none_compat {
         opts.cli_warnings.push(
-            "-ffree-line-length-none is accepted for compatibility; free-form inputs already have no line-length limit".into(),
+            "-ffree-line-length-none is accepted for compatibility; it silences the line-length conformance warning (free-form lines always compile in full regardless)".into(),
         );
     }
     if opts.recursive_default {
@@ -1102,6 +1103,19 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         };
         eprintln!(" preprocessing: {} ({})", opts.input.display(), form);
     }
+    // Source-limit conformance warnings (l01): one scan over the raw
+    // source, before either continuation joiner runs.
+    if let Some(std) = opts.std {
+        for w in conformance::check_source_limits(
+            &source,
+            std,
+            source_form,
+            opts.free_line_length_none_compat,
+        ) {
+            diag::render(&file_str, &source, w.span, diag::Level::Warning, &w.msg, 1);
+        }
+    }
+
     let phase = phases.start("preprocess");
     let mut pp_config = crate::preprocess::PreprocConfig {
         filename: opts.input.to_str().unwrap_or("<input>").to_string(),
