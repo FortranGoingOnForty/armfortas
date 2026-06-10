@@ -444,6 +444,10 @@ pub struct Module {
     pub functions: Vec<Function>,
     pub struct_defs: Vec<super::types::StructDef>,
     pub extern_funcs: Vec<ExternFunc>,
+    /// Layout of the target this module is compiled for (x02). Passes
+    /// holding `&Module` read sizes from here instead of growing a
+    /// parameter on every helper.
+    pub layout: crate::target::TargetLayout,
 }
 
 /// An external function declaration.
@@ -454,13 +458,14 @@ pub struct ExternFunc {
 }
 
 impl Module {
-    pub fn new(name: String) -> Self {
+    pub fn new(name: String, layout: crate::target::TargetLayout) -> Self {
         Self {
             name,
             globals: Vec::new(),
             functions: Vec::new(),
             struct_defs: Vec::new(),
             extern_funcs: Vec::new(),
+            layout,
         }
     }
 
@@ -795,10 +800,10 @@ mod tests {
 
     #[test]
     fn runtime_print_i128_is_supported_by_backend_gate() {
-        let mut module = Module::new("test".into());
+        let mut module = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut func = Function::new("main".into(), vec![], IrType::Void);
         {
-            let mut b = FuncBuilder::new(&mut func);
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
             let wide = b.const_i128(170141183460469231731687303715884105727i128);
             b.runtime_call(RuntimeFunc::PrintInt, vec![wide], IrType::Void);
             b.ret_void();
@@ -813,10 +818,10 @@ mod tests {
 
     #[test]
     fn byte_cursor_gep_into_i128_storage_stays_supported() {
-        let mut module = Module::new("test".into());
+        let mut module = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut func = Function::new("main".into(), vec![], IrType::Void);
         {
-            let mut b = FuncBuilder::new(&mut func);
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
             let arr = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I128)), 3));
             let off = b.const_i64(16);
             let cursor = b.gep(arr, vec![off], IrType::Int(IntWidth::I8));

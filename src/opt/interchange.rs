@@ -474,7 +474,7 @@ mod tests {
     #[test]
     fn interchange_pass_builds() {
         // Smoke test: the pass can be constructed and run on an empty module.
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("test".into(), vec![], IrType::Void);
         f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
         m.add_function(f);

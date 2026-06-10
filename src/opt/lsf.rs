@@ -60,13 +60,13 @@ impl Pass for LocalLsf {
     fn run(&self, module: &mut Module) -> bool {
         let mut changed = false;
         for func in &mut module.functions {
-            changed |= lsf_in_function(func);
+            changed |= lsf_in_function(func, module.layout);
         }
         changed
     }
 }
 
-fn lsf_in_function(func: &mut Function) -> bool {
+fn lsf_in_function(func: &mut Function, layout: crate::target::TargetLayout) -> bool {
     #[derive(Clone, Copy)]
     struct AvailableStore {
         ptr: ValueId,
@@ -85,7 +85,10 @@ fn lsf_in_function(func: &mut Function) -> bool {
                     let eff_ptr = resolve(&all_rewrites, *ptr);
                     let eff_val = resolve(&all_rewrites, *val);
                     available.retain(|entry| {
-                        matches!(alias::query(func, entry.ptr, eff_ptr), AliasResult::NoAlias)
+                        matches!(
+                            alias::query(func, entry.ptr, eff_ptr, layout),
+                            AliasResult::NoAlias
+                        )
                     });
                     available.push(AvailableStore {
                         ptr: eff_ptr,
@@ -97,7 +100,7 @@ fn lsf_in_function(func: &mut Function) -> bool {
                     let eff_ptr = resolve(&all_rewrites, *ptr);
                     if let Some(entry) = available.iter().rev().find(|entry| {
                         matches!(
-                            alias::query(func, entry.ptr, eff_ptr),
+                            alias::query(func, entry.ptr, eff_ptr, layout),
                             AliasResult::MustAlias
                         ) && func.value_type(entry.val).is_some_and(|ty| ty == inst.ty)
                     }) {
@@ -128,9 +131,9 @@ fn lsf_in_function(func: &mut Function) -> bool {
                         // so a precise "different GEP offset →
                         // NoAlias" answer is unsound here.
                         available.retain(|entry| {
-                            pointer_args
-                                .iter()
-                                .all(|arg| !may_reach_through_call_arg(func, entry.ptr, *arg))
+                            pointer_args.iter().all(|arg| {
+                                !may_reach_through_call_arg(func, entry.ptr, *arg, layout)
+                            })
                         });
                     }
                 }
@@ -264,7 +267,7 @@ mod tests {
         // store %42, %alloca
         // %w = load %alloca       ← should become %42
         // %x = iadd %w, %1       ← becomes iadd %42, %1
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Void);
 
         let alloca = push(
@@ -313,7 +316,7 @@ mod tests {
         // store %42, %alloca
         // store %99, %alloca     ← overwrites the 42
         // %w = load %alloca      ← should forward to %99, not %42
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Void);
 
         let alloca = push(
@@ -356,7 +359,7 @@ mod tests {
         // store %42, %alloca
         // call @ext()            ← may write %alloca
         // %w = load %alloca      ← must NOT be forwarded
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Void);
 
         let alloca = push(
@@ -390,7 +393,7 @@ mod tests {
     #[test]
     fn no_forwarding_without_prior_store() {
         // %w = load %alloca      ← no prior store — nothing to forward
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Void);
 
         let alloca = push(
@@ -410,7 +413,7 @@ mod tests {
 
     #[test]
     fn forwards_load_from_must_alias_gep() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
 
         let arr_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I32)), 4);
@@ -465,7 +468,7 @@ mod tests {
 
     #[test]
     fn does_not_forward_scalar_store_into_aggregate_load() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Void);
 
         let arr_ty = IrType::Array(
@@ -527,7 +530,7 @@ mod tests {
         // stores arr(2)=20, calls touch(arr), then reads arr(2).
         // The read must see the callee's store, not the caller's
         // earlier constant.
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
 
         let arr_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I32)), 2);
@@ -603,7 +606,7 @@ mod tests {
         // If LocalLsf or the alias oracle doesn't see that %chain1
         // aliases %g1 (both are byte-offset 4 from %alloca), the
         // load gets forwarded to %20 and the caller prints garbage.
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
 
         let arr_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I32)), 2);
@@ -686,7 +689,7 @@ mod tests {
 
     #[test]
     fn keeps_store_available_across_noalias_call_arg() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new(
             "f".into(),
             vec![param("a", 0, true), param("b", 1, true)],
@@ -741,7 +744,7 @@ mod tests {
         // The call's direct argument is a different alloca from
         // %payload, but the aggregate wrapper carries %payload inside
         // it. LSF must not forward the pre-call value across this call.
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I64));
 
         let payload = push(

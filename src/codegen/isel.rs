@@ -19,12 +19,16 @@ pub fn select_module(module: &Module) -> Vec<MachineFunction> {
     module
         .functions
         .iter()
-        .map(|f| select_function_with_names(f, &func_names))
+        .map(|f| select_function_with_names(f, &func_names, module.layout))
         .collect()
 }
 
-fn select_function_with_names(func: &Function, func_names: &[String]) -> MachineFunction {
-    let mut mf = select_function(func);
+fn select_function_with_names(
+    func: &Function,
+    func_names: &[String],
+    layout: crate::target::TargetLayout,
+) -> MachineFunction {
+    let mut mf = select_function(func, layout);
     // Resolve any Internal call references to actual function names.
     for block in &mut mf.blocks {
         for inst in &mut block.insts {
@@ -50,16 +54,16 @@ fn select_function_with_names(func: &Function, func_names: &[String]) -> Machine
 use super::abi::{classify_abi_arg, AbiArgLoc, AbiArgState};
 
 /// Select machine instructions for one IR function.
-pub fn select_function(func: &Function) -> MachineFunction {
+pub fn select_function(func: &Function, layout: crate::target::TargetLayout) -> MachineFunction {
     let mut mf = MachineFunction::new(func.name.clone());
     mf.internal_only = func.internal_only;
-    let mut ctx = ISelCtx::new();
+    let mut ctx = ISelCtx::new(layout);
 
     // Phase 1: allocate stack slots for all IR alloca instructions.
     for block in &func.blocks {
         for inst in &block.insts {
             if let InstKind::Alloca(ty) = &inst.kind {
-                let size = alloca_size(ty);
+                let size = alloca_size(ty, layout);
                 let offset = mf.alloc_local(size);
                 ctx.alloca_offsets.insert(inst.id, offset);
             }
@@ -477,6 +481,8 @@ fn select_call_inst(
 
 /// Instruction selection context.
 struct ISelCtx {
+    /// Target layout of the module being selected (x02).
+    layout: crate::target::TargetLayout,
     /// IR ValueId → MIR VRegId.
     value_map: HashMap<ValueId, VRegId>,
     /// IR wide scalar ValueId → stack slot offset used as its backing store.
@@ -503,8 +509,9 @@ struct ISelCtx {
 }
 
 impl ISelCtx {
-    fn new() -> Self {
+    fn new(layout: crate::target::TargetLayout) -> Self {
         Self {
+            layout,
             value_map: HashMap::new(),
             wide_value_slots: HashMap::new(),
             block_map: HashMap::new(),
@@ -1534,8 +1541,8 @@ fn select_inst(
             // a stack `logical :: arr(N)` wrote 3 bytes past the slot.
             let elem_size = match &inst.ty {
                 IrType::Ptr(inner) => match inner.as_ref() {
-                    IrType::Struct(_) => alloca_size(inner) as i64,
-                    _ => inner.size_bytes() as i64,
+                    IrType::Struct(_) => alloca_size(inner, ctx.layout) as i64,
+                    _ => inner.size_bytes(&ctx.layout) as i64,
                 },
                 _ => 4, // fallback
             };
@@ -3434,7 +3441,7 @@ fn fcmp_to_arm_cond(op: CmpOp) -> ArmCond {
 }
 
 /// Compute allocation size for an IR type.
-fn alloca_size(ty: &IrType) -> u32 {
+fn alloca_size(ty: &IrType, layout: crate::target::TargetLayout) -> u32 {
     match ty {
         IrType::Void => 0,
         IrType::Bool => 4, // use 4 bytes for alignment
@@ -3447,8 +3454,8 @@ fn alloca_size(ty: &IrType) -> u32 {
             // values themselves remain byte-sized.
             let elem_size = match elem.as_ref() {
                 IrType::Bool => 4,
-                IrType::Struct(_) => alloca_size(elem),
-                _ => elem.size_bytes() as u32,
+                IrType::Struct(_) => alloca_size(elem, layout),
+                _ => elem.size_bytes(&layout) as u32,
             };
             elem_size * (*count as u32)
         }
@@ -3501,10 +3508,10 @@ mod tests {
     fn select_simple(build: impl FnOnce(&mut FuncBuilder)) -> MachineFunction {
         let mut func = Function::new("test".into(), vec![], IrType::Void);
         {
-            let mut b = FuncBuilder::new(&mut func);
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
             build(&mut b);
         }
-        select_function(&func)
+        select_function(&func, crate::target::TargetLayout::LP64)
     }
 
     #[test]
@@ -3816,7 +3823,7 @@ mod tests {
     fn select_call_arg_from_later_block_alloca_has_preallocated_vreg() {
         let mut func = Function::new("test".into(), vec![], IrType::Void);
         {
-            let mut b = FuncBuilder::new(&mut func);
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
             let use_block = b.create_block("use");
             let def_block = b.create_block("def");
 
@@ -3841,7 +3848,7 @@ mod tests {
             b.branch(use_block, vec![]);
         }
 
-        let mf = select_function(&func);
+        let mf = select_function(&func, crate::target::TargetLayout::LP64);
         assert!(
             mf.blocks.iter().any(|block| {
                 block.insts.iter().any(|inst| {
@@ -3975,7 +3982,7 @@ mod tests {
         //   tmp = pb;  pb = pa;  pa = tmp     (3 moves)
         let mut func = Function::new("test".into(), vec![], IrType::Void);
         {
-            let mut b = FuncBuilder::new(&mut func);
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
             let header = b.create_block("header");
             let pa = b.add_block_param(header, IrType::Int(IntWidth::I32));
             let pb = b.add_block_param(header, IrType::Int(IntWidth::I32));
@@ -3995,7 +4002,7 @@ mod tests {
             b.set_block(exit);
             b.ret_void();
         }
-        let mf = select_function(&func);
+        let mf = select_function(&func, crate::target::TargetLayout::LP64);
         let body_mb = find_block(&mf, "body");
         let moves = count_vreg_moves(body_mb, ArmOpcode::MovReg);
         assert_eq!(
@@ -4012,7 +4019,7 @@ mod tests {
         // Resolution: tmp = pb;  pb = pc;  pc = pa;  pa = tmp   (4 moves)
         let mut func = Function::new("test".into(), vec![], IrType::Void);
         {
-            let mut b = FuncBuilder::new(&mut func);
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
             let header = b.create_block("header");
             let pa = b.add_block_param(header, IrType::Int(IntWidth::I32));
             let pb = b.add_block_param(header, IrType::Int(IntWidth::I32));
@@ -4034,7 +4041,7 @@ mod tests {
             b.set_block(exit);
             b.ret_void();
         }
-        let mf = select_function(&func);
+        let mf = select_function(&func, crate::target::TargetLayout::LP64);
         let body_mb = find_block(&mf, "body");
         let moves = count_vreg_moves(body_mb, ArmOpcode::MovReg);
         assert_eq!(
@@ -4052,7 +4059,7 @@ mod tests {
         // move; the 2-cycle adds 3 moves for a total of 4.
         let mut func = Function::new("test".into(), vec![], IrType::Void);
         {
-            let mut b = FuncBuilder::new(&mut func);
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
             let header = b.create_block("header");
             let pa = b.add_block_param(header, IrType::Int(IntWidth::I32));
             let pb = b.add_block_param(header, IrType::Int(IntWidth::I32));
@@ -4077,7 +4084,7 @@ mod tests {
             b.set_block(exit);
             b.ret_void();
         }
-        let mf = select_function(&func);
+        let mf = select_function(&func, crate::target::TargetLayout::LP64);
         let body_mb = find_block(&mf, "body");
         let moves = count_vreg_moves(body_mb, ArmOpcode::MovReg);
         assert_eq!(
@@ -4095,7 +4102,7 @@ mod tests {
         // Expected: 3 GP MovReg + 3 FP FmovReg = 6 total moves.
         let mut func = Function::new("test".into(), vec![], IrType::Void);
         {
-            let mut b = FuncBuilder::new(&mut func);
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
             let header = b.create_block("header");
             let ia = b.add_block_param(header, IrType::Int(IntWidth::I32));
             let ib = b.add_block_param(header, IrType::Int(IntWidth::I32));
@@ -4120,7 +4127,7 @@ mod tests {
             b.set_block(exit);
             b.ret_void();
         }
-        let mf = select_function(&func);
+        let mf = select_function(&func, crate::target::TargetLayout::LP64);
         let body_mb = find_block(&mf, "body");
         let gp_moves = count_vreg_moves(body_mb, ArmOpcode::MovReg);
         let fp_moves = count_vreg_moves(body_mb, ArmOpcode::FmovReg);
@@ -4138,9 +4145,18 @@ mod tests {
 
     #[test]
     fn logical_arrays_use_default_kind_storage_for_stack_slots() {
-        assert_eq!(alloca_size(&IrType::Array(Box::new(IrType::Bool), 3)), 12);
         assert_eq!(
-            alloca_size(&IrType::Array(Box::new(IrType::Int(IntWidth::I32)), 3)),
+            alloca_size(
+                &IrType::Array(Box::new(IrType::Bool), 3),
+                crate::target::TargetLayout::LP64
+            ),
+            12
+        );
+        assert_eq!(
+            alloca_size(
+                &IrType::Array(Box::new(IrType::Int(IntWidth::I32)), 3),
+                crate::target::TargetLayout::LP64
+            ),
             12
         );
     }
@@ -4201,7 +4217,7 @@ mod tests {
         };
         let mut func = Function::new("vadd_test".into(), vec![], IrType::Void);
         {
-            let mut b = FuncBuilder::new(&mut func);
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
             // Two pointer params synthesized via alloca for the
             // smoke test — keeps the body small but exercises the
             // VLoad / VAdd / VStore chain.
@@ -4215,7 +4231,7 @@ mod tests {
             b.ret_void();
         }
 
-        let mf = select_function(&func);
+        let mf = select_function(&func, crate::target::TargetLayout::LP64);
         let opcodes: Vec<ArmOpcode> = mf
             .blocks
             .iter()
@@ -4290,7 +4306,7 @@ mod tests {
         };
         let mut func = Function::new("vfma_test".into(), vec![], IrType::Void);
         {
-            let mut b = FuncBuilder::new(&mut func);
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
             let p_a = b.alloca(v_ty.clone());
             let p_b = b.alloca(v_ty.clone());
             let p_c = b.alloca(v_ty.clone());
@@ -4301,7 +4317,7 @@ mod tests {
             b.ret_void();
         }
 
-        let mf = select_function(&func);
+        let mf = select_function(&func, crate::target::TargetLayout::LP64);
         let opcodes: Vec<ArmOpcode> = mf
             .blocks
             .iter()

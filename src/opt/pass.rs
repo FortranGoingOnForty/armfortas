@@ -166,7 +166,7 @@ mod tests {
     }
 
     fn empty_module() -> Module {
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Void);
         // Entry block needs a terminator to be valid.
         let entry = f.entry;

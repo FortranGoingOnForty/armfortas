@@ -160,7 +160,7 @@ mod tests {
     /// Build a function where the loop header has TWO out-of-loop
     /// predecessors (entry and an if_else block), so no preheader exists.
     fn build_two_entry_loop() -> Module {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("test".into(), vec![], IrType::Void);
 
         let header = f.create_block("header");

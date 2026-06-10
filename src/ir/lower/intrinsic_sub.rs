@@ -568,7 +568,7 @@ pub(crate) fn lower_intrinsic_subroutine(
                             IrType::Ptr(Box::new(elem_ty.clone())),
                             base_ptr,
                         );
-                        let elem_size = b.const_i64(ir_scalar_byte_size(&elem_ty));
+                        let elem_size = b.const_i64(ir_scalar_byte_size(&elem_ty, ctx.layout));
                         store_byte_aggregate_field(
                             b,
                             target_addr,

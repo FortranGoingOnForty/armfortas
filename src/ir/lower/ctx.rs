@@ -230,6 +230,8 @@ pub(super) struct LocalInfo {
 
 /// Lowering context — tracks locals, loop scopes, and symbol table.
 pub(super) struct LowerCtx<'a> {
+    /// Target layout of the module under construction (x02).
+    pub(super) layout: crate::target::TargetLayout,
     pub(super) locals: HashMap<String, LocalInfo>,
     /// Lowercase names of OPTIONAL dummy arguments in the current subprogram.
     /// Hidden character-length forwarding must treat an absent optional
@@ -320,8 +322,10 @@ impl<'a> LowerCtx<'a> {
         char_len_star_params: &'a HashMap<String, Vec<bool>>,
         contained_host_refs: &'a HashMap<String, Vec<String>>,
         ambiguous_use_warnings: AmbiguousUseWarnings,
+        layout: crate::target::TargetLayout,
     ) -> Self {
         Self {
+            layout,
             locals: HashMap::new(),
             optional_locals: HashSet::new(),
             loops: Vec::new(),

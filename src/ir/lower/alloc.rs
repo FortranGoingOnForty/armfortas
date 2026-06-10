@@ -424,7 +424,7 @@ pub(crate) fn alloc_decls(
                             dim_buf
                         };
 
-                        let elem_size = b.const_i64(ir_scalar_byte_size(&array_elem_ty));
+                        let elem_size = b.const_i64(ir_scalar_byte_size(&array_elem_ty, b.layout));
                         let rank_val = b.const_i32(rank as i32);
                         let stat_slot = b.alloca(IrType::Int(IntWidth::I32));
                         b.call(
@@ -497,7 +497,7 @@ pub(crate) fn alloc_decls(
                             extract_array_dims_with_init(specs, init_expr, &param_consts, Some(st));
                         let total_size: i64 = dims.iter().map(|(_, size)| *size).product();
                         let elem_ty = fixed_char_storage_ir_type(len);
-                        let elem_bytes = ir_scalar_byte_size(&elem_ty);
+                        let elem_bytes = ir_scalar_byte_size(&elem_ty, b.layout);
                         let total_bytes = total_size * elem_bytes;
                         let space = b.const_i32(b' ' as i32);
                         let total_bytes_val = b.const_i64(total_bytes);
@@ -809,7 +809,7 @@ pub(crate) fn alloc_decls(
                         } else {
                             (elem_ty.clone(), None, CharKind::None)
                         };
-                    let elem_bytes = ir_scalar_byte_size(&array_elem_ty);
+                    let elem_bytes = ir_scalar_byte_size(&array_elem_ty, b.layout);
                     let total_bytes = total_size * elem_bytes;
                     const STACK_THRESHOLD: i64 = 64 * 1024; // 64KB
 

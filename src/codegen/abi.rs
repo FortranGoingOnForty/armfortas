@@ -150,3 +150,49 @@ pub fn classify_abi_arg(ty: &IrType, state: &mut AbiArgState) -> AbiArgLoc {
         }
     }
 }
+
+#[cfg(test)]
+mod layout_drift_tests {
+    use super::*;
+    use crate::target::TargetLayout;
+
+    /// x02 drift guard: `abi_stack_layout` answers "stack slot when
+    /// passed" and deliberately does NOT route through `TargetLayout`
+    /// (x04's classifier owns call-ABI shape). The duplication is by
+    /// design; silent drift on the values they share is not.
+    #[test]
+    fn abi_stack_layout_agrees_with_target_layout_on_shared_values() {
+        let l = TargetLayout::LP64;
+        assert_eq!(
+            abi_stack_layout(&IrType::Int(IntWidth::I128)),
+            (16, l.i128_align as i64)
+        );
+        assert_eq!(
+            abi_stack_layout(&IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)))),
+            (l.ptr_bytes as i64, l.ptr_align as i64)
+        );
+        assert_eq!(abi_stack_layout(&IrType::Float(FloatWidth::F64)), (8, 8));
+        assert_eq!(
+            abi_stack_layout(&IrType::Vector {
+                lanes: 4,
+                elem: Box::new(IrType::Float(FloatWidth::F32))
+            }),
+            (l.vector_bytes as i64, l.vector_bytes as i64)
+        );
+    }
+
+    /// The compiler-side array_descriptor() must reproduce the 384-byte
+    /// contract that runtime/src/descriptor.rs asserts independently
+    /// (`size_of::<ArrayDescriptor>() == 384`). If these disagree, the
+    /// accessor formula is wrong, not the runtime constant.
+    #[test]
+    fn descriptor_accessors_match_runtime_contract() {
+        let l = TargetLayout::LP64;
+        assert_eq!(l.array_descriptor().0, 384, "see runtime/src/descriptor.rs");
+        assert_eq!(
+            l.string_descriptor().0,
+            32,
+            "see runtime/src/descriptor.rs StringDescriptor"
+        );
+    }
+}

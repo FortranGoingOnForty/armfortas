@@ -150,7 +150,7 @@ mod tests {
 
     #[test]
     fn removes_uncalled_internal_function() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         // func 0: main (entry, kept)
         let mut main_f = Function::new("main".into(), vec![], IrType::Void);
         main_f.block_mut(main_f.entry).terminator = Some(Terminator::Return(None));
@@ -171,7 +171,7 @@ mod tests {
 
     #[test]
     fn keeps_called_function() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         // func 0: caller (entry, always kept) — calls callee at index 1
         let mut caller = Function::new("caller".into(), vec![], IrType::Void);
         let cid = caller.next_value_id();
@@ -197,7 +197,7 @@ mod tests {
 
     #[test]
     fn keeps_module_visible_function_even_without_callers() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         // func 0: __prog_entry (kept as program root)
         let mut prog = Function::new("__prog_entry".into(), vec![], IrType::Void);
         prog.block_mut(prog.entry).terminator = Some(Terminator::Return(None));
@@ -223,7 +223,7 @@ mod tests {
 
     #[test]
     fn keeps_program_body_even_when_helper_is_first() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
 
         let mut helper = Function::new("helper".into(), vec![], IrType::Void);
         helper.internal_only = true;
@@ -246,7 +246,7 @@ mod tests {
 
     #[test]
     fn keeps_internal_function_when_its_address_is_taken() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
 
         let mut prog = Function::new("__prog_entry".into(), vec![], IrType::Void);
         let addr = prog.next_value_id();

@@ -40,7 +40,7 @@ fn copy_array_result_to_fixed_dest(
     src_elem_ty: Option<&IrType>,
 ) {
     let n = array_total_elems_value(b, info);
-    let elem_bytes = b.const_i64(ir_scalar_byte_size(&info.ty));
+    let elem_bytes = b.const_i64(ir_scalar_byte_size(&info.ty, b.layout));
     let byte_count = b.imul(n, elem_bytes);
     let src_kind_tag = src_elem_ty.and_then(numeric_kind_tag_for_ir_type);
     let dest_kind_tag = numeric_kind_tag_for_ir_type(&info.ty);
@@ -3608,7 +3608,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             };
                             let elem_size_bytes = dynamic_layout
                                 .map(|layout| layout.size as i64)
-                                .unwrap_or_else(|| descriptor_element_size_bytes(&field_info));
+                                .unwrap_or_else(|| {
+                                    descriptor_element_size_bytes(&field_info, ctx.layout)
+                                });
                             let es = allocated_array_elem_size(
                                 b,
                                 &field_info,
@@ -3875,7 +3877,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 last_dim_assumed_size: false,
                             };
                             let elem_size_bytes =
-                                local_storage_size_bytes(&field_info, ctx.type_layouts);
+                                local_storage_size_bytes(&field_info, ctx.type_layouts, ctx.layout);
                             let size_val = b.const_i32(elem_size_bytes as i32);
                             let ptr = b.runtime_call(
                                 RuntimeFunc::Allocate,
@@ -3934,7 +3936,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             }
                             continue;
                         }
-                        let elem_size_bytes = local_storage_size_bytes(&info, ctx.type_layouts);
+                        let elem_size_bytes =
+                            local_storage_size_bytes(&info, ctx.type_layouts, ctx.layout);
 
                         if info.allocatable || info.descriptor_arg {
                             let rank = args.len();
@@ -4945,7 +4948,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 offset: i64,
                                 field_ty: IrType,
                                 val| {
-                    let field_bytes = field_ty.size_bytes() as i64;
+                    let field_bytes = field_ty.size_bytes(&b.layout) as i64;
                     debug_assert!(field_bytes > 0 && offset % field_bytes == 0);
                     let slot = b.const_i64(offset / field_bytes);
                     let ptr = b.gep(base, vec![slot], field_ty.clone());
@@ -6000,7 +6003,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 // base_addr: base + (lo - 1) * elem_size
                                 let one = b.const_i64(1);
                                 let lo_0 = b.isub(lo, one);
-                                let elem_bytes = b.const_i64(ir_scalar_byte_size(&arr_info.ty));
+                                let elem_bytes =
+                                    b.const_i64(ir_scalar_byte_size(&arr_info.ty, ctx.layout));
                                 let byte_off = b.imul(lo_0, elem_bytes);
                                 let slice_base =
                                     b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));

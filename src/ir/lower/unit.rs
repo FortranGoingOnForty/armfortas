@@ -87,6 +87,7 @@ pub(crate) fn lower_unit(
                 char_len_star_params,
                 contained_host_refs,
                 ambiguous_use_warnings.clone(),
+                module.layout,
             );
             ctx.proc_scope_id = {
                 let raw_name = name.as_deref();
@@ -107,7 +108,7 @@ pub(crate) fn lower_unit(
             let required_import_names = collect_required_import_names(decls, body);
 
             {
-                let mut b = FuncBuilder::new(&mut func);
+                let mut b = FuncBuilder::new(&mut func, ctx.layout);
                 let _setup_proc_scope_guard = ProcScopeGuard::enter(ctx.proc_scope_id);
                 install_common_locals(&mut b, &mut ctx.locals, decls);
                 install_equivalence_locals(
@@ -366,6 +367,7 @@ pub(crate) fn lower_unit(
             // writes. Order matches contained_host_refs[name].
             let host_ref_infos = build_host_ref_params(
                 name,
+                module.layout,
                 host_decls,
                 host_param_consts,
                 contained_host_refs,
@@ -391,6 +393,7 @@ pub(crate) fn lower_unit(
                 char_len_star_params,
                 contained_host_refs,
                 ambiguous_use_warnings.clone(),
+                module.layout,
             );
             ctx.proc_scope_id = proc_scope_id;
             let mut pending_globals: Vec<PendingGlobal> = Vec::new();
@@ -415,7 +418,7 @@ pub(crate) fn lower_unit(
                 .collect();
 
             {
-                let mut b = FuncBuilder::new(&mut func);
+                let mut b = FuncBuilder::new(&mut func, ctx.layout);
                 let _setup_proc_scope_guard = ProcScopeGuard::enter(ctx.proc_scope_id);
 
                 // Set up hidden-length locals for assumed-len char dummies.
@@ -861,6 +864,7 @@ pub(crate) fn lower_unit(
             }
             let host_ref_infos = build_host_ref_params(
                 name,
+                module.layout,
                 host_decls,
                 host_param_consts,
                 contained_host_refs,
@@ -887,6 +891,7 @@ pub(crate) fn lower_unit(
                 char_len_star_params,
                 contained_host_refs,
                 ambiguous_use_warnings.clone(),
+                module.layout,
             );
             ctx.proc_scope_id = proc_scope_id;
             let mut pending_globals: Vec<PendingGlobal> = Vec::new();
@@ -914,7 +919,7 @@ pub(crate) fn lower_unit(
                 .collect();
 
             {
-                let mut b = FuncBuilder::new(&mut func);
+                let mut b = FuncBuilder::new(&mut func, ctx.layout);
                 let _setup_proc_scope_guard = ProcScopeGuard::enter(ctx.proc_scope_id);
 
                 let mut hidden_len_addrs: HashMap<String, ValueId> = HashMap::new();

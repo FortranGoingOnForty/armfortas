@@ -1214,15 +1214,17 @@ pub fn compile(opts: &Options) -> Result<(), String> {
 
     // 5. Semantic analysis.
     let phase = phases.start("sema");
-    let resolve_result = resolve::resolve_file(&units, &opts.module_search_paths).map_err(|e| {
-        format!(
-            "{}:{}:{}: {}",
-            opts.input.display(),
-            e.span.start.line,
-            e.span.start.col,
-            e.msg
-        )
-    })?;
+    let target_layout = crate::target::TargetLayout::of(&opts.target);
+    let resolve_result = resolve::resolve_file(&units, &opts.module_search_paths, target_layout)
+        .map_err(|e| {
+            format!(
+                "{}:{}:{}: {}",
+                opts.input.display(),
+                e.span.start.line,
+                e.span.start.col,
+                e.msg
+            )
+        })?;
     let mut st = resolve_result.st;
     if opts.force_implicit_none {
         st.force_implicit_none_all_units();
@@ -1301,6 +1303,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         external_optional_params,
         external_descriptor_params,
         external_char_len_star,
+        target_layout,
     );
     if !opts.check_bounds {
         strip_bounds_check_calls(&mut ir_module);
@@ -1437,7 +1440,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     // into a __DATA,__data section. Must come before _main so the
     // labels are defined when functions reference them.
     if !ir_module.globals.is_empty() {
-        asm_text.push_str(&emit::emit_globals(&ir_module.globals));
+        asm_text.push_str(&emit::emit_globals(&ir_module.globals, &ir_module.layout));
         asm_text.push('\n');
     }
 

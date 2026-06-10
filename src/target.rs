@@ -163,6 +163,87 @@ impl fmt::Display for TargetSpec {
     }
 }
 
+/// Sizes and alignments the frontend computes with (sprint x02). Plain
+/// data derived from a `TargetSpec` — no trait, no global, no Default;
+/// layout threads explicitly from the driver down.
+///
+/// Both supported arches are LP64, little-endian, IEEE-754 with the
+/// same natural alignments, so `of()` returns identical values today.
+/// The match on arch is the seam where a future ILP32 or wider-vector
+/// target would differ in exactly one place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TargetLayout {
+    pub ptr_bytes: usize,
+    pub ptr_align: usize,
+    pub bool_bytes: usize,
+    pub i128_align: usize,
+    /// Vector register width. NEON and SSE2 baseline are both 128-bit;
+    /// AVX is a capability query (sprint x10), not a layout field.
+    pub vector_bytes: usize,
+    pub max_scalar_align: usize,
+}
+
+/// Closure slots reserved alongside a procedure-pointer component.
+/// Pre-dates x02 (`PROC_PTR_CLOSURE_SLOTS` in sema); restated here so
+/// `proc_ptr_component()` records the derivation from pointer width.
+const PROC_PTR_CLOSURE_SLOTS: usize = 8;
+
+impl TargetLayout {
+    /// The LP64 layout every supported target shares (the coincidence
+    /// asserted by `layouts_coincide_across_supported_targets`). For
+    /// unit tests building IR modules directly; production code derives
+    /// layout from the selected target via `of()`.
+    pub const LP64: TargetLayout = TargetLayout {
+        ptr_bytes: 8,
+        ptr_align: 8,
+        bool_bytes: 1,
+        i128_align: 16,
+        vector_bytes: 16,
+        max_scalar_align: 16,
+    };
+
+    pub fn of(spec: &TargetSpec) -> TargetLayout {
+        match spec.arch {
+            // Identical on purpose; see the struct doc.
+            Arch::Arm64 | Arch::X86_64 => TargetLayout {
+                ptr_bytes: 8,
+                ptr_align: 8,
+                bool_bytes: 1,
+                i128_align: 16,
+                vector_bytes: 16,
+                max_scalar_align: 16,
+            },
+        }
+    }
+
+    /// `{base_addr, elem_size, rank, flags, dims[15]}` — the stable
+    /// array-descriptor ABI. The runtime asserts 384 independently
+    /// (`runtime/src/descriptor.rs`); if this formula and that assert
+    /// ever disagree, the formula is wrong.
+    pub fn array_descriptor(&self) -> (usize, usize) {
+        // Header: base_addr (ptr) + elem_size (i64) + rank:i32/flags:u32
+        // packed into one slot = 3 pointer-sized slots. Then 15 dims ×
+        // (lower, upper, stride) = 45 slots. 8 × 48 = 384.
+        (self.ptr_bytes * (3 + 45), self.ptr_align)
+    }
+
+    /// `{data, len, capacity, flags}` — the stable string-descriptor ABI.
+    pub fn string_descriptor(&self) -> (usize, usize) {
+        (self.ptr_bytes * 4, self.ptr_align)
+    }
+
+    /// `{data_ptr, type_tag}` carried for `class(T)` / `class(*)` /
+    /// `type(*)` entities.
+    pub fn class_descriptor(&self) -> (usize, usize) {
+        (self.ptr_bytes * 2, self.ptr_align)
+    }
+
+    /// Procedure-pointer component: target pointer plus closure slots.
+    pub fn proc_ptr_component(&self) -> usize {
+        self.ptr_bytes * (1 + PROC_PTR_CLOSURE_SLOTS)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,5 +331,32 @@ mod tests {
                 .object_format(),
             ObjectFormat::Elf
         );
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    #[test]
+    fn layouts_coincide_across_supported_targets() {
+        let layouts: Vec<TargetLayout> = SUPPORTED_TARGETS
+            .iter()
+            .map(|t| TargetLayout::of(&TargetSpec::parse(t).unwrap()))
+            .collect();
+        for pair in layouts.windows(2) {
+            assert_eq!(pair[0], pair[1], "LP64 layout coincidence is the contract");
+        }
+    }
+
+    #[test]
+    fn descriptor_footprints_match_the_stable_abi() {
+        let layout = TargetLayout::of(&TargetSpec::parse("arm64-macos").unwrap());
+        // 384 is asserted independently by runtime/src/descriptor.rs;
+        // these are the compiler-side halves of that contract.
+        assert_eq!(layout.array_descriptor(), (384, 8));
+        assert_eq!(layout.string_descriptor(), (32, 8));
+        assert_eq!(layout.class_descriptor(), (16, 8));
+        assert_eq!(layout.proc_ptr_component(), 72);
     }
 }

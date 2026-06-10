@@ -1586,13 +1586,13 @@ mod tests {
     fn linear_scan_assigns_registers() {
         let mut func = Function::new("test".into(), vec![], IrType::Void);
         {
-            let mut b = FuncBuilder::new(&mut func);
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
             let x = b.const_i32(10);
             let y = b.const_i32(20);
             let _z = b.iadd(x, y);
             b.ret_void();
         }
-        let mut mf = select_function(&func);
+        let mut mf = select_function(&func, crate::target::TargetLayout::LP64);
         let result = linear_scan(&mut mf);
         // Should have assignments for the vregs.
         assert!(
@@ -1610,7 +1610,7 @@ mod tests {
     fn linear_scan_no_x18() {
         let mut func = Function::new("test".into(), vec![], IrType::Void);
         {
-            let mut b = FuncBuilder::new(&mut func);
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
             // Create many vregs to exercise the allocator.
             let mut vals = Vec::new();
             for i in 0..20 {
@@ -1623,7 +1623,7 @@ mod tests {
             }
             b.ret_void();
         }
-        let mut mf = select_function(&func);
+        let mut mf = select_function(&func, crate::target::TargetLayout::LP64);
         let result = linear_scan(&mut mf);
         // x18 must never be assigned.
         for phys in result.assignments.values() {
@@ -1805,14 +1805,14 @@ mod tests {
         // should stay empty (no prologue STP/LDP overhead).
         let mut func = Function::new("test".into(), vec![], IrType::Void);
         {
-            let mut b = FuncBuilder::new(&mut func);
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
             let x = b.const_i32(1);
             let y = b.const_i32(2);
             let z = b.iadd(x, y);
             let _w = b.iadd(z, x);
             b.ret_void();
         }
-        let mut mf = select_function(&func);
+        let mut mf = select_function(&func, crate::target::TargetLayout::LP64);
         let result = linear_scan(&mut mf);
         assert!(
             result.callee_saved_used.is_empty(),

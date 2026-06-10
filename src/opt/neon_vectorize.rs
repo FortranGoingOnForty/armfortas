@@ -3368,7 +3368,7 @@ mod tests {
     /// Build the canonical `c(i) = a(i) + b(i)` loop over i32 arrays of
     /// length 32 (trip count divisible by V=4).
     fn build_array_add_loop() -> (Module, BlockId) {
-        let mut module = Module::new("m".into());
+        let mut module = Module::new("m".into(), crate::target::TargetLayout::LP64);
         let mut func = Function::new("__prog_vec".into(), vec![], IrType::Void);
         let entry = func.entry;
         let header = func.create_block("do_check");
@@ -3558,7 +3558,7 @@ mod tests {
     /// a `VBroadcast` into the preheader, and rewrite the binop to
     /// consume the broadcast vector.
     fn build_array_add_scalar_loop() -> (Module, BlockId, BlockId) {
-        let mut module = Module::new("m".into());
+        let mut module = Module::new("m".into(), crate::target::TargetLayout::LP64);
         let mut func = Function::new("__prog_vec".into(), vec![], IrType::Void);
         let entry = func.entry;
         let header = func.create_block("do_check");
@@ -3724,7 +3724,7 @@ mod tests {
     /// Build `c(i) = b(i)` over i32(32) — a pure array copy with no
     /// arithmetic between the load and the store.
     fn build_array_copy_loop() -> (Module, BlockId) {
-        let mut module = Module::new("m".into());
+        let mut module = Module::new("m".into(), crate::target::TargetLayout::LP64);
         let mut func = Function::new("__prog_vec".into(), vec![], IrType::Void);
         let entry = func.entry;
         let header = func.create_block("do_check");
@@ -3872,7 +3872,7 @@ mod tests {
         // length 31 → not divisible by V=4. The pass vectorizes 28
         // iterations (head_count = 7 × 4) and peels 3 scalar
         // iterations into the exit block.
-        let mut module = Module::new("m".into());
+        let mut module = Module::new("m".into(), crate::target::TargetLayout::LP64);
         let mut func = Function::new("__prog_vec".into(), vec![], IrType::Void);
         let entry = func.entry;
         let header = func.create_block("do_check");

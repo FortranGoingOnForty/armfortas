@@ -613,7 +613,7 @@ fn copy_parameter_array_init(
     let dest_is_complex = is_complex_ty(&dest.ty);
     let source_is_complex = is_complex_ty(source_ty);
     let complex_bytes = if dest_is_complex {
-        Some(b.const_i64(ir_scalar_byte_size(&dest.ty)))
+        Some(b.const_i64(ir_scalar_byte_size(&dest.ty, b.layout)))
     } else {
         None
     };

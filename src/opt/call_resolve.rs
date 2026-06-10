@@ -57,7 +57,7 @@ mod tests {
 
     #[test]
     fn resolves_internal_calls() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
 
         // Callee: function "double_it"
         let mut callee = Function::new("double_it".into(), vec![], IrType::Int(IntWidth::I32));
@@ -98,7 +98,7 @@ mod tests {
 
     #[test]
     fn leaves_external_calls_unchanged() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("main".into(), vec![], IrType::Void);
         let call_id = f.next_value_id();
         f.register_type(call_id, IrType::Void);

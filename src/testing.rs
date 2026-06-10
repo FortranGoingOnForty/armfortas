@@ -328,7 +328,12 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
         stages.insert(Stage::Ast, CapturedStage::Text(format!("{:#?}", units)));
     }
 
-    let rr = resolve::resolve_file(&units, &[]).map_err(|e| CaptureFailure {
+    let rr = resolve::resolve_file(
+        &units,
+        &[],
+        crate::target::TargetLayout::of(&crate::target::TargetSpec::host()),
+    )
+    .map_err(|e| CaptureFailure {
         input: input.clone(),
         opt_level: request.opt_level,
         stage: FailureStage::Sema,
@@ -366,6 +371,7 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
         std::collections::HashMap::new(),
         std::collections::HashMap::new(),
         std::collections::HashMap::new(),
+        crate::target::TargetLayout::of(&crate::target::TargetSpec::host()),
     );
     let ir_errors = verify::verify_module(&ir_module);
     if !ir_errors.is_empty() {
@@ -854,7 +860,7 @@ fn emit_module_asm(module: &crate::ir::inst::Module, allocated: &[MachineFunctio
     }
 
     if !module.globals.is_empty() {
-        asm_text.push_str(&emit::emit_globals(&module.globals));
+        asm_text.push_str(&emit::emit_globals(&module.globals, &module.layout));
         asm_text.push('\n');
     }
 

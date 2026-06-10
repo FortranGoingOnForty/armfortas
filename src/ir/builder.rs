@@ -11,14 +11,18 @@ use crate::lexer::{Position, Span};
 pub struct FuncBuilder<'a> {
     func: &'a mut Function,
     current_block: BlockId,
+    /// Target layout of the module under construction (x02); helpers
+    /// that compute sizes while emitting read it from here.
+    pub layout: crate::target::TargetLayout,
 }
 
 impl<'a> FuncBuilder<'a> {
-    pub fn new(func: &'a mut Function) -> Self {
+    pub fn new(func: &'a mut Function, layout: crate::target::TargetLayout) -> Self {
         let entry = func.entry;
         Self {
             func,
             current_block: entry,
+            layout,
         }
     }
 
@@ -560,7 +564,7 @@ mod tests {
     fn build_simple_function() {
         let mut func = Function::new("main".into(), vec![], IrType::Void);
         {
-            let mut b = FuncBuilder::new(&mut func);
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
             let x = b.const_i32(10);
             let y = b.const_i32(20);
             let z = b.iadd(x, y);
@@ -576,7 +580,7 @@ mod tests {
     fn build_branching_function() {
         let mut func = Function::new("test".into(), vec![], IrType::Void);
         {
-            let mut b = FuncBuilder::new(&mut func);
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
             let cond = b.const_bool(true);
             let bb_true = b.create_block("then");
             let bb_false = b.create_block("else");
@@ -595,7 +599,7 @@ mod tests {
     fn build_block_params() {
         let mut func = Function::new("loop".into(), vec![], IrType::Void);
         {
-            let mut b = FuncBuilder::new(&mut func);
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
             let header = b.create_block("header");
             let i_param = b.add_block_param(header, IrType::Int(IntWidth::I32));
             let init = b.const_i32(0);
@@ -620,7 +624,7 @@ mod tests {
     fn alloca_load_store() {
         let mut func = Function::new("test".into(), vec![], IrType::Void);
         {
-            let mut b = FuncBuilder::new(&mut func);
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
             let addr = b.alloca(IrType::Int(IntWidth::I32));
             let val = b.const_i32(42);
             b.store(val, addr);
@@ -635,7 +639,7 @@ mod tests {
     fn float_arithmetic() {
         let mut func = Function::new("test".into(), vec![], IrType::Void);
         {
-            let mut b = FuncBuilder::new(&mut func);
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
             let a = b.const_f64(3.14);
             let c = b.const_f64(2.0);
             let sum = b.fadd(a, c);
@@ -650,7 +654,7 @@ mod tests {
     fn conversions() {
         let mut func = Function::new("test".into(), vec![], IrType::Void);
         {
-            let mut b = FuncBuilder::new(&mut func);
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
             let i = b.const_i32(42);
             let f = b.int_to_float(i, FloatWidth::F64);
             let back = b.float_to_int(f, IntWidth::I32);

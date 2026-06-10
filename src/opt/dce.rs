@@ -332,7 +332,7 @@ mod tests {
 
     #[test]
     fn removes_unused_const() {
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Void);
         push(
             &mut f,
@@ -349,7 +349,7 @@ mod tests {
 
     #[test]
     fn keeps_const_used_by_return() {
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
         let v = push(
             &mut f,
@@ -367,7 +367,7 @@ mod tests {
     #[test]
     fn keeps_store_even_if_address_unused() {
         // Alloca + Store should both stay even though no one loads.
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Void);
         let addr = push(
             &mut f,
@@ -395,7 +395,7 @@ mod tests {
         // %3 = iadd %1, %2     ; unused
         // %4 = fmul ...        ; uses %3 transitively?  No — distinct chain
         // After DCE: only the terminator remains.
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Void);
         let a = push(
             &mut f,
@@ -419,7 +419,7 @@ mod tests {
 
     #[test]
     fn keeps_call_even_if_result_unused() {
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Void);
         push(
             &mut f,
@@ -436,7 +436,7 @@ mod tests {
 
     #[test]
     fn removes_unused_internal_pure_call() {
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
 
         let mut callee = Function::new("pure_fn".into(), vec![], IrType::Int(IntWidth::I32));
         callee.is_pure = true;
@@ -468,7 +468,7 @@ mod tests {
 
     #[test]
     fn keeps_unused_internal_pure_void_call() {
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
 
         let mut callee = Function::new("pure_hidden_result_fn".into(), vec![], IrType::Void);
         callee.is_pure = true;
@@ -496,7 +496,7 @@ mod tests {
 
     #[test]
     fn float_chain_is_dead() {
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Void);
         let a = push(
             &mut f,

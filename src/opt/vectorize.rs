@@ -635,7 +635,7 @@ mod tests {
 
     #[test]
     fn vectorizes_simple_array_add_loop() {
-        let mut module = Module::new("m".into());
+        let mut module = Module::new("m".into(), crate::target::TargetLayout::LP64);
         let mut func = Function::new("__prog_vec".into(), vec![], IrType::Void);
 
         let entry = func.entry;

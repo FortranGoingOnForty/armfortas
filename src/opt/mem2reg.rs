@@ -684,7 +684,7 @@ mod tests {
     // =============================================================
     #[test]
     fn straight_line_single_store_load() {
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
         let entry = f.entry;
 
@@ -748,7 +748,7 @@ mod tests {
 
     #[test]
     fn skips_promotion_when_store_type_differs_from_slot_pointee() {
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Void);
         let entry = f.entry;
 
@@ -802,7 +802,7 @@ mod tests {
     // =============================================================
     #[test]
     fn diamond_merge_inserts_block_param() {
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
         let entry = f.entry;
 
@@ -901,7 +901,7 @@ mod tests {
     // =============================================================
     #[test]
     fn escaping_alloca_not_promoted() {
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Void);
         let entry = f.entry;
         let slot = push_inst(
@@ -936,7 +936,7 @@ mod tests {
     // =============================================================
     #[test]
     fn mix_promotable_and_escaping() {
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
         let entry = f.entry;
         // Promotable: only used by store + load.
@@ -1001,7 +1001,7 @@ mod tests {
     // =============================================================
     #[test]
     fn loop_counter_promoted_with_header_param() {
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Void);
         let entry = f.entry;
         let slot = push_inst(
@@ -1113,7 +1113,7 @@ mod tests {
     // =============================================================
     #[test]
     fn load_before_any_store_reads_undef() {
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
         let entry = f.entry;
         let slot = push_inst(
@@ -1157,7 +1157,7 @@ mod tests {
     // =============================================================
     #[test]
     fn unreachable_block_with_store_does_not_corrupt_ir() {
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
         let entry = f.entry;
 
@@ -1241,7 +1241,7 @@ mod tests {
     // =============================================================
     #[test]
     fn same_target_cond_branch_does_not_double_append() {
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
         let entry = f.entry;
 
@@ -1380,7 +1380,7 @@ mod tests {
     // =============================================================
     #[test]
     fn only_loaded_alloca_promotes_to_undef() {
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
         let entry = f.entry;
         let slot = push_inst(
@@ -1445,7 +1445,7 @@ mod tests {
     // =============================================================
     #[test]
     fn address_escape_via_store_blocks_promotion() {
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Void);
         let entry = f.entry;
 
@@ -1494,7 +1494,7 @@ mod tests {
     // =============================================================
     #[test]
     fn second_mem2reg_run_is_a_noop() {
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
         let entry = f.entry;
 
@@ -1560,7 +1560,7 @@ mod tests {
     // =============================================================
     #[test]
     fn two_allocas_same_merge_inserts_two_params() {
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
         let entry = f.entry;
 
@@ -1679,7 +1679,7 @@ mod tests {
     // =============================================================
     #[test]
     fn branchy_store_of_promoted_load_keeps_ir_valid() {
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new(
             "f".into(),
             vec![Param {
@@ -1843,7 +1843,7 @@ mod tests {
     // =============================================================
     #[test]
     fn multi_store_per_iteration_uses_last_store() {
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Void);
         let entry = f.entry;
 
@@ -1972,7 +1972,7 @@ mod tests {
     // =============================================================
     #[test]
     fn multi_latch_loop_each_latch_contributes_arg() {
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Void);
         let entry = f.entry;
 
@@ -2131,7 +2131,7 @@ mod tests {
     // =============================================================
     #[test]
     fn nested_loops_promote_both_counters() {
-        let mut m = Module::new("t".into());
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Void);
         let entry = f.entry;
 

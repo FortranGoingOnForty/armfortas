@@ -48,7 +48,7 @@ fn push(f: &mut Function, kind: InstKind, ty: IrType) -> ValueId {
 // see a value that disagrees with what runtime would compute.
 #[test]
 fn audit_const_fold_int_to_f32_must_round() {
-    let mut m = Module::new("t".into());
+    let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
     let mut f = Function::new("f".into(), vec![], IrType::Float(FloatWidth::F32));
     let i = push(
         &mut f,
@@ -89,7 +89,7 @@ fn audit_const_fold_int_to_f32_must_round() {
 // FloatTrunc to f32 should round through f32. Test it directly.
 #[test]
 fn audit_const_fold_float_trunc_must_round() {
-    let mut m = Module::new("t".into());
+    let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
     let mut f = Function::new("f".into(), vec![], IrType::Float(FloatWidth::F32));
     let d = push(
         &mut f,
@@ -127,7 +127,7 @@ fn audit_const_fold_float_trunc_must_round() {
 // terminal value. This documents the reverse-order processing.
 #[test]
 fn audit_strength_reduce_chained_identities() {
-    let mut m = Module::new("t".into());
+    let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
     let x = push(
         &mut f,
@@ -194,7 +194,7 @@ fn audit_strength_reduce_mixed_shl_and_identity_in_block() {
     // %3 = const 1
     // %4 = imul %2, %3  ; identity → pass through %2
     // ret %4
-    let mut m = Module::new("t".into());
+    let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
     let x = push(
         &mut f,
@@ -247,7 +247,7 @@ fn audit_strength_reduce_mixed_shl_and_identity_in_block() {
 // match what AArch64 SDIV produces.
 #[test]
 fn audit_const_fold_idiv_i8_min_neg_one() {
-    let mut m = Module::new("t".into());
+    let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I8));
     let a = push(
         &mut f,
@@ -287,7 +287,7 @@ fn audit_const_fold_idiv_i8_min_neg_one() {
 // =============================================================
 #[test]
 fn audit_dce_removes_dead_block_param() {
-    let mut m = Module::new("t".into());
+    let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
     let mut f = Function::new("f".into(), vec![], IrType::Void);
     let target = f.create_block("target");
     let param_id = f.next_value_id();
@@ -337,7 +337,7 @@ fn audit_dce_removes_dead_block_param() {
 #[test]
 fn audit_dce_keeps_live_block_param() {
     // A block param that IS used inside the block must NOT be removed.
-    let mut m = Module::new("t".into());
+    let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
     let target = f.create_block("target");
     let param_id = f.next_value_id();
@@ -370,7 +370,7 @@ fn audit_dce_removes_one_of_two_block_params_keeps_correct_arg() {
     // entry: br target(c0, c1)
     // p0 is dead, p1 is live. Removing p0 must drop the matching
     // arg slot but keep p1 → c1.
-    let mut m = Module::new("t".into());
+    let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
     let target = f.create_block("target");
     let p0 = f.next_value_id();
@@ -460,7 +460,7 @@ fn audit_dce_removes_one_of_two_block_params_keeps_correct_arg() {
 // survive.
 #[test]
 fn audit_dce_cascading_across_outer_iterations() {
-    let mut m = Module::new("t".into());
+    let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
     let mut f = Function::new("f".into(), vec![], IrType::Void);
 
     // entry: computes %c, branches to other
@@ -575,7 +575,7 @@ fn audit_dce_cascading_across_outer_iterations() {
 fn audit_licm_nested_loop_body_computation() {
     use crate::opt::util::find_natural_loops;
 
-    let mut m = Module::new("t".into());
+    let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
     let mut f = Function::new("f".into(), vec![], IrType::Void);
 
     let outer_header = f.create_block("outer_header");
@@ -695,7 +695,7 @@ fn audit_licm_nested_loop_body_computation() {
 fn audit_licm_multi_latch_with_self_loop() {
     use crate::opt::util::find_natural_loops;
 
-    let mut m = Module::new("t".into());
+    let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
     let mut f = Function::new("f".into(), vec![], IrType::Void);
     let header = f.create_block("header");
     let other = f.create_block("other");
@@ -768,7 +768,7 @@ fn audit_licm_multi_latch_with_self_loop() {
 // const and the invariant load into the preheader.
 #[test]
 fn audit_licm_hoists_clean_alloca_load() {
-    let mut m = Module::new("t".into());
+    let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
     let mut f = Function::new("f".into(), vec![], IrType::Void);
     let slot = push(
         &mut f,
@@ -863,7 +863,7 @@ fn audit_licm_hoists_clean_alloca_load() {
 fn audit_pipeline_o2_e2e_loop_through_passmanager() {
     use crate::opt::{build_pipeline, OptLevel};
 
-    let mut m = Module::new("t".into());
+    let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
     let mut f = Function::new("f".into(), vec![], IrType::Void);
     // Build: entry { %0=const 0; br header(%0) }
     //        header(%i:i32) { %k=const 5; %i2=iadd %i, %k; %lim=const 10;
@@ -975,7 +975,7 @@ fn audit_pipeline_o2_e2e_loop_through_passmanager() {
 fn audit_interaction_const_prop_then_dce_removes_orphan_const() {
     use crate::opt::{build_pipeline, OptLevel};
 
-    let mut m = Module::new("t".into());
+    let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
     let mut f = Function::new("f".into(), vec![], IrType::Void);
     let cond = push(&mut f, InstKind::ConstBool(true), IrType::Bool);
     // This constant is ONLY used in the about-to-be-dead else block.
@@ -1040,7 +1040,7 @@ fn audit_interaction_const_prop_then_dce_removes_orphan_const() {
 fn audit_interaction_strength_reduce_orphans_get_dced() {
     use crate::opt::{build_pipeline, OptLevel};
 
-    let mut m = Module::new("t".into());
+    let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
     let x = push(
         &mut f,
@@ -1093,7 +1093,7 @@ fn audit_interaction_strength_reduce_orphans_get_dced() {
 fn audit_const_fold_shl_at_width_bails() {
     // shl 1_i32, 32_i32 — count equals width, AArch64 masks to 0,
     // so the runtime answer is 1. The fold MUST NOT silently emit 0.
-    let mut m = Module::new("t".into());
+    let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
     let v = push(
         &mut f,
@@ -1128,7 +1128,7 @@ fn audit_const_fold_shl_at_width_bails() {
 // =============================================================
 #[test]
 fn audit_const_fold_shl_negative_count_bails() {
-    let mut m = Module::new("t".into());
+    let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
     let v = push(
         &mut f,
@@ -1161,7 +1161,7 @@ fn audit_const_fold_shl_negative_count_bails() {
 // =============================================================
 #[test]
 fn audit_const_fold_lshr_negative_count_bails() {
-    let mut m = Module::new("t".into());
+    let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
     let v = push(
         &mut f,
@@ -1212,7 +1212,7 @@ fn audit_const_fold_width_drift_iadd() {
     // declared IAdd type: i32
     // Expected: -1 + 2 = 1
     // Pre-fix: 255 + 2 = 257 (wrong)
-    let mut m = Module::new("t".into());
+    let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
     let a = f.next_value_id();
     f.block_mut(f.entry).insts.push(Inst {
@@ -1260,7 +1260,7 @@ fn audit_const_fold_width_drift_isub() {
     // a: ConstInt(250, I8)  = -6
     // b: ConstInt(1,   I8)  =  1
     // Expected: -6 - 1 = -7
-    let mut m = Module::new("t".into());
+    let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
     let a = f.next_value_id();
     f.block_mut(f.entry).insts.push(Inst {
@@ -1307,7 +1307,7 @@ fn audit_const_fold_width_drift_imul() {
     // a: ConstInt(255, I8)  = -1
     // b: ConstInt(3,   I8)  =  3
     // Expected: -1 * 3 = -3
-    let mut m = Module::new("t".into());
+    let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
     let a = f.next_value_id();
     f.block_mut(f.entry).insts.push(Inst {
@@ -1355,7 +1355,7 @@ fn audit_const_fold_width_drift_idiv() {
     // b: ConstInt(2,   I8)  =  2
     // Expected: -1 / 2 = 0 (toward zero)
     // Pre-fix: 255 / 2 = 127 (very wrong)
-    let mut m = Module::new("t".into());
+    let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
     let a = f.next_value_id();
     f.block_mut(f.entry).insts.push(Inst {
@@ -1400,7 +1400,7 @@ fn audit_const_fold_width_drift_icmp() {
     // b: ConstInt(0,   I8)  =  0
     // ICmp Lt: -1 < 0 → true
     // Pre-fix (if ICmp also discarded widths): 255 < 0 → false
-    let mut m = Module::new("t".into());
+    let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
     let mut f = Function::new("f".into(), vec![], IrType::Bool);
     let a = f.next_value_id();
     f.block_mut(f.entry).insts.push(Inst {
@@ -1450,7 +1450,7 @@ fn audit_const_fold_width_drift_icmp() {
 #[test]
 fn audit_cse_dedupes_const_int_bit_pattern() {
     use crate::opt::LocalCse;
-    let mut m = Module::new("t".into());
+    let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I8));
     let a = push(
         &mut f,
@@ -1502,7 +1502,7 @@ fn audit_cse_dedupes_const_int_bit_pattern() {
 // =============================================================
 #[test]
 fn audit_const_fold_ashr_negative_count_bails() {
-    let mut m = Module::new("t".into());
+    let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
     let v = push(
         &mut f,
@@ -1539,7 +1539,7 @@ fn audit_licm_does_not_hoist_idiv() {
     // Without the fix, LICM would happily hoist it to the preheader,
     // potentially executing it when the original loop would have
     // skipped it (causing SIGFPE on b == 0).
-    let mut m = Module::new("t".into());
+    let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
     let mut f = Function::new("f".into(), vec![], IrType::Void);
     let a = push(
         &mut f,
@@ -1644,7 +1644,7 @@ fn audit_licm_does_not_hoist_idiv() {
 // against the simple form of the bug.
 #[test]
 fn audit_const_fold_select_uses_declared_type() {
-    let mut m = Module::new("t".into());
+    let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
     let a = push(
         &mut f,
@@ -1698,7 +1698,7 @@ fn audit_const_fold_select_uses_declared_type() {
 // trying to defend against.
 #[test]
 fn audit_const_fold_select_width_drift_int() {
-    let mut m = Module::new("t".into());
+    let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I64));
 
     // Manually emit a ConstInt(255, I8). The stored value is 255.
@@ -1763,7 +1763,7 @@ fn audit_const_fold_select_width_drift_int() {
 // `IMul(_, _)` until DCE removes it.
 #[test]
 fn audit_strength_reduce_identity_does_not_write_placeholder() {
-    let mut m = Module::new("t".into());
+    let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
     let x = push(
         &mut f,
@@ -1806,7 +1806,7 @@ fn audit_strength_reduce_identity_does_not_write_placeholder() {
 // =============================================================
 #[test]
 fn audit_strength_reduce_identity_reports_changed() {
-    let mut m = Module::new("t".into());
+    let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
     let x = push(
         &mut f,
@@ -1851,7 +1851,7 @@ fn audit_const_fold_icmp_uses_each_operand_width() {
     // most cases. Construct directly: a is i32 holding 255, b is i8
     // holding 255 (which represents -1 at i8 precision). Eq should
     // be FALSE: 255 != -1.
-    let mut m = Module::new("t".into());
+    let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
     let mut f = Function::new("f".into(), vec![], IrType::Bool);
     let a = push(
         &mut f,
@@ -1896,7 +1896,7 @@ fn audit_const_fold_fcmp_f32_after_m1_fix() {
     // After M-1, IntToFloat(16777217:i32, F32) folds to ConstFloat
     // with the f32-rounded value (16777216.0). FCmp Eq against
     // ConstFloat(16777216.0, F32) should now return true.
-    let mut m = Module::new("t".into());
+    let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
     let mut f = Function::new("f".into(), vec![], IrType::Bool);
     let i = push(
         &mut f,
@@ -1939,7 +1939,7 @@ fn audit_const_fold_fcmp_f32_after_m1_fix() {
 fn audit_const_fold_floattoint_from_f32_after_m1_fix() {
     // IntToFloat(16777217, F32) → ConstFloat(16777216.0, F32) after M-1.
     // FloatToInt(_, I32) should produce 16777216, not 16777217.
-    let mut m = Module::new("t".into());
+    let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
     let i = push(
         &mut f,
@@ -1984,7 +1984,7 @@ fn audit_const_fold_popcount_uses_inst_ty() {
     // type is also i32 (the common case). After the fix, the fold
     // result must be tagged with inst.ty (i32), even if a future
     // change makes the source carry a different width.
-    let mut m = Module::new("t".into());
+    let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
     let v = push(
         &mut f,
@@ -2020,7 +2020,7 @@ fn audit_const_fold_popcount_uses_inst_ty() {
 // `real(N, 4)` expressions), the bug becomes a CRITICAL miscompile.
 #[test]
 fn audit_int_to_f32_then_fsub_wrong_answer_today() {
-    let mut m = Module::new("t".into());
+    let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
     let mut f = Function::new("f".into(), vec![], IrType::Float(FloatWidth::F32));
     let i_a = push(
         &mut f,
@@ -2075,7 +2075,7 @@ fn audit_int_to_f32_then_fsub_wrong_answer_today() {
 // =============================================================
 #[test]
 fn audit_const_fold_imul_i8_overflow_wraps() {
-    let mut m = Module::new("t".into());
+    let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I8));
     let a = push(
         &mut f,
@@ -2125,7 +2125,7 @@ fn audit_const_fold_imul_i8_overflow_wraps() {
 fn audit_const_fold_non_rpo_block_order() {
     use crate::opt::{build_pipeline, OptLevel};
 
-    let mut m = Module::new("t".into());
+    let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
 
     let a_block = f.create_block("a");
@@ -2233,7 +2233,7 @@ fn audit_const_fold_non_rpo_block_order() {
 // other pass changes anything here.
 #[test]
 fn audit_const_fold_inner_fixpoint_across_vec_order() {
-    let mut m = Module::new("t".into());
+    let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
 
     // Four blocks, chained: entry → b → a → c → d → return.
@@ -2354,7 +2354,7 @@ fn audit_const_fold_inner_fixpoint_across_vec_order() {
 // Verify shl wrapping at width boundaries.
 #[test]
 fn audit_const_fold_shl_full_width_wrap() {
-    let mut m = Module::new("t".into());
+    let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
     let v = push(
         &mut f,
@@ -2391,7 +2391,7 @@ fn audit_const_fold_shl_full_width_wrap() {
 // =============================================================
 #[test]
 fn audit_const_fold_iadd_i16_overflow() {
-    let mut m = Module::new("t".into());
+    let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I16));
     let a = push(
         &mut f,
@@ -2433,7 +2433,7 @@ fn audit_const_fold_iadd_i16_overflow() {
 // loses one predecessor; verifier must still accept the result.
 #[test]
 fn audit_const_prop_merge_after_drop() {
-    let mut m = Module::new("t".into());
+    let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
 
     let cond = push(&mut f, InstKind::ConstBool(true), IrType::Bool);

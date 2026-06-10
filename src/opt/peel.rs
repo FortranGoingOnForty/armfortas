@@ -349,7 +349,7 @@ mod tests {
 
     #[test]
     fn peel_no_op_on_empty() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("test".into(), vec![], IrType::Void);
         f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
         m.add_function(f);
@@ -361,7 +361,7 @@ mod tests {
     #[test]
     fn peel_no_op_without_eq_check() {
         // Loop with no `if (i == init)` → should not peel.
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("test".into(), vec![], IrType::Void);
 
         let header = f.create_block("header");
@@ -460,7 +460,7 @@ mod tests {
 
     #[test]
     fn peel_skips_loops_with_direct_exit_uses_of_loop_values() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("test".into(), vec![], IrType::Void);
 
         let preheader = f.create_block("preheader");

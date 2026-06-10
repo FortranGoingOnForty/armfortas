@@ -376,7 +376,7 @@ mod tests {
 
     #[test]
     fn bce_no_op_without_bounds_checks() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("test".into(), vec![], IrType::Void);
         f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
         m.add_function(f);
@@ -386,7 +386,7 @@ mod tests {
 
     #[test]
     fn bce_removes_constant_in_bounds() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("test".into(), vec![], IrType::Void);
         let span = crate::lexer::Span {
             file_id: 0,
@@ -444,7 +444,7 @@ mod tests {
 
     #[test]
     fn bce_removes_canonical_loop_iv_check() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("test".into(), vec![], IrType::Void);
         let span = crate::lexer::Span {
             file_id: 0,
@@ -587,7 +587,7 @@ mod tests {
 
     #[test]
     fn bce_keeps_loop_check_when_bounds_are_tighter_than_trip_range() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("test".into(), vec![], IrType::Void);
         let span = crate::lexer::Span {
             file_id: 0,
@@ -723,7 +723,7 @@ mod tests {
 
     #[test]
     fn bce_removes_loop_iv_plus_constant_check() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("test".into(), vec![], IrType::Void);
         let span = crate::lexer::Span {
             file_id: 0,
@@ -852,7 +852,7 @@ mod tests {
 
     #[test]
     fn bce_removes_loop_iv_minus_constant_check() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("test".into(), vec![], IrType::Void);
         let span = crate::lexer::Span {
             file_id: 0,
@@ -981,7 +981,7 @@ mod tests {
 
     #[test]
     fn bce_keeps_loop_iv_plus_constant_check_when_offset_exceeds_upper_bound() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("test".into(), vec![], IrType::Void);
         let span = crate::lexer::Span {
             file_id: 0,
@@ -1111,7 +1111,7 @@ mod tests {
 
     #[test]
     fn bce_removes_loop_iv_plus_constant_check_with_large_step() {
-        let mut m = Module::new("test".into());
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("test".into(), vec![], IrType::Void);
         let span = crate::lexer::Span {
             file_id: 0,

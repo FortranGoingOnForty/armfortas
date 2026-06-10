@@ -364,13 +364,13 @@ mod tests {
     fn liveness_simple_function() {
         let mut func = Function::new("test".into(), vec![], IrType::Void);
         {
-            let mut b = FuncBuilder::new(&mut func);
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
             let x = b.const_i32(10);
             let y = b.const_i32(20);
             let _z = b.iadd(x, y);
             b.ret_void();
         }
-        let mf = select_function(&func);
+        let mf = select_function(&func, crate::target::TargetLayout::LP64);
         let result = compute_liveness(&mf);
         assert!(!result.intervals.is_empty(), "should have live intervals");
         assert!(result.num_positions > 0);
@@ -380,13 +380,13 @@ mod tests {
     fn liveness_intervals_have_correct_class() {
         let mut func = Function::new("test".into(), vec![], IrType::Void);
         {
-            let mut b = FuncBuilder::new(&mut func);
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
             let a = b.const_f64(3.14);
             let c = b.const_f64(2.0);
             let _d = b.fadd(a, c);
             b.ret_void();
         }
-        let mf = select_function(&func);
+        let mf = select_function(&func, crate::target::TargetLayout::LP64);
         let result = compute_liveness(&mf);
         // Should have some Fp64 intervals.
         assert!(
@@ -452,7 +452,7 @@ mod tests {
     fn liveness_branching() {
         let mut func = Function::new("test".into(), vec![], IrType::Void);
         {
-            let mut b = FuncBuilder::new(&mut func);
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
             let cond = b.const_bool(true);
             let bb_t = b.create_block("then");
             let bb_f = b.create_block("else");
@@ -462,7 +462,7 @@ mod tests {
             b.set_block(bb_f);
             b.ret_void();
         }
-        let mf = select_function(&func);
+        let mf = select_function(&func, crate::target::TargetLayout::LP64);
         let result = compute_liveness(&mf);
         assert!(result.num_positions > 0);
     }
