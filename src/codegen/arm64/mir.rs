@@ -3,9 +3,7 @@
 //! Uses virtual registers (VReg) that will be assigned to physical registers
 //! by the register allocator. Before allocation, all vregs are spilled.
 
-/// Virtual register identifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct VRegId(pub u32);
+pub use crate::codegen::shared::VRegId;
 
 /// Virtual register with type class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -369,9 +367,7 @@ impl PhysReg {
     pub const LR: PhysReg = PhysReg::Gp(30);
 }
 
-/// Machine block identifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct MBlockId(pub u32);
+pub use crate::codegen::shared::MBlockId;
 
 /// A machine instruction.
 #[derive(Debug, Clone)]
