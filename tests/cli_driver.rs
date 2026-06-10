@@ -35697,3 +35697,74 @@ fn imported_generic_function_shadows_intrinsic_type_probe() {
     let _ = std::fs::remove_file(&ir);
     let _ = std::fs::remove_file(&src);
 }
+
+// ---- Sprint x00: --target flag ----
+
+#[test]
+fn target_flag_rejects_unknown_triple_listing_supported_set() {
+    let out = Command::new(compiler("armfortas"))
+        .args(["--target", "riscv64-linux", "hello.f90"])
+        .output()
+        .expect("failed to spawn armfortas");
+    assert!(!out.status.success(), "unknown target must be rejected");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("supported targets: arm64-macos"),
+        "diagnostic must list supported targets, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn target_flag_x86_64_fails_at_codegen_boundary_writing_nothing() {
+    let src = unique_path("x00_codegen_guard", "f90");
+    fs::write(&src, "program p\n  print *, 1\nend program p\n").unwrap();
+    let exe = unique_path("x00_codegen_guard", "out");
+
+    let out = Command::new(compiler("armfortas"))
+        .args(["--target", "x86_64-freebsd"])
+        .arg(&src)
+        .arg("-o")
+        .arg(&exe)
+        .output()
+        .expect("failed to spawn armfortas");
+    // Exit code 1: compile error convention (lib.rs exit-code table).
+    assert_eq!(out.status.code(), Some(1), "status: {:?}", out.status);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("x86_64 backend is not implemented yet (sprint x03)"),
+        "expected the x03 boundary diagnostic, got: {}",
+        stderr
+    );
+    assert!(
+        !exe.exists(),
+        "guard failure must not write the output path"
+    );
+
+    let _ = fs::remove_file(&src);
+}
+
+#[test]
+fn target_flag_x86_64_frontend_modes_still_work() {
+    let src = unique_path("x00_frontend_ok", "f90");
+    fs::write(&src, "program p\n  print *, 1\nend program p\n").unwrap();
+    let ir = unique_path("x00_frontend_ok", "ir");
+
+    let out = Command::new(compiler("armfortas"))
+        .args(["--target", "x86_64-linux-musl", "--emit-ir"])
+        .arg(&src)
+        .arg("-o")
+        .arg(&ir)
+        .output()
+        .expect("failed to spawn armfortas");
+    assert!(
+        out.status.success(),
+        "frontend modes must work for x86_64 targets: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let ir_text = fs::read_to_string(&ir).expect("cannot read emitted IR");
+    assert!(ir_text.contains("module"), "IR output looks wrong: {}", ir_text);
+
+    let _ = fs::remove_file(&src);
+    let _ = fs::remove_file(&ir);
+}
