@@ -232,11 +232,14 @@ jobs:
     runs-on: ubuntu-latest
     container: rust:1-alpine
     steps:
+      # rust:1-alpine has no git; without it actions/checkout falls back
+      # to a REST tarball download that cannot fetch submodules. Install
+      # deps BEFORE checkout (binutils: rustc needs a linker for test
+      # binaries; the image ships none).
+      - run: apk add --no-cache git binutils musl-dev grep
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      # rustc needs a linker for test binaries; alpine images ship none.
-      - run: apk add --no-cache binutils musl-dev grep
       - run: cargo build --workspace
       - run: cargo test -p armfortas --lib
       - run: cargo test -p armfortas --tests -- --nocapture --test-threads=1 2>&1 | tee /tmp/tests.log
