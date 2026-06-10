@@ -17,8 +17,19 @@ Deferred items from the l00 F2023 inventory (2026-06-10):
   set (`open(..., leading_zero='suppress')` accepted with no
   implementation behind it).
 - `lbound` on a rank-remapped pointer lowered to an external
-  `call @lbound` instead of descriptor reads (l00 probe 22); needs a
-  reduction independent of F2023.
+  `call @lbound` instead of descriptor reads (l00 probe 22); confirmed on
+  nomad — links fail with `_lbound` undefined. Needs a reduction
+  independent of F2023.
+- The runtime format parser accepts unknown edit-descriptor sequences
+  without raising an I/O error: `'(at)'` printed untrimmed text,
+  `'(lzs, f6.2)'` printed nothing, both exit 0 (nomad, 2026-06-10).
+  Bites typo'd formats today; l05 makes unknown descriptors a runtime
+  error as part of the AT/LZ work.
+- F2023-syntax collisions producing silent wrong answers today (accepted
+  and mis-lowered, garbage at runtime): `real :: a([2,3])` (R818),
+  `allocate(x([2,3]))` (R937), pointer rank-remapping with array bounds.
+  Details in `.docs/audits/f2023-feature-matrix.md`; owned by l01 —
+  until then these spellings corrupt silently rather than erroring.
 
 Deferred items that came up while finishing Sprint 29.10 cleanup work and
 starting the full Sprint 29 audit:
