@@ -3,8 +3,10 @@ name: CI
 on:
   push:
     branches: [trunk]
+  # No base-branch filter: the sprint workflow stacks PRs on other
+  # sprint branches (x01 on x00, ...), and a `branches: [trunk]` filter
+  # here matches the BASE, silently skipping CI on every stacked PR.
   pull_request:
-    branches: [trunk]
 
 env:
   CARGO_TERM_COLOR: always
