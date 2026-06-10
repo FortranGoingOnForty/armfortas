@@ -14,6 +14,7 @@ pub mod parser;
 pub mod preprocess;
 pub mod runtime;
 pub mod sema;
+pub mod target;
 pub mod testing;
 
 /// CLI entry point shared by both the `armfortas` and `afs` binaries.

@@ -21,19 +21,41 @@ pub struct PreprocConfig {
     pub fixed_form: bool,
 }
 
-impl Default for PreprocConfig {
-    fn default() -> Self {
+impl PreprocConfig {
+    /// Predefined macros for a target. The arm64-macos define set is
+    /// contractual: it must stay byte-identical to what shipped before
+    /// targets existed (sprint x00).
+    pub fn for_target(target: &crate::target::TargetSpec) -> Self {
+        use crate::target::{Arch, Os};
+
         let mut defines = HashMap::new();
-        // Built-in predefined macros.
         defines.insert("__ARMFORTAS__".into(), MacroDef::object("1"));
         defines.insert("__ARMFORTAS_MAJOR__".into(), MacroDef::object("0"));
         defines.insert("__ARMFORTAS_MINOR__".into(), MacroDef::object("1"));
-        defines.insert("__aarch64__".into(), MacroDef::object("1"));
-        defines.insert("__arm64__".into(), MacroDef::object("1"));
-        #[cfg(target_os = "macos")]
-        defines.insert("__APPLE__".into(), MacroDef::object("1"));
-        #[cfg(target_os = "linux")]
-        defines.insert("__linux__".into(), MacroDef::object("1"));
+        match target.arch {
+            Arch::Arm64 => {
+                defines.insert("__aarch64__".into(), MacroDef::object("1"));
+                defines.insert("__arm64__".into(), MacroDef::object("1"));
+            }
+            Arch::X86_64 => {
+                defines.insert("__x86_64__".into(), MacroDef::object("1"));
+                defines.insert("__amd64__".into(), MacroDef::object("1"));
+            }
+        }
+        match target.os {
+            Os::MacOs => {
+                defines.insert("__APPLE__".into(), MacroDef::object("1"));
+            }
+            Os::FreeBsd => {
+                // System compilers define __FreeBSD__ to the OS major
+                // version. TargetSpec carries no OS version, so we define 1;
+                // revisit in x06 if a campaign project version-checks it.
+                defines.insert("__FreeBSD__".into(), MacroDef::object("1"));
+            }
+            Os::Linux => {
+                defines.insert("__linux__".into(), MacroDef::object("1"));
+            }
+        }
 
         Self {
             defines,
@@ -41,6 +63,12 @@ impl Default for PreprocConfig {
             filename: "<input>".into(),
             fixed_form: false,
         }
+    }
+}
+
+impl Default for PreprocConfig {
+    fn default() -> Self {
+        Self::for_target(&crate::target::TargetSpec::host())
     }
 }
 
@@ -1584,7 +1612,11 @@ mod tests {
 
     #[test]
     fn predefined_aarch64() {
-        let out = pp("x = __aarch64__\n");
+        // Target-pinned since x00: the assertion is about the arm64-macos
+        // define set, not about whatever host runs the test suite.
+        let target = crate::target::TargetSpec::parse("arm64-macos").unwrap();
+        let config = PreprocConfig::for_target(&target);
+        let out = preprocess("x = __aarch64__\n", &config).unwrap().text;
         assert!(out.contains("x = 1"));
     }
 
@@ -2327,5 +2359,65 @@ deep
             "got: {}",
             err.msg
         );
+    }
+
+    /// Golden per-target define sets (sprint x00). The arm64-macos set is
+    /// contractual: byte-identical to the pre-target-model predefines.
+    #[test]
+    fn target_define_sets_are_golden() {
+        use crate::target::TargetSpec;
+
+        let set = |triple: &str| -> Vec<String> {
+            let target = TargetSpec::parse(triple).unwrap();
+            let mut names: Vec<String> = PreprocConfig::for_target(&target)
+                .defines
+                .keys()
+                .cloned()
+                .collect();
+            names.sort();
+            names
+        };
+        let base = ["__ARMFORTAS_MAJOR__", "__ARMFORTAS_MINOR__", "__ARMFORTAS__"];
+
+        let golden = |extra: &[&str]| -> Vec<String> {
+            let mut v: Vec<String> = base
+                .iter()
+                .chain(extra)
+                .map(|s| s.to_string())
+                .collect();
+            v.sort();
+            v
+        };
+
+        assert_eq!(
+            set("arm64-macos"),
+            golden(&["__APPLE__", "__aarch64__", "__arm64__"])
+        );
+        assert_eq!(
+            set("x86_64-freebsd"),
+            golden(&["__FreeBSD__", "__amd64__", "__x86_64__"])
+        );
+        assert_eq!(
+            set("x86_64-linux-gnu"),
+            golden(&["__amd64__", "__linux__", "__x86_64__"])
+        );
+        // libc flavor is deliberately not a predefine: __GLIBC__ etc. come
+        // from libc headers, not the compiler.
+        assert_eq!(set("x86_64-linux-musl"), set("x86_64-linux-gnu"));
+    }
+
+    #[test]
+    fn target_defines_select_ifdef_branches() {
+        use crate::target::TargetSpec;
+
+        let src = "#ifdef __FreeBSD__\nx = 1\n#elif defined(__APPLE__)\nx = 2\n#else\nx = 3\n#endif\n";
+        let run = |triple: &str| -> String {
+            let target = TargetSpec::parse(triple).unwrap();
+            let config = PreprocConfig::for_target(&target);
+            preprocess(src, &config).unwrap().text
+        };
+        assert!(run("x86_64-freebsd").contains("x = 1"));
+        assert!(run("arm64-macos").contains("x = 2"));
+        assert!(run("x86_64-linux-gnu").contains("x = 3"));
     }
 }

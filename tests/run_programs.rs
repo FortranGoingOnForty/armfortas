@@ -403,6 +403,7 @@ fn compile_to_object(
     output: &Path,
     opt_flag: &str,
     search_dir: &Path,
+    flags: &[String],
 ) -> Result<(), String> {
     let result = Command::new(compiler)
         .current_dir(search_dir)
@@ -414,6 +415,7 @@ fn compile_to_object(
             output.to_str().unwrap(),
             &format!("-I{}", search_dir.display()),
         ])
+        .args(flags)
         .output()
         .map_err(|e| format!("cannot launch compiler for {}: {}", source.display(), e))?;
     if !result.status.success() {
@@ -522,6 +524,49 @@ fn extract_error_expected(source: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Extract `! FLAGS:` extra compiler flags (sprint l00). At most one line
+/// per test; tokens are whitespace-split and appended to every compiler
+/// invocation the harness makes for this test (run, IR, ASM, REPRO,
+/// OPT_EQ, helper objects). The harness owns the opt matrix, output
+/// paths, emit modes, and target selection, so those flags are test
+/// configuration errors here, not pass-through.
+fn extract_flags(source: &str, filename: &str) -> Result<Vec<String>, String> {
+    let mut found: Option<Vec<String>> = None;
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("! FLAGS:") {
+            if found.is_some() {
+                return Err(format!(
+                    "{}: multiple FLAGS annotations; combine into one line",
+                    filename,
+                ));
+            }
+            let tokens: Vec<String> = rest.split_whitespace().map(str::to_string).collect();
+            if tokens.is_empty() {
+                return Err(format!("{}: FLAGS annotation with no flags", filename));
+            }
+            for token in &tokens {
+                let harness_owned = token == "-o"
+                    || token == "-S"
+                    || token == "-c"
+                    || token == "-E"
+                    || token.starts_with("-O")
+                    || token.starts_with("--emit-")
+                    || token == "--target"
+                    || token.starts_with("--target=");
+                if harness_owned {
+                    return Err(format!(
+                        "{}: FLAGS may not contain harness-owned flag '{}'",
+                        filename, token,
+                    ));
+                }
+            }
+            found = Some(tokens);
+        }
+    }
+    Ok(found.unwrap_or_default())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1540,6 +1585,7 @@ fn compile_stage_bytes(
     source: &Path,
     opt_flag: &str,
     stage: ReproStage,
+    flags: &[String],
 ) -> Result<Vec<u8>, String> {
     let source_path = fs::canonicalize(source).map_err(|e| {
         format!(
@@ -1574,6 +1620,7 @@ fn compile_stage_bytes(
         .current_dir(&compile_sandbox)
         .args([source_path.to_str().unwrap(), opt_flag])
         .args(extra_args)
+        .args(flags)
         .args(["-o", out.to_str().unwrap()])
         .output()
         .map_err(|e| {
@@ -1615,6 +1662,7 @@ fn compile_and_run_snapshot(
     source: &Path,
     opt_flag: &str,
     filename: &str,
+    flags: &[String],
 ) -> Result<RunSnapshot, String> {
     let source_path = fs::canonicalize(source)
         .map_err(|e| format!("{}: cannot canonicalize source path: {}", filename, e))?;
@@ -1641,6 +1689,7 @@ fn compile_and_run_snapshot(
             "-o",
             binary.to_str().unwrap(),
         ])
+        .args(flags)
         .output()
         .map_err(|e| format!("{}: cannot run compiler: {}", filename, e))?;
     if !compile.status.success() {
@@ -1719,6 +1768,7 @@ fn run_opt_eq_rules(
     filename: &str,
     baseline_snapshot: &RunSnapshot,
     rules: &[OptEqRule],
+    flags: &[String],
 ) -> Result<(), String> {
     for rule in rules {
         if rule.opt_flags.first().map(String::as_str) != Some(opt_flag) {
@@ -1731,6 +1781,7 @@ fn run_opt_eq_rules(
                 source,
                 opt_flag,
                 ReproStage::Asm,
+                flags,
             )?)
         } else {
             None
@@ -1742,7 +1793,8 @@ fn run_opt_eq_rules(
                 .iter()
                 .any(|component| *component != OptEqComponent::Asm)
             {
-                let other = compile_and_run_snapshot(compiler, source, compare_opt, filename)?;
+                let other =
+                    compile_and_run_snapshot(compiler, source, compare_opt, filename, flags)?;
                 if let Some(detail) =
                     compare_opt_eq_runtime_components(baseline_snapshot, &other, &rule.components)
                 {
@@ -1765,7 +1817,7 @@ fn run_opt_eq_rules(
 
             if let Some(baseline_asm) = &baseline_asm {
                 let other_asm =
-                    compile_stage_bytes(compiler, source, compare_opt, ReproStage::Asm)?;
+                    compile_stage_bytes(compiler, source, compare_opt, ReproStage::Asm, flags)?;
                 if baseline_asm != &other_asm {
                     return Err(format!(
                         "{} [{}]: OPT_EQ({} => {}) failed comparing {} to {}: assembly output differed",
@@ -1978,6 +2030,10 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
 
     let xfail_reason = extract_xfail(&source_text);
     let error_expected = extract_error_expected(&source_text);
+    let extra_flags = match extract_flags(&source_text, filename) {
+        Ok(flags) => flags,
+        Err(e) => return TestOutcome::Fail(e),
+    };
     let error_span = match extract_error_span(&source_text, filename) {
         Ok(span) => span,
         Err(e) => return TestOutcome::Fail(e),
@@ -2116,8 +2172,14 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
                     "{}.o",
                     Path::new(name).file_stem().unwrap().to_str().unwrap()
                 ));
-                if let Err(e) = compile_to_object(compiler, &seg_f90, &seg_o, opt_flag, &build_dir)
-                {
+                if let Err(e) = compile_to_object(
+                    compiler,
+                    &seg_f90,
+                    &seg_o,
+                    opt_flag,
+                    &build_dir,
+                    &extra_flags,
+                ) {
                     compile_error = Some(format!("{} [{}]: {}", filename, opt_flag, e));
                     break;
                 }
@@ -2181,6 +2243,7 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
                     "-o",
                     binary.to_str().unwrap(),
                 ])
+                .args(&extra_flags)
                 .output()
                 .map_err(|e| format!("{}: cannot run compiler: {}", filename, e))?;
 
@@ -2331,8 +2394,10 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
         for stage in &repro_checks {
             match stage {
                 ReproStage::Asm | ReproStage::Obj => {
-                    let first = compile_stage_bytes(compiler, source, opt_flag, *stage)?;
-                    let second = compile_stage_bytes(compiler, source, opt_flag, *stage)?;
+                    let first =
+                        compile_stage_bytes(compiler, source, opt_flag, *stage, &extra_flags)?;
+                    let second =
+                        compile_stage_bytes(compiler, source, opt_flag, *stage, &extra_flags)?;
                     if first != second {
                         let stage_name = match stage {
                             ReproStage::Asm => "asm",
@@ -2403,6 +2468,7 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
                     "-o",
                     ir_dest.to_str().unwrap(),
                 ])
+                .args(&extra_flags)
                 .output()
                 .map_err(|e| format!("{}: cannot run --emit-ir: {}", filename, e))?;
             if !ir_compile.status.success() {
@@ -2428,6 +2494,7 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
                     "-o",
                     asm_dest.to_str().unwrap(),
                 ])
+                .args(&extra_flags)
                 .output()
                 .map_err(|e| format!("{}: cannot run -S: {}", filename, e))?;
             if !asm_compile.status.success() {
@@ -2450,6 +2517,7 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
             filename,
             &snapshot,
             &opt_eq_rules,
+            &extra_flags,
         )?;
 
         if let Some(triangulation) = &phase_triangulation {
@@ -4441,4 +4509,153 @@ fn single_file_module_program_does_not_leave_root_amod() {
         "single-file run_test should not leak {} into the repo root",
         leaked.display()
     );
+}
+
+// ---- Sprint l00: FLAGS annotation ----
+
+#[test]
+fn flags_annotation_parses_tokens() {
+    let src = "! FLAGS: --std=f2023 -fbackslash\nprogram t\nend program t\n";
+    assert_eq!(
+        extract_flags(src, "t.f90").unwrap(),
+        vec!["--std=f2023".to_string(), "-fbackslash".to_string()]
+    );
+    assert!(extract_flags("program t\nend\n", "t.f90")
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn flags_annotation_rejects_harness_owned_flags() {
+    for bad in [
+        "! FLAGS: -O2\n",
+        "! FLAGS: -o /tmp/x\n",
+        "! FLAGS: -S\n",
+        "! FLAGS: -c\n",
+        "! FLAGS: --emit-ir\n",
+        "! FLAGS: --target arm64-macos\n",
+        "! FLAGS: --target=x86_64-freebsd\n",
+        "! FLAGS:\n",
+    ] {
+        assert!(
+            extract_flags(bad, "t.f90").is_err(),
+            "should reject: {}",
+            bad
+        );
+    }
+}
+
+#[test]
+fn flags_annotation_rejects_multiple_lines() {
+    let src = "! FLAGS: --std=f2023\n! FLAGS: -fbackslash\nprogram t\nend\n";
+    let err = extract_flags(src, "t.f90").err().expect("must reject");
+    assert!(err.contains("multiple FLAGS"), "got: {}", err);
+}
+
+#[test]
+fn flags_annotation_applies_to_compile() {
+    // End-to-end through run_test: the probe compiles fine under the
+    // default std, so the ERROR_EXPECTED gate diagnostic can only appear
+    // if `! FLAGS: --std=f95` actually reached the compiler command line.
+    // Frontend-only (rejection happens before codegen), so this runs on
+    // every host regardless of x00's codegen guard.
+    let compiler = find_compiler();
+    let dir = std::env::temp_dir().join(format!("afs_flags_e2e_{}", std::process::id()));
+    let _ = fs::create_dir_all(&dir);
+    let src = dir.join("flags_probe.f90");
+    fs::write(
+        &src,
+        "! FLAGS: --std=f95\n\
+         ! ERROR_EXPECTED: DO CONCURRENT requires --std=F2008 or later\n\
+         program t\n  integer :: i\n  do concurrent (i = 1:1)\n  end do\nend program t\n",
+    )
+    .unwrap();
+    match run_test(&compiler, &src, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!("FLAGS e2e probe should pass, got {:?}", other),
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ---- Sprint l00: imported gfortran.dg F2023 fixtures ----
+
+/// Locate tests/fixtures/gfortran-dg/ from the test working directory.
+fn find_gfortran_dg_fixtures() -> PathBuf {
+    let candidates = [
+        "tests/fixtures/gfortran-dg",
+        "../tests/fixtures/gfortran-dg",
+    ];
+    for c in &candidates {
+        let p = PathBuf::from(c);
+        if p.is_dir() {
+            return p;
+        }
+    }
+    panic!("cannot find tests/fixtures/gfortran-dg/ directory");
+}
+
+/// Run the gfortran.dg F2023 imports (see tests/fixtures/gfortran-dg/README.md
+/// for provenance and per-file conversion notes). Same oracle as the
+/// test_programs sweep: run_test honors FLAGS / EXIT_CODE / ERROR_EXPECTED /
+/// XFAIL annotations; XFAIL'd fixtures count as passing until their feature
+/// lands, then report XPASS so the annotation gets removed.
+#[test]
+fn gfortran_dg_fixtures() {
+    let compiler = find_compiler();
+    let fixture_dir = find_gfortran_dg_fixtures();
+
+    let mut sources: Vec<PathBuf> = fs::read_dir(&fixture_dir)
+        .expect("cannot read tests/fixtures/gfortran-dg/")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|ext| ext.to_str()) == Some("f90"))
+        .collect();
+    sources.sort();
+
+    assert!(
+        !sources.is_empty(),
+        "no .f90 fixtures found in tests/fixtures/gfortran-dg/"
+    );
+
+    let mut failures = Vec::new();
+    let mut passed = 0;
+    let mut xfailed = 0;
+
+    for source in &sources {
+        let name = source.file_name().unwrap().to_str().unwrap();
+        match run_test(&compiler, source, "-O0") {
+            TestOutcome::Pass => {
+                passed += 1;
+                eprintln!("  PASS  [-O0]: {}", name);
+            }
+            TestOutcome::Xfail(detail) => {
+                xfailed += 1;
+                let one_line = detail.lines().next().unwrap_or("");
+                eprintln!("  XFAIL [-O0]: {} — {}", name, one_line);
+            }
+            TestOutcome::Xpass(msg) => {
+                eprintln!("  XPASS [-O0]: {}", name);
+                failures.push(msg);
+            }
+            TestOutcome::Fail(msg) => {
+                eprintln!("  FAIL  [-O0]: {}", name);
+                failures.push(msg);
+            }
+        }
+    }
+
+    eprintln!(
+        "\n[gfortran-dg -O0] {} passed, {} xfailed, {} failed out of {} fixtures",
+        passed,
+        xfailed,
+        failures.len(),
+        sources.len(),
+    );
+
+    if !failures.is_empty() {
+        panic!(
+            "gfortran-dg fixture failures at -O0:\n\n{}",
+            failures.join("\n\n")
+        );
+    }
 }

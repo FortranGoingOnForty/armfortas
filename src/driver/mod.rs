@@ -161,6 +161,10 @@ pub struct Options {
     pub static_link: bool,
     /// `-rpath` entries passed to `ld`.
     pub rpath: Vec<PathBuf>,
+
+    // ---- Target ----
+    /// What we compile for (`--target <triple>`; defaults to the host).
+    pub target: crate::target::TargetSpec,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -214,6 +218,7 @@ impl Default for Options {
             shared: false,
             static_link: false,
             rpath: Vec::new(),
+            target: crate::target::TargetSpec::host(),
         }
     }
 }
@@ -304,6 +309,17 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
             "--emit-ir" => opts.emit_ir = true,
             "--emit-ast" => opts.emit_ast = true,
             "--emit-tokens" => opts.emit_tokens = true,
+
+            // ---- Target ----
+            "--target" => {
+                i += 1;
+                let triple = args.get(i).ok_or("--target requires a triple")?;
+                opts.target = crate::target::TargetSpec::parse(triple)?;
+            }
+            arg if arg.starts_with("--target=") => {
+                opts.target =
+                    crate::target::TargetSpec::parse(&arg["--target=".len()..])?;
+            }
 
             // ---- Optimization ----
             "-O" => opts.opt_level = OptLevel::O0,
@@ -755,6 +771,9 @@ COMPILATION:
   -cpp                        Accept GNU-style preprocessing flag
   -D<name>[=<value>]          Define a preprocessor macro
   -o <file>                   Output file name
+  --target <triple>           Target to compile for (default: this machine).
+                              Supported: arm64-macos, x86_64-freebsd,
+                              x86_64-linux-gnu, x86_64-linux-musl
 
 LANGUAGE:
   -std=<standard>             GNU-compatible alias for --std=<standard>
@@ -1081,7 +1100,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         // resolver searches relative-to-current-file first, then this
         // list — both gfortran and flang do the same.
         include_paths: opts.module_search_paths.clone(),
-        ..crate::preprocess::PreprocConfig::default()
+        ..crate::preprocess::PreprocConfig::for_target(&opts.target)
     };
     for (name, value) in &opts.preprocessor_defines {
         pp_config
@@ -1353,6 +1372,16 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         );
     }
 
+    // x00: the codegen boundary. Frontend modes (-E, --emit-ir/ast/tokens)
+    // work for every target; instruction selection exists only for ARM64
+    // until sprint x03. Loud error, never a silent fallback.
+    if opts.target.arch != crate::target::Arch::Arm64 {
+        return Err(format!(
+            "cannot generate code for target '{}': the x86_64 backend is not implemented yet (sprint x03)",
+            opts.target
+        ));
+    }
+
     // 7. Instruction selection.
     let phase = phases.start("codegen");
     let machine_funcs = isel::select_module(&ir_module);
@@ -1495,6 +1524,17 @@ _main:
 
     fs::write(&asm_path, &asm_text).map_err(|e| format!("cannot write temp assembly: {}", e))?;
 
+    // x00: the assemble step knows Mach-O only; ELF assembly lands in
+    // sprint x06. Unreachable today (the codegen guard fires first) but the
+    // boundary is explicit so x03 cannot silently assemble for the wrong
+    // format.
+    if opts.target.object_format() != crate::target::ObjectFormat::MachO {
+        return Err(format!(
+            "cannot assemble for target '{}': ELF toolchain support is not implemented yet (sprint x06)",
+            opts.target
+        ));
+    }
+
     let phase = phases.start("assemble");
     let as_result = if let Some(assembler) = env_override("AFS_AS_PATH") {
         Command::new(assembler)
@@ -1599,6 +1639,15 @@ fn link(obj: &Path, output: &Path, opts: &Options) -> Result<(), String> {
 /// Link prebuilt objects and archives with the runtime to produce a
 /// binary or shared library, preserving the user-supplied input order.
 fn link_inputs(inputs: &[PathBuf], output: &Path, opts: &Options) -> Result<(), String> {
+    // x00: both link paths (system ld and afs-ld) are Mach-O only; the ELF
+    // link path lands in sprint x06. Live today for link-artifact inputs
+    // (`armfortas --target x86_64-freebsd foo.o`), which skip codegen.
+    if opts.target.object_format() != crate::target::ObjectFormat::MachO {
+        return Err(format!(
+            "cannot link for target '{}': ELF toolchain support is not implemented yet (sprint x06)",
+            opts.target
+        ));
+    }
     if let Some(linker) = afs_ld_override() {
         return link_inputs_with_afs_ld(&linker, inputs, output, opts);
     }
@@ -2058,6 +2107,42 @@ mod tests {
     }
 
     #[test]
+    fn default_target_is_host() {
+        assert_eq!(Options::default().target, crate::target::TargetSpec::host());
+    }
+
+    #[test]
+    fn options_from_args_accepts_target_flag() {
+        for args in [
+            vec![
+                "--target".to_string(),
+                "x86_64-freebsd".to_string(),
+                "hello.f90".to_string(),
+            ],
+            vec![
+                "--target=x86_64-freebsd".to_string(),
+                "hello.f90".to_string(),
+            ],
+        ] {
+            let opts = Options::from_args(&args).expect("driver should accept --target");
+            assert_eq!(opts.target.triple(), "x86_64-freebsd");
+        }
+    }
+
+    #[test]
+    fn options_from_args_rejects_unknown_target() {
+        let args = vec!["--target=riscv64-linux".to_string(), "hello.f90".to_string()];
+        let err = Options::from_args(&args)
+            .err()
+            .expect("unknown target must be rejected");
+        assert!(
+            err.contains("supported targets: arm64-macos"),
+            "diagnostic must list supported targets, got: {}",
+            err
+        );
+    }
+
+    #[test]
     fn default_standard_is_f2018() {
         assert_eq!(
             Options::default().std,
@@ -2231,6 +2316,12 @@ mod tests {
         );
     }
 
+    /// The five backend_allows_* tests assert ARM64 instruction shapes;
+    /// since x00 they say so instead of assuming the host is ARM64.
+    fn arm64_macos() -> crate::target::TargetSpec {
+        crate::target::TargetSpec::parse("arm64-macos").unwrap()
+    }
+
     #[test]
     fn backend_allows_simple_integer16_memory_codegen_at_o0() {
         let output = std::env::temp_dir().join(format!(
@@ -2248,6 +2339,7 @@ mod tests {
             opt_level: OptLevel::O0,
             extra_inputs: vec![],
             module_search_paths: vec![],
+            target: arm64_macos(),
             ..Options::default()
         };
 
@@ -2278,6 +2370,7 @@ mod tests {
             opt_level: OptLevel::O0,
             extra_inputs: vec![],
             module_search_paths: vec![],
+            target: arm64_macos(),
             ..Options::default()
         };
 
@@ -2308,6 +2401,7 @@ mod tests {
             opt_level: OptLevel::O0,
             extra_inputs: vec![],
             module_search_paths: vec![],
+            target: arm64_macos(),
             ..Options::default()
         };
 
@@ -2343,6 +2437,7 @@ mod tests {
             opt_level: OptLevel::O0,
             extra_inputs: vec![],
             module_search_paths: vec![],
+            target: arm64_macos(),
             ..Options::default()
         };
 
@@ -2378,6 +2473,7 @@ mod tests {
             opt_level: OptLevel::O1,
             extra_inputs: vec![],
             module_search_paths: vec![],
+            target: arm64_macos(),
             ..Options::default()
         };
 
