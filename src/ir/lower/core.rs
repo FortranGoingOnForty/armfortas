@@ -6994,6 +6994,14 @@ pub(super) fn eval_const_scalar_with_any_scope(
                 return const_inquiry_for_ir_type(&key, &ty);
             }
             if matches!(key.as_str(), "real" | "dble" | "dfloat" | "float") {
+                if let Some(bits) = args.first().and_then(boz_arg_bits) {
+                    // BOZ transfers the bit pattern (16.9.160).
+                    return Some(ConstScalar::Float(if key == "real" || key == "float" {
+                        f32::from_bits(bits as u32) as f64
+                    } else {
+                        f64::from_bits(bits)
+                    }));
+                }
                 let value = const_call_arg_expr(args.first()?)
                     .and_then(|e| eval_const_scalar_with_any_scope(e, param_consts, st))?;
                 return Some(ConstScalar::Float(value.to_float()));
@@ -7208,6 +7216,33 @@ pub(super) fn eval_const_scalar_with_any_scope(
                 }
             }
         }
+        _ => None,
+    }
+}
+
+/// Digits of a BOZ literal as raw bits (F2018 16.9.160: REAL/DBLE of a
+/// boz-literal-constant transfer the bit pattern, not the integer
+/// value). u64 so all 64-bit patterns survive; from_str_radix on the
+/// extracted digit string.
+pub(crate) fn boz_bits(text: &str, base: &crate::ast::expr::BozBase) -> Option<u64> {
+    let radix = match base {
+        crate::ast::expr::BozBase::Binary => 2,
+        crate::ast::expr::BozBase::Octal => 8,
+        crate::ast::expr::BozBase::Hex => 16,
+    };
+    let digits: String = text
+        .chars()
+        .skip_while(|c| !matches!(c, '\'' | '"'))
+        .skip(1)
+        .take_while(|c| !matches!(c, '\'' | '"'))
+        .collect();
+    u64::from_str_radix(&digits, radix).ok()
+}
+
+fn boz_arg_bits(arg: &crate::ast::expr::Argument) -> Option<u64> {
+    let e = const_call_arg_expr(arg)?;
+    match &e.node {
+        Expr::BozLiteral { text, base } => boz_bits(text, base),
         _ => None,
     }
 }
@@ -7798,6 +7833,14 @@ pub(super) fn eval_const_scalar_with_decl_scope(
                     const_inquiry_for_ir_type(&key, &ty)
                 }
                 "real" | "dble" | "dfloat" | "float" => {
+                    if let Some(bits) = args.first().and_then(boz_arg_bits) {
+                        // BOZ transfers the bit pattern (16.9.160).
+                        return Some(ConstScalar::Float(if key == "real" || key == "float" {
+                            f32::from_bits(bits as u32) as f64
+                        } else {
+                            f64::from_bits(bits)
+                        }));
+                    }
                     let value = const_call_arg_expr(args.first()?).and_then(|e| {
                         eval_const_scalar_with_decl_scope(e, decls, param_consts, st)
                     })?;

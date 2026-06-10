@@ -1938,6 +1938,39 @@ pub(crate) fn lower_expr_full(
                 // user generic the explicit check earlier already routes
                 // to the structure ctor / generic-resolve path before
                 // we get here.
+                // F2018 16.9.160/.68: REAL/DBLE of a boz-literal transfer
+                // the BIT PATTERN at the result kind — never an integer
+                // value conversion. Intercept on the AST (the generic
+                // path has already collapsed the BOZ to an int const).
+                if !has_named_interface
+                    && matches!(key.as_str(), "real" | "float" | "sngl" | "dble" | "dfloat")
+                {
+                    if let Some(crate::ast::expr::SectionSubscript::Element(arg0)) =
+                        original_args.first().map(|a| &a.value)
+                    {
+                        if let crate::ast::expr::Expr::BozLiteral { text, base } = &arg0.node {
+                            if let Some(bits) = super::core::boz_bits(text, base) {
+                                let kind8 = matches!(key.as_str(), "dble" | "dfloat")
+                                    || original_args.iter().skip(1).any(|a| {
+                                        matches!(
+                                            &a.value,
+                                            crate::ast::expr::SectionSubscript::Element(k)
+                                                if matches!(
+                                                    &k.node,
+                                                    crate::ast::expr::Expr::IntegerLiteral { text, .. }
+                                                        if text.trim() == "8"
+                                                )
+                                        )
+                                    });
+                                return if kind8 {
+                                    b.const_f64(f64::from_bits(bits))
+                                } else {
+                                    b.const_f32(f32::from_bits(bits as u32))
+                                };
+                            }
+                        }
+                    }
+                }
                 if !has_named_interface && key == "cmplx" {
                     if let Some(result) = lower_cmplx_intrinsic_expr(
                         b,
