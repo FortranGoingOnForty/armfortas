@@ -41106,7 +41106,7 @@ fn target_flag_rejects_unknown_triple_listing_supported_set() {
 }
 
 #[test]
-fn target_flag_x86_64_fails_at_codegen_boundary_writing_nothing() {
+fn target_flag_x86_64_links_natively_or_diagnoses_the_host_boundary() {
     let src = unique_path("x00_codegen_guard", "f90");
     fs::write(&src, "program p\n  print *, 1\nend program p\n").unwrap();
     let exe = unique_path("x00_codegen_guard", "out");
@@ -41118,23 +41118,31 @@ fn target_flag_x86_64_fails_at_codegen_boundary_writing_nothing() {
         .arg(&exe)
         .output()
         .expect("failed to spawn armfortas");
-    // Exit code 1: compile error convention (lib.rs exit-code table).
-    assert_eq!(out.status.code(), Some(1), "status: {:?}", out.status);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    // The boundary advances sprint by sprint: x00 errored at the
-    // backend, x03 at instruction selection, x05 at the link step.
-    // (On non-x86 hosts the assemble step's cross-assembly guard fires
-    // first instead — both name the sprint that unblocks them.)
-    assert!(
-        stderr.contains("the ELF link step is not implemented yet (sprint x06)")
-            || stderr.contains("cross-assembly needs the afs-as x86 encoder (sprint x14)"),
-        "expected the x06 link (or x14 cross-assembly) diagnostic, got: {}",
-        stderr
-    );
-    assert!(
-        !exe.exists(),
-        "guard failure must not write the output path"
-    );
+    // The boundary advanced sprint by sprint — x00 errored at the
+    // backend, x03 at instruction selection, x05 at the link step —
+    // and x06 removed it on the matching host: a FreeBSD x86_64 box
+    // links and the binary exists. Elsewhere a guard still fires and
+    // names what unblocks it: cross-assembly (x14) on non-x86 hosts,
+    // cross-linking on x86 hosts with a different OS.
+    if cfg!(all(target_os = "freebsd", target_arch = "x86_64")) {
+        assert_eq!(out.status.code(), Some(0), "status: {:?}", out.status);
+        assert!(exe.exists(), "successful link must write the output path");
+        let _ = fs::remove_file(&exe);
+    } else {
+        // Exit code 1: compile error convention (lib.rs exit-code table).
+        assert_eq!(out.status.code(), Some(1), "status: {:?}", out.status);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("cross-linking is out of scope")
+                || stderr.contains("cross-assembly needs the afs-as x86 encoder (sprint x14)"),
+            "expected the cross-link (or x14 cross-assembly) diagnostic, got: {}",
+            stderr
+        );
+        assert!(
+            !exe.exists(),
+            "guard failure must not write the output path"
+        );
+    }
 
     let _ = fs::remove_file(&src);
 }

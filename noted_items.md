@@ -51,6 +51,19 @@ Deferred items from the l00 F2023 inventory (2026-06-10):
   Details in `.docs/audits/f2023-feature-matrix.md`; owned by l01 —
   until then these spellings corrupt silently rather than erroring.
 
+Resolved during x06 (kept as a lesson for x07's parity sweep):
+
+- (FIXED in x06) The x05 naive allocator sized FP spill traffic off the
+  instruction suffix, which on conversions describes the GP side:
+  `cvtsi2sdl` stored its double def with movss (4 of 8 bytes),
+  `cvttsd2sil` loaded its double source with movss. Objects assembled
+  and linked fine; the wrong answers only surfaced when x06 made
+  binaries runnable (`x05_conversions` printed `0 / 0.750000 / 0` for
+  `3 / 3.750000 / -2`). Pinned by `conversion_spill_traffic_uses_fp_width`
+  (x86_object_smoke) and the elf_link_e2e CHECK runs. Lesson: gas
+  accepting the asm proves nothing about operand widths — only running
+  output does.
+
 Deferred items that came up while finishing Sprint 29.10 cleanup work and
 starting the full Sprint 29 audit:
 

@@ -11,11 +11,21 @@
 #               carries an integer count >= 1, and no suite outside the
 #               expected list skipped. Silent skips and count=0 skips
 #               both fail.
+#   posix-elf-musl — posix-elf plus the suites in
+#               ci/expected_skips_posix-elf-musl-extra.txt (x06: the
+#               native link gate, which a musl host cannot run until
+#               x11). Same strictness, larger expected set.
 set -eu
 
 log="$1"
 profile="$2"
 expected_list="$(dirname "$0")/expected_skips_posix-elf.txt"
+if [ "$profile" = "posix-elf-musl" ]; then
+    merged=$(mktemp)
+    cat "$expected_list" "$(dirname "$0")/expected_skips_posix-elf-musl-extra.txt" > "$merged"
+    expected_list="$merged"
+    profile="posix-elf"
+fi
 
 skips=$(grep -c '^HARNESS_SKIP ' "$log" || true)
 
@@ -69,7 +79,7 @@ posix-elf)
     exit "$status"
     ;;
 *)
-    echo "check_skips: unknown profile '$profile' (macos | posix-elf)" >&2
+    echo "check_skips: unknown profile '$profile' (macos | posix-elf | posix-elf-musl)" >&2
     exit 2
     ;;
 esac

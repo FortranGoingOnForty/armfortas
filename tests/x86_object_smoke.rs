@@ -230,6 +230,47 @@ fn big_frames_emit_the_probe_loop() {
     );
 }
 
+/// Conversion instructions carry the GP width in their suffix; the
+/// XMM side has its own. The naive allocator once sized FP slot
+/// traffic off the suffix: `cvtsi2sdl` stored its double def with
+/// movss (4 of 8 bytes) and `cvttsd2sil` loaded its double source
+/// with movss — silent wrong answers at runtime (x06). Pin the
+/// allocator's load/store widths around both.
+#[test]
+fn conversion_spill_traffic_uses_fp_width() {
+    if skip("conversion_spill_traffic_uses_fp_width", 1) {
+        return;
+    }
+    let asm = emit_asm("x86_64-freebsd", "x05_conversions");
+    let lines: Vec<&str> = asm.lines().map(str::trim).collect();
+    for (i, line) in lines.iter().enumerate() {
+        // Naive-allocator shape: the def store-back immediately
+        // follows, the use load immediately precedes.
+        if line.starts_with("cvtsi2sd") {
+            assert!(
+                lines[i + 1].starts_with("movsd"),
+                "cvtsi2sd double def stored narrow: {} | {}",
+                line,
+                lines[i + 1]
+            );
+        }
+        if line.starts_with("cvttsd2si") {
+            assert!(
+                lines[i - 1].starts_with("movsd"),
+                "cvttsd2si double source loaded narrow: {} | {}",
+                lines[i - 1],
+                line
+            );
+        }
+    }
+    assert!(
+        lines.iter().any(|l| l.starts_with("cvtsi2sd"))
+            && lines.iter().any(|l| l.starts_with("cvttsd2si")),
+        "expected both conversion directions in:\n{}",
+        asm
+    );
+}
+
 /// The anti-32KB-bug gate at 1MB: many sub-threshold arrays force a
 /// ~1MB stack frame; the same frame code must handle it (no
 /// size-dependent encoding paths), and every page gets probed.
