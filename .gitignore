@@ -52,3 +52,6 @@ AGENTS.md
 /test_sp*.txt
 /test_int32.txt
 /stdlib_intrinsics_sum.ast
+
+# FreeBSD core dumps from compiler crashes during development.
+*.core

@@ -12,8 +12,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
 
-use crate::codegen::mir::MachineFunction;
-use crate::codegen::{emit, isel, linearscan, peephole};
 use crate::ir::inst::{InstKind, Module, RuntimeFunc};
 use crate::ir::{lower, printer as ir_printer, verify};
 use crate::lexer::{detect_source_form, tokenize, SourceForm};
@@ -946,15 +944,6 @@ impl PhaseGuard {
     }
 }
 
-fn main_wrapper_target(allocated: &[MachineFunction]) -> Option<&str> {
-    // Only emit _main if there's a __prog_* function (a Fortran PROGRAM
-    // body).  The previous .or_else fallback picked any non-"main"
-    // function, which incorrectly wrapped module procedures.
-    allocated
-        .iter()
-        .find(|func| func.name.starts_with("__prog_"))
-        .map(|func| func.name.as_str())
-}
 
 fn all_input_paths(opts: &Options) -> Vec<PathBuf> {
     let mut inputs = vec![opts.input.clone()];
@@ -1374,103 +1363,12 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         );
     }
 
-    // x00: the codegen boundary. Frontend modes (-E, --emit-ir/ast/tokens)
-    // work for every target; instruction selection exists only for ARM64
-    // until sprint x03. Loud error, never a silent fallback.
-    if opts.target.arch != crate::target::Arch::Arm64 {
-        return Err(format!(
-            "cannot generate code for target '{}': the x86_64 backend is not implemented yet (sprint x03)",
-            opts.target
-        ));
-    }
-
-    // 7. Instruction selection.
+    // 7-9. Backend: instruction selection, register allocation, and
+    // assembly emission, dispatched on the target arch (x03). For
+    // x86_64 this errors naming sprint x05.
     let phase = phases.start("codegen");
-    let machine_funcs = isel::select_module(&ir_module);
-
-    // 7.5. Backend peephole (O2+): FMA fusion, etc.
-    let mut allocated: Vec<_> = machine_funcs;
-    if opts.opt_level >= OptLevel::O2 {
-        for mf in &mut allocated {
-            peephole::run_peephole(mf);
-        }
-    }
-
-    let use_naive_regalloc = opts.opt_level == OptLevel::O0
-        || std::env::var_os("ARMFORTAS_USE_NAIVE_REGALLOC").is_some();
-
-    // 8. Register allocation.
-    for mf in &mut allocated {
-        if use_naive_regalloc {
-            crate::codegen::regalloc::regalloc_naive(mf);
-        } else {
-            let liveness = crate::codegen::liveness::compute_liveness(mf);
-            let result = linearscan::linear_scan(mf);
-            linearscan::apply_allocation(mf, &result, &liveness);
-            linearscan::parallelize_entry_arg_moves(mf);
-            linearscan::parallelize_call_arg_moves(mf);
-            linearscan::insert_split_bridges(mf, &result.split_records);
-            linearscan::insert_callee_saves(mf, &result.callee_saved_used);
-            linearscan::coalesce_moves(mf);
-            // 8.5. Tail call optimization (O1+): BL + epilogue → epilogue + B.
-            // Runs after regalloc so we can inspect physical register assignments.
-            if opts.opt_level >= OptLevel::O1 {
-                crate::codegen::tailcall::tail_call_opt(mf);
-            }
-        }
-        // 8.6. Branch relaxation: any B.cond whose target lies
-        // outside the ±1MB conditional-branch window is expanded
-        // to a `B.{!cond} skip; B far_target; skip:` trampoline
-        // so the assembler doesn't choke on the encoding.
-        crate::codegen::relax_branches::relax_branches(mf);
-    }
-
-    // 9. Emit assembly.
-    let mut asm_text = String::new();
-    asm_text.push_str(".section __TEXT,__text,regular,pure_instructions\n");
-    for mf in &allocated {
-        // Re-emit __TEXT section before each function in case the previous
-        // function's constant pool switched to __DATA.
-        asm_text.push_str(".section __TEXT,__text,regular,pure_instructions\n");
-        asm_text.push_str(&emit::emit_function(mf));
-        asm_text.push('\n');
-    }
-
-    // Emit module-level globals (SAVE'd locals + module variables)
-    // into a __DATA,__data section. Must come before _main so the
-    // labels are defined when functions reference them.
-    if !ir_module.globals.is_empty() {
-        asm_text.push_str(&emit::emit_globals(&ir_module.globals, &ir_module.layout));
-        asm_text.push('\n');
-    }
-
-    // Emit _main entry point (must be in __TEXT section).
-    if let Some(user_func) = main_wrapper_target(&allocated) {
-        if user_func != "main" {
-            asm_text.push_str("\n.section __TEXT,__text,regular,pure_instructions\n");
-            asm_text.push_str(&format!(
-                "\
-.globl _main
-.p2align 2
-_main:
-    stp x29, x30, [sp, #-16]!
-    mov x29, sp
-    bl _afs_program_init
-    bl _{0}
-    bl _afs_program_finalize
-    mov x0, #0
-    ldp x29, x30, [sp], #16
-    ret
-",
-                user_func
-            ));
-        }
-    }
-
+    let asm_text = crate::codegen::emit_module(&ir_module, opts)?;
     phase.end(&mut phases);
-    if opts.verbose {
-        eprintln!(" codegen: {} machine functions", allocated.len());
-    }
     if opts.emit_asm {
         let out = opts.output_path();
         fs::write(&out, &asm_text)
@@ -2500,12 +2398,12 @@ mod tests {
     #[test]
     fn main_wrapper_prefers_program_body_over_earlier_helpers() {
         let allocated = vec![
-            MachineFunction::new("bump".into()),
-            MachineFunction::new("__prog_audit_entry".into()),
+            crate::codegen::mir::MachineFunction::new("bump".into()),
+            crate::codegen::mir::MachineFunction::new("__prog_audit_entry".into()),
         ];
 
         assert_eq!(
-            main_wrapper_target(&allocated),
+            crate::codegen::arm64::main_wrapper_target(&allocated),
             Some("__prog_audit_entry"),
             "main wrapper should call the lowered program body, not the first helper"
         );
