@@ -122,6 +122,10 @@ pub(super) struct Ctx<'a> {
     /// validated (empty for PROGRAM/MODULE scope). Used by the
     /// RANK(n) C-constraint check.
     pub(super) current_args: HashSet<String>,
+    /// True while validating the actual arguments of a CALL statement —
+    /// the only context where a conditional arm may be `.NIL.` and
+    /// where conditional arguments select associations (F2023).
+    pub(super) in_call_arg: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -155,6 +159,7 @@ impl<'a> Ctx<'a> {
             warn_pedantic,
             warn_deprecated,
             current_args: HashSet::new(),
+            in_call_arg: false,
         }
     }
 
@@ -459,6 +464,27 @@ fn eval_const_int_expr_checked(
     }
 }
 
+/// Scope-aware expression typing for conditional-expression checks:
+/// `sema::types::expr_type` has no scope context and resolves bare
+/// names through implicit rules, mistyping locals and dummies. Names
+/// go through the validator's scoped lookup instead; everything else
+/// falls back to expr_type (whose recursion bottoms out in literals
+/// and operators, which are scope-independent).
+fn conditional_operand_type(
+    ctx: &Ctx<'_>,
+    expr: &crate::ast::expr::SpannedExpr,
+) -> crate::sema::types::FortranType {
+    match &expr.node {
+        Expr::Name { name } => ctx
+            .lookup(name)
+            .and_then(|sym| sym.type_info.as_ref())
+            .map(crate::sema::types::type_info_to_fortran_type)
+            .unwrap_or(crate::sema::types::FortranType::Unknown),
+        Expr::ParenExpr { inner } => conditional_operand_type(ctx, inner),
+        _ => crate::sema::types::expr_type(expr, ctx.st),
+    }
+}
+
 /// Syntactic + symbol-table probe for an array-valued conditional arm:
 /// a whole-array name, an array constructor, or a section (a call-form
 /// expression with a range subscript). Conservative — anything it
@@ -490,13 +516,22 @@ fn conditional_arm_is_arraylike(ctx: &Ctx<'_>, expr: &crate::ast::expr::SpannedE
 
 fn validate_const_int_expr_tree(ctx: &mut Ctx<'_>, expr: &crate::ast::expr::SpannedExpr) {
     match &expr.node {
+        Expr::NilArgument => {
+            // Reaching a bare .NIL. here means it sits outside a
+            // conditional-argument arm (the call-argument walk strips
+            // the legal positions before recursing).
+            ctx.error(
+                expr.span,
+                ".NIL. is only valid as an arm of a conditional actual argument",
+            );
+        }
         Expr::ConditionalExpr {
             cond,
             then_val,
             else_val,
         } => {
             ctx.require_std(expr.span, FortranStandard::F2023, "conditional expression");
-            let cond_ty = crate::sema::types::expr_type(cond, ctx.st);
+            let cond_ty = conditional_operand_type(ctx, cond);
             if !matches!(
                 cond_ty,
                 crate::sema::types::FortranType::Logical { .. }
@@ -510,8 +545,8 @@ fn validate_const_int_expr_tree(ctx: &mut Ctx<'_>, expr: &crate::ast::expr::Span
             // Arms must share declared type and kind; character lengths
             // may differ (gfortran conditional_1.f90 assigns mixed-length
             // arms to a deferred-length allocatable).
-            let t_ty = crate::sema::types::expr_type(then_val, ctx.st);
-            let e_ty = crate::sema::types::expr_type(else_val, ctx.st);
+            let t_ty = conditional_operand_type(ctx, then_val);
+            let e_ty = conditional_operand_type(ctx, else_val);
             let compatible = match (&t_ty, &e_ty) {
                 (crate::sema::types::FortranType::Unknown, _)
                 | (_, crate::sema::types::FortranType::Unknown) => true,
@@ -543,9 +578,21 @@ fn validate_const_int_expr_tree(ctx: &mut Ctx<'_>, expr: &crate::ast::expr::Span
                     );
                 }
             }
+            for arm in [then_val, else_val] {
+                if matches!(arm.node, Expr::NilArgument) && !ctx.in_call_arg {
+                    ctx.error(
+                        arm.span,
+                        ".NIL. is only valid as an arm of a conditional actual \
+                         argument in a CALL statement",
+                    );
+                }
+            }
             validate_const_int_expr_tree(ctx, cond);
-            validate_const_int_expr_tree(ctx, then_val);
-            validate_const_int_expr_tree(ctx, else_val);
+            for arm in [then_val, else_val] {
+                if !matches!(arm.node, Expr::NilArgument) {
+                    validate_const_int_expr_tree(ctx, arm);
+                }
+            }
         }
         Expr::IntegerLiteral { .. } => {
             if let Err(diag) = eval_const_int_expr_checked(ctx, expr) {
@@ -590,7 +637,33 @@ fn validate_const_int_expr_tree(ctx: &mut Ctx<'_>, expr: &crate::ast::expr::Span
         }
         Expr::FunctionCall { callee, args } => {
             validate_const_int_expr_tree(ctx, callee);
+            // F2023 conditional arguments in FUNCTION references would
+            // need association-selecting lowering on the fn-call path;
+            // until that lands, reject for user procedures (a value
+            // temp would break INTENT(OUT)/INOUT silently). Intrinsic
+            // arguments are value-consumed, so a conditional VALUE is
+            // fine there.
+            let user_proc = matches!(
+                &callee.node,
+                Expr::Name { name } if ctx.lookup(name).is_some_and(|sym| matches!(
+                    sym.kind,
+                    crate::sema::symtab::SymbolKind::Function
+                        | crate::sema::symtab::SymbolKind::Subroutine
+                        | crate::sema::symtab::SymbolKind::ProcedurePointer
+                ))
+            );
             for arg in args {
+                if user_proc {
+                    if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
+                        if matches!(e.node, Expr::ConditionalExpr { .. }) {
+                            ctx.error(
+                                e.span,
+                                "conditional arguments to user procedures are only \
+                                 supported in CALL statements so far",
+                            );
+                        }
+                    }
+                }
                 validate_const_int_subscript(ctx, &arg.value);
             }
         }
@@ -913,9 +986,12 @@ fn validate_stmt_const_int_exprs(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
         }
         Stmt::Call { callee, args } => {
             validate_const_int_expr_tree(ctx, callee);
+            let saved = ctx.in_call_arg;
+            ctx.in_call_arg = true;
             for arg in args {
                 validate_const_int_subscript(ctx, &arg.value);
             }
+            ctx.in_call_arg = saved;
         }
         Stmt::Print { items, .. } => {
             for item in items {
