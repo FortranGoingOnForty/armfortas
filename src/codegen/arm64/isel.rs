@@ -519,7 +519,7 @@ fn select_call_inst(
                 MachineOperand::PhysReg(PhysReg::Gp(16)),
                 MachineOperand::PhysReg(PhysReg::Gp(17)),
             ],
-            def: None,
+            def: Some(dest),
         });
     } else if inst.ty != IrType::Void {
         let class = type_to_reg_class(&inst.ty);
@@ -2294,11 +2294,15 @@ fn select_terminator(
                     ],
                     def: None,
                 });
-                // x16 = src >> 32; s1 ← w16
+                // x16 = src >> 32; s1 ← w16. The shift amount lives
+                // in x17, NOT x9 — x9 is the allocator's vreg-load
+                // scratch and the VReg(src) substitution below would
+                // clobber it (caught by the differential: imag lane
+                // read the real lane's bits).
                 mf.block_mut(mb).insts.push(MachineInst {
                     opcode: ArmOpcode::Movz,
                     operands: vec![
-                        MachineOperand::PhysReg(PhysReg::Gp(9)),
+                        MachineOperand::PhysReg(PhysReg::Gp(17)),
                         MachineOperand::Imm(32),
                         MachineOperand::Shift(0),
                     ],
@@ -2309,7 +2313,7 @@ fn select_terminator(
                     operands: vec![
                         MachineOperand::PhysReg(PhysReg::Gp(16)),
                         MachineOperand::VReg(src),
-                        MachineOperand::PhysReg(PhysReg::Gp(9)),
+                        MachineOperand::PhysReg(PhysReg::Gp(17)),
                     ],
                     def: None,
                 });
