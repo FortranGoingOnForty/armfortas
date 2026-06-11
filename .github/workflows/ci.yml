@@ -228,6 +228,8 @@ jobs:
       - run: cargo test -p armfortas --lib
       - run: cargo test -p armfortas --tests -- --nocapture --test-threads=1 2>&1 | tee /tmp/tests.log
       - run: ci/check_skips.sh /tmp/tests.log posix-elf
+      # x07: surface the -O0 sweep counts in the job summary.
+      - run: grep -E '\[-O0\] .* passed' /tmp/tests.log >> "$GITHUB_STEP_SUMMARY" || true
 
   build-linux-musl:
     name: "Linux musl: build + tests (e2e skip-gated)"
@@ -265,3 +267,5 @@ jobs:
           run: |
             cargo build --workspace
             cargo test -p armfortas --lib
+            cargo test --test run_programs test_programs_end_to_end -- --nocapture 2>&1 | tee /tmp/sweep.log
+            grep -E '\[-O0\] .* passed' /tmp/sweep.log
