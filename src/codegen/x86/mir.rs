@@ -261,6 +261,14 @@ pub enum X86Opcode {
     // ---- Integer arithmetic (destructive: tied to operand 0) ----
     Add,
     Sub,
+    /// Add-with-carry / subtract-with-borrow: the i128 pair ops. The
+    /// flags producer (Add/Sub on the low quad) must be ADJACENT —
+    /// the naive allocator only inserts mov-family spill traffic,
+    /// which preserves RFLAGS (x05 module doc), and the i128 emitters
+    /// use physical registers + frame slots so no spill lands between
+    /// the pair at all.
+    Adc,
+    Sbb,
     Imul,
     And,
     Or,
@@ -331,10 +339,9 @@ impl X86Opcode {
     pub fn tied_use(&self) -> Option<usize> {
         use X86Opcode::*;
         match self {
-            Add | Sub | Imul | And | Or | Xor | Neg | Not | Shl | Shr | Sar | Addss | Addsd
-            | Subss | Subsd | Mulss | Mulsd | Divss | Divsd | Xorps | Xorpd | Andps | Andpd => {
-                Some(0)
-            }
+            Add | Sub | Adc | Sbb | Imul | And | Or | Xor | Neg | Not | Shl | Shr | Sar | Addss
+            | Addsd | Subss | Subsd | Mulss | Mulsd | Divss | Divsd | Xorps | Xorpd | Andps
+            | Andpd => Some(0),
             // Sqrtss/Sqrtsd are two-operand non-destructive
             // (`sqrtsd %src, %dst`) — deliberately not tied.
             _ => None,

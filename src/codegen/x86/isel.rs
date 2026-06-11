@@ -75,8 +75,15 @@ pub fn select_function(
     // Phase 2.5: classify incoming parameters and reserve their vregs.
     let mut abi_state = X86AbiState::new();
     let mut param_info: Vec<(X86VReg, X86AbiArgLoc, IrType)> = Vec::new();
+    let mut wide_param_info: Vec<((i32, i32), X86AbiArgLoc)> = Vec::new();
     for param in &func.params {
         let loc = classify_abi_arg(&abi_ty_of(&param.ty), &mut abi_state);
+        if matches!(param.ty, IrType::Int(IntWidth::I128)) {
+            let slots = (mf.alloc_frame_slot(8, 8), mf.alloc_frame_slot(8, 8));
+            ctx.wide_slots.insert(param.id, slots);
+            wide_param_info.push((slots, loc));
+            continue;
+        }
         let vreg = mf.new_vreg(type_to_class(&param.ty));
         ctx.value_map.insert(param.id, vreg);
         param_info.push((vreg, loc, param.ty.clone()));
@@ -126,18 +133,59 @@ pub fn select_function(
         }
     }
 
+    // Phase 3.5: spill incoming i128 pairs to their wide slots. The
+    // SysV pair arrives as (lo, hi) in two consecutive GP registers;
+    // stack-passed i128 sits at rbp+16+offset, 16-byte aligned
+    // (abi.tex §3.2.3: INTEGER class, two eightbytes).
+    for (slots, loc) in &wide_param_info {
+        match loc {
+            X86AbiArgLoc::GpPair(lo, hi) => {
+                emit_store_pair_to_slot(&mut mf, MBlockId(0), *slots, *lo, *hi);
+            }
+            X86AbiArgLoc::Stack { offset, .. } => {
+                for (half, scratch) in [(0i64, X86Reg::Rax), (8, X86Reg::Rdx)] {
+                    push(
+                        &mut mf,
+                        MBlockId(0),
+                        X86Opcode::MovRM,
+                        OpSize::Q,
+                        vec![X86Operand::Mem {
+                            base: Some(X86Reg::Rbp),
+                            index: None,
+                            scale: 1,
+                            disp: 16 + offset + half,
+                        }],
+                        Some(X86Operand::Reg(scratch)),
+                    );
+                }
+                emit_store_pair_to_slot(&mut mf, MBlockId(0), *slots, X86Reg::Rax, X86Reg::Rdx);
+            }
+            other => panic!("isel: unexpected ABI loc {:?} for incoming i128", other),
+        }
+    }
+
     // Phase 4a: reserve vregs for every block param and instruction
     // result before walking any instructions — branch terminators need
     // target-param vregs, and SSA dominance allows uses that precede
     // the defining block in vec order (same rationale as ARM isel).
     for block in &func.blocks {
         for bp in &block.params {
+            if matches!(bp.ty, IrType::Int(IntWidth::I128)) {
+                let slots = (mf.alloc_frame_slot(8, 8), mf.alloc_frame_slot(8, 8));
+                ctx.wide_slots.insert(bp.id, slots);
+                continue;
+            }
             reject_unsupported(&bp.ty);
             let vreg = mf.new_vreg(type_to_class(&bp.ty));
             ctx.value_map.insert(bp.id, vreg);
         }
         for inst in &block.insts {
             if matches!(inst.ty, IrType::Void) {
+                continue;
+            }
+            if matches!(inst.ty, IrType::Int(IntWidth::I128)) {
+                let slots = (mf.alloc_frame_slot(8, 8), mf.alloc_frame_slot(8, 8));
+                ctx.wide_slots.insert(inst.id, slots);
                 continue;
             }
             reject_unsupported(&inst.ty);
@@ -180,6 +228,16 @@ struct X86ISelCtx {
     alloca_slots: HashMap<ValueId, i32>,
     /// IR BlockId → its block params, snapshotted before phase 4b.
     block_params: HashMap<BlockId, Vec<BlockParam>>,
+    /// IR i128 ValueId → (lo, hi) frame slots. i128 values are
+    /// memory-resident (the arm64 isel's wide-slot model) as TWO
+    /// independent 8-byte slots — every producer stores a quad pair,
+    /// every consumer loads through physical scratches (rax:rdx), and
+    /// no i128 ever occupies a vreg. Two slots instead of one
+    /// 16-byte slot keeps the operand grammar untouched: each half is
+    /// an ordinary FrameSlot. Nothing requires the halves adjacent;
+    /// ABI crossings (args, returns, memory) always stage via the
+    /// register pair.
+    wide_slots: HashMap<ValueId, (i32, i32)>,
 }
 
 impl X86ISelCtx {
@@ -190,6 +248,7 @@ impl X86ISelCtx {
             block_map: HashMap::new(),
             alloca_slots: HashMap::new(),
             block_params: HashMap::new(),
+            wide_slots: HashMap::new(),
         }
     }
 
@@ -199,6 +258,17 @@ impl X86ISelCtx {
             panic!(
                 "isel: unmapped IR value %{} — phase 4a should have allocated \
                  a vreg for every IR value before phase 4b runs",
+                val.0
+            )
+        })
+    }
+
+    /// (lo, hi) frame slots of an i128 value (allocated in 2.5/4a).
+    fn lookup_wide_slot(&self, val: ValueId) -> (i32, i32) {
+        *self.wide_slots.get(&val).unwrap_or_else(|| {
+            panic!(
+                "isel: i128 value %{} has no wide slots — phase 4a should have \
+                 allocated them",
                 val.0
             )
         })
@@ -314,6 +384,182 @@ fn select_inst(
     func: &Function,
     func_names: &[String],
 ) -> MBlockId {
+    // ---- i128 early dispatch (x08): wide-slot model ----
+    if matches!(inst.ty, IrType::Int(IntWidth::I128)) {
+        use X86Reg::{Rax, Rcx, Rdx};
+        match &inst.kind {
+            InstKind::ConstInt(val, IntWidth::I128) => {
+                let dest = ctx.lookup_wide_slot(inst.id);
+                emit_const_i128_pair(mf, mb, *val, Rax, Rdx);
+                emit_store_pair_to_slot(mf, mb, dest, Rax, Rdx);
+                return mb;
+            }
+            InstKind::Undef(_) => {
+                let dest = ctx.lookup_wide_slot(inst.id);
+                emit_const_i128_pair(mf, mb, 0, Rax, Rdx);
+                emit_store_pair_to_slot(mf, mb, dest, Rax, Rdx);
+                return mb;
+            }
+            InstKind::IAdd(a, b) | InstKind::ISub(a, b) => {
+                let dest = ctx.lookup_wide_slot(inst.id);
+                let lhs = ctx.lookup_wide_slot(*a);
+                let rhs = ctx.lookup_wide_slot(*b);
+                emit_load_slot_pair(mf, mb, lhs, Rax, Rdx);
+                let (lo_op, hi_op) = if matches!(inst.kind, InstKind::IAdd(..)) {
+                    (X86Opcode::Add, X86Opcode::Adc)
+                } else {
+                    (X86Opcode::Sub, X86Opcode::Sbb)
+                };
+                // add/adc (sub/sbb) MUST stay adjacent: both operands
+                // are phys regs + frame slots, so the allocator
+                // inserts nothing between them.
+                emit_alu_reg_slot(mf, mb, lo_op, Rax, rhs.0);
+                emit_alu_reg_slot(mf, mb, hi_op, Rdx, rhs.1);
+                emit_store_pair_to_slot(mf, mb, dest, Rax, Rdx);
+                return mb;
+            }
+            InstKind::INeg(a) => {
+                let dest = ctx.lookup_wide_slot(inst.id);
+                let src = ctx.lookup_wide_slot(*a);
+                emit_load_slot_pair(mf, mb, src, Rax, Rdx);
+                // 128-bit two's-complement negate:
+                //   negq hi; negq lo; sbbq $0, hi
+                // negq lo sets CF iff lo != 0; hi = -hi - CF.
+                push(
+                    mf,
+                    mb,
+                    X86Opcode::Neg,
+                    OpSize::Q,
+                    vec![X86Operand::Reg(Rdx)],
+                    Some(X86Operand::Reg(Rdx)),
+                );
+                push(
+                    mf,
+                    mb,
+                    X86Opcode::Neg,
+                    OpSize::Q,
+                    vec![X86Operand::Reg(Rax)],
+                    Some(X86Operand::Reg(Rax)),
+                );
+                push(
+                    mf,
+                    mb,
+                    X86Opcode::Sbb,
+                    OpSize::Q,
+                    vec![X86Operand::Reg(Rdx), X86Operand::Imm(0)],
+                    Some(X86Operand::Reg(Rdx)),
+                );
+                emit_store_pair_to_slot(mf, mb, dest, Rax, Rdx);
+                return mb;
+            }
+            InstKind::Load(addr) => {
+                let dest = ctx.lookup_wide_slot(inst.id);
+                match ctx.addr_operand(*addr) {
+                    X86Operand::FrameSlot(base_slot) => {
+                        // An alloca'd i128: its storage is one 16-byte
+                        // alloca slot; load (lo, hi) from +0/+8 of it.
+                        // FrameSlot has no displacement, so go through
+                        // rcx as a pointer.
+                        push(
+                            mf,
+                            mb,
+                            X86Opcode::Lea,
+                            OpSize::Q,
+                            vec![X86Operand::FrameSlot(base_slot)],
+                            Some(X86Operand::Reg(Rcx)),
+                        );
+                    }
+                    vreg_op => {
+                        // Pointer in a vreg: pull the pointer VALUE
+                        // into rcx (MovRR; the allocator loads the
+                        // vreg into a scratch and moves it over).
+                        push(
+                            mf,
+                            mb,
+                            X86Opcode::MovRR,
+                            OpSize::Q,
+                            vec![vreg_op],
+                            Some(X86Operand::Reg(Rcx)),
+                        );
+                    }
+                }
+                for (disp, reg) in [(0i64, Rax), (8, Rdx)] {
+                    push(
+                        mf,
+                        mb,
+                        X86Opcode::MovRM,
+                        OpSize::Q,
+                        vec![X86Operand::Mem {
+                            base: Some(Rcx),
+                            index: None,
+                            scale: 1,
+                            disp,
+                        }],
+                        Some(X86Operand::Reg(reg)),
+                    );
+                }
+                emit_store_pair_to_slot(mf, mb, dest, Rax, Rdx);
+                return mb;
+            }
+            InstKind::Select(cond, tv, fv) => {
+                // Same diamond shape as the narrow Select below, but
+                // copying slot pairs.
+                let dest = ctx.lookup_wide_slot(inst.id);
+                let ts = ctx.lookup_wide_slot(*tv);
+                let fs = ctx.lookup_wide_slot(*fv);
+                let vcond = ctx.lookup_vreg(*cond);
+                let false_mb = mf.new_block();
+                let join_mb = mf.new_block();
+                push(
+                    mf,
+                    mb,
+                    X86Opcode::Test,
+                    OpSize::L,
+                    vec![X86Operand::VReg(vcond), X86Operand::VReg(vcond)],
+                    None,
+                );
+                push(
+                    mf,
+                    mb,
+                    X86Opcode::Jcc,
+                    OpSize::Q,
+                    vec![X86Operand::Cond(X86Cond::E), X86Operand::BlockRef(false_mb)],
+                    None,
+                );
+                emit_load_slot_pair(mf, mb, ts, Rax, Rdx);
+                emit_store_pair_to_slot(mf, mb, dest, Rax, Rdx);
+                push(
+                    mf,
+                    mb,
+                    X86Opcode::Jmp,
+                    OpSize::Q,
+                    vec![X86Operand::BlockRef(join_mb)],
+                    None,
+                );
+                emit_load_slot_pair(mf, false_mb, fs, Rax, Rdx);
+                emit_store_pair_to_slot(mf, false_mb, dest, Rax, Rdx);
+                push(
+                    mf,
+                    false_mb,
+                    X86Opcode::Jmp,
+                    OpSize::Q,
+                    vec![X86Operand::BlockRef(join_mb)],
+                    None,
+                );
+                return join_mb;
+            }
+            InstKind::Call(..) | InstKind::RuntimeCall(..) => {
+                // The call selector stores the rax:rdx return pair to
+                // the wide slot itself.
+                select_call_inst(mf, ctx, mb, inst, func, func_names);
+                return mb;
+            }
+            other => panic!("x08 scope: i128 instruction {:?} not selected yet", other),
+        }
+    }
+    // i128 with non-i128 result types: stores, compares, returns of
+    // i128 OPERANDS are handled in their own arms below.
+
     match &inst.kind {
         // ---- Constants ----
         InstKind::ConstInt(val, width) => {
@@ -563,6 +809,16 @@ fn select_inst(
         // ---- Comparisons ----
         InstKind::ICmp(op, a, b) => {
             let dest = ctx.lookup_vreg(inst.id);
+            let a_i128 = matches!(func.value_type(*a), Some(IrType::Int(IntWidth::I128)));
+            let b_i128 = matches!(func.value_type(*b), Some(IrType::Int(IntWidth::I128)));
+            if a_i128 || b_i128 {
+                assert!(
+                    a_i128 && b_i128,
+                    "isel: mixed-width i128 compare should have been widened in IR"
+                );
+                emit_i128_icmp(mf, ctx, mb, *op, *a, *b, dest);
+                return mb;
+            }
             let wide = needs_wide_icmp(func.value_type(*a).as_ref())
                 || needs_wide_icmp(func.value_type(*b).as_ref());
             let va = cmp_operand_vreg(mf, ctx, mb, func, *a, wide);
@@ -961,10 +1217,55 @@ fn select_inst(
         }
 
         InstKind::Store(val, addr) => {
-            let src = ctx.lookup_vreg(*val);
             let val_ty = func
                 .value_type(*val)
                 .unwrap_or_else(|| panic!("isel: missing type for stored value %{}", val.0));
+            if matches!(val_ty, IrType::Int(IntWidth::I128)) {
+                let src = ctx.lookup_wide_slot(*val);
+                emit_load_slot_pair(mf, mb, src, X86Reg::Rax, X86Reg::Rdx);
+                match ctx.addr_operand(*addr) {
+                    X86Operand::FrameSlot(base_slot) => {
+                        push(
+                            mf,
+                            mb,
+                            X86Opcode::Lea,
+                            OpSize::Q,
+                            vec![X86Operand::FrameSlot(base_slot)],
+                            Some(X86Operand::Reg(X86Reg::Rcx)),
+                        );
+                    }
+                    vreg_op => {
+                        push(
+                            mf,
+                            mb,
+                            X86Opcode::MovRR,
+                            OpSize::Q,
+                            vec![vreg_op],
+                            Some(X86Operand::Reg(X86Reg::Rcx)),
+                        );
+                    }
+                }
+                for (disp, reg) in [(0i64, X86Reg::Rax), (8, X86Reg::Rdx)] {
+                    push(
+                        mf,
+                        mb,
+                        X86Opcode::MovMR,
+                        OpSize::Q,
+                        vec![
+                            X86Operand::Reg(reg),
+                            X86Operand::Mem {
+                                base: Some(X86Reg::Rcx),
+                                index: None,
+                                scale: 1,
+                                disp,
+                            },
+                        ],
+                        None,
+                    );
+                }
+                return mb;
+            }
+            let src = ctx.lookup_vreg(*val);
             let addr_op = ctx.addr_operand(*addr);
             emit_store(mf, mb, src, &val_ty, addr_op);
         }
@@ -1482,6 +1783,62 @@ fn select_call_inst(
     // later argument computation can clobber an argument register.
     let mut pending: Vec<X86Inst> = Vec::new();
     for (arg, loc, ty) in &arg_locs {
+        if matches!(ty, IrType::Int(IntWidth::I128)) {
+            let slots = ctx.lookup_wide_slot(*arg);
+            match loc {
+                // psABI: a two-eightbyte INTEGER argument takes two
+                // consecutive GP argument registers (abi.tex §3.2.3);
+                // when fewer than two remain, the WHOLE argument goes
+                // to the stack and the registers stay available for
+                // later args (the classifier owns that revert rule).
+                X86AbiArgLoc::GpPair(lo, hi) => {
+                    // Direct slot→argreg loads; deferring to `pending`
+                    // is unnecessary because the sources are frame
+                    // slots, which later arg computation cannot
+                    // clobber... but a later arg's own staging COULD
+                    // overwrite lo/hi if they alias rax/rdx scratches
+                    // used by i128 stack stores below. Batch with
+                    // `pending` like every other register arg.
+                    pending.push(X86Inst {
+                        opcode: X86Opcode::MovRM,
+                        size: OpSize::Q,
+                        operands: vec![X86Operand::FrameSlot(slots.0)],
+                        def: Some(X86Operand::Reg(*lo)),
+                    });
+                    pending.push(X86Inst {
+                        opcode: X86Opcode::MovRM,
+                        size: OpSize::Q,
+                        operands: vec![X86Operand::FrameSlot(slots.1)],
+                        def: Some(X86Operand::Reg(*hi)),
+                    });
+                }
+                X86AbiArgLoc::Stack { offset, .. } => {
+                    // 16-byte aligned outgoing slot (classifier
+                    // guarantees the offset).
+                    emit_load_slot_pair(mf, mb, slots, X86Reg::Rax, X86Reg::Rdx);
+                    for (half, reg) in [(0i64, X86Reg::Rax), (8, X86Reg::Rdx)] {
+                        push(
+                            mf,
+                            mb,
+                            X86Opcode::MovMR,
+                            OpSize::Q,
+                            vec![
+                                X86Operand::Reg(reg),
+                                X86Operand::Mem {
+                                    base: Some(X86Reg::Rsp),
+                                    index: None,
+                                    scale: 1,
+                                    disp: offset + half,
+                                },
+                            ],
+                            None,
+                        );
+                    }
+                }
+                other => panic!("isel: unexpected ABI loc {:?} for i128 arg", other),
+            }
+            continue;
+        }
         let v = ctx.lookup_vreg(*arg);
         match loc {
             X86AbiArgLoc::Gp(r) => pending.push(X86Inst {
@@ -1556,6 +1913,13 @@ fn select_call_inst(
     );
 
     if inst.ty != IrType::Void {
+        if matches!(inst.ty, IrType::Int(IntWidth::I128)) {
+            // psABI: INTEGER pair returns in rax (low) : rdx (high)
+            // (abi.tex §3.2.3, returning of values).
+            let dest = ctx.lookup_wide_slot(inst.id);
+            emit_store_pair_to_slot(mf, mb, dest, X86Reg::Rax, X86Reg::Rdx);
+            return;
+        }
         let dest = ctx.lookup_vreg(inst.id);
         match classify_return(&abi_ty_of(&inst.ty)) {
             X86RetLoc::Regs(regs) if regs.len() == 1 => {
@@ -1593,10 +1957,19 @@ fn select_terminator(
             push(mf, mb, X86Opcode::Ret, OpSize::Q, vec![], None);
         }
         Terminator::Return(Some(val)) => {
-            let src = ctx.lookup_vreg(*val);
             let ty = func
                 .value_type(*val)
                 .unwrap_or_else(|| panic!("isel: missing type for return value %{}", val.0));
+            if matches!(ty, IrType::Int(IntWidth::I128)) {
+                // psABI (abi.tex §3.2.3, returning of values): a two-
+                // eightbyte INTEGER-class value returns in rax (low)
+                // and rdx (high).
+                let src = ctx.lookup_wide_slot(*val);
+                emit_load_slot_pair(mf, mb, src, X86Reg::Rax, X86Reg::Rdx);
+                push(mf, mb, X86Opcode::Ret, OpSize::Q, vec![], None);
+                return;
+            }
+            let src = ctx.lookup_vreg(*val);
             match classify_return(&abi_ty_of(&ty)) {
                 X86RetLoc::Regs(regs) if regs.len() == 1 => {
                     let r = regs[0];
@@ -1764,6 +2137,8 @@ fn emit_branch_arg_copies(
     target_block: BlockId,
     args: &[ValueId],
 ) {
+    // (i128 branch args are slot-to-slot pair copies, handled in the
+    // per-arg loop below by the wide_slots lookup.)
     if args.is_empty() {
         return;
     }
@@ -1779,6 +2154,19 @@ fn emit_branch_arg_copies(
 
     let mut staged: Vec<(X86VReg, X86VReg)> = Vec::with_capacity(args.len());
     for (arg, bp) in args.iter().zip(target_params.iter()) {
+        if matches!(bp.ty, IrType::Int(IntWidth::I128)) {
+            // Wide branch arg: slot-pair copy through rax:rdx. Slots
+            // are per-value, so source and destination never alias
+            // unless they are literally the same value (skip then).
+            let dst = ctx.lookup_wide_slot(bp.id);
+            let src = ctx.lookup_wide_slot(*arg);
+            if dst == src {
+                continue;
+            }
+            emit_load_slot_pair(mf, mb, src, X86Reg::Rax, X86Reg::Rdx);
+            emit_store_pair_to_slot(mf, mb, dst, X86Reg::Rax, X86Reg::Rdx);
+            continue;
+        }
         let dst = ctx.lookup_vreg(bp.id);
         let src = ctx.lookup_vreg(*arg);
         if dst == src {
@@ -1858,6 +2246,137 @@ fn fp_size(ty: &IrType) -> OpSize {
     fp_size_w(float_width(ty))
 }
 
+/// i128 compare via the sub/sbb flags idiom — no branches:
+///   Eq/Ne:  xor-diff both halves, OR them, set{e,ne} on ZF.
+///   Lt/Ge:  rax:rdx = lhs; subq rhs.lo; sbbq rhs.hi; SF!=OF iff
+///           lhs < rhs (signed)  → setl / setge.
+///   Gt/Le:  the same idiom with the operands swapped (rhs < lhs).
+/// Everything stays in phys regs + frame slots, so the allocator
+/// cannot break the sub/sbb flag adjacency.
+fn emit_i128_icmp(
+    mf: &mut X86Function,
+    ctx: &mut X86ISelCtx,
+    mb: MBlockId,
+    op: CmpOp,
+    a: ValueId,
+    b: ValueId,
+    dest: X86VReg,
+) {
+    use X86Reg::{Rax, Rdx};
+    let (first, second, cond) = match op {
+        CmpOp::Eq => (a, b, X86Cond::E),
+        CmpOp::Ne => (a, b, X86Cond::Ne),
+        CmpOp::Lt => (a, b, X86Cond::L),
+        CmpOp::Ge => (a, b, X86Cond::Ge),
+        // lhs > rhs  ==  rhs < lhs;  lhs <= rhs  ==  !(rhs < lhs)
+        CmpOp::Gt => (b, a, X86Cond::L),
+        CmpOp::Le => (b, a, X86Cond::Ge),
+    };
+    let fs = ctx.lookup_wide_slot(first);
+    let ss = ctx.lookup_wide_slot(second);
+    emit_load_slot_pair(mf, mb, fs, Rax, Rdx);
+    match op {
+        CmpOp::Eq | CmpOp::Ne => {
+            emit_alu_reg_slot(mf, mb, X86Opcode::Xor, Rax, ss.0);
+            emit_alu_reg_slot(mf, mb, X86Opcode::Xor, Rdx, ss.1);
+            push(
+                mf,
+                mb,
+                X86Opcode::Or,
+                OpSize::Q,
+                vec![X86Operand::Reg(Rax), X86Operand::Reg(Rdx)],
+                Some(X86Operand::Reg(Rax)),
+            );
+        }
+        _ => {
+            emit_alu_reg_slot(mf, mb, X86Opcode::Sub, Rax, ss.0);
+            emit_alu_reg_slot(mf, mb, X86Opcode::Sbb, Rdx, ss.1);
+        }
+    }
+    emit_setcc_movzx(mf, mb, cond, dest);
+}
+
+// ---- i128 slot helpers (x08) ----
+//
+// i128 values are memory-resident (lo, hi) frame-slot pairs (the
+// arm64 wide-slot model adapted to x05's operand grammar). Staging
+// goes through rax:rdx (rcx/rsi for second pairs and pointer bases) —
+// physical registers the naive allocator never touches. Emitted
+// instructions mix only phys regs and frame slots, so no spill
+// traffic can land between a flags producer (Add/Sub on the low
+// quad) and its Adc/Sbb consumer.
+
+fn emit_load_slot_pair(
+    mf: &mut X86Function,
+    mb: MBlockId,
+    slots: (i32, i32),
+    lo: X86Reg,
+    hi: X86Reg,
+) {
+    for (slot, reg) in [(slots.0, lo), (slots.1, hi)] {
+        push(
+            mf,
+            mb,
+            X86Opcode::MovRM,
+            OpSize::Q,
+            vec![X86Operand::FrameSlot(slot)],
+            Some(X86Operand::Reg(reg)),
+        );
+    }
+}
+
+fn emit_store_pair_to_slot(
+    mf: &mut X86Function,
+    mb: MBlockId,
+    slots: (i32, i32),
+    lo: X86Reg,
+    hi: X86Reg,
+) {
+    for (slot, reg) in [(slots.0, lo), (slots.1, hi)] {
+        push(
+            mf,
+            mb,
+            X86Opcode::MovMR,
+            OpSize::Q,
+            vec![X86Operand::Reg(reg), X86Operand::FrameSlot(slot)],
+            None,
+        );
+    }
+}
+
+/// movabsq both halves of a constant into (lo, hi).
+fn emit_const_i128_pair(mf: &mut X86Function, mb: MBlockId, val: i128, lo: X86Reg, hi: X86Reg) {
+    let bits = val as u128;
+    for (half, reg) in [(bits as u64, lo), ((bits >> 64) as u64, hi)] {
+        push(
+            mf,
+            mb,
+            X86Opcode::MovRI,
+            OpSize::Q,
+            vec![X86Operand::Imm(half as i64)],
+            Some(X86Operand::Reg(reg)),
+        );
+    }
+}
+
+/// Tied ALU op `reg <op>= slot` (the operand-1 memory form).
+fn emit_alu_reg_slot(
+    mf: &mut X86Function,
+    mb: MBlockId,
+    opcode: X86Opcode,
+    reg: X86Reg,
+    slot: i32,
+) {
+    push(
+        mf,
+        mb,
+        opcode,
+        OpSize::Q,
+        vec![X86Operand::Reg(reg), X86Operand::FrameSlot(slot)],
+        Some(X86Operand::Reg(reg)),
+    );
+}
+
 /// IrType → ABI scalar for the x04 classifier. Scalars only — x05's
 /// call scope.
 fn abi_ty_of(ty: &IrType) -> AbiTy {
@@ -1867,7 +2386,7 @@ fn abi_ty_of(ty: &IrType) -> AbiTy {
         IrType::Int(IntWidth::I16) => AbiTy::Scalar(AbiField::I16),
         IrType::Int(IntWidth::I32) => AbiTy::Scalar(AbiField::I32),
         IrType::Int(IntWidth::I64) => AbiTy::Scalar(AbiField::I64),
-        IrType::Int(IntWidth::I128) => panic!("x05 scope: i128 calls deferred"),
+        IrType::Int(IntWidth::I128) => AbiTy::Scalar(AbiField::I128),
         IrType::Float(FloatWidth::F32) => AbiTy::Scalar(AbiField::F32),
         IrType::Float(FloatWidth::F64) => AbiTy::Scalar(AbiField::F64),
         IrType::Ptr(_) | IrType::FuncPtr(_) => AbiTy::Scalar(AbiField::Ptr),

@@ -254,6 +254,8 @@ fn emit_inst(inst: &X86Inst, func: &X86Function) -> String {
         Lea => format!("lea{} {}, {}", suf, op(0), def()),
         Add => format!("add{} {}, {}", suf, op(1), def()),
         Sub => format!("sub{} {}, {}", suf, op(1), def()),
+        Adc => format!("adc{} {}, {}", suf, op(1), def()),
+        Sbb => format!("sbb{} {}, {}", suf, op(1), def()),
         Imul => format!("imul{} {}, {}", suf, op(1), def()),
         And => format!("and{} {}, {}", suf, op(1), def()),
         Or => format!("or{} {}, {}", suf, op(1), def()),

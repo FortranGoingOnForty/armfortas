@@ -40,7 +40,13 @@ each was a systemic root cause failing dozens of programs):
 
 ## Findings
 
-### X64-O0-001 — i128 values are not selected by the x86 backend
+### X64-O0-001 — i128 values are not selected by the x86 backend [FIXED in x08]
+
+Resolved: i128 values are memory-resident (lo, hi) frame-slot pairs
+staged through rax:rdx (the arm64 wide-slot model); add/adc, sub/sbb,
+neg, compares via the sub/sbb flags idiom, rax:rdx returns, GpPair
+args with the SysV revert rule. All 13 programs pass and the
+annotations are removed; kept for history:
 - Programs (13): integer16_format, integer16_format_read,
   integer16_format_read_arrays, integer16_format_read_sections,
   integer16_format_read_targets, integer16_internal_format,
@@ -51,7 +57,7 @@ each was a systemic root cause failing dozens of programs):
 - Both ELF platforms: compile error `x05 scope: i128 values deferred`.
 - Category: BACKEND. The isel has no i128 register-pair strategy;
   x05 deferred it deliberately (loud error, never wrong answers).
-- Owner: x08 (the fourteen dedicated i128 suites are its first deliverable).
+- Owner: x08 — DONE (this entry retained as the finding record).
 
 ### X64-O0-002 — indirect calls through procedure pointers
 - Programs (3): procedure_dummy_interface_scope_hidden_lengths,
