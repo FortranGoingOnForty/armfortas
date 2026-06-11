@@ -251,6 +251,20 @@ fn addr_operand_position(inst: &X86Inst) -> Option<usize> {
         // dereferences a vreg address — but a vreg there would still
         // be an address value.
         X86Opcode::Lea => Some(0),
+        // FP loads through a pointer held in a vreg: movss/movsd
+        // cannot take a GP register source, so a GP-class operand 0
+        // is by construction an ADDRESS (the source-side mirror of
+        // the is_fp_store_addr def handling below). Without this the
+        // pointer itself was loaded as the "value" and gas rejected
+        // `movss %r10d, %xmm14` — ~100 sweep programs at once (x07).
+        X86Opcode::Movss | X86Opcode::Movsd
+            if matches!(
+                inst.operands.first(),
+                Some(X86Operand::VReg(v)) if v.class != X86RegClass::Xmm
+            ) =>
+        {
+            Some(0)
+        }
         _ => None,
     }
 }
