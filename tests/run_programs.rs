@@ -1306,11 +1306,20 @@ fn extract_asm_checks(
     filename: &str,
     active: &TargetSpec,
 ) -> Result<Vec<ShapeCheck>, String> {
+    // Unscoped `! ASM_CHECK:`/`! ASM_NOT:` keep meaning arm64-macos
+    // (x01/x07 grammar): every existing assertion is ARM-shaped, and
+    // silently matching them against x86 text would fail the whole
+    // corpus. A program opts into other targets with an explicit
+    // selector.
+    let bare_active = *active == TargetSpec::parse("arm64-macos").unwrap();
     let mut checks = Vec::new();
     for (i, line) in source.lines().enumerate() {
+        let bare_check = line.trim().starts_with("! ASM_CHECK:");
+        let bare_not = line.trim().starts_with("! ASM_NOT:");
         if let Some((is_active, rest)) =
             match_qualified_directive(line, "ASM_CHECK", active, filename, i + 1)?
         {
+            let is_active = is_active && (!bare_check || bare_active);
             if is_active {
                 checks.push(ShapeCheck {
                     line_num: i + 1,
@@ -1323,6 +1332,7 @@ fn extract_asm_checks(
         if let Some((is_active, rest)) =
             match_qualified_directive(line, "ASM_NOT", active, filename, i + 1)?
         {
+            let is_active = is_active && (!bare_not || bare_active);
             if is_active {
                 checks.push(ShapeCheck {
                     line_num: i + 1,
@@ -2003,6 +2013,15 @@ fn run_opt_eq_rules(
         };
 
         for compare_opt in rule.opt_flags.iter().skip(1) {
+            // ELF hosts run -O0 only this sprint (x07); comparing
+            // against a level the platform cannot compile yet is x09's
+            // work, not a failure today. macOS compares every level,
+            // unchanged.
+            if armfortas::testing::native_e2e_level_support(&format!("-{}", compare_opt)).is_err()
+                && armfortas::testing::native_e2e_level_support(compare_opt).is_err()
+            {
+                continue;
+            }
             if rule
                 .components
                 .iter()
@@ -2902,6 +2921,90 @@ fn test_programs_end_to_end_ofast() {
     if let Err(msg) = run_all_at("-Ofast", "test_programs_end_to_end_ofast") {
         panic!("Test failures at -Ofast:\n\n{}", msg);
     }
+}
+
+/// x07 DoD: every `XFAIL(x86_64*): X64-O0-NNN` annotation in
+/// test_programs/ must reference a finding ID present in the sweep
+/// log, and every finding ID in the log must still have at least one
+/// annotation (no orphans in either direction). Runs everywhere — it
+/// only reads text.
+#[test]
+fn xfail_findings_cross_check() {
+    use std::collections::BTreeSet;
+    let log_path = {
+        let mut found = None;
+        for dir in [".docs/audits", "../.docs/audits"] {
+            let p = Path::new(dir).join("x86_64-o0-sweep.md");
+            if p.exists() {
+                found = Some(p);
+                break;
+            }
+        }
+        found.expect("x86_64-o0-sweep.md not found (tracked via .gitignore exception)")
+    };
+    let log = fs::read_to_string(&log_path).unwrap();
+    let id_re = |text: &str| -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        let bytes = text.as_bytes();
+        let needle = b"X64-O0-";
+        let mut i = 0;
+        while i + needle.len() < bytes.len() {
+            if &bytes[i..i + needle.len()] == needle {
+                let start = i;
+                let mut j = i + needle.len();
+                while j < bytes.len() && bytes[j].is_ascii_digit() {
+                    j += 1;
+                }
+                if j > i + needle.len() {
+                    out.insert(text[start..j].to_string());
+                }
+                i = j;
+            } else {
+                i += 1;
+            }
+        }
+        out
+    };
+    let log_ids = id_re(&log);
+    assert!(!log_ids.is_empty(), "sweep log has no finding IDs");
+
+    let test_dir = find_test_programs();
+    let mut annotation_ids = BTreeSet::new();
+    for entry in fs::read_dir(&test_dir).unwrap().filter_map(|e| e.ok()) {
+        let p = entry.path();
+        if !is_test_program_source(&p) {
+            continue;
+        }
+        let src = fs::read_to_string(&p).unwrap_or_default();
+        for line in src.lines() {
+            // musl is gated off until x11; its qualifier exists only
+            // in the x01 inactive-selector fixture and carries no
+            // sweep finding.
+            if line.contains("XFAIL(x86_64") && !line.contains("musl") {
+                for id in id_re(line) {
+                    annotation_ids.insert(id);
+                }
+                assert!(
+                    line.contains("X64-O0-"),
+                    "{}: XFAIL(x86_64*) without a X64-O0-NNN finding ID: {}",
+                    p.display(),
+                    line
+                );
+            }
+        }
+    }
+    let orphan_annotations: Vec<_> = annotation_ids.difference(&log_ids).collect();
+    assert!(
+        orphan_annotations.is_empty(),
+        "XFAIL annotations reference IDs missing from the sweep log: {:?}",
+        orphan_annotations
+    );
+    let orphan_findings: Vec<_> = log_ids.difference(&annotation_ids).collect();
+    assert!(
+        orphan_findings.is_empty(),
+        "sweep-log findings with no remaining XFAIL annotation (fixed? remove the entry or mark it resolved): {:?}",
+        orphan_findings
+    );
 }
 
 #[test]
