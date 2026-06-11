@@ -557,3 +557,56 @@ end program mixed
         );
     }
 }
+
+/// COMMON-block layout agreement across TUs: both sides declare the
+/// same /shared/ block with mixed integer/real members (character
+/// members are sema-rejected pending inline-byte storage, l06);
+/// offsets must agree or the reader sees garbage. Both targets are
+/// LP64 little-endian — divergence is a bug, never a platform
+/// difference (campaign hard constraint).
+#[test]
+fn cross_tu_common_block_layout() {
+    let wb = Workbench::new("commontu");
+    let writer = wb.fortran_obj(
+        "writer",
+        r#"
+subroutine fill_shared()
+  implicit none
+  integer(4) :: count
+  real(8) :: weight
+  integer(8) :: stamp
+  common /shared/ count, weight, stamp
+  count = 42
+  weight = 2.5d0
+  stamp = 1234567890123_8
+end subroutine fill_shared
+"#,
+    );
+    let reader = wb.fortran_obj(
+        "main",
+        r#"
+program commontu
+  implicit none
+  integer(4) :: count
+  real(8) :: weight
+  integer(8) :: stamp
+  common /shared/ count, weight, stamp
+  call fill_shared()
+  print *, count
+  print *, int(weight * 10.0d0), stamp
+end program commontu
+"#,
+    );
+    let out = wb.link_and_run("commontu_bin", &[&reader, &writer]);
+    let lines: Vec<String> = out
+        .lines()
+        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect();
+    assert_eq!(
+        lines,
+        vec!["42", "25 1234567890123"],
+        "cross-TU COMMON layout divergence:
+{}",
+        out
+    );
+}
