@@ -1368,9 +1368,9 @@ fn emit_vreg_move(mf: &mut X86Function, mb: MBlockId, dst: X86VReg, src: X86VReg
 /// convention width (sign for i8/i16, zero for Bool).
 fn emit_load(mf: &mut X86Function, mb: MBlockId, dest: X86VReg, ty: &IrType, addr: X86Operand) {
     let (opcode, size) = match ty {
-        IrType::Bool => (X86Opcode::Movzx { src: OpSize::B }, OpSize::L),
-        IrType::Int(IntWidth::I8) => (X86Opcode::Movsx { src: OpSize::B }, OpSize::L),
-        IrType::Int(IntWidth::I16) => (X86Opcode::Movsx { src: OpSize::W }, OpSize::L),
+        IrType::Bool => (X86Opcode::MovzxRM { src: OpSize::B }, OpSize::L),
+        IrType::Int(IntWidth::I8) => (X86Opcode::MovsxRM { src: OpSize::B }, OpSize::L),
+        IrType::Int(IntWidth::I16) => (X86Opcode::MovsxRM { src: OpSize::W }, OpSize::L),
         IrType::Int(IntWidth::I32) => (X86Opcode::MovRM, OpSize::L),
         IrType::Int(IntWidth::I64) | IrType::Ptr(_) | IrType::FuncPtr(_) => {
             (X86Opcode::MovRM, OpSize::Q)
@@ -1403,8 +1403,13 @@ fn emit_store(mf: &mut X86Function, mb: MBlockId, src: X86VReg, ty: &IrType, add
             vec![X86Operand::VReg(src), addr],
             None,
         ),
-        IrType::Int(IntWidth::I16) => panic!(
-            "x05 scope: i16 stores deferred (16-bit register names not wired in the printer)"
+        IrType::Int(IntWidth::I16) => push(
+            mf,
+            mb,
+            X86Opcode::MovMR,
+            OpSize::W,
+            vec![X86Operand::VReg(src), addr],
+            None,
         ),
         IrType::Int(IntWidth::I32) => push(
             mf,

@@ -1,11 +1,9 @@
-! Pins the x86 bool-deref miscompile found during l02 (2026-06-10):
-! `if (c)` on a LOGICAL dummy branches on the low byte of the POINTER
-! instead of loading the pointed-to value — movzbl gets a register
-! source where it needs a memory operand (isel/regalloc addressing
-! form for i8 loads through a pointer vreg). IR verified correct;
-! arm64 correct. Owned by x07's parity sweep; the XFAIL flips to a
-! hard failure there the moment the fix lands.
-! XFAIL(x86_64): bool loads through pointer vregs select a register-source movzx (x07)
+! Pins the x86 bool-deref miscompile found during l02 and fixed in
+! x07: `if (c)` on a LOGICAL dummy branched on the low byte of the
+! POINTER — the extending loads shared an opcode with register
+! zero-extension, so the allocator could not tell addresses from
+! values. Movzx/Movsx now have RM (memory-source) variants carrying
+! the MovRM address convention.
 ! CHECK: false-branch
 ! CHECK: true-branch
 program x07_bool_dummy_branch

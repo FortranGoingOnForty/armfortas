@@ -243,8 +243,8 @@ fn xmm_width_override(opcode: X86Opcode) -> (Option<OpSize>, Option<OpSize>) {
 /// `X86Opcode::MovRM` convention) or address-as-def store form.
 fn addr_operand_position(inst: &X86Inst) -> Option<usize> {
     match inst.opcode {
-        // MovRM: operand 0 is the source address.
-        X86Opcode::MovRM => Some(0),
+        // MovRM and the extending loads: operand 0 is the source address.
+        X86Opcode::MovRM | X86Opcode::MovzxRM { .. } | X86Opcode::MovsxRM { .. } => Some(0),
         // MovMR/MovMI: operand 1 is the destination address.
         X86Opcode::MovMR | X86Opcode::MovMI => Some(1),
         // Lea reads an address operand (FrameSlot/Mem/RipLabel), never
