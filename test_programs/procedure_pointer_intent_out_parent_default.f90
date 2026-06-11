@@ -1,7 +1,6 @@
 ! CHECK: ok
 ! IR_CHECK: afs_modproc_m_default_fn
 ! REPRO_CHECK: run
-! XFAIL(x86_64): X64-O0-002 (indirect calls through procedure pointers are not selected yet)
 module m
   implicit none
 

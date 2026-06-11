@@ -257,6 +257,8 @@ pub enum X86Opcode {
         src: OpSize,
     },
     Lea,
+    /// Indirect call through a register: `call *%reg`.
+    CallReg,
 
     // ---- Integer arithmetic (destructive: tied to operand 0) ----
     Add,

@@ -1748,6 +1748,11 @@ fn select_call_inst(
     func: &Function,
     func_names: &[String],
 ) {
+    // Indirect targets: the pointer value is staged into r11 BEFORE
+    // argument marshaling could clobber anything (r11 is caller-saved,
+    // never an argument register, and distinct from rax, which the AL
+    // varargs rule writes immediately before the call).
+    let mut indirect_target: Option<X86VReg> = None;
     let (label, args, is_internal) = match &inst.kind {
         InstKind::Call(FuncRef::External(name), args) => (name.clone(), args.as_slice(), false),
         InstKind::Call(FuncRef::Internal(idx), args) => {
@@ -1757,8 +1762,9 @@ fn select_call_inst(
                 .clone();
             (name, args.as_slice(), true)
         }
-        InstKind::Call(FuncRef::Indirect(_), _) => {
-            panic!("x05 scope: indirect calls deferred")
+        InstKind::Call(FuncRef::Indirect(target), args) => {
+            indirect_target = Some(ctx.lookup_vreg(*target));
+            (String::new(), args.as_slice(), false)
         }
         InstKind::RuntimeCall(rf, args) => {
             (runtime_func_symbol(rf, args, func), args.as_slice(), false)
@@ -1903,14 +1909,37 @@ fn select_call_inst(
             Some(X86Operand::Reg(X86Reg::Rax)),
         );
     }
-    push(
-        mf,
-        mb,
-        X86Opcode::Call,
-        OpSize::Q,
-        vec![X86Operand::Extern(label)],
-        None,
-    );
+    if let Some(target) = indirect_target {
+        // Stage the pointer into r11, then `call *%r11`. The MovRR
+        // sits with the batched register-arg moves' tail; its source
+        // vreg load (regalloc scratch r10) cannot disturb argument
+        // registers.
+        push(
+            mf,
+            mb,
+            X86Opcode::MovRR,
+            OpSize::Q,
+            vec![X86Operand::VReg(target)],
+            Some(X86Operand::Reg(X86Reg::R11)),
+        );
+        push(
+            mf,
+            mb,
+            X86Opcode::CallReg,
+            OpSize::Q,
+            vec![X86Operand::Reg(X86Reg::R11)],
+            None,
+        );
+    } else {
+        push(
+            mf,
+            mb,
+            X86Opcode::Call,
+            OpSize::Q,
+            vec![X86Operand::Extern(label)],
+            None,
+        );
+    }
 
     if inst.ty != IrType::Void {
         if matches!(inst.ty, IrType::Int(IntWidth::I128)) {

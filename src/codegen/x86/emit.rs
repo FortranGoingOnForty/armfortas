@@ -293,6 +293,7 @@ fn emit_inst(inst: &X86Inst, func: &X86Function) -> String {
         Jcc => format!("j{} {}", cond(0).mnemonic(), block(1)),
         // Bare name for now; @PLT decoration is link-policy (x06).
         Call => format!("call {}", opq(0)),
+        CallReg => format!("call *{}", opq(0)),
         // Epilogue folded into every return: restoring rsp from rbp
         // makes the epilogue frame-size-independent (no encoding paths
         // that vary with N — the anti-32KB-bug property).

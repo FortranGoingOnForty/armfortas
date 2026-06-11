@@ -59,7 +59,7 @@ annotations are removed; kept for history:
   x05 deferred it deliberately (loud error, never wrong answers).
 - Owner: x08 — DONE (this entry retained as the finding record).
 
-### X64-O0-002 — indirect calls through procedure pointers
+### X64-O0-002 — indirect calls through procedure pointers [FIXED in x08]
 - Programs (3): procedure_dummy_interface_scope_hidden_lengths,
   procedure_pointer_intent_out_parent_default,
   stdlib_hashmaps_tbp_int8_array_dispatch
@@ -67,7 +67,7 @@ annotations are removed; kept for history:
 - Category: BACKEND/ABI. Call selection only handles direct FuncRefs;
   calling through a value needs `call *%reg` plus the SysV argument
   marshaling it shares with direct calls.
-- Owner: x08 (cross-TU ABI sprint owns call-shape work).
+- Owner: x08 — DONE. Indirect targets stage into r11 and call *%r11; argument marshaling is shared with direct calls.
 
 ### X64-O0-003 — no register class for by-value array/complex aggregates
 - Programs (2): complex_dp_parameter_zero_compare,
