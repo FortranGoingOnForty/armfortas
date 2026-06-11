@@ -243,14 +243,28 @@ fn xmm_width_override(opcode: X86Opcode) -> (Option<OpSize>, Option<OpSize>) {
 /// `X86Opcode::MovRM` convention) or address-as-def store form.
 fn addr_operand_position(inst: &X86Inst) -> Option<usize> {
     match inst.opcode {
-        // MovRM: operand 0 is the source address.
-        X86Opcode::MovRM => Some(0),
+        // MovRM and the extending loads: operand 0 is the source address.
+        X86Opcode::MovRM | X86Opcode::MovzxRM { .. } | X86Opcode::MovsxRM { .. } => Some(0),
         // MovMR/MovMI: operand 1 is the destination address.
         X86Opcode::MovMR | X86Opcode::MovMI => Some(1),
         // Lea reads an address operand (FrameSlot/Mem/RipLabel), never
         // dereferences a vreg address — but a vreg there would still
         // be an address value.
         X86Opcode::Lea => Some(0),
+        // FP loads through a pointer held in a vreg: movss/movsd
+        // cannot take a GP register source, so a GP-class operand 0
+        // is by construction an ADDRESS (the source-side mirror of
+        // the is_fp_store_addr def handling below). Without this the
+        // pointer itself was loaded as the "value" and gas rejected
+        // `movss %r10d, %xmm14` — ~100 sweep programs at once (x07).
+        X86Opcode::Movss | X86Opcode::Movsd
+            if matches!(
+                inst.operands.first(),
+                Some(X86Operand::VReg(v)) if v.class != X86RegClass::Xmm
+            ) =>
+        {
+            Some(0)
+        }
         _ => None,
     }
 }

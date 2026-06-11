@@ -49,10 +49,12 @@ pub fn emit_module(
                 text.push('\n');
             }
             if !ir_module.globals.is_empty() {
-                return Err(
-                    "x86_64 module globals (SAVE/module variables) are not emitted yet (sprint x07)"
-                        .to_string(),
-                );
+                text.push_str(&shared::emit_globals(
+                    &ir_module.globals,
+                    &ir_module.layout,
+                    shared::GlobalsDialect::Elf,
+                ));
+                text.push('\n');
             }
             // ELF entry wrapper: main → runtime init, program body,
             // finalize (the Mach-O twin lives in arm64::emit_module).

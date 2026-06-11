@@ -35,11 +35,42 @@ pub fn native_e2e_support() -> Result<(), String> {
     if host == crate::target::TargetSpec::parse("arm64-macos").unwrap() {
         Ok(())
     } else {
+        // Suites gated here are macOS-only until the sprint that
+        // ports each one (x08 multifile/ABI, x09+ opt levels and
+        // vectorizer shapes). The run_programs -O0 sweep uses the
+        // level-aware gate below instead (x07).
         Err(format!(
-            "host {} has no native toolchain path; native link arrives in x06",
+            "host {} runs this suite after its enabling sprint (x08+); run_programs -O0 is the x07 surface",
             host
         ))
     }
+}
+
+/// Level-aware gate for the run_programs sweep (x07): macOS runs every
+/// opt level; x86_64 ELF glibc/FreeBSD hosts run -O0 only until the
+/// x09 allocator work turns the optimizing levels on; musl waits for
+/// the x11 link story.
+pub fn native_e2e_level_support(opt_flag: &str) -> Result<(), String> {
+    let host = crate::target::TargetSpec::host();
+    if host == crate::target::TargetSpec::parse("arm64-macos").unwrap() {
+        return Ok(());
+    }
+    if host.arch == crate::target::Arch::X86_64
+        && host.object_format() == crate::target::ObjectFormat::Elf
+        && host.libc != crate::target::Libc::Musl
+    {
+        if opt_flag == "-O0" {
+            return Ok(());
+        }
+        return Err(format!(
+            "{} on host {}: ELF targets run -O0 only until the x09 allocator work",
+            opt_flag, host
+        ));
+    }
+    Err(format!(
+        "host {} has no native run path (musl linking lands in x11)",
+        host
+    ))
 }
 
 static CAPTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -860,7 +891,11 @@ fn emit_module_asm(module: &crate::ir::inst::Module, allocated: &[MachineFunctio
     }
 
     if !module.globals.is_empty() {
-        asm_text.push_str(&emit::emit_globals(&module.globals, &module.layout));
+        asm_text.push_str(&crate::codegen::shared::emit_globals(
+            &module.globals,
+            &module.layout,
+            crate::codegen::shared::GlobalsDialect::MachO,
+        ));
         asm_text.push('\n');
     }
 

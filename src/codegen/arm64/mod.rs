@@ -85,7 +85,11 @@ pub fn emit_module(ir_module: &Module, opts: &Options) -> String {
     // into a __DATA,__data section. Must come before _main so the
     // labels are defined when functions reference them.
     if !ir_module.globals.is_empty() {
-        asm_text.push_str(&emit::emit_globals(&ir_module.globals, &ir_module.layout));
+        asm_text.push_str(&crate::codegen::shared::emit_globals(
+            &ir_module.globals,
+            &ir_module.layout,
+            crate::codegen::shared::GlobalsDialect::MachO,
+        ));
         asm_text.push('\n');
     }
 

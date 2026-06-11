@@ -91,34 +91,31 @@ impl X86Reg {
                 _ => unreachable!(),
             };
         }
-        // One table: (q, l, b). Low-byte forms only — never %ah..%dh.
-        const NAMES: [(&str, &str, &str); 16] = [
-            ("%rax", "%eax", "%al"),
-            ("%rcx", "%ecx", "%cl"),
-            ("%rdx", "%edx", "%dl"),
-            ("%rbx", "%ebx", "%bl"),
-            ("%rsp", "%esp", "%spl"),
-            ("%rbp", "%ebp", "%bpl"),
-            ("%rsi", "%esi", "%sil"),
-            ("%rdi", "%edi", "%dil"),
-            ("%r8", "%r8d", "%r8b"),
-            ("%r9", "%r9d", "%r9b"),
-            ("%r10", "%r10d", "%r10b"),
-            ("%r11", "%r11d", "%r11b"),
-            ("%r12", "%r12d", "%r12b"),
-            ("%r13", "%r13d", "%r13b"),
-            ("%r14", "%r14d", "%r14b"),
-            ("%r15", "%r15d", "%r15b"),
+        // One table: (q, l, w, b). Low-byte forms only — never %ah..%dh.
+        const NAMES: [(&str, &str, &str, &str); 16] = [
+            ("%rax", "%eax", "%ax", "%al"),
+            ("%rcx", "%ecx", "%cx", "%cl"),
+            ("%rdx", "%edx", "%dx", "%dl"),
+            ("%rbx", "%ebx", "%bx", "%bl"),
+            ("%rsp", "%esp", "%sp", "%spl"),
+            ("%rbp", "%ebp", "%bp", "%bpl"),
+            ("%rsi", "%esi", "%si", "%sil"),
+            ("%rdi", "%edi", "%di", "%dil"),
+            ("%r8", "%r8d", "%r8w", "%r8b"),
+            ("%r9", "%r9d", "%r9w", "%r9b"),
+            ("%r10", "%r10d", "%r10w", "%r10b"),
+            ("%r11", "%r11d", "%r11w", "%r11b"),
+            ("%r12", "%r12d", "%r12w", "%r12b"),
+            ("%r13", "%r13d", "%r13w", "%r13b"),
+            ("%r14", "%r14d", "%r14w", "%r14b"),
+            ("%r15", "%r15d", "%r15w", "%r15b"),
         ];
-        let (q, l, b) = NAMES[self as usize];
+        let (q, l, w, b) = NAMES[self as usize];
         match size {
             OpSize::Q => q,
             OpSize::L => l,
+            OpSize::W => w,
             OpSize::B => b,
-            // 16-bit forms exist (%ax, %r8w, ...) but nothing emits
-            // them yet; add the column when an op needs it rather
-            // than carrying untested spellings.
-            OpSize::W => panic!("16-bit register names not wired yet: {:?}", self),
         }
     }
 }
@@ -244,6 +241,19 @@ pub enum X86Opcode {
     /// Zero-extend. NOTE: 32→64 zero extension is `movl` (implicit
     /// zeroing), not movzlq — x05 concern, printer rejects that pair.
     Movzx {
+        src: OpSize,
+    },
+    /// Sign-extending LOAD: operand 0 is an ADDRESS (the MovRM
+    /// convention), so regalloc dereferences through it. Same
+    /// mnemonic as Movsx; split because a plain Movsx operand is a
+    /// VALUE register and the allocator cannot tell pointers from
+    /// values in a vreg (x07: `if (logical_dummy)` branched on the
+    /// low byte of the pointer).
+    MovsxRM {
+        src: OpSize,
+    },
+    /// Zero-extending LOAD: operand 0 is an ADDRESS. See MovsxRM.
+    MovzxRM {
         src: OpSize,
     },
     Lea,

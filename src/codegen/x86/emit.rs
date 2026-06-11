@@ -231,6 +231,26 @@ fn emit_inst(inst: &X86Inst, func: &X86Function) -> String {
                 def()
             )
         }
+        MovsxRM { src } => format!(
+            "movs{}{} {}, {}",
+            src.suffix(),
+            suf,
+            operand(&inst.operands[0], src),
+            def()
+        ),
+        MovzxRM { src } => {
+            assert!(
+                !(src == OpSize::L && s == OpSize::Q),
+                "32->64 zero extension is movl to the 32-bit register, not movzlq"
+            );
+            format!(
+                "movz{}{} {}, {}",
+                src.suffix(),
+                suf,
+                operand(&inst.operands[0], src),
+                def()
+            )
+        }
         Lea => format!("lea{} {}, {}", suf, op(0), def()),
         Add => format!("add{} {}, {}", suf, op(1), def()),
         Sub => format!("sub{} {}, {}", suf, op(1), def()),

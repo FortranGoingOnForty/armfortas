@@ -2,6 +2,7 @@
 ! REPRO_CHECK: run
 ! OPT_EQ: O0,O1,O2,O3,Os,Ofast => stdout|stderr|exit
 ! PHASE_TRIANGULATE: ir|asm|obj|repro
+! XFAIL(x86_64): X64-O0-003 (no x86 register class for by-value array/complex aggregates)
 program complex_dp_parameter_zero_compare
   use, intrinsic :: iso_fortran_env, only: real64
   implicit none

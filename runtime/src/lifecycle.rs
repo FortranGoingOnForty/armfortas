@@ -13,10 +13,16 @@ extern "C" fn afs_atexit_finalize() {
     crate::io_system::afs_io_finalize();
 }
 
-/// Called before the user's program body.
-/// Sets up I/O units, signal handlers, etc.
+/// Called before the user's program body, with main's (argc, argv)
+/// forwarded by the entry wrapper — both wrappers call this first,
+/// while the values still sit in the argument registers. Sets up I/O
+/// units and stores argv for COMMAND_ARGUMENT_COUNT/GET_COMMAND*
+/// (std::env::args is empty under a non-Rust main on ELF; see
+/// system.rs). Extra register garbage on old callers is harmless:
+/// store_args validates before storing.
 #[no_mangle]
-pub extern "C" fn afs_program_init() {
+pub extern "C" fn afs_program_init(argc: i32, argv: *const *const u8) {
+    crate::system::store_args(argc, argv);
     crate::io_system::afs_io_init();
     REGISTER_ATEXIT.call_once(|| unsafe {
         let _ = atexit(afs_atexit_finalize);

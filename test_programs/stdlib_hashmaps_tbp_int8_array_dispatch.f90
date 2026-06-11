@@ -1,6 +1,7 @@
 ! CHECK: ok
 ! IR_CHECK: afs_modproc_m_int8_map_entry
 ! REPRO_CHECK: run
+! XFAIL(x86_64): X64-O0-002 (indirect calls through procedure pointers are not selected yet)
 module m
   use iso_fortran_env, only: int8, int32, int64
   implicit none

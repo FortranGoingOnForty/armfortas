@@ -155,10 +155,53 @@ pub extern "C" fn afs_date_and_time(
     }
 }
 
+// ---- argv plumbing (x07) ----
+//
+// `std::env::args()` captures argv through an `.init_array`
+// constructor inside Rust std. Linking libarmfortas_rt.a under a
+// NON-Rust `main` (the compiler's entry wrapper) lets the linker drop
+// the archive member holding that constructor — nothing references
+// it — so std's argv comes back EMPTY on ELF targets and
+// command_argument_count() returned -1. The entry wrappers therefore
+// forward main's (argc, argv) into afs_program_init, which stores
+// them here; std::env::args stays as the fallback (macOS reads argv
+// via _NSGetArgv and never needed the handoff).
+use std::sync::atomic::{AtomicI32, AtomicPtr, Ordering};
+
+static STORED_ARGC: AtomicI32 = AtomicI32::new(-1);
+static STORED_ARGV: AtomicPtr<*const u8> = AtomicPtr::new(std::ptr::null_mut());
+
+pub(crate) fn store_args(argc: i32, argv: *const *const u8) {
+    if argc >= 0 && !argv.is_null() {
+        STORED_ARGV.store(argv as *mut *const u8, Ordering::Release);
+        STORED_ARGC.store(argc, Ordering::Release);
+    }
+}
+
+/// The program's arguments as owned strings, from the stored argv
+/// when the entry wrapper provided one, else from std.
+fn program_args() -> Vec<String> {
+    let argc = STORED_ARGC.load(Ordering::Acquire);
+    let argv = STORED_ARGV.load(Ordering::Acquire);
+    if argc >= 0 && !argv.is_null() {
+        let mut out = Vec::with_capacity(argc as usize);
+        for i in 0..argc as usize {
+            let p = unsafe { *argv.add(i) };
+            if p.is_null() {
+                break;
+            }
+            let cstr = unsafe { std::ffi::CStr::from_ptr(p as *const std::ffi::c_char) };
+            out.push(cstr.to_string_lossy().into_owned());
+        }
+        return out;
+    }
+    std::env::args().collect()
+}
+
 /// COMMAND_ARGUMENT_COUNT: returns argc - 1.
 #[no_mangle]
 pub extern "C" fn afs_command_argument_count() -> i32 {
-    std::env::args().count() as i32 - 1
+    program_args().len() as i32 - 1
 }
 
 /// GET_COMMAND_ARGUMENT: retrieve the nth command-line argument.
@@ -170,7 +213,7 @@ pub extern "C" fn afs_get_command_argument(
     length: *mut i32,
     status: *mut i32,
 ) {
-    let args: Vec<String> = std::env::args().collect();
+    let args: Vec<String> = program_args();
     if number < 0 || number as usize >= args.len() {
         if !status.is_null() {
             unsafe {
@@ -219,7 +262,7 @@ pub extern "C" fn afs_get_command(
     length: *mut i32,
     status: *mut i32,
 ) {
-    let full: String = std::env::args().collect::<Vec<_>>().join(" ");
+    let full: String = program_args().join(" ");
     let bytes = full.as_bytes();
 
     if !length.is_null() {
