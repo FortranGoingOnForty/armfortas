@@ -110,6 +110,23 @@ pub fn emit_globals(
             (GlobalsDialect::MachO, true) => writeln!(out, ".globl {}", symbol).unwrap(),
             (GlobalsDialect::MachO, false) => writeln!(out, ".private_extern {}", symbol).unwrap(),
             (GlobalsDialect::Elf, vis) => {
+                // Uninitialized COMMON-block storage must be a COMMON
+                // symbol (.comm): every TU declaring /blk/ emits the
+                // same symbols, and the linker merges them. A strong
+                // .data definition per TU is a duplicate-symbol error
+                // on ELF (found by x08's cross-TU COMMON test).
+                // Initialized commons (BLOCK DATA) stay strong — one
+                // TU owns the initializer.
+                let zero_init = matches!(
+                    g.initializer,
+                    None | Some(crate::ir::inst::GlobalInit::Zero)
+                );
+                if g.name.starts_with("afs_common_") && zero_init {
+                    let size = g.ty.size_bytes(layout).max(1);
+                    let align = size.min(16).next_power_of_two();
+                    writeln!(out, ".comm {},{},{}", symbol, size, align).unwrap();
+                    continue;
+                }
                 if vis {
                     writeln!(out, ".globl {}", symbol).unwrap();
                 } else {
