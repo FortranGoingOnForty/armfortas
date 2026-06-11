@@ -860,7 +860,11 @@ fn emit_module_asm(module: &crate::ir::inst::Module, allocated: &[MachineFunctio
     }
 
     if !module.globals.is_empty() {
-        asm_text.push_str(&emit::emit_globals(&module.globals, &module.layout));
+        asm_text.push_str(&crate::codegen::shared::emit_globals(
+            &module.globals,
+            &module.layout,
+            crate::codegen::shared::GlobalsDialect::MachO,
+        ));
         asm_text.push('\n');
     }
 
