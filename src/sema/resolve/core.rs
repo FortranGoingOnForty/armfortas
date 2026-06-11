@@ -202,7 +202,7 @@ pub(super) fn resolve_unit(
             body,
             contains,
         } => {
-            let scope_name = name.clone().unwrap_or_else(|| "<main>".into());
+            let scope_name = name.clone().unwrap_or_else(|| "main".into());
             st.push_scope(ScopeKind::Program(scope_name));
             let scope_id = st.current_scope();
             process_uses(st, uses, module_search_paths, layouts)?;

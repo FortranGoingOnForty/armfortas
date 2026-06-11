@@ -497,11 +497,25 @@ fn conditional_arm_is_arraylike(ctx: &Ctx<'_>, expr: &crate::ast::expr::SpannedE
             .lookup(name)
             .is_some_and(|sym| !sym.attrs.array_spec.is_empty()),
         Expr::FunctionCall { callee, args } => {
-            // A range subscript makes it a section; an array-returning
-            // function (declared result_rank > 0) is array-valued even
-            // with scalar args.
-            args.iter()
-                .any(|arg| !matches!(arg.value, crate::ast::expr::SectionSubscript::Element(_)))
+            // A range subscript makes it a section — unless the base is
+            // a CHARACTER scalar, where `c(1:3)` is a SUBSTRING (scalar,
+            // legal as an arm; gfortran's conditional_1 relies on it).
+            // An array-returning function (declared result_rank > 0) is
+            // array-valued even with scalar args.
+            let base_is_char_scalar = matches!(
+                &callee.node,
+                Expr::Name { name } if ctx.lookup(name).is_some_and(|sym| {
+                    sym.attrs.array_spec.is_empty()
+                        && matches!(
+                            sym.type_info,
+                            Some(crate::sema::symtab::TypeInfo::Character { .. })
+                        )
+                })
+            );
+            (!base_is_char_scalar
+                && args.iter().any(|arg| {
+                    !matches!(arg.value, crate::ast::expr::SectionSubscript::Element(_))
+                }))
                 || matches!(
                     &callee.node,
                     Expr::Name { name } if ctx
@@ -1046,7 +1060,7 @@ fn find_scope_for_unit(
     #[allow(clippy::type_complexity)]
     let (kind_matcher, _name): (Box<dyn Fn(&ScopeKind) -> bool>, Option<String>) = match unit {
         ProgramUnit::Program { name, .. } => {
-            let target = name.clone().unwrap_or_else(|| "<main>".into());
+            let target = name.clone().unwrap_or_else(|| "main".into());
             (
                 Box::new(move |k| matches!(k, ScopeKind::Program(ref n) if n == &target)),
                 None,
