@@ -51,7 +51,7 @@ each was a systemic root cause failing dozens of programs):
 - Both ELF platforms: compile error `x05 scope: i128 values deferred`.
 - Category: BACKEND. The isel has no i128 register-pair strategy;
   x05 deferred it deliberately (loud error, never wrong answers).
-- Owner: x09 (backend depth work alongside the allocator).
+- Owner: x08 (the fourteen dedicated i128 suites are its first deliverable).
 
 ### X64-O0-002 — indirect calls through procedure pointers
 - Programs (3): procedure_dummy_interface_scope_hidden_lengths,
