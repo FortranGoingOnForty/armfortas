@@ -118,6 +118,49 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse a prefix expression (atom, unary operator, parenthesized expr).
+    /// The `then : else` tail of a conditional expression, with the
+    /// condition already parsed and `?` consumed. The else-part may
+    /// itself be `cond ? then : else` — right-recursive, so chains
+    /// like `( c1 ? v1 : c2 ? v2 : v3 )` group as
+    /// `c1 ? v1 : (c2 ? v2 : v3)` without nested parentheses
+    /// (F2023; gfortran conditional_1.f90 line 16 relies on this).
+    fn parse_conditional_after_question(
+        &mut self,
+        cond: SpannedExpr,
+    ) -> Result<SpannedExpr, ParseError> {
+        let then_val = self.parse_conditional_arm()?;
+        self.expect(&TokenKind::Colon)?;
+        let mut else_val = self.parse_conditional_arm()?;
+        if self.eat(&TokenKind::Question) {
+            else_val = self.parse_conditional_after_question(else_val)?;
+        }
+        let span = span_from_to(cond.span, self.prev_span());
+        Ok(Spanned::new(
+            Expr::ConditionalExpr {
+                cond: Box::new(cond),
+                then_val: Box::new(then_val),
+                else_val: Box::new(else_val),
+            },
+            span,
+        ))
+    }
+
+    /// One arm of a conditional: an expression, or `.NIL.` (legal only
+    /// when the conditional is an actual argument — sema enforces the
+    /// context, the parser just represents it).
+    fn parse_conditional_arm(&mut self) -> Result<SpannedExpr, ParseError> {
+        // `.nil.` is not in the known dot-operator set, so the lexer
+        // produces DefinedOp("nil") for it.
+        if let TokenKind::DefinedOp(op) = self.peek() {
+            if op == "nil" {
+                let span = self.current_span();
+                self.advance();
+                return Ok(Spanned::new(Expr::NilArgument, span));
+            }
+        }
+        self.parse_expr()
+    }
+
     fn parse_prefix(&mut self) -> Result<SpannedExpr, ParseError> {
         let start = self.current_span();
 
@@ -181,6 +224,16 @@ impl<'a> Parser<'a> {
                     return self.parse_array_constructor_slash(start);
                 }
                 let inner = self.parse_expr()?;
+                // F2023 conditional expression: `( cond ? then : else )`.
+                // Must be probed after the inner expression parse and
+                // before the complex-literal comma check — the inner
+                // expression may itself contain commas and parens.
+                if self.eat(&TokenKind::Question) {
+                    let conditional = self.parse_conditional_after_question(inner)?;
+                    self.expect(&TokenKind::RParen)?;
+                    let span = span_from_to(start, self.prev_span());
+                    return Ok(Spanned::new(conditional.node, span));
+                }
                 // Check for complex literal: (expr, expr)
                 if self.eat(&TokenKind::Comma) {
                     let imag = self.parse_expr()?;

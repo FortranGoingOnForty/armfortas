@@ -86,6 +86,7 @@ pub enum TokenKind {
     ColonColon, // ::
     Semicolon,  // ;
     Percent,    // %
+    Question,   // ? (F2023 conditional expressions, l02)
     Arrow,      // =>
     Assign,     // =
     Ampersand,  // & (when not continuation)
@@ -128,6 +129,7 @@ impl fmt::Display for TokenKind {
             TokenKind::ColonColon => write!(f, "::"),
             TokenKind::Semicolon => write!(f, ";"),
             TokenKind::Percent => write!(f, "%"),
+            TokenKind::Question => write!(f, "?"),
             TokenKind::Arrow => write!(f, "=>"),
             TokenKind::Assign => write!(f, "="),
             TokenKind::Ampersand => write!(f, "&"),
@@ -1117,6 +1119,7 @@ impl<'a> Lexer<'a> {
             b':' => (TokenKind::Colon, ":"),
             b';' => (TokenKind::Semicolon, ";"),
             b'%' => (TokenKind::Percent, "%"),
+            b'?' => (TokenKind::Question, "?"),
             b'&' => (TokenKind::Ampersand, "&"),
             _ => {
                 let unexpected = self

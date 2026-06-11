@@ -649,6 +649,83 @@ pub(crate) fn lower_expr_full(
             }
         }
 
+        Expr::NilArgument => {
+            // Sema rejects .NIL. outside conditional-argument arms, and
+            // the call-argument lowering consumes legal ones before
+            // reaching the generic expression path.
+            unreachable!("NilArgument survived to value lowering — sema gate failed");
+        }
+        Expr::ConditionalExpr {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            // F2023 conditional expression. Short-circuit is
+            // load-bearing: exactly one arm may be evaluated (arms can
+            // have side effects or guard traps, e.g. `(i <= n ? a(i) : 0)`).
+            // A literal condition folds to the chosen arm with no
+            // blocks at all — parameter-style initializers reach here
+            // after constant propagation.
+            if let crate::ast::expr::Expr::LogicalLiteral { value, .. } = &cond.node {
+                let arm = if *value { then_val } else { else_val };
+                return lower_expr_full(
+                    b,
+                    locals,
+                    arm,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                );
+            }
+            let cond_val = lower_expr_full(
+                b,
+                locals,
+                cond,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
+            let bb_then = b.create_block("cond_then");
+            let bb_else = b.create_block("cond_else");
+            let bb_merge = b.create_block("cond_merge");
+            b.cond_branch(cond_val, bb_then, vec![], bb_else, vec![]);
+
+            b.set_block(bb_then);
+            let t = lower_expr_full(
+                b,
+                locals,
+                then_val,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
+            let result_ty = b.func().value_type(t).unwrap_or(IrType::Int(IntWidth::I32));
+            let result = b.add_block_param(bb_merge, result_ty.clone());
+            b.branch(bb_merge, vec![t]);
+
+            b.set_block(bb_else);
+            let e_raw = lower_expr_full(
+                b,
+                locals,
+                else_val,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
+            let e_val = coerce_to_type(b, e_raw, &result_ty);
+            b.branch(bb_merge, vec![e_val]);
+
+            b.set_block(bb_merge);
+            result
+        }
         Expr::BinaryOp { op, left, right } => {
             if matches!(op, BinaryOp::Concat)
                 && expr_is_character_expr(b, locals, left, st, type_layouts)

@@ -6100,6 +6100,16 @@ pub(super) fn check_filtered_in_expr(
     filtered: &HashSet<String>,
 ) {
     match &expr.node {
+        Expr::NilArgument => {}
+        Expr::ConditionalExpr {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            check_filtered_in_expr(cond, filtered);
+            check_filtered_in_expr(then_val, filtered);
+            check_filtered_in_expr(else_val, filtered);
+        }
         Expr::Name { name } => {
             let key = name.to_lowercase();
             if filtered.contains(&key) {
@@ -11466,6 +11476,12 @@ pub(super) fn actual_expr_rank(
 ) -> Option<usize> {
     use crate::ast::expr::Expr;
     match &expr.node {
+        Expr::NilArgument => None,
+        // Arms of a conditional agree in rank (sema-enforced); take
+        // the then-arm's.
+        Expr::ConditionalExpr { then_val, .. } => {
+            actual_expr_rank(then_val, locals, st, type_layouts)
+        }
         Expr::Name { name } => {
             let key = name.to_lowercase();
             let symbol_rank = st
@@ -12855,6 +12871,11 @@ pub(super) fn operator_expr_type_info(
     use crate::sema::symtab::TypeInfo;
 
     match &expr.node {
+        Expr::NilArgument => None,
+        // Arms of a conditional share a declared type (sema-enforced).
+        Expr::ConditionalExpr { then_val, .. } => {
+            operator_expr_type_info(then_val, locals, st, type_layouts)
+        }
         Expr::IntegerLiteral { .. }
         | Expr::RealLiteral { .. }
         | Expr::StringLiteral { .. }
@@ -20134,6 +20155,75 @@ pub(super) fn lower_string_expr_full(
             let ptr = b.const_string(value.as_bytes());
             let len = b.const_i64(value.len() as i64);
             (ptr, len)
+        }
+        // F2023 conditional with character arms: branch, each arm
+        // materializes its own (ptr, len) — lengths may legitimately
+        // differ — and the merge block carries BOTH as block
+        // parameters. Short-circuit (one arm evaluated) as everywhere.
+        Expr::ConditionalExpr {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            if let crate::ast::expr::Expr::LogicalLiteral { value, .. } = &cond.node {
+                let arm = if *value { then_val } else { else_val };
+                return lower_string_expr_full(
+                    b,
+                    locals,
+                    arm,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                );
+            }
+            let cond_val = crate::ir::lower::expr::lower_expr_full(
+                b,
+                locals,
+                cond,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
+            let bb_then = b.create_block("cond_str_then");
+            let bb_else = b.create_block("cond_str_else");
+            let bb_merge = b.create_block("cond_str_merge");
+            let merged_ptr =
+                b.add_block_param(bb_merge, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+            let merged_len = b.add_block_param(bb_merge, IrType::Int(IntWidth::I64));
+            b.cond_branch(cond_val, bb_then, vec![], bb_else, vec![]);
+
+            b.set_block(bb_then);
+            let (t_ptr, t_len) = lower_string_expr_full(
+                b,
+                locals,
+                then_val,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
+            b.branch(bb_merge, vec![t_ptr, t_len]);
+
+            b.set_block(bb_else);
+            let (e_ptr, e_len) = lower_string_expr_full(
+                b,
+                locals,
+                else_val,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
+            b.branch(bb_merge, vec![e_ptr, e_len]);
+
+            b.set_block(bb_merge);
+            (merged_ptr, merged_len)
         }
         Expr::ComponentAccess { .. } => {
             if let Some(tl) = type_layouts {

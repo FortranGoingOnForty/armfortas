@@ -135,6 +135,126 @@ fn lower_external_io_pos_seek(
     );
 }
 
+/// Make a conditional-argument arm value match the merge slot type.
+/// The only legitimate mismatch is the absent-argument null (i64 0)
+/// flowing into a pointer-typed slot, and pointee differences between
+/// arms' addresses; both are representation-free casts.
+fn conform_condarg_to_slot(b: &mut FuncBuilder, val: ValueId, slot_ty: &IrType) -> ValueId {
+    let val_ty = b.func().value_type(val);
+    match (&val_ty, slot_ty) {
+        (Some(t), s) if t == s => val,
+        (Some(IrType::Int(_)), IrType::Ptr(pointee)) => b.int_to_ptr(val, (**pointee).clone()),
+        (Some(IrType::Ptr(_)), IrType::Ptr(pointee)) => {
+            // Same address, different pointee annotation: round-trip
+            // through the integer domain (both casts are free).
+            let as_int = b.ptr_to_int(val);
+            b.int_to_ptr(as_int, (**pointee).clone())
+        }
+        _ => val,
+    }
+}
+
+/// Lower one CALL actual argument, honoring F2023 conditional
+/// arguments. A conditional selects between argument ASSOCIATIONS:
+/// each arm materializes its own address/descriptor/value in its own
+/// block (via `materialize`, the caller's full ABI decision tree) and
+/// the merge block carries the chosen one as a block parameter. A
+/// `.NIL.` arm produces the same absent representation an omitted
+/// OPTIONAL gets (`missing_optional_call_arg`) — one null convention,
+/// so PRESENT() in the callee just works. Never a value temporary:
+/// INTENT(OUT)/INOUT writes land in the selected actual.
+fn lower_call_arg_maybe_conditional(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    e: &crate::ast::expr::SpannedExpr,
+    callee_key: &str,
+    arg_index: usize,
+    is_value: bool,
+    materialize: &mut dyn FnMut(&mut FuncBuilder, &crate::ast::expr::SpannedExpr) -> ValueId,
+) -> ValueId {
+    use crate::ast::expr::Expr;
+    match &e.node {
+        Expr::NilArgument => missing_optional_call_arg(b, ctx.st, callee_key, arg_index, is_value),
+        Expr::ConditionalExpr {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            if let Expr::LogicalLiteral { value, .. } = &cond.node {
+                let arm = if *value { then_val } else { else_val };
+                return lower_call_arg_maybe_conditional(
+                    b,
+                    ctx,
+                    arm,
+                    callee_key,
+                    arg_index,
+                    is_value,
+                    materialize,
+                );
+            }
+            let cond_val = super::expr::lower_expr_full(
+                b,
+                &ctx.locals,
+                cond,
+                ctx.st,
+                Some(ctx.type_layouts),
+                Some(ctx.internal_funcs),
+                Some(ctx.contained_host_refs),
+                Some(ctx.descriptor_params),
+            );
+            let bb_then = b.create_block("condarg_then");
+            let bb_else = b.create_block("condarg_else");
+            let bb_merge = b.create_block("condarg_merge");
+            b.cond_branch(cond_val, bb_then, vec![], bb_else, vec![]);
+
+            b.set_block(bb_then);
+            // The .NIL. null is an i64 zero; a pointer-typed slot is
+            // decided by whichever arm materializes an address. Lower
+            // the then-arm first, take the WIDER commitment: if then
+            // is the .NIL. arm, the else-arm decides the slot type and
+            // then conforms (and vice versa).
+            let t_raw = lower_call_arg_maybe_conditional(
+                b,
+                ctx,
+                then_val,
+                callee_key,
+                arg_index,
+                is_value,
+                materialize,
+            );
+            let then_is_nil = matches!(then_val.node, Expr::NilArgument);
+            let slot_ty = if then_is_nil && !is_value {
+                // Absent-by-ref: the merge carries an address.
+                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)))
+            } else {
+                b.func()
+                    .value_type(t_raw)
+                    .unwrap_or(IrType::Int(IntWidth::I64))
+            };
+            let merged = b.add_block_param(bb_merge, slot_ty.clone());
+            let t_val = conform_condarg_to_slot(b, t_raw, &slot_ty);
+            b.branch(bb_merge, vec![t_val]);
+
+            b.set_block(bb_else);
+            let e_val = lower_call_arg_maybe_conditional(
+                b,
+                ctx,
+                else_val,
+                callee_key,
+                arg_index,
+                is_value,
+                materialize,
+            );
+            let e_val = conform_condarg_to_slot(b, e_val, &slot_ty);
+            b.branch(bb_merge, vec![e_val]);
+
+            b.set_block(bb_merge);
+            merged
+        }
+        _ => materialize(b, e),
+    }
+}
+
 /// Lower a single statement.
 pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
     match &stmt.node {
@@ -2128,8 +2248,15 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             .unwrap_or(false);
                         let wants_string_descriptor = wants_string_descriptor && !wants_bind_c_char;
                         let value = match slot {
-                            Some(arg) => match &arg.value {
-                                crate::ast::expr::SectionSubscript::Element(e) => {
+                            Some(arg) => {
+                                match &arg.value {
+                                    crate::ast::expr::SectionSubscript::Element(arg_expr) => {
+                                        // Same conditional-argument treatment as
+                                        // the direct-call path; wants_descriptor
+                                        // is per-arm (it inspects the actual).
+                                        let mut materialize = |b: &mut FuncBuilder,
+                                                           e: &crate::ast::expr::SpannedExpr|
+                                     -> ValueId {
                                     let wants_descriptor = (mask_wants_descriptor
                                         || actual_is_descriptor_array(&ctx.locals, e))
                                         && !wants_bind_c_char;
@@ -2213,9 +2340,20 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                             && !wants_pointer,
                                         value,
                                     )
+                                    };
+                                        lower_call_arg_maybe_conditional(
+                                            b,
+                                            ctx,
+                                            arg_expr,
+                                            abi_primary_key,
+                                            i,
+                                            is_value,
+                                            &mut materialize,
+                                        )
+                                    }
+                                    _ => b.const_i32(0),
                                 }
-                                _ => b.const_i32(0),
-                            },
+                            }
                             None => {
                                 missing_optional_call_arg(b, ctx.st, abi_primary_key, i, is_value)
                             }
@@ -2417,8 +2555,16 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             .map(|mask| mask.get(i).copied().unwrap_or(false))
                             .unwrap_or(false);
                         let value = match slot {
-                            Some(arg) => match &arg.value {
-                                crate::ast::expr::SectionSubscript::Element(e) => {
+                            Some(arg) => {
+                                match &arg.value {
+                                    crate::ast::expr::SectionSubscript::Element(arg_expr) => {
+                                        // The materialization tree below is
+                                        // reused per conditional-argument arm
+                                        // (F2023): each arm builds its own
+                                        // association in its own block.
+                                        let mut materialize = |b: &mut FuncBuilder,
+                                                           e: &crate::ast::expr::SpannedExpr|
+                                     -> ValueId {
                                     let value = if is_value && wants_bind_c_char {
                                         lower_bind_c_char_value_arg(
                                             b,
@@ -2511,9 +2657,20 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                             && !wants_pointer,
                                         value,
                                     )
+                                    };
+                                        lower_call_arg_maybe_conditional(
+                                            b,
+                                            ctx,
+                                            arg_expr,
+                                            abi_primary_key,
+                                            i,
+                                            is_value,
+                                            &mut materialize,
+                                        )
+                                    }
+                                    _ => b.const_i32(0),
                                 }
-                                _ => b.const_i32(0),
-                            },
+                            }
                             None => {
                                 missing_optional_call_arg(b, ctx.st, abi_primary_key, i, is_value)
                             }

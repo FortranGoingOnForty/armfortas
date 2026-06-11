@@ -105,3 +105,39 @@ starting the full Sprint 29 audit:
   prints `ok`, preserves exit 1 for `false`, and writes the redirected file.
   Drill current `-c` execution/exit-status behavior before returning to fortsh
   as a compiler acceptance target.
+
+Found during l02 (2026-06-10), pre-existing on trunk, x86_64 only:
+
+- **silent-wrong-answer (x86 backend)**: `if (c)` on a LOGICAL dummy
+  takes the wrong branch — the bool load through the pointer vreg
+  selects a register-source `movzbl %r10b` (low byte of the ADDRESS)
+  instead of a memory-operand load through it. IR is correct
+  (`load ptr<bool>` then `load bool`); the defect is in x86 isel or
+  the regalloc address-operand metadata for the movzx family (the
+  addr_operand_position list covers MovRM/MovMR/Lea only). arm64
+  unaffected. Pinned by `test_programs/x07_bool_dummy_branch.f90`
+  (`XFAIL(x86_64)`); owned by the x07 parity sweep. Until fixed, any
+  x86 code path branching on a by-ref logical is suspect.
+
+Found while unblocking l02's CI (2026-06-10, all pre-existing on trunk):
+
+- **Parser runaway-allocation loop (FIXED with l02)**: the implicit-main
+  parser never consumed CONTAINS, so parse_file pushed empty program
+  units forever — 55GB resident before being killed manually; on CI it
+  ate both macOS jobs' timeouts. Trigger: any bare main with internal
+  procedures, reachable once l02's `?` lexing let conditional_8.f90
+  parse past its print line. Fixed: implicit mains parse a CONTAINS
+  section (F2018 R1401), plus a parse_file progress guard turning any
+  future zero-progress unit parse into a clean error. Bare-main
+  internal procedures also exposed a name-mangling mismatch (`<main>`
+  scope vs `main` lowering prefix) — aligned. Fixture
+  `l02_bare_main_contains.f90`.
+- Standalone attribute statements are not parsed: `allocatable :: g`
+  (allocatable function result, gfortran-dg conditional_8.f90), and
+  presumably the pointer/target forms. Parse error today.
+- Conditional expression inside a character LEN spec
+  (`character(len=(n > 5 ? n : 5))`, conditional_7.f90) is not parsed —
+  the len-spec consumes the opening paren before the conditional check.
+- DO CONCURRENT index-in-LOCAL locality constraint is not validated:
+  conditional_9.f90 is a dg-error test we accept silently (vacuous
+  accept; the conditional in it compiles fine).

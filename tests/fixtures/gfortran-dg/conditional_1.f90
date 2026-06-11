@@ -4,7 +4,6 @@
 ! Conversion notes: tests/fixtures/gfortran-dg/README.md
 ! FLAGS: --std=f2023
 ! EXIT_CODE: 0
-! XFAIL: f2023 conditional expressions not implemented (l02); see .docs/audits/f2023-feature-matrix.md
 program conditional_simple
   implicit none
   integer :: i = 42

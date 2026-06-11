@@ -595,6 +595,10 @@ pub fn expr_type(
     }
 
     match &expr.node {
+        // F2023 conditional: arms share a declared type (validated in
+        // sema); the result type is the then-arm's.
+        Expr::NilArgument => FortranType::Unknown,
+        Expr::ConditionalExpr { then_val, .. } => expr_type(then_val, symtab),
         // Literals
         Expr::IntegerLiteral { kind, .. } => FortranType::Integer {
             kind: kind

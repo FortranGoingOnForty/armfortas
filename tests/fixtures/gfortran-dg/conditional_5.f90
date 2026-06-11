@@ -7,7 +7,6 @@
 ! under every std, which does not match, so the XFAIL fires.
 ! FLAGS: --std=f2018
 ! ERROR_EXPECTED: requires --std=F2023
-! XFAIL: f2023 conditional-expression conformance gate under --std=f2018 not implemented (l02); see .docs/audits/f2023-feature-matrix.md
 program conditional_std
   implicit none
   integer :: i = 42
