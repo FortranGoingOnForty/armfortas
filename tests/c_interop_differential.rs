@@ -64,6 +64,15 @@ fn find_clang() -> Option<PathBuf> {
 }
 
 fn require_clang() -> PathBuf {
+    // Hosts that cannot link natively yet (musl until x11) skip the
+    // whole suite with a count, exactly like run_programs.
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=c_interop_differential test=all count=7 reason=\"{}\"",
+            reason
+        );
+        std::process::exit(0);
+    }
     match find_clang() {
         Some(p) => p,
         None => {

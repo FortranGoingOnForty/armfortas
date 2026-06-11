@@ -233,7 +233,7 @@ pub fn select_function(func: &Function, layout: crate::target::TargetLayout) -> 
     // `lookup_vreg` without ordering concerns.
     for block in &func.blocks {
         for bp in &block.params {
-            if matches!(bp.ty, IrType::Int(IntWidth::I128)) {
+            if is_wide_pair_ty_arm(&bp.ty) {
                 let offset = mf.alloc_local(16);
                 ctx.wide_value_slots.insert(bp.id, offset);
                 continue;
@@ -256,7 +256,7 @@ pub fn select_function(func: &Function, layout: crate::target::TargetLayout) -> 
             if matches!(inst.ty, IrType::Void) {
                 continue;
             }
-            if matches!(inst.ty, IrType::Int(IntWidth::I128)) {
+            if is_wide_pair_ty_arm(&inst.ty) {
                 let offset = mf.alloc_local(16);
                 ctx.wide_value_slots.insert(inst.id, offset);
                 continue;
@@ -459,6 +459,68 @@ fn select_call_inst(
             PhysReg::Gp(0),
             PhysReg::Gp(1),
         );
+    } else if is_wide_pair_ty_arm(&inst.ty) {
+        // complex(8) HFA return: d0 (real) / d1 (imag) into the slot.
+        let dest_slot = ctx.lookup_wide_slot(inst.id);
+        for (half, fp) in [(0i64, PhysReg::Fp(0)), (8, PhysReg::Fp(1))] {
+            mf.block_mut(mb).insts.push(MachineInst {
+                opcode: ArmOpcode::StrFpImm,
+                operands: vec![
+                    MachineOperand::PhysReg(fp),
+                    MachineOperand::PhysReg(PhysReg::FP),
+                    MachineOperand::Imm(dest_slot as i64 + half),
+                ],
+                def: None,
+            });
+        }
+    } else if is_complex8_pair_ty_arm(&inst.ty) {
+        // complex(4) HFA return: s0/s1 packed into the Gp64 dest as
+        // raw bits (lo = s0, hi = s1) — fmov w16,s0; fmov w17,s1;
+        // x_dest = x16 | (x17 << 32).
+        let dest = ctx.get_vreg(mf, inst.id, RegClass::Gp64);
+        mf.block_mut(mb).insts.push(MachineInst {
+            opcode: ArmOpcode::MovReg,
+            operands: vec![
+                MachineOperand::PhysReg(PhysReg::Gp32(16)),
+                MachineOperand::PhysReg(PhysReg::Fp32(0)),
+            ],
+            def: None,
+        });
+        mf.block_mut(mb).insts.push(MachineInst {
+            opcode: ArmOpcode::MovReg,
+            operands: vec![
+                MachineOperand::PhysReg(PhysReg::Gp32(17)),
+                MachineOperand::PhysReg(PhysReg::Fp32(1)),
+            ],
+            def: None,
+        });
+        mf.block_mut(mb).insts.push(MachineInst {
+            opcode: ArmOpcode::Movz,
+            operands: vec![
+                MachineOperand::PhysReg(PhysReg::Gp(9)),
+                MachineOperand::Imm(32),
+                MachineOperand::Shift(0),
+            ],
+            def: None,
+        });
+        mf.block_mut(mb).insts.push(MachineInst {
+            opcode: ArmOpcode::LslReg,
+            operands: vec![
+                MachineOperand::PhysReg(PhysReg::Gp(17)),
+                MachineOperand::PhysReg(PhysReg::Gp(17)),
+                MachineOperand::PhysReg(PhysReg::Gp(9)),
+            ],
+            def: None,
+        });
+        mf.block_mut(mb).insts.push(MachineInst {
+            opcode: ArmOpcode::OrrReg,
+            operands: vec![
+                MachineOperand::VReg(dest),
+                MachineOperand::PhysReg(PhysReg::Gp(16)),
+                MachineOperand::PhysReg(PhysReg::Gp(17)),
+            ],
+            def: None,
+        });
     } else if inst.ty != IrType::Void {
         let class = type_to_reg_class(&inst.ty);
         let dest = ctx.get_vreg(mf, inst.id, class);
@@ -583,7 +645,7 @@ fn select_inst(
     inst: &Inst,
     func: &Function,
 ) {
-    if matches!(inst.ty, IrType::Int(IntWidth::I128)) {
+    if is_wide_pair_ty_arm(&inst.ty) {
         match &inst.kind {
             InstKind::ConstInt(val, IntWidth::I128) => {
                 let dest_slot = ctx.lookup_wide_slot(inst.id);
@@ -1458,7 +1520,7 @@ fn select_inst(
         }
 
         InstKind::Store(val, addr) => {
-            if matches!(func.value_type(*val), Some(IrType::Int(IntWidth::I128))) {
+            if matches!(func.value_type(*val), Some(ref t) if is_wide_pair_ty_arm(t)) {
                 let src_slot = ctx.lookup_wide_slot(*val);
                 emit_load_phys_i128_pair(
                     mf,
@@ -2201,6 +2263,67 @@ fn select_terminator(
             emit_epilogue(mf, mb);
         }
         Terminator::Return(Some(val)) => {
+            if matches!(func.value_type(*val), Some(ref t) if is_wide_pair_ty_arm(t) && !matches!(t, IrType::Int(IntWidth::I128)))
+            {
+                // complex(8) HFA: d0 = real (slot+0), d1 = imag (slot+8).
+                let src_slot = ctx.lookup_wide_slot(*val);
+                for (half, fp) in [(0i64, PhysReg::Fp(0)), (8, PhysReg::Fp(1))] {
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode: ArmOpcode::LdrFpImm,
+                        operands: vec![
+                            MachineOperand::PhysReg(fp),
+                            MachineOperand::PhysReg(PhysReg::FP),
+                            MachineOperand::Imm(src_slot as i64 + half),
+                        ],
+                        def: None,
+                    });
+                }
+                emit_epilogue(mf, mb);
+                return;
+            }
+            if matches!(func.value_type(*val), Some(ref t) if is_complex8_pair_ty_arm(t)) {
+                // complex(4) HFA: s0 = low 32 bits, s1 = high 32 bits
+                // of the Gp64 raw-bit value.
+                let src = ctx.lookup_vreg(*val);
+                // s0 ← w-view of src
+                mf.block_mut(mb).insts.push(MachineInst {
+                    opcode: ArmOpcode::MovReg,
+                    operands: vec![
+                        MachineOperand::PhysReg(PhysReg::Fp32(0)),
+                        MachineOperand::VReg(src),
+                    ],
+                    def: None,
+                });
+                // x16 = src >> 32; s1 ← w16
+                mf.block_mut(mb).insts.push(MachineInst {
+                    opcode: ArmOpcode::Movz,
+                    operands: vec![
+                        MachineOperand::PhysReg(PhysReg::Gp(9)),
+                        MachineOperand::Imm(32),
+                        MachineOperand::Shift(0),
+                    ],
+                    def: None,
+                });
+                mf.block_mut(mb).insts.push(MachineInst {
+                    opcode: ArmOpcode::LsrReg,
+                    operands: vec![
+                        MachineOperand::PhysReg(PhysReg::Gp(16)),
+                        MachineOperand::VReg(src),
+                        MachineOperand::PhysReg(PhysReg::Gp(9)),
+                    ],
+                    def: None,
+                });
+                mf.block_mut(mb).insts.push(MachineInst {
+                    opcode: ArmOpcode::MovReg,
+                    operands: vec![
+                        MachineOperand::PhysReg(PhysReg::Fp32(1)),
+                        MachineOperand::PhysReg(PhysReg::Gp32(16)),
+                    ],
+                    def: None,
+                });
+                emit_epilogue(mf, mb);
+                return;
+            }
             if matches!(func.value_type(*val), Some(IrType::Int(IntWidth::I128))) {
                 let src_slot = ctx.lookup_wide_slot(*val);
                 emit_load_phys_i128_pair(
@@ -2641,6 +2764,37 @@ fn emit_const_u64_phys(mf: &mut MachineFunction, mb: MBlockId, dest: PhysReg, va
             first = false;
         }
     }
+}
+
+/// Layout-independent scalar element size (the element types by-value
+/// complex copies carry). Mirror of the x86 helper.
+fn scalar_elem_bytes_arm(ty: &IrType) -> u64 {
+    match ty {
+        IrType::Bool | IrType::Int(IntWidth::I8) => 1,
+        IrType::Int(IntWidth::I16) => 2,
+        IrType::Int(IntWidth::I32) | IrType::Float(FloatWidth::F32) => 4,
+        IrType::Int(IntWidth::I64) | IrType::Float(FloatWidth::F64) => 8,
+        IrType::Int(IntWidth::I128) => 16,
+        _ => 0,
+    }
+}
+
+/// 16-byte values that ride the wide-slot machinery: i128 and the
+/// by-value 16-byte arrays BIND(C) complex(8) returns produce (AAPCS64
+/// returns those as an HFA in d0/d1, never x0/x1 — the bits are the
+/// same pair of quads either way once stored).
+fn is_wide_pair_ty_arm(ty: &IrType) -> bool {
+    match ty {
+        IrType::Int(IntWidth::I128) => true,
+        IrType::Array(elem, n) => scalar_elem_bytes_arm(elem) * n == 16,
+        _ => false,
+    }
+}
+
+/// `[f32 x 2]` — complex(4) by value: 8 raw bytes in a Gp64 vreg,
+/// crossing the AAPCS64 boundary as an HFA in s0/s1.
+fn is_complex8_pair_ty_arm(ty: &IrType) -> bool {
+    matches!(ty, IrType::Array(elem, 2) if matches!(elem.as_ref(), IrType::Float(FloatWidth::F32)))
 }
 
 fn emit_const_i128_to_phys_pair(

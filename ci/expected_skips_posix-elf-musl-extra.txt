@@ -1,3 +1,4 @@
 # Suites a musl host additionally cannot run: the x06 link gate
 # needs glibc or FreeBSD until the x11 musl story lands.
 elf_link_e2e
+c_interop_differential
