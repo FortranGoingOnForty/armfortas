@@ -1497,6 +1497,54 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     fs::write(&asm_path, &asm_text).map_err(|e| format!("cannot write temp assembly: {}", e))?;
 
     // x05: ELF targets assemble with the system assembler when the
+    let local_descriptor_params = crate::ir::lower::collect_descriptor_params_for_units(&units);
+    let local_char_len_star_params =
+        crate::ir::lower::collect_char_len_star_params_for_units(&units);
+
+    // Emit .amod files for each MODULE in the compilation unit.
+    // -J <dir> overrides where they go. For compile-only (-c) builds
+    // without -J, keep the traditional compiler behavior of writing
+    // module files into the current working directory even if the
+    // object output path points into a source subdirectory. For full
+    // link/shared outputs, keep following the primary output path.
+    for unit in &units {
+        if let crate::ast::unit::ProgramUnit::Module { name, .. } = &unit.node {
+            let mod_key = name.to_lowercase();
+            if let Some(mod_scope_id) = st.find_module_scope(&mod_key) {
+                let amod_text = crate::sema::amod::write_amod(
+                    name,
+                    opts.input.to_str().unwrap_or(""),
+                    &source,
+                    &st,
+                    mod_scope_id,
+                    &module_globals,
+                    &type_layouts,
+                    &ir_module,
+                    &local_descriptor_params,
+                    &local_char_len_star_params,
+                );
+                let amod_dir: std::path::PathBuf =
+                    opts.module_output_dir.clone().unwrap_or_else(|| {
+                        if opts.emit_obj {
+                            std::env::current_dir()
+                                .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                        } else {
+                            opts.output_path()
+                                .parent()
+                                .unwrap_or_else(|| std::path::Path::new("."))
+                                .to_path_buf()
+                        }
+                    });
+                let amod_path = amod_dir.join(format!("{}.amod", mod_key));
+                fs::write(&amod_path, &amod_text)
+                    .map_err(|e| format!("cannot write '{}': {}", amod_path.display(), e))?;
+                if opts.verbose {
+                    eprintln!(" amod: {}", amod_path.display());
+                }
+            }
+        }
+    }
+
     // host arch matches (gas on FreeBSD/Linux; `as --64`). Cross-
     // assembly from a non-x86 host waits for afs-as's x86 encoder
     // (x14). Mach-O keeps the existing as/AFS_AS routing below.
@@ -1558,54 +1606,6 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     }
     if opts.verbose {
         eprintln!(" assembled: {}", obj_path.display());
-    }
-
-    let local_descriptor_params = crate::ir::lower::collect_descriptor_params_for_units(&units);
-    let local_char_len_star_params =
-        crate::ir::lower::collect_char_len_star_params_for_units(&units);
-
-    // Emit .amod files for each MODULE in the compilation unit.
-    // -J <dir> overrides where they go. For compile-only (-c) builds
-    // without -J, keep the traditional compiler behavior of writing
-    // module files into the current working directory even if the
-    // object output path points into a source subdirectory. For full
-    // link/shared outputs, keep following the primary output path.
-    for unit in &units {
-        if let crate::ast::unit::ProgramUnit::Module { name, .. } = &unit.node {
-            let mod_key = name.to_lowercase();
-            if let Some(mod_scope_id) = st.find_module_scope(&mod_key) {
-                let amod_text = crate::sema::amod::write_amod(
-                    name,
-                    opts.input.to_str().unwrap_or(""),
-                    &source,
-                    &st,
-                    mod_scope_id,
-                    &module_globals,
-                    &type_layouts,
-                    &ir_module,
-                    &local_descriptor_params,
-                    &local_char_len_star_params,
-                );
-                let amod_dir: std::path::PathBuf =
-                    opts.module_output_dir.clone().unwrap_or_else(|| {
-                        if opts.emit_obj {
-                            std::env::current_dir()
-                                .unwrap_or_else(|_| std::path::PathBuf::from("."))
-                        } else {
-                            opts.output_path()
-                                .parent()
-                                .unwrap_or_else(|| std::path::Path::new("."))
-                                .to_path_buf()
-                        }
-                    });
-                let amod_path = amod_dir.join(format!("{}.amod", mod_key));
-                fs::write(&amod_path, &amod_text)
-                    .map_err(|e| format!("cannot write '{}': {}", amod_path.display(), e))?;
-                if opts.verbose {
-                    eprintln!(" amod: {}", amod_path.display());
-                }
-            }
-        }
     }
 
     if opts.emit_obj {
