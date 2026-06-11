@@ -69,7 +69,7 @@ annotations are removed; kept for history:
   marshaling it shares with direct calls.
 - Owner: x08 — DONE. Indirect targets stage into r11 and call *%r11; argument marshaling is shared with direct calls.
 
-### X64-O0-003 — no register class for by-value array/complex aggregates
+### X64-O0-003 — no register class for by-value array/complex aggregates [FIXED in x08]
 - Programs (2): complex_dp_parameter_zero_compare,
   stdlib_math_swap_cdp_default_cmplx_array
 - Both ELF platforms: compile error
@@ -77,4 +77,4 @@ annotations are removed; kept for history:
 - Category: ABI. Complex values reaching isel as by-value
   `Array(f64, 2)` need the x04 classifier's SSE-pair treatment wired
   into value classing instead of a vreg class lookup.
-- Owner: x08.
+- Owner: x08 — DONE. 8-byte by-value arrays ride Gp64 raw bits; 16-byte ones reuse the i128 wide-slot pair machinery.

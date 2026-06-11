@@ -78,7 +78,7 @@ pub fn select_function(
     let mut wide_param_info: Vec<((i32, i32), X86AbiArgLoc)> = Vec::new();
     for param in &func.params {
         let loc = classify_abi_arg(&abi_ty_of(&param.ty), &mut abi_state);
-        if matches!(param.ty, IrType::Int(IntWidth::I128)) {
+        if is_wide_pair_ty(&param.ty) {
             let slots = (mf.alloc_frame_slot(8, 8), mf.alloc_frame_slot(8, 8));
             ctx.wide_slots.insert(param.id, slots);
             wide_param_info.push((slots, loc));
@@ -170,7 +170,7 @@ pub fn select_function(
     // the defining block in vec order (same rationale as ARM isel).
     for block in &func.blocks {
         for bp in &block.params {
-            if matches!(bp.ty, IrType::Int(IntWidth::I128)) {
+            if is_wide_pair_ty(&bp.ty) {
                 let slots = (mf.alloc_frame_slot(8, 8), mf.alloc_frame_slot(8, 8));
                 ctx.wide_slots.insert(bp.id, slots);
                 continue;
@@ -183,7 +183,7 @@ pub fn select_function(
             if matches!(inst.ty, IrType::Void) {
                 continue;
             }
-            if matches!(inst.ty, IrType::Int(IntWidth::I128)) {
+            if is_wide_pair_ty(&inst.ty) {
                 let slots = (mf.alloc_frame_slot(8, 8), mf.alloc_frame_slot(8, 8));
                 ctx.wide_slots.insert(inst.id, slots);
                 continue;
@@ -384,8 +384,8 @@ fn select_inst(
     func: &Function,
     func_names: &[String],
 ) -> MBlockId {
-    // ---- i128 early dispatch (x08): wide-slot model ----
-    if matches!(inst.ty, IrType::Int(IntWidth::I128)) {
+    // ---- wide-pair early dispatch (x08): i128 and 16-byte arrays ----
+    if is_wide_pair_ty(&inst.ty) {
         use X86Reg::{Rax, Rcx, Rdx};
         match &inst.kind {
             InstKind::ConstInt(val, IntWidth::I128) => {
@@ -1220,7 +1220,7 @@ fn select_inst(
             let val_ty = func
                 .value_type(*val)
                 .unwrap_or_else(|| panic!("isel: missing type for stored value %{}", val.0));
-            if matches!(val_ty, IrType::Int(IntWidth::I128)) {
+            if is_wide_pair_ty(&val_ty) {
                 let src = ctx.lookup_wide_slot(*val);
                 emit_load_slot_pair(mf, mb, src, X86Reg::Rax, X86Reg::Rdx);
                 match ctx.addr_operand(*addr) {
@@ -1678,6 +1678,7 @@ fn emit_load(mf: &mut X86Function, mb: MBlockId, dest: X86VReg, ty: &IrType, add
         }
         IrType::Float(FloatWidth::F32) => (X86Opcode::Movss, OpSize::L),
         IrType::Float(FloatWidth::F64) => (X86Opcode::Movsd, OpSize::Q),
+        IrType::Array(elem, n) if scalar_elem_bytes(elem) * n == 8 => (X86Opcode::MovRM, OpSize::Q),
         other => panic!("x05 scope: load of {:?} deferred", other),
     };
     push(
@@ -1735,6 +1736,14 @@ fn emit_store(mf: &mut X86Function, mb: MBlockId, src: X86VReg, ty: &IrType, add
             fp_size_w(*w),
             vec![X86Operand::VReg(src)],
             Some(addr),
+        ),
+        IrType::Array(elem, n) if scalar_elem_bytes(elem) * n == 8 => push(
+            mf,
+            mb,
+            X86Opcode::MovMR,
+            OpSize::Q,
+            vec![X86Operand::VReg(src), addr],
+            None,
         ),
         other => panic!("x05 scope: store of {:?} deferred", other),
     }
@@ -2183,7 +2192,7 @@ fn emit_branch_arg_copies(
 
     let mut staged: Vec<(X86VReg, X86VReg)> = Vec::with_capacity(args.len());
     for (arg, bp) in args.iter().zip(target_params.iter()) {
-        if matches!(bp.ty, IrType::Int(IntWidth::I128)) {
+        if is_wide_pair_ty(&bp.ty) {
             // Wide branch arg: slot-pair copy through rax:rdx. Slots
             // are per-value, so source and destination never alias
             // unless they are literally the same value (skip then).
@@ -2215,7 +2224,10 @@ fn emit_branch_arg_copies(
 fn type_to_class(ty: &IrType) -> X86RegClass {
     match ty {
         IrType::Float(_) => X86RegClass::Xmm,
-        IrType::Int(IntWidth::I128) => panic!("x05 scope: i128 values deferred"),
+        // 8-byte by-value arrays (complex(4) copies: [f32 x 2]) are
+        // raw quad bits in a GP register; 16-byte ones take the
+        // wide-slot path before classing is consulted.
+        IrType::Array(elem, n) if scalar_elem_bytes(elem) * n == 8 => X86RegClass::Gp64,
         IrType::Int(IntWidth::I64) | IrType::Ptr(_) | IrType::FuncPtr(_) => X86RegClass::Gp64,
         IrType::Int(_) | IrType::Bool => X86RegClass::Gp32,
         IrType::Vector { .. } => panic!("x05 scope: vector values deferred"),
@@ -2323,6 +2335,31 @@ fn emit_i128_icmp(
         }
     }
     emit_setcc_movzx(mf, mb, cond, dest);
+}
+
+/// Byte size of a scalar element type, layout-independent (floats and
+/// fixed ints only — exactly the element types by-value array copies
+/// carry).
+fn scalar_elem_bytes(ty: &IrType) -> u64 {
+    match ty {
+        IrType::Bool | IrType::Int(IntWidth::I8) => 1,
+        IrType::Int(IntWidth::I16) => 2,
+        IrType::Int(IntWidth::I32) | IrType::Float(FloatWidth::F32) => 4,
+        IrType::Int(IntWidth::I64) | IrType::Float(FloatWidth::F64) => 8,
+        IrType::Int(IntWidth::I128) => 16,
+        _ => 0,
+    }
+}
+
+/// 16-byte values that ride the wide-slot pair machinery: i128 and
+/// by-value 16-byte arrays (complex(8) copies appear in IR as
+/// `load/store : [f64 x 2]`). Raw bit pairs either way.
+fn is_wide_pair_ty(ty: &IrType) -> bool {
+    match ty {
+        IrType::Int(IntWidth::I128) => true,
+        IrType::Array(elem, n) => scalar_elem_bytes(elem) * n == 16,
+        _ => false,
+    }
 }
 
 // ---- i128 slot helpers (x08) ----
