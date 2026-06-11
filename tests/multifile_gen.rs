@@ -20,6 +20,13 @@ fn unique_dir(prefix: &str) -> PathBuf {
 }
 
 fn find_compiler() -> PathBuf {
+    // CARGO_BIN_EXE points at the binary built for THIS test profile;
+    // the path probes below can hit a stale binary from the other
+    // profile (a release armfortas predating module-global emission
+    // failed every multifile test while the debug build was fine).
+    if let Some(p) = std::env::var_os("CARGO_BIN_EXE_armfortas") {
+        return PathBuf::from(p);
+    }
     for c in &["target/release/armfortas", "target/debug/armfortas"] {
         let p = PathBuf::from(c);
         if p.exists() {
@@ -37,14 +44,6 @@ fn find_runtime() -> PathBuf {
         }
     }
     panic!("libarmfortas_rt.a not found");
-}
-
-fn sdk_path() -> String {
-    let out = Command::new("xcrun")
-        .args(["--sdk", "macosx", "--show-sdk-path"])
-        .output()
-        .expect("xcrun failed");
-    String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 
 fn compile_file(compiler: &Path, source: &Path, output: &Path, search_dir: &Path, opt: &str) {
@@ -74,24 +73,21 @@ fn compile_file(compiler: &Path, source: &Path, output: &Path, search_dir: &Path
 }
 
 fn link_files(objects: &[PathBuf], output: &Path) {
+    // Link through the compiler binary: the driver owns crt discovery,
+    // runtime location, and the per-format link line on every platform
+    // (the old inline ld invocation was Mach-O-only).
+    let compiler = find_compiler();
     let runtime = find_runtime();
-    let sdk = sdk_path();
-    let mut args: Vec<String> = vec!["-o".into(), output.to_str().unwrap().into()];
+    let mut cmd = Command::new(&compiler);
     for o in objects {
-        args.push(o.to_str().unwrap().into());
+        cmd.arg(o);
     }
-    args.push(runtime.to_str().unwrap().into());
-    args.extend([
-        "-lSystem".into(),
-        "-syslibroot".into(),
-        sdk,
-        "-arch".into(),
-        "arm64".into(),
-    ]);
-    let result = Command::new("ld")
-        .args(&args)
+    let result = cmd
+        .arg(&runtime)
+        .arg("-o")
+        .arg(output)
         .output()
-        .expect("ld launch failed");
+        .expect("compiler launch failed for link");
     assert!(
         result.status.success(),
         "link failed:\n{}",
@@ -246,7 +242,7 @@ fn run_generated_test(
 
 #[test]
 fn chain_depth_5() {
-    if let Err(reason) = armfortas::testing::native_e2e_support() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
         eprintln!(
             "\nHARNESS_SKIP suite=multifile_gen test=chain_depth_5 count=1 reason=\"{}\"",
             reason
@@ -259,7 +255,7 @@ fn chain_depth_5() {
 
 #[test]
 fn chain_depth_10() {
-    if let Err(reason) = armfortas::testing::native_e2e_support() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
         eprintln!(
             "\nHARNESS_SKIP suite=multifile_gen test=chain_depth_10 count=1 reason=\"{}\"",
             reason
@@ -272,7 +268,7 @@ fn chain_depth_10() {
 
 #[test]
 fn chain_depth_20() {
-    if let Err(reason) = armfortas::testing::native_e2e_support() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
         eprintln!(
             "\nHARNESS_SKIP suite=multifile_gen test=chain_depth_20 count=1 reason=\"{}\"",
             reason
@@ -285,7 +281,7 @@ fn chain_depth_20() {
 
 #[test]
 fn chain_depth_10_o2() {
-    if let Err(reason) = armfortas::testing::native_e2e_support() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O2") {
         eprintln!(
             "\nHARNESS_SKIP suite=multifile_gen test=chain_depth_10_o2 count=1 reason=\"{}\"",
             reason
@@ -298,7 +294,7 @@ fn chain_depth_10_o2() {
 
 #[test]
 fn diamond_width_4() {
-    if let Err(reason) = armfortas::testing::native_e2e_support() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
         eprintln!(
             "\nHARNESS_SKIP suite=multifile_gen test=diamond_width_4 count=1 reason=\"{}\"",
             reason
@@ -311,7 +307,7 @@ fn diamond_width_4() {
 
 #[test]
 fn diamond_width_8() {
-    if let Err(reason) = armfortas::testing::native_e2e_support() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
         eprintln!(
             "\nHARNESS_SKIP suite=multifile_gen test=diamond_width_8 count=1 reason=\"{}\"",
             reason
@@ -324,7 +320,7 @@ fn diamond_width_8() {
 
 #[test]
 fn diamond_width_4_o2() {
-    if let Err(reason) = armfortas::testing::native_e2e_support() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O2") {
         eprintln!(
             "\nHARNESS_SKIP suite=multifile_gen test=diamond_width_4_o2 count=1 reason=\"{}\"",
             reason
@@ -389,7 +385,7 @@ fn run_cross_opt_test(
 
 #[test]
 fn abi_matrix_chain5_mod_o0_main_o2() {
-    if let Err(reason) = armfortas::testing::native_e2e_support() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
         eprintln!(
             "\nHARNESS_SKIP suite=multifile_gen test=abi_matrix_chain5_mod_o0_main_o2 count=1 reason=\"{}\"",
             reason
@@ -402,7 +398,7 @@ fn abi_matrix_chain5_mod_o0_main_o2() {
 
 #[test]
 fn abi_matrix_chain5_mod_o2_main_o0() {
-    if let Err(reason) = armfortas::testing::native_e2e_support() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O2") {
         eprintln!(
             "\nHARNESS_SKIP suite=multifile_gen test=abi_matrix_chain5_mod_o2_main_o0 count=1 reason=\"{}\"",
             reason
@@ -415,7 +411,7 @@ fn abi_matrix_chain5_mod_o2_main_o0() {
 
 #[test]
 fn abi_matrix_diamond4_mod_o0_main_o2() {
-    if let Err(reason) = armfortas::testing::native_e2e_support() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
         eprintln!(
             "\nHARNESS_SKIP suite=multifile_gen test=abi_matrix_diamond4_mod_o0_main_o2 count=1 reason=\"{}\"",
             reason
@@ -428,7 +424,7 @@ fn abi_matrix_diamond4_mod_o0_main_o2() {
 
 #[test]
 fn abi_matrix_diamond4_mod_o2_main_o0() {
-    if let Err(reason) = armfortas::testing::native_e2e_support() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O2") {
         eprintln!(
             "\nHARNESS_SKIP suite=multifile_gen test=abi_matrix_diamond4_mod_o2_main_o0 count=1 reason=\"{}\"",
             reason
@@ -441,7 +437,7 @@ fn abi_matrix_diamond4_mod_o2_main_o0() {
 
 #[test]
 fn abi_matrix_chain5_mod_o0_main_ofast() {
-    if let Err(reason) = armfortas::testing::native_e2e_support() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
         eprintln!(
             "\nHARNESS_SKIP suite=multifile_gen test=abi_matrix_chain5_mod_o0_main_ofast count=1 reason=\"{}\"",
             reason
@@ -461,7 +457,7 @@ fn abi_matrix_chain5_mod_o0_main_ofast() {
 
 #[test]
 fn abi_matrix_chain5_mod_ofast_main_o0() {
-    if let Err(reason) = armfortas::testing::native_e2e_support() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-Ofast") {
         eprintln!(
             "\nHARNESS_SKIP suite=multifile_gen test=abi_matrix_chain5_mod_ofast_main_o0 count=1 reason=\"{}\"",
             reason

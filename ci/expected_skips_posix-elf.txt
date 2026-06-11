@@ -34,7 +34,6 @@ loop_partial_unroll_runtime
 loop_partial_unroll_runtime_red
 memory_runtime
 module_host_audit
-multifile
 multifile_gen
 ofast_fast_math
 opt_audit_29_11
