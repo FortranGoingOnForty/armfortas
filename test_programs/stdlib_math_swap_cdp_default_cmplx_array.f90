@@ -1,6 +1,5 @@
 ! CHECK: ok
 ! REPRO_CHECK: run
-! XFAIL(x86_64): X64-O0-003 (no x86 register class for by-value array/complex aggregates)
 module m
   use iso_fortran_env, only: real32, real64
   implicit none

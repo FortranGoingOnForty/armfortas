@@ -2,7 +2,6 @@
 ! IR_CHECK: call @afs_modproc_proc_dummy_iface_scope_m_new_string(
 ! IR_CHECK: call %
 ! REPRO_CHECK: run
-! XFAIL(x86_64): X64-O0-002 (indirect calls through procedure pointers are not selected yet)
 module proc_dummy_iface_scope_m
   implicit none
 

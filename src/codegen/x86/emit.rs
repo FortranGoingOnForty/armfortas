@@ -254,6 +254,8 @@ fn emit_inst(inst: &X86Inst, func: &X86Function) -> String {
         Lea => format!("lea{} {}, {}", suf, op(0), def()),
         Add => format!("add{} {}, {}", suf, op(1), def()),
         Sub => format!("sub{} {}, {}", suf, op(1), def()),
+        Adc => format!("adc{} {}, {}", suf, op(1), def()),
+        Sbb => format!("sbb{} {}, {}", suf, op(1), def()),
         Imul => format!("imul{} {}, {}", suf, op(1), def()),
         And => format!("and{} {}, {}", suf, op(1), def()),
         Or => format!("or{} {}, {}", suf, op(1), def()),
@@ -291,6 +293,8 @@ fn emit_inst(inst: &X86Inst, func: &X86Function) -> String {
         Jcc => format!("j{} {}", cond(0).mnemonic(), block(1)),
         // Bare name for now; @PLT decoration is link-policy (x06).
         Call => format!("call {}", opq(0)),
+        CallReg => format!("call *{}", opq(0)),
+        MovqGpToXmm | MovqXmmToGp => format!("movq {}, {}", opq(0), def()),
         // Epilogue folded into every return: restoring rsp from rbp
         // makes the epilogue frame-size-independent (no encoding paths
         // that vary with N — the anti-32KB-bug property).

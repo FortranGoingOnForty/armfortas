@@ -126,6 +126,11 @@ pub(super) struct Ctx<'a> {
     /// the only context where a conditional arm may be `.NIL.` and
     /// where conditional arguments select associations (F2023).
     pub(super) in_call_arg: bool,
+    /// True while validating a BIND(C) procedure (including interface
+    /// bodies). BIND(C) `character(kind=c_char), value` dummies have a
+    /// working byte-copy lowering; only the Fortran-internal character
+    /// VALUE path lacks copy-in.
+    pub(super) in_bind_c_unit: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -160,6 +165,7 @@ impl<'a> Ctx<'a> {
             warn_deprecated,
             current_args: HashSet::new(),
             in_call_arg: false,
+            in_bind_c_unit: false,
         }
     }
 
@@ -1195,10 +1201,13 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             body,
             contains,
             args,
+            bind,
             ..
         } => {
             let saved_pure = ctx.in_pure;
             let saved_elemental = ctx.in_elemental;
+            let saved_bind_c = ctx.in_bind_c_unit;
+            ctx.in_bind_c_unit = bind.is_some();
             ctx.in_pure = prefix.iter().any(|p| matches!(p, Prefix::Pure));
             ctx.in_elemental = prefix.iter().any(|p| matches!(p, Prefix::Elemental));
             let is_impure = prefix.iter().any(|p| matches!(p, Prefix::Impure));
@@ -1264,6 +1273,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             ctx.current_args = saved_args;
             ctx.in_pure = saved_pure;
             ctx.in_elemental = saved_elemental;
+            ctx.in_bind_c_unit = saved_bind_c;
         }
         ProgramUnit::Function {
             prefix,
@@ -1273,10 +1283,13 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             body,
             contains,
             args,
+            bind,
             ..
         } => {
             let saved_pure = ctx.in_pure;
             let saved_elemental = ctx.in_elemental;
+            let saved_bind_c = ctx.in_bind_c_unit;
+            ctx.in_bind_c_unit = bind.is_some();
             ctx.in_pure = prefix.iter().any(|p| matches!(p, Prefix::Pure));
             ctx.in_elemental = prefix.iter().any(|p| matches!(p, Prefix::Elemental));
             let is_impure = prefix.iter().any(|p| matches!(p, Prefix::Impure));
@@ -1340,6 +1353,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             ctx.current_args = saved_args;
             ctx.in_pure = saved_pure;
             ctx.in_elemental = saved_elemental;
+            ctx.in_bind_c_unit = saved_bind_c;
         }
         ProgramUnit::Submodule {
             uses,
@@ -1449,6 +1463,23 @@ fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
                 }
             }
 
+            // Character VALUE dummies are not lowered with copy-in
+            // semantics yet: the callee receives the caller's storage
+            // pointer, so mutation corrupts the caller (or SEGVs on a
+            // literal actual). Found by x08's VALUE coverage; owned by
+            // l06. BIND(C) procedures are exempt: their c_char VALUE
+            // dummies take the working byte-copy path.
+            if attrs.iter().any(|a| matches!(a, Attribute::Value))
+                && matches!(type_spec, crate::ast::decl::TypeSpec::Character(_))
+                && !ctx.in_bind_c_unit
+            {
+                ctx.error(
+                    decl.span,
+                    "the VALUE attribute on CHARACTER dummies is not supported yet \
+                     (copy-in lowering lands with the C-interop string work)",
+                );
+            }
+
             // Deferred-length character must be allocatable or pointer.
             if let crate::ast::decl::TypeSpec::Character(Some(sel)) = type_spec {
                 if let Some(crate::ast::decl::LenSpec::Colon) = &sel.len {
@@ -1527,8 +1558,32 @@ fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
             ctx.require_std(decl.span, FortranStandard::F90, "USE statement");
         }
 
-        if matches!(decl.node, Decl::CommonBlock { .. }) {
+        if let Decl::CommonBlock { vars, .. } = &decl.node {
             warn_legacy_feature(ctx, decl.span, "COMMON block");
+            // Character members are not lowered with storage-
+            // association semantics: the member became a POINTER slot
+            // holding the string's address instead of inline bytes,
+            // and reads passed length 0 — silently empty on every
+            // target (found by x08's cross-TU COMMON test; owned by
+            // l06 alongside the string-representation work).
+            for var in vars {
+                let is_char = ctx.lookup(var).is_some_and(|sym| {
+                    matches!(
+                        sym.type_info,
+                        Some(crate::sema::symtab::TypeInfo::Character { .. })
+                    )
+                });
+                if is_char {
+                    ctx.error(
+                        decl.span,
+                        format!(
+                            "character member '{}' in a COMMON block is not supported \
+                             yet (storage association needs inline character bytes)",
+                            var
+                        ),
+                    );
+                }
+            }
         }
 
         if matches!(decl.node, Decl::EquivalenceStmt { .. }) {
@@ -2915,6 +2970,69 @@ mod tests {
             .filter(|d| d.kind == DiagKind::Error)
             .map(|d| d.msg.clone())
             .collect()
+    }
+
+    // ---- Character VALUE dummies ----
+
+    #[test]
+    fn char_value_dummy_rejected_without_bind_c() {
+        let errs = errors_from(
+            "\
+subroutine foo(c)
+  character(1), value :: c
+end subroutine
+",
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("VALUE attribute on CHARACTER")),
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn char_value_dummy_allowed_in_bind_c() {
+        let errs = errors_from(
+            "\
+subroutine foo(c) bind(c, name='foo')
+  use iso_c_binding
+  character(kind=c_char), value :: c
+end subroutine
+",
+        );
+        assert!(
+            !errs
+                .iter()
+                .any(|e| e.contains("VALUE attribute on CHARACTER")),
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn char_value_dummy_allowed_in_bind_c_interface_body() {
+        let errs = errors_from(
+            "\
+program p
+  use iso_c_binding
+  interface
+    function check_char(ch) result(rc) bind(c, name='check_char')
+      import :: c_char, c_int
+      character(kind=c_char), value :: ch
+      integer(c_int) :: rc
+    end function
+  end interface
+end program
+",
+        );
+        assert!(
+            !errs
+                .iter()
+                .any(|e| e.contains("VALUE attribute on CHARACTER")),
+            "{:?}",
+            errs
+        );
     }
 
     // ---- Intent enforcement ----

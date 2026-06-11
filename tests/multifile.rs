@@ -18,6 +18,13 @@ fn unique_dir() -> PathBuf {
 }
 
 fn find_compiler() -> PathBuf {
+    // CARGO_BIN_EXE points at the binary built for THIS test profile;
+    // the path probes below can hit a stale binary from the other
+    // profile (a release armfortas predating module-global emission
+    // failed every multifile test while the debug build was fine).
+    if let Some(p) = std::env::var_os("CARGO_BIN_EXE_armfortas") {
+        return PathBuf::from(p);
+    }
     for c in &["target/release/armfortas", "target/debug/armfortas"] {
         let p = PathBuf::from(c);
         if p.exists() {
@@ -35,14 +42,6 @@ fn find_runtime() -> PathBuf {
         }
     }
     panic!("libarmfortas_rt.a not found");
-}
-
-fn sdk_path() -> String {
-    let out = Command::new("xcrun")
-        .args(["--sdk", "macosx", "--show-sdk-path"])
-        .output()
-        .expect("xcrun failed");
-    String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 
 /// Compile a .f90 file with -c, producing .o and optionally .amod.
@@ -71,24 +70,21 @@ fn compile_file(compiler: &Path, source: &Path, output: &Path, search_dir: Optio
 
 /// Link .o files into a binary.
 fn link_files(objects: &[&Path], output: &Path) {
+    // Link through the compiler binary: the driver owns crt discovery,
+    // runtime location, and the per-format link line on every platform
+    // (the old inline ld invocation was Mach-O-only).
+    let compiler = find_compiler();
     let runtime = find_runtime();
-    let sdk = sdk_path();
-    let mut args: Vec<String> = vec!["-o".into(), output.to_str().unwrap().into()];
+    let mut cmd = Command::new(&compiler);
     for o in objects {
-        args.push(o.to_str().unwrap().into());
+        cmd.arg(o);
     }
-    args.push(runtime.to_str().unwrap().into());
-    args.extend([
-        "-lSystem".into(),
-        "-syslibroot".into(),
-        sdk,
-        "-arch".into(),
-        "arm64".into(),
-    ]);
-    let result = Command::new("ld")
-        .args(&args)
+    let result = cmd
+        .arg(&runtime)
+        .arg("-o")
+        .arg(output)
         .output()
-        .expect("ld launch failed");
+        .expect("compiler launch failed for link");
     assert!(
         result.status.success(),
         "link failed:\n{}",
@@ -141,7 +137,7 @@ fn multifile_test(mod_source: &str, main_source: &str, expected_substring: &str)
 
 #[test]
 fn basic_module_variable_and_subroutine() {
-    if let Err(reason) = armfortas::testing::native_e2e_support() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
         eprintln!(
             "\nHARNESS_SKIP suite=multifile test=basic_module_variable_and_subroutine count=1 reason=\"{}\"",
             reason
@@ -157,7 +153,7 @@ fn basic_module_variable_and_subroutine() {
 
 #[test]
 fn module_with_allocatable_array() {
-    if let Err(reason) = armfortas::testing::native_e2e_support() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
         eprintln!(
             "\nHARNESS_SKIP suite=multifile test=module_with_allocatable_array count=1 reason=\"{}\"",
             reason
@@ -173,7 +169,7 @@ fn module_with_allocatable_array() {
 
 #[test]
 fn module_with_derived_type() {
-    if let Err(reason) = armfortas::testing::native_e2e_support() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
         eprintln!(
             "\nHARNESS_SKIP suite=multifile test=module_with_derived_type count=1 reason=\"{}\"",
             reason
@@ -189,7 +185,7 @@ fn module_with_derived_type() {
 
 #[test]
 fn module_parameter_constants() {
-    if let Err(reason) = armfortas::testing::native_e2e_support() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
         eprintln!(
             "\nHARNESS_SKIP suite=multifile test=module_parameter_constants count=1 reason=\"{}\"",
             reason
@@ -205,7 +201,7 @@ fn module_parameter_constants() {
 
 #[test]
 fn use_only_filtering() {
-    if let Err(reason) = armfortas::testing::native_e2e_support() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
         eprintln!(
             "\nHARNESS_SKIP suite=multifile test=use_only_filtering count=1 reason=\"{}\"",
             reason
@@ -221,7 +217,7 @@ fn use_only_filtering() {
 
 #[test]
 fn use_rename() {
-    if let Err(reason) = armfortas::testing::native_e2e_support() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
         eprintln!(
             "\nHARNESS_SKIP suite=multifile test=use_rename count=1 reason=\"{}\"",
             reason
@@ -240,7 +236,7 @@ fn use_rename() {
 /// dispatches each specific at the call site.
 #[test]
 fn generic_interface_cross_module() {
-    if let Err(reason) = armfortas::testing::native_e2e_support() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
         eprintln!(
             "\nHARNESS_SKIP suite=multifile test=generic_interface_cross_module count=1 reason=\"{}\"",
             reason
@@ -261,7 +257,7 @@ fn generic_interface_cross_module() {
 /// dispatch walks the chain.
 #[test]
 fn generic_interface_transitive_use() {
-    if let Err(reason) = armfortas::testing::native_e2e_support() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
         eprintln!(
             "\nHARNESS_SKIP suite=multifile test=generic_interface_transitive_use count=1 reason=\"{}\"",
             reason
@@ -307,7 +303,7 @@ fn generic_interface_transitive_use() {
 
 #[test]
 fn submodule_host_association_resolves_transitive_real_parameter() {
-    if let Err(reason) = armfortas::testing::native_e2e_support() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
         eprintln!(
             "\nHARNESS_SKIP suite=multifile test=submodule_host_association_resolves_transitive_real_parameter count=1 reason=\"{}\"",
             reason
@@ -375,7 +371,7 @@ fn submodule_host_association_resolves_transitive_real_parameter() {
 
 #[test]
 fn generic_interface_beats_private_renamed_import() {
-    if let Err(reason) = armfortas::testing::native_e2e_support() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
         eprintln!(
             "\nHARNESS_SKIP suite=multifile test=generic_interface_beats_private_renamed_import count=1 reason=\"{}\"",
             reason
@@ -424,7 +420,7 @@ fn generic_interface_beats_private_renamed_import() {
 
 #[test]
 fn imported_type_bound_result_guides_operator_generic() {
-    if let Err(reason) = armfortas::testing::native_e2e_support() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
         eprintln!(
             "\nHARNESS_SKIP suite=multifile test=imported_type_bound_result_guides_operator_generic count=1 reason=\"{}\"",
             reason
@@ -549,7 +545,7 @@ end program
 
 #[test]
 fn module_private_default() {
-    if let Err(reason) = armfortas::testing::native_e2e_support() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
         eprintln!(
             "\nHARNESS_SKIP suite=multifile test=module_private_default count=1 reason=\"{}\"",
             reason

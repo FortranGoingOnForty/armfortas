@@ -2999,10 +2999,18 @@ fn xfail_findings_cross_check() {
         "XFAIL annotations reference IDs missing from the sweep log: {:?}",
         orphan_annotations
     );
-    let orphan_findings: Vec<_> = log_ids.difference(&annotation_ids).collect();
+    // A finding whose heading carries "[FIXED" is resolved history —
+    // its annotations are gone by design.
+    let orphan_findings: Vec<_> = log_ids
+        .difference(&annotation_ids)
+        .filter(|id| {
+            !log.lines()
+                .any(|l| l.contains(id.as_str()) && l.contains("[FIXED"))
+        })
+        .collect();
     assert!(
         orphan_findings.is_empty(),
-        "sweep-log findings with no remaining XFAIL annotation (fixed? remove the entry or mark it resolved): {:?}",
+        "sweep-log findings with no remaining XFAIL annotation (fixed? mark the heading [FIXED ...]): {:?}",
         orphan_findings
     );
 }

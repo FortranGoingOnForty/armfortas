@@ -19863,7 +19863,17 @@ pub(super) fn callee_hidden_result_abi(
         // Complex scalar return: hidden output pointer, caller-allocated buffer.
         // Mirrors function_hidden_result_abi (definition side) so calls
         // resolved via SymbolTable see the same ABI as direct lowering.
-        TypeInfo::Complex { .. } if !sym.attrs.pointer => Some(HiddenResultAbi::ComplexBuffer),
+        // BIND(C) callees return per the C ABI instead (definition side
+        // already exempts them; without the same exemption HERE the
+        // caller passed a hidden buffer that a clang-built callee never
+        // writes — the x08 differential read zeros).
+        TypeInfo::Complex { .. } if !sym.attrs.pointer => {
+            if sym.attrs.binding_label.is_some() {
+                None
+            } else {
+                Some(HiddenResultAbi::ComplexBuffer)
+            }
+        }
         _ => None,
     }
 }

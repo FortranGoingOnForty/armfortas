@@ -106,6 +106,33 @@ pub fn emit_globals(
         };
         // Module globals need external linkage for multi-file.
         let is_module_global = g.name.starts_with("afs_mod_") || g.name.starts_with("afs_common_");
+
+        // Uninitialized COMMON storage is a COMMON symbol (.comm) on
+        // BOTH formats: every TU declaring /blk/ emits the same
+        // symbols and the linker merges them. A strong per-TU
+        // definition is a duplicate-symbol error (found cross-TU by
+        // x08's differential — on ELF first, then Mach-O in CI).
+        // Initialized commons (BLOCK DATA) stay strong: one TU owns
+        // the initializer.
+        let zero_init = matches!(
+            g.initializer,
+            None | Some(crate::ir::inst::GlobalInit::Zero)
+        );
+        if g.name.starts_with("afs_common_") && zero_init {
+            let size = g.ty.size_bytes(layout).max(1);
+            let pow2 = size.min(16).next_power_of_two();
+            match dialect {
+                GlobalsDialect::Elf => {
+                    writeln!(out, ".comm {},{},{}", symbol, size, pow2).unwrap();
+                }
+                GlobalsDialect::MachO => {
+                    // Mach-O .comm takes log2 alignment.
+                    writeln!(out, ".comm {},{},{}", symbol, size, pow2.trailing_zeros()).unwrap();
+                }
+            }
+            continue;
+        }
+
         match (dialect, is_module_global) {
             (GlobalsDialect::MachO, true) => writeln!(out, ".globl {}", symbol).unwrap(),
             (GlobalsDialect::MachO, false) => writeln!(out, ".private_extern {}", symbol).unwrap(),

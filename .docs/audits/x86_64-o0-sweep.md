@@ -40,7 +40,13 @@ each was a systemic root cause failing dozens of programs):
 
 ## Findings
 
-### X64-O0-001 — i128 values are not selected by the x86 backend
+### X64-O0-001 — i128 values are not selected by the x86 backend [FIXED in x08]
+
+Resolved: i128 values are memory-resident (lo, hi) frame-slot pairs
+staged through rax:rdx (the arm64 wide-slot model); add/adc, sub/sbb,
+neg, compares via the sub/sbb flags idiom, rax:rdx returns, GpPair
+args with the SysV revert rule. All 13 programs pass and the
+annotations are removed; kept for history:
 - Programs (13): integer16_format, integer16_format_read,
   integer16_format_read_arrays, integer16_format_read_sections,
   integer16_format_read_targets, integer16_internal_format,
@@ -51,9 +57,9 @@ each was a systemic root cause failing dozens of programs):
 - Both ELF platforms: compile error `x05 scope: i128 values deferred`.
 - Category: BACKEND. The isel has no i128 register-pair strategy;
   x05 deferred it deliberately (loud error, never wrong answers).
-- Owner: x08 (the fourteen dedicated i128 suites are its first deliverable).
+- Owner: x08 — DONE (this entry retained as the finding record).
 
-### X64-O0-002 — indirect calls through procedure pointers
+### X64-O0-002 — indirect calls through procedure pointers [FIXED in x08]
 - Programs (3): procedure_dummy_interface_scope_hidden_lengths,
   procedure_pointer_intent_out_parent_default,
   stdlib_hashmaps_tbp_int8_array_dispatch
@@ -61,9 +67,9 @@ each was a systemic root cause failing dozens of programs):
 - Category: BACKEND/ABI. Call selection only handles direct FuncRefs;
   calling through a value needs `call *%reg` plus the SysV argument
   marshaling it shares with direct calls.
-- Owner: x08 (cross-TU ABI sprint owns call-shape work).
+- Owner: x08 — DONE. Indirect targets stage into r11 and call *%r11; argument marshaling is shared with direct calls.
 
-### X64-O0-003 — no register class for by-value array/complex aggregates
+### X64-O0-003 — no register class for by-value array/complex aggregates [FIXED in x08]
 - Programs (2): complex_dp_parameter_zero_compare,
   stdlib_math_swap_cdp_default_cmplx_array
 - Both ELF platforms: compile error
@@ -71,4 +77,4 @@ each was a systemic root cause failing dozens of programs):
 - Category: ABI. Complex values reaching isel as by-value
   `Array(f64, 2)` need the x04 classifier's SSE-pair treatment wired
   into value classing instead of a vreg class lookup.
-- Owner: x08.
+- Owner: x08 — DONE. 8-byte by-value arrays ride Gp64 raw bits; 16-byte ones reuse the i128 wide-slot pair machinery.
