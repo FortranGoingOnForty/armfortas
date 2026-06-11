@@ -409,7 +409,13 @@ fn sdk_path() -> Result<String, String> {
 /// cannot run the native toolchain path (sprint x01). `count` must come
 /// from real discovery, never a literal.
 fn skip_native_e2e(test_name: &str, count: usize) -> bool {
-    match armfortas::testing::native_e2e_support() {
+    skip_native_e2e_at("-O0", test_name, count)
+}
+
+/// Level-aware variant: ELF hosts run -O0 only this sprint (x09 turns
+/// the optimizing levels on); macOS runs everything.
+fn skip_native_e2e_at(opt_flag: &str, test_name: &str, count: usize) -> bool {
+    match armfortas::testing::native_e2e_level_support(opt_flag) {
         Ok(()) => false,
         Err(reason) => {
             eprintln!(
@@ -453,8 +459,34 @@ fn compile_to_object(
     Ok(())
 }
 
-/// Link object files with the runtime into a binary.
-fn link_objects(objects: &[PathBuf], output: &Path) -> Result<(), String> {
+/// Link object files with the runtime into a binary, by handing the
+/// prebuilt objects to the compiler binary itself — the driver owns
+/// crt discovery, runtime location, and per-format link lines on
+/// every platform (x06), so the harness never reimplements them.
+fn link_objects(compiler: &Path, objects: &[PathBuf], output: &Path) -> Result<(), String> {
+    let mut args: Vec<String> = Vec::with_capacity(objects.len() + 2);
+    for o in objects {
+        args.push(o.to_str().unwrap().into());
+    }
+    args.push("-o".into());
+    args.push(output.to_str().unwrap().into());
+    let result = Command::new(compiler)
+        .args(&args)
+        .output()
+        .map_err(|e| format!("cannot launch compiler for link: {}", e))?;
+    if !result.status.success() {
+        return Err(format!(
+            "link failed:\n{}",
+            String::from_utf8_lossy(&result.stderr)
+        ));
+    }
+    Ok(())
+}
+
+/// The retired Mach-O-only link line (pre-x07). Kept compiling for the
+/// macOS-only suites that still call it directly, if any remain.
+#[allow(dead_code)]
+fn link_objects_macho(objects: &[PathBuf], output: &Path) -> Result<(), String> {
     let runtime = find_runtime();
     let sdk = sdk_path()?;
     let mut args: Vec<String> = vec!["-o".into(), output.to_str().unwrap().into()];
@@ -2406,7 +2438,7 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
             }
 
             // Link all .o files into a binary.
-            link_objects(&objects, &binary)
+            link_objects(compiler, &objects, &binary)
                 .map_err(|e| format!("{} [{}]: {}", filename, opt_flag, e))?;
 
             let _ = fs::remove_dir_all(&build_dir);
@@ -2780,7 +2812,7 @@ fn run_all_at(opt_flag: &str, test_name: &str) -> Result<(), String> {
         "no Fortran sources found in test_programs/"
     );
 
-    if skip_native_e2e(test_name, sources.len()) {
+    if skip_native_e2e_at(opt_flag, test_name, sources.len()) {
         return Ok(());
     }
 
