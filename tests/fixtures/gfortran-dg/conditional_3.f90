@@ -11,7 +11,7 @@
 ! expectation to its actual diagnostic.
 ! FLAGS: --std=f2023
 ! ERROR_EXPECTED: expected ':'
-! XFAIL: f2023 conditional expressions not implemented (l02); see .docs/audits/f2023-feature-matrix.md
+! XFAIL: armfortas diagnostic wording differs from gfortran's dg-error substrings (deliberate; revisit if dg wording alignment becomes a goal)
 program conditional_syntax
   implicit none
   integer :: i = 42
