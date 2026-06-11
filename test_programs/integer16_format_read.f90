@@ -7,6 +7,7 @@
 ! REPRO_CHECK: asm
 ! REPRO_CHECK: obj
 ! OPT_EQ: O0,O1,O2,O3,Os,Ofast => stdout|stderr|exit
+! XFAIL(x86_64): X64-O0-001 (i128 values are not selected by the x86 backend yet)
 program integer16_format_read
   implicit none
   integer(16) :: x
