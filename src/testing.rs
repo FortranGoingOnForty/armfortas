@@ -442,8 +442,12 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
             OptLevel::Os => IrOptLevel::Os,
             OptLevel::Ofast => IrOptLevel::Ofast,
         };
+        // Captures compile for the host target (the layout calls above
+        // use TargetSpec::host() too), so the pipeline gates on the
+        // host arch.
+        let host_arch = crate::target::TargetSpec::host().arch;
         let pm = if ir_module.contains_i128_outside_globals() && request.opt_level != OptLevel::O0 {
-            build_i128_pipeline(ir_opt).ok_or_else(|| CaptureFailure {
+            build_i128_pipeline(ir_opt, host_arch).ok_or_else(|| CaptureFailure {
                 input: input.clone(),
                 opt_level: request.opt_level,
                 stage: FailureStage::Ir,
@@ -454,7 +458,7 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
                 stages: stages.clone(),
             })?
         } else {
-            build_pipeline(ir_opt)
+            build_pipeline(ir_opt, host_arch)
         };
         pm.run(&mut optimized);
         Some(optimized)
