@@ -2,3 +2,4 @@
 # needs glibc or FreeBSD until the x11 musl story lands.
 elf_link_e2e
 c_interop_differential
+multifile
