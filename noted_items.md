@@ -149,6 +149,8 @@ l06's intake):
 - **Character VALUE dummies** never had copy-in semantics: the callee
   received the caller's storage pointer, so mutation corrupted the
   caller (SEGV on literal actuals). `x08_value_scalars.f90` found it.
+  Rejection covers the Fortran-internal convention only — BIND(C)
+  c_char VALUE dummies already byte-copy correctly and stay accepted.
 - **Character COMMON members** lowered as a pointer slot instead of
   inline bytes; every read came back empty (afs_write_string got
   len 0). The x08 cross-TU COMMON differential found it; the same
