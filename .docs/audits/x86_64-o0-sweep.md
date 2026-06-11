@@ -11,7 +11,7 @@ pairing is enforced by `xfail_findings_cross_check` in
 | platform | pass | XFAIL | notes |
 |---|---|---|---|
 | x86_64-freebsd (dorado) | 513 | 18 | sweep runs in ~25s |
-| x86_64-linux-gnu (hasu) | see below | 18 | validated post-annotation |
+| x86_64-linux-gnu (hasu, NixOS) | 513 | 18 | full suite 120/120 green, ~52s |
 
 Fixed during the sweep rather than annotated (the >20-findings rule —
 each was a systemic root cause failing dozens of programs):
