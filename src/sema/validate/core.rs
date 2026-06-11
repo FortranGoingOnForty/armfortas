@@ -1449,6 +1449,21 @@ fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
                 }
             }
 
+            // Character VALUE dummies are not lowered with copy-in
+            // semantics yet: the callee receives the caller's storage
+            // pointer, so mutation corrupts the caller (or SEGVs on a
+            // literal actual). Found by x08's VALUE coverage; owned by
+            // l06 (C-interop strings). Reject loudly until then.
+            if attrs.iter().any(|a| matches!(a, Attribute::Value))
+                && matches!(type_spec, crate::ast::decl::TypeSpec::Character(_))
+            {
+                ctx.error(
+                    decl.span,
+                    "the VALUE attribute on CHARACTER dummies is not supported yet \
+                     (copy-in lowering lands with the C-interop string work)",
+                );
+            }
+
             // Deferred-length character must be allocatable or pointer.
             if let crate::ast::decl::TypeSpec::Character(Some(sel)) = type_spec {
                 if let Some(crate::ast::decl::LenSpec::Colon) = &sel.len {
@@ -1527,8 +1542,32 @@ fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
             ctx.require_std(decl.span, FortranStandard::F90, "USE statement");
         }
 
-        if matches!(decl.node, Decl::CommonBlock { .. }) {
+        if let Decl::CommonBlock { vars, .. } = &decl.node {
             warn_legacy_feature(ctx, decl.span, "COMMON block");
+            // Character members are not lowered with storage-
+            // association semantics: the member became a POINTER slot
+            // holding the string's address instead of inline bytes,
+            // and reads passed length 0 — silently empty on every
+            // target (found by x08's cross-TU COMMON test; owned by
+            // l06 alongside the string-representation work).
+            for var in vars {
+                let is_char = ctx.lookup(var).is_some_and(|sym| {
+                    matches!(
+                        sym.type_info,
+                        Some(crate::sema::symtab::TypeInfo::Character { .. })
+                    )
+                });
+                if is_char {
+                    ctx.error(
+                        decl.span,
+                        format!(
+                            "character member '{}' in a COMMON block is not supported \
+                             yet (storage association needs inline character bytes)",
+                            var
+                        ),
+                    );
+                }
+            }
         }
 
         if matches!(decl.node, Decl::EquivalenceStmt { .. }) {
