@@ -294,6 +294,7 @@ fn emit_inst(inst: &X86Inst, func: &X86Function) -> String {
         // Bare name for now; @PLT decoration is link-policy (x06).
         Call => format!("call {}", opq(0)),
         CallReg => format!("call *{}", opq(0)),
+        MovqGpToXmm | MovqXmmToGp => format!("movq {}, {}", opq(0), def()),
         // Epilogue folded into every return: restoring rsp from rbp
         // makes the epilogue frame-size-independent (no encoding paths
         // that vary with N — the anti-32KB-bug property).

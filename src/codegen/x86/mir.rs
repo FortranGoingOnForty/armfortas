@@ -259,6 +259,12 @@ pub enum X86Opcode {
     Lea,
     /// Indirect call through a register: `call *%reg`.
     CallReg,
+    /// `movq %r64, %xmm` — raw 8-byte bits GP→XMM (SSE2). Carries
+    /// complex(4) values (packed re/im) across the psABI's SSE-class
+    /// boundary without touching memory.
+    MovqGpToXmm,
+    /// `movq %xmm, %r64` — the reverse.
+    MovqXmmToGp,
 
     // ---- Integer arithmetic (destructive: tied to operand 0) ----
     Add,

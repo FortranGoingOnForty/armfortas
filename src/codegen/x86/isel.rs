@@ -142,6 +142,19 @@ pub fn select_function(
             X86AbiArgLoc::GpPair(lo, hi) => {
                 emit_store_pair_to_slot(&mut mf, MBlockId(0), *slots, *lo, *hi);
             }
+            X86AbiArgLoc::XmmPair(a, b) => {
+                // complex(8) param: xmm pair into the wide slots.
+                for (slot, xmm) in [(slots.0, *a), (slots.1, *b)] {
+                    push(
+                        &mut mf,
+                        MBlockId(0),
+                        X86Opcode::Movsd,
+                        OpSize::Q,
+                        vec![X86Operand::Reg(xmm)],
+                        Some(X86Operand::FrameSlot(slot)),
+                    );
+                }
+            }
             X86AbiArgLoc::Stack { offset, .. } => {
                 for (half, scratch) in [(0i64, X86Reg::Rax), (8, X86Reg::Rdx)] {
                     push(
@@ -1798,6 +1811,79 @@ fn select_call_inst(
     // later argument computation can clobber an argument register.
     let mut pending: Vec<X86Inst> = Vec::new();
     for (arg, loc, ty) in &arg_locs {
+        if matches!(ty, IrType::Array(..)) {
+            match (loc, is_wide_pair_ty(ty)) {
+                // complex(4): one xmm, packed (movq raw bits across).
+                (X86AbiArgLoc::Xmm(r), false) => {
+                    let v = ctx.lookup_vreg(*arg);
+                    pending.push(X86Inst {
+                        opcode: X86Opcode::MovqGpToXmm,
+                        size: OpSize::Q,
+                        operands: vec![X86Operand::VReg(v)],
+                        def: Some(X86Operand::Reg(*r)),
+                    });
+                }
+                // complex(8): two xmm regs from the slot pair.
+                (X86AbiArgLoc::XmmPair(a, b), true) => {
+                    let slots = ctx.lookup_wide_slot(*arg);
+                    for (slot, xmm) in [(slots.0, *a), (slots.1, *b)] {
+                        pending.push(X86Inst {
+                            opcode: X86Opcode::Movsd,
+                            size: OpSize::Q,
+                            operands: vec![X86Operand::FrameSlot(slot)],
+                            def: Some(X86Operand::Reg(xmm)),
+                        });
+                    }
+                }
+                (X86AbiArgLoc::Stack { offset, .. }, wide) => {
+                    if wide {
+                        let slots = ctx.lookup_wide_slot(*arg);
+                        emit_load_slot_pair(mf, mb, slots, X86Reg::Rax, X86Reg::Rdx);
+                        for (half, reg) in [(0i64, X86Reg::Rax), (8, X86Reg::Rdx)] {
+                            push(
+                                mf,
+                                mb,
+                                X86Opcode::MovMR,
+                                OpSize::Q,
+                                vec![
+                                    X86Operand::Reg(reg),
+                                    X86Operand::Mem {
+                                        base: Some(X86Reg::Rsp),
+                                        index: None,
+                                        scale: 1,
+                                        disp: offset + half,
+                                    },
+                                ],
+                                None,
+                            );
+                        }
+                    } else {
+                        let v = ctx.lookup_vreg(*arg);
+                        push(
+                            mf,
+                            mb,
+                            X86Opcode::MovMR,
+                            OpSize::Q,
+                            vec![
+                                X86Operand::VReg(v),
+                                X86Operand::Mem {
+                                    base: Some(X86Reg::Rsp),
+                                    index: None,
+                                    scale: 1,
+                                    disp: *offset,
+                                },
+                            ],
+                            None,
+                        );
+                    }
+                }
+                (other, wide) => panic!(
+                    "isel: unexpected ABI loc {:?} for complex arg (wide={})",
+                    other, wide
+                ),
+            }
+            continue;
+        }
         if matches!(ty, IrType::Int(IntWidth::I128)) {
             let slots = ctx.lookup_wide_slot(*arg);
             match loc {
@@ -1958,6 +2044,35 @@ fn select_call_inst(
             emit_store_pair_to_slot(mf, mb, dest, X86Reg::Rax, X86Reg::Rdx);
             return;
         }
+        if is_wide_pair_ty(&inst.ty) {
+            // complex(8) return: xmm0/xmm1 into the wide slot pair.
+            let dest = ctx.lookup_wide_slot(inst.id);
+            for (slot, xmm) in [(dest.0, X86Reg::Xmm0), (dest.1, X86Reg::Xmm1)] {
+                push(
+                    mf,
+                    mb,
+                    X86Opcode::Movsd,
+                    OpSize::Q,
+                    vec![X86Operand::Reg(xmm)],
+                    Some(X86Operand::FrameSlot(slot)),
+                );
+            }
+            return;
+        }
+        if matches!(&inst.ty, IrType::Array(elem, 2) if matches!(elem.as_ref(), IrType::Float(FloatWidth::F32)))
+        {
+            // complex(4) return: packed xmm0 → Gp64 raw bits.
+            let dest = ctx.lookup_vreg(inst.id);
+            push(
+                mf,
+                mb,
+                X86Opcode::MovqXmmToGp,
+                OpSize::Q,
+                vec![X86Operand::Reg(X86Reg::Xmm0)],
+                Some(X86Operand::VReg(dest)),
+            );
+            return;
+        }
         let dest = ctx.lookup_vreg(inst.id);
         match classify_return(&abi_ty_of(&inst.ty)) {
             X86RetLoc::Regs(regs) if regs.len() == 1 => {
@@ -2004,6 +2119,42 @@ fn select_terminator(
                 // and rdx (high).
                 let src = ctx.lookup_wide_slot(*val);
                 emit_load_slot_pair(mf, mb, src, X86Reg::Rax, X86Reg::Rdx);
+                push(mf, mb, X86Opcode::Ret, OpSize::Q, vec![], None);
+                return;
+            }
+            if is_wide_pair_ty(&ty) {
+                // complex(8): two SSE eightbytes → xmm0 (real), xmm1
+                // (imag) — abi.tex §3.2.3 via the classifier's
+                // ComplexF64 row.
+                let src = ctx.lookup_wide_slot(*val);
+                for (slot, xmm) in [(src.0, X86Reg::Xmm0), (src.1, X86Reg::Xmm1)] {
+                    push(
+                        mf,
+                        mb,
+                        X86Opcode::Movsd,
+                        OpSize::Q,
+                        vec![X86Operand::FrameSlot(slot)],
+                        Some(X86Operand::Reg(xmm)),
+                    );
+                }
+                push(mf, mb, X86Opcode::Ret, OpSize::Q, vec![], None);
+                return;
+            }
+            if matches!(&ty, IrType::Array(elem, 2) if matches!(elem.as_ref(), IrType::Float(FloatWidth::F32)))
+            {
+                // complex(4): ONE SSE eightbyte, returned PACKED in
+                // xmm0's low 64 bits (NOT xmm0/xmm1 — AAPCS64 habit;
+                // see AbiTy::ComplexF32 docs / abi.tex §3.2.3). The
+                // value rides a Gp64 vreg as raw bits; movq it across.
+                let src = ctx.lookup_vreg(*val);
+                push(
+                    mf,
+                    mb,
+                    X86Opcode::MovqGpToXmm,
+                    OpSize::Q,
+                    vec![X86Operand::VReg(src)],
+                    Some(X86Operand::Reg(X86Reg::Xmm0)),
+                );
                 push(mf, mb, X86Opcode::Ret, OpSize::Q, vec![], None);
                 return;
             }
@@ -2456,6 +2607,15 @@ fn abi_ty_of(ty: &IrType) -> AbiTy {
         IrType::Float(FloatWidth::F32) => AbiTy::Scalar(AbiField::F32),
         IrType::Float(FloatWidth::F64) => AbiTy::Scalar(AbiField::F64),
         IrType::Ptr(_) | IrType::FuncPtr(_) => AbiTy::Scalar(AbiField::Ptr),
+        // Fortran COMPLEX reaches the boundary as a by-value float
+        // pair; the classifier owns the eightbyte split (complex(4)
+        // is ONE SSE eightbyte, abi.tex §3.2.3 — see AbiTy docs).
+        IrType::Array(elem, 2) if matches!(elem.as_ref(), IrType::Float(FloatWidth::F32)) => {
+            AbiTy::ComplexF32
+        }
+        IrType::Array(elem, 2) if matches!(elem.as_ref(), IrType::Float(FloatWidth::F64)) => {
+            AbiTy::ComplexF64
+        }
         other => panic!("x05 scope: non-scalar ABI type {:?} deferred", other),
     }
 }
