@@ -20,7 +20,19 @@ impl<'a> Parser<'a> {
             if self.peek() == &TokenKind::Eof {
                 break;
             }
+            // Progress guard: a unit parse that consumes no tokens
+            // would loop here forever, allocating units until OOM
+            // (seen with a stray attribute statement after a bare-main
+            // CONTAINS function). Any zero-progress Ok is a parser
+            // bug surfaced as a clean error, never a spin.
+            let before = self.pos;
             units.push(self.parse_program_unit()?);
+            if self.pos == before {
+                return Err(self.error(format!(
+                    "parser made no progress at '{}' (internal error — please report)",
+                    self.peek_text()
+                )));
+            }
         }
         Ok(units)
     }
@@ -192,6 +204,19 @@ impl<'a> Parser<'a> {
         // No PROGRAM keyword — implicit main program.
         let (uses, imports, implicit, decls, body, ifaces) = self.parse_unit_body(&["program"])?;
 
+        // A bare main may carry internal procedures (F2018 R1401: the
+        // program-stmt is optional, the rest of main-program is not
+        // restricted). Without this, `contains` was left unconsumed
+        // and parse_file spun on it (OOM via the unit Vec before the
+        // progress guard existed).
+        self.skip_newlines();
+        let mut contains = if self.peek_text().eq_ignore_ascii_case("contains") {
+            self.parse_contains_section()?
+        } else {
+            Vec::new()
+        };
+        contains.extend(ifaces);
+
         // Consume the END [PROGRAM] if present — parse_unit_body breaks
         // *before* consuming the terminator, so we must advance past it
         // or parse_file will re-enter parse_program_unit at the same
@@ -210,7 +235,7 @@ impl<'a> Parser<'a> {
                 implicit,
                 decls,
                 body,
-                contains: ifaces,
+                contains,
             },
             span,
         ))
