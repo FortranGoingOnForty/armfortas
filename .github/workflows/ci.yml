@@ -274,7 +274,11 @@ jobs:
         with:
           release: "15.0"
           usesh: true
-          prepare: pkg install -y rust
+          # binutils explicitly: FreeBSD base has no `as` (LLVM base
+          # tools), and the rust package's dependency set has drifted
+          # on whether it pulls one in. The driver shells out to `as`
+          # for ELF assembly (until afs-as x86 lands in x14).
+          prepare: pkg install -y rust binutils
           run: |
             cargo build --workspace
             cargo test -p armfortas --lib
