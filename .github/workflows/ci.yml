@@ -233,6 +233,9 @@ jobs:
       - run: ci/check_skips.sh /tmp/tests.log posix-elf
       # x09: SSE-only FP — fail on any x87 mnemonic at -O2/-Ofast.
       - run: ci/check_x87.sh
+      # x10: SSE2 ceiling — fail on any SSE3+/SSE4/AVX mnemonic at
+      # -O3/-Ofast (the vectorizer's baseline contract).
+      - run: ci/check_isa_ceiling.sh
       # x10: per-target benchmark gate (size-only in CI; see script).
       - run: cargo build --release -p armfortas -p armfortas-rt
       - run: BENCH_SKIP_TIME=1 ./scripts/benchmark_gate.sh
