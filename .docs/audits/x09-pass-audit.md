@@ -115,3 +115,17 @@ a compile error. Deliverable 3 is satisfied by construction; what
 remains is adding the x86 counterpart passes (peephole — deliverable
 4) and a real x86 register allocator (the matrix work), since the x86
 path currently runs `regalloc_naive` at every level.
+
+## MIN/MAX NaN policy (x10 addendum)
+
+Scalar and vector MIN/MAX agree per target but differ across targets,
+both conforming (Fortran leaves MAX/MIN with NaN processor-dependent):
+
+- arm64: fmax/fmin (scalar and .4s/.2d vector) — NaN PROPAGATES.
+- x86_64: select-of-compare scalar, min/max[ps|pd] vector with the
+  isel operand order matching it — NaN lane takes the SECOND operand.
+
+`test_programs/x10_minmax_nan_lanes.f90` pins the per-target
+O0≡O3 invariant and the policy-independent lanes; it deliberately
+does not pin the NaN lane's value. x12's gfortran differentials must
+compare NaN-bearing MIN/MAX outputs per this note, not byte-wise.
