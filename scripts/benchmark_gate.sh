@@ -24,7 +24,9 @@
 # binary size is, so size gates everywhere.
 
 set -euo pipefail
-cd "$(git rev-parse --show-toplevel)"
+# Repo root via git when available; the FreeBSD CI VM has no git (the
+# tree arrives by rsync) and already runs from the root.
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 
 COMPILER="./target/release/armfortas"
 PROGRAMS=(
