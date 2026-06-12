@@ -1291,6 +1291,10 @@ fn tool_output(tool: &str, args: &[&str]) -> Result<String, String> {
 fn normalize_tool_output(text: &str) -> String {
     text.lines()
         .filter(|line| !line.trim_end().ends_with(".o:"))
+        // objdump's ELF header line carries the temp path
+        // ("/tmp/.../output.o:\tfile format elf64-x86-64"); otool's
+        // path line is bare and caught by the ".o:" filter above.
+        .filter(|line| !(line.contains(".o:") && line.contains("file format")))
         .map(str::trim_end)
         .collect::<Vec<_>>()
         .join("\n")

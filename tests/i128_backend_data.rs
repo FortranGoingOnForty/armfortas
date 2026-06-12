@@ -30,11 +30,20 @@ fn globals_only_i128_backend_emits_expected_words_in_asm() {
         Stage::Asm,
     );
 
-    assert!(
-        asm.contains(".section __DATA,__data"),
-        "asm should emit a data section for i128 globals:\n{}",
-        asm
-    );
+    if cfg!(target_arch = "x86_64") {
+        // ELF spells the data section as a bare .data directive.
+        assert!(
+            asm.contains("\n.data"),
+            "asm should emit a data section for i128 globals:\n{}",
+            asm
+        );
+    } else {
+        assert!(
+            asm.contains(".section __DATA,__data"),
+            "asm should emit a data section for i128 globals:\n{}",
+            asm
+        );
+    }
     assert!(
         asm.matches(".p2align 4").count() >= 2,
         "scalar and array i128 globals should request 16-byte alignment:\n{}",

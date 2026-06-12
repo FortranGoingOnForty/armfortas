@@ -29,6 +29,13 @@ fn capture_run(request: CaptureRequest) -> RunCapture {
 }
 
 fn main_section<'a>(asm: &'a str) -> &'a str {
+    // ELF entry symbol is bare "main"; Mach-O keeps "_main".
+    if cfg!(target_arch = "x86_64") {
+        let start = asm
+            .find("\nmain:\n")
+            .unwrap_or_else(|| panic!("missing main section:\n{}", asm));
+        return &asm[start..];
+    }
     let start = asm
         .find("\n_main:\n")
         .unwrap_or_else(|| panic!("missing _main section:\n{}", asm));
@@ -47,6 +54,19 @@ fn capture_main_wrapper_calls_program_body_not_first_helper() {
     );
 
     let main = main_section(&asm);
+    if cfg!(target_arch = "x86_64") {
+        assert!(
+            main.contains("callq __prog_program_entry_helper"),
+            "main should call the lowered program body:\n{}",
+            main
+        );
+        assert!(
+            !main.contains("call set_value"),
+            "main should not jump directly to the first helper procedure:\n{}",
+            main
+        );
+        return;
+    }
     assert!(
         main.contains("bl ___prog_program_entry_helper"),
         "_main should call the lowered program body:\n{}",

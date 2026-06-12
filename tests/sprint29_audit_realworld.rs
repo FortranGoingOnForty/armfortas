@@ -254,14 +254,18 @@ fn linked_realworld_binaries_are_deterministic_modulo_uuid() {
             ));
 
             compile_binary(&compiler, &source, opt, &bin_path);
-            let load_commands = tool_output("otool", &["-l", bin_path.to_str().unwrap()]);
-            assert!(
-                load_commands.contains("LC_UUID"),
-                "linked binary at {} should carry LC_UUID for {}:\n{}",
-                opt,
-                name,
-                load_commands
-            );
+            if cfg!(target_os = "macos") {
+                // LC_UUID is a Mach-O load command; ELF binaries are
+                // compared raw (normalize_lc_uuid no-ops on ELF magic).
+                let load_commands = tool_output("otool", &["-l", bin_path.to_str().unwrap()]);
+                assert!(
+                    load_commands.contains("LC_UUID"),
+                    "linked binary at {} should carry LC_UUID for {}:\n{}",
+                    opt,
+                    name,
+                    load_commands
+                );
+            }
             let first =
                 normalize_lc_uuid(fs::read(&bin_path).expect("cannot read first binary image"));
 

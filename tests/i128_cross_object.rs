@@ -148,7 +148,41 @@ fn sdk_root() -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
+fn find_compiler() -> PathBuf {
+    if let Some(p) = std::env::var_os("CARGO_BIN_EXE_armfortas") {
+        return PathBuf::from(p);
+    }
+    for c in &["target/release/armfortas", "target/debug/armfortas"] {
+        let p = PathBuf::from(c);
+        if p.exists() {
+            return fs::canonicalize(&p).unwrap();
+        }
+    }
+    panic!("armfortas binary not found");
+}
+
 fn link_objects(objects: &[&Path], output: &Path) {
+    if !cfg!(target_os = "macos") {
+        // ELF hosts: the driver owns the link line (crt discovery,
+        // libc, runtime); the inline ld invocation below is Mach-O-only.
+        let rt_path = find_runtime_lib();
+        let mut cmd = Command::new(find_compiler());
+        for o in objects {
+            cmd.arg(o);
+        }
+        let result = cmd
+            .arg(&rt_path)
+            .arg("-o")
+            .arg(output)
+            .output()
+            .expect("compiler launch failed for link");
+        assert!(
+            result.status.success(),
+            "driver link failed:\n{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        return;
+    }
     let rt_path = find_runtime_lib();
     let sysroot = sdk_root();
     let mut args: Vec<String> = objects
@@ -318,12 +352,16 @@ fn deterministic_cross_object_case_named(
     compile_c_object(&helper, &helper_obj);
 
     link_objects(&[&fortran_obj, &helper_obj], &binary);
-    let load_commands = tool_output("otool", &["-l", binary.to_str().unwrap()]);
-    assert!(
-        load_commands.contains("LC_UUID"),
-        "linked cross-object integer(16) binary should carry LC_UUID:\n{}",
-        load_commands
-    );
+    if cfg!(target_os = "macos") {
+        // LC_UUID is a Mach-O load command; ELF binaries are compared raw
+        // (normalize_lc_uuid is a no-op on non-Mach-O magic).
+        let load_commands = tool_output("otool", &["-l", binary.to_str().unwrap()]);
+        assert!(
+            load_commands.contains("LC_UUID"),
+            "linked cross-object integer(16) binary should carry LC_UUID:\n{}",
+            load_commands
+        );
+    }
     let first = normalize_lc_uuid(fs::read(&binary).expect("cannot read first linked binary"));
 
     link_objects(&[&fortran_obj, &helper_obj], &binary);

@@ -64,7 +64,13 @@ fn optir_respects_requested_optimization_level() {
 #[test]
 fn backend_capture_stages_use_optimized_ir() {
     let source = fixture("inline_pure.f90");
-    let outlined_helper = "_afs_internal___prog_inline_pure_1";
+    // ELF symbols are bare and x86 spells the branch "call"; Mach-O
+    // keeps the underscore prefix and "bl".
+    let (call_mnemonic, outlined_helper) = if cfg!(target_arch = "x86_64") {
+        ("call", "afs_internal___prog_inline_pure_1")
+    } else {
+        ("bl", "_afs_internal___prog_inline_pure_1")
+    };
 
     let asm_o0 = capture_text(
         CaptureRequest {
@@ -84,7 +90,7 @@ fn backend_capture_stages_use_optimized_ir() {
     );
 
     assert!(
-        asm_o0.contains(&format!("bl {}", outlined_helper)),
+        asm_o0.contains(&format!("{} {}", call_mnemonic, outlined_helper)),
         "O0 assembly should still contain the out-of-line helper call"
     );
     assert!(
@@ -92,7 +98,7 @@ fn backend_capture_stages_use_optimized_ir() {
         "O0 assembly should still emit the contained helper function"
     );
     assert!(
-        !asm_o2.contains(&format!("bl {}", outlined_helper)),
+        !asm_o2.contains(&format!("{} {}", call_mnemonic, outlined_helper)),
         "O2 assembly capture should reflect inlining and remove helper calls"
     );
     assert!(

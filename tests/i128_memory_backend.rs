@@ -30,6 +30,31 @@ fn simple_local_i128_roundtrip_emits_wide_pair_moves_at_o0() {
         Stage::Asm,
     );
 
+    if cfg!(target_arch = "x86_64") {
+        // x86 i128 convention (x08): limbs in rax:rdx, paired movq
+        // for stores/loads at offsets 0 and 8.
+        assert!(
+            asm.contains("movq $42, %rax"),
+            "backend should materialize the low 64-bit half of the i128 constant:\n{}",
+            asm
+        );
+        assert!(
+            asm.contains("movq $0, %rdx"),
+            "backend should zero the high 64-bit half of the i128 constant:\n{}",
+            asm
+        );
+        assert!(
+            asm.contains("movq %rax, (%rcx)") && asm.contains("movq %rdx, 8(%rcx)"),
+            "backend should store i128 values as paired 64-bit writes:\n{}",
+            asm
+        );
+        assert!(
+            asm.contains("movq (%rcx), %rax") && asm.contains("movq 8(%rcx), %rdx"),
+            "backend should reload i128 values as paired 64-bit reads:\n{}",
+            asm
+        );
+        return;
+    }
     assert!(
         asm.contains("movz x16, #42"),
         "backend should materialize the low 64-bit half of the i128 constant:\n{}",
@@ -63,6 +88,20 @@ fn simple_local_i128_add_emits_carry_chain_ops_at_o0() {
         Stage::Asm,
     );
 
+    if cfg!(target_arch = "x86_64") {
+        // x86 carry chain: addq low + adcq high.
+        assert!(
+            asm.contains("addq") && asm.contains(", %rax"),
+            "backend should use ADDQ for the low i128 word:\n{}",
+            asm
+        );
+        assert!(
+            asm.contains("adcq") && asm.contains(", %rdx"),
+            "backend should use ADCQ for the high i128 word:\n{}",
+            asm
+        );
+        return;
+    }
     assert!(
         asm.contains("adds x16, x16, x8"),
         "backend should use ADDS for the low i128 word:\n{}",
@@ -86,6 +125,26 @@ fn simple_local_i128_subneg_emits_borrow_chain_ops_at_o0() {
         Stage::Asm,
     );
 
+    if cfg!(target_arch = "x86_64") {
+        // x86 borrow chain: subq low + sbbq high; negation is
+        // negq/negq/sbbq $0.
+        assert!(
+            asm.contains("subq"),
+            "backend should use SUBQ for the low i128 subtraction word:\n{}",
+            asm
+        );
+        assert!(
+            asm.contains("sbbq"),
+            "backend should use SBBQ for the high i128 subtraction word:\n{}",
+            asm
+        );
+        assert!(
+            asm.contains("negq %rax") && asm.contains("sbbq $0, %rdx"),
+            "backend should use NEGQ/SBBQ for i128 negation:\n{}",
+            asm
+        );
+        return;
+    }
     assert!(
         asm.contains("subs x16, x16, x8"),
         "backend should use SUBS for the low i128 subtraction word:\n{}",
@@ -114,6 +173,35 @@ fn simple_local_i128_eqne_emits_pair_compare_ops_at_o0() {
         Stage::Asm,
     );
 
+    if cfg!(target_arch = "x86_64") {
+        // x86 i128 eq/ne: xor both limbs, OR them, then sete/setne.
+        assert!(
+            asm.contains("xorq") && asm.contains(", %rax"),
+            "backend should compare the low i128 limb:\n{}",
+            asm
+        );
+        assert!(
+            asm.contains(", %rdx"),
+            "backend should compare the high i128 limb:\n{}",
+            asm
+        );
+        assert!(
+            asm.contains("orq %rdx, %rax"),
+            "backend should combine the xored limbs with OR:\n{}",
+            asm
+        );
+        assert!(
+            asm.contains("sete"),
+            "backend should materialize the equality flag:\n{}",
+            asm
+        );
+        assert!(
+            asm.contains("setne"),
+            "backend should materialize the inequality flag:\n{}",
+            asm
+        );
+        return;
+    }
     assert!(
         asm.contains("cmp x16, x8"),
         "backend should compare the low i128 limb:\n{}",
@@ -157,6 +245,27 @@ fn simple_local_i128_ordered_compares_emit_signed_and_unsigned_limb_checks_at_o0
         Stage::Asm,
     );
 
+    if cfg!(target_arch = "x86_64") {
+        // x86 ordered i128 compares: full sub/sbb borrow chain, then
+        // setl (lt; gt via operand swap) and setge (ge; le via swap).
+        // No per-limb unsigned conditions exist in this scheme.
+        assert!(
+            asm.contains("subq") && asm.contains("sbbq"),
+            "backend should compare i128 values through a sub/sbb borrow chain:\n{}",
+            asm
+        );
+        assert!(
+            asm.contains("setl"),
+            "backend should use SETL for strict ordered i128 compares:\n{}",
+            asm
+        );
+        assert!(
+            asm.contains("setge"),
+            "backend should use SETGE for inclusive ordered i128 compares:\n{}",
+            asm
+        );
+        return;
+    }
     assert!(
         asm.contains("cset w10, lt"),
         "backend should use signed high-limb compare for i128 lt/le:\n{}",
@@ -279,6 +388,21 @@ fn simple_local_i128_select_lowers_to_ir_select_and_pair_csel_at_o0() {
         },
         Stage::Asm,
     );
+    if cfg!(target_arch = "x86_64") {
+        // x86 lowers the wide select to a test + branch diamond over
+        // paired limb moves; there is no pair-cmov contract.
+        assert!(
+            asm.contains("testl"),
+            "wide integer(16) select should test the IR select condition:\n{}",
+            asm
+        );
+        assert!(
+            asm.contains("je .L"),
+            "wide integer(16) select should branch over the paired limb moves:\n{}",
+            asm
+        );
+        return;
+    }
     assert_eq!(
         asm.matches("csel x").count(),
         2,
@@ -364,6 +488,26 @@ fn simple_internal_i128_call_uses_pair_arg_and_return_regs_at_o0() {
         Stage::Asm,
     );
 
+    if cfg!(target_arch = "x86_64") {
+        // x86: bare symbol call, i128 arg pair in rdi:rsi, result pair
+        // in rax:rdx.
+        assert!(
+            asm.contains("call afs_internal_"),
+            "internal integer(16) call should branch to the internalized contained helper:\n{}",
+            asm
+        );
+        assert!(
+            asm.contains(", %rdi") && asm.contains(", %rsi"),
+            "internal integer(16) ABI should pass the i128 arg in the rdi:rsi pair:\n{}",
+            asm
+        );
+        assert!(
+            asm.contains("movq %rax, ") && asm.contains("movq %rdx, "),
+            "internal integer(16) ABI should spill the rax:rdx result pair:\n{}",
+            asm
+        );
+        return;
+    }
     assert!(
         asm.contains("bl _afs_internal_"),
         "internal integer(16) call should branch to the internalized contained helper:\n{}",
