@@ -35,6 +35,9 @@ pub fn emit_module(
         crate::target::Arch::Arm64 => Ok(arm64::emit_module(ir_module, opts)),
         crate::target::Arch::X86_64 => {
             let mut funcs = x86::isel::select_module(ir_module);
+            if opts.verbose {
+                eprintln!(" codegen: {} machine functions", funcs.len());
+            }
             let mut text = String::new();
             for f in &mut funcs {
                 // Backend peephole (O2+): same gate as the ARM64 one.
