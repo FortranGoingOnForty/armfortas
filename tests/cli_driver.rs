@@ -37647,6 +37647,50 @@ fn polymorphic_component_array_indexing_is_not_misread_as_tbp_dispatch() {
 }
 
 #[test]
+fn class_dummy_component_array_indexing_uses_declared_base_layout() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=class_dummy_component_array_indexing_uses_declared_base_layout count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module repro\n  implicit none\n  type :: holder_t\n    character, allocatable :: chunk(:)\n    integer :: idx = 1\n  end type holder_t\ncontains\n  subroutine read_one(obj, c)\n    class(holder_t), intent(inout) :: obj\n    character, intent(out) :: c\n    allocate(obj%chunk(2))\n    obj%chunk(1) = 'a'\n    obj%chunk(2) = 'b'\n    c = obj%chunk(obj%idx)\n  end subroutine read_one\nend module repro\nprogram p\n  use repro\n  implicit none\n  type(holder_t) :: obj\n  character :: c\n  call read_one(obj, c)\n  if (c /= 'a') error stop 1\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("class_dummy_component_array_indexing", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("class dummy component array indexing compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "class dummy component array indexing compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("class dummy component array indexing run failed");
+    assert!(
+        run.status.success(),
+        "class dummy component array indexing run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected class dummy component array indexing output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn renamed_imported_abstract_tbp_dispatch_uses_canonical_type_layout() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

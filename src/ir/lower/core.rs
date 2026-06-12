@@ -21361,96 +21361,6 @@ pub(super) fn lower_string_expr_full(
             }
             if let Expr::ComponentAccess { .. } = &callee.node {
                 if let Some(tl) = type_layouts {
-                    if let Expr::ComponentAccess { base, component } = &callee.node {
-                        if let Some((_obj_addr, type_name)) =
-                            resolve_component_base_for_method(b, locals, base, st, tl)
-                        {
-                            if let Some(layout) = tl.get(&type_name) {
-                                let bp = resolved_bound_proc_for_call(
-                                    b,
-                                    locals,
-                                    st,
-                                    layout,
-                                    component,
-                                    args,
-                                    type_layouts,
-                                    internal_funcs,
-                                    contained_host_refs,
-                                    descriptor_params,
-                                )
-                                .or_else(|| layout.bound_proc(component));
-                                if let Some(bp) = bp {
-                                    let target_key = abi_key_for_link_name(st, &bp.target_name)
-                                        .unwrap_or_else(|| bp.abi_name.clone());
-                                    if let Some(ret_abi) =
-                                        callee_character_return_abi(st, &target_key)
-                                    {
-                                        match ret_abi {
-                                            CharacterReturnAbi::HiddenDescriptor => {
-                                                let desc = b.alloca(IrType::Array(
-                                                    Box::new(IrType::Int(IntWidth::I8)),
-                                                    32,
-                                                ));
-                                                let zero_i32 = b.const_i32(0);
-                                                let size32 = b.const_i64(32);
-                                                b.call(
-                                                    FuncRef::External("memset".into()),
-                                                    vec![desc, zero_i32, size32],
-                                                    IrType::Ptr(Box::new(IrType::Int(
-                                                        IntWidth::I8,
-                                                    ))),
-                                                );
-                                                emit_bound_function_call(
-                                                    b,
-                                                    locals,
-                                                    st,
-                                                    type_layouts,
-                                                    internal_funcs,
-                                                    contained_host_refs,
-                                                    descriptor_params,
-                                                    callee.span,
-                                                    base,
-                                                    component,
-                                                    args,
-                                                    Some(desc),
-                                                    IrType::Void,
-                                                );
-                                                return load_string_descriptor_view(b, desc);
-                                            }
-                                            CharacterReturnAbi::BindCScalarByte => {
-                                                if let Some(byte) = emit_bound_function_call(
-                                                    b,
-                                                    locals,
-                                                    st,
-                                                    type_layouts,
-                                                    internal_funcs,
-                                                    contained_host_refs,
-                                                    descriptor_params,
-                                                    callee.span,
-                                                    base,
-                                                    component,
-                                                    args,
-                                                    None,
-                                                    IrType::Int(IntWidth::I8),
-                                                ) {
-                                                    let slot = b.alloca(IrType::Int(IntWidth::I8));
-                                                    b.store(byte, slot);
-                                                    return (slot, b.const_i64(1));
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        reject_unsupported_polymorphic_component_method_base(
-                            callee.span,
-                            base,
-                            locals,
-                            st,
-                            tl,
-                        );
-                    }
                     if args.len() == 1 {
                         if let crate::ast::expr::SectionSubscript::Element(_) = &args[0].value {
                             if let Some(result) = fixed_component_char_array_elem_ptr_and_len(
@@ -21553,6 +21463,96 @@ pub(super) fn lower_string_expr_full(
                                 }
                             }
                         }
+                    }
+                    if let Expr::ComponentAccess { base, component } = &callee.node {
+                        if let Some((_obj_addr, type_name)) =
+                            resolve_component_base_for_method(b, locals, base, st, tl)
+                        {
+                            if let Some(layout) = tl.get(&type_name) {
+                                let bp = resolved_bound_proc_for_call(
+                                    b,
+                                    locals,
+                                    st,
+                                    layout,
+                                    component,
+                                    args,
+                                    type_layouts,
+                                    internal_funcs,
+                                    contained_host_refs,
+                                    descriptor_params,
+                                )
+                                .or_else(|| layout.bound_proc(component));
+                                if let Some(bp) = bp {
+                                    let target_key = abi_key_for_link_name(st, &bp.target_name)
+                                        .unwrap_or_else(|| bp.abi_name.clone());
+                                    if let Some(ret_abi) =
+                                        callee_character_return_abi(st, &target_key)
+                                    {
+                                        match ret_abi {
+                                            CharacterReturnAbi::HiddenDescriptor => {
+                                                let desc = b.alloca(IrType::Array(
+                                                    Box::new(IrType::Int(IntWidth::I8)),
+                                                    32,
+                                                ));
+                                                let zero_i32 = b.const_i32(0);
+                                                let size32 = b.const_i64(32);
+                                                b.call(
+                                                    FuncRef::External("memset".into()),
+                                                    vec![desc, zero_i32, size32],
+                                                    IrType::Ptr(Box::new(IrType::Int(
+                                                        IntWidth::I8,
+                                                    ))),
+                                                );
+                                                emit_bound_function_call(
+                                                    b,
+                                                    locals,
+                                                    st,
+                                                    type_layouts,
+                                                    internal_funcs,
+                                                    contained_host_refs,
+                                                    descriptor_params,
+                                                    callee.span,
+                                                    base,
+                                                    component,
+                                                    args,
+                                                    Some(desc),
+                                                    IrType::Void,
+                                                );
+                                                return load_string_descriptor_view(b, desc);
+                                            }
+                                            CharacterReturnAbi::BindCScalarByte => {
+                                                if let Some(byte) = emit_bound_function_call(
+                                                    b,
+                                                    locals,
+                                                    st,
+                                                    type_layouts,
+                                                    internal_funcs,
+                                                    contained_host_refs,
+                                                    descriptor_params,
+                                                    callee.span,
+                                                    base,
+                                                    component,
+                                                    args,
+                                                    None,
+                                                    IrType::Int(IntWidth::I8),
+                                                ) {
+                                                    let slot = b.alloca(IrType::Int(IntWidth::I8));
+                                                    b.store(byte, slot);
+                                                    return (slot, b.const_i64(1));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        reject_unsupported_polymorphic_component_method_base(
+                            callee.span,
+                            base,
+                            locals,
+                            st,
+                            tl,
+                        );
                     }
                 }
             }
@@ -42204,7 +42204,19 @@ pub(super) fn resolve_component_base(
         Expr::Name { name } => {
             let key = name.to_lowercase();
             let info = locals.get(&key)?;
-            let type_name = info.derived_type.as_ref()?.clone();
+            let type_name = info.derived_type.clone().or_else(|| {
+                let type_info = operator_expr_type_info(base, Some(locals), st, Some(tl))?;
+                let raw_name = match type_info {
+                    crate::sema::symtab::TypeInfo::Derived(name)
+                    | crate::sema::symtab::TypeInfo::Class(name) => name,
+                    _ => return None,
+                };
+                let scope_id = callee_scope_id_for_lookup(st, b.func().name.as_str());
+                Some(
+                    canonical_layout_type_name_for_scope(st, scope_id, &raw_name, tl)
+                        .unwrap_or(raw_name),
+                )
+            })?;
             // For a derived-type POINTER, info.addr is a pointer slot
             // whose contents are the associated struct's address.
             // Pointer dummies passed by reference add one more layer:
