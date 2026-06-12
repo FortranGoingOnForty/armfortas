@@ -1152,12 +1152,21 @@ fn select_inst(
                         // 32→64 zero extension is `movl` (implicit
                         // upper-half zeroing, the printer's documented
                         // rule); same-width/wider sources degrade to a
-                        // plain move like ARM isel does.
+                        // plain move like ARM isel does. A 64→64
+                        // "extend" must move the full quad: a movl here
+                        // writes only 4 bytes of the def's 8-byte spill
+                        // slot and the reload picks up stale upper bytes
+                        // (x09: popcnt(int64) counted garbage bits).
+                        let mov_size = if src_bits == 64 && dst_bits == 64 {
+                            OpSize::Q
+                        } else {
+                            OpSize::L
+                        };
                         push(
                             mf,
                             mb,
                             X86Opcode::MovRR,
-                            OpSize::L,
+                            mov_size,
                             vec![X86Operand::VReg(src)],
                             Some(X86Operand::VReg(dest)),
                         );
