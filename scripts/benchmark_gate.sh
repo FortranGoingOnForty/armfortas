@@ -5,8 +5,10 @@
 #   - Compile time (wall clock)
 #   - Binary size
 #
-# Compares against a baseline file (.benchmarks/baseline.txt).
-# If no baseline exists, creates one.
+# Compares against a per-target baseline file
+# (.benchmarks/baseline-<triple>.txt, triple from `armfortas
+# --print-target`). If no baseline exists, creates one. Thresholds
+# are shared across targets; the baselines are not (x10).
 #
 # Usage:
 #   ./scripts/benchmark_gate.sh           # compare against baseline
@@ -15,12 +17,16 @@
 # Thresholds:
 #   Compile time: fail if >30% slower than baseline
 #   Binary size:  fail if >15% larger than baseline
+#
+# BENCH_SKIP_TIME=1 skips the compile-time comparison (still recorded).
+# CI sets it: committed time baselines come from the fleet machines
+# (dorado/hasu/nomad) and wall-clock is not comparable across hosts;
+# binary size is, so size gates everywhere.
 
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
 COMPILER="./target/release/armfortas"
-BASELINE=".benchmarks/baseline.txt"
 PROGRAMS=(
     test_programs/array_bulk_kernels.f90
     test_programs/module_init.f90
@@ -34,6 +40,10 @@ if [ ! -x "$COMPILER" ]; then
     echo "Build the compiler first: cargo build --release"
     exit 1
 fi
+
+TRIPLE=$("$COMPILER" --print-target)
+BASELINE=".benchmarks/baseline-${TRIPLE}.txt"
+echo "Target: $TRIPLE (baseline: $BASELINE)"
 
 mkdir -p .benchmarks
 TMPDIR=$(mktemp -d)
@@ -123,7 +133,8 @@ else:
 ")
 
     status="OK"
-    if python3 -c "exit(0 if $time / max($base_time, 0.001) > 1.30 else 1)" 2>/dev/null; then
+    if [ "${BENCH_SKIP_TIME:-0}" != "1" ] \
+        && python3 -c "exit(0 if $time / max($base_time, 0.001) > 1.30 else 1)" 2>/dev/null; then
         status="SLOW"
         FAIL=1
     fi

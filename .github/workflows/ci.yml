@@ -55,6 +55,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --workspace --release
       - run: cargo test --release --test run_programs -- --nocapture
+      # x10: per-target benchmark gate. Size-only in CI (time baselines
+      # come from the fleet machines and don't compare across hosts).
+      - run: BENCH_SKIP_TIME=1 ./scripts/benchmark_gate.sh
 
   # All integration suites in tests/*.rs: audit reproducers, multi-file
   # compilation, cross-TU ABI matrix, module host association, optimizer
@@ -230,6 +233,9 @@ jobs:
       - run: ci/check_skips.sh /tmp/tests.log posix-elf
       # x09: SSE-only FP — fail on any x87 mnemonic at -O2/-Ofast.
       - run: ci/check_x87.sh
+      # x10: per-target benchmark gate (size-only in CI; see script).
+      - run: cargo build --release -p armfortas -p armfortas-rt
+      - run: BENCH_SKIP_TIME=1 ./scripts/benchmark_gate.sh
       # x09: surface the full opt-matrix counts in the job summary.
       - run: grep -E '\[-O[A-Za-z0-9]+\] .* passed' /tmp/tests.log >> "$GITHUB_STEP_SUMMARY" || true
 
@@ -271,3 +277,6 @@ jobs:
             cargo test -p armfortas --lib
             cargo test --test run_programs test_programs_end_to_end -- --nocapture 2>&1 | tee /tmp/sweep.log
             grep -E '\[-O0\] .* passed' /tmp/sweep.log
+            # x10: per-target benchmark gate (size-only in CI).
+            cargo build --release -p armfortas -p armfortas-rt
+            BENCH_SKIP_TIME=1 ./scripts/benchmark_gate.sh

@@ -70,6 +70,10 @@ pub fn cli_entry() -> ! {
             println!("{}", driver::dump_version_string());
             process::exit(0);
         }
+        driver::ParsedCli::Info(driver::InfoAction::PrintTarget) => {
+            println!("{}", target::TargetSpec::host());
+            process::exit(0);
+        }
         driver::ParsedCli::Compile(opts) => {
             if emit_cli_warnings(&program_name, &opts) {
                 process::exit(EXIT_COMPILE);
