@@ -1955,6 +1955,34 @@ pub(crate) fn lower_expr_full(
                     )
                     .is_none();
 
+                // F2023 R771: enumeration constructor `name(i)` —
+                // the value IS the (1-based) ordinal, lowered as a
+                // plain i32. Constant ordinals were range-checked in
+                // validation.
+                if let Some(sym) = st.find_symbol_any_scope(&key) {
+                    if matches!(sym.kind, crate::sema::symtab::SymbolKind::EnumerationType)
+                        && args.len() == 1
+                    {
+                        if let crate::ast::expr::SectionSubscript::Element(e) = &args[0].value {
+                            let v = lower_expr_full(
+                                b,
+                                locals,
+                                e,
+                                st,
+                                type_layouts,
+                                internal_funcs,
+                                contained_host_refs,
+                                descriptor_params,
+                            );
+                            return crate::ir::lower::core::coerce_int_like_to_width(
+                                b,
+                                v,
+                                IntWidth::I32,
+                            );
+                        }
+                    }
+                }
+
                 if !has_named_interface || fallback_to_structure_ctor {
                     if let Some(tmp) = lower_structure_constructor_expr(
                         b,

@@ -1297,6 +1297,9 @@ pub(super) fn type_info_to_type_spec(
     };
 
     match type_info {
+        // Enumeration values are integer ordinals; their TypeSpec
+        // round-trips through TYPE(name) (the standard's spelling).
+        Some(TypeInfo::Enumeration(name)) => TypeSpec::Type(name.clone()),
         Some(TypeInfo::Integer { kind }) => TypeSpec::Integer(make_kind(*kind)),
         Some(TypeInfo::Real { kind }) => TypeSpec::Real(make_kind(*kind)),
         Some(TypeInfo::DoublePrecision) => TypeSpec::DoublePrecision,
@@ -3197,6 +3200,10 @@ pub(super) fn collect_name_refs_decls(
             | TypeSpec::Class(_)
             | TypeSpec::ClassStar
             | TypeSpec::TypeStar => {}
+            // TYPEOF/CLASSOF reference an already-declared entity;
+            // collecting the name here would synthesize a bogus
+            // implicit local.
+            TypeSpec::TypeOf(_) | TypeSpec::ClassOf(_) => {}
         }
     }
 
@@ -3255,7 +3262,8 @@ pub(super) fn collect_name_refs_decls(
             | Decl::ImplicitStmt { .. }
             | Decl::UseStmt { .. }
             | Decl::CommonBlock { .. }
-            | Decl::EnumDef { .. } => {}
+            | Decl::EnumDef { .. }
+            | Decl::EnumerationTypeDef { .. } => {}
         }
     }
 }
@@ -12450,6 +12458,11 @@ pub(super) fn defined_assignment_arg_semantic_match(
         declared.unwrap_or(default) == actual.unwrap_or(default)
     }
     match declared {
+        TypeInfo::Enumeration(decl_name) => matches!(
+            actual,
+            Some(TypeInfo::Enumeration(actual_name))
+                if actual_name.eq_ignore_ascii_case(decl_name)
+        ),
         TypeInfo::Derived(decl_name) => matches!(
             actual,
             Some(TypeInfo::Derived(actual_name))
@@ -12498,6 +12511,11 @@ pub(super) fn operator_arg_semantic_match(
     use crate::sema::symtab::TypeInfo;
 
     match declared {
+        TypeInfo::Enumeration(decl_name) => matches!(
+            actual,
+            Some(TypeInfo::Enumeration(actual_name))
+                if actual_name.eq_ignore_ascii_case(decl_name)
+        ),
         TypeInfo::Character { .. } => matches!(actual, Some(TypeInfo::Character { .. })),
         TypeInfo::Derived(decl_name) => matches!(
             actual,
@@ -12582,6 +12600,11 @@ pub(super) fn generic_declared_semantic_match(
     };
 
     match declared {
+        TypeInfo::Enumeration(decl_name) => matches!(
+            actual,
+            TypeInfo::Enumeration(actual_name)
+                if actual_name.eq_ignore_ascii_case(decl_name)
+        ),
         TypeInfo::Integer {
             kind: declared_kind,
         } => matches!(
@@ -12771,6 +12794,7 @@ pub(super) fn fortran_type_to_type_info(
             kind: Some(*kind),
         }),
         FortranType::Derived { name } => Some(TypeInfo::Derived(name.clone())),
+        FortranType::Enumeration { name } => Some(TypeInfo::Enumeration(name.clone())),
         FortranType::ClassOf { base } => Some(TypeInfo::Class(base.clone())),
         FortranType::UnlimitedPoly => Some(TypeInfo::ClassStar),
         FortranType::AssumedType => Some(TypeInfo::TypeStar),
@@ -21861,11 +21885,36 @@ pub(super) fn lower_type_spec_with_param_consts(
             let lower_name = name.to_lowercase();
             if lower_name == "c_ptr" || lower_name == "c_funptr" {
                 IrType::Int(IntWidth::I64)
+            } else if let Some(st) = st {
+                // TYPE(name) also spells F2023 enumeration and named
+                // interoperable enum types (7.6.2 NOTE) — those are
+                // scalar integer ordinals, not struct pointers.
+                match st.find_symbol_any_scope(&lower_name) {
+                    Some(sym)
+                        if matches!(sym.kind, crate::sema::symtab::SymbolKind::EnumerationType) =>
+                    {
+                        match &sym.type_info {
+                            Some(ti) => type_info_to_ir_type(ti),
+                            None => IrType::Int(IntWidth::I32),
+                        }
+                    }
+                    _ => IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                }
             } else {
                 // User-defined derived types are byte pointers (struct layout resolved elsewhere).
                 IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)))
             }
         }
+        // F2023 TYPEOF/CLASSOF: the declared type of the referenced
+        // entity; resolution validated the reference, so a failed
+        // lookup here only happens on already-rejected programs.
+        TypeSpec::TypeOf(entity) | TypeSpec::ClassOf(entity) => match st
+            .and_then(|st| st.find_symbol_any_scope(&entity.to_lowercase()))
+            .and_then(|sym| sym.type_info.clone())
+        {
+            Some(ti) => type_info_to_ir_type(&ti),
+            None => IrType::Int(IntWidth::I32),
+        },
         _ => IrType::Int(IntWidth::I32), // fallback
     }
 }

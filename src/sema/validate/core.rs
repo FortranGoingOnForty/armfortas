@@ -837,7 +837,7 @@ fn validate_decl_const_int_exprs(ctx: &mut Ctx<'_>, decl: &crate::ast::decl::Spa
                 }
             }
         }
-        Decl::EnumDef { enumerators } => {
+        Decl::EnumDef { enumerators, .. } => {
             for (_, expr) in enumerators {
                 if let Some(expr) = expr {
                     validate_const_int_expr_tree(ctx, expr);
@@ -1504,6 +1504,62 @@ fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
                         FortranStandard::F2018,
                         "CLASS(*)/TYPE(*) declaration",
                     );
+                }
+                TypeSpec::TypeOf(entity) | TypeSpec::ClassOf(entity) => {
+                    let is_classof = matches!(type_spec, TypeSpec::ClassOf(_));
+                    ctx.require_std(
+                        decl.span,
+                        FortranStandard::F2023,
+                        if is_classof { "CLASSOF" } else { "TYPEOF" },
+                    );
+                    // The entity must be previously declared with a
+                    // complete type (resolution is source-ordered, so
+                    // a forward reference fails this lookup too).
+                    match ctx.st.find_symbol_any_scope(&entity.to_lowercase()) {
+                        None => ctx.error(
+                            decl.span,
+                            format!(
+                                "{}({}) references an undeclared entity",
+                                if is_classof { "CLASSOF" } else { "TYPEOF" },
+                                entity
+                            ),
+                        ),
+                        Some(sym) => match &sym.type_info {
+                            None => ctx.error(
+                                decl.span,
+                                format!(
+                                    "{}({}) requires an entity with a complete type",
+                                    if is_classof { "CLASSOF" } else { "TYPEOF" },
+                                    entity
+                                ),
+                            ),
+                            Some(crate::sema::symtab::TypeInfo::ClassStar)
+                            | Some(crate::sema::symtab::TypeInfo::TypeStar) => ctx.error(
+                                decl.span,
+                                format!(
+                                    "{}({}) of an unlimited polymorphic or assumed-type                                      entity is not allowed",
+                                    if is_classof { "CLASSOF" } else { "TYPEOF" },
+                                    entity
+                                ),
+                            ),
+                            Some(ti) if is_classof => {
+                                if !matches!(
+                                    ti,
+                                    crate::sema::symtab::TypeInfo::Derived(_)
+                                        | crate::sema::symtab::TypeInfo::Class(_)
+                                ) {
+                                    ctx.error(
+                                        decl.span,
+                                        format!(
+                                            "CLASSOF({}) requires an entity of derived or                                              CLASS type",
+                                            entity
+                                        ),
+                                    );
+                                }
+                            }
+                            _ => {}
+                        },
+                    }
                 }
                 _ => {}
             }

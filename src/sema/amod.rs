@@ -1244,6 +1244,10 @@ fn type_info_to_string(info: Option<&TypeInfo>) -> String {
             Some(k) => format!("integer({})", k),
             None => "integer".to_string(),
         },
+        // l07 flag: enumeration types need full .amod round-trip
+        // support when multi-file lands; the string form keeps
+        // hashing/diagnostics honest meanwhile.
+        Some(TypeInfo::Enumeration(name)) => format!("enumeration({})", name),
         Some(TypeInfo::Real { kind }) => match kind {
             Some(k) => format!("real({})", k),
             None => "real".to_string(),

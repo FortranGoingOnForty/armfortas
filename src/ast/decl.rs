@@ -70,9 +70,19 @@ pub enum Decl {
     /// `data x /1.0/, y /2.0/`
     DataStmt { sets: Vec<DataSet> },
 
-    /// `enum, bind(c)`
+    /// `enum, bind(c) [:: name]` — interoperable enumeration
+    /// (F2023 R760 adds the optional enum-type-name).
     EnumDef {
+        type_name: Option<String>,
         enumerators: Vec<(String, Option<SpannedExpr>)>,
+    },
+
+    /// F2023 `enumeration type :: name` (R766): a distinct
+    /// nonintrinsic, non-interoperable type. Enumerators carry no
+    /// values — declaration order defines 1-based ordinals.
+    EnumerationTypeDef {
+        name: String,
+        enumerators: Vec<String>,
     },
 
     /// Standalone attribute statement: `allocatable :: x`, `dimension(10) :: a`
@@ -102,6 +112,12 @@ pub enum TypeSpec {
     ClassStar,
     /// `type(*)` — assumed type
     TypeStar,
+    /// F2023 `typeof(entity)` — the declared type of a previously
+    /// declared entity.
+    TypeOf(String),
+    /// F2023 `classof(entity)` — polymorphic with the entity's
+    /// declared type as base.
+    ClassOf(String),
 }
 
 /// Kind selector: `(4)`, `(kind=4)`, `*4`

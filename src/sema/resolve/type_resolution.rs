@@ -113,10 +113,50 @@ pub(super) fn type_spec_to_info(ts: &TypeSpec, st: &SymbolTable) -> TypeInfo {
             len: extract_char_len(sel, st),
             kind: None,
         },
-        TypeSpec::Type(name) => TypeInfo::Derived(name.clone()),
+        TypeSpec::Type(name) => {
+            // TYPE(name) covers derived types AND F2023 enumeration /
+            // named-enum types (the standard reuses the spelling —
+            // 7.6.2 NOTE declares `Type(v_value) :: x`). What `name`
+            // denotes decides.
+            match st.find_symbol_any_scope(&name.to_lowercase()) {
+                Some(sym)
+                    if matches!(sym.kind, crate::sema::symtab::SymbolKind::EnumerationType) =>
+                {
+                    sym.type_info
+                        .clone()
+                        .unwrap_or(TypeInfo::Derived(name.clone()))
+                }
+                _ => TypeInfo::Derived(name.clone()),
+            }
+        }
         TypeSpec::Class(name) => TypeInfo::Class(name.clone()),
         TypeSpec::ClassStar => TypeInfo::ClassStar,
         TypeSpec::TypeStar => TypeInfo::TypeStar,
+        // F2023 TYPEOF/CLASSOF resolve at declaration time to the
+        // referenced entity's declared type. Resolution is source-
+        // ordered, so a forward (or missing) reference fails the
+        // lookup here; validation emits the diagnostic and the
+        // TypeStar fallback never survives to lowering.
+        TypeSpec::TypeOf(entity) => match st.find_symbol_any_scope(&entity.to_lowercase()) {
+            Some(sym) => match sym.type_info.clone() {
+                // TYPEOF gives the non-polymorphic declared type.
+                Some(TypeInfo::Class(base)) => TypeInfo::Derived(base),
+                Some(ti) => ti,
+                None => TypeInfo::TypeStar,
+            },
+            None => TypeInfo::TypeStar,
+        },
+        TypeSpec::ClassOf(entity) => match st.find_symbol_any_scope(&entity.to_lowercase()) {
+            Some(sym) => match sym.type_info.clone() {
+                Some(TypeInfo::Derived(base)) | Some(TypeInfo::Class(base)) => {
+                    TypeInfo::Class(base)
+                }
+                // CLASSOF of a non-derived entity is rejected in
+                // validation; fall back like TYPEOF.
+                _ => TypeInfo::TypeStar,
+            },
+            None => TypeInfo::TypeStar,
+        },
     }
 }
 

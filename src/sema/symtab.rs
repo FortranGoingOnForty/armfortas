@@ -682,6 +682,11 @@ pub enum SymbolKind {
     DerivedType,
     NamedInterface,
     Enumerator,
+    /// F2023 enumeration type name (7.6.2) or named interoperable
+    /// enum type (7.6.1). The symbol's type_info distinguishes them:
+    /// Enumeration(name) for the strict kind, Integer for the
+    /// interoperable alias.
+    EnumerationType,
     Namelist,
     CommonBlock,
     ExternalProc,
@@ -693,16 +698,31 @@ pub enum SymbolKind {
 /// Type information for a symbol.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeInfo {
-    Integer { kind: Option<u8> },
-    Real { kind: Option<u8> },
+    Integer {
+        kind: Option<u8>,
+    },
+    Real {
+        kind: Option<u8>,
+    },
     DoublePrecision,
-    Complex { kind: Option<u8> },
-    Logical { kind: Option<u8> },
-    Character { len: Option<i64>, kind: Option<u8> },
+    Complex {
+        kind: Option<u8>,
+    },
+    Logical {
+        kind: Option<u8>,
+    },
+    Character {
+        len: Option<i64>,
+        kind: Option<u8>,
+    },
     Derived(String),
     Class(String),
     ClassStar,
     TypeStar,
+    /// F2023 enumeration type (7.6.2): name-based identity, strict —
+    /// no implicit conversion to/from integers. Values lower to
+    /// default-integer ordinals (1-based); all safety is frontend.
+    Enumeration(String),
 }
 
 /// Symbol attributes.

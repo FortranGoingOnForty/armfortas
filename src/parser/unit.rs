@@ -873,6 +873,11 @@ impl<'a> Parser<'a> {
                 decls.push(self.parse_enum_def()?);
                 continue;
             }
+            // F2023 R766: ENUMERATION TYPE [..] :: name
+            if text == "enumeration" {
+                decls.push(self.parse_enumeration_type_def()?);
+                continue;
+            }
 
             // INTRINSIC / EXTERNAL :: name-list — informational
             // declarations that mark functions as intrinsic or external.
