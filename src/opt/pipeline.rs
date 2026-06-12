@@ -25,7 +25,7 @@ use super::jump_thread::JumpThread;
 use super::licm::Licm;
 use super::lsf::LocalLsf;
 use super::mem2reg::Mem2Reg;
-use super::neon_vectorize::NeonVectorize;
+use super::neon_vectorize::{NeonVectorize, SseVectorize};
 use super::pass::PassManager;
 use super::peel::LoopPeel;
 use super::preheader::PreheaderInsert;
@@ -119,13 +119,12 @@ impl OptLevel {
 /// in one function makes it trivial to audit which passes run at which
 /// level.
 ///
-/// The pipeline is target-neutral except the two vectorizers:
-/// `NeonVectorize` emits 128-bit V-ops only the arm64 isel selects,
-/// and `Vectorize` calls NEON-backed runtime kernels. Both register
-/// only for `Arch::Arm64`; the x86 SIMD story lands in x10 (the x09
-/// pass audit has the full survey).
+/// The pipeline is target-neutral except the loop vectorizer, which
+/// registers a per-arch driver at O3/Ofast: `NeonVectorize` on arm64,
+/// `SseVectorize` on x86_64 (x10) — same analysis and rewrites, a
+/// per-ISA legality table. `Vectorize` (runtime bulk kernels with
+/// scalar fallbacks) registers on both.
 pub fn build_pipeline(level: OptLevel, arch: crate::target::Arch) -> PassManager {
-    let vectorizers = arch == crate::target::Arch::Arm64;
     let mut pm = PassManager::new();
     match level {
         OptLevel::O0 => {
@@ -248,9 +247,15 @@ pub fn build_pipeline(level: OptLevel, arch: crate::target::Arch) -> PassManager
             pm.add(Box::new(LoopInterchange));
             pm.add(Box::new(LoopFission));
             pm.add(Box::new(LoopFusion));
-            if vectorizers {
-                pm.add(Box::new(NeonVectorize));
-                pm.add(Box::new(Vectorize));
+            match arch {
+                crate::target::Arch::Arm64 => {
+                    pm.add(Box::new(NeonVectorize));
+                    pm.add(Box::new(Vectorize));
+                }
+                crate::target::Arch::X86_64 => {
+                    pm.add(Box::new(SseVectorize));
+                    pm.add(Box::new(Vectorize));
+                }
             }
             pm.add(Box::new(LoopUnroll));
             pm.add(Box::new(Gvn)); // keep O3/Ofast aligned with O2/Os value numbering
@@ -285,9 +290,15 @@ pub fn build_pipeline(level: OptLevel, arch: crate::target::Arch) -> PassManager
             pm.add(Box::new(LoopInterchange));
             pm.add(Box::new(LoopFission));
             pm.add(Box::new(LoopFusion));
-            if vectorizers {
-                pm.add(Box::new(NeonVectorize));
-                pm.add(Box::new(Vectorize));
+            match arch {
+                crate::target::Arch::Arm64 => {
+                    pm.add(Box::new(NeonVectorize));
+                    pm.add(Box::new(Vectorize));
+                }
+                crate::target::Arch::X86_64 => {
+                    pm.add(Box::new(SseVectorize));
+                    pm.add(Box::new(Vectorize));
+                }
             }
             pm.add(Box::new(LoopUnroll));
             pm.add(Box::new(FastMathReassoc));
@@ -411,11 +422,10 @@ mod tests {
     }
 
     #[test]
-    fn x86_pipeline_excludes_vectorizers_and_matches_arm_otherwise() {
-        // x09: the only per-target pipeline difference is the two
-        // vectorizer passes at O3/Ofast. Everything else must stay
-        // identical across arches — a divergence here is a bug, not a
-        // tuning choice.
+    fn x86_pipeline_matches_arm_with_sse_vectorizer() {
+        // x10: the only per-target pipeline difference is which loop
+        // vectorizer driver registers at O3/Ofast. Everything else
+        // must stay identical across arches.
         for lvl in [
             OptLevel::O0,
             OptLevel::O1,
@@ -427,17 +437,23 @@ mod tests {
             let arm: Vec<_> = build_pipeline(lvl, Arch::Arm64)
                 .pass_names()
                 .into_iter()
-                .filter(|n| *n != "neon_vectorize" && *n != "vectorize")
+                .map(|n| {
+                    if n == "neon_vectorize" {
+                        "sse2_vectorize"
+                    } else {
+                        n
+                    }
+                })
                 .collect();
             let x86 = build_pipeline(lvl, Arch::X86_64).pass_names();
             assert_eq!(
                 arm, x86,
-                "{:?}: x86 pipeline should be the arm64 pipeline minus vectorizers",
+                "{:?}: x86 pipeline should be the arm64 pipeline with the SSE driver",
                 lvl
             );
             assert!(
-                !x86.contains(&"neon_vectorize") && !x86.contains(&"vectorize"),
-                "{:?}: vectorizers must not register for x86_64, got {:?}",
+                !x86.contains(&"neon_vectorize"),
+                "{:?}: the NEON driver must not register for x86_64, got {:?}",
                 lvl,
                 x86
             );

@@ -764,6 +764,537 @@ fn select_inst(
                 Some(X86Operand::VReg(dest)),
             );
         }
+
+        // ---- Packed SSE2 vector ops (x10). Only shapes the
+        // SSE2_BASELINE vec_isa table admits reach here: float
+        // mul/div/min/max/abs/fma, int add/sub/neg, i32 compares,
+        // float compares, sum reductions for all four lane types,
+        // float min/max reductions. Anything else is a table bug —
+        // panic loudly rather than guess. ----
+        InstKind::VLoad(ptr) => {
+            let dest = ctx.lookup_vreg(inst.id);
+            let vp = ctx.lookup_vreg(*ptr);
+            push(
+                mf,
+                mb,
+                X86Opcode::Movups,
+                OpSize::Q,
+                vec![X86Operand::VReg(vp)],
+                Some(X86Operand::VReg(dest)),
+            );
+        }
+        InstKind::VStore(vec, ptr) => {
+            let vv = ctx.lookup_vreg(*vec);
+            let vp = ctx.lookup_vreg(*ptr);
+            // Store form: def carries the address vreg (the
+            // is_fp_store_addr convention shared with Movss/Movsd).
+            push(
+                mf,
+                mb,
+                X86Opcode::Movups,
+                OpSize::Q,
+                vec![X86Operand::VReg(vv)],
+                Some(X86Operand::VReg(vp)),
+            );
+        }
+        InstKind::VAdd(a, b) | InstKind::VSub(a, b) => {
+            let dest = ctx.lookup_vreg(inst.id);
+            let va = ctx.lookup_vreg(*a);
+            let vb = ctx.lookup_vreg(*b);
+            let is_add = matches!(inst.kind, InstKind::VAdd(..));
+            let opcode = match vec_elem_of(&inst.ty) {
+                IrType::Float(FloatWidth::F32) => {
+                    if is_add {
+                        X86Opcode::Addps
+                    } else {
+                        X86Opcode::Subps
+                    }
+                }
+                IrType::Float(FloatWidth::F64) => {
+                    if is_add {
+                        X86Opcode::Addpd
+                    } else {
+                        X86Opcode::Subpd
+                    }
+                }
+                IrType::Int(IntWidth::I32) => {
+                    if is_add {
+                        X86Opcode::Paddd
+                    } else {
+                        X86Opcode::Psubd
+                    }
+                }
+                IrType::Int(IntWidth::I64) => {
+                    if is_add {
+                        X86Opcode::Paddq
+                    } else {
+                        X86Opcode::Psubq
+                    }
+                }
+                other => panic!("x10: no packed add/sub for {:?}", other),
+            };
+            push(
+                mf,
+                mb,
+                opcode,
+                OpSize::Q,
+                vec![X86Operand::VReg(va), X86Operand::VReg(vb)],
+                Some(X86Operand::VReg(dest)),
+            );
+        }
+        InstKind::VMul(a, b) | InstKind::VDiv(a, b) => {
+            let dest = ctx.lookup_vreg(inst.id);
+            let va = ctx.lookup_vreg(*a);
+            let vb = ctx.lookup_vreg(*b);
+            let is_mul = matches!(inst.kind, InstKind::VMul(..));
+            let opcode = match vec_elem_of(&inst.ty) {
+                IrType::Float(FloatWidth::F32) => {
+                    if is_mul {
+                        X86Opcode::Mulps
+                    } else {
+                        X86Opcode::Divps
+                    }
+                }
+                IrType::Float(FloatWidth::F64) => {
+                    if is_mul {
+                        X86Opcode::Mulpd
+                    } else {
+                        X86Opcode::Divpd
+                    }
+                }
+                // Integer mul/div are refused by the SSE2 vec_isa
+                // table before vectorization.
+                other => panic!("x10: packed mul/div on {:?} should not reach isel", other),
+            };
+            push(
+                mf,
+                mb,
+                opcode,
+                OpSize::Q,
+                vec![X86Operand::VReg(va), X86Operand::VReg(vb)],
+                Some(X86Operand::VReg(dest)),
+            );
+        }
+        InstKind::VMin(a, b) | InstKind::VMax(a, b) => {
+            // Operand order is load-bearing for NaN: the vectorizer
+            // builds VMax(t, f) from select(fcmp(t, f), t, f), where
+            // NaN makes the compare false and yields f. min/max[ps|pd]
+            // return the SECOND operand (src) on NaN; with dst = t
+            // (tied operand 0) and src = f the packed op reproduces
+            // the scalar select exactly.
+            let dest = ctx.lookup_vreg(inst.id);
+            let va = ctx.lookup_vreg(*a);
+            let vb = ctx.lookup_vreg(*b);
+            let is_min = matches!(inst.kind, InstKind::VMin(..));
+            let opcode = match vec_elem_of(&inst.ty) {
+                IrType::Float(FloatWidth::F32) => {
+                    if is_min {
+                        X86Opcode::Minps
+                    } else {
+                        X86Opcode::Maxps
+                    }
+                }
+                IrType::Float(FloatWidth::F64) => {
+                    if is_min {
+                        X86Opcode::Minpd
+                    } else {
+                        X86Opcode::Maxpd
+                    }
+                }
+                other => panic!("x10: packed min/max on {:?} should not reach isel", other),
+            };
+            push(
+                mf,
+                mb,
+                opcode,
+                OpSize::Q,
+                vec![X86Operand::VReg(va), X86Operand::VReg(vb)],
+                Some(X86Operand::VReg(dest)),
+            );
+        }
+        InstKind::VSqrt(a) => {
+            let dest = ctx.lookup_vreg(inst.id);
+            let va = ctx.lookup_vreg(*a);
+            let opcode = match vec_elem_of(&inst.ty) {
+                IrType::Float(FloatWidth::F32) => X86Opcode::Sqrtps,
+                IrType::Float(FloatWidth::F64) => X86Opcode::Sqrtpd,
+                other => panic!("x10: packed sqrt on {:?} should not reach isel", other),
+            };
+            push(
+                mf,
+                mb,
+                opcode,
+                OpSize::Q,
+                vec![X86Operand::VReg(va)],
+                Some(X86Operand::VReg(dest)),
+            );
+        }
+        InstKind::VNeg(a) => {
+            let dest = ctx.lookup_vreg(inst.id);
+            let va = ctx.lookup_vreg(*a);
+            match vec_elem_of(&inst.ty).clone() {
+                IrType::Float(w) => {
+                    // xor with the per-lane sign mask.
+                    let mask = vec_mask_vreg(mf, ctx, mb, &w, true);
+                    let opcode = match w {
+                        FloatWidth::F32 => X86Opcode::Xorps,
+                        FloatWidth::F64 => X86Opcode::Xorpd,
+                    };
+                    push(
+                        mf,
+                        mb,
+                        opcode,
+                        OpSize::Q,
+                        vec![X86Operand::VReg(va), X86Operand::VReg(mask)],
+                        Some(X86Operand::VReg(dest)),
+                    );
+                }
+                IrType::Int(w) => {
+                    // 0 - x: load a zero vector, psub the source.
+                    let zero = mf.new_vreg(X86RegClass::Xmm128);
+                    let label = mf.add_rodata_bytes(&[0u8; 16]);
+                    push(
+                        mf,
+                        mb,
+                        X86Opcode::Movups,
+                        OpSize::Q,
+                        vec![X86Operand::RipLabel(label)],
+                        Some(X86Operand::VReg(zero)),
+                    );
+                    let opcode = match w {
+                        IntWidth::I32 => X86Opcode::Psubd,
+                        IntWidth::I64 => X86Opcode::Psubq,
+                        other => panic!("x10: packed neg on {:?} lanes", other),
+                    };
+                    push(
+                        mf,
+                        mb,
+                        opcode,
+                        OpSize::Q,
+                        vec![X86Operand::VReg(zero), X86Operand::VReg(va)],
+                        Some(X86Operand::VReg(dest)),
+                    );
+                }
+                other => panic!("x10: packed neg on {:?} should not reach isel", other),
+            }
+        }
+        InstKind::VAbs(a) => {
+            let dest = ctx.lookup_vreg(inst.id);
+            let va = ctx.lookup_vreg(*a);
+            match vec_elem_of(&inst.ty).clone() {
+                IrType::Float(w) => {
+                    let mask = vec_mask_vreg(mf, ctx, mb, &w, false);
+                    let opcode = match w {
+                        FloatWidth::F32 => X86Opcode::Andps,
+                        FloatWidth::F64 => X86Opcode::Andpd,
+                    };
+                    push(
+                        mf,
+                        mb,
+                        opcode,
+                        OpSize::Q,
+                        vec![X86Operand::VReg(va), X86Operand::VReg(mask)],
+                        Some(X86Operand::VReg(dest)),
+                    );
+                }
+                other => panic!("x10: packed abs on {:?} should not reach isel", other),
+            }
+        }
+        InstKind::VFma(a, b, c) => {
+            // SSE2 has no fused multiply-add; mul + add (two
+            // roundings) matches what scalar x86 codegen produces for
+            // the same source, preserving the O0-vs-O3 invariant.
+            let dest = ctx.lookup_vreg(inst.id);
+            let va = ctx.lookup_vreg(*a);
+            let vb = ctx.lookup_vreg(*b);
+            let vc = ctx.lookup_vreg(*c);
+            let (mul_op, add_op) = match vec_elem_of(&inst.ty) {
+                IrType::Float(FloatWidth::F32) => (X86Opcode::Mulps, X86Opcode::Addps),
+                IrType::Float(FloatWidth::F64) => (X86Opcode::Mulpd, X86Opcode::Addpd),
+                other => panic!("x10: packed fma on {:?} should not reach isel", other),
+            };
+            let prod = mf.new_vreg(X86RegClass::Xmm128);
+            push(
+                mf,
+                mb,
+                mul_op,
+                OpSize::Q,
+                vec![X86Operand::VReg(va), X86Operand::VReg(vb)],
+                Some(X86Operand::VReg(prod)),
+            );
+            push(
+                mf,
+                mb,
+                add_op,
+                OpSize::Q,
+                vec![X86Operand::VReg(prod), X86Operand::VReg(vc)],
+                Some(X86Operand::VReg(dest)),
+            );
+        }
+        InstKind::VBroadcast(s) => {
+            let dest = ctx.lookup_vreg(inst.id);
+            let vs = ctx.lookup_vreg(*s);
+            match vec_elem_of(&inst.ty).clone() {
+                IrType::Float(FloatWidth::F32) => {
+                    // Copy the scalar into a vector register, then
+                    // splat lane 0 with shufps $0 (tied self-shuffle).
+                    let tmp = mf.new_vreg(X86RegClass::Xmm128);
+                    push(
+                        mf,
+                        mb,
+                        X86Opcode::Movaps,
+                        OpSize::Q,
+                        vec![X86Operand::VReg(vs)],
+                        Some(X86Operand::VReg(tmp)),
+                    );
+                    push(
+                        mf,
+                        mb,
+                        X86Opcode::Shufps,
+                        OpSize::Q,
+                        vec![
+                            X86Operand::VReg(tmp),
+                            X86Operand::VReg(tmp),
+                            X86Operand::Imm(0),
+                        ],
+                        Some(X86Operand::VReg(dest)),
+                    );
+                }
+                IrType::Float(FloatWidth::F64) => {
+                    let tmp = mf.new_vreg(X86RegClass::Xmm128);
+                    push(
+                        mf,
+                        mb,
+                        X86Opcode::Movaps,
+                        OpSize::Q,
+                        vec![X86Operand::VReg(vs)],
+                        Some(X86Operand::VReg(tmp)),
+                    );
+                    push(
+                        mf,
+                        mb,
+                        X86Opcode::Unpcklpd,
+                        OpSize::Q,
+                        vec![X86Operand::VReg(tmp), X86Operand::VReg(tmp)],
+                        Some(X86Operand::VReg(dest)),
+                    );
+                }
+                IrType::Int(w) => {
+                    // movd/movq the GP scalar into lane 0, then
+                    // splat: pshufd $0 for i32, punpcklqdq for i64.
+                    let tmp = mf.new_vreg(X86RegClass::Xmm128);
+                    let mv_size = match w {
+                        IntWidth::I64 => OpSize::Q,
+                        _ => OpSize::L,
+                    };
+                    push(
+                        mf,
+                        mb,
+                        X86Opcode::Movd,
+                        mv_size,
+                        vec![X86Operand::VReg(vs)],
+                        Some(X86Operand::VReg(tmp)),
+                    );
+                    match w {
+                        IntWidth::I32 => push(
+                            mf,
+                            mb,
+                            X86Opcode::Pshufd,
+                            OpSize::Q,
+                            vec![X86Operand::VReg(tmp), X86Operand::Imm(0)],
+                            Some(X86Operand::VReg(dest)),
+                        ),
+                        IntWidth::I64 => push(
+                            mf,
+                            mb,
+                            X86Opcode::Punpcklqdq,
+                            OpSize::Q,
+                            vec![X86Operand::VReg(tmp), X86Operand::VReg(tmp)],
+                            Some(X86Operand::VReg(dest)),
+                        ),
+                        other => panic!("x10: packed broadcast of {:?} lanes", other),
+                    }
+                }
+                other => panic!("x10: packed broadcast of {:?} should not reach isel", other),
+            }
+        }
+        InstKind::VICmp(op, a, b) => {
+            // i32 lanes only (the table refuses i64 compares on
+            // SSE2). Eq/Gt are native; the rest are operand swaps
+            // and/or an all-ones inversion.
+            let dest = ctx.lookup_vreg(inst.id);
+            let va = ctx.lookup_vreg(*a);
+            let vb = ctx.lookup_vreg(*b);
+            emit_packed_icmp(mf, ctx, mb, *op, va, vb, dest);
+        }
+        InstKind::VFCmp(op, a, b) => {
+            let dest = ctx.lookup_vreg(inst.id);
+            let va = ctx.lookup_vreg(*a);
+            let vb = ctx.lookup_vreg(*b);
+            let is_f32 = matches!(vec_elem_of(&inst.ty), IrType::Float(FloatWidth::F32));
+            let cmp_op = if is_f32 {
+                X86Opcode::Cmpps
+            } else {
+                X86Opcode::Cmppd
+            };
+            // cmpps predicates: 0=eq, 1=lt, 2=le, 4=neq. gt/ge swap
+            // operands onto lt/le. Unordered (NaN) compares false for
+            // the ordered predicates and true for neq — matching the
+            // scalar ucomi+setcc lowering.
+            let (imm, lhs, rhs) = match op {
+                CmpOp::Eq => (0i64, va, vb),
+                CmpOp::Lt => (1, va, vb),
+                CmpOp::Le => (2, va, vb),
+                CmpOp::Ne => (4, va, vb),
+                CmpOp::Gt => (1, vb, va),
+                CmpOp::Ge => (2, vb, va),
+            };
+            push(
+                mf,
+                mb,
+                cmp_op,
+                OpSize::Q,
+                vec![
+                    X86Operand::VReg(lhs),
+                    X86Operand::VReg(rhs),
+                    X86Operand::Imm(imm),
+                ],
+                Some(X86Operand::VReg(dest)),
+            );
+        }
+        InstKind::VSelect(mask, t, f) => {
+            // (t & mask) | (~mask & f) via pand/pandn/por.
+            let dest = ctx.lookup_vreg(inst.id);
+            let vm = ctx.lookup_vreg(*mask);
+            let vt = ctx.lookup_vreg(*t);
+            let vf = ctx.lookup_vreg(*f);
+            let t_and = mf.new_vreg(X86RegClass::Xmm128);
+            push(
+                mf,
+                mb,
+                X86Opcode::Pand,
+                OpSize::Q,
+                vec![X86Operand::VReg(vt), X86Operand::VReg(vm)],
+                Some(X86Operand::VReg(t_and)),
+            );
+            // pandn computes ~dst & src with dst = tied operand 0,
+            // so operand order is [mask, f].
+            let f_andn = mf.new_vreg(X86RegClass::Xmm128);
+            push(
+                mf,
+                mb,
+                X86Opcode::Pandn,
+                OpSize::Q,
+                vec![X86Operand::VReg(vm), X86Operand::VReg(vf)],
+                Some(X86Operand::VReg(f_andn)),
+            );
+            push(
+                mf,
+                mb,
+                X86Opcode::Por,
+                OpSize::Q,
+                vec![X86Operand::VReg(t_and), X86Operand::VReg(f_andn)],
+                Some(X86Operand::VReg(dest)),
+            );
+        }
+        InstKind::VReduceSum(v) | InstKind::VReduceMin(v) | InstKind::VReduceMax(v) => {
+            let dest = ctx.lookup_vreg(inst.id);
+            let vv = ctx.lookup_vreg(*v);
+            let elem = func
+                .value_type(*v)
+                .map(|t| vec_elem_of(&t).clone())
+                .unwrap_or_else(|| panic!("x10: missing vector type for reduce %{}", v.0));
+            let step = match (&inst.kind, &elem) {
+                (InstKind::VReduceSum(_), IrType::Float(FloatWidth::F32)) => X86Opcode::Addps,
+                (InstKind::VReduceSum(_), IrType::Float(FloatWidth::F64)) => X86Opcode::Addpd,
+                (InstKind::VReduceSum(_), IrType::Int(IntWidth::I32)) => X86Opcode::Paddd,
+                (InstKind::VReduceSum(_), IrType::Int(IntWidth::I64)) => X86Opcode::Paddq,
+                (InstKind::VReduceMin(_), IrType::Float(FloatWidth::F32)) => X86Opcode::Minps,
+                (InstKind::VReduceMin(_), IrType::Float(FloatWidth::F64)) => X86Opcode::Minpd,
+                (InstKind::VReduceMax(_), IrType::Float(FloatWidth::F32)) => X86Opcode::Maxps,
+                (InstKind::VReduceMax(_), IrType::Float(FloatWidth::F64)) => X86Opcode::Maxpd,
+                (k, e) => panic!("x10: reduce {:?} on {:?} should not reach isel", k, e),
+            };
+            // Fold the upper half onto the lower, then (for 4-lane
+            // shapes) lane 1 onto lane 0, all in packed registers;
+            // lane 0 is the answer.
+            let half = mf.new_vreg(X86RegClass::Xmm128);
+            push(
+                mf,
+                mb,
+                X86Opcode::Pshufd,
+                OpSize::Q,
+                vec![X86Operand::VReg(vv), X86Operand::Imm(0x4E)],
+                Some(X86Operand::VReg(half)),
+            );
+            let fold1 = mf.new_vreg(X86RegClass::Xmm128);
+            push(
+                mf,
+                mb,
+                step,
+                OpSize::Q,
+                vec![X86Operand::VReg(vv), X86Operand::VReg(half)],
+                Some(X86Operand::VReg(fold1)),
+            );
+            let four_lanes = matches!(
+                elem,
+                IrType::Float(FloatWidth::F32) | IrType::Int(IntWidth::I32)
+            );
+            let final_vec = if four_lanes {
+                let lane1 = mf.new_vreg(X86RegClass::Xmm128);
+                push(
+                    mf,
+                    mb,
+                    X86Opcode::Pshufd,
+                    OpSize::Q,
+                    vec![X86Operand::VReg(fold1), X86Operand::Imm(0xE5)],
+                    Some(X86Operand::VReg(lane1)),
+                );
+                let fold0 = mf.new_vreg(X86RegClass::Xmm128);
+                push(
+                    mf,
+                    mb,
+                    step,
+                    OpSize::Q,
+                    vec![X86Operand::VReg(fold1), X86Operand::VReg(lane1)],
+                    Some(X86Operand::VReg(fold0)),
+                );
+                fold0
+            } else {
+                fold1
+            };
+            // Extract lane 0 into the scalar destination.
+            match elem {
+                IrType::Float(FloatWidth::F32) => push(
+                    mf,
+                    mb,
+                    X86Opcode::Movss,
+                    OpSize::L,
+                    vec![X86Operand::VReg(final_vec)],
+                    Some(X86Operand::VReg(dest)),
+                ),
+                IrType::Float(FloatWidth::F64) => push(
+                    mf,
+                    mb,
+                    X86Opcode::Movsd,
+                    OpSize::Q,
+                    vec![X86Operand::VReg(final_vec)],
+                    Some(X86Operand::VReg(dest)),
+                ),
+                IrType::Int(w) => push(
+                    mf,
+                    mb,
+                    X86Opcode::Movd,
+                    match w {
+                        IntWidth::I64 => OpSize::Q,
+                        _ => OpSize::L,
+                    },
+                    vec![X86Operand::VReg(final_vec)],
+                    Some(X86Operand::VReg(dest)),
+                ),
+                other => panic!("x10: reduce extract for {:?}", other),
+            }
+        }
         InstKind::FPow(a, b) => {
             // libm call, mirroring ARM isel's pow/powf lowering. Two
             // xmm argument registers → AL=2 per the blanket external
@@ -2390,7 +2921,8 @@ fn type_to_class(ty: &IrType) -> X86RegClass {
         IrType::Array(elem, n) if scalar_elem_bytes(elem) * n == 8 => X86RegClass::Gp64,
         IrType::Int(IntWidth::I64) | IrType::Ptr(_) | IrType::FuncPtr(_) => X86RegClass::Gp64,
         IrType::Int(_) | IrType::Bool => X86RegClass::Gp32,
-        IrType::Vector { .. } => panic!("x05 scope: vector values deferred"),
+        // 128-bit SSE vectors (x10).
+        IrType::Vector { .. } => X86RegClass::Xmm128,
         other => panic!("x05 scope: no register class for {:?}", other),
     }
 }
@@ -2415,6 +2947,97 @@ fn gp_move_size(class: X86RegClass) -> OpSize {
         X86RegClass::Gp64 => OpSize::Q,
         X86RegClass::Gp8 => OpSize::B,
         _ => OpSize::L,
+    }
+}
+
+/// Element type of a vector IR type (x10 packed lowering).
+fn vec_elem_of(ty: &IrType) -> &IrType {
+    match ty {
+        IrType::Vector { elem, .. } => elem,
+        other => panic!("x10: expected vector type, got {:?}", other),
+    }
+}
+
+/// Load a per-lane float sign/abs mask from .rodata into a fresh
+/// vector vreg. `sign` picks 0x8000.. (negate) vs 0x7fff.. (abs).
+fn vec_mask_vreg(
+    mf: &mut X86Function,
+    _ctx: &X86ISelCtx,
+    mb: MBlockId,
+    width: &FloatWidth,
+    sign: bool,
+) -> X86VReg {
+    let mut bytes = [0u8; 16];
+    match width {
+        FloatWidth::F32 => {
+            let lane: u32 = if sign { 0x8000_0000 } else { 0x7fff_ffff };
+            for i in 0..4 {
+                bytes[i * 4..i * 4 + 4].copy_from_slice(&lane.to_le_bytes());
+            }
+        }
+        FloatWidth::F64 => {
+            let lane: u64 = if sign {
+                0x8000_0000_0000_0000
+            } else {
+                0x7fff_ffff_ffff_ffff
+            };
+            for i in 0..2 {
+                bytes[i * 8..i * 8 + 8].copy_from_slice(&lane.to_le_bytes());
+            }
+        }
+    }
+    let label = mf.add_rodata_bytes(&bytes);
+    let mask = mf.new_vreg(X86RegClass::Xmm128);
+    push(
+        mf,
+        mb,
+        X86Opcode::Movups,
+        OpSize::Q,
+        vec![X86Operand::RipLabel(label)],
+        Some(X86Operand::VReg(mask)),
+    );
+    mask
+}
+
+/// Packed i32 compare via pcmpgtd/pcmpeqd: Eq/Gt native, Lt a swap,
+/// Ne/Ge/Le by inverting with an all-ones mask.
+fn emit_packed_icmp(
+    mf: &mut X86Function,
+    _ctx: &X86ISelCtx,
+    mb: MBlockId,
+    op: CmpOp,
+    va: X86VReg,
+    vb: X86VReg,
+    dest: X86VReg,
+) {
+    let direct = |mf: &mut X86Function, opc, l: X86VReg, r: X86VReg, d: X86VReg| {
+        mf.block_mut(mb).insts.push(X86Inst {
+            opcode: opc,
+            size: OpSize::Q,
+            operands: vec![X86Operand::VReg(l), X86Operand::VReg(r)],
+            def: Some(X86Operand::VReg(d)),
+        });
+    };
+    let inverted = |mf: &mut X86Function, opc, l: X86VReg, r: X86VReg, d: X86VReg| {
+        let raw = mf.new_vreg(X86RegClass::Xmm128);
+        direct(mf, opc, l, r, raw);
+        let ones_label = mf.add_rodata_bytes(&[0xffu8; 16]);
+        let ones = mf.new_vreg(X86RegClass::Xmm128);
+        mf.block_mut(mb).insts.push(X86Inst {
+            opcode: X86Opcode::Movups,
+            size: OpSize::Q,
+            operands: vec![X86Operand::RipLabel(ones_label)],
+            def: Some(X86Operand::VReg(ones)),
+        });
+        direct(mf, X86Opcode::Pxor, raw, ones, d);
+    };
+    match op {
+        CmpOp::Eq => direct(mf, X86Opcode::Pcmpeqd, va, vb, dest),
+        CmpOp::Gt => direct(mf, X86Opcode::Pcmpgtd, va, vb, dest),
+        CmpOp::Lt => direct(mf, X86Opcode::Pcmpgtd, vb, va, dest),
+        CmpOp::Ne => inverted(mf, X86Opcode::Pcmpeqd, va, vb, dest),
+        CmpOp::Ge => inverted(mf, X86Opcode::Pcmpgtd, vb, va, dest),
+        CmpOp::Le => inverted(mf, X86Opcode::Pcmpgtd, va, vb, dest),
     }
 }
 

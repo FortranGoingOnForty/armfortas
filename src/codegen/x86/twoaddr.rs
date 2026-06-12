@@ -35,6 +35,10 @@ fn move_opcode(op: X86Opcode) -> (X86Opcode, Option<OpSize>) {
     match op {
         Addss | Subss | Mulss | Divss | Xorps | Andps => (Movss, Some(OpSize::L)),
         Addsd | Subsd | Mulsd | Divsd | Xorpd | Andpd => (Movsd, Some(OpSize::Q)),
+        // Packed SSE2 (x10): the tie copy must move all 128 bits.
+        Addps | Addpd | Subps | Subpd | Mulps | Mulpd | Divps | Divpd | Minps | Minpd | Maxps
+        | Maxpd | Paddd | Paddq | Psubd | Psubq | Pand | Pandn | Por | Pxor | Pcmpgtd | Pcmpeqd
+        | Cmpps | Cmppd | Shufps | Movhlps | Unpcklpd | Punpcklqdq => (Movaps, Some(OpSize::Q)),
         // GP moves reuse the op's own size.
         _ => (MovRR, None),
     }

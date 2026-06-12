@@ -34,28 +34,45 @@ impl Pass for NeonVectorize {
     }
 
     fn run(&self, module: &mut Module) -> bool {
-        let mut changed = false;
-        for func in &mut module.functions {
-            while vectorize_one_loop(func) {
-                changed = true;
-            }
-        }
-        if changed {
-            for func in &mut module.functions {
-                func.rebuild_type_cache();
-            }
-        }
-        changed
+        run_loop_vectorizer(module, &super::vec_isa::NEON)
     }
 }
 
-fn vectorize_one_loop(func: &mut Function) -> bool {
+/// SSE2 driver (x10): identical analysis and rewrites, the
+/// SSE2_BASELINE legality table. Loops the table refuses stay scalar.
+pub struct SseVectorize;
+
+impl Pass for SseVectorize {
+    fn name(&self) -> &'static str {
+        "sse2_vectorize"
+    }
+
+    fn run(&self, module: &mut Module) -> bool {
+        run_loop_vectorizer(module, &super::vec_isa::SSE2_BASELINE)
+    }
+}
+
+fn run_loop_vectorizer(module: &mut Module, isa: &super::vec_isa::VectorIsa) -> bool {
+    let mut changed = false;
+    for func in &mut module.functions {
+        while vectorize_one_loop(func, isa) {
+            changed = true;
+        }
+    }
+    if changed {
+        for func in &mut module.functions {
+            func.rebuild_type_cache();
+        }
+    }
+    changed
+}
+
+fn vectorize_one_loop(func: &mut Function, isa: &super::vec_isa::VectorIsa) -> bool {
     let loops = find_natural_loops(func);
     if loops.is_empty() {
         return false;
     }
     let preds = predecessors(func);
-    let isa = &super::vec_isa::NEON;
 
     for lp in &loops {
         // Try element-wise vectorization first (no escaping values).
