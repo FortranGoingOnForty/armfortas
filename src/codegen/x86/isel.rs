@@ -1926,29 +1926,11 @@ fn select_inst(
             panic!("x05 scope: aggregate field ops deferred")
         }
 
-        InstKind::VAdd(..)
-        | InstKind::VSub(..)
-        | InstKind::VMul(..)
-        | InstKind::VDiv(..)
-        | InstKind::VNeg(..)
-        | InstKind::VAbs(..)
-        | InstKind::VSqrt(..)
-        | InstKind::VFma(..)
-        | InstKind::VSelect(..)
-        | InstKind::VMin(..)
-        | InstKind::VMax(..)
-        | InstKind::VICmp(..)
-        | InstKind::VFCmp(..)
-        | InstKind::VLoad(..)
-        | InstKind::VStore(..)
-        | InstKind::VBitcast(..)
-        | InstKind::VExtract(..)
-        | InstKind::VInsert(..)
-        | InstKind::VBroadcast(..)
-        | InstKind::VReduceSum(..)
-        | InstKind::VReduceMin(..)
-        | InstKind::VReduceMax(..) => {
-            panic!("x05 scope: vector ops deferred (x10 brings SSE vectors)")
+        // VBitcast/VExtract/VInsert: no producer emits them today
+        // (the vectorizer's surface is selected above); reject loudly
+        // rather than guess at lane semantics.
+        InstKind::VBitcast(..) | InstKind::VExtract(..) | InstKind::VInsert(..) => {
+            panic!("x10 scope: vector lane ops VBitcast/VExtract/VInsert have no producer")
         }
     }
     mb
