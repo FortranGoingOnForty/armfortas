@@ -59,56 +59,60 @@ fn use_counts(f: &X86Function) -> HashMap<VRegId, usize> {
 
 fn cmp_zero_to_test(f: &mut X86Function) -> usize {
     let uses = use_counts(f);
-    let mut changed = 0;
 
-    for block_idx in 0..f.blocks.len() {
-        // Map: vreg -> index of the `MovRI v, $0` that defines it,
-        // valid within this block walk. A redefinition of the vreg
-        // (any def) invalidates the entry.
-        let mut zero_defs: HashMap<VRegId, usize> = HashMap::new();
-        let mut dead: Vec<usize> = Vec::new();
-
-        for i in 0..f.blocks[block_idx].insts.len() {
-            let inst = &f.blocks[block_idx].insts[i];
-
-            // Track zero materializations.
-            if inst.opcode == X86Opcode::MovRI {
-                if let (Some(X86Operand::VReg(d)), Some(X86Operand::Imm(0))) =
-                    (&inst.def, inst.operands.first())
-                {
-                    zero_defs.insert(d.id, i);
-                    continue;
-                }
-            }
-            // Any other def of a tracked vreg invalidates it.
+    // The const may be materialized far from the Cmp (SSA constants
+    // select once, often in the entry block), so block-local tracking
+    // misses most sites. A vreg is a usable zero when its ONLY def in
+    // the whole function is `MovRI v, $0` — multi-def vregs (block
+    // param copies) are skipped.
+    let mut def_counts: HashMap<VRegId, usize> = HashMap::new();
+    let mut zero_site: HashMap<VRegId, (usize, usize)> = HashMap::new();
+    for (bi, block) in f.blocks.iter().enumerate() {
+        for (ii, inst) in block.insts.iter().enumerate() {
             if let Some(X86Operand::VReg(d)) = &inst.def {
-                zero_defs.remove(&d.id);
-            }
-
-            // Rewrite `Cmp(lhs, zero_vreg)` → `Test(lhs, lhs)`.
-            if inst.opcode == X86Opcode::Cmp {
-                if let (Some(X86Operand::VReg(lhs)), Some(X86Operand::VReg(rhs))) =
-                    (inst.operands.first(), inst.operands.get(1))
+                *def_counts.entry(d.id).or_insert(0) += 1;
+                if inst.opcode == X86Opcode::MovRI
+                    && matches!(inst.operands.first(), Some(X86Operand::Imm(0)))
                 {
-                    if let Some(&def_idx) = zero_defs.get(&rhs.id) {
-                        let lhs = *lhs;
-                        let single_use = uses.get(&rhs.id).copied().unwrap_or(0) == 1;
-                        let inst = &mut f.blocks[block_idx].insts[i];
-                        inst.opcode = X86Opcode::Test;
-                        inst.operands = vec![X86Operand::VReg(lhs), X86Operand::VReg(lhs)];
-                        if single_use {
-                            dead.push(def_idx);
-                        }
-                        changed += 1;
-                    }
+                    zero_site.insert(d.id, (bi, ii));
                 }
             }
         }
+    }
+    let is_zero = |id: VRegId| def_counts.get(&id) == Some(&1) && zero_site.contains_key(&id);
 
-        dead.sort_unstable();
-        for &idx in dead.iter().rev() {
-            f.blocks[block_idx].insts.remove(idx);
+    let mut changed = 0;
+    let mut rewritten_uses: HashMap<VRegId, usize> = HashMap::new();
+    for block in &mut f.blocks {
+        for inst in &mut block.insts {
+            if inst.opcode != X86Opcode::Cmp {
+                continue;
+            }
+            let (Some(X86Operand::VReg(lhs)), Some(X86Operand::VReg(rhs))) =
+                (inst.operands.first(), inst.operands.get(1))
+            else {
+                continue;
+            };
+            let (lhs, rhs) = (*lhs, *rhs);
+            if !is_zero(rhs.id) {
+                continue;
+            }
+            inst.opcode = X86Opcode::Test;
+            inst.operands = vec![X86Operand::VReg(lhs), X86Operand::VReg(lhs)];
+            *rewritten_uses.entry(rhs.id).or_insert(0) += 1;
+            changed += 1;
         }
+    }
+
+    // Delete a zero's MovRI only when every use was rewritten away.
+    let mut dead: Vec<(usize, usize)> = zero_site
+        .iter()
+        .filter(|(id, _)| rewritten_uses.get(id) == uses.get(id) && rewritten_uses.contains_key(id))
+        .map(|(_, site)| *site)
+        .collect();
+    dead.sort_unstable();
+    for &(bi, ii) in dead.iter().rev() {
+        f.blocks[bi].insts.remove(ii);
     }
     changed
 }
@@ -206,7 +210,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_use_zero_keeps_the_movri() {
+    fn multi_use_zero_rewrites_all_and_movri_dies() {
         let mut f = func_with(vec![
             movri(1, 0),
             cmp(0, 1),
@@ -216,9 +220,28 @@ mod tests {
         let changed = run_peephole(&mut f);
         assert_eq!(changed, 2, "both cmps rewrite");
         let insts = &f.blocks[0].insts;
-        assert_eq!(insts[0].opcode, X86Opcode::MovRI, "zero stays: {:?}", insts);
+        assert_eq!(insts.len(), 3, "all uses rewritten, MovRI dies: {:?}", insts);
+        assert_eq!(insts[0].opcode, X86Opcode::Test);
         assert_eq!(insts[1].opcode, X86Opcode::Test);
-        assert_eq!(insts[2].opcode, X86Opcode::Test);
+    }
+
+    #[test]
+    fn zero_with_surviving_non_cmp_use_keeps_the_movri() {
+        // The zero also feeds an Add — only the Cmp use rewrites, so
+        // the materialization must stay.
+        let add = X86Inst {
+            opcode: X86Opcode::Add,
+            size: OpSize::Q,
+            operands: vec![X86Operand::VReg(vreg(2)), X86Operand::VReg(vreg(1))],
+            def: Some(X86Operand::VReg(vreg(2))),
+        };
+        let mut f = func_with(vec![movri(1, 0), cmp(0, 1), add]);
+        let changed = run_peephole(&mut f);
+        assert_eq!(changed, 1);
+        let insts = &f.blocks[0].insts;
+        assert_eq!(insts.len(), 3, "MovRI must survive: {:?}", insts);
+        assert_eq!(insts[0].opcode, X86Opcode::MovRI);
+        assert_eq!(insts[1].opcode, X86Opcode::Test);
     }
 
     #[test]
