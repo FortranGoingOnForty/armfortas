@@ -1,46 +1,10 @@
 # Suites expected to skip on hosts without the native toolchain
-# (posix-elf profile). One suite name per line. Regenerated from a
-# FreeBSD full --tests run after x09 opened the optimizing levels:
-# what remains is Mach-O artifact audits, the arm64-only vectorizer
-# shapes (x10), afs-as/afs-ld standalone (x13/x14), reference-
-# compiler differentials, and cli_driver's ELF-gated -shared test.
+# (posix-elf profile). Regenerated after x10 enabled the vectorize
+# suites on x86_64: what remains is Mach-O artifact audits, the
+# afs-as/afs-ld standalone toolchain (x13/x14), reference-compiler
+# differentials, and cli_driver's ELF-gated -shared test.
 abi_differential
 artifact_audit_29_10
 cli_driver
 standalone_toolchain
 testing
-vectorize_array_copy
-vectorize_do_loop
-vectorize_dot_product
-vectorize_f32
-vectorize_fma
-vectorize_invariant_scalar
-vectorize_minmax_binary
-vectorize_multi_statement
-vectorize_reduce_fp
-vectorize_reduce_fp_minmax
-vectorize_reduce_i64
-vectorize_reduce_minmax
-vectorize_reduce_minmax_tail
-vectorize_reduce_minmax_unary
-vectorize_reduce_sum
-vectorize_reduce_sum_diff
-vectorize_reduce_sum_tail
-vectorize_reduce_sum_unary
-vectorize_scalar_tail
-vectorize_sqrt
-vectorize_unary
-vectorize_where
-vectorize_where_2arr
-vectorize_where_binop
-vectorize_where_binop_on_b
-vectorize_where_const
-vectorize_where_elsewhere
-vectorize_where_elsewhere_arr
-vectorize_where_elsewhere_arr_binop
-vectorize_where_elsewhere_arr_unary
-vectorize_where_elsewhere_binop
-vectorize_where_int
-vectorize_where_invariant
-vectorize_where_unary
-vectorize_where_unary_on_b
