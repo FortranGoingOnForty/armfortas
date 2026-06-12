@@ -1,5 +1,44 @@
-# Suites a musl host additionally cannot run: the x06 link gate
-# needs glibc or FreeBSD until the x11 musl story lands.
+# Suites a musl host additionally cannot run: no native link path
+# until the x11 musl story lands. Everything the x09 gate opening
+# enabled on glibc/FreeBSD still skips here.
 elf_link_e2e
 c_interop_differential
 multifile
+allocate_constructor_runtime
+allocate_validation
+bit_intrinsic_kind
+bounds_checks
+calling_convention_runtime
+claims_audit_29_11
+control_flow_runtime
+determinism_sweep
+fortsh_module_graph
+i128_backend_data
+i128_cross_object
+i128_external_backend
+i128_formatted_read
+i128_high_opt
+i128_internal_io
+i128_memory_backend
+i128_o1
+i128_o2
+i128_runtime_io
+i128_runtime_read
+i128_stack_args
+incremental
+ipo_const_arg
+ipo_return_prop
+loop_partial_unroll
+loop_partial_unroll_reduction
+loop_partial_unroll_runtime
+loop_partial_unroll_runtime_red
+memory_runtime
+module_host_audit
+multifile_gen
+ofast_fast_math
+opt_audit_29_11
+program_entry_audit
+regalloc_runtime
+run_programs
+sprint29_audit_realworld
+sroa_shape_audit_29_11
