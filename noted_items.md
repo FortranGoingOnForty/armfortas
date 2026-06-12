@@ -169,3 +169,12 @@ targets):
   resolution. Error-path robustness, not a miscompile; owner: next
   frontend sprint that touches module resolution (l07 submodules is
   the natural slot).
+
+Found while writing x10's NaN min/max fixture (2026-06-12, both
+targets, long-standing):
+
+- **The F edit descriptor falls back to E-notation**: `print
+  '(F6.1)', 4160.0` emits `4.1600000E3` on macOS and ELF alike. The
+  corpus's CHECK lines have been written around it, which is why it
+  never surfaced. Owner: l05 (F2023 I/O sprint) — implement Fw.d
+  editing alongside the AT/LEADING_ZERO work.
