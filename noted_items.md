@@ -169,3 +169,28 @@ targets):
   resolution. Error-path robustness, not a miscompile; owner: next
   frontend sprint that touches module resolution (l07 submodules is
   the natural slot).
+
+Found while writing x10's NaN min/max fixture (2026-06-12, both
+targets, long-standing):
+
+- **The F edit descriptor falls back to E-notation**: `print
+  '(F6.1)', 4160.0` emits `4.1600000E3` on macOS and ELF alike. The
+  corpus's CHECK lines have been written around it, which is why it
+  never surfaced. Owner: l05 (F2023 I/O sprint) — implement Fw.d
+  editing alongside the AT/LEADING_ZERO work.
+
+Unexplained transient during x10 validation on nomad (2026-06-12):
+
+- **rank_remap_strided_section_copyin.f90 failed (ERROR STOP 5) at
+  -O0 on arm64** from one specific build lineage of the compiler —
+  three consecutive runs across two separately-invoked builds — then
+  vanished: a per-commit bisect over the same range passed everywhere
+  including the previously-failing head, and a 20× compile+run stress
+  of the rebuilt head produced zero failures and byte-identical asm
+  every time. Same source, different binary, deterministic per
+  binary. Prime suspect is corrupted rustc incremental state in
+  nomad's target dir (dozens of branch switches that day); cargo
+  clean applied. NOT reproduced on a clean build anywhere, and CI's
+  fresh-checkout macOS jobs never saw it. If it recurs: SAVE THE BAD
+  COMPILER BINARY before rebuilding — that artifact is the evidence
+  the investigation needs.

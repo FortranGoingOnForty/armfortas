@@ -8,7 +8,11 @@
 ! IR_CHECK: call @afs_array_add_i32(
 ! IR_CHECK: call @afs_fill_i32(
 ! ASM_CHECK: _afs_array_add_i32
+! ASM_CHECK(x86_64-freebsd): afs_array_add_i32
+! ASM_CHECK(x86_64-linux-gnu): afs_array_add_i32
 ! ASM_CHECK: _afs_fill_i32
+! ASM_CHECK(x86_64-freebsd): afs_fill_i32
+! ASM_CHECK(x86_64-linux-gnu): afs_fill_i32
 program test_array_bulk_kernels
   implicit none
   integer :: a(8), b(8), c(8)

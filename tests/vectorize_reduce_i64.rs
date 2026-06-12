@@ -64,11 +64,22 @@ fn o3_vectorizes_i64_sum_reduction() {
         },
         Stage::Asm,
     );
-    assert!(
-        o3_asm.contains("addp.2d") && o3_asm.contains("umov.d"),
-        "VReduceSum on i64 should lower via addp.2d + umov.d:\n{}",
-        o3_asm
-    );
+    if cfg!(target_arch = "aarch64") {
+        assert!(
+            o3_asm.contains("addp.2d") && o3_asm.contains("umov.d"),
+            "VReduceSum on i64 should lower via addp.2d + umov.d:\n{}",
+            o3_asm
+        );
+    } else {
+        // x86: SSE2 reduces the two i64 lanes through a shuffle plus
+        // paddq; the shuffle/extract shape is an isel detail, so
+        // assert the step op.
+        assert!(
+            o3_asm.contains("paddq"),
+            "VReduceSum on i64 should step through paddq:\n{}",
+            o3_asm
+        );
+    }
 
     let stdout = capture_run_stdout(CaptureRequest {
         input: source,

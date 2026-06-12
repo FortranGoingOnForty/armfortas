@@ -112,10 +112,18 @@ fn o3_vectorizes_full_extent_do_loop_and_keeps_objects_deterministic() {
             "kernel-form O3 assembly should reference the bulk add kernel:\n{}",
             o3_asm
         );
-    } else {
+    } else if cfg!(target_arch = "aarch64") {
         assert!(
             o3_asm.contains("ldr q") || o3_asm.contains("add.4s") || o3_asm.contains("str q"),
             "neon-form O3 assembly should reference 128-bit vector ops:\n{}",
+            o3_asm
+        );
+    } else {
+        // x86: SseVectorize (x10) lowers the i32 add over 4-lane
+        // vectors as paddd with movups loads/stores.
+        assert!(
+            o3_asm.contains("paddd") && o3_asm.contains("movups"),
+            "sse-form O3 assembly should reference packed i32 add and unaligned moves:\n{}",
             o3_asm
         );
     }

@@ -66,19 +66,26 @@ pub fn native_macho_toolchain_support() -> Result<(), String> {
     }
 }
 
-/// Gate for suites that assert vectorized (NEON) IR/asm shapes. The
-/// vectorizer passes register only for arm64 (x09 pass audit); the x86
-/// SIMD story is x10. Keep these suites arm64-macos-only until then.
+/// Gate for suites that assert vectorized IR/asm shapes: NEON shapes
+/// on arm64-macos, SSE2 shapes on x86_64 ELF glibc/FreeBSD hosts since
+/// x10 registered SseVectorize at O3/Ofast. Shapes the SSE2 legality
+/// table refuses (src/opt/vec_isa.rs) stay scalar on x86; suites
+/// assert per-arch. musl waits on the x11 link story.
 pub fn native_vectorizer_support() -> Result<(), String> {
     let host = crate::target::TargetSpec::host();
     if host == crate::target::TargetSpec::parse("arm64-macos").unwrap() {
-        Ok(())
-    } else {
-        Err(format!(
-            "host {}: vectorizer passes are arm64-only until x10",
-            host
-        ))
+        return Ok(());
     }
+    if host.arch == crate::target::Arch::X86_64
+        && host.object_format() == crate::target::ObjectFormat::Elf
+        && host.libc != crate::target::Libc::Musl
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "host {} has no native run path (musl linking lands in x11)",
+        host
+    ))
 }
 
 /// Level-aware gate for the run_programs sweep: macOS and x86_64 ELF

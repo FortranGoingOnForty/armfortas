@@ -324,6 +324,61 @@ fn emit_inst(inst: &X86Inst, func: &X86Function) -> String {
         // Non-destructive two-operand form: `sqrtsd %src, %dst`.
         Sqrtss => format!("sqrtss {}, {}", op(0), def()),
         Sqrtsd => format!("sqrtsd {}, {}", op(0), def()),
+        // ---- Packed SSE2 (x10). Tied family prints like the scalar
+        // SSE block above: src = operands[1], dst = def (== tied
+        // operands[0] after twoaddr). ----
+        Addps | Addpd | Subps | Subpd | Mulps | Mulpd | Divps | Divpd | Minps | Minpd | Maxps
+        | Maxpd | Paddd | Paddq | Psubd | Psubq | Pand | Pandn | Por | Pxor | Pcmpgtd | Pcmpeqd
+        | Movhlps | Unpcklpd | Punpcklqdq => {
+            let mn = match inst.opcode {
+                Addps => "addps",
+                Addpd => "addpd",
+                Subps => "subps",
+                Subpd => "subpd",
+                Mulps => "mulps",
+                Mulpd => "mulpd",
+                Divps => "divps",
+                Divpd => "divpd",
+                Minps => "minps",
+                Minpd => "minpd",
+                Maxps => "maxps",
+                Maxpd => "maxpd",
+                Paddd => "paddd",
+                Paddq => "paddq",
+                Psubd => "psubd",
+                Psubq => "psubq",
+                Pand => "pand",
+                Pandn => "pandn",
+                Por => "por",
+                Pxor => "pxor",
+                Pcmpgtd => "pcmpgtd",
+                Pcmpeqd => "pcmpeqd",
+                Movhlps => "movhlps",
+                Unpcklpd => "unpcklpd",
+                _ => "punpcklqdq",
+            };
+            format!("{} {}, {}", mn, op(1), def())
+        }
+        // movups covers both directions: the load form has the
+        // address in operands[0] and the register def; the store
+        // form has the value in operands[0] and the address as def.
+        Movups => format!("movups {}, {}", op(0), def()),
+        Movaps => format!("movaps {}, {}", op(0), def()),
+        Sqrtps => format!("sqrtps {}, {}", op(0), def()),
+        Sqrtpd => format!("sqrtpd {}, {}", op(0), def()),
+        // Predicate-immediate compares: `cmpps $imm, %src, %dst`
+        // (tied; operands = [dst, src, imm]).
+        Cmpps => format!("cmpps {}, {}, {}", op(2), op(1), def()),
+        Cmppd => format!("cmppd {}, {}, {}", op(2), op(1), def()),
+        // Shuffles with immediate: pshufd is untied (src + imm → dst);
+        // shufps is tied (operands = [dst, src, imm]).
+        Pshufd => format!("pshufd {}, {}, {}", op(1), op(0), def()),
+        Shufps => format!("shufps {}, {}, {}", op(2), op(1), def()),
+        // GP <-> XMM lane-0 move; movq for 64-bit lanes.
+        Movd => match inst.size {
+            OpSize::Q => format!("movq {}, {}", op(0), def()),
+            _ => format!("movd {}, {}", op(0), def()),
+        },
         Ucomiss => format!("ucomiss {}, {}", op(1), op(0)),
         Ucomisd => format!("ucomisd {}, {}", op(1), op(0)),
         // The integer side of cvt carries the suffix (cvtsi2sdq for a

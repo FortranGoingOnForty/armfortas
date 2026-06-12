@@ -5,8 +5,10 @@
 #   - Compile time (wall clock)
 #   - Binary size
 #
-# Compares against a baseline file (.benchmarks/baseline.txt).
-# If no baseline exists, creates one.
+# Compares against a per-target baseline file
+# (.benchmarks/baseline-<triple>.txt, triple from `armfortas
+# --print-target`). If no baseline exists, creates one. Thresholds
+# are shared across targets; the baselines are not (x10).
 #
 # Usage:
 #   ./scripts/benchmark_gate.sh           # compare against baseline
@@ -15,12 +17,18 @@
 # Thresholds:
 #   Compile time: fail if >30% slower than baseline
 #   Binary size:  fail if >15% larger than baseline
+#
+# BENCH_SKIP_TIME=1 skips the compile-time comparison (still recorded).
+# CI sets it: committed time baselines come from the fleet machines
+# (dorado/hasu/nomad) and wall-clock is not comparable across hosts;
+# binary size is, so size gates everywhere.
 
 set -euo pipefail
-cd "$(git rev-parse --show-toplevel)"
+# Repo root via git when available; the FreeBSD CI VM has no git (the
+# tree arrives by rsync) and already runs from the root.
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 
 COMPILER="./target/release/armfortas"
-BASELINE=".benchmarks/baseline.txt"
 PROGRAMS=(
     test_programs/array_bulk_kernels.f90
     test_programs/module_init.f90
@@ -35,9 +43,37 @@ if [ ! -x "$COMPILER" ]; then
     exit 1
 fi
 
+TRIPLE=$("$COMPILER" --print-target)
+# Linux baselines are additionally distro-tagged: NixOS and ubuntu
+# link different crt/libgcc/build-id sets, so binary sizes are only
+# comparable within a distro (learned when CI's ubuntu binaries came
+# out 63-81% larger than the NixOS baseline). An environment without
+# a committed baseline bootstraps one and passes — commit it to arm
+# the gate there.
+ENV_TAG=""
+case "$TRIPLE" in
+*linux*)
+    if [ -r /etc/os-release ]; then
+        ENV_TAG="-$(. /etc/os-release && echo "$ID")"
+    fi
+    ;;
+esac
+BASELINE=".benchmarks/baseline-${TRIPLE}${ENV_TAG}.txt"
+echo "Target: $TRIPLE (baseline: $BASELINE)"
+
 mkdir -p .benchmarks
 TMPDIR=$(mktemp -d)
 trap "rm -rf $TMPDIR" EXIT
+
+# Monotonic-ish seconds: python3 where present (the fleet boxes),
+# whole-second date elsewhere (the CI VM, which gates size only).
+now_s() {
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import time; print(f"{time.monotonic():.4f}")'
+    else
+        date +%s
+    fi
+}
 
 compile_and_measure() {
     local src="$1"
@@ -47,10 +83,10 @@ compile_and_measure() {
 
     # Compile and time it
     local start end elapsed
-    start=$(python3 -c 'import time; print(time.monotonic())')
+    start=$(now_s)
     "$COMPILER" "$src" $OPT -o "$binary" 2>/dev/null
-    end=$(python3 -c 'import time; print(time.monotonic())')
-    elapsed=$(python3 -c "print(f'{$end - $start:.4f}')")
+    end=$(now_s)
+    elapsed=$(awk -v a="$start" -v b="$end" 'BEGIN { printf "%.4f", b - a }')
 
     # Binary size
     local size
@@ -102,32 +138,21 @@ while IFS=' ' read -r name time size; do
     base_time=$(echo "$baseline_line" | awk '{print $2}')
     base_size=$(echo "$baseline_line" | awk '{print $3}')
 
-    # Time regression check (30% threshold)
-    time_ratio=$(python3 -c "
-bt, ct = $base_time, $time
-if bt > 0:
-    ratio = ct / bt
-    print(f'{ratio:.2f}')
-else:
-    print('1.00')
-")
-    time_pct=$(python3 -c "print(f'{($time / max($base_time, 0.001) - 1) * 100:.1f}')")
-
-    # Size regression check (15% threshold)
-    size_pct=$(python3 -c "
-bs, cs = $base_size, $size
-if bs > 0:
-    print(f'{(cs / bs - 1) * 100:.1f}')
-else:
-    print('0.0')
-")
+    # All threshold math in awk: the CI VM has no python3.
+    time_pct=$(awk -v b="$base_time" -v c="$time" \
+        'BEGIN { if (b < 0.001) b = 0.001; printf "%.1f", (c / b - 1) * 100 }')
+    size_pct=$(awk -v b="$base_size" -v c="$size" \
+        'BEGIN { if (b < 1) b = 1; printf "%.1f", (c / b - 1) * 100 }')
 
     status="OK"
-    if python3 -c "exit(0 if $time / max($base_time, 0.001) > 1.30 else 1)" 2>/dev/null; then
+    if [ "${BENCH_SKIP_TIME:-0}" != "1" ] \
+        && [ "$(awk -v b="$base_time" -v c="$time" \
+            'BEGIN { if (b < 0.001) b = 0.001; print (c / b > 1.30) ? 1 : 0 }')" = "1" ]; then
         status="SLOW"
         FAIL=1
     fi
-    if python3 -c "exit(0 if $size / max($base_size, 1) > 1.15 else 1)" 2>/dev/null; then
+    if [ "$(awk -v b="$base_size" -v c="$size" \
+        'BEGIN { if (b < 1) b = 1; print (c / b > 1.15) ? 1 : 0 }')" = "1" ]; then
         status="BLOAT"
         FAIL=1
     fi

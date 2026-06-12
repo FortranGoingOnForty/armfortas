@@ -115,3 +115,23 @@ a compile error. Deliverable 3 is satisfied by construction; what
 remains is adding the x86 counterpart passes (peephole — deliverable
 4) and a real x86 register allocator (the matrix work), since the x86
 path currently runs `regalloc_naive` at every level.
+
+## MIN/MAX NaN policy (x10 addendum)
+
+Scalar and vector MIN/MAX agree per target but differ across targets,
+both conforming (Fortran leaves MAX/MIN with NaN processor-dependent):
+
+- Element-wise MIN/MAX now implements select-of-compare semantics on
+  BOTH targets (NaN lane takes the second operand): x86 via
+  min/max[ps|pd] operand ordering, arm64 via fcmge+bsl — the original
+  fmax.4s lowering propagated NaN and broke the per-target O0≡O3
+  invariant (caught by x10_minmax_nan_lanes' OPT_EQ on macOS CI).
+- Across-lane MIN/MAX reductions keep the native forms
+  (fmaxv/fminv/fmaxp on arm, min/max[ps|pd] shuffle trees on x86);
+  their NaN behavior matches each target's scalar reduction loop but
+  can differ cross-target for NaN-bearing inputs.
+
+`test_programs/x10_minmax_nan_lanes.f90` pins the per-target
+O0≡O3 invariant and the policy-independent lanes; it deliberately
+does not pin the NaN lane's value. x12's gfortran differentials must
+compare NaN-bearing MIN/MAX outputs per this note, not byte-wise.

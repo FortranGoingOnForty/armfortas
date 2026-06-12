@@ -15,7 +15,7 @@
 //!   mov+op, so their intervals interfere and regalloc cannot
 //!   reintroduce the register-level alias.
 
-use super::mir::{OpSize, X86Function, X86Inst, X86Opcode, X86Operand};
+use super::mir::{OpSize, X86Function, X86Inst, X86Opcode, X86Operand, X86RegClass};
 
 /// Tied opcodes whose operands may swap (`a op b == b op a`).
 fn is_commutative(op: X86Opcode) -> bool {
@@ -35,6 +35,10 @@ fn move_opcode(op: X86Opcode) -> (X86Opcode, Option<OpSize>) {
     match op {
         Addss | Subss | Mulss | Divss | Xorps | Andps => (Movss, Some(OpSize::L)),
         Addsd | Subsd | Mulsd | Divsd | Xorpd | Andpd => (Movsd, Some(OpSize::Q)),
+        // Packed SSE2 (x10): the tie copy must move all 128 bits.
+        Addps | Addpd | Subps | Subpd | Mulps | Mulpd | Divps | Divpd | Minps | Minpd | Maxps
+        | Maxpd | Paddd | Paddq | Psubd | Psubq | Pand | Pandn | Por | Pxor | Pcmpgtd | Pcmpeqd
+        | Cmpps | Cmppd | Shufps | Movhlps | Unpcklpd | Punpcklqdq => (Movaps, Some(OpSize::Q)),
         // GP moves reuse the op's own size.
         _ => (MovRR, None),
     }
@@ -66,7 +70,20 @@ pub fn convert_to_two_address(f: &mut X86Function) {
             }
 
             let (mv, mv_size) = move_opcode(inst.opcode);
-            let mv_size = mv_size.unwrap_or(inst.size);
+            let mut mv = mv;
+            let mut mv_size = mv_size.unwrap_or(inst.size);
+            // xorps/andps and friends serve both the scalar lowering
+            // (sign flips on Xmm-class values, movss/movsd tie copies)
+            // and the packed one (x10, Xmm128). The opcode alone can't
+            // tell them apart — the def's class can: a 128-bit def
+            // must tie-copy all 128 bits or the upper lanes arrive as
+            // stale slot bytes.
+            if let X86Operand::VReg(v) = &def {
+                if v.class == X86RegClass::Xmm128 {
+                    mv = X86Opcode::Movaps;
+                    mv_size = OpSize::Q;
+                }
+            }
 
             if inst.operands.get(1) == Some(&def) {
                 // The d==b pitfall: route b through a fresh temp.

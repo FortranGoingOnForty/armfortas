@@ -18,8 +18,12 @@ pub enum X86RegClass {
     Gp64,
     Gp32,
     Gp8,
-    /// Scalar f32/f64 now; SSE vectors in x10.
+    /// Scalar f32/f64 in the low lane of an XMM register.
     Xmm,
+    /// Full 128-bit XMM vector value (x10). Same physical registers
+    /// as `Xmm`; the class drives slot width (16 bytes) and spill
+    /// traffic (movups) in the allocator.
+    Xmm128,
 }
 
 /// Physical registers. GP names for all three widths derive from one
@@ -336,6 +340,61 @@ pub enum X86Opcode {
     Andpd,
     Sqrtss,
     Sqrtsd,
+
+    // ---- Packed SSE2 (x10 vectorizer; nothing above SSE2, ever —
+    // the CI ISA-ceiling grep enforces it) ----
+    /// Unaligned 128-bit load/store/move. Used for every vector
+    /// load/store regardless of element type: descriptors don't
+    /// guarantee 16-byte alignment and movups on aligned data costs
+    /// the same on every µarch that matters.
+    Movups,
+    /// Register-register 128-bit move.
+    Movaps,
+    Addps,
+    Addpd,
+    Subps,
+    Subpd,
+    Mulps,
+    Mulpd,
+    Divps,
+    Divpd,
+    Sqrtps,
+    Sqrtpd,
+    /// NaN/zero semantics: returns the SECOND operand (the AT&T src)
+    /// when either input is NaN. Isel orders operands so this matches
+    /// the scalar select-of-compare lowering.
+    Minps,
+    Minpd,
+    Maxps,
+    Maxpd,
+    /// Packed integer add/sub, 4×i32 / 2×i64 (tied).
+    Paddd,
+    Paddq,
+    Psubd,
+    Psubq,
+    /// Packed bitwise (tied): mask select via pand/pandn/por.
+    Pand,
+    Pandn,
+    Por,
+    Pxor,
+    /// Packed signed i32 compare-greater (tied); the only packed
+    /// integer compare SSE2 offers besides pcmpeqd.
+    Pcmpgtd,
+    Pcmpeqd,
+    /// Packed float compares: predicate immediate in operands
+    /// (0=eq, 1=lt, 2=le, 4=ne, 5=nlt/ge, 6=nle/gt — isel uses
+    /// only 0/1/2/4 plus operand swap).
+    Cmpps,
+    Cmppd,
+    /// Lane shuffles for broadcast and reduction trees.
+    Pshufd,
+    Shufps,
+    Movhlps,
+    Unpcklpd,
+    Punpcklqdq,
+    /// GP <-> XMM lane 0 moves for broadcasts and extracts
+    /// (movd/movq by size).
+    Movd,
 }
 
 impl X86Opcode {
@@ -350,6 +409,14 @@ impl X86Opcode {
             Add | Sub | Adc | Sbb | Imul | And | Or | Xor | Neg | Not | Shl | Shr | Sar | Addss
             | Addsd | Subss | Subsd | Mulss | Mulsd | Divss | Divsd | Xorps | Xorpd | Andps
             | Andpd => Some(0),
+            // Packed SSE2 is destructive two-operand like the scalar
+            // SSE family. pshufd is NOT tied (imm + src → dst);
+            // sqrtps/pd likewise (src → dst).
+            Addps | Addpd | Subps | Subpd | Mulps | Mulpd | Divps | Divpd | Minps | Minpd
+            | Maxps | Maxpd | Paddd | Paddq | Psubd | Psubq | Pand | Pandn | Por | Pxor
+            | Pcmpgtd | Pcmpeqd | Cmpps | Cmppd | Shufps | Movhlps | Unpcklpd | Punpcklqdq => {
+                Some(0)
+            }
             // Sqrtss/Sqrtsd are two-operand non-destructive
             // (`sqrtsd %src, %dst`) — deliberately not tied.
             _ => None,

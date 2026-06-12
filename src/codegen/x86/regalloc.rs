@@ -59,7 +59,13 @@ pub fn regalloc_naive(f: &mut X86Function) {
     let mut ids: Vec<VRegId> = vreg_class.keys().copied().collect();
     ids.sort(); // deterministic slot assignment
     for id in ids {
-        let slot = f.alloc_frame_slot(8, 8);
+        // Vector vregs spill the full 128 bits; everything else gets
+        // the usual 8-byte slot.
+        let slot = if vreg_class.get(&id) == Some(&X86RegClass::Xmm128) {
+            f.alloc_frame_slot(16, 16)
+        } else {
+            f.alloc_frame_slot(8, 8)
+        };
         vreg_slot.insert(id, slot);
     }
 
@@ -95,7 +101,7 @@ pub fn regalloc_naive(f: &mut X86Function) {
             let mut fp_used = 0usize;
             let mut scratch_for = |v: &X86VReg| -> X86Reg {
                 match v.class {
-                    X86RegClass::Xmm => {
+                    X86RegClass::Xmm | X86RegClass::Xmm128 => {
                         let r = FP_SCRATCH[fp_used.min(1)];
                         fp_used += 1;
                         r
@@ -179,9 +185,11 @@ pub fn regalloc_naive(f: &mut X86Function) {
             if !tied {
                 match inst.def.clone() {
                     Some(X86Operand::VReg(v)) => {
-                        let is_fp_store_addr =
-                            matches!(inst.opcode, X86Opcode::Movss | X86Opcode::Movsd)
-                                && v.class != X86RegClass::Xmm;
+                        let is_fp_store_addr = matches!(
+                            inst.opcode,
+                            X86Opcode::Movss | X86Opcode::Movsd | X86Opcode::Movups
+                        ) && v.class != X86RegClass::Xmm
+                            && v.class != X86RegClass::Xmm128;
                         let scratch = scratch_for(&v);
                         let slot = vreg_slot[&v.id];
                         if is_fp_store_addr {
@@ -270,10 +278,11 @@ fn addr_operand_position(inst: &X86Inst) -> Option<usize> {
         // the is_fp_store_addr def handling below). Without this the
         // pointer itself was loaded as the "value" and gas rejected
         // `movss %r10d, %xmm14` — ~100 sweep programs at once (x07).
-        X86Opcode::Movss | X86Opcode::Movsd
+        X86Opcode::Movss | X86Opcode::Movsd | X86Opcode::Movups
             if matches!(
                 inst.operands.first(),
-                Some(X86Operand::VReg(v)) if v.class != X86RegClass::Xmm
+                Some(X86Operand::VReg(v))
+                    if v.class != X86RegClass::Xmm && v.class != X86RegClass::Xmm128
             ) =>
         {
             Some(0)
@@ -284,6 +293,12 @@ fn addr_operand_position(inst: &X86Inst) -> Option<usize> {
 
 fn load(scratch: X86Reg, class: X86RegClass, mem: X86Operand, size: OpSize) -> X86Inst {
     match class {
+        X86RegClass::Xmm128 => X86Inst {
+            opcode: X86Opcode::Movups,
+            size: OpSize::Q,
+            operands: vec![mem],
+            def: Some(X86Operand::Reg(scratch)),
+        },
         X86RegClass::Xmm => X86Inst {
             opcode: if size == OpSize::L {
                 X86Opcode::Movss
@@ -305,6 +320,12 @@ fn load(scratch: X86Reg, class: X86RegClass, mem: X86Operand, size: OpSize) -> X
 
 fn store(scratch: X86Reg, class: X86RegClass, mem: X86Operand, size: OpSize) -> X86Inst {
     match class {
+        X86RegClass::Xmm128 => X86Inst {
+            opcode: X86Opcode::Movups,
+            size: OpSize::Q,
+            operands: vec![X86Operand::Reg(scratch)],
+            def: Some(mem),
+        },
         X86RegClass::Xmm => X86Inst {
             opcode: if size == OpSize::L {
                 X86Opcode::Movss

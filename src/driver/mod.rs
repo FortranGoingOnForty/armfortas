@@ -75,6 +75,32 @@ pub enum SourceFormOverride {
     Fixed,
 }
 
+/// Target CPU capability level (x10). One binary targets one ISA
+/// level — no runtime dispatch. `Baseline` means the architectural
+/// floor: SSE2 on x86_64, NEON on arm64. Higher levels
+/// (x86-64-v2, avx2, ...) are reserved names until a sprint takes
+/// them; parse rejects them so scripts fail loudly instead of
+/// compiling at a level the user didn't get.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TargetCpu {
+    #[default]
+    Baseline,
+}
+
+fn parse_target_cpu(name: &str) -> Result<TargetCpu, String> {
+    match name {
+        "baseline" => Ok(TargetCpu::Baseline),
+        "x86-64-v2" | "x86-64-v3" | "avx2" | "avx512" => Err(format!(
+            "--target-cpu={} is reserved but not implemented; only 'baseline' is supported",
+            name
+        )),
+        other => Err(format!(
+            "unknown --target-cpu '{}'; only 'baseline' is supported",
+            other
+        )),
+    }
+}
+
 /// Action that should run when args parsing completes successfully
 /// without producing a compile job (e.g. --help, --version).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +108,9 @@ pub enum InfoAction {
     Help,
     Version,
     DumpVersion,
+    /// Print the default (host) target triple. Scripts key per-target
+    /// artifacts off this (x10: benchmark baselines).
+    PrintTarget,
 }
 
 /// Result of parsing CLI args — either a real compile job or an
@@ -178,6 +207,8 @@ pub struct Options {
     /// `-no-pie`: link a position-dependent executable (crt1.o, no
     /// -pie). ELF targets only; the default is PIE.
     pub no_pie: bool,
+    /// ISA capability level (x10): baseline only today.
+    pub target_cpu: TargetCpu,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -235,6 +266,7 @@ impl Default for Options {
             target: crate::target::TargetSpec::host(),
             crt_search_dirs: Vec::new(),
             no_pie: false,
+            target_cpu: TargetCpu::Baseline,
         }
     }
 }
@@ -296,6 +328,7 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
             "--help" | "-h" => info_action = Some(InfoAction::Help),
             "--version" | "-V" => info_action = Some(InfoAction::Version),
             "-dumpversion" => info_action = Some(InfoAction::DumpVersion),
+            "--print-target" => info_action = Some(InfoAction::PrintTarget),
 
             // ---- Output path ----
             "-o" => {
@@ -334,6 +367,19 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
             }
             arg if arg.starts_with("--target=") => {
                 opts.target = crate::target::TargetSpec::parse(&arg["--target=".len()..])?;
+            }
+            // ---- Target CPU capability (x10) ----
+            // One binary targets one ISA level; runtime dispatch is
+            // deliberately out of scope. Only the architectural
+            // baseline is accepted today (SSE2 on x86_64, NEON on
+            // arm64); names like x86-64-v2/avx2 are reserved.
+            "--target-cpu" => {
+                i += 1;
+                let cpu = args.get(i).ok_or("--target-cpu requires a value")?;
+                opts.target_cpu = parse_target_cpu(cpu)?;
+            }
+            arg if arg.starts_with("--target-cpu=") => {
+                opts.target_cpu = parse_target_cpu(&arg["--target-cpu=".len()..])?;
             }
             "-B" => {
                 i += 1;
@@ -802,6 +848,9 @@ COMPILATION:
   --target <triple>           Target to compile for (default: this machine).
                               Supported: arm64-macos, x86_64-freebsd,
                               x86_64-linux-gnu, x86_64-linux-musl
+  --target-cpu <level>        ISA capability level; only 'baseline' today
+                              (SSE2 on x86_64, NEON on arm64)
+  --print-target              Print the default target triple and exit
   -B <dir>                    Extra crt-object search directory (ELF link;
                               also AFS_CRT_DIR). Required on layouts without
                               an FHS crt location, e.g. NixOS

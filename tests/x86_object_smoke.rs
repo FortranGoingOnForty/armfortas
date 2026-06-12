@@ -129,7 +129,7 @@ fn curated_programs_compile_to_elf_objects() {
                 hdr_text
             );
             let syms = Command::new(&readelf)
-                .args(["-s"])
+                .args(["-s", "-W"])
                 .arg(&obj)
                 .output()
                 .expect("cannot run readelf -s");

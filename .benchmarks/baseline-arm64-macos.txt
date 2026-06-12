@@ -1,0 +1,6 @@
+array_bulk_kernels 0.0959 1839824
+module_init 0.0812 1648488
+two_loops 0.0879 1648360
+derived_type_nested 0.0833 1648416
+allocatable 0.0892 1839800
+

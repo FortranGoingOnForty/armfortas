@@ -66,18 +66,34 @@ fn o3_vectorizes_fp_sum_reductions() {
         },
         Stage::Asm,
     );
-    // f32 reduce: faddp.4s + faddp.2s pair.
-    // f64 reduce: faddp.2d (single step).
-    assert!(
-        o3_asm.contains("faddp.4s") && o3_asm.contains("faddp.2s"),
-        "f32 reduce should use the two-step faddp pair:\n{}",
-        o3_asm
-    );
-    assert!(
-        o3_asm.contains("faddp.2d"),
-        "f64 reduce should use faddp.2d:\n{}",
-        o3_asm
-    );
+    if cfg!(target_arch = "aarch64") {
+        // f32 reduce: faddp.4s + faddp.2s pair.
+        // f64 reduce: faddp.2d (single step).
+        assert!(
+            o3_asm.contains("faddp.4s") && o3_asm.contains("faddp.2s"),
+            "f32 reduce should use the two-step faddp pair:\n{}",
+            o3_asm
+        );
+        assert!(
+            o3_asm.contains("faddp.2d"),
+            "f64 reduce should use faddp.2d:\n{}",
+            o3_asm
+        );
+    } else {
+        // x86: the SSE2 reduce tree shape (pshufd/movhlps shuffles)
+        // is an isel detail; assert the step ops instead — addps for
+        // the f32 lanes, addpd for the f64 lanes.
+        assert!(
+            o3_asm.contains("addps"),
+            "f32 reduce should step through addps:\n{}",
+            o3_asm
+        );
+        assert!(
+            o3_asm.contains("addpd"),
+            "f64 reduce should step through addpd:\n{}",
+            o3_asm
+        );
+    }
 
     let stdout = capture_run_stdout(CaptureRequest {
         input: source,
