@@ -2206,6 +2206,9 @@ fn cmp_operand_vreg(
 fn emit_vreg_move(mf: &mut X86Function, mb: MBlockId, dst: X86VReg, src: X86VReg) {
     let (opcode, size) = match dst.class {
         X86RegClass::Xmm => (X86Opcode::Movsd, OpSize::Q),
+        // Vector block params (the vectorized accumulator) move all
+        // 128 bits (x10).
+        X86RegClass::Xmm128 => (X86Opcode::Movaps, OpSize::Q),
         class => (X86Opcode::MovRR, gp_move_size(class)),
     };
     push(
