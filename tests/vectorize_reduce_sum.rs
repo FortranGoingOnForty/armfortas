@@ -66,16 +66,27 @@ fn o3_vectorizes_manual_sum_reduction_loop() {
         },
         Stage::Asm,
     );
-    assert!(
-        o3_asm.contains("mov.16b"),
-        "regalloc must materialise V128 block-param transfers via `mov.16b`, not `fmov d`:\n{}",
-        o3_asm
-    );
-    assert!(
-        o3_asm.contains("addv.4s"),
-        "VReduceSum should lower to `addv.4s` for an i32 accumulator:\n{}",
-        o3_asm
-    );
+    if cfg!(target_arch = "aarch64") {
+        assert!(
+            o3_asm.contains("mov.16b"),
+            "regalloc must materialise V128 block-param transfers via `mov.16b`, not `fmov d`:\n{}",
+            o3_asm
+        );
+        assert!(
+            o3_asm.contains("addv.4s"),
+            "VReduceSum should lower to `addv.4s` for an i32 accumulator:\n{}",
+            o3_asm
+        );
+    } else {
+        // x86: the SSE2 reduce tree (pshufd + step op + movd extract)
+        // is an isel detail; assert the paddd step op for the i32
+        // accumulator.
+        assert!(
+            o3_asm.contains("paddd"),
+            "VReduceSum should step through paddd for an i32 accumulator:\n{}",
+            o3_asm
+        );
+    }
 
     // Runtime: sum(1..32) = 32*33/2 = 528.
     let stdout = capture_run_stdout(CaptureRequest {

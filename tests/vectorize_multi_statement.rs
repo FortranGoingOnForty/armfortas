@@ -47,22 +47,34 @@ fn o3_vectorizes_two_statement_do_body() {
         Stage::OptIr,
     );
 
-    // Both statements should land in vector form: at least two VStores
-    // and two VAdds/VMuls in the IR (one for `a(i)=b(i)+scale`, one
-    // for `c(i)=b(i)*6`).
-    let n_vstore = o3_ir.matches("vstore").count();
-    let n_vbroadcast = o3_ir.matches("vbroadcast").count();
-    assert!(
-        n_vstore >= 2,
-        "two-store body should produce >=2 VStores, got {}:\n{}",
-        n_vstore,
-        o3_ir
-    );
-    assert!(
-        n_vbroadcast >= 1,
-        "scale and constant 6 should each become a VBroadcast (>=1 expected):\n{}",
-        o3_ir
-    );
+    if cfg!(target_arch = "aarch64") {
+        // Both statements should land in vector form: at least two VStores
+        // and two VAdds/VMuls in the IR (one for `a(i)=b(i)+scale`, one
+        // for `c(i)=b(i)*6`).
+        let n_vstore = o3_ir.matches("vstore").count();
+        let n_vbroadcast = o3_ir.matches("vbroadcast").count();
+        assert!(
+            n_vstore >= 2,
+            "two-store body should produce >=2 VStores, got {}:\n{}",
+            n_vstore,
+            o3_ir
+        );
+        assert!(
+            n_vbroadcast >= 1,
+            "scale and constant 6 should each become a VBroadcast (>=1 expected):\n{}",
+            o3_ir
+        );
+    } else {
+        // x86: `c(i)=b(i)*6` needs an i32 lane multiply, which SSE2
+        // refuses (vec_isa.rs int_mul = false); the loop body is
+        // analyzed as a unit, so the whole loop stays scalar.
+        assert_eq!(
+            o3_ir.matches("vstore").count(),
+            0,
+            "SSE2 refuses the i32 lane multiply; the two-statement loop must stay scalar:\n{}",
+            o3_ir
+        );
+    }
 
     // Runtime check: a(1)=8, a(32)=39, c(1)=6, d(32)=c(32)=192.
     let stdout = capture_run_stdout(CaptureRequest {

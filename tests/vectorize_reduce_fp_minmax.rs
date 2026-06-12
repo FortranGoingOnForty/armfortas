@@ -74,28 +74,43 @@ fn o3_vectorizes_fp_minmax_reductions() {
         },
         Stage::Asm,
     );
-    assert!(
-        o3_asm.contains("fmaxv.4s"),
-        "f32 max reduce should use fmaxv.4s:\n{}",
-        o3_asm
-    );
-    assert!(
-        o3_asm.contains("fminv.4s"),
-        "f32 min reduce should use fminv.4s:\n{}",
-        o3_asm
-    );
-    // f64: NEON has no fmaxv.2d, the pairwise scalar form is the
-    // across-lane reduce for two f64 lanes.
-    assert!(
-        o3_asm.contains("fmaxp.2d"),
-        "f64 max reduce should use fmaxp.2d:\n{}",
-        o3_asm
-    );
-    assert!(
-        o3_asm.contains("fminp.2d"),
-        "f64 min reduce should use fminp.2d:\n{}",
-        o3_asm
-    );
+    if cfg!(target_arch = "aarch64") {
+        assert!(
+            o3_asm.contains("fmaxv.4s"),
+            "f32 max reduce should use fmaxv.4s:\n{}",
+            o3_asm
+        );
+        assert!(
+            o3_asm.contains("fminv.4s"),
+            "f32 min reduce should use fminv.4s:\n{}",
+            o3_asm
+        );
+        // f64: NEON has no fmaxv.2d, the pairwise scalar form is the
+        // across-lane reduce for two f64 lanes.
+        assert!(
+            o3_asm.contains("fmaxp.2d"),
+            "f64 max reduce should use fmaxp.2d:\n{}",
+            o3_asm
+        );
+        assert!(
+            o3_asm.contains("fminp.2d"),
+            "f64 min reduce should use fminp.2d:\n{}",
+            o3_asm
+        );
+    } else {
+        // x86: SSE2 reduces through a shuffle tree; the tree shape is
+        // an isel detail, so assert the step ops per element type.
+        assert!(
+            o3_asm.contains("maxps") && o3_asm.contains("minps"),
+            "f32 min/max reduces should step through maxps/minps:\n{}",
+            o3_asm
+        );
+        assert!(
+            o3_asm.contains("maxpd") && o3_asm.contains("minpd"),
+            "f64 min/max reduces should step through maxpd/minpd:\n{}",
+            o3_asm
+        );
+    }
 
     let stdout = capture_run_stdout(CaptureRequest {
         input: source,

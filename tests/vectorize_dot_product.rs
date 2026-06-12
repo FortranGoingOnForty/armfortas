@@ -46,20 +46,31 @@ fn o3_vectorizes_manual_dot_product_loop() {
         },
         Stage::OptIr,
     );
-    // The dot-product path produces two vloads, a vmul, a vadd into
-    // the vector accumulator, and a final vreduce_sum.
-    let n_vload = o3_ir.matches("vload").count();
-    assert!(
-        n_vload >= 2,
-        "dot product needs at least 2 VLoads in the body, got {}:\n{}",
-        n_vload,
-        o3_ir
-    );
-    assert!(
-        o3_ir.contains("vmul") && o3_ir.contains("vadd") && o3_ir.contains("vreduce_sum"),
-        "expected dot-product shape (vmul + vadd + vreduce_sum):\n{}",
-        o3_ir
-    );
+    if cfg!(target_arch = "aarch64") {
+        // The dot-product path produces two vloads, a vmul, a vadd into
+        // the vector accumulator, and a final vreduce_sum.
+        let n_vload = o3_ir.matches("vload").count();
+        assert!(
+            n_vload >= 2,
+            "dot product needs at least 2 VLoads in the body, got {}:\n{}",
+            n_vload,
+            o3_ir
+        );
+        assert!(
+            o3_ir.contains("vmul") && o3_ir.contains("vadd") && o3_ir.contains("vreduce_sum"),
+            "expected dot-product shape (vmul + vadd + vreduce_sum):\n{}",
+            o3_ir
+        );
+    } else {
+        // x86: SSE2 has no i32 lane multiply (vec_isa.rs int_mul =
+        // false), so this loop must stay scalar; correctness is the
+        // runtime check below.
+        assert!(
+            !o3_ir.contains("vmul") && !o3_ir.contains("vreduce_sum"),
+            "SSE2 refuses the i32 lane multiply; the dot loop must stay scalar:\n{}",
+            o3_ir
+        );
+    }
 
     // Runtime: sum(i*i for i = 1..32) = 32*33*65/6 = 11440.
     let stdout = capture_run_stdout(CaptureRequest {

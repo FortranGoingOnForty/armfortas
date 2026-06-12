@@ -11,9 +11,17 @@
 ! IR_CHECK: call @afs_scalar_sub_array_i32(
 ! IR_CHECK: call @afs_array_add_scalar_i32(
 ! ASM_CHECK: _afs_array_sub_i32
+! ASM_CHECK(x86_64-freebsd): afs_array_sub_i32
+! ASM_CHECK(x86_64-linux-gnu): afs_array_sub_i32
 ! ASM_CHECK: _afs_array_mul_scalar_i32
+! ASM_CHECK(x86_64-freebsd): afs_array_mul_scalar_i32
+! ASM_CHECK(x86_64-linux-gnu): afs_array_mul_scalar_i32
 ! ASM_CHECK: _afs_scalar_sub_array_i32
+! ASM_CHECK(x86_64-freebsd): afs_scalar_sub_array_i32
+! ASM_CHECK(x86_64-linux-gnu): afs_scalar_sub_array_i32
 ! ASM_CHECK: _afs_array_add_scalar_i32
+! ASM_CHECK(x86_64-freebsd): afs_array_add_scalar_i32
+! ASM_CHECK(x86_64-linux-gnu): afs_array_add_scalar_i32
 program test_array_bulk_arithmetic
   implicit none
   integer :: a(8), b(8), c(8)

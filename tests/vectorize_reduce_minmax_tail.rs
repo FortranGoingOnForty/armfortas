@@ -46,20 +46,38 @@ fn o3_vectorizes_minmax_reductions_with_scalar_tail() {
         },
         Stage::OptIr,
     );
-    // Two vreduce_max (i32 + f32) and two vreduce_min (i32 + f64)
-    // should fire, each followed by peeled scalar select chains.
-    assert_eq!(
-        o3_ir.matches("vreduce_max").count(),
-        2,
-        "expected two vreduce_max:\n{}",
-        o3_ir
-    );
-    assert_eq!(
-        o3_ir.matches("vreduce_min").count(),
-        2,
-        "expected two vreduce_min:\n{}",
-        o3_ir
-    );
+    if cfg!(target_arch = "aarch64") {
+        // Two vreduce_max (i32 + f32) and two vreduce_min (i32 + f64)
+        // should fire, each followed by peeled scalar select chains.
+        assert_eq!(
+            o3_ir.matches("vreduce_max").count(),
+            2,
+            "expected two vreduce_max:\n{}",
+            o3_ir
+        );
+        assert_eq!(
+            o3_ir.matches("vreduce_min").count(),
+            2,
+            "expected two vreduce_min:\n{}",
+            o3_ir
+        );
+    } else {
+        // x86: SSE2 refuses the i32 min/max reduces (vec_isa.rs
+        // reduce_min_max_i32 = false), so only the f32 max and f64
+        // min loops vectorize; the i32 loops stay scalar.
+        assert_eq!(
+            o3_ir.matches("vreduce_max").count(),
+            1,
+            "expected one vreduce_max (f32; i32 stays scalar on SSE2):\n{}",
+            o3_ir
+        );
+        assert_eq!(
+            o3_ir.matches("vreduce_min").count(),
+            1,
+            "expected one vreduce_min (f64; i32 stays scalar on SSE2):\n{}",
+            o3_ir
+        );
+    }
 
     let stdout = capture_run_stdout(CaptureRequest {
         input: source,
