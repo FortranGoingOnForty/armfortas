@@ -2142,24 +2142,72 @@ fn select_inst(
             let vb = ctx.lookup_vreg(*b);
             let dest = ctx.get_vreg(mf, inst.id, RegClass::V128);
             let is_max = matches!(inst.kind, InstKind::VMax(..));
-            let opcode = match (VShape::from_ir(&inst.ty), is_max) {
-                (Some(VShape::V4S), true) => ArmOpcode::SmaxV4S,
-                (Some(VShape::V4S), false) => ArmOpcode::SminV4S,
-                (Some(VShape::F4S), true) => ArmOpcode::FmaxV4S,
-                (Some(VShape::F4S), false) => ArmOpcode::FminV4S,
-                (Some(VShape::F2D), true) => ArmOpcode::FmaxV2D,
-                (Some(VShape::F2D), false) => ArmOpcode::FminV2D,
-                _ => ArmOpcode::Nop,
-            };
-            mf.block_mut(mb).insts.push(MachineInst {
-                opcode,
-                operands: vec![
-                    MachineOperand::VReg(dest),
-                    MachineOperand::VReg(va),
-                    MachineOperand::VReg(vb),
-                ],
-                def: Some(dest),
-            });
+            match VShape::from_ir(&inst.ty) {
+                // Integer lanes: smax/smin match the scalar
+                // select-of-compare exactly (no NaN to disagree on).
+                Some(VShape::V4S) => {
+                    let opcode = if is_max {
+                        ArmOpcode::SmaxV4S
+                    } else {
+                        ArmOpcode::SminV4S
+                    };
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode,
+                        operands: vec![
+                            MachineOperand::VReg(dest),
+                            MachineOperand::VReg(va),
+                            MachineOperand::VReg(vb),
+                        ],
+                        def: Some(dest),
+                    });
+                }
+                // Float lanes: NOT fmax/fmin — those propagate NaN,
+                // while the scalar lowering of the same source is a
+                // compare+csel that takes the second operand on an
+                // unordered compare. Reproduce the select exactly:
+                // VMax(t,f) = bsl(fcmge(t,f), t, f) and
+                // VMin(t,f) = bsl(fcmge(f,t), t, f) (t<=f ⟺ f>=t).
+                // Caught by x10_minmax_nan_lanes via OPT_EQ: fmax.4s
+                // at O3 leaked NaN where O0's csel took the b lane.
+                Some(shape @ (VShape::F4S | VShape::F2D)) => {
+                    let fcmge = match shape {
+                        VShape::F4S => ArmOpcode::FcmgeV4S,
+                        _ => ArmOpcode::FcmgeV2D,
+                    };
+                    let (cmp_lhs, cmp_rhs) = if is_max { (va, vb) } else { (vb, va) };
+                    let mask = mf.new_vreg(RegClass::V128);
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode: fcmge,
+                        operands: vec![
+                            MachineOperand::VReg(mask),
+                            MachineOperand::VReg(cmp_lhs),
+                            MachineOperand::VReg(cmp_rhs),
+                        ],
+                        def: Some(mask),
+                    });
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode: ArmOpcode::Mov16B,
+                        operands: vec![MachineOperand::VReg(dest), MachineOperand::VReg(mask)],
+                        def: Some(dest),
+                    });
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode: ArmOpcode::BslV16B,
+                        operands: vec![
+                            MachineOperand::VReg(dest),
+                            MachineOperand::VReg(va),
+                            MachineOperand::VReg(vb),
+                        ],
+                        def: Some(dest),
+                    });
+                }
+                _ => {
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode: ArmOpcode::Nop,
+                        operands: vec![],
+                        def: None,
+                    });
+                }
+            }
         }
         InstKind::VReduceMin(v) | InstKind::VReduceMax(v) => {
             let src = ctx.lookup_vreg(*v);

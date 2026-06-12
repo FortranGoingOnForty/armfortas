@@ -278,7 +278,13 @@ jobs:
           run: |
             cargo build --workspace
             cargo test -p armfortas --lib
-            cargo test --test run_programs test_programs_end_to_end -- --nocapture 2>&1 | tee /tmp/sweep.log
+            # --exact: the bare substring also matches the _o1.._ofast
+            # matrix fns, which x09's gate opening turned into six real
+            # concurrent sweeps — more than this small VM can run
+            # (assembler spawns started failing). The full matrix
+            # belongs to the ubuntu/macOS jobs; this VM smoke-tests
+            # FreeBSD at -O0.
+            cargo test --test run_programs test_programs_end_to_end -- --exact --nocapture 2>&1 | tee /tmp/sweep.log
             grep -E '\[-O0\] .* passed' /tmp/sweep.log
             # x10: per-target benchmark gate (size-only in CI).
             cargo build --release -p armfortas -p armfortas-rt

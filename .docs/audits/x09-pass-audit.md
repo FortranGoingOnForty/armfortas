@@ -121,9 +121,15 @@ path currently runs `regalloc_naive` at every level.
 Scalar and vector MIN/MAX agree per target but differ across targets,
 both conforming (Fortran leaves MAX/MIN with NaN processor-dependent):
 
-- arm64: fmax/fmin (scalar and .4s/.2d vector) — NaN PROPAGATES.
-- x86_64: select-of-compare scalar, min/max[ps|pd] vector with the
-  isel operand order matching it — NaN lane takes the SECOND operand.
+- Element-wise MIN/MAX now implements select-of-compare semantics on
+  BOTH targets (NaN lane takes the second operand): x86 via
+  min/max[ps|pd] operand ordering, arm64 via fcmge+bsl — the original
+  fmax.4s lowering propagated NaN and broke the per-target O0≡O3
+  invariant (caught by x10_minmax_nan_lanes' OPT_EQ on macOS CI).
+- Across-lane MIN/MAX reductions keep the native forms
+  (fmaxv/fminv/fmaxp on arm, min/max[ps|pd] shuffle trees on x86);
+  their NaN behavior matches each target's scalar reduction loop but
+  can differ cross-target for NaN-bearing inputs.
 
 `test_programs/x10_minmax_nan_lanes.f90` pins the per-target
 O0≡O3 invariant and the policy-independent lanes; it deliberately
