@@ -890,9 +890,10 @@ pub fn program_name() -> String {
 /// Version string emitted by `--version`.
 pub fn version_string() -> String {
     format!(
-        "{} {} (aarch64-apple-darwin)",
+        "{} {} ({})",
         program_name(),
-        env!("CARGO_PKG_VERSION")
+        env!("CARGO_PKG_VERSION"),
+        crate::target::TargetSpec::host()
     )
 }
 
@@ -1579,9 +1580,17 @@ pub fn compile(opts: &Options) -> Result<(), String> {
             return Ok(());
         }
         let _ = fs::remove_file(&asm_path);
-        let result = link_inputs(std::slice::from_ref(&obj_path), &opts.output_path(), opts);
+        let binary_path = opts.output_path();
+        let phase = phases.start("link");
+        let result = link_inputs(std::slice::from_ref(&obj_path), &binary_path, opts);
+        phase.end(&mut phases);
         let _ = fs::remove_file(&obj_path);
-        return result;
+        result?;
+        if opts.verbose {
+            eprintln!(" linked: {}", binary_path.display());
+        }
+        phases.report();
+        return Ok(());
     }
 
     let phase = phases.start("assemble");
@@ -1644,7 +1653,11 @@ fn link(obj: &Path, output: &Path, opts: &Options) -> Result<(), String> {
 /// line — crt discovery, dynamic linker, library order — and no `cc`
 /// appears anywhere in the pipeline. Flag surface sticks to the
 /// lld/bfd intersection (FreeBSD ld is lld, Linux usually GNU bfd).
-fn link_inputs_elf(inputs: &[PathBuf], output: &Path, opts: &Options) -> Result<(), String> {
+pub(crate) fn link_inputs_elf(
+    inputs: &[PathBuf],
+    output: &Path,
+    opts: &Options,
+) -> Result<(), String> {
     let host = crate::target::TargetSpec::host();
     if host.arch != opts.target.arch
         || host.object_format() != crate::target::ObjectFormat::Elf
