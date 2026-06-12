@@ -157,3 +157,16 @@ l06's intake):
   test also caught COMMON blocks emitting strong .data definitions
   per TU on ELF (duplicate-symbol link errors) — fixed with .comm
   emission for uninitialized commons.
+
+Found during x09's determinism sweep (2026-06-11, pre-existing, all
+targets):
+
+- **Circular USE segfaults the compiler** when a multifile bundle is
+  compiled as a single source: `error_circular_use_direct.f90` and
+  `error_circular_use_indirect.f90` SIGSEGV under `--emit-ir` (and
+  every other mode) instead of reporting the cycle. The harness never
+  sees it because MULTIFILE_LINK splits the bundle and the expected
+  "not found" error fires first. Likely unbounded recursion in module
+  resolution. Error-path robustness, not a miscompile; owner: next
+  frontend sprint that touches module resolution (l07 submodules is
+  the natural slot).

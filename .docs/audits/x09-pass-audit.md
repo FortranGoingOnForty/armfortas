@@ -91,6 +91,17 @@ lands (x10 or later). Policy:
 - The x86 peephole (deliverable 4) must not synthesize x87 or FMA;
   the x87 grep gate in CI enforces the former permanently.
 
+## Allocator decision (intake item, recorded)
+
+The x07-era assumption was that -O1+ on x86 had to wait for a real
+register allocator. The x09 sweeps falsified that: the naive
+allocator is correct at every level (533/2/0 across the corpus,
+-O0..-Ofast, FreeBSD + Linux), so the per-level gates opened without
+allocator work. The x86 linear scan — and with it the MirView
+shared-core question from x05 — is deferred to x10, where the
+benchmark gate provides the measurements that performance work
+should answer to. Recorded in x10's intake.
+
 ## Backend pass dispatch (deliverable 3 fact-check)
 
 The sprint doc's driver line references are stale: the x03 backend
