@@ -220,7 +220,12 @@ mod tests {
         let changed = run_peephole(&mut f);
         assert_eq!(changed, 2, "both cmps rewrite");
         let insts = &f.blocks[0].insts;
-        assert_eq!(insts.len(), 3, "all uses rewritten, MovRI dies: {:?}", insts);
+        assert_eq!(
+            insts.len(),
+            3,
+            "all uses rewritten, MovRI dies: {:?}",
+            insts
+        );
         assert_eq!(insts[0].opcode, X86Opcode::Test);
         assert_eq!(insts[1].opcode, X86Opcode::Test);
     }
