@@ -2402,11 +2402,12 @@ pub(crate) fn lower_expr_full(
                         .map(|mask| mask.get(i).copied().unwrap_or(false))
                         .unwrap_or(false);
                     let wants_descriptor = wants_descriptor && !wants_bind_c_char;
-                    let wants_polymorphic_descriptor = wants_descriptor
+                    let dummy_is_class = wants_descriptor
                         && callee_class_args
                             .as_ref()
                             .map(|mask| mask.get(i).copied().unwrap_or(false))
                             .unwrap_or(false);
+                    let wants_polymorphic_descriptor = wants_descriptor && dummy_is_class;
                     let wants_string_descriptor = wants_string_descriptor && !wants_bind_c_char;
                     let wants_pointer = callee_pointer_args
                         .as_ref()
@@ -2488,7 +2489,7 @@ pub(crate) fn lower_expr_full(
                                                 descriptor_params,
                                             )
                                             .unwrap_or_else(|| {
-                                                lower_arg_by_ref_full(
+                                                lower_arg_by_ref_for_dummy_full(
                                                     b,
                                                     locals,
                                                     e,
@@ -2497,10 +2498,11 @@ pub(crate) fn lower_expr_full(
                                                     internal_funcs,
                                                     contained_host_refs,
                                                     descriptor_params,
+                                                    dummy_is_class,
                                                 )
                                             })
                                         } else {
-                                            lower_arg_by_ref_full(
+                                            lower_arg_by_ref_for_dummy_full(
                                                 b,
                                                 locals,
                                                 e,
@@ -2509,6 +2511,7 @@ pub(crate) fn lower_expr_full(
                                                 internal_funcs,
                                                 contained_host_refs,
                                                 descriptor_params,
+                                                dummy_is_class,
                                             )
                                         };
                                         optional_arg_absent_if_unallocated_allocatable_char(
@@ -2737,10 +2740,15 @@ pub(crate) fn lower_expr_full(
                                             // actual itself. A descriptor-
                                             // backed local must be passed by
                                             // descriptor regardless.
-                                            let actual_is_descriptor_backed =
-                                                actual_is_descriptor_array(locals, e);
+                                            let actual_uses_descriptor =
+                                                actual_is_descriptor_backed(
+                                                    locals,
+                                                    e,
+                                                    st,
+                                                    type_layouts,
+                                                );
                                             let wants_descriptor =
-                                                mask_says_descriptor || actual_is_descriptor_backed;
+                                                mask_says_descriptor || actual_uses_descriptor;
                                             let v = if wants_descriptor {
                                                 lower_arg_descriptor_full(
                                                     b,

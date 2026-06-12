@@ -16358,7 +16358,7 @@ pub(super) fn emit_named_function_call(
             .as_ref()
             .map(|mask| i < mask.len() && mask[i])
             .unwrap_or(false);
-        let wants_descriptor = callee_descriptor_args
+        let mask_wants_descriptor = callee_descriptor_args
             .as_ref()
             .map(|mask| i < mask.len() && mask[i])
             .unwrap_or(false);
@@ -16370,8 +16370,7 @@ pub(super) fn emit_named_function_call(
             .as_ref()
             .map(|mask| i < mask.len() && mask[i])
             .unwrap_or(false);
-        let wants_descriptor = wants_descriptor && !wants_bind_c_char;
-        let wants_polymorphic_descriptor = wants_descriptor
+        let dummy_is_class = mask_wants_descriptor
             && callee_class_args
                 .as_ref()
                 .map(|mask| i < mask.len() && mask[i])
@@ -16418,6 +16417,10 @@ pub(super) fn emit_named_function_call(
         };
         let value = match &arg.value {
             crate::ast::expr::SectionSubscript::Element(e) => {
+                let wants_descriptor = (mask_wants_descriptor
+                    || actual_is_descriptor_backed(locals, e, st, type_layouts))
+                    && !wants_bind_c_char;
+                let wants_polymorphic_descriptor = wants_descriptor && dummy_is_class;
                 let value = if is_value && wants_bind_c_char {
                     lower_bind_c_char_value_arg(
                         b,
@@ -16479,7 +16482,7 @@ pub(super) fn emit_named_function_call(
                     )
                     .unwrap_or_else(|| {
                         if full_ref_context {
-                            lower_arg_by_ref_full(
+                            lower_arg_by_ref_for_dummy_full(
                                 b,
                                 locals,
                                 e,
@@ -16488,6 +16491,7 @@ pub(super) fn emit_named_function_call(
                                 internal_funcs,
                                 contained_host_refs,
                                 descriptor_params,
+                                dummy_is_class,
                             )
                         } else {
                             lower_arg_by_ref(b, locals, e, st)
@@ -16506,7 +16510,7 @@ pub(super) fn emit_named_function_call(
                     )
                     .unwrap_or_else(|| {
                         if full_ref_context {
-                            lower_arg_by_ref_full(
+                            lower_arg_by_ref_for_dummy_full(
                                 b,
                                 locals,
                                 e,
@@ -16515,13 +16519,14 @@ pub(super) fn emit_named_function_call(
                                 internal_funcs,
                                 contained_host_refs,
                                 descriptor_params,
+                                dummy_is_class,
                             )
                         } else {
                             lower_arg_by_ref(b, locals, e, st)
                         }
                     })
                 } else if full_ref_context {
-                    lower_arg_by_ref_full(
+                    lower_arg_by_ref_for_dummy_full(
                         b,
                         locals,
                         e,
@@ -16530,6 +16535,7 @@ pub(super) fn emit_named_function_call(
                         internal_funcs,
                         contained_host_refs,
                         descriptor_params,
+                        dummy_is_class,
                     )
                 } else {
                     lower_arg_by_ref(b, locals, e, st)
@@ -16787,6 +16793,11 @@ pub(super) fn emit_resolved_bound_proc_call(
             .map(|mask| mask.get(i).copied().unwrap_or(false))
             .unwrap_or(false);
         let wants_descriptor = wants_descriptor && !wants_bind_c_char;
+        let dummy_is_class = wants_descriptor
+            && callee_class_args
+                .as_ref()
+                .map(|mask| mask.get(i).copied().unwrap_or(false))
+                .unwrap_or(false);
         let wants_string_descriptor = wants_string_descriptor && !wants_bind_c_char;
         let wants_pointer = callee_pointer_args
             .as_ref()
@@ -16801,11 +16812,7 @@ pub(super) fn emit_resolved_bound_proc_call(
         // expression. The plain-call path threads this through; without
         // it, the TBP path passed NULL for class(*) literal actuals,
         // producing SIGSEGV inside the callee on first use.
-        let wants_polymorphic_descriptor = wants_descriptor
-            && callee_class_args
-                .as_ref()
-                .map(|mask| mask.get(i).copied().unwrap_or(false))
-                .unwrap_or(false);
+        let wants_polymorphic_descriptor = wants_descriptor && dummy_is_class;
         let value = match slot {
             Some(arg) => match &arg.value {
                 crate::ast::expr::SectionSubscript::Element(e) => {
@@ -16883,7 +16890,7 @@ pub(super) fn emit_resolved_bound_proc_call(
                             descriptor_params,
                         )
                         .unwrap_or_else(|| {
-                            lower_arg_by_ref_full(
+                            lower_arg_by_ref_for_dummy_full(
                                 b,
                                 locals,
                                 e,
@@ -16892,10 +16899,11 @@ pub(super) fn emit_resolved_bound_proc_call(
                                 internal_funcs,
                                 contained_host_refs,
                                 descriptor_params,
+                                dummy_is_class,
                             )
                         })
                     } else {
-                        lower_arg_by_ref_full(
+                        lower_arg_by_ref_for_dummy_full(
                             b,
                             locals,
                             e,
@@ -16904,6 +16912,7 @@ pub(super) fn emit_resolved_bound_proc_call(
                             internal_funcs,
                             contained_host_refs,
                             descriptor_params,
+                            dummy_is_class,
                         )
                     };
                     optional_arg_absent_if_unallocated_allocatable_char(
@@ -19205,6 +19214,7 @@ pub(super) fn clear_intent_out_derived_params(
         };
         if info.is_pointer
             || info.allocatable
+            || decl_is_allocatable(pname, decls)
             || (local_uses_array_descriptor(info) && !info.is_class)
             || !info.dims.is_empty()
         {
@@ -19267,7 +19277,7 @@ pub(super) fn clear_intent_out_allocatable_array_params(
         let Some(info) = locals.get(pname) else {
             continue;
         };
-        if info.is_class || !local_uses_array_descriptor(info) {
+        if !local_uses_array_descriptor(info) {
             continue;
         }
 
@@ -29483,21 +29493,56 @@ pub(super) fn local_uses_array_descriptor(info: &LocalInfo) -> bool {
     info.allocatable || info.descriptor_arg
 }
 
-/// True if `expr` is a simple Name reference to a local whose runtime
-/// representation is a descriptor (assumed-shape, allocatable, pointer
-/// array). Used as a fallback when an abstract-interface mask lookup
-/// misses, so we still pass the descriptor instead of the data pointer.
+/// True if `expr` is a simple Name reference to an array local whose
+/// runtime representation is a descriptor (assumed-shape, allocatable,
+/// pointer array). Used as a fallback when an abstract-interface mask
+/// lookup misses, so we still pass the descriptor instead of the data
+/// pointer.
 pub(super) fn actual_is_descriptor_array(
     locals: &HashMap<String, LocalInfo>,
     expr: &crate::ast::expr::SpannedExpr,
 ) -> bool {
     if let Expr::Name { name } = &expr.node {
         if let Some(info) = locals.get(&name.to_lowercase()) {
-            return local_uses_array_descriptor(info)
-                || (!info.dims.is_empty() && info.descriptor_arg);
+            return !info.dims.is_empty() && local_uses_array_descriptor(info);
         }
     }
     false
+}
+
+pub(super) fn actual_is_descriptor_backed(
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> bool {
+    if actual_is_descriptor_array(locals, expr) {
+        return true;
+    }
+
+    let Expr::ComponentAccess { base, component } = &expr.node else {
+        return false;
+    };
+    let Some(tl) = type_layouts else {
+        return false;
+    };
+    let Some(base_ti) = operator_expr_type_info(base, Some(locals), st, Some(tl)) else {
+        return false;
+    };
+    let type_name = match base_ti {
+        crate::sema::symtab::TypeInfo::Derived(name)
+        | crate::sema::symtab::TypeInfo::Class(name) => name,
+        _ => return false,
+    };
+    let Some(field) = tl
+        .get(&type_name)
+        .and_then(|layout| layout.field(component))
+    else {
+        return false;
+    };
+
+    field_uses_array_descriptor(field)
+        || (field.size == 384 && (field.allocatable || field.pointer))
 }
 
 const DESC_CHAR_SLOT_TABLE: i32 = 1 << 3;
@@ -45366,6 +45411,81 @@ pub(super) fn lower_arg_by_ref_full(
     let tmp = b.alloca(ty);
     b.store(val, tmp);
     tmp
+}
+
+fn scalar_class_actual_object_addr_for_concrete_dummy(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+) -> Option<ValueId> {
+    let Expr::Name { name } = &expr.node else {
+        return None;
+    };
+    let info = locals.get(&name.to_lowercase())?;
+    if !info.by_ref || !info.dims.is_empty() || info.is_pointer {
+        return None;
+    }
+    if !matches!(info.char_kind, CharKind::None) {
+        return None;
+    }
+
+    if info.descriptor_arg {
+        let base = array_data_ptr_for_call(b, info);
+        let zero = b.const_i64(0);
+        return Some(b.gep(base, vec![zero], IrType::Int(IntWidth::I8)));
+    }
+
+    let slot_holds_descriptor_ptr = matches!(
+        b.func().value_type(info.addr),
+        Some(IrType::Ptr(slot_ty))
+            if matches!(
+                slot_ty.as_ref(),
+                IrType::Ptr(desc_ty)
+                    if matches!(
+                        desc_ty.as_ref(),
+                        IrType::Array(elem, 384)
+                            if matches!(elem.as_ref(), IrType::Int(IntWidth::I8))
+                    )
+            )
+    );
+    if !slot_holds_descriptor_ptr {
+        return None;
+    }
+
+    let desc = b.load_typed(info.addr, descriptor_ptr_ir_type(384));
+    Some(b.load_typed(
+        desc,
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn lower_arg_by_ref_for_dummy_full(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+    dummy_is_class: bool,
+) -> ValueId {
+    if !dummy_is_class {
+        if let Some(addr) = scalar_class_actual_object_addr_for_concrete_dummy(b, locals, expr) {
+            return addr;
+        }
+    }
+    lower_arg_by_ref_full(
+        b,
+        locals,
+        expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    )
 }
 
 pub(super) fn lower_bind_c_char_arg_raw(

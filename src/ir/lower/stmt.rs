@@ -2372,10 +2372,12 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             .as_ref()
                             .map(|mask| mask.get(i).copied().unwrap_or(false))
                             .unwrap_or(false);
-                        let wants_polymorphic_descriptor = class_mask
-                            .as_ref()
-                            .map(|mask| mask.get(i).copied().unwrap_or(false))
-                            .unwrap_or(false);
+                        let dummy_is_class = mask_wants_descriptor
+                            && class_mask
+                                .as_ref()
+                                .map(|mask| mask.get(i).copied().unwrap_or(false))
+                                .unwrap_or(false);
+                        let wants_polymorphic_descriptor = dummy_is_class;
                         let wants_string_descriptor = wants_string_descriptor && !wants_bind_c_char;
                         let value = match slot {
                             Some(arg) => {
@@ -2388,7 +2390,12 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                            e: &crate::ast::expr::SpannedExpr|
                                      -> ValueId {
                                     let wants_descriptor = (mask_wants_descriptor
-                                        || actual_is_descriptor_array(&ctx.locals, e))
+                                        || actual_is_descriptor_backed(
+                                            &ctx.locals,
+                                            e,
+                                            ctx.st,
+                                            Some(ctx.type_layouts),
+                                        ))
                                         && !wants_bind_c_char;
                                     let value = if is_value && wants_bind_c_char {
                                         lower_bind_c_char_value_arg(
@@ -2452,9 +2459,31 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                             Some(ctx.contained_host_refs),
                                             Some(ctx.descriptor_params),
                                         )
-                                        .unwrap_or_else(|| lower_arg_by_ref_ctx(b, ctx, e))
+                                        .unwrap_or_else(|| {
+                                            lower_arg_by_ref_for_dummy_full(
+                                                b,
+                                                &ctx.locals,
+                                                e,
+                                                ctx.st,
+                                                Some(ctx.type_layouts),
+                                                Some(ctx.internal_funcs),
+                                                Some(ctx.contained_host_refs),
+                                                Some(ctx.descriptor_params),
+                                                dummy_is_class,
+                                            )
+                                        })
                                     } else {
-                                        lower_arg_by_ref_ctx(b, ctx, e)
+                                        lower_arg_by_ref_for_dummy_full(
+                                            b,
+                                            &ctx.locals,
+                                            e,
+                                            ctx.st,
+                                            Some(ctx.type_layouts),
+                                            Some(ctx.internal_funcs),
+                                            Some(ctx.contained_host_refs),
+                                            Some(ctx.descriptor_params),
+                                            dummy_is_class,
+                                        )
                                     };
                                     optional_arg_absent_if_unallocated_allocatable_char(
                                         b,
@@ -2658,7 +2687,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             .as_ref()
                             .map(|mask| mask.get(i).copied().unwrap_or(false))
                             .unwrap_or(false);
-                        let wants_descriptor = desc_mask
+                        let mask_wants_descriptor = desc_mask
                             .as_ref()
                             .map(|mask| mask.get(i).copied().unwrap_or(false))
                             .unwrap_or(false);
@@ -2678,8 +2707,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             .as_ref()
                             .map(|mask| mask.get(i).copied().unwrap_or(false))
                             .unwrap_or(false);
-                        let wants_descriptor = wants_descriptor && !wants_bind_c_char;
-                        let wants_polymorphic_descriptor = wants_descriptor
+                        let dummy_is_class = mask_wants_descriptor
                             && class_mask
                                 .as_ref()
                                 .map(|mask| mask.get(i).copied().unwrap_or(false))
@@ -2700,6 +2728,16 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         let mut materialize = |b: &mut FuncBuilder,
                                                            e: &crate::ast::expr::SpannedExpr|
                                      -> ValueId {
+                                    let wants_descriptor = (mask_wants_descriptor
+                                        || actual_is_descriptor_backed(
+                                            &ctx.locals,
+                                            e,
+                                            ctx.st,
+                                            Some(ctx.type_layouts),
+                                        ))
+                                        && !wants_bind_c_char;
+                                    let wants_polymorphic_descriptor =
+                                        wants_descriptor && dummy_is_class;
                                     let value = if is_value && wants_bind_c_char {
                                         lower_bind_c_char_value_arg(
                                             b,
@@ -2762,7 +2800,19 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                             Some(ctx.contained_host_refs),
                                             Some(ctx.descriptor_params),
                                         )
-                                        .unwrap_or_else(|| lower_arg_by_ref_ctx(b, ctx, e))
+                                        .unwrap_or_else(|| {
+                                            lower_arg_by_ref_for_dummy_full(
+                                                b,
+                                                &ctx.locals,
+                                                e,
+                                                ctx.st,
+                                                Some(ctx.type_layouts),
+                                                Some(ctx.internal_funcs),
+                                                Some(ctx.contained_host_refs),
+                                                Some(ctx.descriptor_params),
+                                                dummy_is_class,
+                                            )
+                                        })
                                     } else if wants_intent_in_array {
                                         lower_contiguous_intent_in_array_actual(
                                             b,
@@ -2774,9 +2824,31 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                             Some(ctx.contained_host_refs),
                                             Some(ctx.descriptor_params),
                                         )
-                                        .unwrap_or_else(|| lower_arg_by_ref_ctx(b, ctx, e))
+                                        .unwrap_or_else(|| {
+                                            lower_arg_by_ref_for_dummy_full(
+                                                b,
+                                                &ctx.locals,
+                                                e,
+                                                ctx.st,
+                                                Some(ctx.type_layouts),
+                                                Some(ctx.internal_funcs),
+                                                Some(ctx.contained_host_refs),
+                                                Some(ctx.descriptor_params),
+                                                dummy_is_class,
+                                            )
+                                        })
                                     } else {
-                                        lower_arg_by_ref_ctx(b, ctx, e)
+                                        lower_arg_by_ref_for_dummy_full(
+                                            b,
+                                            &ctx.locals,
+                                            e,
+                                            ctx.st,
+                                            Some(ctx.type_layouts),
+                                            Some(ctx.internal_funcs),
+                                            Some(ctx.contained_host_refs),
+                                            Some(ctx.descriptor_params),
+                                            dummy_is_class,
+                                        )
                                     };
                                     optional_arg_absent_if_unallocated_allocatable_char(
                                         b,

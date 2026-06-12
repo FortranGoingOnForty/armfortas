@@ -9089,6 +9089,51 @@ fn move_alloc_nested_class_allocatable_container_preserves_real_payload() {
 }
 
 #[test]
+fn class_allocatable_intent_out_constructor_preserves_descriptor_storage() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=class_allocatable_intent_out_constructor_preserves_descriptor_storage count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type, abstract :: base_t\n    character(:), allocatable :: key\n  end type\n  type, abstract :: generic_t\n  end type\n  type, extends(generic_t) :: string_t\n    character(:), allocatable :: raw\n  end type\n  type, extends(base_t) :: keyval_t\n    class(generic_t), allocatable :: val\n  contains\n    procedure :: set_string\n    procedure :: get_string\n  end type\ncontains\n  subroutine new_keyval(self)\n    type(keyval_t), intent(out) :: self\n    associate(self => self); end associate\n  end subroutine\n  subroutine construct(self)\n    class(base_t), allocatable, intent(out) :: self\n    type(keyval_t), allocatable :: tmp\n    allocate(tmp)\n    call new_keyval(tmp)\n    call move_alloc(tmp, self)\n  end subroutine\n  subroutine set_string(self, text)\n    class(keyval_t), intent(inout) :: self\n    character(*), intent(in) :: text\n    type(string_t), allocatable :: tmp\n    allocate(tmp)\n    tmp%raw = text\n    call move_alloc(tmp, self%val)\n  end subroutine\n  subroutine get_string(self, text)\n    class(keyval_t), intent(in) :: self\n    character(:), allocatable, intent(out) :: text\n    character(:), pointer :: ptr\n    ptr => cast_string(self%val)\n    if (.not. associated(ptr)) error stop 1\n    text = ptr\n  end subroutine\n  function cast_string(val) result(ptr)\n    class(generic_t), intent(in), target :: val\n    character(:), pointer :: ptr\n    nullify(ptr)\n    select type (val)\n    type is (string_t)\n      ptr => val%raw\n    end select\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  class(base_t), allocatable :: val\n  character(:), allocatable :: text\n  call construct(val)\n  select type (val)\n  type is (keyval_t)\n    call val%set_string('value')\n    call val%get_string(text)\n  class default\n    error stop 2\n  end select\n  if (.not. allocated(text)) error stop 3\n  if (text /= 'value') error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("class_alloc_out_constructor_descriptor", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("class allocatable intent(out) constructor compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "class allocatable intent(out) constructor should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("class allocatable intent(out) constructor run failed to spawn");
+    assert!(
+        run.status.success(),
+        "class allocatable intent(out) constructor should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected class allocatable constructor output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn alloc_source_from_class_pointer_deep_copies_nested_allocatable_payload() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
