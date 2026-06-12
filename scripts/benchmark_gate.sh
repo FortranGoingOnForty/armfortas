@@ -51,6 +51,16 @@ mkdir -p .benchmarks
 TMPDIR=$(mktemp -d)
 trap "rm -rf $TMPDIR" EXIT
 
+# Monotonic-ish seconds: python3 where present (the fleet boxes),
+# whole-second date elsewhere (the CI VM, which gates size only).
+now_s() {
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import time; print(f"{time.monotonic():.4f}")'
+    else
+        date +%s
+    fi
+}
+
 compile_and_measure() {
     local src="$1"
     local stem
@@ -59,10 +69,10 @@ compile_and_measure() {
 
     # Compile and time it
     local start end elapsed
-    start=$(python3 -c 'import time; print(time.monotonic())')
+    start=$(now_s)
     "$COMPILER" "$src" $OPT -o "$binary" 2>/dev/null
-    end=$(python3 -c 'import time; print(time.monotonic())')
-    elapsed=$(python3 -c "print(f'{$end - $start:.4f}')")
+    end=$(now_s)
+    elapsed=$(awk -v a="$start" -v b="$end" 'BEGIN { printf "%.4f", b - a }')
 
     # Binary size
     local size
@@ -114,33 +124,21 @@ while IFS=' ' read -r name time size; do
     base_time=$(echo "$baseline_line" | awk '{print $2}')
     base_size=$(echo "$baseline_line" | awk '{print $3}')
 
-    # Time regression check (30% threshold)
-    time_ratio=$(python3 -c "
-bt, ct = $base_time, $time
-if bt > 0:
-    ratio = ct / bt
-    print(f'{ratio:.2f}')
-else:
-    print('1.00')
-")
-    time_pct=$(python3 -c "print(f'{($time / max($base_time, 0.001) - 1) * 100:.1f}')")
-
-    # Size regression check (15% threshold)
-    size_pct=$(python3 -c "
-bs, cs = $base_size, $size
-if bs > 0:
-    print(f'{(cs / bs - 1) * 100:.1f}')
-else:
-    print('0.0')
-")
+    # All threshold math in awk: the CI VM has no python3.
+    time_pct=$(awk -v b="$base_time" -v c="$time" \
+        'BEGIN { if (b < 0.001) b = 0.001; printf "%.1f", (c / b - 1) * 100 }')
+    size_pct=$(awk -v b="$base_size" -v c="$size" \
+        'BEGIN { if (b < 1) b = 1; printf "%.1f", (c / b - 1) * 100 }')
 
     status="OK"
     if [ "${BENCH_SKIP_TIME:-0}" != "1" ] \
-        && python3 -c "exit(0 if $time / max($base_time, 0.001) > 1.30 else 1)" 2>/dev/null; then
+        && [ "$(awk -v b="$base_time" -v c="$time" \
+            'BEGIN { if (b < 0.001) b = 0.001; print (c / b > 1.30) ? 1 : 0 }')" = "1" ]; then
         status="SLOW"
         FAIL=1
     fi
-    if python3 -c "exit(0 if $size / max($base_size, 1) > 1.15 else 1)" 2>/dev/null; then
+    if [ "$(awk -v b="$base_size" -v c="$size" \
+        'BEGIN { if (b < 1) b = 1; print (c / b > 1.15) ? 1 : 0 }')" = "1" ]; then
         status="BLOAT"
         FAIL=1
     fi
