@@ -45402,6 +45402,17 @@ pub(super) fn lower_arg_by_ref_full(
         if let IrType::Ptr(inner) = &ty {
             if let IrType::Array(elem, 384) = inner.as_ref() {
                 if matches!(elem.as_ref(), IrType::Int(IntWidth::I8)) {
+                    let scalar_aggregate_actual =
+                        matches!(
+                            operator_expr_type_info(expr, Some(locals), st, type_layouts),
+                            Some(
+                                crate::sema::symtab::TypeInfo::Derived(_)
+                                    | crate::sema::symtab::TypeInfo::Class(_)
+                            )
+                        ) && actual_expr_rank(expr, locals, st, type_layouts) == Some(0);
+                    if scalar_aggregate_actual {
+                        return val;
+                    }
                     return b.load_typed(val, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
                 }
             }
@@ -45453,10 +45464,7 @@ fn scalar_class_actual_object_addr_for_concrete_dummy(
     }
 
     let desc = b.load_typed(info.addr, descriptor_ptr_ir_type(384));
-    Some(b.load_typed(
-        desc,
-        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-    ))
+    Some(b.load_typed(desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)))))
 }
 
 #[allow(clippy::too_many_arguments)]

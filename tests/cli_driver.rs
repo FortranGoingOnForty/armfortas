@@ -9134,6 +9134,51 @@ fn class_allocatable_intent_out_constructor_preserves_descriptor_storage() {
 }
 
 #[test]
+fn scalar_derived_constructor_result_actual_preserves_object_storage() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=scalar_derived_constructor_result_actual_preserves_object_storage count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type :: key_t\n    character(:), allocatable :: key\n  end type\n  type :: path_t\n    type(key_t), allocatable :: path(:)\n  end type\n  interface path_t\n    module procedure new_path2\n  end interface\ncontains\n  function new_path2(key1, key2) result(path)\n    character(*), intent(in) :: key1, key2\n    type(path_t) :: path\n    allocate(path%path(2))\n    path%path(1)%key = key1\n    path%path(2)%key = key2\n  end function\n  subroutine consume(path)\n    type(path_t), intent(in) :: path\n    if (.not. allocated(path%path)) error stop 1\n    if (size(path%path) /= 2) error stop 2\n    if (path%path(1)%key /= 'string') error stop 3\n    if (path%path(2)%key /= 'sub') error stop 4\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  call consume(path_t('string', 'sub'))\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("scalar_derived_constructor_result_actual", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("scalar derived constructor actual compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "scalar derived constructor actual should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("scalar derived constructor actual run failed to spawn");
+    assert!(
+        run.status.success(),
+        "scalar derived constructor actual should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected scalar derived constructor actual output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn alloc_source_from_class_pointer_deep_copies_nested_allocatable_payload() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
