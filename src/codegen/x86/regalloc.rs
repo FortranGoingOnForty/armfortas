@@ -209,6 +209,19 @@ pub fn regalloc_naive(f: &mut X86Function) {
             if let Some((scratch, class, slot)) = def_store {
                 let store_size = if class == X86RegClass::Xmm {
                     xmm_def_width.unwrap_or(size)
+                } else if size == OpSize::L {
+                    // Any 32-bit op zero-extends through bit 63 of the
+                    // dest register (x86-64 architectural rule), so the
+                    // full quad in the scratch is exact. Storing only 4
+                    // bytes left the slot's upper half stale; an i64
+                    // consumer of a 32→64 zext (`movl` idiom) then read
+                    // garbage. Found via the class(*) select-type tag
+                    // on glibc at -O1 (x09): `int_extend u32→i64` of
+                    // the descriptor's compact tag reconstructed a
+                    // corrupt prefix and the complex(real32) guard
+                    // missed. Same slot-width class as the
+                    // x09_popcnt_int64 isel fix, one layer deeper.
+                    OpSize::Q
                 } else {
                     size
                 };
