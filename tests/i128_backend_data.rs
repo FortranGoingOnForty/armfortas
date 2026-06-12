@@ -85,12 +85,12 @@ fn globals_only_i128_object_snapshot_is_deterministic_at_o2() {
     );
 
     assert!(
-        first.contains("_afs_mod_integer16_globals_backend_big_scalar"),
+        first.contains("afs_mod_integer16_globals_backend_big_scalar"),
         "object snapshot should retain the i128 scalar global symbol:\n{}",
         first
     );
     assert!(
-        first.contains("_afs_mod_integer16_globals_backend_big_array"),
+        first.contains("afs_mod_integer16_globals_backend_big_array"),
         "object snapshot should retain the i128 array global symbol:\n{}",
         first
     );

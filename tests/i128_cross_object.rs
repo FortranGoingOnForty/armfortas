@@ -59,8 +59,7 @@ fn opt_label(opt_level: OptLevel) -> &'static str {
 fn compile_c_object(source: &Path, output: &Path) {
     let output_status = Command::new("clang")
         .args([
-            "-arch",
-            "arm64",
+            "-fPIC",
             "-c",
             source.to_str().unwrap(),
             "-o",

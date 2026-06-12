@@ -101,8 +101,7 @@ fn undefined_symbols(path: &std::path::Path) -> Vec<String> {
 fn compile_c_object(source: &std::path::Path, output: &std::path::Path) {
     let result = Command::new("clang")
         .args([
-            "-arch",
-            "arm64",
+            "-fPIC",
             "-c",
             source.to_str().unwrap(),
             "-o",
@@ -1958,17 +1957,23 @@ fn runtime_sized_local_character_uses_runtime_string_support() {
 
     let undefined = undefined_symbols(&out);
     assert!(
-        undefined.iter().any(|sym| sym == "_afs_len_trim"),
+        undefined
+            .iter()
+            .any(|sym| sym.trim_start_matches('_') == "afs_len_trim"),
         "runtime-sized local character should call afs_len_trim, undefineds were: {:?}",
         undefined
     );
     assert!(
-        !undefined.iter().any(|sym| sym == "_working_input"),
+        !undefined
+            .iter()
+            .any(|sym| sym.trim_start_matches('_') == "working_input"),
         "runtime-sized local character should not lower to an external working_input call: {:?}",
         undefined
     );
     assert!(
-        !undefined.iter().any(|sym| sym == "_len_trim"),
+        !undefined
+            .iter()
+            .any(|sym| sym.trim_start_matches('_') == "len_trim"),
         "runtime-sized local character should not lower to a raw len_trim symbol: {:?}",
         undefined
     );
@@ -2003,7 +2008,9 @@ fn assumed_length_character_dummy_keeps_hidden_length_abi() {
 
     let undefined = undefined_symbols(&out);
     assert!(
-        !undefined.iter().any(|sym| sym == "_prompt_str"),
+        !undefined
+            .iter()
+            .any(|sym| sym.trim_start_matches('_') == "prompt_str"),
         "assumed-length dummy should not become an external prompt_str call: {:?}",
         undefined
     );
@@ -2618,12 +2625,16 @@ fn bind_c_name_call_uses_declared_c_symbol() {
 
     let undefined = undefined_symbols(&out);
     assert!(
-        undefined.iter().any(|sym| sym == "_getpid"),
+        undefined
+            .iter()
+            .any(|sym| sym.trim_start_matches('_') == "getpid"),
         "bind(c, name=...) should call the declared C symbol: {:?}",
         undefined
     );
     assert!(
-        !undefined.iter().any(|sym| sym == "_getpid_c"),
+        !undefined
+            .iter()
+            .any(|sym| sym.trim_start_matches('_') == "getpid_c"),
         "bind(c, name=...) should not call the local Fortran alias: {:?}",
         undefined
     );
@@ -4323,24 +4334,28 @@ fn module_procedure_case_and_bind_label_survive_amod_import() {
     assert!(
         undefined
             .iter()
-            .any(|sym| sym == "_afs_modproc_m_WEXITSTATUS"),
+            .any(|sym| sym.trim_start_matches('_') == "afs_modproc_m_WEXITSTATUS"),
         "mixed-case module procedures should retain case across .amod import: {:?}",
         undefined
     );
     assert!(
         !undefined
             .iter()
-            .any(|sym| sym == "_afs_modproc_m_wexitstatus"),
+            .any(|sym| sym.trim_start_matches('_') == "afs_modproc_m_wexitstatus"),
         "imported mixed-case module procedures should not be downcased: {:?}",
         undefined
     );
     assert!(
-        undefined.iter().any(|sym| sym == "_close"),
+        undefined
+            .iter()
+            .any(|sym| sym.trim_start_matches('_') == "close"),
         "bind(c, name=...) procedures should keep binding labels across .amod import: {:?}",
         undefined
     );
     assert!(
-        !undefined.iter().any(|sym| sym == "_c_close"),
+        !undefined
+            .iter()
+            .any(|sym| sym.trim_start_matches('_') == "c_close"),
         "bind(c, name=...) procedures should not fall back to Fortran aliases: {:?}",
         undefined
     );
@@ -4374,12 +4389,16 @@ fn repeat_intrinsic_lowers_to_runtime_symbol() {
 
     let undefined = undefined_symbols(&out);
     assert!(
-        undefined.iter().any(|sym| sym == "_afs_repeat"),
+        undefined
+            .iter()
+            .any(|sym| sym.trim_start_matches('_') == "afs_repeat"),
         "repeat intrinsic should lower to afs_repeat, undefineds were: {:?}",
         undefined
     );
     assert!(
-        !undefined.iter().any(|sym| sym == "_repeat"),
+        !undefined
+            .iter()
+            .any(|sym| sym.trim_start_matches('_') == "repeat"),
         "repeat intrinsic should not lower to a raw repeat symbol: {:?}",
         undefined
     );
@@ -4415,7 +4434,9 @@ fn pointer_dummy_associated_lowers_without_raw_symbol() {
 
     let undefined = undefined_symbols(&out);
     assert!(
-        !undefined.iter().any(|sym| sym == "_associated"),
+        !undefined
+            .iter()
+            .any(|sym| sym.trim_start_matches('_') == "associated"),
         "pointer dummy associated() should not escape as a raw symbol: {:?}",
         undefined
     );
@@ -4495,7 +4516,9 @@ fn pointer_function_result_associated_lowers_without_raw_symbol() {
 
     let undefined = undefined_symbols(&out);
     assert!(
-        !undefined.iter().any(|sym| sym == "_associated"),
+        !undefined
+            .iter()
+            .any(|sym| sym.trim_start_matches('_') == "associated"),
         "pointer function-result associated() should not escape as a raw symbol: {:?}",
         undefined
     );
@@ -4530,24 +4553,31 @@ fn component_array_intrinsics_survive_logical_condition_lowering() {
 
     let undefined = undefined_symbols(&out);
     assert!(
-        undefined.iter().any(|sym| sym == "_afs_array_allocated"),
+        undefined
+            .iter()
+            .any(|sym| sym.trim_start_matches('_') == "afs_array_allocated"),
         "component array condition should lower allocated() to afs_array_allocated: {:?}",
         undefined
     );
     assert!(
-        undefined.iter().any(|sym| sym == "_afs_array_size"),
+        undefined
+            .iter()
+            .any(|sym| sym.trim_start_matches('_') == "afs_array_size"),
         "component array condition should lower size() to afs_array_size: {:?}",
         undefined
     );
     assert!(
-        undefined.iter().any(|sym| sym == "_afs_len_trim"),
+        undefined
+            .iter()
+            .any(|sym| sym.trim_start_matches('_') == "afs_len_trim"),
         "component array condition should lower len_trim() to afs_len_trim: {:?}",
         undefined
     );
     assert!(
         !undefined
             .iter()
-            .any(|sym| sym == "_allocated" || sym == "_size"),
+            .any(|sym| sym.trim_start_matches('_') == "allocated"
+                || sym.trim_start_matches('_') == "size"),
         "component array condition should not call raw allocated/size symbols: {:?}",
         undefined
     );
@@ -4583,17 +4613,23 @@ fn allocatable_array_element_component_intrinsics_do_not_escape() {
 
     let undefined = undefined_symbols(&out);
     assert!(
-        undefined.iter().any(|sym| sym == "_afs_array_allocated"),
+        undefined
+            .iter()
+            .any(|sym| sym.trim_start_matches('_') == "afs_array_allocated"),
         "allocatable component arrays should lower allocated() to afs_array_allocated: {:?}",
         undefined
     );
     assert!(
-        undefined.iter().any(|sym| sym == "_afs_string_allocated"),
+        undefined
+            .iter()
+            .any(|sym| sym.trim_start_matches('_') == "afs_string_allocated"),
         "allocatable character components should lower allocated() to afs_string_allocated: {:?}",
         undefined
     );
     assert!(
-        !undefined.iter().any(|sym| sym == "_allocated"),
+        !undefined
+            .iter()
+            .any(|sym| sym.trim_start_matches('_') == "allocated"),
         "allocatable array-element component allocated() should not escape as a raw symbol: {:?}",
         undefined
     );
@@ -4717,7 +4753,9 @@ fn fixed_component_array_size_lowers_without_raw_symbol() {
 
     let undefined = undefined_symbols(&out);
     assert!(
-        !undefined.iter().any(|sym| sym == "_size"),
+        !undefined
+            .iter()
+            .any(|sym| sym.trim_start_matches('_') == "size"),
         "fixed-size component array SIZE() should not escape as a raw symbol: {:?}",
         undefined
     );
@@ -4753,12 +4791,16 @@ fn allocate_bounds_size_intrinsic_lowers_without_raw_symbol() {
 
     let undefined = undefined_symbols(&out);
     assert!(
-        undefined.iter().any(|sym| sym == "_afs_array_size"),
+        undefined
+            .iter()
+            .any(|sym| sym.trim_start_matches('_') == "afs_array_size"),
         "allocate bounds should still lower size() to afs_array_size: {:?}",
         undefined
     );
     assert!(
-        !undefined.iter().any(|sym| sym == "_size"),
+        !undefined
+            .iter()
+            .any(|sym| sym.trim_start_matches('_') == "size"),
         "allocate bounds size() should not escape as a raw symbol: {:?}",
         undefined
     );
@@ -5863,12 +5905,16 @@ fn automatic_component_array_bound_size_lowers_without_raw_symbol() {
 
     let undefined = undefined_symbols(&out);
     assert!(
-        undefined.iter().any(|sym| sym == "_afs_array_size"),
+        undefined
+            .iter()
+            .any(|sym| sym.trim_start_matches('_') == "afs_array_size"),
         "automatic component bound size() should still lower through afs_array_size: {:?}",
         undefined
     );
     assert!(
-        !undefined.iter().any(|sym| sym == "_size"),
+        !undefined
+            .iter()
+            .any(|sym| sym.trim_start_matches('_') == "size"),
         "automatic component bound size() should not escape as a raw symbol: {:?}",
         undefined
     );
@@ -5931,17 +5977,24 @@ fn scalar_char_component_ops_and_achar_compile() {
 
     let undefined = undefined_symbols(&out);
     assert!(
-        undefined.iter().any(|sym| sym == "_afs_len_trim"),
+        undefined
+            .iter()
+            .any(|sym| sym.trim_start_matches('_') == "afs_len_trim"),
         "scalar char component should lower len_trim() to afs_len_trim: {:?}",
         undefined
     );
     assert!(
-        undefined.iter().any(|sym| sym == "_afs_char"),
+        undefined
+            .iter()
+            .any(|sym| sym.trim_start_matches('_') == "afs_char"),
         "ACHAR should lower to afs_char: {:?}",
         undefined
     );
     assert!(
-        !undefined.iter().any(|sym| sym == "_achar" || sym == "_ifs"),
+        !undefined
+            .iter()
+            .any(|sym| sym.trim_start_matches('_') == "achar"
+                || sym.trim_start_matches('_') == "ifs"),
         "scalar char component lowering should not introduce raw achar/ifs symbols: {:?}",
         undefined
     );
@@ -6711,12 +6764,16 @@ fn scalar_char_substring_argument_avoids_raw_local_symbol() {
 
     let undefined = undefined_symbols(&out);
     assert!(
-        undefined.iter().any(|sym| sym == "_afs_len_trim"),
+        undefined
+            .iter()
+            .any(|sym| sym.trim_start_matches('_') == "afs_len_trim"),
         "character dummy call should still route len_trim through the runtime: {:?}",
         undefined
     );
     assert!(
-        !undefined.iter().any(|sym| sym == "_working_input"),
+        !undefined
+            .iter()
+            .any(|sym| sym.trim_start_matches('_') == "working_input"),
         "character substring argument should not lower as an external local symbol: {:?}",
         undefined
     );
@@ -6751,17 +6808,21 @@ fn allocated_on_derived_array_element_component_uses_descriptor_runtime() {
 
     let undefined = undefined_symbols(&out);
     assert!(
-        undefined.iter().any(|sym| sym == "_afs_array_allocated"),
+        undefined
+            .iter()
+            .any(|sym| sym.trim_start_matches('_') == "afs_array_allocated"),
         "allocated(cmds(i)%tokens) should lower to afs_array_allocated: {:?}",
         undefined
     );
     assert!(
-        undefined.iter().any(|sym| sym == "_afs_array_size"),
+        undefined
+            .iter()
+            .any(|sym| sym.trim_start_matches('_') == "afs_array_size"),
         "size(cmds(i)%tokens) should lower to afs_array_size: {:?}",
         undefined
     );
     assert!(
-        !undefined.iter().any(|sym| sym == "_allocated" || sym == "_size"),
+        !undefined.iter().any(|sym| sym.trim_start_matches('_') == "allocated" || sym.trim_start_matches('_') == "size"),
         "derived array element component intrinsics should not call raw allocated/size symbols: {:?}",
         undefined
     );
@@ -8569,8 +8630,8 @@ fn dash_capital_s_produces_assembly_text() {
     );
     let asm = std::fs::read_to_string(&out).expect("missing asm output");
     assert!(
-        asm.contains("__TEXT"),
-        ".s output should contain section directive"
+        asm.contains("__TEXT") || asm.contains(".text"),
+        ".s output should contain a text-section directive"
     );
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
@@ -19177,7 +19238,10 @@ fn user_function_call_with_section_arg_emits_one_section_descriptor_per_callsite
         String::from_utf8_lossy(&compile.stderr)
     );
     let asm = std::fs::read_to_string(&out).expect("read asm");
-    let n = asm.matches("bl _afs_create_section").count();
+    // Count call sites by the bare symbol: `bl _afs_create_section`
+    // on arm64-macos, `call afs_create_section` on ELF — the symbol
+    // only appears at call sites in -S output on both.
+    let n = asm.matches("afs_create_section").count();
     // 8 source-level sections.  Observed-good: 14 emissions
     // (~1.75x) — one descriptor per call plus a small per-callsite
     // overhead.  History:
@@ -21402,6 +21466,15 @@ fn shared_compile_emits_amod_and_links_cleanly() {
         );
         return;
     }
+    // -shared on ELF is rejected by design until the x11 link work
+    // (driver: "executables only this sprint"); the dylib flow is
+    // Mach-O-only today.
+    if armfortas::testing::native_macho_toolchain_support().is_err() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=shared_compile_emits_amod_and_links_cleanly count=1 reason=\"-shared on ELF lands in x11\""
+        );
+        return;
+    }
     let dir = unique_dir("shared_mod");
     let lib_src = write_program_in(
         &dir,
@@ -22258,21 +22331,42 @@ fn procedure_pointer_calls_and_assignment_run_indirectly() {
         String::from_utf8_lossy(&compile.stderr)
     );
     let asm = std::fs::read_to_string(&out).expect("cannot read indirect-call assembly");
-    assert!(
-        asm.contains("blr "),
-        "procedure-pointer calls should lower to BLR: {}",
-        asm
-    );
-    assert!(
-        asm.contains("_twice@PAGE") && asm.contains("_bump@PAGE"),
-        "procedure-pointer assignment should materialize callee addresses: {}",
-        asm
-    );
-    assert!(
-        !asm.contains("bl _p") && !asm.contains("bl _q"),
-        "procedure-pointer calls should not lower as direct symbol calls: {}",
-        asm
-    );
+    // Same contract per arch: calls go through a register, callee
+    // addresses materialize symbolically, no direct call to the
+    // pointer's own name.
+    if cfg!(target_arch = "x86_64") {
+        assert!(
+            asm.contains("call *%"),
+            "procedure-pointer calls should lower to an indirect call: {}",
+            asm
+        );
+        assert!(
+            asm.contains("twice(%rip)") && asm.contains("bump(%rip)"),
+            "procedure-pointer assignment should materialize callee addresses: {}",
+            asm
+        );
+        assert!(
+            !asm.contains("call p\n") && !asm.contains("call q\n"),
+            "procedure-pointer calls should not lower as direct symbol calls: {}",
+            asm
+        );
+    } else {
+        assert!(
+            asm.contains("blr "),
+            "procedure-pointer calls should lower to BLR: {}",
+            asm
+        );
+        assert!(
+            asm.contains("_twice@PAGE") && asm.contains("_bump@PAGE"),
+            "procedure-pointer assignment should materialize callee addresses: {}",
+            asm
+        );
+        assert!(
+            !asm.contains("bl _p") && !asm.contains("bl _q"),
+            "procedure-pointer calls should not lower as direct symbol calls: {}",
+            asm
+        );
+    }
 
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
@@ -22439,16 +22533,32 @@ fn c_funloc_bind_c_handler_uses_binding_label_symbol() {
     );
 
     let asm = std::fs::read_to_string(&out).expect("cannot read c_funloc assembly");
-    assert!(
-        asm.contains("_sig_handler@PAGE"),
-        "c_funloc should materialize the bind(C) label, not the module symbol: {}",
-        asm
-    );
-    assert!(
-        !asm.contains("_afs_modproc_m_sig_handler@PAGE"),
-        "c_funloc should not reference the non-bind(C) module procedure symbol: {}",
-        asm
-    );
+    // Address materialization is @PAGE on arm64-macos, (%rip) on ELF;
+    // the contract is the same: the bind(C) label, not the module
+    // procedure symbol.
+    if cfg!(target_arch = "x86_64") {
+        assert!(
+            asm.contains("sig_handler(%rip)"),
+            "c_funloc should materialize the bind(C) label, not the module symbol: {}",
+            asm
+        );
+        assert!(
+            !asm.contains("afs_modproc_m_sig_handler(%rip)"),
+            "c_funloc should not reference the non-bind(C) module procedure symbol: {}",
+            asm
+        );
+    } else {
+        assert!(
+            asm.contains("_sig_handler@PAGE"),
+            "c_funloc should materialize the bind(C) label, not the module symbol: {}",
+            asm
+        );
+        assert!(
+            !asm.contains("_afs_modproc_m_sig_handler@PAGE"),
+            "c_funloc should not reference the non-bind(C) module procedure symbol: {}",
+            asm
+        );
+    }
 
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
@@ -24074,12 +24184,16 @@ fn char_intrinsics_and_transfer_lower_without_raw_symbols() {
 
     let undefined = undefined_symbols(&out);
     assert!(
-        undefined.iter().any(|sym| sym == "_afs_string_allocated"),
+        undefined
+            .iter()
+            .any(|sym| sym.trim_start_matches('_') == "afs_string_allocated"),
         "deferred-char ALLOCATED() should lower to the string runtime: {:?}",
         undefined
     );
     assert!(
-        undefined.iter().any(|sym| sym == "_afs_lgt"),
+        undefined
+            .iter()
+            .any(|sym| sym.trim_start_matches('_') == "afs_lgt"),
         "LGT should lower to the string runtime: {:?}",
         undefined
     );
@@ -24124,7 +24238,7 @@ fn deferred_char_allocatable_dummy_uses_descriptor_abi() {
     );
     let asm = std::fs::read_to_string(&out).expect("cannot read deferred-char dummy assembly");
     assert!(
-        asm.contains("bl _afs_move_alloc_string"),
+        asm.contains("afs_move_alloc_string"),
         "MOVE_ALLOC on deferred-length character dummies should call the string runtime: {}",
         asm
     );
@@ -25229,12 +25343,14 @@ fn use_renamed_procedure_call_uses_remote_symbol() {
     assert!(
         undefined
             .iter()
-            .any(|sym| sym == "_afs_modproc_m_set_shell_variable"),
+            .any(|sym| sym.trim_start_matches('_') == "afs_modproc_m_set_shell_variable"),
         "USE rename should call the imported procedure symbol: {:?}",
         undefined
     );
     assert!(
-        !undefined.iter().any(|sym| sym == "_var_set_shell_variable"),
+        !undefined
+            .iter()
+            .any(|sym| sym.trim_start_matches('_') == "var_set_shell_variable"),
         "USE rename should not lower to the local alias as a link symbol: {:?}",
         undefined
     );
@@ -25270,21 +25386,26 @@ fn linked_binary_carries_uuid_and_launches() {
         String::from_utf8_lossy(&compile.stderr)
     );
 
-    let otool = Command::new("otool")
-        .args(["-l", exe.to_str().unwrap()])
-        .output()
-        .expect("otool spawn failed");
-    assert!(
-        otool.status.success(),
-        "otool should inspect linked hello: {}",
-        String::from_utf8_lossy(&otool.stderr)
-    );
-    let load_commands = String::from_utf8_lossy(&otool.stdout);
-    assert!(
-        load_commands.contains("LC_UUID"),
-        "linked hello should carry LC_UUID so dyld accepts it:\n{}",
-        load_commands
-    );
+    // LC_UUID is a Mach-O load command (dyld requirement); ELF has no
+    // equivalent obligation, so the inspection runs on macOS only and
+    // the launch check below covers both.
+    if armfortas::testing::native_macho_toolchain_support().is_ok() {
+        let otool = Command::new("otool")
+            .args(["-l", exe.to_str().unwrap()])
+            .output()
+            .expect("otool spawn failed");
+        assert!(
+            otool.status.success(),
+            "otool should inspect linked hello: {}",
+            String::from_utf8_lossy(&otool.stderr)
+        );
+        let load_commands = String::from_utf8_lossy(&otool.stdout);
+        assert!(
+            load_commands.contains("LC_UUID"),
+            "linked hello should carry LC_UUID so dyld accepts it:\n{}",
+            load_commands
+        );
+    }
 
     let run = Command::new(&exe)
         .current_dir(&dir)
@@ -25546,7 +25667,9 @@ fn program_internal_char_helper_assignment_uses_internal_symbol() {
 
     let undefined = undefined_symbols(&obj);
     assert!(
-        !undefined.iter().any(|sym| sym == "_helper"),
+        !undefined
+            .iter()
+            .any(|sym| sym.trim_start_matches('_') == "helper"),
         "program-contained character helper should not escape as a raw external symbol: {:?}",
         undefined
     );
@@ -28326,7 +28449,9 @@ fn allocatable_result_helper_assignment_uses_resolved_symbol() {
 
     let undefined = undefined_symbols(&obj);
     assert!(
-        !undefined.iter().any(|sym| sym == "_helper"),
+        !undefined
+            .iter()
+            .any(|sym| sym.trim_start_matches('_') == "helper"),
         "same-file allocatable-result helper should not lower to a raw external symbol: {:?}",
         undefined
     );
@@ -31363,7 +31488,9 @@ end program
     );
     let undefined = undefined_symbols(&obj);
     assert!(
-        !undefined.iter().any(|sym| sym == "_all"),
+        !undefined
+            .iter()
+            .any(|sym| sym.trim_start_matches('_') == "all"),
         "ALL over section/result comparison must not escape as raw _all: {:?}",
         undefined
     );
@@ -31435,7 +31562,9 @@ end program
     );
     let undefined = undefined_symbols(&obj);
     assert!(
-        !undefined.iter().any(|sym| sym == "_all"),
+        !undefined
+            .iter()
+            .any(|sym| sym.trim_start_matches('_') == "all"),
         "ALL over real section/scalar comparison must not escape as raw _all: {:?}",
         undefined
     );
@@ -31507,7 +31636,9 @@ end program
     );
     let undefined = undefined_symbols(&obj);
     assert!(
-        !undefined.iter().any(|sym| sym == "_all"),
+        !undefined
+            .iter()
+            .any(|sym| sym.trim_start_matches('_') == "all"),
         "ALL over complex array comparison must not escape as raw _all: {:?}",
         undefined
     );
@@ -33708,7 +33839,9 @@ fn imported_array_function_actual_to_descriptor_dummy_keeps_nested_descriptor_ab
     );
     let undef = undefined_symbols(&main_obj);
     assert!(
-        !undef.iter().any(|sym| sym == "_reshape"),
+        !undef
+            .iter()
+            .any(|sym| sym.trim_start_matches('_') == "reshape"),
         "descriptor consumer emitted scalar reshape call: {undef:?}"
     );
 
@@ -39249,26 +39382,52 @@ fn nested_call_chain_with_array_section_args_keeps_frame_bounded() {
         String::from_utf8_lossy(&asm_compile.stderr)
     );
     let asm_text = std::fs::read_to_string(&asm).expect("read asm");
-    let outer_fn_marker = "_afs_modproc_wmin_water_simple:";
+    let outer_fn_marker = if cfg!(target_arch = "x86_64") {
+        "afs_modproc_wmin_water_simple:"
+    } else {
+        "_afs_modproc_wmin_water_simple:"
+    };
     let outer_start = asm_text
         .find(outer_fn_marker)
         .expect("outer function symbol present in asm");
-    // Count the 16K stack-probe pattern within the outer function's
-    // prologue. The probe is `movz x16, #16384 ; sub sp, sp, x16`.
-    // Pre-fix: ~958. Post-fix: well under 50 for this shape.
-    let probes_to_next_label = asm_text[outer_start..]
-        .lines()
-        .take_while(|line| {
-            !line.trim_start().starts_with("_afs_modproc_") || line.contains("water_simple:")
-        })
-        .filter(|line| line.contains("movz x16, #16384"))
-        .count();
-    assert!(
-        probes_to_next_label < 60,
-        "water_simple prologue still emits {} 16K stack probes (pre-fix was 380+, post-fix should be well under 60). \
-         The fix in array_function_result_elem_type may have regressed.",
-        probes_to_next_label
-    );
+    if cfg!(target_arch = "x86_64") {
+        // Same contract, x86 shape: the frame is a prologue
+        // `subq $N, %rsp`. The pre-fix pathology would be ~15MB of
+        // frame; assert the first subq stays well under 1MB.
+        let frame = asm_text[outer_start..]
+            .lines()
+            .take(20)
+            .find_map(|l| {
+                l.trim()
+                    .strip_prefix("subq $")
+                    .and_then(|r| r.split(',').next())
+                    .and_then(|n| n.trim().parse::<i64>().ok())
+            })
+            .expect("prologue subq present");
+        assert!(
+            frame < 1_000_000,
+            "water_simple prologue allocates {} bytes of frame (pre-fix shape was ~15MB). \
+             The fix in array_function_result_elem_type may have regressed.",
+            frame
+        );
+    } else {
+        // Count the 16K stack-probe pattern within the outer function's
+        // prologue. The probe is `movz x16, #16384 ; sub sp, sp, x16`.
+        // Pre-fix: ~958. Post-fix: well under 50 for this shape.
+        let probes_to_next_label = asm_text[outer_start..]
+            .lines()
+            .take_while(|line| {
+                !line.trim_start().starts_with("_afs_modproc_") || line.contains("water_simple:")
+            })
+            .filter(|line| line.contains("movz x16, #16384"))
+            .count();
+        assert!(
+            probes_to_next_label < 60,
+            "water_simple prologue still emits {} 16K stack probes (pre-fix was 380+, post-fix should be well under 60). \
+             The fix in array_function_result_elem_type may have regressed.",
+            probes_to_next_label
+        );
+    }
     let run = Command::new(&out)
         .output()
         .expect("water-hash-frame run failed");

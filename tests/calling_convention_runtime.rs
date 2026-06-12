@@ -44,8 +44,7 @@ fn write_program_in(dir: &std::path::Path, name: &str, text: &str) -> PathBuf {
 fn compile_c_object(source: &std::path::Path, output: &std::path::Path) {
     let result = Command::new("clang")
         .args([
-            "-arch",
-            "arm64",
+            "-fPIC",
             "-c",
             source.to_str().unwrap(),
             "-o",

@@ -319,7 +319,7 @@ fn o3_vectorizes_realworld_explicit_do_stage() {
     }
     if o3_kernel {
         assert!(
-            o3_asm.contains("_afs_array_add_i32"),
+            o3_asm.contains("afs_array_add_i32"),
             "kernel-form O3 assembly should reference the bulk add kernel:\n{}",
             o3_asm
         );

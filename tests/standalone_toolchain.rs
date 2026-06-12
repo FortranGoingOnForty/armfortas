@@ -140,7 +140,7 @@ fn compile_with_driver_args_and_vars(
 
 #[test]
 fn hello_world_runs_through_afs_as_and_afs_ld() {
-    if let Err(reason) = armfortas::testing::native_e2e_support() {
+    if let Err(reason) = armfortas::testing::native_macho_toolchain_support() {
         eprintln!(
             "\nHARNESS_SKIP suite=standalone_toolchain test=hello_world_runs_through_afs_as_and_afs_ld count=1 reason=\"{}\"",
             reason
@@ -243,7 +243,7 @@ fn hello_world_runs_through_afs_as_and_afs_ld() {
 
 #[test]
 fn hello_world_runs_through_driver_with_standalone_tool_overrides() {
-    if let Err(reason) = armfortas::testing::native_e2e_support() {
+    if let Err(reason) = armfortas::testing::native_macho_toolchain_support() {
         eprintln!(
             "\nHARNESS_SKIP suite=standalone_toolchain test=hello_world_runs_through_driver_with_standalone_tool_overrides count=1 reason=\"{}\"",
             reason
@@ -321,7 +321,7 @@ fn hello_world_runs_through_driver_with_standalone_tool_overrides() {
 
 #[test]
 fn hello_world_runs_through_driver_with_afs_ld_enable_flag() {
-    if let Err(reason) = armfortas::testing::native_e2e_support() {
+    if let Err(reason) = armfortas::testing::native_macho_toolchain_support() {
         eprintln!(
             "\nHARNESS_SKIP suite=standalone_toolchain test=hello_world_runs_through_driver_with_afs_ld_enable_flag count=1 reason=\"{}\"",
             reason
@@ -376,7 +376,7 @@ fn hello_world_runs_through_driver_with_afs_ld_enable_flag() {
 
 #[test]
 fn hello_world_keeps_apple_ld_path_with_afs_ld_zero() {
-    if let Err(reason) = armfortas::testing::native_e2e_support() {
+    if let Err(reason) = armfortas::testing::native_macho_toolchain_support() {
         eprintln!(
             "\nHARNESS_SKIP suite=standalone_toolchain test=hello_world_keeps_apple_ld_path_with_afs_ld_zero count=1 reason=\"{}\"",
             reason
@@ -419,7 +419,7 @@ fn hello_world_keeps_apple_ld_path_with_afs_ld_zero() {
 
 #[test]
 fn shared_library_runs_through_driver_with_standalone_linker_override() {
-    if let Err(reason) = armfortas::testing::native_e2e_support() {
+    if let Err(reason) = armfortas::testing::native_macho_toolchain_support() {
         eprintln!(
             "\nHARNESS_SKIP suite=standalone_toolchain test=shared_library_runs_through_driver_with_standalone_linker_override count=1 reason=\"{}\"",
             reason
@@ -515,7 +515,7 @@ fn shared_library_runs_through_driver_with_standalone_linker_override() {
 
 #[test]
 fn hello_world_compiles_to_object_with_standalone_assembler_override() {
-    if let Err(reason) = armfortas::testing::native_e2e_support() {
+    if let Err(reason) = armfortas::testing::native_macho_toolchain_support() {
         eprintln!(
             "\nHARNESS_SKIP suite=standalone_toolchain test=hello_world_compiles_to_object_with_standalone_assembler_override count=1 reason=\"{}\"",
             reason
@@ -585,7 +585,7 @@ fn sprint18_program_matrix_runs_through_driver_standalone_overrides() {
         ("negative_step.f90", "5"),
         ("real_function.f90", "6.28"),
     ];
-    if let Err(reason) = armfortas::testing::native_e2e_support() {
+    if let Err(reason) = armfortas::testing::native_macho_toolchain_support() {
         eprintln!(
             "\nHARNESS_SKIP suite=standalone_toolchain test=sprint18_program_matrix_runs_through_driver_standalone_overrides count={} reason=\"{}\"",
             cases.len(),

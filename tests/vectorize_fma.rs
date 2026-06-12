@@ -29,7 +29,7 @@ fn capture_run_stdout(request: CaptureRequest) -> String {
 
 #[test]
 fn o0_scalar_fma_fixture_runs_correctly() {
-    if let Err(reason) = armfortas::testing::native_e2e_support() {
+    if let Err(reason) = armfortas::testing::native_vectorizer_support() {
         eprintln!(
             "\nHARNESS_SKIP suite=vectorize_fma test=o0_scalar_fma_fixture_runs_correctly count=1 reason=\"{}\"",
             reason
@@ -62,7 +62,7 @@ fn o0_scalar_fma_fixture_runs_correctly() {
 
 #[test]
 fn o3_vectorizes_elementwise_fma() {
-    if let Err(reason) = armfortas::testing::native_e2e_support() {
+    if let Err(reason) = armfortas::testing::native_vectorizer_support() {
         eprintln!(
             "\nHARNESS_SKIP suite=vectorize_fma test=o3_vectorizes_elementwise_fma count=1 reason=\"{}\"",
             reason

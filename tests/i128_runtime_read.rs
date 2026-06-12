@@ -46,7 +46,7 @@ fn integer16_read_uses_wide_reader_in_ir_and_asm() {
         Stage::Asm,
     );
     assert!(
-        asm.contains("_afs_read_int128"),
+        asm.contains("afs_read_int128"),
         "assembly should reference the wide runtime reader symbol:\n{}",
         asm
     );
