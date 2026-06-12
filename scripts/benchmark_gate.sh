@@ -44,7 +44,21 @@ if [ ! -x "$COMPILER" ]; then
 fi
 
 TRIPLE=$("$COMPILER" --print-target)
-BASELINE=".benchmarks/baseline-${TRIPLE}.txt"
+# Linux baselines are additionally distro-tagged: NixOS and ubuntu
+# link different crt/libgcc/build-id sets, so binary sizes are only
+# comparable within a distro (learned when CI's ubuntu binaries came
+# out 63-81% larger than the NixOS baseline). An environment without
+# a committed baseline bootstraps one and passes — commit it to arm
+# the gate there.
+ENV_TAG=""
+case "$TRIPLE" in
+*linux*)
+    if [ -r /etc/os-release ]; then
+        ENV_TAG="-$(. /etc/os-release && echo "$ID")"
+    fi
+    ;;
+esac
+BASELINE=".benchmarks/baseline-${TRIPLE}${ENV_TAG}.txt"
 echo "Target: $TRIPLE (baseline: $BASELINE)"
 
 mkdir -p .benchmarks
