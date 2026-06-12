@@ -373,6 +373,7 @@ pub(crate) fn build_vector_plan(
     func: &Function,
     shape: &CountedLoop,
     loop_defs: &HashSet<ValueId>,
+    isa: &super::vec_isa::VectorIsa,
 ) -> Option<VectorPlan> {
     let body = func.block(shape.body);
 
@@ -445,6 +446,7 @@ pub(crate) fn build_vector_plan(
             shape,
             &dest,
             loop_defs,
+            isa,
         )?;
         statements.push(Statement {
             op,
@@ -499,6 +501,7 @@ pub(crate) fn classify_body_op(
     shape: &CountedLoop,
     dest: &ArrayAccess,
     loop_defs: &HashSet<ValueId>,
+    isa: &super::vec_isa::VectorIsa,
 ) -> Option<BodyOp> {
     match kind {
         InstKind::Load(_) => {
@@ -562,16 +565,23 @@ pub(crate) fn classify_body_op(
             dest,
             loop_defs,
         ),
-        InstKind::IMul(l, r) => binop_body(
-            stored_value,
-            BinaryKind::Mul,
-            *l,
-            *r,
-            func,
-            shape,
-            dest,
-            loop_defs,
-        ),
+        InstKind::IMul(l, r) => {
+            // Integer lane multiply is per-ISA (NEON mul.4s; SSE2
+            // has none at baseline).
+            if !isa.int_mul {
+                return None;
+            }
+            binop_body(
+                stored_value,
+                BinaryKind::Mul,
+                *l,
+                *r,
+                func,
+                shape,
+                dest,
+                loop_defs,
+            )
+        }
         InstKind::FAdd(l, r) => {
             // Detect element-wise FMA: `c(i) = a(i)*b(i) + d(i)`.
             // The store value is FAdd whose one operand is an FMul of
@@ -661,6 +671,11 @@ pub(crate) fn classify_body_op(
             } else {
                 return None;
             };
+            // Integer lane min/max is per-ISA (NEON smax/smin.4s;
+            // SSE2 baseline has no i32 form).
+            if matches!(dest.elem_ty, IrType::Int(_)) && !isa.int_min_max {
+                return None;
+            }
             binop_body(stored_value, bk, *t, *f, func, shape, dest, loop_defs)
         }
         _ => None,
@@ -1064,7 +1079,11 @@ pub(crate) struct WherePlan {
     pub(crate) span: crate::lexer::Span,
 }
 
-pub(crate) fn build_where_plan(func: &Function, shape: &WhereLoop) -> Option<WherePlan> {
+pub(crate) fn build_where_plan(
+    func: &Function,
+    shape: &WhereLoop,
+    isa: &super::vec_isa::VectorIsa,
+) -> Option<WherePlan> {
     let body_block = func.block(shape.body);
     let then_block = func.block(shape.then_block);
     // Reject calls in body or then.
@@ -1228,6 +1247,7 @@ pub(crate) fn build_where_plan(func: &Function, shape: &WhereLoop) -> Option<Whe
                 let kind = match inst.kind {
                     InstKind::IAdd(..) | InstKind::FAdd(..) => BinaryKind::Add,
                     InstKind::ISub(..) | InstKind::FSub(..) => BinaryKind::Sub,
+                    InstKind::IMul(..) if !isa.int_mul => return None,
                     InstKind::IMul(..) | InstKind::FMul(..) => BinaryKind::Mul,
                     InstKind::FDiv(..) => BinaryKind::Div,
                     _ => unreachable!(),
@@ -1416,6 +1436,7 @@ pub(crate) fn build_where_plan(func: &Function, shape: &WhereLoop) -> Option<Whe
                         let kind = match inst.kind {
                             InstKind::IAdd(..) | InstKind::FAdd(..) => BinaryKind::Add,
                             InstKind::ISub(..) | InstKind::FSub(..) => BinaryKind::Sub,
+                            InstKind::IMul(..) if !isa.int_mul => return None,
                             InstKind::IMul(..) | InstKind::FMul(..) => BinaryKind::Mul,
                             InstKind::FDiv(..) => BinaryKind::Div,
                             _ => unreachable!(),
@@ -1689,6 +1710,7 @@ pub(crate) fn detect_reduction_plan(
     func: &Function,
     lp: &NaturalLoop,
     preds: &HashMap<BlockId, Vec<BlockId>>,
+    isa: &super::vec_isa::VectorIsa,
 ) -> Option<ReductionPlan> {
     if lp.latches.len() != 1 || lp.body.len() != 2 {
         return None;
@@ -1915,6 +1937,9 @@ pub(crate) fn detect_reduction_plan(
                 kind: unary_kind,
             }
         }
+        // The integer dot fold multiplies lanes element-wise before
+        // the sum, so it needs the ISA's integer lane multiply.
+        (IrType::Int(_), InstKind::IMul(..)) if !isa.int_mul => return None,
         (IrType::Int(_), InstKind::IMul(la, lb)) | (IrType::Float(_), InstKind::FMul(la, lb)) => {
             let load_a_inst = defs.get(la)?;
             let load_b_inst = defs.get(lb)?;
@@ -2019,18 +2044,17 @@ pub(crate) fn detect_reduction_plan(
     if acc_extra_uses != 0 {
         return None;
     }
-    // Min/Max codegen is wired for i32 (smaxv/sminv.4s + umov.s),
-    // f32 (fmaxv/fminv.4s direct to scalar fp reg), and f64 (no
-    // fmaxv.2d on NEON; fmaxp/fminp.2d gives the across-lane reduce
-    // for the two f64 lanes).
-    if !matches!(reduce, ReductionKind::Sum)
-        && !matches!(
-            elem_ty,
-            IrType::Int(IntWidth::I32)
-                | IrType::Float(FloatWidth::F32)
-                | IrType::Float(FloatWidth::F64)
-        )
-    {
+    // Across-lane Min/Max legality is per-ISA: NEON wires i32
+    // (smaxv/sminv.4s + umov.s), f32 (fmaxv/fminv.4s), and f64
+    // (fmaxp/fminp.2d); SSE2 reduces only the float forms via a
+    // shuffle tree.
+    let reduce_min_max_legal = match elem_ty {
+        IrType::Int(IntWidth::I32) => isa.reduce_min_max_i32,
+        IrType::Float(FloatWidth::F32) => isa.reduce_min_max_f32,
+        IrType::Float(FloatWidth::F64) => isa.reduce_min_max_f64,
+        _ => false,
+    };
+    if !matches!(reduce, ReductionKind::Sum) && !reduce_min_max_legal {
         return None;
     }
 

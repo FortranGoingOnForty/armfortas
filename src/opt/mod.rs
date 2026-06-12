@@ -47,6 +47,7 @@ pub mod unroll;
 pub mod unswitch;
 pub mod util;
 pub(crate) mod vec_analysis;
+pub(crate) mod vec_isa;
 pub mod vectorize;
 
 #[cfg(test)]

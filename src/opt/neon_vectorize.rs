@@ -55,13 +55,14 @@ fn vectorize_one_loop(func: &mut Function) -> bool {
         return false;
     }
     let preds = predecessors(func);
+    let isa = &super::vec_isa::NEON;
 
     for lp in &loops {
         // Try element-wise vectorization first (no escaping values).
         if let Some(shape) = detect_counted_loop(func, lp, &preds) {
             let loop_defs = loop_defined_values(func, lp);
             if !loop_values_escape(func, lp, &loop_defs) {
-                if let Some(plan) = build_vector_plan(func, &shape, &loop_defs) {
+                if let Some(plan) = build_vector_plan(func, &shape, &loop_defs, isa) {
                     apply_vector_plan(func, &shape, plan);
                     return true;
                 }
@@ -69,13 +70,13 @@ fn vectorize_one_loop(func: &mut Function) -> bool {
         }
         // WHERE-block diamond (4-block: header / body / then / incr).
         if let Some(shape) = detect_where_loop(func, lp, &preds) {
-            if let Some(plan) = build_where_plan(func, &shape) {
+            if let Some(plan) = build_where_plan(func, &shape, isa) {
                 apply_where_plan(func, &shape, plan);
                 return true;
             }
         }
         // Fall back: reduction loop (one escaping accumulator).
-        if let Some(plan) = detect_reduction_plan(func, lp, &preds) {
+        if let Some(plan) = detect_reduction_plan(func, lp, &preds, isa) {
             apply_reduction_plan(func, lp, plan);
             return true;
         }
