@@ -56,8 +56,8 @@ fn integer16_formatted_read_uses_wide_runtime_symbols() {
         },
         Stage::Asm,
     );
-    assert!(asm.contains("_afs_fmt_read_int128"));
-    assert!(asm.contains("_afs_fmt_read_int"));
+    assert!(asm.contains("afs_fmt_read_int128"));
+    assert!(asm.contains("afs_fmt_read_int"));
 }
 
 #[test]
@@ -167,8 +167,8 @@ fn integer16_formatted_read_targets_use_wide_runtime_symbols() {
         },
         Stage::Asm,
     );
-    assert!(asm.contains("_afs_fmt_read_int128"));
-    assert!(asm.contains("_afs_fmt_read_int"));
+    assert!(asm.contains("afs_fmt_read_int128"));
+    assert!(asm.contains("afs_fmt_read_int"));
 }
 
 #[test]
@@ -285,7 +285,7 @@ fn integer16_formatted_read_arrays_use_wide_runtime_symbols() {
         },
         Stage::Asm,
     );
-    assert!(asm.contains("_afs_fmt_read_int128"));
+    assert!(asm.contains("afs_fmt_read_int128"));
 }
 
 #[test]
@@ -392,7 +392,7 @@ fn integer16_formatted_read_sections_use_wide_runtime_symbols() {
         },
         Stage::Asm,
     );
-    assert!(asm.contains("_afs_fmt_read_int128"));
+    assert!(asm.contains("afs_fmt_read_int128"));
 }
 
 #[test]
@@ -492,7 +492,7 @@ fn integer16_formatted_read_alloc_section_uses_descriptor_bounds_and_wide_reader
         },
         Stage::Asm,
     );
-    assert!(asm.contains("_afs_fmt_read_int128"));
+    assert!(asm.contains("afs_fmt_read_int128"));
 }
 
 #[test]
@@ -547,7 +547,7 @@ fn integer16_formatted_read_alloc_reverse_section_uses_wide_reader() {
         },
         Stage::Asm,
     );
-    assert!(asm.contains("_afs_fmt_read_int128"));
+    assert!(asm.contains("afs_fmt_read_int128"));
 }
 
 #[test]

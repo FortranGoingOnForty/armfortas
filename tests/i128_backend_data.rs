@@ -30,11 +30,20 @@ fn globals_only_i128_backend_emits_expected_words_in_asm() {
         Stage::Asm,
     );
 
-    assert!(
-        asm.contains(".section __DATA,__data"),
-        "asm should emit a data section for i128 globals:\n{}",
-        asm
-    );
+    if cfg!(target_arch = "x86_64") {
+        // ELF spells the data section as a bare .data directive.
+        assert!(
+            asm.contains("\n.data"),
+            "asm should emit a data section for i128 globals:\n{}",
+            asm
+        );
+    } else {
+        assert!(
+            asm.contains(".section __DATA,__data"),
+            "asm should emit a data section for i128 globals:\n{}",
+            asm
+        );
+    }
     assert!(
         asm.matches(".p2align 4").count() >= 2,
         "scalar and array i128 globals should request 16-byte alignment:\n{}",
@@ -85,12 +94,12 @@ fn globals_only_i128_object_snapshot_is_deterministic_at_o2() {
     );
 
     assert!(
-        first.contains("_afs_mod_integer16_globals_backend_big_scalar"),
+        first.contains("afs_mod_integer16_globals_backend_big_scalar"),
         "object snapshot should retain the i128 scalar global symbol:\n{}",
         first
     );
     assert!(
-        first.contains("_afs_mod_integer16_globals_backend_big_array"),
+        first.contains("afs_mod_integer16_globals_backend_big_array"),
         "object snapshot should retain the i128 array global symbol:\n{}",
         first
     );

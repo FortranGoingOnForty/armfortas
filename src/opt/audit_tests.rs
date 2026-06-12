@@ -951,7 +951,7 @@ fn audit_pipeline_o2_e2e_loop_through_passmanager() {
     // verify the input is well-formed
     assert!(verify_module(&m).is_empty(), "test setup invalid");
 
-    let pm = build_pipeline(OptLevel::O2);
+    let pm = build_pipeline(OptLevel::O2, crate::target::Arch::Arm64);
     pm.run(&mut m);
 
     // Final IR must verify.
@@ -1009,7 +1009,7 @@ fn audit_interaction_const_prop_then_dce_removes_orphan_const() {
     });
     m.add_function(f);
 
-    let pm = build_pipeline(OptLevel::O2);
+    let pm = build_pipeline(OptLevel::O2, crate::target::Arch::Arm64);
     pm.run(&mut m);
 
     let post = verify_module(&m);
@@ -1057,7 +1057,7 @@ fn audit_interaction_strength_reduce_orphans_get_dced() {
     f.block_mut(entry).terminator = Some(Terminator::Return(Some(mul)));
     m.add_function(f);
 
-    let pm = build_pipeline(OptLevel::O2);
+    let pm = build_pipeline(OptLevel::O2, crate::target::Arch::Arm64);
     pm.run(&mut m);
 
     // strength_reduce makes mul an identity (passes through to x), then
@@ -2163,7 +2163,7 @@ fn audit_const_fold_non_rpo_block_order() {
     let pre = verify_module(&m);
     assert!(pre.is_empty(), "test setup invalid: {:?}", pre);
 
-    let pm = build_pipeline(OptLevel::O2);
+    let pm = build_pipeline(OptLevel::O2, crate::target::Arch::Arm64);
     pm.run(&mut m);
 
     let post = verify_module(&m);

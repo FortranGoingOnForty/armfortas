@@ -22,11 +22,10 @@ Pre-existing failure surfaced during sprint-gate runs on nomad
 
 Deferred items from the l00 F2023 inventory (2026-06-10):
 
-- `! FLAGS:` landed in the root harness (run_programs) but is not yet
-  consumed by bencch; per the one-dialect rule bencch must either apply
-  it or clearly report it unsupported. Today bencch only parses
-  `! CHECK:` (`bencch/bench/src/lib.rs:4866`), so a shared fixture with
-  FLAGS would compile without its flags and could silently diverge.
+- ~~`! FLAGS:` landed in the root harness (run_programs) but is not
+  yet consumed by bencch~~ — resolved in x09: `compile_output` applies
+  FLAGS through the driver's CLI parser and the capture path refuses
+  loudly on FLAGS-carrying fixtures (`bencch/bench/src/compiler.rs`).
 - `USE <intrinsic-module>, ONLY: name` does not validate `name`:
   `use iso_fortran_env, only: zzz_not_a_thing` compiles silently.
 - Implicit external function calls are accepted in constant contexts:
@@ -157,3 +156,16 @@ l06's intake):
   test also caught COMMON blocks emitting strong .data definitions
   per TU on ELF (duplicate-symbol link errors) — fixed with .comm
   emission for uninitialized commons.
+
+Found during x09's determinism sweep (2026-06-11, pre-existing, all
+targets):
+
+- **Circular USE segfaults the compiler** when a multifile bundle is
+  compiled as a single source: `error_circular_use_direct.f90` and
+  `error_circular_use_indirect.f90` SIGSEGV under `--emit-ir` (and
+  every other mode) instead of reporting the cycle. The harness never
+  sees it because MULTIFILE_LINK splits the bundle and the expected
+  "not found" error fires first. Likely unbounded recursion in module
+  resolution. Error-path robustness, not a miscompile; owner: next
+  frontend sprint that touches module resolution (l07 submodules is
+  the natural slot).

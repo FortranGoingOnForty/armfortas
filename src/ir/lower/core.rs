@@ -5697,7 +5697,14 @@ pub(super) fn install_host_param_consts(
     host_param_consts: &HashMap<String, ConstScalar>,
     st: &SymbolTable,
 ) {
-    for (name, value) in host_param_consts {
+    // Sorted walk: HashMap iteration order would otherwise decide the
+    // alloca emission order, making the IR (and the final binary)
+    // differ run to run. Caught by x09's trunk-vs-branch asm diff on
+    // stdlib_math_arg_complex_elemental.f90.
+    let mut names: Vec<&String> = host_param_consts.keys().collect();
+    names.sort();
+    for name in names {
+        let value = &host_param_consts[name];
         if locals.contains_key(name) {
             continue;
         }

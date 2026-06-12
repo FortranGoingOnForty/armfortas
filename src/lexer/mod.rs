@@ -2070,10 +2070,22 @@ end program hello
             all_source.lines().count(),
             elapsed
         );
+        // The 2s budget was calibrated on Apple Silicon single-core
+        // speed; dorado (FreeBSD x86_64) measures 2.0-2.4s on the same
+        // fixture. Keep the original budget on arm64-macos and give
+        // other hosts 2x — the assertion's job is catching
+        // order-of-magnitude lexer regressions, not ranking hardware.
+        let host = crate::target::TargetSpec::host();
+        let budget = if host == crate::target::TargetSpec::parse("arm64-macos").unwrap() {
+            2.0
+        } else {
+            4.0
+        };
         assert!(
-            elapsed.as_secs_f64() < 2.0,
-            "too slow: {:?} (must be < 2s)",
-            elapsed
+            elapsed.as_secs_f64() < budget,
+            "too slow: {:?} (must be < {}s)",
+            elapsed,
+            budget
         );
     }
 

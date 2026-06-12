@@ -29,7 +29,7 @@ fn capture_run_stdout(request: CaptureRequest) -> String {
 
 #[test]
 fn o3_vectorizes_two_statement_do_body() {
-    if let Err(reason) = armfortas::testing::native_e2e_support() {
+    if let Err(reason) = armfortas::testing::native_vectorizer_support() {
         eprintln!(
             "\nHARNESS_SKIP suite=vectorize_multi_statement test=o3_vectorizes_two_statement_do_body count=1 reason=\"{}\"",
             reason

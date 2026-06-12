@@ -23,6 +23,17 @@ fn assert_i128_return_stored_after_call(asm: &str, call_marker: &str, context: &
     let call_idx = asm
         .find(call_marker)
         .unwrap_or_else(|| panic!("missing call marker '{}' in:\n{}", call_marker, asm));
+    if cfg!(target_arch = "x86_64") {
+        // x86 returns the i128 in rax:rdx; both limbs spill after the call.
+        let tail = &asm[call_idx..];
+        assert!(
+            tail.contains("movq %rax, ") && tail.contains("movq %rdx, "),
+            "{}:\n{}",
+            context,
+            asm
+        );
+        return;
+    }
     assert!(
         asm[call_idx..].contains("stp x0, x1, [x29, #-"),
         "{}:\n{}",
@@ -42,6 +53,32 @@ fn internal_i128_stack_call_spills_fifth_arg_and_loads_incoming_slot_at_o0() {
         Stage::Asm,
     );
 
+    if cfg!(target_arch = "x86_64") {
+        // x86 fits three i128 args in rdi:rsi/rdx:rcx/r8:r9; the fifth
+        // lands in the second outgoing stack slot (rsp+16/24) and the
+        // callee reads its stack args above the saved frame.
+        assert!(
+            asm.contains("call afs_internal_"),
+            "internal integer(16) stack-call should branch to the internalized contained helper:\n{}",
+            asm
+        );
+        assert!(
+            asm.contains("movq %rax, 16(%rsp)") && asm.contains("movq %rdx, 24(%rsp)"),
+            "fifth integer(16) arg should spill to the outgoing stack area:\n{}",
+            asm
+        );
+        assert!(
+            asm.contains("movq 16(%rbp), %rax") && asm.contains("movq 32(%rbp), %rax"),
+            "callee should load the incoming stack-passed integer(16) args above the frame:\n{}",
+            asm
+        );
+        assert_i128_return_stored_after_call(
+            &asm,
+            "call afs_internal_",
+            "caller should still receive the returned integer(16) value in rax:rdx even when args spill to the stack",
+        );
+        return;
+    }
     assert!(
         asm.contains("bl _afs_internal_"),
         "internal integer(16) stack-call should branch to the internalized contained helper:\n{}",
@@ -188,6 +225,24 @@ fn external_i128_stack_call_spills_fifth_arg_and_tracks_symbol_at_o0() {
         Stage::Asm,
     );
 
+    if cfg!(target_arch = "x86_64") {
+        assert!(
+            asm.contains("call add5_ext"),
+            "external integer(16) stack-call should branch to the declared symbol:\n{}",
+            asm
+        );
+        assert!(
+            asm.contains("movq %rax, 16(%rsp)") && asm.contains("movq %rdx, 24(%rsp)"),
+            "fifth external integer(16) arg should spill to the outgoing stack area:\n{}",
+            asm
+        );
+        assert_i128_return_stored_after_call(
+            &asm,
+            "call add5_ext",
+            "external integer(16) stack-call should still receive the returned value in rax:rdx",
+        );
+        return;
+    }
     assert!(
         asm.contains("bl _add5_ext"),
         "external integer(16) stack-call should branch to the declared symbol:\n{}",

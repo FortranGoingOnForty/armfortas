@@ -112,12 +112,20 @@ impl OptLevel {
     }
 }
 
-/// Build the pass pipeline for a given optimization level.
+/// Build the pass pipeline for a given optimization level and target
+/// architecture.
 ///
 /// Adding a new optimization pass is a single push here. Keeping this
 /// in one function makes it trivial to audit which passes run at which
 /// level.
-pub fn build_pipeline(level: OptLevel) -> PassManager {
+///
+/// The pipeline is target-neutral except the two vectorizers:
+/// `NeonVectorize` emits 128-bit V-ops only the arm64 isel selects,
+/// and `Vectorize` calls NEON-backed runtime kernels. Both register
+/// only for `Arch::Arm64`; the x86 SIMD story lands in x10 (the x09
+/// pass audit has the full survey).
+pub fn build_pipeline(level: OptLevel, arch: crate::target::Arch) -> PassManager {
+    let vectorizers = arch == crate::target::Arch::Arm64;
     let mut pm = PassManager::new();
     match level {
         OptLevel::O0 => {
@@ -240,8 +248,10 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(LoopInterchange));
             pm.add(Box::new(LoopFission));
             pm.add(Box::new(LoopFusion));
-            pm.add(Box::new(NeonVectorize));
-            pm.add(Box::new(Vectorize));
+            if vectorizers {
+                pm.add(Box::new(NeonVectorize));
+                pm.add(Box::new(Vectorize));
+            }
             pm.add(Box::new(LoopUnroll));
             pm.add(Box::new(Gvn)); // keep O3/Ofast aligned with O2/Os value numbering
             pm.add(Box::new(Dce));
@@ -275,8 +285,10 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
             pm.add(Box::new(LoopInterchange));
             pm.add(Box::new(LoopFission));
             pm.add(Box::new(LoopFusion));
-            pm.add(Box::new(NeonVectorize));
-            pm.add(Box::new(Vectorize));
+            if vectorizers {
+                pm.add(Box::new(NeonVectorize));
+                pm.add(Box::new(Vectorize));
+            }
             pm.add(Box::new(LoopUnroll));
             pm.add(Box::new(FastMathReassoc));
             pm.add(Box::new(Gvn));
@@ -294,20 +306,17 @@ pub fn build_pipeline(level: OptLevel) -> PassManager {
 /// params and mem2reg-style joins, the widened `i128` lane can use the full
 /// ordinary O1/O2/O3/Os/Ofast pipelines. Higher levels remain gated until their
 /// pass shapes are proven end to end.
-pub fn build_i128_pipeline(level: OptLevel) -> Option<PassManager> {
+pub fn build_i128_pipeline(level: OptLevel, arch: crate::target::Arch) -> Option<PassManager> {
     match level {
-        OptLevel::O1 => Some(build_pipeline(OptLevel::O1)),
-        OptLevel::O2 => Some(build_pipeline(OptLevel::O2)),
-        OptLevel::O3 => Some(build_pipeline(OptLevel::O3)),
-        OptLevel::Os => Some(build_pipeline(OptLevel::Os)),
-        OptLevel::Ofast => Some(build_pipeline(OptLevel::Ofast)),
-        _ => None,
+        OptLevel::O0 => None,
+        _ => Some(build_pipeline(level, arch)),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::target::Arch;
 
     #[test]
     fn parse_flags() {
@@ -331,7 +340,7 @@ mod tests {
     #[test]
     fn pipelines_build() {
         // O0 has no passes; every other level has at least one.
-        assert!(build_pipeline(OptLevel::O0).is_empty());
+        assert!(build_pipeline(OptLevel::O0, Arch::Arm64).is_empty());
         for lvl in [
             OptLevel::O1,
             OptLevel::O2,
@@ -339,7 +348,7 @@ mod tests {
             OptLevel::Os,
             OptLevel::Ofast,
         ] {
-            let pm = build_pipeline(lvl);
+            let pm = build_pipeline(lvl, Arch::Arm64);
             assert!(
                 !pm.is_empty(),
                 "pipeline {:?} should have at least one pass",
@@ -351,7 +360,7 @@ mod tests {
     #[test]
     fn higher_optimization_levels_keep_gvn_enabled() {
         for lvl in [OptLevel::O2, OptLevel::O3, OptLevel::Os, OptLevel::Ofast] {
-            let pm = build_pipeline(lvl);
+            let pm = build_pipeline(lvl, Arch::Arm64);
             let names = pm.pass_names();
             assert!(
                 names.contains(&"gvn"),
@@ -364,8 +373,8 @@ mod tests {
 
     #[test]
     fn ofast_enables_fast_math_reassoc_but_o3_does_not() {
-        let o3 = build_pipeline(OptLevel::O3).pass_names();
-        let ofast = build_pipeline(OptLevel::Ofast).pass_names();
+        let o3 = build_pipeline(OptLevel::O3, Arch::Arm64).pass_names();
+        let ofast = build_pipeline(OptLevel::Ofast, Arch::Arm64).pass_names();
         assert!(
             !o3.contains(&"fast-math-reassoc"),
             "O3 should stay strict, got {:?}",
@@ -380,9 +389,9 @@ mod tests {
 
     #[test]
     fn vectorize_is_enabled_only_at_o3_and_above() {
-        let o2 = build_pipeline(OptLevel::O2).pass_names();
-        let o3 = build_pipeline(OptLevel::O3).pass_names();
-        let ofast = build_pipeline(OptLevel::Ofast).pass_names();
+        let o2 = build_pipeline(OptLevel::O2, Arch::Arm64).pass_names();
+        let o3 = build_pipeline(OptLevel::O3, Arch::Arm64).pass_names();
+        let ofast = build_pipeline(OptLevel::Ofast, Arch::Arm64).pass_names();
 
         assert!(
             !o2.contains(&"vectorize"),
@@ -402,25 +411,68 @@ mod tests {
     }
 
     #[test]
+    fn x86_pipeline_excludes_vectorizers_and_matches_arm_otherwise() {
+        // x09: the only per-target pipeline difference is the two
+        // vectorizer passes at O3/Ofast. Everything else must stay
+        // identical across arches — a divergence here is a bug, not a
+        // tuning choice.
+        for lvl in [
+            OptLevel::O0,
+            OptLevel::O1,
+            OptLevel::O2,
+            OptLevel::O3,
+            OptLevel::Os,
+            OptLevel::Ofast,
+        ] {
+            let arm: Vec<_> = build_pipeline(lvl, Arch::Arm64)
+                .pass_names()
+                .into_iter()
+                .filter(|n| *n != "neon_vectorize" && *n != "vectorize")
+                .collect();
+            let x86 = build_pipeline(lvl, Arch::X86_64).pass_names();
+            assert_eq!(
+                arm, x86,
+                "{:?}: x86 pipeline should be the arm64 pipeline minus vectorizers",
+                lvl
+            );
+            assert!(
+                !x86.contains(&"neon_vectorize") && !x86.contains(&"vectorize"),
+                "{:?}: vectorizers must not register for x86_64, got {:?}",
+                lvl,
+                x86
+            );
+        }
+    }
+
+    #[test]
+    fn arm64_o3_keeps_vectorizers() {
+        // Golden guard: the gating change must not alter the arm64
+        // registered pass list.
+        let o3 = build_pipeline(OptLevel::O3, Arch::Arm64).pass_names();
+        assert!(o3.contains(&"neon_vectorize"), "got {:?}", o3);
+        assert!(o3.contains(&"vectorize"), "got {:?}", o3);
+    }
+
+    #[test]
     fn i128_pipeline_is_available_through_ofast() {
         assert!(
-            build_i128_pipeline(OptLevel::O1).is_some(),
+            build_i128_pipeline(OptLevel::O1, Arch::Arm64).is_some(),
             "O1 should have the widened i128-safe pipeline"
         );
         assert!(
-            build_i128_pipeline(OptLevel::O2).is_some(),
+            build_i128_pipeline(OptLevel::O2, Arch::Arm64).is_some(),
             "O2 should be available once the widened i128 lane is proven"
         );
         for lvl in [OptLevel::O3, OptLevel::Os, OptLevel::Ofast] {
             assert!(
-                build_i128_pipeline(lvl).is_some(),
+                build_i128_pipeline(lvl, Arch::Arm64).is_some(),
                 "{:?} should be available once the widened i128 lane is proven",
                 lvl
             );
         }
         for lvl in [OptLevel::O0] {
             assert!(
-                build_i128_pipeline(lvl).is_none(),
+                build_i128_pipeline(lvl, Arch::Arm64).is_none(),
                 "{:?} should not yet have widened i128 optimization support",
                 lvl
             );
@@ -429,10 +481,10 @@ mod tests {
 
     #[test]
     fn i128_pipeline_matches_full_o1() {
-        let wide = build_i128_pipeline(OptLevel::O1)
+        let wide = build_i128_pipeline(OptLevel::O1, Arch::Arm64)
             .expect("O1 should expose the widened i128 pipeline")
             .pass_names();
-        let full = build_pipeline(OptLevel::O1).pass_names();
+        let full = build_pipeline(OptLevel::O1, Arch::Arm64).pass_names();
         assert_eq!(
             wide, full,
             "the widened i128 O1 lane should stay aligned with the ordinary O1 pipeline"
@@ -442,10 +494,10 @@ mod tests {
     #[test]
     fn i128_pipeline_matches_full_higher_levels() {
         for lvl in [OptLevel::O2, OptLevel::O3, OptLevel::Os, OptLevel::Ofast] {
-            let wide = build_i128_pipeline(lvl)
+            let wide = build_i128_pipeline(lvl, Arch::Arm64)
                 .expect("level should expose the widened i128 pipeline")
                 .pass_names();
-            let full = build_pipeline(lvl).pass_names();
+            let full = build_pipeline(lvl, Arch::Arm64).pass_names();
             assert_eq!(
                 wide, full,
                 "the widened i128 lane should stay aligned with the ordinary {:?} pipeline",

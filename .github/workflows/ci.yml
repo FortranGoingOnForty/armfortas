@@ -228,8 +228,10 @@ jobs:
       - run: cargo test -p armfortas --lib
       - run: cargo test -p armfortas --tests -- --nocapture --test-threads=1 2>&1 | tee /tmp/tests.log
       - run: ci/check_skips.sh /tmp/tests.log posix-elf
-      # x07: surface the -O0 sweep counts in the job summary.
-      - run: grep -E '\[-O0\] .* passed' /tmp/tests.log >> "$GITHUB_STEP_SUMMARY" || true
+      # x09: SSE-only FP — fail on any x87 mnemonic at -O2/-Ofast.
+      - run: ci/check_x87.sh
+      # x09: surface the full opt-matrix counts in the job summary.
+      - run: grep -E '\[-O[A-Za-z0-9]+\] .* passed' /tmp/tests.log >> "$GITHUB_STEP_SUMMARY" || true
 
   build-linux-musl:
     name: "Linux musl: build + tests (e2e skip-gated)"

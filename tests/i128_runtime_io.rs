@@ -46,7 +46,7 @@ fn integer16_print_uses_wide_writer_in_ir_and_asm() {
         Stage::Asm,
     );
     assert!(
-        asm.contains("_afs_write_int128"),
+        asm.contains("afs_write_int128"),
         "assembly should reference the wide runtime writer symbol:\n{}",
         asm
     );
@@ -163,7 +163,7 @@ fn integer16_formatted_write_uses_wide_push_in_ir_and_asm() {
         Stage::Asm,
     );
     assert!(
-        asm.contains("_afs_fmt_push_int128"),
+        asm.contains("afs_fmt_push_int128"),
         "assembly should reference the wide format push symbol:\n{}",
         asm
     );

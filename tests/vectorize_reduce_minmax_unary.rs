@@ -29,7 +29,7 @@ fn capture_run_stdout(request: CaptureRequest) -> String {
 
 #[test]
 fn o3_vectorizes_minmax_with_unary_load() {
-    if let Err(reason) = armfortas::testing::native_e2e_support() {
+    if let Err(reason) = armfortas::testing::native_vectorizer_support() {
         eprintln!(
             "\nHARNESS_SKIP suite=vectorize_reduce_minmax_unary test=o3_vectorizes_minmax_with_unary_load count=1 reason=\"{}\"",
             reason

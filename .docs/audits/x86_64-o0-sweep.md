@@ -78,3 +78,28 @@ annotations are removed; kept for history:
   `Array(f64, 2)` need the x04 classifier's SSE-pair treatment wired
   into value classing instead of a vreg class lookup.
 - Owner: x08 — DONE. 8-byte by-value arrays ride Gp64 raw bits; 16-byte ones reuse the i128 wide-slot pair machinery.
+
+## x09 findings (opt-level parity sweeps)
+
+### X64-O1-001 — i64-to-i64 extend selected as 32-bit move [FIXED in x09]
+- Programs: cli_driver bit-manipulation test (popcnt/poppar on
+  integer(int64)); fixture `x09_popcnt_int64.f90` added.
+- All ELF platforms, every level: `popcnt(int64)` counted stale slot
+  bytes — `IntExtend` i64→i64 unsigned emitted `movl`, writing only 4
+  of the def slot's 8 bytes.
+- Category: BACKEND. Fixed in isel: same-width 64-bit extends move the
+  full quad (`src/codegen/x86/isel.rs`, IntExtend arm).
+
+### X64-O1-002 — 32-bit GP def stores left slot upper half stale [FIXED in x09]
+- Programs: class_star_rank1_complex_select_type_state_message.f90 at
+  -O1 on glibc (layout-sensitive; latent everywhere on x86).
+- The naive allocator stored every 32-bit instruction's def with a
+  4-byte store; i64 consumers of 32→64 zero-extends (`movl` idiom)
+  read garbage upper halves. Manifested as the class(*) select-type
+  compact tag reconstructing a corrupt prefix (gdb: 0x0af5_ffff_…
+  vs 0x0af5_c1a5_…) so the complex(real32) guard missed; valgrind
+  pinned the uninitialized read.
+- Category: BACKEND. Fixed in regalloc: 32-bit ops zero the dest
+  register's upper half (x86-64 architectural rule), so GP def-stores
+  of L-sized instructions store the full quad
+  (`src/codegen/x86/regalloc.rs`).

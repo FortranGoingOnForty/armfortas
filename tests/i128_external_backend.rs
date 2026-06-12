@@ -30,6 +30,25 @@ fn external_i128_call_uses_pair_arg_and_return_regs_at_o0() {
         Stage::Asm,
     );
 
+    if cfg!(target_arch = "x86_64") {
+        // x86: bare symbol call, i128 arg in rdi:rsi, result in rax:rdx.
+        assert!(
+            asm.contains("call add_ext"),
+            "external integer(16) call should branch to the declared symbol:\n{}",
+            asm
+        );
+        assert!(
+            asm.contains(", %rdi") && asm.contains(", %rsi"),
+            "external integer(16) ABI should pass the outgoing arg in the rdi:rsi pair:\n{}",
+            asm
+        );
+        assert!(
+            asm.contains("movq %rax, ") && asm.contains("movq %rdx, "),
+            "external integer(16) ABI should spill the returned rax:rdx pair:\n{}",
+            asm
+        );
+        return;
+    }
     assert!(
         asm.contains("bl _add_ext"),
         "external integer(16) call should branch to the declared symbol:\n{}",
@@ -65,6 +84,15 @@ fn external_i128_call_object_snapshot_tracks_external_symbol_at_o0() {
         Stage::Obj,
     );
 
+    if cfg!(target_arch = "x86_64") {
+        // ELF nm prints undefined symbols bare: "U add_ext".
+        assert!(
+            obj.contains("U add_ext"),
+            "object snapshot should preserve the unresolved external integer(16) symbol:\n{}",
+            obj
+        );
+        return;
+    }
     assert!(
         obj.contains("external _add_ext"),
         "object snapshot should preserve the unresolved external integer(16) symbol:\n{}",

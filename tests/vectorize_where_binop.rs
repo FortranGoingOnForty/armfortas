@@ -29,7 +29,7 @@ fn capture_run_stdout(request: CaptureRequest) -> String {
 
 #[test]
 fn o3_vectorizes_where_with_binop_invariant_scalar_body() {
-    if let Err(reason) = armfortas::testing::native_e2e_support() {
+    if let Err(reason) = armfortas::testing::native_vectorizer_support() {
         eprintln!(
             "\nHARNESS_SKIP suite=vectorize_where_binop test=o3_vectorizes_where_with_binop_invariant_scalar_body count=1 reason=\"{}\"",
             reason

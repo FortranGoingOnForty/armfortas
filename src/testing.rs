@@ -26,31 +26,13 @@ use crate::parser::Parser;
 use crate::sema::{resolve, validate};
 
 /// Whether this host can assemble, link, and run armfortas-produced
-/// binaries natively (sprint x01). Today only arm64-macos qualifies;
-/// x06 widens this per-target. E2e suites call this before compiling
-/// anything; on `Err` they print one `HARNESS_SKIP` line per `#[test]`
-/// and return. The error text is the skip reason.
+/// binaries natively (sprint x01). arm64-macos always; x86_64 ELF
+/// glibc/FreeBSD since x09 opened the optimizing levels (x06 built the
+/// link path, x07/x08 proved -O0 and the ABI hard cases). E2e suites
+/// call this before compiling anything; on `Err` they print one
+/// `HARNESS_SKIP` line per `#[test]` and return. The error text is the
+/// skip reason.
 pub fn native_e2e_support() -> Result<(), String> {
-    let host = crate::target::TargetSpec::host();
-    if host == crate::target::TargetSpec::parse("arm64-macos").unwrap() {
-        Ok(())
-    } else {
-        // Suites gated here are macOS-only until the sprint that
-        // ports each one (x08 multifile/ABI, x09+ opt levels and
-        // vectorizer shapes). The run_programs -O0 sweep uses the
-        // level-aware gate below instead (x07).
-        Err(format!(
-            "host {} runs this suite after its enabling sprint (x08+); run_programs -O0 is the x07 surface",
-            host
-        ))
-    }
-}
-
-/// Level-aware gate for the run_programs sweep (x07): macOS runs every
-/// opt level; x86_64 ELF glibc/FreeBSD hosts run -O0 only until the
-/// x09 allocator work turns the optimizing levels on; musl waits for
-/// the x11 link story.
-pub fn native_e2e_level_support(opt_flag: &str) -> Result<(), String> {
     let host = crate::target::TargetSpec::host();
     if host == crate::target::TargetSpec::parse("arm64-macos").unwrap() {
         return Ok(());
@@ -59,13 +41,61 @@ pub fn native_e2e_level_support(opt_flag: &str) -> Result<(), String> {
         && host.object_format() == crate::target::ObjectFormat::Elf
         && host.libc != crate::target::Libc::Musl
     {
-        if opt_flag == "-O0" {
-            return Ok(());
-        }
-        return Err(format!(
-            "{} on host {}: ELF targets run -O0 only until the x09 allocator work",
-            opt_flag, host
-        ));
+        return Ok(());
+    }
+    Err(format!(
+        "host {} has no native run path (musl linking lands in x11)",
+        host
+    ))
+}
+
+/// Gate for suites that assert Mach-O artifact properties (otool/nm
+/// snapshots, LC_UUID, load commands). These are format-specific
+/// audits, not portability gaps — ELF twins would assert different
+/// things (build-id, readelf sections) and belong to whichever sprint
+/// needs them.
+pub fn native_macho_toolchain_support() -> Result<(), String> {
+    let host = crate::target::TargetSpec::host();
+    if host == crate::target::TargetSpec::parse("arm64-macos").unwrap() {
+        Ok(())
+    } else {
+        Err(format!(
+            "host {}: Mach-O artifact audits need the arm64-macos toolchain",
+            host
+        ))
+    }
+}
+
+/// Gate for suites that assert vectorized (NEON) IR/asm shapes. The
+/// vectorizer passes register only for arm64 (x09 pass audit); the x86
+/// SIMD story is x10. Keep these suites arm64-macos-only until then.
+pub fn native_vectorizer_support() -> Result<(), String> {
+    let host = crate::target::TargetSpec::host();
+    if host == crate::target::TargetSpec::parse("arm64-macos").unwrap() {
+        Ok(())
+    } else {
+        Err(format!(
+            "host {}: vectorizer passes are arm64-only until x10",
+            host
+        ))
+    }
+}
+
+/// Level-aware gate for the run_programs sweep: macOS and x86_64 ELF
+/// glibc/FreeBSD hosts run every opt level (x09 opened -O1..-Ofast
+/// after the vectorizer gating landed and the level sweeps came back
+/// clean); musl waits for the x11 link story.
+pub fn native_e2e_level_support(opt_flag: &str) -> Result<(), String> {
+    let _ = opt_flag;
+    let host = crate::target::TargetSpec::host();
+    if host == crate::target::TargetSpec::parse("arm64-macos").unwrap() {
+        return Ok(());
+    }
+    if host.arch == crate::target::Arch::X86_64
+        && host.object_format() == crate::target::ObjectFormat::Elf
+        && host.libc != crate::target::Libc::Musl
+    {
+        return Ok(());
     }
     Err(format!(
         "host {} has no native run path (musl linking lands in x11)",
@@ -442,8 +472,12 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
             OptLevel::Os => IrOptLevel::Os,
             OptLevel::Ofast => IrOptLevel::Ofast,
         };
+        // Captures compile for the host target (the layout calls above
+        // use TargetSpec::host() too), so the pipeline gates on the
+        // host arch.
+        let host_arch = crate::target::TargetSpec::host().arch;
         let pm = if ir_module.contains_i128_outside_globals() && request.opt_level != OptLevel::O0 {
-            build_i128_pipeline(ir_opt).ok_or_else(|| CaptureFailure {
+            build_i128_pipeline(ir_opt, host_arch).ok_or_else(|| CaptureFailure {
                 input: input.clone(),
                 opt_level: request.opt_level,
                 stage: FailureStage::Ir,
@@ -454,7 +488,7 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
                 stages: stages.clone(),
             })?
         } else {
-            build_pipeline(ir_opt)
+            build_pipeline(ir_opt, host_arch)
         };
         pm.run(&mut optimized);
         Some(optimized)
@@ -491,50 +525,91 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
             stages,
         });
     }
-    let machine_funcs = isel::select_module(backend_ir);
-    if wants(Stage::Mir) {
-        stages.insert(
-            Stage::Mir,
-            CapturedStage::Text(format_machine_functions(&machine_funcs)),
-        );
-    }
+    // The backend stages follow the HOST target: on arm64-macos the
+    // hand-rolled ARM sequence below mirrors the driver pipeline
+    // stage by stage; on x86_64 ELF hosts (x09) the x86 backend runs
+    // instead — captured Mir/Regalloc are x86 MIR dumps and the asm
+    // comes from the same `codegen::emit_module` entry the driver
+    // uses, so captured asm matches shipped asm on both targets.
+    let host = crate::target::TargetSpec::host();
+    let asm_text = if host.arch == crate::target::Arch::X86_64 {
+        let mut funcs = crate::codegen::x86::isel::select_module(backend_ir);
+        if wants(Stage::Mir) {
+            stages.insert(
+                Stage::Mir,
+                CapturedStage::Text(format_x86_functions(&funcs)),
+            );
+        }
+        for f in &mut funcs {
+            if request.opt_level >= OptLevel::O2 {
+                crate::codegen::x86::peephole::run_peephole(f);
+            }
+            crate::codegen::x86::twoaddr::convert_to_two_address(f);
+            crate::codegen::x86::regalloc::regalloc_naive(f);
+        }
+        if wants(Stage::Regalloc) {
+            stages.insert(
+                Stage::Regalloc,
+                CapturedStage::Text(format_x86_functions(&funcs)),
+            );
+        }
+        let host_opts = crate::driver::Options {
+            opt_level: request.opt_level,
+            ..Default::default()
+        };
+        crate::codegen::emit_module(backend_ir, &host_opts).map_err(|detail| CaptureFailure {
+            input: input.clone(),
+            opt_level: request.opt_level,
+            stage: FailureStage::Ir,
+            detail,
+            stages: stages.clone(),
+        })?
+    } else {
+        let machine_funcs = isel::select_module(backend_ir);
+        if wants(Stage::Mir) {
+            stages.insert(
+                Stage::Mir,
+                CapturedStage::Text(format_machine_functions(&machine_funcs)),
+            );
+        }
 
-    let mut allocated = machine_funcs.clone();
-    // Backend peephole at O2+ (must run BEFORE regalloc — it
-    // operates on vregs).
-    if request.opt_level >= OptLevel::O2 {
+        let mut allocated = machine_funcs.clone();
+        // Backend peephole at O2+ (must run BEFORE regalloc — it
+        // operates on vregs).
+        if request.opt_level >= OptLevel::O2 {
+            for mf in &mut allocated {
+                crate::codegen::peephole::run_peephole(mf);
+            }
+        }
         for mf in &mut allocated {
-            crate::codegen::peephole::run_peephole(mf);
+            if request.opt_level == OptLevel::O0 {
+                crate::codegen::regalloc::regalloc_naive(mf);
+            } else {
+                let liveness = crate::codegen::liveness::compute_liveness(mf);
+                let result = linearscan::linear_scan(mf);
+                linearscan::apply_allocation(mf, &result, &liveness);
+                // Post-allocation passes — must mirror the driver pipeline so
+                // captured asm matches the binary the user actually ships.
+                // parallelize_call_arg_moves in particular fixes a w0/w1
+                // clobber pattern visible at high register pressure.
+                linearscan::parallelize_entry_arg_moves(mf);
+                linearscan::parallelize_call_arg_moves(mf);
+                linearscan::insert_split_bridges(mf, &result.split_records);
+                linearscan::insert_callee_saves(mf, &result.callee_saved_used);
+                linearscan::coalesce_moves(mf);
+                crate::codegen::tailcall::tail_call_opt(mf);
+            }
+            crate::codegen::relax_branches::relax_branches(mf);
         }
-    }
-    for mf in &mut allocated {
-        if request.opt_level == OptLevel::O0 {
-            crate::codegen::regalloc::regalloc_naive(mf);
-        } else {
-            let liveness = crate::codegen::liveness::compute_liveness(mf);
-            let result = linearscan::linear_scan(mf);
-            linearscan::apply_allocation(mf, &result, &liveness);
-            // Post-allocation passes — must mirror the driver pipeline so
-            // captured asm matches the binary the user actually ships.
-            // parallelize_call_arg_moves in particular fixes a w0/w1
-            // clobber pattern visible at high register pressure.
-            linearscan::parallelize_entry_arg_moves(mf);
-            linearscan::parallelize_call_arg_moves(mf);
-            linearscan::insert_split_bridges(mf, &result.split_records);
-            linearscan::insert_callee_saves(mf, &result.callee_saved_used);
-            linearscan::coalesce_moves(mf);
-            crate::codegen::tailcall::tail_call_opt(mf);
+        if wants(Stage::Regalloc) {
+            stages.insert(
+                Stage::Regalloc,
+                CapturedStage::Text(format_machine_functions(&allocated)),
+            );
         }
-        crate::codegen::relax_branches::relax_branches(mf);
-    }
-    if wants(Stage::Regalloc) {
-        stages.insert(
-            Stage::Regalloc,
-            CapturedStage::Text(format_machine_functions(&allocated)),
-        );
-    }
 
-    let asm_text = emit_module_asm(backend_ir, &allocated);
+        emit_module_asm(backend_ir, &allocated)
+    };
     if wants(Stage::Asm) {
         stages.insert(Stage::Asm, CapturedStage::Text(asm_text.clone()));
     }
@@ -936,6 +1011,17 @@ fn next_temp_root(prefix: &str) -> PathBuf {
     std::env::temp_dir().join(format!("{}_{}_{}", prefix, std::process::id(), id))
 }
 
+/// Debug-format x86 machine functions for the Mir/Regalloc capture
+/// stages. A structured printer (MirView) is x10's call; until then a
+/// derive(Debug) dump is honest and greppable.
+fn format_x86_functions(funcs: &[crate::codegen::x86::mir::X86Function]) -> String {
+    let mut out = String::new();
+    for f in funcs {
+        out.push_str(&format!("{:#?}\n", f));
+    }
+    out
+}
+
 fn assemble_with_system(asm_path: &Path, obj_path: &Path) -> Result<(), String> {
     let output = Command::new("as")
         .args([
@@ -955,7 +1041,24 @@ fn assemble_with_system(asm_path: &Path, obj_path: &Path) -> Result<(), String> 
     }
 }
 
+/// Link a captured object into a runnable binary for the HOST: the
+/// driver's ELF link line on x86_64 ELF hosts, the Mach-O xcrun/ld
+/// path on arm64-macos.
 fn link_with_runtime(obj: &Path, output: &Path) -> Result<(), String> {
+    let host = crate::target::TargetSpec::host();
+    if host.object_format() == crate::target::ObjectFormat::Elf {
+        // Refresh the runtime staticlib the same way the Mach-O path
+        // does before delegating to the driver's link line.
+        if let Some(workspace_root) = find_workspace_root() {
+            maybe_refresh_runtime_lib(&workspace_root)?;
+        }
+        let opts = crate::driver::Options::default();
+        return crate::driver::link_inputs_elf(&[obj.to_path_buf()], output, &opts);
+    }
+    link_with_runtime_macho(obj, output)
+}
+
+fn link_with_runtime_macho(obj: &Path, output: &Path) -> Result<(), String> {
     let rt_path = find_runtime_lib()?;
     let sdk = Command::new("xcrun")
         .args(["--show-sdk-path"])
@@ -1163,8 +1266,10 @@ pub fn find_inspection_tool(env_key: &str, candidates: &[&str]) -> String {
 }
 
 fn object_snapshot(path: &Path) -> Result<String, String> {
-    // Captures remain Mach-O until x06 threads the capture target.
-    ObjectInspector::for_format(crate::target::ObjectFormat::MachO).snapshot(path)
+    // Captures compile for the host (x09), so inspect with the host's
+    // object format.
+    let format = crate::target::TargetSpec::host().object_format();
+    ObjectInspector::for_format(format).snapshot(path)
 }
 
 fn tool_output(tool: &str, args: &[&str]) -> Result<String, String> {
@@ -1186,6 +1291,10 @@ fn tool_output(tool: &str, args: &[&str]) -> Result<String, String> {
 fn normalize_tool_output(text: &str) -> String {
     text.lines()
         .filter(|line| !line.trim_end().ends_with(".o:"))
+        // objdump's ELF header line carries the temp path
+        // ("/tmp/.../output.o:\tfile format elf64-x86-64"); otool's
+        // path line is bare and caught by the ".o:" filter above.
+        .filter(|line| !(line.contains(".o:") && line.contains("file format")))
         .map(str::trim_end)
         .collect::<Vec<_>>()
         .join("\n")
@@ -1219,9 +1328,12 @@ mod inspector_tests {
     /// the pre-sprint otool/nm pipeline spelled out literally.
     #[test]
     fn macho_snapshot_matches_pre_sprint_pipeline() {
-        if native_e2e_support().is_err() {
+        // Mach-O-specific golden: requires the arm64-macos toolchain,
+        // not just any native run path (x09 opened native_e2e_support
+        // to ELF hosts, where otool/Mach-O semantics don't exist).
+        if native_macho_toolchain_support().is_err() {
             eprintln!(
-                "\nHARNESS_SKIP suite=testing test=macho_snapshot_matches_pre_sprint_pipeline count=1 reason=\"Mach-O tools need the native toolchain\""
+                "\nHARNESS_SKIP suite=testing test=macho_snapshot_matches_pre_sprint_pipeline count=1 reason=\"Mach-O tools need the arm64-macos toolchain\""
             );
             return;
         }

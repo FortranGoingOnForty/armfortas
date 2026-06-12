@@ -108,7 +108,7 @@ fn opt_name(opt: OptLevel) -> &'static str {
 
 #[test]
 fn optimized_object_snapshot_removes_inlined_helper_symbol() {
-    if let Err(reason) = armfortas::testing::native_e2e_support() {
+    if let Err(reason) = armfortas::testing::native_macho_toolchain_support() {
         eprintln!(
             "\nHARNESS_SKIP suite=artifact_audit_29_10 test=optimized_object_snapshot_removes_inlined_helper_symbol count=1 reason=\"{}\"",
             reason
@@ -153,7 +153,7 @@ fn optimized_object_snapshot_removes_inlined_helper_symbol() {
 
 #[test]
 fn object_snapshot_is_deterministic_with_module_globals_across_opt_levels() {
-    if let Err(reason) = armfortas::testing::native_e2e_support() {
+    if let Err(reason) = armfortas::testing::native_macho_toolchain_support() {
         eprintln!(
             "\nHARNESS_SKIP suite=artifact_audit_29_10 test=object_snapshot_is_deterministic_with_module_globals_across_opt_levels count=1 reason=\"{}\"",
             reason
@@ -197,7 +197,7 @@ fn object_snapshot_is_deterministic_with_module_globals_across_opt_levels() {
 
 #[test]
 fn linked_binary_is_deterministic_for_same_output_path_and_has_uuid() {
-    if let Err(reason) = armfortas::testing::native_e2e_support() {
+    if let Err(reason) = armfortas::testing::native_macho_toolchain_support() {
         eprintln!(
             "\nHARNESS_SKIP suite=artifact_audit_29_10 test=linked_binary_is_deterministic_for_same_output_path_and_has_uuid count=1 reason=\"{}\"",
             reason
@@ -242,7 +242,7 @@ fn linked_binary_is_deterministic_for_same_output_path_and_has_uuid() {
 
 #[test]
 fn linked_runtime_heavy_binary_is_deterministic_for_section_reads() {
-    if let Err(reason) = armfortas::testing::native_e2e_support() {
+    if let Err(reason) = armfortas::testing::native_macho_toolchain_support() {
         eprintln!(
             "\nHARNESS_SKIP suite=artifact_audit_29_10 test=linked_runtime_heavy_binary_is_deterministic_for_section_reads count=1 reason=\"{}\"",
             reason

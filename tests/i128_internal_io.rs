@@ -56,8 +56,8 @@ fn integer16_internal_io_uses_wide_internal_symbols() {
         },
         Stage::Asm,
     );
-    assert!(asm.contains("_afs_write_internal_int128"));
-    assert!(asm.contains("_afs_read_internal_int128"));
+    assert!(asm.contains("afs_write_internal_int128"));
+    assert!(asm.contains("afs_read_internal_int128"));
 }
 
 #[test]
@@ -155,8 +155,8 @@ fn integer16_internal_format_uses_internal_format_sink() {
         },
         Stage::Asm,
     );
-    assert!(asm.contains("_afs_fmt_begin_internal_ex"));
-    assert!(asm.contains("_afs_fmt_push_int128"));
+    assert!(asm.contains("afs_fmt_begin_internal_ex"));
+    assert!(asm.contains("afs_fmt_push_int128"));
 }
 
 #[test]
@@ -255,7 +255,7 @@ fn integer16_internal_format_read_uses_internal_format_reader() {
         },
         Stage::Asm,
     );
-    assert!(asm.contains("_afs_fmt_read_int128_internal"));
+    assert!(asm.contains("afs_fmt_read_int128_internal"));
 }
 
 #[test]
@@ -355,8 +355,8 @@ fn integer16_internal_format_read_targets_use_internal_format_readers() {
         },
         Stage::Asm,
     );
-    assert!(asm.contains("_afs_fmt_read_int128_internal"));
-    assert!(asm.contains("_afs_fmt_read_int_internal"));
+    assert!(asm.contains("afs_fmt_read_int128_internal"));
+    assert!(asm.contains("afs_fmt_read_int_internal"));
 }
 
 #[test]
@@ -468,7 +468,7 @@ fn integer16_internal_format_read_arrays_use_internal_format_readers() {
         },
         Stage::Asm,
     );
-    assert!(asm.contains("_afs_fmt_read_int128_internal"));
+    assert!(asm.contains("afs_fmt_read_int128_internal"));
 }
 
 #[test]
@@ -570,7 +570,7 @@ fn integer16_internal_format_read_sections_use_internal_format_readers() {
         },
         Stage::Asm,
     );
-    assert!(asm.contains("_afs_fmt_read_int128_internal"));
+    assert!(asm.contains("afs_fmt_read_int128_internal"));
 }
 
 #[test]
@@ -669,7 +669,7 @@ fn integer16_internal_format_read_alloc_section_uses_descriptor_bounds_and_wide_
         },
         Stage::Asm,
     );
-    assert!(asm.contains("_afs_fmt_read_int128_internal"));
+    assert!(asm.contains("afs_fmt_read_int128_internal"));
 }
 
 #[test]
@@ -765,7 +765,7 @@ fn integer16_internal_format_read_alloc_reverse_section_uses_wide_reader() {
         },
         Stage::Asm,
     );
-    assert!(asm.contains("_afs_fmt_read_int128_internal"));
+    assert!(asm.contains("afs_fmt_read_int128_internal"));
 }
 
 #[test]
