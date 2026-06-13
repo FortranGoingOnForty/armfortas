@@ -901,6 +901,56 @@ pub(crate) fn lower_intrinsic(
                 None
             }
         }
+        // F2023 degree / half-revolution trig → runtime (afs_*), not
+        // libm: the exactness contract needs reduction in the native
+        // unit (see runtime/src/math.rs). One-argument forms.
+        "acosd" | "asind" | "atand" | "cosd" | "sind" | "tand" | "acospi" | "asinpi" | "atanpi"
+        | "cospi" | "sinpi" | "tanpi" => {
+            if let Some(arg) = args.first() {
+                let ty = b
+                    .func()
+                    .value_type(*arg)
+                    .unwrap_or(IrType::Float(FloatWidth::F64));
+                let is_f32 = matches!(ty, IrType::Float(FloatWidth::F32));
+                let base = format!("afs_{}", name);
+                let func_name = if is_f32 {
+                    format!("{}_f32", base)
+                } else {
+                    base
+                };
+                let ret_ty = if is_f32 {
+                    IrType::Float(FloatWidth::F32)
+                } else {
+                    IrType::Float(FloatWidth::F64)
+                };
+                Some(b.call(FuncRef::External(func_name), vec![*arg], ret_ty))
+            } else {
+                None
+            }
+        }
+        "atan2d" | "atan2pi" => {
+            if args.len() >= 2 {
+                let ty = b
+                    .func()
+                    .value_type(args[0])
+                    .unwrap_or(IrType::Float(FloatWidth::F64));
+                let is_f32 = matches!(ty, IrType::Float(FloatWidth::F32));
+                let base = format!("afs_{}", name);
+                let func_name = if is_f32 {
+                    format!("{}_f32", base)
+                } else {
+                    base
+                };
+                let ret_ty = if is_f32 {
+                    IrType::Float(FloatWidth::F32)
+                } else {
+                    IrType::Float(FloatWidth::F64)
+                };
+                Some(b.call(FuncRef::External(func_name), vec![args[0], args[1]], ret_ty))
+            } else {
+                None
+            }
+        }
         "gamma" | "dgamma" => args.first().map(|a| {
             let ty = b
                 .func()
@@ -1354,6 +1404,37 @@ pub(crate) fn lower_intrinsic(
                     Some(b.const_i32(kind))
                 } else {
                     Some(b.const_i32(8)) // non-constant: default to 8
+                }
+            } else {
+                None
+            }
+        }
+        "selected_logical_kind" => {
+            // SELECTED_LOGICAL_KIND(BITS): smallest logical kind whose
+            // storage is at least BITS bits (1/2/4/8 → 8/16/32/64 bits),
+            // -1 if none. Const-foldable here; non-constant args fall to
+            // the runtime helper (the kind set is fixed, no libm need).
+            if let Some(arg) = args.first() {
+                if let Some(bits) = extract_const_int_from_value(b, *arg) {
+                    let kind: i32 = if bits <= 8 {
+                        1
+                    } else if bits <= 16 {
+                        2
+                    } else if bits <= 32 {
+                        4
+                    } else if bits <= 64 {
+                        8
+                    } else {
+                        -1
+                    };
+                    Some(b.const_i32(kind))
+                } else {
+                    let v = coerce_int_like_to_width(b, *arg, IntWidth::I32);
+                    Some(b.call(
+                        FuncRef::External("afs_selected_logical_kind".into()),
+                        vec![v],
+                        IrType::Int(IntWidth::I32),
+                    ))
                 }
             } else {
                 None

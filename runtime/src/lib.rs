@@ -17,6 +17,7 @@ pub mod format;
 mod io;
 pub mod io_system;
 mod lifecycle;
+pub mod math;
 mod mem;
 pub mod string;
 pub mod system;

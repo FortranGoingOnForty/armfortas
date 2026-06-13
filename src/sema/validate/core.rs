@@ -1041,6 +1041,16 @@ fn validate_const_int_expr_tree(ctx: &mut Ctx<'_>, expr: &crate::ast::expr::Span
                 if let Some((type_name, count)) = enum_ctor {
                     check_enum_constructor(ctx, expr.span, &type_name, count, args);
                 }
+                // F2023 16.9.181: SELECTED_LOGICAL_KIND is f2023-only
+                // (gfortran rejects it under -std=f2018 as undeclared);
+                // gate it when the name resolves to the intrinsic (a
+                // user procedure of the same name shadows it and is
+                // exempt). The degree/half-rev trig functions are NOT
+                // gated — gfortran ships them as longstanding extensions.
+                if name.eq_ignore_ascii_case("selected_logical_kind") && ctx.lookup(name).is_none()
+                {
+                    ctx.require_std(expr.span, FortranStandard::F2023, "SELECTED_LOGICAL_KIND");
+                }
             }
             // F2023 conditional arguments in FUNCTION references would
             // need association-selecting lowering on the fn-call path;
@@ -3358,6 +3368,10 @@ pub fn is_intrinsic_name(name: &str) -> bool {
         "abs" | "iabs" | "dabs" | "cabs" | "acos" | "asin" | "atan" | "atan2" |
         "hypot" | "anint" | "dnint" | "aint" | "dint" | "norm2" |
         "cos" | "sin" | "tan" | "sinh" | "cosh" | "tanh" | "asinh" | "acosh" | "atanh" |
+        // F2023 degree trig (16.9) and half-revolution trig.
+        "acosd" | "asind" | "atand" | "atan2d" | "cosd" | "sind" | "tand" |
+        "acospi" | "asinpi" | "atanpi" | "atan2pi" | "cospi" | "sinpi" | "tanpi" |
+        "selected_logical_kind" |
         "exp" | "log" | "log10" | "sqrt" | "dsqrt" |
         "mod" | "modulo" | "max" | "min" | "sign" | "dim" |
         "int" | "nint" | "real" | "dble" | "logical" | "cmplx" | "conjg" |
