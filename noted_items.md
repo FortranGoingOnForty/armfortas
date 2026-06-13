@@ -225,3 +225,69 @@ Found running the FULL workspace suite on FreeBSD for the first time
   of the multi-platform campaign. Until then `cargo test --workspace`
   is macOS-only; the FreeBSD surface is `cargo test -p armfortas`
   plus the armfortas integration suites (all green here).
+
+Found during l04 (2026-06-12):
+
+- **No general intrinsic argument-count checking.** `atan2(1.0)` (one
+  arg to a two-arg intrinsic) compiles silently, as does `atan2d(1.0)`.
+  armfortas has no arity gate for elemental/transformational
+  intrinsics; misuse is caught only if lowering happens to panic. Out
+  of scope for l04 (the F2023 trig additions match the existing
+  intrinsics' lack of checking by design). Owner: a dedicated
+  intrinsic-signature-checking sprint if a target project surfaces it.
+
+- **SYSTEM_CLOCK runtime is not integer-kind aware** (found l04,
+  2026-06-12): afs_system_clock writes i64 COUNT (nanoseconds, ~1.7e18)
+  and COUNT_MAX (i64::MAX) into the caller's temp, which the lowering
+  then truncates to the argument kind. With default integer (kind 4)
+  COUNT and COUNT_MAX overflow — COUNT_MAX reads back as -1. gfortran
+  picks a rate/max that fits the argument kind (rate 1000, max
+  HUGE(kind)). Fix needs the kind threaded into the runtime call (new
+  signature or per-kind entry points). l04 delivered the F2023
+  argument-kind RESTRICTIONS (validation); this runtime value-range
+  fix is separate. Owner: l05 (I/O + runtime) or a dedicated
+  system-intrinsics pass.
+
+- **PRINT with a character format inserts spurious spaces** (found
+  l04, 2026-06-12): `print '(A,A,A)', 'x[', s(1:1), ']'` emits
+  `   x[ a ]` (leading spaces + spaces around the variable-length
+  item), while `write(*,'(A,A,A)') ...` emits `x[a]` correctly. PRINT
+  with an explicit char format is not honoring it like WRITE does.
+  Most fixtures dodge it via the harness's CHECK whitespace
+  normalization; bracketed-token output exposes it. Owner: l05 (I/O).
+
+- **No subroutine-as-function diagnostic** (found l04, 2026-06-12):
+  `r = system_clock()` and `r = split(s, set, p)` (intrinsic
+  subroutines used in function position) both compile silently. The
+  l04 doc assumed an existing "not a function" diagnostic to reuse,
+  but armfortas has none for any intrinsic subroutine. Adding one only
+  for SPLIT/TOKENIZE would be inconsistent. Owner: a dedicated
+  intrinsic-signature-checking pass (same owner as the arity gap).
+
+- **TOKENIZE deferred from l04** (2026-06-12): SPLIT shipped; TOKENIZE
+  (both forms) is split out as its own focused piece because it writes
+  into caller-allocated arrays — the use-after-free risk class the
+  string-descriptor design exists to guard. Implementation approach
+  scouted:
+  - Form 2, `CALL TOKENIZE(STRING, SET, FIRST, LAST)`: FIRST/LAST are
+    allocatable integer arrays. Get each descriptor via
+    array_descriptor_addr (see move_alloc_target precedent in
+    intrinsic_sub.rs), allocate with afs_allocate_1d(desc, elem_size,
+    ntokens), fill 1-based start/end positions. Subtlety: read the
+    element kind (4 vs 8) from the local/descriptor, don't assume i32.
+  - Form 1, `CALL TOKENIZE(STRING, SET, TOKENS [, SEPARATOR])`: TOKENS
+    is an allocatable deferred-length character array — each element a
+    string. Must route per-element storage through the
+    afs_assign_char_deferred path, never raw malloc, to keep the
+    allocate-before-free invariant. This is the hard part and why it's
+    deferred rather than rushed.
+  Owner: l04 follow-up (l04a) or fold into l05's I/O/runtime work.
+
+- **SPLIT does not bounds-check POS** (found l04, 2026-06-12):
+  gfortran's split_3/split_4 dg-shouldfail tests expect a runtime
+  error when POS is out of range (or BACK with POS at the string
+  start). armfortas intrinsics don't emit runtime argument bounds
+  checks, so these run and exit 0. Kept XFAIL. SELECTED_CHAR_KIND
+  (F2003, used by split_2) is also unimplemented (undefined symbol at
+  link). Owners: intrinsic runtime-bounds pass / F2003 intrinsic
+  backlog respectively.

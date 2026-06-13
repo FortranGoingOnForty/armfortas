@@ -1012,9 +1012,14 @@ pub fn intrinsic_result_type(name: &str, args: &[FortranType]) -> Option<Fortran
         // Real-valued math.
         "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "asinh"
         | "acosh" | "atanh" | "exp" | "log" | "log10" | "sqrt" | "atan2" | "gamma"
-        | "log_gamma" | "erf" | "erfc" => {
+        | "log_gamma" | "erf" | "erfc"
+        // F2023 degree and half-revolution trig: result type and kind
+        // follow the real argument, exactly like the radian family.
+        | "acosd" | "asind" | "atand" | "atan2d" | "cosd" | "sind" | "tand"
+        | "acospi" | "asinpi" | "atanpi" | "atan2pi" | "cospi" | "sinpi" | "tanpi" => {
             Some(args.first().cloned().unwrap_or(FortranType::default_real()))
         }
+        "selected_logical_kind" => Some(FortranType::default_integer()),
 
         // Integer-valued.
         "int" | "nint" | "floor" | "ceiling" => Some(FortranType::default_integer()),

@@ -313,6 +313,20 @@ fn eval_const_int_expr(
                         -1
                     })
                 }
+                "selected_logical_kind" => {
+                    let bits = first_arg_val?;
+                    Some(if bits <= 8 {
+                        1
+                    } else if bits <= 16 {
+                        2
+                    } else if bits <= 32 {
+                        4
+                    } else if bits <= 64 {
+                        8
+                    } else {
+                        -1
+                    })
+                }
                 "kind" => {
                     let arg = args.first()?;
                     let crate::ast::expr::SectionSubscript::Element(e) = &arg.value else {

@@ -1041,6 +1041,16 @@ fn validate_const_int_expr_tree(ctx: &mut Ctx<'_>, expr: &crate::ast::expr::Span
                 if let Some((type_name, count)) = enum_ctor {
                     check_enum_constructor(ctx, expr.span, &type_name, count, args);
                 }
+                // F2023 16.9.181: SELECTED_LOGICAL_KIND is f2023-only
+                // (gfortran rejects it under -std=f2018 as undeclared);
+                // gate it when the name resolves to the intrinsic (a
+                // user procedure of the same name shadows it and is
+                // exempt). The degree/half-rev trig functions are NOT
+                // gated — gfortran ships them as longstanding extensions.
+                if name.eq_ignore_ascii_case("selected_logical_kind") && ctx.lookup(name).is_none()
+                {
+                    ctx.require_std(expr.span, FortranStandard::F2023, "SELECTED_LOGICAL_KIND");
+                }
             }
             // F2023 conditional arguments in FUNCTION references would
             // need association-selecting lowering on the fn-call path;
@@ -2306,6 +2316,9 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
                 if name.eq_ignore_ascii_case("move_alloc") {
                     ctx.require_std(stmt.span, FortranStandard::F2003, "MOVE_ALLOC");
                 }
+                if name.eq_ignore_ascii_case("system_clock") && ctx.lookup(name).is_none() {
+                    validate_system_clock_args(ctx, args, stmt.span);
+                }
             }
             if ctx.in_pure {
                 validate_pure_call(ctx, callee, stmt.span);
@@ -2547,6 +2560,59 @@ fn uses_internal_character_file(ctx: &Ctx, controls: &[IoControl]) -> bool {
             }],
         ),
         _ => expr_type(&unit.value, ctx.st).is_character(),
+    }
+}
+
+/// F2023 16.9.202 SYSTEM_CLOCK argument restrictions: every integer
+/// argument must have a kind no smaller than the default integer kind,
+/// and all integer arguments must have the same kind. COUNT_RATE may
+/// be real (exempt from both rules). Only enforced when SYSTEM_CLOCK
+/// resolves to the intrinsic (a user procedure of the same name is
+/// exempt). Gated by --std=f2023 — these are conformance diagnostics,
+/// silent under f2018.
+fn validate_system_clock_args(ctx: &mut Ctx, args: &[crate::ast::expr::Argument], span: Span) {
+    use crate::sema::types::FortranType;
+    if ctx.std.is_none_or(|s| s < FortranStandard::F2023) {
+        return;
+    }
+    const FORMALS: [&str; 3] = ["count", "count_rate", "count_max"];
+    let mut int_kinds: Vec<u8> = Vec::new();
+    let mut positional = 0usize;
+    for arg in args {
+        let formal = match arg.keyword.as_deref() {
+            Some(kw) => kw.to_ascii_lowercase(),
+            None => {
+                let f = FORMALS.get(positional).map(|s| s.to_string());
+                positional += 1;
+                match f {
+                    Some(f) => f,
+                    None => continue,
+                }
+            }
+        };
+        let crate::ast::expr::SectionSubscript::Element(e) = &arg.value else {
+            continue;
+        };
+        if let FortranType::Integer { kind } = conditional_operand_type(ctx, e) {
+            if kind < 4 {
+                ctx.error(
+                    e.span,
+                    format!(
+                        "SYSTEM_CLOCK argument '{}' has integer kind {} smaller than the \
+                         default integer kind (F2023 16.9.202)",
+                        formal, kind
+                    ),
+                );
+            } else {
+                int_kinds.push(kind);
+            }
+        }
+    }
+    if int_kinds.len() >= 2 && int_kinds.iter().any(|k| *k != int_kinds[0]) {
+        ctx.error(
+            span,
+            "SYSTEM_CLOCK integer arguments must all have the same kind (F2023 16.9.202)",
+        );
     }
 }
 
@@ -3358,6 +3424,10 @@ pub fn is_intrinsic_name(name: &str) -> bool {
         "abs" | "iabs" | "dabs" | "cabs" | "acos" | "asin" | "atan" | "atan2" |
         "hypot" | "anint" | "dnint" | "aint" | "dint" | "norm2" |
         "cos" | "sin" | "tan" | "sinh" | "cosh" | "tanh" | "asinh" | "acosh" | "atanh" |
+        // F2023 degree trig (16.9) and half-revolution trig.
+        "acosd" | "asind" | "atand" | "atan2d" | "cosd" | "sind" | "tand" |
+        "acospi" | "asinpi" | "atanpi" | "atan2pi" | "cospi" | "sinpi" | "tanpi" |
+        "selected_logical_kind" |
         "exp" | "log" | "log10" | "sqrt" | "dsqrt" |
         "mod" | "modulo" | "max" | "min" | "sign" | "dim" |
         "int" | "nint" | "real" | "dble" | "logical" | "cmplx" | "conjg" |
@@ -3381,6 +3451,8 @@ pub fn is_intrinsic_name(name: &str) -> bool {
         "dshiftl" | "dshiftr" | "maskl" | "maskr" | "merge_bits" |
         "new_line" | "null" | "move_alloc" |
         "system_clock" | "date_and_time" | "cpu_time" | "random_number" | "random_seed" |
+        // F2023 string-parsing subroutines.
+        "split" | "tokenize" |
         "command_argument_count" | "get_command_argument" | "get_environment_variable" |
         "execute_command_line" | "compiler_version" | "compiler_options" |
         "is_iostat_end" | "is_iostat_eor" |

@@ -2,13 +2,12 @@
 ! (gcc commit b700707a77eeaa1d37f733c4b2d2e242063c29d2).
 ! Original directives: { dg-do compile } { dg-options "-std=f2018" } + 2x dg-error "has no IMPLICIT type"
 ! Conversion notes: tests/fixtures/gfortran-dg/README.md
-! armfortas already rejects this (SELECTED_LOGICAL_KIND is not an
-! intrinsic yet, so under IMPLICIT NONE the name is undeclared) — same
-! intent as gfortran's "has no IMPLICIT type". When l04 adds the
-! intrinsic, the f2018 conformance gate must keep rejecting this file
-! and this expectation will need the gate's wording.
+! gfortran rejects this under -std=f2018 ("has no IMPLICIT type") because
+! SELECTED_LOGICAL_KIND is an F2023 intrinsic. l04 implements it and
+! gates it behind --std=f2023, so the f2018 conformance gate keeps
+! rejecting this file — now with the gate's own wording.
 ! FLAGS: --std=f2018
-! ERROR_EXPECTED: used but not declared
+! ERROR_EXPECTED: SELECTED_LOGICAL_KIND requires --std=F2023
 program selected
   implicit none
 

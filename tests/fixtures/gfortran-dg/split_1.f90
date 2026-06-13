@@ -4,7 +4,6 @@
 ! Conversion notes: tests/fixtures/gfortran-dg/README.md
 ! FLAGS: --std=f2023
 ! EXIT_CODE: 0
-! XFAIL: f2023 SPLIT not implemented (l04); see .docs/audits/f2023-feature-matrix.md
 program b
   character(len=:), allocatable :: input
   character(len=2) :: set = ', '

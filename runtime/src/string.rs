@@ -472,9 +472,153 @@ pub extern "C" fn afs_llt(a: *const u8, a_len: i64, b: *const u8, b_len: i64) ->
     (afs_compare_char(a, a_len, b, b_len) < 0) as i32
 }
 
+/// F2023 16.9.197 SPLIT(STRING, SET, POS [, BACK]). POS is 1-based
+/// iteration state, updated in place. Each character of SET is a
+/// separator.
+///
+/// Forward (back == 0): on entry 0 <= POS <= LEN; sets POS to the
+/// position of the first separator strictly after the old POS, or
+/// LEN+1 if there is none. The token just parsed is
+/// STRING(old_pos+1 : new_pos-1).
+///
+/// Backward (back != 0): on entry 1 <= POS <= LEN+1; sets POS to the
+/// position of the last separator strictly before the old POS, or 0
+/// if none. The token is STRING(new_pos+1 : old_pos-1).
+#[no_mangle]
+pub extern "C" fn afs_split(
+    str_ptr: *const u8,
+    str_len: i64,
+    set_ptr: *const u8,
+    set_len: i64,
+    pos: *mut i64,
+    back: i32,
+) {
+    if pos.is_null() {
+        return;
+    }
+    let cur = unsafe { *pos };
+    let s: &[u8] = if str_ptr.is_null() || str_len <= 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(str_ptr, str_len as usize) }
+    };
+    let set: &[u8] = if set_ptr.is_null() || set_len <= 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(set_ptr, set_len as usize) }
+    };
+    let is_sep = |c: u8| set.contains(&c);
+
+    let new_pos = if back == 0 {
+        // First separator at a 1-based position strictly greater than cur.
+        let mut p = cur.max(0) + 1;
+        let mut found = str_len + 1;
+        while p <= str_len {
+            if is_sep(s[(p - 1) as usize]) {
+                found = p;
+                break;
+            }
+            p += 1;
+        }
+        found
+    } else {
+        // Last separator at a 1-based position strictly less than cur.
+        let mut p = cur.min(str_len + 1) - 1;
+        let mut found = 0i64;
+        while p >= 1 {
+            if is_sep(s[(p - 1) as usize]) {
+                found = p;
+                break;
+            }
+            p -= 1;
+        }
+        found
+    };
+    unsafe {
+        *pos = new_pos;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- SPLIT ----
+
+    fn split_forward_tokens(s: &[u8], set: &[u8]) -> Vec<Vec<u8>> {
+        // Canonical F2023 forward loop: the exit test (POS > LEN) runs
+        // after processing each token, so a trailing separator still
+        // yields a final empty token.
+        let mut pos: i64 = 0;
+        let mut tokens = Vec::new();
+        loop {
+            let istart = pos + 1;
+            afs_split(
+                s.as_ptr(),
+                s.len() as i64,
+                set.as_ptr(),
+                set.len() as i64,
+                &mut pos,
+                0,
+            );
+            tokens.push(s[(istart - 1) as usize..(pos - 1) as usize].to_vec());
+            if pos > s.len() as i64 {
+                break;
+            }
+        }
+        tokens
+    }
+
+    #[test]
+    fn split_forward_csv() {
+        let toks = split_forward_tokens(b"a,bb,ccc", b",");
+        assert_eq!(toks, vec![b"a".to_vec(), b"bb".to_vec(), b"ccc".to_vec()]);
+    }
+
+    #[test]
+    fn split_forward_empty_tokens() {
+        // Leading, doubled, and trailing separators yield empty tokens.
+        let toks = split_forward_tokens(b",a,,b,", b",");
+        assert_eq!(
+            toks,
+            vec![
+                b"".to_vec(),
+                b"a".to_vec(),
+                b"".to_vec(),
+                b"b".to_vec(),
+                b"".to_vec()
+            ]
+        );
+    }
+
+    #[test]
+    fn split_not_found_forward_is_len_plus_1() {
+        let s = b"abc";
+        let mut pos: i64 = 0;
+        afs_split(s.as_ptr(), 3, b",".as_ptr(), 1, &mut pos, 0);
+        assert_eq!(pos, 4);
+    }
+
+    #[test]
+    fn split_backward_walk() {
+        let s = b"a,bb,ccc";
+        let mut pos: i64 = s.len() as i64 + 1;
+        let mut toks: Vec<Vec<u8>> = Vec::new();
+        while pos > 0 {
+            let old = pos;
+            afs_split(s.as_ptr(), s.len() as i64, b",".as_ptr(), 1, &mut pos, 1);
+            toks.push(s[pos as usize..(old - 1) as usize].to_vec());
+        }
+        assert_eq!(toks, vec![b"ccc".to_vec(), b"bb".to_vec(), b"a".to_vec()]);
+    }
+
+    #[test]
+    fn split_not_found_backward_is_zero() {
+        let s = b"abc";
+        let mut pos: i64 = 4;
+        afs_split(s.as_ptr(), 3, b",".as_ptr(), 1, &mut pos, 1);
+        assert_eq!(pos, 0);
+    }
 
     // ---- Fixed-length assignment ----
 
