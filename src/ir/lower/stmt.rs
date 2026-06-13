@@ -115,6 +115,27 @@ fn io_control_by_keyword<'a>(controls: &'a [IoControl], needle: &str) -> Option<
     })
 }
 
+fn inquire_size_storeback_type(
+    b: &FuncBuilder,
+    ctx: &LowerCtx<'_>,
+    expr: &crate::ast::expr::SpannedExpr,
+    dest_addr: ValueId,
+) -> IrType {
+    if let Some(ti) =
+        operator_expr_type_info(expr, Some(&ctx.locals), ctx.st, Some(ctx.type_layouts))
+    {
+        let ty = type_info_to_ir_type(&ti);
+        if matches!(ty, IrType::Int(_)) {
+            return ty;
+        }
+    }
+
+    match b.func().value_type(dest_addr) {
+        Some(IrType::Ptr(inner)) => (*inner).clone(),
+        _ => IrType::Int(IntWidth::I32),
+    }
+}
+
 fn lower_external_io_pos_seek(
     b: &mut FuncBuilder,
     ctx: &mut LowerCtx,
@@ -5893,7 +5914,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             let (size_addr, size_storeback) = if let Some(spec) = size_spec {
                 let dest_addr = lower_arg_by_ref_ctx(b, ctx, &spec.value);
                 let temp = b.alloca(IrType::Int(IntWidth::I64));
-                (temp, Some(dest_addr))
+                let dest_ty = inquire_size_storeback_type(b, ctx, &spec.value, dest_addr);
+                (temp, Some((dest_addr, dest_ty)))
             } else {
                 (null, None)
             };
@@ -5987,12 +6009,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     IrType::Void,
                 );
             }
-            if let Some(dest_addr) = size_storeback {
+            if let Some((dest_addr, dest_ty)) = size_storeback {
                 let size_val = b.load(size_addr);
-                let dest_ty = match b.func().value_type(dest_addr) {
-                    Some(IrType::Ptr(inner)) => (*inner).clone(),
-                    _ => IrType::Int(IntWidth::I32),
-                };
                 let coerced = coerce_to_type(b, size_val, &dest_ty);
                 b.store(coerced, dest_addr);
             }

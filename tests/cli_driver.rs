@@ -23957,6 +23957,56 @@ fn inquire_unit_size_widens_through_runtime_and_stores_back() {
 }
 
 #[test]
+fn inquire_unit_size_stores_full_value_to_derived_component() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=inquire_unit_size_stores_full_value_to_derived_component count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("inquire_unit_size_component");
+    let input = dir.join("payload.bin");
+    fs::write(&input, vec![b'x'; 863]).expect("write payload");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        &format!(
+            "program p\n  implicit none\n  type :: parser_state\n    integer :: ipos = 1\n    integer :: filesize = -1\n  end type parser_state\n  type(parser_state) :: state\n  integer :: unit, ios\n  open(newunit=unit, file='{}', status='old', access='stream', form='unformatted', action='read', iostat=ios)\n  if (ios /= 0) error stop 1\n  inquire(unit=unit, size=state%filesize, iostat=ios)\n  if (ios /= 0) error stop 2\n  if (state%filesize /= 863) then\n    print *, state%filesize\n    error stop 3\n  end if\n  if (state%ipos /= 1) error stop 4\n  close(unit)\n  print *, 'ok'\nend program\n",
+            input.display()
+        ),
+    );
+    let out = dir.join("main.out");
+    let compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        compile.status.success(),
+        "INQUIRE(unit=, size=component) compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "INQUIRE(unit=, size=component) runtime failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected INQUIRE(unit=, size=component) output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn open_with_newunit_and_iostat_uses_keyword_specs() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
