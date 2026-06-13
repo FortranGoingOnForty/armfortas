@@ -211,3 +211,17 @@ Deferred from l03's enumeration type-safety pass (2026-06-12):
   representation; a `TYPE(enum)` component falls into the
   unknown-derived path. Owner: l03 follow-up audit; promote to its
   own row if a target project hits it.
+
+Found running the FULL workspace suite on FreeBSD for the first time
+(2026-06-12, l03):
+
+- **19 afs-as suites and 1 afs-ld test hard-fail off macOS arm64**:
+  the differential corpus (verify_against_system_as, corpus_compat,
+  roundtrip, hello_world, ...) assembles with the system `as`, links
+  for the Apple target, and runs the binaries — none of it can work
+  on a GNU/x86 host, and none of it skips. clang_probe_dashboard got
+  its skip gate (afs-as a02dc89); the rest need either the same gate
+  or, better, real ELF coverage. Owner: the afs-as x86_64/ELF phase
+  of the multi-platform campaign. Until then `cargo test --workspace`
+  is macOS-only; the FreeBSD surface is `cargo test -p armfortas`
+  plus the armfortas integration suites (all green here).
