@@ -901,6 +901,12 @@ fn select_inst(
                         X86Opcode::Maxpd
                     }
                 }
+                // Signed i32 has no native packed min/max at SSE2 —
+                // synthesize compare-and-blend (x10c-1).
+                IrType::Int(IntWidth::I32) => {
+                    emit_packed_iminmax(mf, mb, is_min, va, vb, dest);
+                    return mb;
+                }
                 other => panic!("x10: packed min/max on {:?} should not reach isel", other),
             };
             push(
@@ -1204,15 +1210,37 @@ fn select_inst(
                 .value_type(*v)
                 .map(|t| vec_elem_of(&t).clone())
                 .unwrap_or_else(|| panic!("x10: missing vector type for reduce %{}", v.0));
+            // The fold step is a single packed op for sum and float
+            // min/max; signed i32 min/max has no native packed op at
+            // SSE2, so its step is the pcmpgtd compare-and-blend
+            // synthesis (x10c-1).
             let step = match (&inst.kind, &elem) {
-                (InstKind::VReduceSum(_), IrType::Float(FloatWidth::F32)) => X86Opcode::Addps,
-                (InstKind::VReduceSum(_), IrType::Float(FloatWidth::F64)) => X86Opcode::Addpd,
-                (InstKind::VReduceSum(_), IrType::Int(IntWidth::I32)) => X86Opcode::Paddd,
-                (InstKind::VReduceSum(_), IrType::Int(IntWidth::I64)) => X86Opcode::Paddq,
-                (InstKind::VReduceMin(_), IrType::Float(FloatWidth::F32)) => X86Opcode::Minps,
-                (InstKind::VReduceMin(_), IrType::Float(FloatWidth::F64)) => X86Opcode::Minpd,
-                (InstKind::VReduceMax(_), IrType::Float(FloatWidth::F32)) => X86Opcode::Maxps,
-                (InstKind::VReduceMax(_), IrType::Float(FloatWidth::F64)) => X86Opcode::Maxpd,
+                (InstKind::VReduceSum(_), IrType::Float(FloatWidth::F32)) => {
+                    ReduceStep::Op(X86Opcode::Addps)
+                }
+                (InstKind::VReduceSum(_), IrType::Float(FloatWidth::F64)) => {
+                    ReduceStep::Op(X86Opcode::Addpd)
+                }
+                (InstKind::VReduceSum(_), IrType::Int(IntWidth::I32)) => {
+                    ReduceStep::Op(X86Opcode::Paddd)
+                }
+                (InstKind::VReduceSum(_), IrType::Int(IntWidth::I64)) => {
+                    ReduceStep::Op(X86Opcode::Paddq)
+                }
+                (InstKind::VReduceMin(_), IrType::Float(FloatWidth::F32)) => {
+                    ReduceStep::Op(X86Opcode::Minps)
+                }
+                (InstKind::VReduceMin(_), IrType::Float(FloatWidth::F64)) => {
+                    ReduceStep::Op(X86Opcode::Minpd)
+                }
+                (InstKind::VReduceMax(_), IrType::Float(FloatWidth::F32)) => {
+                    ReduceStep::Op(X86Opcode::Maxps)
+                }
+                (InstKind::VReduceMax(_), IrType::Float(FloatWidth::F64)) => {
+                    ReduceStep::Op(X86Opcode::Maxpd)
+                }
+                (InstKind::VReduceMin(_), IrType::Int(IntWidth::I32)) => ReduceStep::IntMinMax(true),
+                (InstKind::VReduceMax(_), IrType::Int(IntWidth::I32)) => ReduceStep::IntMinMax(false),
                 (k, e) => panic!("x10: reduce {:?} on {:?} should not reach isel", k, e),
             };
             // Fold the upper half onto the lower, then (for 4-lane
@@ -1228,14 +1256,7 @@ fn select_inst(
                 Some(X86Operand::VReg(half)),
             );
             let fold1 = mf.new_vreg(X86RegClass::Xmm128);
-            push(
-                mf,
-                mb,
-                step,
-                OpSize::Q,
-                vec![X86Operand::VReg(vv), X86Operand::VReg(half)],
-                Some(X86Operand::VReg(fold1)),
-            );
+            emit_reduce_step(mf, mb, step, vv, half, fold1);
             let four_lanes = matches!(
                 elem,
                 IrType::Float(FloatWidth::F32) | IrType::Int(IntWidth::I32)
@@ -1251,14 +1272,7 @@ fn select_inst(
                     Some(X86Operand::VReg(lane1)),
                 );
                 let fold0 = mf.new_vreg(X86RegClass::Xmm128);
-                push(
-                    mf,
-                    mb,
-                    step,
-                    OpSize::Q,
-                    vec![X86Operand::VReg(fold1), X86Operand::VReg(lane1)],
-                    Some(X86Operand::VReg(fold0)),
-                );
+                emit_reduce_step(mf, mb, step, fold1, lane1, fold0);
                 fold0
             } else {
                 fold1
@@ -3023,6 +3037,78 @@ fn emit_packed_icmp(
         CmpOp::Ne => inverted(mf, X86Opcode::Pcmpeqd, va, vb, dest),
         CmpOp::Ge => inverted(mf, X86Opcode::Pcmpgtd, vb, va, dest),
         CmpOp::Le => inverted(mf, X86Opcode::Pcmpgtd, va, vb, dest),
+    }
+}
+
+/// Packed signed i32 min/max synthesis for SSE2 (no pminsd/pmaxsd until
+/// SSE4.1). Compare-and-blend: a signed `pcmpgtd` mask selects between
+/// the two operands with `pand`/`pandn`/`por`. This is the sequence
+/// gfortran and LLVM/flang both emit at the SSE2 baseline (LLVM marks
+/// SMIN/SMAX v4i32 Legal at SSE2 and expands to exactly this).
+///
+///   max(a,b):  mask = a>b;  (mask & a) | (~mask & b)
+///   min(a,b):  mask = a>b;  (mask & b) | (~mask & a)
+///
+/// `pandn op0,op1` computes `(~op0) & op1`. All ops are emitted
+/// three-address; two-address conversion inserts the tie copies, so the
+/// shared `mask` is preserved across both blends.
+fn emit_packed_iminmax(
+    mf: &mut X86Function,
+    mb: MBlockId,
+    is_min: bool,
+    va: X86VReg,
+    vb: X86VReg,
+    dest: X86VReg,
+) {
+    let push = |mf: &mut X86Function, opc, l: X86VReg, r: X86VReg, d: X86VReg| {
+        mf.block_mut(mb).insts.push(X86Inst {
+            opcode: opc,
+            size: OpSize::Q,
+            operands: vec![X86Operand::VReg(l), X86Operand::VReg(r)],
+            def: Some(X86Operand::VReg(d)),
+        });
+    };
+    let mask = mf.new_vreg(X86RegClass::Xmm128);
+    push(mf, X86Opcode::Pcmpgtd, va, vb, mask); // mask = a > b
+    let keep = mf.new_vreg(X86RegClass::Xmm128); // mask & (max?a:b)
+    let drop = mf.new_vreg(X86RegClass::Xmm128); // ~mask & (max?b:a)
+    if is_min {
+        push(mf, X86Opcode::Pand, mask, vb, keep); // a>b -> b
+        push(mf, X86Opcode::Pandn, mask, va, drop); // a<=b -> a
+    } else {
+        push(mf, X86Opcode::Pand, mask, va, keep); // a>b -> a
+        push(mf, X86Opcode::Pandn, mask, vb, drop); // a<=b -> b
+    }
+    push(mf, X86Opcode::Por, keep, drop, dest);
+}
+
+/// One step of a packed across-lane reduction tree: either a single
+/// packed op (sum, float min/max) or the synthesized signed i32 min/max.
+#[derive(Clone, Copy)]
+enum ReduceStep {
+    Op(X86Opcode),
+    /// `true` = min, `false` = max.
+    IntMinMax(bool),
+}
+
+fn emit_reduce_step(
+    mf: &mut X86Function,
+    mb: MBlockId,
+    step: ReduceStep,
+    a: X86VReg,
+    b: X86VReg,
+    dest: X86VReg,
+) {
+    match step {
+        ReduceStep::Op(opc) => {
+            mf.block_mut(mb).insts.push(X86Inst {
+                opcode: opc,
+                size: OpSize::Q,
+                operands: vec![X86Operand::VReg(a), X86Operand::VReg(b)],
+                def: Some(X86Operand::VReg(dest)),
+            });
+        }
+        ReduceStep::IntMinMax(is_min) => emit_packed_iminmax(mf, mb, is_min, a, b, dest),
     }
 }
 
