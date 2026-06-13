@@ -7,7 +7,7 @@
 ! confirm SPLIT's error semantics when it lands.
 ! FLAGS: --std=f2023
 ! EXIT_CODE: 1
-! XFAIL: f2023 SPLIT not implemented (l04); see .docs/audits/f2023-feature-matrix.md
+! XFAIL: SPLIT POS-out-of-range runtime check not implemented (dg-shouldfail case); armfortas intrinsics do not bounds-check POS. See noted_items.md
 program b
   character(len=:), allocatable :: input
   character(len=2) :: set = ', '
