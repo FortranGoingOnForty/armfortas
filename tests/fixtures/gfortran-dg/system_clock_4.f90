@@ -7,7 +7,6 @@
 ! accepts every call here with no diagnostic, so the XFAIL fires.
 ! FLAGS: --std=f2023
 ! ERROR_EXPECTED: SYSTEM_CLOCK
-! XFAIL: f2023 SYSTEM_CLOCK integer-argument restrictions not implemented (l04); see .docs/audits/f2023-feature-matrix.md
 ! PR fortran/112609 - F2023 restrictions on integer arguments to SYSTEM_CLOCK
 
 program p
