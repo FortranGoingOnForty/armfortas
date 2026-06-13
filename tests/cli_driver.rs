@@ -7664,6 +7664,50 @@ fn imported_param_c_char_array_scan_in_char_result_function_runs() {
 }
 
 #[test]
+fn character_parameter_array_implied_do_initializes_elements() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=character_parameter_array_implied_do_initializes_elements count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: i\n  character(len=1), dimension(22), parameter :: valid_chars = &\n    [ (achar(i), i=48,57), &\n      (achar(i), i=65,70), &\n      (achar(i), i=97,102) ]\n\n  if (iachar(valid_chars(1)) /= 48) error stop 1\n  if (iachar(valid_chars(10)) /= 57) error stop 2\n  if (iachar(valid_chars(11)) /= 65) error stop 3\n  if (iachar(valid_chars(22)) /= 102) error stop 4\n  if (.not. any('2' == valid_chars)) error stop 5\n  if (.not. any('F' == valid_chars)) error stop 6\n  if (.not. any('a' == valid_chars)) error stop 7\n  if (any('G' == valid_chars)) error stop 8\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("char_param_array_implied_do", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("character parameter array implied-do compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "character parameter array implied-do compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("character parameter array implied-do run failed");
+    assert!(
+        run.status.success(),
+        "character parameter array implied-do run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected character parameter array implied-do output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn verify_on_indexed_parameter_character_array_element_runs() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

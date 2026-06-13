@@ -25716,12 +25716,57 @@ pub(super) fn store_char_ac_values_into(
     let off_slot = b.alloca(IrType::Int(IntWidth::I64));
     let zero64 = b.const_i64(0);
     b.store(zero64, off_slot);
+    store_char_ac_values_at_off(
+        b,
+        locals,
+        dest_base,
+        elem_len,
+        off_slot,
+        values,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn store_char_ac_values_at_off(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    dest_base: ValueId,
+    elem_len: i64,
+    off_slot: ValueId,
+    values: &[crate::ast::expr::AcValue],
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) {
     let step_bytes = b.const_i64(elem_len);
     let dest_len = b.const_i64(elem_len);
 
     for v in values {
         match v {
             crate::ast::expr::AcValue::Expr(e) => {
+                if let Expr::ArrayConstructor { values: inner, .. } = &e.node {
+                    store_char_ac_values_at_off(
+                        b,
+                        locals,
+                        dest_base,
+                        elem_len,
+                        off_slot,
+                        inner,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
+                    );
+                    continue;
+                }
                 let cur_off = b.load(off_slot);
                 let elem_ptr = b.gep(dest_base, vec![cur_off], IrType::Int(IntWidth::I8));
                 let (src_ptr, src_len) = lower_string_expr_full(
@@ -25742,9 +25787,159 @@ pub(super) fn store_char_ac_values_into(
                 let next_off = b.iadd(cur_off, step_bytes);
                 b.store(next_off, off_slot);
             }
-            crate::ast::expr::AcValue::ImpliedDo(_) => {}
+            crate::ast::expr::AcValue::ImpliedDo(ido) => {
+                store_char_ac_implied_do(
+                    b,
+                    locals,
+                    dest_base,
+                    elem_len,
+                    off_slot,
+                    &ido.values,
+                    &ido.var,
+                    &ido.start,
+                    &ido.end,
+                    ido.step.as_ref(),
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                );
+            }
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn store_char_ac_implied_do(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    dest_base: ValueId,
+    elem_len: i64,
+    off_slot: ValueId,
+    inner: &[crate::ast::expr::AcValue],
+    var: &str,
+    start: &crate::ast::expr::SpannedExpr,
+    end: &crate::ast::expr::SpannedExpr,
+    step: Option<&crate::ast::expr::SpannedExpr>,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) {
+    let var_ty = IrType::Int(IntWidth::I32);
+    let var_addr = b.alloca(var_ty.clone());
+    let start_val = super::expr::lower_expr_full(
+        b,
+        locals,
+        start,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    );
+    let start_coerced = coerce_to_type(b, start_val, &var_ty);
+    b.store(start_coerced, var_addr);
+
+    let end_val = super::expr::lower_expr_full(
+        b,
+        locals,
+        end,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    );
+    let end_coerced = coerce_to_type(b, end_val, &var_ty);
+
+    let step_val_raw = match step {
+        Some(e) => super::expr::lower_expr_full(
+            b,
+            locals,
+            e,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        ),
+        None => b.const_i32(1),
+    };
+    let step_val = coerce_to_type(b, step_val_raw, &var_ty);
+
+    let mut scratch_locals = locals.clone();
+    scratch_locals.insert(
+        var.to_lowercase(),
+        LocalInfo {
+            addr: var_addr,
+            ty: var_ty.clone(),
+            dims: vec![],
+            allocatable: false,
+            descriptor_arg: false,
+            by_ref: false,
+            char_kind: CharKind::None,
+            derived_type: None,
+            inline_const: None,
+            is_pointer: false,
+            runtime_dim_upper: vec![],
+            is_class: false,
+            logical_kind: None,
+            last_dim_assumed_size: false,
+        },
+    );
+
+    let check = b.create_block("char_ac_impdo_check");
+    let body = b.create_block("char_ac_impdo_body");
+    let exit = b.create_block("char_ac_impdo_exit");
+    b.branch(check, vec![]);
+
+    b.set_block(check);
+    let cur_var = b.load(var_addr);
+    let const_step = step.and_then(eval_const_int);
+    if let Some(sv) = const_step {
+        let cmp_op = if sv < 0 { CmpOp::Ge } else { CmpOp::Le };
+        let cond = b.icmp(cmp_op, cur_var, end_coerced);
+        b.cond_branch(cond, body, vec![], exit, vec![]);
+    } else {
+        let zero = b.const_i32(0);
+        let step_neg = b.icmp(CmpOp::Lt, step_val, zero);
+        let bb_neg = b.create_block("char_ac_impdo_neg_check");
+        let bb_pos = b.create_block("char_ac_impdo_pos_check");
+        b.cond_branch(step_neg, bb_neg, vec![], bb_pos, vec![]);
+
+        b.set_block(bb_neg);
+        let cond_neg = b.icmp(CmpOp::Ge, cur_var, end_coerced);
+        b.cond_branch(cond_neg, body, vec![], exit, vec![]);
+
+        b.set_block(bb_pos);
+        let cond_pos = b.icmp(CmpOp::Le, cur_var, end_coerced);
+        b.cond_branch(cond_pos, body, vec![], exit, vec![]);
+    }
+
+    b.set_block(body);
+    store_char_ac_values_at_off(
+        b,
+        &scratch_locals,
+        dest_base,
+        elem_len,
+        off_slot,
+        inner,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    );
+
+    let cur_var_end = b.load(var_addr);
+    let next_var = b.iadd(cur_var_end, step_val);
+    b.store(next_var, var_addr);
+    b.branch(check, vec![]);
+
+    b.set_block(exit);
 }
 
 /// Lower an implied-do array constructor iterator:
