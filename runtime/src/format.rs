@@ -67,6 +67,9 @@ pub enum FormatDesc {
     Logical { width: usize },
     /// A: character. A or Aw.
     Character { width: Option<usize> },
+    /// AT: character output trimmed to len_trim — A with trailing
+    /// blanks removed (F2023). No width form.
+    CharTrimmed,
 
     // ---- Control edit descriptors ----
     /// X: skip n positions. nX.
@@ -91,6 +94,8 @@ pub enum FormatDesc {
     RoundingMode(RoundMode),
     /// DC, DP: decimal comma or point mode (F2003).
     DecimalMode(DecimalSep),
+    /// LZ, LZS, LZP: leading-zero control for F/E/D/G output (F2023).
+    LeadingZero(LeadingZeroMode),
     /// DT: derived type I/O (F2003). Placeholder — requires user-defined I/O procedures.
     DerivedType { type_name: String },
 
@@ -121,6 +126,16 @@ pub enum SignMode {
     /// SP: always show plus sign.
     Plus,
     /// SS: suppress plus sign.
+    Suppress,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeadingZeroMode {
+    /// LZ: return to the processor default (armfortas prints the zero).
+    Default,
+    /// LZP: print the leading zero before the decimal point.
+    Print,
+    /// LZS: suppress the leading zero (`.25` instead of `0.25`).
     Suppress,
 }
 
@@ -430,12 +445,38 @@ fn parse_edit_descriptor(
             exp_width: e,
         }),
         'L' => {
-            let w = parse_number(chars).unwrap_or(1);
-            Some(FormatDesc::Logical { width: w })
+            // LZ/LZS/LZP (F2023 leading-zero control) — matched
+            // longest-first so LZS is not read as LZ + S(ign). Plain
+            // `L`/`Lw` is logical.
+            if chars.peek().map(|c| c.to_ascii_uppercase()) == Some('Z') {
+                chars.next();
+                let mode = match chars.peek().map(|c| c.to_ascii_uppercase()) {
+                    Some('S') => {
+                        chars.next();
+                        LeadingZeroMode::Suppress
+                    }
+                    Some('P') => {
+                        chars.next();
+                        LeadingZeroMode::Print
+                    }
+                    _ => LeadingZeroMode::Default,
+                };
+                Some(FormatDesc::LeadingZero(mode))
+            } else {
+                let w = parse_number(chars).unwrap_or(1);
+                Some(FormatDesc::Logical { width: w })
+            }
         }
         'A' => {
-            let w = parse_number(chars);
-            Some(FormatDesc::Character { width: w })
+            // AT (F2023): A with trailing blanks trimmed. Distinguished
+            // from `Aw` — AT takes no width (AT4 is malformed).
+            if chars.peek().map(|c| c.to_ascii_uppercase()) == Some('T') {
+                chars.next();
+                Some(FormatDesc::CharTrimmed)
+            } else {
+                let w = parse_number(chars);
+                Some(FormatDesc::Character { width: w })
+            }
         }
         'X' => Some(FormatDesc::Skip {
             count: repeat.unwrap_or(1),
@@ -570,6 +611,7 @@ pub struct FormatEngine {
     scale_factor: i32,
     round_mode: RoundMode,
     decimal_sep: DecimalSep,
+    leading_zero: LeadingZeroMode,
 }
 
 impl FormatEngine {
@@ -580,6 +622,34 @@ impl FormatEngine {
             scale_factor: 0,
             round_mode: RoundMode::Compatible,
             decimal_sep: DecimalSep::Point,
+            leading_zero: LeadingZeroMode::Default,
+        }
+    }
+
+    /// Override the connection-level leading-zero mode (LEADING_ZERO= on
+    /// OPEN, or a per-statement WRITE override). The default is the
+    /// processor default (print). Wired in l05-2.
+    pub fn set_leading_zero(&mut self, mode: LeadingZeroMode) {
+        self.leading_zero = mode;
+    }
+
+    /// Suppress the single leading zero before the decimal point when in
+    /// LZS mode: `0.25` -> `.25`, `-0.25` -> `-.25`. Other magnitudes
+    /// (`10.25`, non-finite text) are untouched. Applied before field
+    /// fitting so the freed column becomes leading blank. Print/Default
+    /// keep the processor-default output (the zero), byte-identical to
+    /// pre-F2023 behavior.
+    fn apply_leading_zero(&self, s: &str) -> String {
+        if self.leading_zero != LeadingZeroMode::Suppress {
+            return s.to_string();
+        }
+        let (sign, rest) = match s.as_bytes().first() {
+            Some(b'+') | Some(b'-') => (&s[..1], &s[1..]),
+            _ => ("", s),
+        };
+        match rest.strip_prefix("0.") {
+            Some(frac) => format!("{}.{}", sign, frac),
+            None => s.to_string(),
         }
     }
 
@@ -667,6 +737,9 @@ impl FormatEngine {
                 }
                 FormatDesc::DecimalMode(sep) => {
                     self.decimal_sep = *sep;
+                }
+                FormatDesc::LeadingZero(mode) => {
+                    self.leading_zero = *mode;
                 }
                 FormatDesc::DerivedType { .. } => {} // requires user-defined I/O — no-op for now
                 FormatDesc::TabTo { position } => {
@@ -760,7 +833,7 @@ impl FormatEngine {
                 // kP scale factor: F format multiplies value by 10^k.
                 let scaled = *v * 10f64.powi(self.scale_factor);
                 let rounded = self.apply_explicit_rounding(scaled, *decimals);
-                let s = self.format_fixed(rounded, *decimals);
+                let s = self.apply_leading_zero(&self.format_fixed(rounded, *decimals));
                 Ok(self.apply_decimal_sep(&fit_field(&s, *width)))
             }
             (
@@ -774,7 +847,7 @@ impl FormatEngine {
                 if let Some(s) = self.format_nonfinite(*v) {
                     return Ok(self.apply_decimal_sep(&fit_field(&s, *width)));
                 }
-                let s = self.format_e_style(*v, *decimals, *exp_width, 'E');
+                let s = self.apply_leading_zero(&self.format_e_style(*v, *decimals, *exp_width, 'E'));
                 Ok(self.apply_decimal_sep(&fit_exponential_field(&s, *width)))
             }
             (
@@ -817,7 +890,7 @@ impl FormatEngine {
                 if let Some(s) = self.format_nonfinite(*v) {
                     return Ok(self.apply_decimal_sep(&fit_field(&s, *width)));
                 }
-                let s = self.format_e_style(*v, *decimals, None, 'D');
+                let s = self.apply_leading_zero(&self.format_e_style(*v, *decimals, None, 'D'));
                 Ok(self.apply_decimal_sep(&fit_exponential_field(&s, *width)))
             }
             (
@@ -838,7 +911,7 @@ impl FormatEngine {
                 let abs_v = v.abs();
                 if abs_v == 0.0 || (abs_v >= 0.1 && abs_v < 10f64.powi(*decimals as i32)) {
                     let rounded = self.apply_explicit_rounding(*v, *decimals);
-                    let s = self.format_fixed(rounded, *decimals);
+                    let s = self.apply_leading_zero(&self.format_fixed(rounded, *decimals));
                     Ok(self.apply_decimal_sep(&fit_field(&s, *width)))
                 } else {
                     let s = self.format_e_style(*v, *decimals, *exp_width, 'E');
@@ -893,6 +966,12 @@ impl FormatEngine {
                 } else {
                     Ok(s.into_owned())
                 }
+            }
+            // AT (F2023): character output trimmed to len_trim — the
+            // value with trailing blanks removed, no field width.
+            (FormatDesc::CharTrimmed, IoValue::Character(bytes)) => {
+                let s = String::from_utf8_lossy(bytes);
+                Ok(s.trim_end_matches(' ').to_string())
             }
 
             _ => Err(FormatError::TypeMismatch),
@@ -1183,7 +1262,8 @@ fn format_has_data_descriptor(descs: &[FormatDesc]) -> bool {
         | FormatDesc::RealD { .. }
         | FormatDesc::RealG { .. }
         | FormatDesc::Logical { .. }
-        | FormatDesc::Character { .. } => true,
+        | FormatDesc::Character { .. }
+        | FormatDesc::CharTrimmed => true,
         FormatDesc::Group { descriptors, .. } | FormatDesc::UnlimitedRepeat { descriptors } => {
             format_has_data_descriptor(descriptors)
         }
@@ -1539,6 +1619,88 @@ mod tests {
             descs[10],
             FormatDesc::RoundingMode(RoundMode::ProcessorDefined)
         ));
+    }
+
+    #[test]
+    fn parse_leading_zero_modes() {
+        let descs = parse_format("(LZ, F6.3, LZS, F6.3, LZP, F6.3)");
+        assert!(matches!(
+            descs[0],
+            FormatDesc::LeadingZero(LeadingZeroMode::Default)
+        ));
+        assert!(matches!(
+            descs[2],
+            FormatDesc::LeadingZero(LeadingZeroMode::Suppress)
+        ));
+        assert!(matches!(
+            descs[4],
+            FormatDesc::LeadingZero(LeadingZeroMode::Print)
+        ));
+    }
+
+    #[test]
+    fn parse_lz_not_confused_with_logical_or_sign() {
+        // LZS must tokenize as one descriptor, not LZ + S(ign default);
+        // bare L is still logical.
+        let descs = parse_format("(LZS, L2)");
+        assert!(matches!(
+            descs[0],
+            FormatDesc::LeadingZero(LeadingZeroMode::Suppress)
+        ));
+        assert!(matches!(descs[1], FormatDesc::Logical { width: 2 }));
+    }
+
+    #[test]
+    fn parse_at_descriptor_not_tab() {
+        // AT is the trimmed-character descriptor, distinct from A and
+        // from a T position descriptor.
+        let descs = parse_format("(1X,AT,F4.1)");
+        assert!(matches!(descs[0], FormatDesc::Skip { .. }));
+        assert!(matches!(descs[1], FormatDesc::CharTrimmed));
+        assert!(matches!(descs[2], FormatDesc::RealF { .. }));
+        let plain = parse_format("(A4)");
+        assert!(matches!(plain[0], FormatDesc::Character { width: Some(4) }));
+    }
+
+    #[test]
+    fn format_leading_zero_suppress() {
+        // LZS drops the leading zero; default/LZP keep it.
+        let s = FormatEngine::new(parse_format("(LZS, F6.3)")).format_values(&[IoValue::Real(0.25)]);
+        assert_eq!(s.trim(), ".250");
+        let neg =
+            FormatEngine::new(parse_format("(LZS, F7.3)")).format_values(&[IoValue::Real(-0.25)]);
+        assert_eq!(neg.trim(), "-.250");
+        let def = FormatEngine::new(parse_format("(F6.3)")).format_values(&[IoValue::Real(0.25)]);
+        assert_eq!(def.trim(), "0.250");
+        let lzp =
+            FormatEngine::new(parse_format("(LZP, F6.3)")).format_values(&[IoValue::Real(0.25)]);
+        assert_eq!(lzp.trim(), "0.250");
+    }
+
+    #[test]
+    fn format_leading_zero_suppress_only_below_one() {
+        // No leading zero to drop when |value| >= 1.
+        let s = FormatEngine::new(parse_format("(LZS, F7.3)")).format_values(&[IoValue::Real(10.25)]);
+        assert_eq!(s.trim(), "10.250");
+    }
+
+    #[test]
+    fn format_leading_zero_suppress_exponential() {
+        // E-format mantissa leading zero is suppressed too.
+        let s =
+            FormatEngine::new(parse_format("(LZS, E10.3)")).format_values(&[IoValue::Real(0.25)]);
+        assert!(s.contains(".250"), "got {s}");
+        assert!(!s.trim().starts_with('0'), "leading zero not suppressed: {s}");
+    }
+
+    #[test]
+    fn format_at_trims_trailing_blanks() {
+        let s = FormatEngine::new(parse_format("(AT)"))
+            .format_values(&[IoValue::Character(b"hi   ".to_vec())]);
+        assert_eq!(s, "hi");
+        let blank = FormatEngine::new(parse_format("(AT)"))
+            .format_values(&[IoValue::Character(b"     ".to_vec())]);
+        assert_eq!(blank, "");
     }
 
     #[test]
