@@ -16618,6 +16618,19 @@ pub(super) fn procedure_abi_lookup_keys(st: &SymbolTable, keys: &[&str]) -> Vec<
     out
 }
 
+fn module_procedure_link_name_candidates(link_name: &str) -> Vec<String> {
+    let Some(stripped) = link_name.strip_prefix("afs_modproc_") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut cursor = stripped;
+    while let Some(idx) = cursor.find('_') {
+        cursor = &cursor[idx + 1..];
+        out.push(cursor.to_string());
+    }
+    out
+}
+
 pub(super) fn procedure_abi_lookup_keys_for_call_target(
     st: &SymbolTable,
     call_name: &str,
@@ -17069,6 +17082,7 @@ pub(super) fn emit_bound_function_call(
         contained_host_refs,
         None,
         descriptor_params,
+        None,
         obj_addr,
         Some(pass_desc_addr),
         FuncRef::External(bp.target_name.clone()),
@@ -17088,6 +17102,7 @@ pub(super) fn emit_resolved_bound_proc_call(
     contained_host_refs: Option<&HashMap<String, Vec<String>>>,
     optional_params: Option<&HashMap<String, Vec<bool>>>,
     descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+    char_len_star_params: Option<&HashMap<String, Vec<bool>>>,
     obj_addr: ValueId,
     pass_desc_addr: Option<ValueId>,
     func_ref: FuncRef,
@@ -17105,7 +17120,10 @@ pub(super) fn emit_resolved_bound_proc_call(
         st,
         if nopass { 0 } else { 1 },
     );
-    let abi_lookup_keys = procedure_abi_lookup_keys(st, &[target.as_str(), &target_key]);
+    let mut abi_seed_keys = vec![target.clone(), target_key.clone(), bp.abi_name.clone()];
+    abi_seed_keys.extend(module_procedure_link_name_candidates(&target));
+    let abi_seed_refs: Vec<&str> = abi_seed_keys.iter().map(String::as_str).collect();
+    let abi_lookup_keys = procedure_abi_lookup_keys(st, &abi_seed_refs);
     let abi_primary_key = abi_lookup_keys
         .first()
         .map(String::as_str)
@@ -17130,7 +17148,11 @@ pub(super) fn emit_resolved_bound_proc_call(
             .or_else(|| callee_optional_arg_mask(st, k))
     });
     let callee_char_len_star_args =
-        first_procedure_lookup(&abi_lookup_keys, |k| callee_char_len_star_mask(st, k));
+        first_procedure_lookup(&abi_lookup_keys, |k| {
+            char_len_star_params
+                .and_then(|m| cached_param_mask_for_lookup(st, m, k))
+                .or_else(|| callee_char_len_star_mask(st, k))
+        });
 
     let mut call_args =
         Vec::with_capacity(arg_slots.len() + hidden_result.is_some() as usize + (!nopass) as usize);
@@ -17401,6 +17423,7 @@ pub(super) fn emit_dynamic_bound_proc_lookup_dispatch(
     contained_host_refs: Option<&HashMap<String, Vec<String>>>,
     optional_params: Option<&HashMap<String, Vec<bool>>>,
     descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+    char_len_star_params: Option<&HashMap<String, Vec<bool>>>,
     call_span: crate::lexer::Span,
     desc_addr: ValueId,
     obj_addr: ValueId,
@@ -17424,6 +17447,12 @@ pub(super) fn emit_dynamic_bound_proc_lookup_dispatch(
     )
     .or_else(|| base_layout.bound_proc(component))
     .unwrap_or_else(|| fail_unmatched_bound_proc_resolution(call_span, base_layout, component));
+    let candidates = concrete_bound_proc_dispatch_candidates(
+        type_layouts,
+        base_type,
+        component,
+        &declared_bp.abi_name,
+    );
     let slot_index = base_layout.bound_procs.iter().position(|bp| {
         bp.method_name.eq_ignore_ascii_case(component)
             && bp.abi_name.eq_ignore_ascii_case(&declared_bp.abi_name)
@@ -17459,9 +17488,10 @@ pub(super) fn emit_dynamic_bound_proc_lookup_dispatch(
     let zero = b.const_i64(0);
     let has_vtable = b.icmp(CmpOp::Ne, vtable_raw, zero);
     let dispatch_bb = b.create_block("vtable_dispatch");
+    let fallback_bb = b.create_block("vtable_dispatch_fallback");
     let fail_bb = b.create_block("vtable_dispatch_fail");
     let done_bb = b.create_block("vtable_dispatch_done");
-    b.cond_branch(has_vtable, dispatch_bb, vec![], fail_bb, vec![]);
+    b.cond_branch(has_vtable, dispatch_bb, vec![], fallback_bb, vec![]);
 
     b.set_block(dispatch_bb);
     let slot_off = b.const_i64(VTABLE_HEADER_BYTES + slot_index * 8);
@@ -17470,7 +17500,7 @@ pub(super) fn emit_dynamic_bound_proc_lookup_dispatch(
     let target_raw = b.ptr_to_int(target_ptr);
     let target_ok = b.icmp(CmpOp::Ne, target_raw, zero);
     let call_bb = b.create_block("vtable_dispatch_call");
-    b.cond_branch(target_ok, call_bb, vec![], fail_bb, vec![]);
+    b.cond_branch(target_ok, call_bb, vec![], fallback_bb, vec![]);
 
     b.set_block(call_bb);
     let call_result = emit_resolved_bound_proc_call(
@@ -17482,6 +17512,7 @@ pub(super) fn emit_dynamic_bound_proc_lookup_dispatch(
         contained_host_refs,
         optional_params,
         descriptor_params,
+        char_len_star_params,
         obj_addr,
         Some(desc_addr),
         FuncRef::Indirect(target_ptr),
@@ -17494,6 +17525,60 @@ pub(super) fn emit_dynamic_bound_proc_lookup_dispatch(
         b.store(call_result, slot);
     }
     b.branch(done_bb, vec![]);
+
+    b.set_block(fallback_bb);
+    if candidates.is_empty() {
+        b.branch(fail_bb, vec![]);
+    } else {
+        let runtime_tag = load_array_desc_type_tag(b, desc_addr);
+        let test_blocks: Vec<BlockId> = candidates
+            .iter()
+            .enumerate()
+            .map(|(i, _)| b.create_block(&format!("tbp_dispatch_test_{}", i)))
+            .collect();
+        let case_blocks: Vec<BlockId> = candidates
+            .iter()
+            .enumerate()
+            .map(|(i, _)| b.create_block(&format!("tbp_dispatch_case_{}", i)))
+            .collect();
+        b.branch(test_blocks[0], vec![]);
+
+        for (idx, (type_tag, bp)) in candidates.iter().enumerate() {
+            b.set_block(test_blocks[idx]);
+            let expected_tag = b.const_i64(*type_tag as i64);
+            let is_match = b.icmp(CmpOp::Eq, runtime_tag, expected_tag);
+            let next_test = if idx + 1 < test_blocks.len() {
+                test_blocks[idx + 1]
+            } else {
+                fail_bb
+            };
+            b.cond_branch(is_match, case_blocks[idx], vec![], next_test, vec![]);
+
+            b.set_block(case_blocks[idx]);
+            let call_result = emit_resolved_bound_proc_call(
+                b,
+                locals,
+                st,
+                Some(type_layouts),
+                internal_funcs,
+                contained_host_refs,
+                optional_params,
+                descriptor_params,
+                char_len_star_params,
+                obj_addr,
+                Some(desc_addr),
+                FuncRef::External(bp.target_name.clone()),
+                bp,
+                args,
+                None,
+                call_ret_ty.clone(),
+            )?;
+            if let Some(slot) = result_slot {
+                b.store(call_result, slot);
+            }
+            b.branch(done_bb, vec![]);
+        }
+    }
 
     b.set_block(fail_bb);
     b.runtime_call(RuntimeFunc::ErrorStop, vec![], IrType::Void);
@@ -17657,6 +17742,30 @@ pub(super) fn resolve_polymorphic_component_method_base_for_dispatch(
     }
 }
 
+pub(super) fn concrete_bound_proc_dispatch_candidates(
+    tl: &crate::sema::type_layout::TypeLayoutRegistry,
+    base_type: &str,
+    component: &str,
+    abi_name: &str,
+) -> Vec<(u64, crate::sema::type_layout::BoundProc)> {
+    let mut out: Vec<(u64, crate::sema::type_layout::BoundProc)> = tl
+        .layouts
+        .values()
+        .filter(|layout| !layout.is_abstract)
+        .filter(|layout| is_type_or_extends(&layout.name, base_type, tl))
+        .filter_map(|layout| {
+            layout
+                .bound_proc_candidates(component)
+                .into_iter()
+                .find(|bp| bp.abi_name.eq_ignore_ascii_case(abi_name))
+                .cloned()
+                .map(|bp| (layout.type_tag, bp))
+        })
+        .collect();
+    out.sort_by_key(|(tag, _)| *tag);
+    out
+}
+
 pub(super) fn concrete_type_dispatch_candidates(
     tl: &crate::sema::type_layout::TypeLayoutRegistry,
     base_type: &str,
@@ -17681,6 +17790,7 @@ pub(super) fn emit_polymorphic_component_bound_dispatch(
     contained_host_refs: Option<&HashMap<String, Vec<String>>>,
     optional_params: Option<&HashMap<String, Vec<bool>>>,
     descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+    char_len_star_params: Option<&HashMap<String, Vec<bool>>>,
     call_span: crate::lexer::Span,
     base: &crate::ast::expr::SpannedExpr,
     component: &str,
@@ -17703,6 +17813,7 @@ pub(super) fn emit_polymorphic_component_bound_dispatch(
         contained_host_refs,
         optional_params,
         descriptor_params,
+        char_len_star_params,
         call_span,
         desc_addr,
         obj_addr,
@@ -20375,10 +20486,7 @@ pub(super) fn cached_param_mask_for_lookup(
         | crate::sema::symtab::ScopeKind::Subroutine(name) => name.to_lowercase(),
         _ => return None,
     };
-    proc_name
-        .eq_ignore_ascii_case(callee_name)
-        .then(|| cache.get(&proc_name).cloned())
-        .flatten()
+    cache.get(&proc_name).cloned()
 }
 
 pub(super) fn callee_value_arg_mask(st: &SymbolTable, callee_name: &str) -> Option<Vec<bool>> {
@@ -20440,7 +20548,7 @@ pub(super) fn callee_intent_in_array_arg_mask(
                 .unwrap_or(false)
         })
         .collect();
-    Some(mask)
+    mask.iter().any(|flag| *flag).then_some(mask)
 }
 
 pub(super) fn callee_pointer_arg_mask(st: &SymbolTable, callee_name: &str) -> Option<Vec<bool>> {
@@ -20531,7 +20639,7 @@ pub(super) fn callee_char_len_star_mask(st: &SymbolTable, callee_name: &str) -> 
                 .unwrap_or(false)
         })
         .collect();
-    Some(mask)
+    mask.iter().any(|flag| *flag).then_some(mask)
 }
 
 /// Check if a callee has deferred-length allocatable/pointer character dummies

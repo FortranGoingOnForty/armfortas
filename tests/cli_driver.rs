@@ -3239,6 +3239,108 @@ fn bind_c_c_char_buffer_survives_amod_import_without_hidden_lengths() {
 }
 
 #[test]
+fn amod_preserves_allocatable_assumed_len_char_array_hidden_len() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=amod_preserves_allocatable_assumed_len_char_array_hidden_len count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("amod_assumed_len_char_vec");
+    let mod_src = write_program_in(
+        &dir,
+        "provider.f90",
+        "module provider\n  implicit none\n  type :: core_t\n  contains\n    procedure :: get_vec\n  end type\ncontains\n  subroutine get_vec(self, vec)\n    class(core_t), intent(inout) :: self\n    character(len=*), dimension(:), allocatable, intent(out) :: vec\n    allocate(vec(2))\n    vec(1) = 'abcde'\n    vec(2) = 'vwxyz'\n  end subroutine\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use provider, only : core_t\n  implicit none\n  type(core_t) :: core\n  character(len=5), allocatable :: vec(:)\n  call core%get_vec(vec)\n  if (.not. allocated(vec)) error stop 1\n  if (size(vec) /= 2) error stop 2\n  if (vec(1) /= 'abcde') error stop 3\n  if (vec(2) /= 'vwxyz') error stop 4\n  print *, 'ok'\nend program\n",
+    );
+
+    let mod_obj = dir.join("provider.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            mod_src.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("assumed-len char vec provider compile failed to spawn");
+    assert!(
+        compile_mod.status.success(),
+        "assumed-len char vec provider should compile: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+    let amod = std::fs::read_to_string(dir.join("provider.amod")).expect("missing provider.amod");
+    assert!(
+        amod.contains("@abi cc=aapcs64 hidden_char_lens=1"),
+        "provider .amod should advertise the vector element length: {}",
+        amod
+    );
+    assert!(
+        amod.contains("@arg vec@len"),
+        "provider .amod should serialize the vector hidden length arg: {}",
+        amod
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_main = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            main_src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("assumed-len char vec user compile failed to spawn");
+    assert!(
+        compile_main.status.success(),
+        "assumed-len char vec user should compile: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let exe = dir.join("amod_assumed_len_char_vec.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            main_obj.to_str().unwrap(),
+            mod_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("assumed-len char vec link failed to spawn");
+    assert!(
+        link.status.success(),
+        "assumed-len char vec objects should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+    let run = Command::new(&exe)
+        .output()
+        .expect("assumed-len char vec run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "assumed-len char vec binary should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn bind_c_c_char_value_arg_passes_actual_byte_after_value_handle() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -39899,6 +40001,43 @@ fn type_bound_generic_dispatch_disambiguates_by_rank() {
     assert!(
         run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
         "tbp-rank: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn type_bound_generic_forwards_allocatable_assumed_len_char_array_len() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=type_bound_generic_forwards_allocatable_assumed_len_char_array_len count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type :: core_t\n  contains\n    procedure :: get_string_vec_by_path\n    procedure :: get_string_vec\n    generic :: get => get_string_vec_by_path, get_string_vec\n  end type\ncontains\n  subroutine get_string_vec(self, item, vec)\n    class(core_t), intent(inout) :: self\n    integer, intent(in) :: item\n    character(len=*), dimension(:), allocatable, intent(out) :: vec\n    if (item /= 7) error stop 10\n    allocate(vec(2))\n    vec(1) = 'abcde'\n    vec(2) = 'vwxyz'\n  end subroutine\n\n  subroutine get_string_vec_by_path(self, item, path, vec, found, default)\n    class(core_t), intent(inout) :: self\n    integer, intent(in) :: item\n    character(len=*), intent(in) :: path\n    character(len=*), dimension(:), allocatable, intent(out) :: vec\n    logical, intent(out), optional :: found\n    character(len=*), dimension(:), intent(in), optional :: default\n    if (path /= 'files') error stop 11\n    if (present(default)) error stop 12\n    if (present(found)) found = .true.\n    call self%get(item, vec)\n  end subroutine\nend module\n\nprogram p\n  use m\n  implicit none\n  type(core_t) :: core\n  character(len=5), allocatable :: vec(:)\n  logical :: found\n  found = .false.\n  call core%get(7, 'files', vec, found)\n  if (.not. found) error stop 1\n  if (.not. allocated(vec)) error stop 2\n  if (size(vec) /= 2) error stop 3\n  if (vec(1) /= 'abcde') error stop 4\n  if (vec(2) /= 'vwxyz') error stop 5\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("tbp_assumed_len_char_vec", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("tbp-assumed-len-char-vec compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "tbp-assumed-len-char-vec compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("tbp-assumed-len-char-vec run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "tbp-assumed-len-char-vec run failed: status={:?} stdout={} stderr={}",
         run.status,
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr)

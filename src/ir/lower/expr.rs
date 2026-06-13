@@ -2686,6 +2686,7 @@ pub(crate) fn lower_expr_full(
                         contained_host_refs,
                         None,
                         descriptor_params,
+                        None,
                         callee.span,
                         base,
                         component,
