@@ -45412,6 +45412,17 @@ pub(super) fn lower_arg_by_ref_full(
                 return derived_scalar_storage_addr_for_call(b, info);
             }
             if info.by_ref {
+                if info.is_pointer && info.dims.is_empty() && !info.descriptor_arg {
+                    // A POINTER dummy's local slot holds the caller's pointer
+                    // slot. An ordinary dummy associates with the target.
+                    let caller_slot = b.load(info.addr);
+                    let pointee_ty = if info.ty.is_ptr() {
+                        info.ty.clone()
+                    } else {
+                        IrType::Ptr(Box::new(info.ty.clone()))
+                    };
+                    return b.load_typed(caller_slot, pointee_ty);
+                }
                 if info.descriptor_arg {
                     return array_data_ptr_for_call(b, info);
                 }
