@@ -284,6 +284,31 @@ pub(crate) fn lower_intrinsic_subroutine(
             }
             true
         }
+        "split" => {
+            // CALL SPLIT(STRING, SET, POS [, BACK]). POS is INTENT(INOUT)
+            // iteration state — copy-in the current value, let the
+            // runtime update it through an i64 slot, copy-out.
+            let (str_ptr, str_len) = nth_arg_str(b, ctx, args, 0);
+            let (set_ptr, set_len) = nth_arg_str(b, ctx, args, 1);
+            let (pos_slot, pos_wb) = nth_arg_i64_out(b, ctx, args, 2);
+            if let Some(wb) = &pos_wb {
+                let cur = b.load(wb.dest_ptr);
+                let cur_i64 = coerce_to_type(b, cur, &IrType::Int(IntWidth::I64));
+                b.store(cur_i64, pos_slot);
+            }
+            let back = nth_arg_val(b, ctx, args, 3, 0);
+            b.call(
+                FuncRef::External("afs_split".into()),
+                vec![str_ptr, str_len, set_ptr, set_len, pos_slot, back],
+                IrType::Void,
+            );
+            if let Some(wb) = pos_wb {
+                let raw = b.load(wb.tmp_ptr);
+                let coerced = coerce_to_type(b, raw, &wb.dest_ty);
+                b.store(coerced, wb.dest_ptr);
+            }
+            true
+        }
         "cpu_time" => {
             let (time, writeback) = nth_arg_f64_out(b, ctx, args, 0);
             b.call(

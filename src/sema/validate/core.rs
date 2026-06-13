@@ -3451,6 +3451,8 @@ pub fn is_intrinsic_name(name: &str) -> bool {
         "dshiftl" | "dshiftr" | "maskl" | "maskr" | "merge_bits" |
         "new_line" | "null" | "move_alloc" |
         "system_clock" | "date_and_time" | "cpu_time" | "random_number" | "random_seed" |
+        // F2023 string-parsing subroutines.
+        "split" | "tokenize" |
         "command_argument_count" | "get_command_argument" | "get_environment_variable" |
         "execute_command_line" | "compiler_version" | "compiler_options" |
         "is_iostat_end" | "is_iostat_eor" |
