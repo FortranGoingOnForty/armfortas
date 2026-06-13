@@ -1962,6 +1962,15 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     .map(|k| k.eq_ignore_ascii_case("iomsg"))
                     .unwrap_or(false)
             });
+            // LEADING_ZERO= statement override (F2023): seeds the format
+            // engine's leading-zero mode for this WRITE, beating the
+            // connection mode. Only meaningful for formatted output.
+            let leading_zero_ctrl = controls.iter().find(|c| {
+                c.keyword
+                    .as_deref()
+                    .map(|k| k.eq_ignore_ascii_case("leading_zero"))
+                    .unwrap_or(false)
+            });
             let iostat_arg_ptr = iostat_ctrl.map(|c| lower_arg_by_ref_ctx(b, ctx, &c.value));
             let iostat_ptr = iostat_arg_ptr.unwrap_or(null_i8_ptr);
             let (iomsg_arg_ptr, iomsg_ptr, iomsg_len) = if let Some(c) = iomsg_ctrl {
@@ -1998,6 +2007,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             ],
                             IrType::Void,
                         );
+                        lower_fmt_leading_zero_override(b, ctx, leading_zero_ctrl);
                         for item in items {
                             lower_fmt_push(b, ctx, item);
                         }
@@ -2087,6 +2097,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     vec![unit, fmt_ptr, fmt_len, iostat_ptr, iomsg_ptr, iomsg_len],
                     IrType::Void,
                 );
+                lower_fmt_leading_zero_override(b, ctx, leading_zero_ctrl);
 
                 for item in items {
                     lower_fmt_push(b, ctx, item);
@@ -5052,10 +5063,22 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     .map(|k| k.eq_ignore_ascii_case("position"))
                     .unwrap_or(false)
             });
+            let has_leading_zero = specs.iter().any(|s| {
+                s.keyword
+                    .as_deref()
+                    .map(|k| k.eq_ignore_ascii_case("leading_zero"))
+                    .unwrap_or(false)
+            });
             let has_iostat = iostat_spec.is_some();
             let has_newunit = newunit_spec.is_some();
 
-            if !has_access && !has_form && !has_recl && !has_position && !has_iostat && !has_newunit
+            if !has_access
+                && !has_form
+                && !has_recl
+                && !has_position
+                && !has_leading_zero
+                && !has_iostat
+                && !has_newunit
             {
                 // Simple case: use 7-arg afs_open_simple (unit + 3 string pairs).
                 b.call(
@@ -5091,13 +5114,37 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         (z, z)
                     });
 
-                // Layout matches repr(C) OpenControlBlock (128 bytes):
+                // Find LEADING_ZERO= spec (F2023 connection-level mode).
+                let (leading_zero_ptr, leading_zero_len) = specs
+                    .iter()
+                    .find(|s| {
+                        s.keyword
+                            .as_deref()
+                            .map(|k| k.eq_ignore_ascii_case("leading_zero"))
+                            .unwrap_or(false)
+                    })
+                    .map(|s| {
+                        lower_string_expr_with_layouts(
+                            b,
+                            &ctx.locals,
+                            &s.value,
+                            ctx.st,
+                            Some(ctx.type_layouts),
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        let z = b.const_i64(0);
+                        (z, z)
+                    });
+
+                // Layout matches repr(C) OpenControlBlock (144 bytes):
                 //   0: unit(i32) + 4 pad, 8: filename(ptr), 16: filename_len(i64),
                 //  24: status(ptr), 32: status_len(i64), 40: action(ptr), 48: action_len(i64),
                 //  56: access(ptr), 64: access_len(i64), 72: form(ptr), 80: form_len(i64),
                 //  88: recl(i64), 96: iostat(ptr), 104: newunit(ptr),
-                // 112: position(ptr), 120: position_len(i64)
-                let cb_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 128);
+                // 112: position(ptr), 120: position_len(i64),
+                // 128: leading_zero(ptr), 136: leading_zero_len(i64)
+                let cb_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 144);
                 let cb = b.alloca(cb_ty);
 
                 let store_at = |b: &mut crate::ir::builder::FuncBuilder,
@@ -5142,6 +5189,10 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     .func()
                     .value_type(position_ptr)
                     .unwrap_or(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                let leading_zero_ptr_ty = b
+                    .func()
+                    .value_type(leading_zero_ptr)
+                    .unwrap_or(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
                 let iostat_ptr = iostat_spec
                     .map(|spec| lower_arg_by_ref_ctx(b, ctx, &spec.value))
                     .unwrap_or(null);
@@ -5173,6 +5224,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 store_at(b, cb, 104, newunit_ptr_ty, newunit_ptr);
                 store_at(b, cb, 112, position_ptr_ty, position_ptr);
                 store_at(b, cb, 120, IrType::Int(IntWidth::I64), position_len);
+                store_at(b, cb, 128, leading_zero_ptr_ty, leading_zero_ptr);
+                store_at(b, cb, 136, IrType::Int(IntWidth::I64), leading_zero_len);
 
                 b.call(FuncRef::External("afs_open".into()), vec![cb], IrType::Void);
             }
@@ -5523,6 +5576,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             let (stream_ptr, stream_len) = lower_string_spec(b, "stream");
             let (formatted_ptr, formatted_len) = lower_string_spec(b, "formatted");
             let (unformatted_ptr, unformatted_len) = lower_string_spec(b, "unformatted");
+            let (leading_zero_ptr, leading_zero_len) = lower_string_spec(b, "leading_zero");
             let recl_addr = lower_ref_spec(b, "recl");
             let size_spec = spec_by_keyword("size");
             let (size_addr, size_storeback) = if let Some(spec) = size_spec {
@@ -5575,6 +5629,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         formatted_len,
                         unformatted_ptr,
                         unformatted_len,
+                        leading_zero_ptr,
+                        leading_zero_len,
                     ],
                     IrType::Void,
                 );
@@ -5614,6 +5670,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         formatted_len,
                         unformatted_ptr,
                         unformatted_len,
+                        leading_zero_ptr,
+                        leading_zero_len,
                     ],
                     IrType::Void,
                 );
