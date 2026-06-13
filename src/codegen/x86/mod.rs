@@ -7,6 +7,7 @@
 pub mod abi;
 pub mod emit;
 pub mod isel;
+pub mod linearscan;
 pub mod liveness;
 pub mod mir;
 pub mod peephole;
