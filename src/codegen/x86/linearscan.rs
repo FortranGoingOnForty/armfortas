@@ -214,6 +214,32 @@ fn spill_slot_size(class: X86RegClass) -> (u64, u64) {
     }
 }
 
+/// Where a split interval's post-call half lives. `Allocated` is the
+/// win — the post-half got its own register, so the only memory traffic
+/// is the bridge store/load across the call. `Spilled` means the
+/// post-half could not get a register either, so post-call uses load
+/// directly from the bridge slot (the same slot the pre-half stored to).
+#[derive(Clone, Copy)]
+enum PostHalf {
+    Allocated(X86Reg),
+    Spilled,
+}
+
+/// One live-range split at a call boundary. `apply_allocation` uses
+/// `call_position` to decide, per use, whether to read the pre-half
+/// (`pre_phys`) or the post-half (`post`), and brackets the call with
+/// `store pre_phys -> bridge_slot` then (if the post-half is allocated)
+/// `load post_phys <- bridge_slot`.
+#[derive(Clone)]
+struct SplitRecord {
+    vreg: VRegId,
+    class: X86RegClass,
+    call_position: u32,
+    pre_phys: X86Reg,
+    post: PostHalf,
+    bridge_slot: i32,
+}
+
 /// Result of register allocation.
 pub struct AllocResult {
     /// VRegId → assigned physical register.
@@ -224,6 +250,8 @@ pub struct AllocResult {
     /// Callee-saved registers used, needing prologue save / epilogue
     /// restore. Sorted for deterministic save order.
     pub callee_saved_used: Vec<X86Reg>,
+    /// Live-range splits performed at call boundaries.
+    split_records: Vec<SplitRecord>,
     /// The liveness result the assignment was built from (apply pass
     /// reuses the intervals/positions).
     pub liveness: LivenessResult,
@@ -274,8 +302,59 @@ pub fn linear_scan(f: &mut X86Function) -> AllocResult {
     // callee-saved register or a spill with no special-casing.
     let occ = build_phys_occupancy(f);
 
-    let intervals: Vec<LiveInterval> = liveness.intervals.clone();
-    for interval in &intervals {
+    // Tight def/use range per vreg, the set of vregs defined in more than
+    // one block, and the set of blocks each vreg is referenced in — the
+    // splitter's false-positive guards. The dataflow live range inflates
+    // vreg-to-vreg copy chains across whole blocks, so a call lexically
+    // inside the inflated range may sit outside the real def/use range; a
+    // phi-like (multi-def) vreg's value is carried by parallel copies in
+    // every predecessor; and a vreg referenced in more than one block may
+    // be loop-carried — its def before a loop, a use before the call
+    // inside the loop body. Splitting any of these corrupts the value, so
+    // the splitter consults all three.
+    let mut vreg_actual_range: HashMap<VRegId, (u32, u32)> = HashMap::new();
+    let mut vreg_def_blocks: HashMap<VRegId, HashSet<usize>> = HashMap::new();
+    let mut vreg_ref_blocks: HashMap<VRegId, HashSet<usize>> = HashMap::new();
+    {
+        let mut p: u32 = 0;
+        for (bi, block) in f.blocks.iter().enumerate() {
+            for inst in &block.insts {
+                let touch = |id: VRegId, range: &mut HashMap<VRegId, (u32, u32)>| {
+                    let e = range.entry(id).or_insert((p, p));
+                    e.0 = e.0.min(p);
+                    e.1 = e.1.max(p);
+                };
+                if let Some(X86Operand::VReg(d)) = inst.def {
+                    vreg_def_blocks.entry(d.id).or_default().insert(bi);
+                    vreg_ref_blocks.entry(d.id).or_default().insert(bi);
+                    touch(d.id, &mut vreg_actual_range);
+                }
+                for op in &inst.operands {
+                    if let X86Operand::VReg(v) = op {
+                        vreg_ref_blocks.entry(v.id).or_default().insert(bi);
+                        touch(v.id, &mut vreg_actual_range);
+                    }
+                }
+                p += 2;
+            }
+        }
+    }
+    let multi_def: HashSet<VRegId> = vreg_def_blocks
+        .iter()
+        .filter(|(_, blocks)| blocks.len() > 1)
+        .map(|(v, _)| *v)
+        .collect();
+
+    // synthetic post-half vreg -> (original vreg, call position, bridge slot)
+    let mut splits_in_progress: HashMap<VRegId, (VRegId, u32, i32)> = HashMap::new();
+
+    // Worklist: a clone of the sorted intervals; a split inserts its
+    // post-half at the correct sorted position so the linear-scan
+    // invariant (process in start order) holds.
+    let mut worklist: Vec<LiveInterval> = liveness.intervals.clone();
+    let mut idx = 0;
+    while idx < worklist.len() {
+        let interval = worklist[idx].clone();
         let is_fp = is_fp_class(interval.class);
         let (active, free) = if is_fp {
             (&mut active_fp, &mut free_fp)
@@ -309,18 +388,106 @@ pub fn linear_scan(f: &mut X86Function) -> AllocResult {
             if is_callee_saved(reg) {
                 callee_saved_used.insert(reg);
             }
+            idx += 1;
             continue;
         }
 
-        // No free register works. Evict the active interval that ends
-        // furthest among those whose register is fixed-free over our
-        // range; take it if it outlives us, otherwise spill ourselves.
+        // No whole-range register. Before spilling, try splitting at a
+        // single call boundary: the pre-half [start, call) takes a
+        // caller-saved register clear over that sub-range, the post-half
+        // re-enters the worklist as a fresh interval, and apply bridges
+        // the call with a store/load. Guarded against:
+        //   - false-positive crossings from inflated liveness (straddle
+        //     check against the tight def/use range);
+        //   - phi-like (multi-def) vregs whose value is carried by
+        //     predecessor parallel-copies;
+        //   - loop-carried vregs (referenced in more than one block). The
+        //     bridge restores the post-half right after the call, but the
+        //     pre-half caller-saved register is dead from then on. If a
+        //     use lexically before the call is reached again via a back
+        //     edge (def outside the loop, use inside), that use reads the
+        //     clobbered pre_phys. Confining splits to a single-block live
+        //     range rules this out: such a block either runs once, or is a
+        //     loop body whose def re-executes each iteration, re-filling
+        //     pre_phys before the bridge store. (complex(dp) programs hit
+        //     this hard on x86 — zero callee-saved xmm forces every
+        //     call-crossing FP value down the split path.)
+        let single_block = vreg_ref_blocks
+            .get(&interval.vreg)
+            .is_some_and(|b| b.len() == 1);
+        let split_ok = interval.call_crossings.len() == 1
+            && !multi_def.contains(&interval.vreg)
+            && single_block
+            && vreg_actual_range
+                .get(&interval.vreg)
+                .is_some_and(|&(rs, re)| {
+                    let cp = interval.call_crossings[0];
+                    cp > rs && cp < re
+                });
+        if split_ok {
+            let cp = interval.call_crossings[0];
+            let pre_end = cp.saturating_sub(1);
+            // Pre-half register: a caller-saved free reg clear of fixed
+            // references over [start, call-1] (occ already records the
+            // call's arg-setup writes, so a clobbered candidate is
+            // rejected — the bridge store would otherwise capture garbage).
+            let pre_pick = free.iter().position(|&r| {
+                !is_callee_saved(r) && phys_free_over(&occ, r, interval.start, pre_end)
+            });
+            if let Some(pi) = pre_pick {
+                let pre_phys = free.remove(pi);
+                let (sz, al) = spill_slot_size(interval.class);
+                let bridge_slot = f.alloc_frame_slot(sz, al);
+                let synthetic = f.new_vreg(interval.class).id;
+                assignments.insert(interval.vreg, pre_phys);
+                // Pre-half ends before the call; the active list reflects
+                // that so the register frees for post-call intervals.
+                let (active, _) = if is_fp {
+                    (&mut active_fp, &mut free_fp)
+                } else {
+                    (&mut active_gp, &mut free_gp)
+                };
+                active.push((pre_phys, pre_end, interval.vreg));
+                active.sort_by_key(|&(_, end, _)| end);
+                splits_in_progress.insert(synthetic, (interval.vreg, cp, bridge_slot));
+                let post_half = LiveInterval {
+                    vreg: synthetic,
+                    class: interval.class,
+                    start: cp.saturating_add(1),
+                    end: interval.end,
+                    crosses_call: false,
+                    call_crossings: Vec::new(),
+                    hint: None,
+                };
+                let key = (post_half.start, post_half.vreg.0);
+                let mut insert_at = idx + 1;
+                while insert_at < worklist.len() {
+                    let w = &worklist[insert_at];
+                    if (w.start, w.vreg.0) > key {
+                        break;
+                    }
+                    insert_at += 1;
+                }
+                worklist.insert(insert_at, post_half);
+                idx += 1;
+                continue;
+            }
+        }
+
+        // Evict the active interval that ends furthest among those whose
+        // register is fixed-free over our range; take it if it outlives
+        // us, otherwise spill ourselves.
+        let (active, _) = if is_fp {
+            (&mut active_fp, &mut free_fp)
+        } else {
+            (&mut active_gp, &mut free_gp)
+        };
         let victim = active
             .iter()
             .enumerate()
             .filter(|(_, &(reg, _, _))| phys_free_over(&occ, reg, interval.start, interval.end))
             .max_by_key(|(_, &(_, end, _))| end)
-            .map(|(idx, &entry)| (idx, entry));
+            .map(|(vi, &entry)| (vi, entry));
 
         if let Some((vidx, (spill_reg, spill_end, victim_vreg))) = victim {
             if spill_end > interval.end {
@@ -339,6 +506,7 @@ pub fn linear_scan(f: &mut X86Function) -> AllocResult {
                 if is_callee_saved(spill_reg) {
                     callee_saved_used.insert(spill_reg);
                 }
+                idx += 1;
                 continue;
             }
         }
@@ -346,7 +514,34 @@ pub fn linear_scan(f: &mut X86Function) -> AllocResult {
         let (sz, al) = spill_slot_size(interval.class);
         let slot = f.alloc_frame_slot(sz, al);
         spills.insert(interval.vreg, slot);
+        idx += 1;
     }
+
+    // Materialize split records from the in-progress map.
+    let mut split_records: Vec<SplitRecord> = splits_in_progress
+        .into_iter()
+        .filter_map(|(synthetic, (orig, call_position, bridge_slot))| {
+            let pre_phys = *assignments.get(&orig)?;
+            let post = if let Some(&p) = assignments.get(&synthetic) {
+                PostHalf::Allocated(p)
+            } else if spills.contains_key(&synthetic) {
+                PostHalf::Spilled
+            } else {
+                return None;
+            };
+            assignments.remove(&synthetic);
+            spills.remove(&synthetic);
+            Some(SplitRecord {
+                vreg: orig,
+                class: vreg_class.get(&orig).copied().unwrap_or(X86RegClass::Gp64),
+                call_position,
+                pre_phys,
+                post,
+                bridge_slot,
+            })
+        })
+        .collect();
+    split_records.sort_by_key(|r| (r.vreg.0, r.call_position));
 
     let mut callee_saved: Vec<X86Reg> = callee_saved_used.into_iter().collect();
     callee_saved.sort_by_key(reg_sort_key);
@@ -355,6 +550,7 @@ pub fn linear_scan(f: &mut X86Function) -> AllocResult {
         assignments,
         spills,
         callee_saved_used: callee_saved,
+        split_records,
         liveness,
     }
 }
@@ -405,7 +601,22 @@ pub fn apply_allocation(f: &mut X86Function, result: &AllocResult) {
                 .unwrap_or_else(|| panic!("frame slot {} has no layout", slot)),
         }
     };
-    let resolve = |v: &X86VReg| -> Resolved {
+    // Position-aware resolution: a split vreg reads its pre-half
+    // register at positions up to the call and its post-half location
+    // (register or the bridge slot) after it.
+    let resolve = |v: &X86VReg, cur_pos: u32| -> Resolved {
+        for r in &result.split_records {
+            if r.vreg != v.id {
+                continue;
+            }
+            if cur_pos > r.call_position {
+                return match r.post {
+                    PostHalf::Allocated(p) => Resolved::Reg(p),
+                    PostHalf::Spilled => Resolved::Slot(r.bridge_slot),
+                };
+            }
+            return Resolved::Reg(r.pre_phys);
+        }
         if let Some(&phys) = result.assignments.get(&v.id) {
             Resolved::Reg(phys)
         } else if let Some(&slot) = result.spills.get(&v.id) {
@@ -416,10 +627,41 @@ pub fn apply_allocation(f: &mut X86Function, result: &AllocResult) {
         }
     };
 
+    // Position counter matching liveness/occupancy (step 2, blocks in
+    // order) so split bridges land at the right call and the
+    // position-aware resolve picks pre/post halves correctly. Tracks the
+    // ORIGINAL instruction stream — inserted spill/bridge moves don't
+    // advance it.
+    let mut cur_pos: u32 = 0;
     for block_idx in 0..f.blocks.len() {
         let insts = std::mem::take(&mut f.blocks[block_idx].insts);
         let mut out = Vec::with_capacity(insts.len() * 2);
         for mut inst in insts {
+            // Bridge a split call: store each pre-half register to its
+            // bridge slot just before the call (occ guaranteed the
+            // pre_phys survives the arg setup); the post-half load
+            // follows the call below.
+            let bridge_here: Vec<SplitRecord> = if matches!(
+                inst.opcode,
+                X86Opcode::Call | X86Opcode::CallReg
+            ) {
+                result
+                    .split_records
+                    .iter()
+                    .filter(|r| r.call_position == cur_pos)
+                    .cloned()
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            for r in &bridge_here {
+                out.push(store(
+                    r.pre_phys,
+                    r.class,
+                    mem_for_slot(r.bridge_slot),
+                    OpSize::Q,
+                ));
+            }
             let mut gp_used = 0usize;
             let mut fp_used = 0usize;
             // At most two spilled operands per class fit the 2 scratch
@@ -462,7 +704,7 @@ pub fn apply_allocation(f: &mut X86Function, result: &AllocResult) {
                     X86Operand::VReg(v) => v,
                     _ => unreachable!(),
                 };
-                match resolve(&v) {
+                match resolve(&v, cur_pos) {
                     Resolved::Reg(phys) => {
                         inst.operands[0] = X86Operand::Reg(phys);
                         inst.def = Some(X86Operand::Reg(phys));
@@ -486,7 +728,7 @@ pub fn apply_allocation(f: &mut X86Function, result: &AllocResult) {
                 match op {
                     X86Operand::VReg(v) => {
                         let is_addr = Some(i) == addr_position;
-                        match resolve(v) {
+                        match resolve(v, cur_pos) {
                             Resolved::Reg(phys) => {
                                 *op = if is_addr {
                                     X86Operand::Mem {
@@ -536,7 +778,7 @@ pub fn apply_allocation(f: &mut X86Function, result: &AllocResult) {
                         X86Opcode::Movss | X86Opcode::Movsd | X86Opcode::Movups
                     ) && v.class != X86RegClass::Xmm
                         && v.class != X86RegClass::Xmm128;
-                    match resolve(&v) {
+                    match resolve(&v, cur_pos) {
                         Resolved::Reg(phys) => {
                             inst.def = Some(if is_fp_store_addr {
                                 X86Operand::Mem {
@@ -585,6 +827,21 @@ pub fn apply_allocation(f: &mut X86Function, result: &AllocResult) {
                 };
                 out.push(store(scratch, class, mem_for_slot(slot), store_size));
             }
+            // Post-call bridge load: reload the post-half register from
+            // the bridge slot after the call clobbers caller-saved regs.
+            // A spilled post-half stays in the slot — later uses resolve
+            // to Resolved::Slot and load on demand, so nothing to emit.
+            for r in &bridge_here {
+                if let PostHalf::Allocated(post_phys) = r.post {
+                    out.push(load(
+                        post_phys,
+                        r.class,
+                        mem_for_slot(r.bridge_slot),
+                        OpSize::Q,
+                    ));
+                }
+            }
+            cur_pos += 2;
         }
         f.blocks[block_idx].insts = out;
     }
