@@ -263,3 +263,22 @@ Found during l04 (2026-06-12):
   but armfortas has none for any intrinsic subroutine. Adding one only
   for SPLIT/TOKENIZE would be inconsistent. Owner: a dedicated
   intrinsic-signature-checking pass (same owner as the arity gap).
+
+- **TOKENIZE deferred from l04** (2026-06-12): SPLIT shipped; TOKENIZE
+  (both forms) is split out as its own focused piece because it writes
+  into caller-allocated arrays — the use-after-free risk class the
+  string-descriptor design exists to guard. Implementation approach
+  scouted:
+  - Form 2, `CALL TOKENIZE(STRING, SET, FIRST, LAST)`: FIRST/LAST are
+    allocatable integer arrays. Get each descriptor via
+    array_descriptor_addr (see move_alloc_target precedent in
+    intrinsic_sub.rs), allocate with afs_allocate_1d(desc, elem_size,
+    ntokens), fill 1-based start/end positions. Subtlety: read the
+    element kind (4 vs 8) from the local/descriptor, don't assume i32.
+  - Form 1, `CALL TOKENIZE(STRING, SET, TOKENS [, SEPARATOR])`: TOKENS
+    is an allocatable deferred-length character array — each element a
+    string. Must route per-element storage through the
+    afs_assign_char_deferred path, never raw malloc, to keep the
+    allocate-before-free invariant. This is the hard part and why it's
+    deferred rather than rushed.
+  Owner: l04 follow-up (l04a) or fold into l05's I/O/runtime work.
