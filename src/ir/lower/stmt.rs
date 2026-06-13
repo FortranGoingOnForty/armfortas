@@ -6593,13 +6593,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         }
                     }
                 }
-                let (ptr, len) = lower_string_expr_with_layouts(
-                    b,
-                    &ctx.locals,
-                    value,
-                    ctx.st,
-                    Some(ctx.type_layouts),
-                );
+                let (ptr, len) = lower_string_expr_ctx(b, ctx, value);
                 store_string_descriptor_view(b, tgt_desc, ptr, len);
                 return;
             }

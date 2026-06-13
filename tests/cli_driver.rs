@@ -29297,6 +29297,49 @@ fn deferred_character_pointer_function_result_compiles_and_runs() {
 }
 
 #[test]
+fn deferred_character_pointer_result_from_class_component_preserves_descriptor() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=deferred_character_pointer_result_from_class_component_preserves_descriptor count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type, abstract :: generic_value\n  end type\n  type, extends(generic_value) :: string_value\n    character(:), allocatable :: raw\n  end type\n  type :: keyval_t\n    class(generic_value), allocatable :: val\n  contains\n    procedure :: set_string\n    procedure :: get_string\n  end type\ncontains\n  subroutine set_string(self, text)\n    class(keyval_t), intent(inout) :: self\n    character(*), intent(in) :: text\n    type(string_value), allocatable :: tmp\n    allocate(tmp)\n    tmp%raw = text\n    call move_alloc(tmp, self%val)\n  end subroutine\n  subroutine get_string(self, text)\n    class(keyval_t), intent(in) :: self\n    character(:), allocatable, intent(out) :: text\n    character(:), pointer :: ptr\n    ptr => cast_string(self%val)\n    if (.not. associated(ptr)) error stop 1\n    text = ptr\n  end subroutine\n  function cast_string(val) result(ptr)\n    class(generic_value), intent(in), target :: val\n    character(:), pointer :: ptr\n    nullify(ptr)\n    select type (val)\n    type is (string_value)\n      ptr => val%raw\n    end select\n  end function\nend module\n\nprogram p\n  use m\n  implicit none\n  type(keyval_t) :: kv\n  character(:), allocatable :: text\n  call kv%set_string('value')\n  call kv%get_string(text)\n  if (.not. allocated(text)) error stop 2\n  if (text /= 'value') error stop 3\n  print *, len(text), text\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("deferred_char_ptr_class_component", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("deferred char pointer class component compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "deferred char pointer class component should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "deferred char pointer class component should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("value"),
+        "unexpected deferred char pointer class component output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn allocatable_result_helper_assignment_uses_resolved_symbol() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
