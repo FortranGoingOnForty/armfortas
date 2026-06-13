@@ -286,15 +286,11 @@ pub fn linear_scan(f: &mut X86Function) -> AllocResult {
 
         // First free register (pool preference order) with no fixed
         // reference across [start,end]. A hint, when set, jumps the
-        // queue if it also passes.
-        let hinted: Option<X86Reg> = interval.hint.and_then(|h| {
-            FP_ALLOC_ORDER
-                .iter()
-                .chain(GP_ALLOC_ORDER.iter())
-                .copied()
-                .nth(h as usize)
-        });
-        let free_idx = hinted
+        // queue if it is free and also passes — that places the vreg in
+        // the register isel moves it to/from, so coalescing drops the
+        // move.
+        let free_idx = interval
+            .hint
             .and_then(|hr| {
                 free.iter()
                     .position(|&r| r == hr)
@@ -623,6 +619,32 @@ pub fn apply_allocation(f: &mut X86Function, result: &AllocResult) {
         for (k, s) in saves.into_iter().enumerate() {
             head.insert(k, s);
         }
+    }
+
+    coalesce_self_moves(f);
+}
+
+/// Drop register-to-register moves that became `mov P, P` after
+/// allocation — the payoff of hinting a vreg toward the register isel
+/// moves it to/from. A self-move preserves the value of P for any width
+/// (a narrower `movl %eax,%eax` also zero-extends, but a 32-bit vreg's
+/// upper bits are never observed without an explicit widen), so the
+/// drop is value-preserving. Gated by the full matrix + the class_star
+/// valgrind check (the X64-O1-002 zero-extension reproducer).
+fn coalesce_self_moves(f: &mut X86Function) {
+    for block in &mut f.blocks {
+        block.insts.retain(|inst| {
+            if !matches!(
+                inst.opcode,
+                X86Opcode::MovRR | X86Opcode::Movss | X86Opcode::Movsd | X86Opcode::Movaps
+            ) {
+                return true;
+            }
+            !matches!(
+                (&inst.def, inst.operands.first()),
+                (Some(X86Operand::Reg(d)), Some(X86Operand::Reg(s))) if d == s
+            )
+        });
     }
 }
 
