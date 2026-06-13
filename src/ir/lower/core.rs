@@ -11355,6 +11355,9 @@ pub(super) fn generic_candidate_matches_slots_with_proc_elemental(
             Some(Some(arg_val)) => {
                 let actual_is_proc = actual_is_procedure.get(idx).copied().unwrap_or(false);
                 if actual_is_proc {
+                    if !declared_arg_accepts_procedure_actual(decl_sym) {
+                        return false;
+                    }
                     continue;
                 }
                 let Some(ti) = decl_sym.type_info.as_ref() else {
@@ -11376,6 +11379,44 @@ pub(super) fn generic_candidate_matches_slots_with_proc_elemental(
     }
 
     true
+}
+
+fn declared_arg_accepts_procedure_actual(sym: &crate::sema::symtab::Symbol) -> bool {
+    matches!(
+        sym.kind,
+        crate::sema::symtab::SymbolKind::Function
+            | crate::sema::symtab::SymbolKind::Subroutine
+            | crate::sema::symtab::SymbolKind::ExternalProc
+            | crate::sema::symtab::SymbolKind::ProcedurePointer
+    ) || sym.attrs.external
+}
+
+fn actual_arg_is_procedure_reference(
+    arg: &crate::ast::expr::Argument,
+    locals: Option<&HashMap<String, LocalInfo>>,
+    st: &SymbolTable,
+) -> bool {
+    let crate::ast::expr::SectionSubscript::Element(expr) = &arg.value else {
+        return false;
+    };
+    let Expr::Name { name } = &expr.node else {
+        return false;
+    };
+    let key = name.to_lowercase();
+    if locals.is_some_and(|l| l.contains_key(&key)) {
+        return false;
+    }
+    st.lookup(&key)
+        .or_else(|| st.find_symbol_any_scope(&key))
+        .map(|sym| {
+            matches!(
+                sym.kind,
+                crate::sema::symtab::SymbolKind::Function
+                    | crate::sema::symtab::SymbolKind::Subroutine
+                    | crate::sema::symtab::SymbolKind::ProcedurePointer
+            ) || sym.attrs.external
+        })
+        .unwrap_or(false)
 }
 
 pub(super) fn reorder_actual_bool_slots_by_formal_skip(
@@ -12544,6 +12585,10 @@ pub(super) fn resolve_bound_proc_actuals<'a>(
             _ => None,
         })
         .collect();
+    let actual_is_procedure: Vec<bool> = args
+        .iter()
+        .map(|arg| actual_arg_is_procedure_reference(arg, Some(locals), st))
+        .collect();
 
     // Pass 1: collect every candidate whose type + IR-shape match —
     // exactly the set the original first-match-wins loop would accept.
@@ -12567,6 +12612,12 @@ pub(super) fn resolve_bound_proc_actuals<'a>(
         ) else {
             continue;
         };
+        let actual_is_procedure_slots = reorder_actual_bool_slots_by_formal_skip(
+            args,
+            &actual_is_procedure,
+            &scope.arg_order,
+            formal_skip,
+        );
         let supplied = arg_slots
             .iter()
             .enumerate()
@@ -12579,6 +12630,9 @@ pub(super) fn resolve_bound_proc_actuals<'a>(
             .all(
                 |(idx, declared_arg)| match declared_arg.type_info.as_ref() {
                     Some(declared_type) => {
+                        if actual_is_procedure_slots.get(idx).copied().unwrap_or(false) {
+                            return declared_arg_accepts_procedure_actual(declared_arg);
+                        }
                         let actual = semantic_slots.get(idx).and_then(|slot| slot.as_ref());
                         if matches!(
                             declared_type,
@@ -12593,12 +12647,13 @@ pub(super) fn resolve_bound_proc_actuals<'a>(
                     None => true,
                 },
             );
-        let ir_match = generic_candidate_matches_slots_with_formal_skip(
+        let ir_match = generic_candidate_matches_slots_with_proc(
             b,
             &declared_args,
             &arg_slots,
             supplied,
             formal_skip,
+            &actual_is_procedure_slots,
         );
         if semantic_match && ir_match {
             matched.push(bp);
