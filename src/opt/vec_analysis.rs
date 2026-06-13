@@ -654,6 +654,39 @@ pub(crate) fn classify_body_op(
                 InstKind::ICmp(op, a, b) | InstKind::FCmp(op, a, b) => (op, a, b),
                 _ => return None,
             };
+            // Integer abs idiom: ABS lowers (intrinsic.rs) to
+            // `select(icmp(Ge, x, 0), x, ineg(x))`. Fold it to a unary
+            // abs so the backend emits the dedicated synthesis (x86
+            // sign-mask xor-sub; arm64 `abs.4s`) rather than scalarizing.
+            // i32 only: the x86 sign mask needs a 32-bit compare (i64
+            // would want pcmpgtq, SSE4.2). The symmetric
+            // `select(icmp(Le, x, 0), ineg(x), x)` is matched too.
+            if matches!(dest.elem_ty, IrType::Int(IntWidth::I32))
+                && resolve_const_int(func, cmp_b) == Some(0)
+            {
+                let neg_of = |arm: ValueId| -> Option<ValueId> {
+                    match defs.get(&arm)?.kind {
+                        InstKind::INeg(n) => Some(n),
+                        _ => None,
+                    }
+                };
+                let abs_src = match cmp_op {
+                    CmpOp::Ge | CmpOp::Gt if cmp_a == *t && neg_of(*f) == Some(*t) => Some(*t),
+                    CmpOp::Le | CmpOp::Lt if cmp_a == *f && neg_of(*t) == Some(*f) => Some(*f),
+                    _ => None,
+                };
+                if let Some(src) = abs_src {
+                    return unary_body(
+                        stored_value,
+                        UnaryKind::Abs,
+                        src,
+                        func,
+                        shape,
+                        dest,
+                        loop_defs,
+                    );
+                }
+            }
             // The select's arms must be exactly the cmp's operands in
             // some order so the result is `max` or `min` of them.
             let bk = if cmp_a == *t && cmp_b == *f {

@@ -1003,6 +1003,9 @@ fn select_inst(
                         Some(X86Operand::VReg(dest)),
                     );
                 }
+                // Signed i32 has no native packed abs at SSE2 (pabsd is
+                // SSSE3) — synthesize sign-mask xor-sub (x10c-2).
+                IrType::Int(IntWidth::I32) => emit_packed_iabs(mf, mb, va, dest),
                 other => panic!("x10: packed abs on {:?} should not reach isel", other),
             }
         }
@@ -3080,6 +3083,38 @@ fn emit_packed_iminmax(
         push(mf, X86Opcode::Pandn, mask, vb, drop); // a<=b -> b
     }
     push(mf, X86Opcode::Por, keep, drop, dest);
+}
+
+/// Packed signed i32 abs synthesis for SSE2 (no `pabsd` until SSSE3).
+/// The sign mask + xor-sub idiom gfortran and LLVM emit at the SSE2
+/// baseline: `mask = (0 > x)` (all-ones where x is negative), then
+/// `(x ^ mask) - mask`. For x<0 mask=-1 so it yields `~x - (-1) = -x`;
+/// for x>=0 mask=0 so it yields `x`. `pcmpgtd` is a signed compare, so
+/// the mask is the arithmetic sign mask (the `psrad $31` LLVM uses, which
+/// we lack as a packed opcode). Zero comes from rodata, not a self-xor,
+/// to avoid a read-before-def of an undefined vreg.
+fn emit_packed_iabs(mf: &mut X86Function, mb: MBlockId, vx: X86VReg, dest: X86VReg) {
+    let push = |mf: &mut X86Function, opc, l: X86VReg, r: X86VReg, d: X86VReg| {
+        mf.block_mut(mb).insts.push(X86Inst {
+            opcode: opc,
+            size: OpSize::Q,
+            operands: vec![X86Operand::VReg(l), X86Operand::VReg(r)],
+            def: Some(X86Operand::VReg(d)),
+        });
+    };
+    let zero_label = mf.add_rodata_bytes(&[0u8; 16]);
+    let zero = mf.new_vreg(X86RegClass::Xmm128);
+    mf.block_mut(mb).insts.push(X86Inst {
+        opcode: X86Opcode::Movups,
+        size: OpSize::Q,
+        operands: vec![X86Operand::RipLabel(zero_label)],
+        def: Some(X86Operand::VReg(zero)),
+    });
+    let mask = mf.new_vreg(X86RegClass::Xmm128);
+    push(mf, X86Opcode::Pcmpgtd, zero, vx, mask); // mask = 0 > x  (x < 0)
+    let xored = mf.new_vreg(X86RegClass::Xmm128);
+    push(mf, X86Opcode::Pxor, vx, mask, xored); // x ^ mask
+    push(mf, X86Opcode::Psubd, xored, mask, dest); // (x ^ mask) - mask
 }
 
 /// One step of a packed across-lane reduction tree: either a single

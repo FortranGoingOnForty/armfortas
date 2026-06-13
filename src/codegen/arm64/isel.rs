@@ -1814,9 +1814,11 @@ fn select_inst(
         InstKind::VAbs(a) => emit_vunop(mf, ctx, mb, inst, *a, |s| match s {
             VShape::F4S => ArmOpcode::FabsV4S,
             VShape::F2D => ArmOpcode::FabsV2D,
-            // NEON `abs` exists for integer too but the four-shape
-            // alias isn't generated yet; placeholder.
-            VShape::V4S | VShape::V2D => ArmOpcode::Nop,
+            // Signed integer NEON abs (x10c-2). Replaces the former
+            // no-op placeholder: folding integer abs to VAbs now feeds
+            // this path, and a Nop would silently miscompile.
+            VShape::V4S => ArmOpcode::AbsV4S,
+            VShape::V2D => ArmOpcode::AbsV2D,
         }),
         InstKind::VSqrt(a) => emit_vunop(mf, ctx, mb, inst, *a, |s| match s {
             VShape::F4S => ArmOpcode::FsqrtV4S,

@@ -192,9 +192,18 @@ fn apply_vector_plan(func: &mut Function, shape: &CountedLoop, plan: VectorPlan)
         if let BodyOp::Unary {
             unary_id,
             kind: unary_kind,
-            ..
+            source,
         } = &stmt.op
         {
+            // Integer abs folds from a `select(icmp, x, ineg(x))`, so its
+            // unary_id is the Select, not an FAbs/INeg — take the abs
+            // source from the classified operand (the load, already
+            // rewritten to a VLoad above). The dead cmp/ineg/const left
+            // behind are DCE'd, same as the min/max select's dead cmp.
+            let src_load = match source {
+                BinopOperand::ArrayLoad(id) => Some(*id),
+                BinopOperand::InvariantScalar(_) => None,
+            };
             let body_block = func.block_mut(shape.body);
             if let Some(inst) = body_block.insts.iter_mut().find(|i| i.id == *unary_id) {
                 let new_kind = match (inst.kind.clone(), unary_kind) {
@@ -203,6 +212,9 @@ fn apply_vector_plan(func: &mut Function, shape: &CountedLoop, plan: VectorPlan)
                     }
                     (InstKind::FAbs(s), UnaryKind::Abs) => InstKind::VAbs(s),
                     (InstKind::FSqrt(s), UnaryKind::Sqrt) => InstKind::VSqrt(s),
+                    (InstKind::Select(..), UnaryKind::Abs) => {
+                        InstKind::VAbs(src_load.expect("integer abs source must be an array load"))
+                    }
                     _ => inst.kind.clone(),
                 };
                 inst.kind = new_kind;
