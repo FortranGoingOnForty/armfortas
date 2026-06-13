@@ -215,6 +215,15 @@ fn register_iso_fortran_env(st: &mut SymbolTable) {
     insert_param_val(st, m, "real32", ik4.clone(), Some(4));
     insert_param_val(st, m, "real64", ik4.clone(), Some(8));
     insert_param_val(st, m, "real128", ik4.clone(), Some(16));
+    // F2023 16.10.2: logical kind constants (kind = bit width / 8) and
+    // the 16-bit real constant. armfortas has no 16-bit real, so
+    // REAL16 takes the standard's -2 sentinel ("no kind of this size,
+    // but a larger size exists"; 16.10.2.27) since real32/64 exist.
+    insert_param_val(st, m, "logical8", ik4.clone(), Some(1));
+    insert_param_val(st, m, "logical16", ik4.clone(), Some(2));
+    insert_param_val(st, m, "logical32", ik4.clone(), Some(4));
+    insert_param_val(st, m, "logical64", ik4.clone(), Some(8));
+    insert_param_val(st, m, "real16", ik4.clone(), Some(-2));
     insert_param_val(st, m, "character_kinds", ik4.clone(), Some(1));
     insert_param_val(st, m, "integer_kinds", ik4.clone(), Some(4));
     insert_param_val(st, m, "logical_kinds", ik4.clone(), Some(4));

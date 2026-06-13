@@ -2316,6 +2316,9 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
                 if name.eq_ignore_ascii_case("move_alloc") {
                     ctx.require_std(stmt.span, FortranStandard::F2003, "MOVE_ALLOC");
                 }
+                if name.eq_ignore_ascii_case("system_clock") && ctx.lookup(name).is_none() {
+                    validate_system_clock_args(ctx, args, stmt.span);
+                }
             }
             if ctx.in_pure {
                 validate_pure_call(ctx, callee, stmt.span);
@@ -2557,6 +2560,59 @@ fn uses_internal_character_file(ctx: &Ctx, controls: &[IoControl]) -> bool {
             }],
         ),
         _ => expr_type(&unit.value, ctx.st).is_character(),
+    }
+}
+
+/// F2023 16.9.202 SYSTEM_CLOCK argument restrictions: every integer
+/// argument must have a kind no smaller than the default integer kind,
+/// and all integer arguments must have the same kind. COUNT_RATE may
+/// be real (exempt from both rules). Only enforced when SYSTEM_CLOCK
+/// resolves to the intrinsic (a user procedure of the same name is
+/// exempt). Gated by --std=f2023 — these are conformance diagnostics,
+/// silent under f2018.
+fn validate_system_clock_args(ctx: &mut Ctx, args: &[crate::ast::expr::Argument], span: Span) {
+    use crate::sema::types::FortranType;
+    if ctx.std.is_none_or(|s| s < FortranStandard::F2023) {
+        return;
+    }
+    const FORMALS: [&str; 3] = ["count", "count_rate", "count_max"];
+    let mut int_kinds: Vec<u8> = Vec::new();
+    let mut positional = 0usize;
+    for arg in args {
+        let formal = match arg.keyword.as_deref() {
+            Some(kw) => kw.to_ascii_lowercase(),
+            None => {
+                let f = FORMALS.get(positional).map(|s| s.to_string());
+                positional += 1;
+                match f {
+                    Some(f) => f,
+                    None => continue,
+                }
+            }
+        };
+        let crate::ast::expr::SectionSubscript::Element(e) = &arg.value else {
+            continue;
+        };
+        if let FortranType::Integer { kind } = conditional_operand_type(ctx, e) {
+            if kind < 4 {
+                ctx.error(
+                    e.span,
+                    format!(
+                        "SYSTEM_CLOCK argument '{}' has integer kind {} smaller than the \
+                         default integer kind (F2023 16.9.202)",
+                        formal, kind
+                    ),
+                );
+            } else {
+                int_kinds.push(kind);
+            }
+        }
+    }
+    if int_kinds.len() >= 2 && int_kinds.iter().any(|k| *k != int_kinds[0]) {
+        ctx.error(
+            span,
+            "SYSTEM_CLOCK integer arguments must all have the same kind (F2023 16.9.202)",
+        );
     }
 }
 
