@@ -13775,6 +13775,51 @@ fn module_character_star_parameter_with_achar_and_repeat_defaults_initializes_ru
 }
 
 #[test]
+fn character_star_parameter_achar_kind_keyword_initializes_byte() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=character_star_parameter_achar_kind_keyword_initializes_byte count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  integer, parameter :: ck = selected_char_kind('DEFAULT')\n  character(kind=ck,len=*), parameter :: newline = achar(10, kind=ck)\n  character(kind=ck,len=*), parameter :: root = achar(36, kind=ck)\ncontains\n  subroutine check()\n    character(kind=ck,len=:), allocatable :: s\n    if (ck /= 1) error stop 1\n    if (len(newline) /= 1) error stop 2\n    if (iachar(newline) /= 10) error stop 3\n    if (iachar(root) /= 36) error stop 4\n    s = 'a' // newline // 'b'\n    if (len(s) /= 3) error stop 5\n    if (iachar(s(2:2)) /= 10) error stop 6\n    print *, 'ok'\n  end subroutine check\nend module m\nprogram p\n  use m, only: check\n  implicit none\n  call check()\nend program p\n",
+        "achar_kind_keyword_param.f90",
+    );
+    let out = unique_path("achar_kind_keyword_param", "bin");
+
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("achar kind keyword parameter compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "achar kind keyword parameter compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("achar kind keyword parameter run failed");
+    assert!(
+        run.status.success(),
+        "achar kind keyword parameter run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected achar kind keyword parameter output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn polymorphic_name_bound_calls_dispatch_for_visitor_and_destroy() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

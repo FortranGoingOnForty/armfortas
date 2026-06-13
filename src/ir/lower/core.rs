@@ -5020,10 +5020,28 @@ pub(super) fn eval_const_char_bytes(
             if intrinsic != "char" && intrinsic != "achar" {
                 return None;
             }
-            if args.len() != 1 || args[0].keyword.is_some() {
-                return None;
+
+            let mut code_arg = None;
+            for (i, arg) in args.iter().enumerate() {
+                match arg.keyword.as_deref().map(str::to_ascii_lowercase) {
+                    Some(keyword) if keyword == "kind" => continue,
+                    Some(keyword) if keyword == "i" && code_arg.is_none() => {
+                        let crate::ast::expr::SectionSubscript::Element(expr) = &arg.value else {
+                            return None;
+                        };
+                        code_arg = Some(expr);
+                    }
+                    None if i == 0 && code_arg.is_none() => {
+                        let crate::ast::expr::SectionSubscript::Element(expr) = &arg.value else {
+                            return None;
+                        };
+                        code_arg = Some(expr);
+                    }
+                    None if i == 1 => continue,
+                    _ => return None,
+                }
             }
-            let crate::ast::expr::SectionSubscript::Element(arg_expr) = &args[0].value else {
+            let Some(arg_expr) = code_arg else {
                 return None;
             };
             let code = eval_const_char_int_expr(arg_expr, param_consts, param_chars)?;
