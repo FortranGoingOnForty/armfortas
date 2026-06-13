@@ -1291,6 +1291,111 @@ pub(super) fn smp_parent_interface_scope(
     })
 }
 
+/// Rewrite `TYPEOF(entity)` / `CLASSOF(entity)` declaration specs to
+/// the concrete specs resolution recorded on the declared symbols,
+/// recursing through CONTAINS. Runs once in the driver before
+/// lowering: every lowering pre-pass (descriptor params, class-dummy
+/// detection, result ABI, derived storage) keys on the syntactic
+/// TypeSpec, so an unresolved TypeOf silently took the unknown-type
+/// fallbacks — a TYPEOF(point) local dropped its component stores and
+/// a CLASSOF dummy missed the caller-side class descriptor.
+pub fn normalize_typeof_specs(units: &mut [crate::ast::Spanned<ProgramUnit>], st: &SymbolTable) {
+    for unit in units {
+        normalize_typeof_specs_in_unit(&mut unit.node, st);
+    }
+}
+
+fn normalize_typeof_specs_in_unit(unit: &mut ProgramUnit, st: &SymbolTable) {
+    use crate::sema::symtab::ScopeKind;
+    let (scope_id, decls, contains) = match unit {
+        ProgramUnit::Program {
+            name,
+            decls,
+            contains,
+            ..
+        } => {
+            let target = name.clone();
+            let sid = st
+                .all_scopes()
+                .iter()
+                .find(|s| match (&s.kind, target.as_deref()) {
+                    (ScopeKind::Program(n), Some(t)) => n.eq_ignore_ascii_case(t),
+                    (ScopeKind::Program(_), None) => true,
+                    _ => false,
+                })
+                .map(|s| s.id);
+            (sid, decls, contains)
+        }
+        ProgramUnit::Function {
+            name,
+            decls,
+            contains,
+            ..
+        }
+        | ProgramUnit::Subroutine {
+            name,
+            decls,
+            contains,
+            ..
+        } => (
+            procedure_scope_by_name(st, name).map(|s| s.id),
+            decls,
+            contains,
+        ),
+        ProgramUnit::Module {
+            name,
+            decls,
+            contains,
+            ..
+        }
+        | ProgramUnit::Submodule {
+            name,
+            decls,
+            contains,
+            ..
+        } => (st.find_module_scope(name), decls, contains),
+        _ => return,
+    };
+    rewrite_typeof_decls(decls, st, scope_id);
+    for contained in contains {
+        normalize_typeof_specs_in_unit(&mut contained.node, st);
+    }
+}
+
+fn rewrite_typeof_decls(
+    decls: &mut [crate::ast::decl::SpannedDecl],
+    st: &SymbolTable,
+    scope_id: Option<crate::sema::symtab::ScopeId>,
+) {
+    use crate::ast::decl::TypeSpec;
+    for d in decls {
+        let Decl::TypeDecl {
+            type_spec,
+            entities,
+            ..
+        } = &mut d.node
+        else {
+            continue;
+        };
+        if !matches!(type_spec, TypeSpec::TypeOf(_) | TypeSpec::ClassOf(_)) {
+            continue;
+        }
+        // The declared entity's own symbol carries the type that
+        // resolution computed for the TYPEOF/CLASSOF spec.
+        let Some(entity) = entities.first() else {
+            continue;
+        };
+        let key = entity.name.to_lowercase();
+        let ti = scope_id
+            .and_then(|sid| st.lookup_in(sid, &key))
+            .or_else(|| st.find_symbol_any_scope(&key))
+            .and_then(|sym| sym.type_info.clone());
+        if let Some(ti) = ti {
+            *type_spec = type_info_to_type_spec(Some(&ti));
+        }
+    }
+}
+
 /// Sprint35-SMP Phase 2: convert a sema TypeInfo back to an AST TypeSpec
 /// so the synthesizer can build a Decl::TypeDecl that matches what the
 /// parser would have produced from the original interface body. Kind
