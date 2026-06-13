@@ -5045,6 +5045,87 @@ pub(super) fn eval_const_char_bytes(
     }
 }
 
+fn eval_const_char_expr_len(
+    e: &crate::ast::expr::SpannedExpr,
+    param_consts: &HashMap<String, ConstScalar>,
+    param_chars: &HashMap<String, Vec<u8>>,
+    st: &SymbolTable,
+) -> Option<i64> {
+    match &e.node {
+        Expr::StringLiteral { value, .. } => Some(value.len() as i64),
+        Expr::Name { name } => param_chars
+            .get(&name.to_lowercase())
+            .and_then(|bytes| i64::try_from(bytes.len()).ok())
+            .or_else(|| {
+                st.find_symbol_any_scope(&name.to_lowercase())
+                    .and_then(|sym| match sym.type_info.as_ref() {
+                        Some(crate::sema::symtab::TypeInfo::Character {
+                            len: Some(len), ..
+                        }) => Some(*len),
+                        _ => None,
+                    })
+            }),
+        Expr::ComponentAccess { base, component } => {
+            let Expr::Name { name } = &base.node else {
+                return None;
+            };
+            let key = crate::sema::type_layout::derived_param_field_lookup_key(name, component);
+            param_chars
+                .get(&key)
+                .and_then(|bytes| i64::try_from(bytes.len()).ok())
+        }
+        Expr::ParenExpr { inner } => eval_const_char_expr_len(inner, param_consts, param_chars, st),
+        Expr::BinaryOp {
+            op: BinaryOp::Concat,
+            left,
+            right,
+        } => {
+            let left_len = eval_const_char_expr_len(left, param_consts, param_chars, st)?;
+            let right_len = eval_const_char_expr_len(right, param_consts, param_chars, st)?;
+            left_len.checked_add(right_len)
+        }
+        Expr::FunctionCall { callee, args } => {
+            if args.len() == 1 && args[0].keyword.is_none() {
+                if let Some(base_len) =
+                    eval_const_char_expr_len(callee, param_consts, param_chars, st)
+                {
+                    return eval_const_char_substring_len(base_len, &args[0].value, param_consts);
+                }
+            }
+            let Expr::Name { name } = &callee.node else {
+                return None;
+            };
+            let intrinsic = name.to_lowercase();
+            match intrinsic.as_str() {
+                "char" | "achar" | "new_line" => Some(1),
+                "repeat" if args.len() >= 2 => {
+                    if args[0].keyword.is_some() || args[1].keyword.is_some() {
+                        return None;
+                    }
+                    let crate::ast::expr::SectionSubscript::Element(str_expr) = &args[0].value
+                    else {
+                        return None;
+                    };
+                    let crate::ast::expr::SectionSubscript::Element(copies_expr) = &args[1].value
+                    else {
+                        return None;
+                    };
+                    let str_len =
+                        eval_const_char_expr_len(str_expr, param_consts, param_chars, st)?;
+                    let copies = eval_const_char_int_expr(copies_expr, param_consts, param_chars)?;
+                    if copies < 0 {
+                        return None;
+                    }
+                    let copies = i64::try_from(copies).ok()?;
+                    str_len.checked_mul(copies)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 fn eval_const_char_int_expr(
     e: &crate::ast::expr::SpannedExpr,
     param_consts: &HashMap<String, ConstScalar>,
@@ -5134,6 +5215,44 @@ fn eval_const_char_substring(
             let start = usize::try_from(start_idx - 1).ok()?;
             let end = usize::try_from(end_idx).ok()?;
             Some(bytes[start..end].to_vec())
+        }
+    }
+}
+
+fn eval_const_char_substring_len(
+    base_len: i64,
+    subscript: &crate::ast::expr::SectionSubscript,
+    param_consts: &HashMap<String, ConstScalar>,
+) -> Option<i64> {
+    match subscript {
+        crate::ast::expr::SectionSubscript::Element(expr) => {
+            let idx = eval_const_int_in_scope(expr, param_consts)?;
+            if (1..=base_len).contains(&idx) {
+                Some(1)
+            } else {
+                None
+            }
+        }
+        crate::ast::expr::SectionSubscript::Range { start, end, stride } => {
+            if stride.is_some() {
+                return None;
+            }
+            let start_idx = start
+                .as_ref()
+                .map(|expr| eval_const_int_in_scope(expr, param_consts))
+                .unwrap_or(Some(1))?;
+            let end_idx = end
+                .as_ref()
+                .map(|expr| eval_const_int_in_scope(expr, param_consts))
+                .unwrap_or(Some(base_len))?;
+            if start_idx < 1 || end_idx > base_len {
+                return None;
+            }
+            Some(if end_idx < start_idx {
+                0
+            } else {
+                end_idx - start_idx + 1
+            })
         }
     }
 }
@@ -5252,6 +5371,7 @@ pub(super) fn declared_char_len(
                         },
                     )
                 })
+                .or_else(|| eval_const_char_expr_len(expr, param_consts, param_char_consts, st))
                 .or_else(|| {
                     // Fallback: when the init is a Name that
                     // refers to another character parameter
@@ -9004,6 +9124,15 @@ pub(super) fn fixed_char_expr_len(
             }
         }
         Expr::ParenExpr { inner } => fixed_char_expr_len(b, inner, locals, st, type_layouts),
+        Expr::BinaryOp {
+            op: BinaryOp::Concat,
+            left,
+            right,
+        } => {
+            let left_len = fixed_char_expr_len(b, left, locals, st, type_layouts)?;
+            let right_len = fixed_char_expr_len(b, right, locals, st, type_layouts)?;
+            left_len.checked_add(right_len)
+        }
         Expr::FunctionCall { callee, .. } => {
             if let Expr::Name { name } = &callee.node {
                 if let Some(info) = locals.get(&name.to_lowercase()) {
@@ -42874,18 +43003,17 @@ pub(super) fn expr_is_character_expr(
             }
             matches!(op, BinaryOp::Concat)
         }
-        Expr::Name { name } => locals
-            .get(&name.to_lowercase())
-            .map(|info| {
-                info.char_kind != CharKind::None
+        Expr::Name { name } => {
+            let key = name.to_lowercase();
+            if let Some(info) = locals.get(&key) {
+                return info.char_kind != CharKind::None
                     || descriptor_backed_runtime_char_array(info)
-                    || local_fixed_char_allocatable_scalar_len(info).is_some()
-            })
-            .unwrap_or_else(|| {
-                st.find_symbol_any_scope(name)
-                    .and_then(|sym| sym.type_info.as_ref())
-                    .is_some_and(|ty| matches!(ty, crate::sema::symtab::TypeInfo::Character { .. }))
-            }),
+                    || local_fixed_char_allocatable_scalar_len(info).is_some();
+            }
+            st.find_symbol_any_scope(&key)
+                .and_then(|sym| sym.type_info.as_ref())
+                .is_some_and(|ty| matches!(ty, crate::sema::symtab::TypeInfo::Character { .. }))
+        }
         Expr::ComponentAccess { .. } => type_layouts
             .and_then(|tl| resolve_component_field_access(b, locals, expr, st, tl))
             .map(|(_, field)| {

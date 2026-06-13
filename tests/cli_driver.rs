@@ -683,6 +683,51 @@ fn character_star_parameter_concat_with_char_len_writes_stream_header() {
 }
 
 #[test]
+fn local_character_star_parameter_concat_uses_imported_lengths() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=local_character_star_parameter_concat_uses_imported_lengths count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module chars\n  implicit none\n  character(len=*), parameter :: quote = '\"'\n  character(len=*), parameter :: slash = '/'\nend module chars\nprogram p\n  use chars\n  implicit none\n  character(len=*), parameter :: specials_no_slash = quote // quote\n  character(len=*), parameter :: specials = specials_no_slash // slash\n  character(len=:), allocatable :: out\n  out = specials\n  if (len(specials_no_slash) /= 2) error stop 1\n  if (len(specials) /= 3) error stop 2\n  if (len(out) /= 3) error stop 3\n  if (out(1:1) /= quote) error stop 4\n  if (out(2:2) /= quote) error stop 5\n  if (out(3:3) /= slash) error stop 6\n  print *, 'ok'\nend program p\n",
+        "local_char_star_import_concat.f90",
+    );
+    let out = unique_path("local_char_star_import_concat", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("local imported character parameter concat compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "local imported character parameter concat compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("local imported character parameter concat run failed");
+    assert!(
+        run.status.success(),
+        "local imported character parameter concat run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected local imported character parameter concat output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn stream_unformatted_narrow_integer_io_preserves_raw_widths() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
