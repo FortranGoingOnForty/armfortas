@@ -459,12 +459,14 @@ fn eval_const_field_logical_expr(
 fn eval_const_field_char_expr(
     expr: &crate::ast::expr::SpannedExpr,
     const_params: &HashMap<String, i64>,
+    const_char_params: &HashMap<String, String>,
     const_derived_field_inits: &HashMap<String, FieldDefaultInit>,
 ) -> Option<String> {
     use crate::ast::expr::Expr;
 
     match &expr.node {
         Expr::StringLiteral { value, .. } => Some(value.clone()),
+        Expr::Name { name } => const_char_params.get(&name.to_lowercase()).cloned(),
         Expr::ComponentAccess { base, component } => {
             let Expr::Name { name } = &base.node else {
                 return None;
@@ -474,19 +476,27 @@ fn eval_const_field_char_expr(
                 _ => None,
             }
         }
-        Expr::ParenExpr { inner } => {
-            eval_const_field_char_expr(inner, const_params, const_derived_field_inits)
-        }
+        Expr::ParenExpr { inner } => eval_const_field_char_expr(
+            inner,
+            const_params,
+            const_char_params,
+            const_derived_field_inits,
+        ),
         Expr::BinaryOp {
             op: crate::ast::expr::BinaryOp::Concat,
             left,
             right,
         } => {
-            let mut out =
-                eval_const_field_char_expr(left, const_params, const_derived_field_inits)?;
+            let mut out = eval_const_field_char_expr(
+                left,
+                const_params,
+                const_char_params,
+                const_derived_field_inits,
+            )?;
             out.push_str(&eval_const_field_char_expr(
                 right,
                 const_params,
+                const_char_params,
                 const_derived_field_inits,
             )?);
             Some(out)
@@ -521,6 +531,7 @@ fn eval_const_field_char_expr(
                             eval_const_field_char_expr(
                                 expr,
                                 const_params,
+                                const_char_params,
                                 const_derived_field_inits,
                             )?
                         }
@@ -553,13 +564,17 @@ pub fn eval_const_field_default_init_for_layout(
     expr: &crate::ast::expr::SpannedExpr,
     registry: &TypeLayoutRegistry,
     const_params: &HashMap<String, i64>,
+    const_char_params: &HashMap<String, String>,
     const_derived_field_inits: &HashMap<String, FieldDefaultInit>,
 ) -> Option<FieldDefaultInit> {
     match type_info {
-        TypeInfo::Character { .. } => {
-            eval_const_field_char_expr(expr, const_params, const_derived_field_inits)
-                .map(FieldDefaultInit::Character)
-        }
+        TypeInfo::Character { .. } => eval_const_field_char_expr(
+            expr,
+            const_params,
+            const_char_params,
+            const_derived_field_inits,
+        )
+        .map(FieldDefaultInit::Character),
         TypeInfo::Integer { .. } => {
             eval_const_field_int_expr(expr, const_params, const_derived_field_inits)
                 .map(|value| FieldDefaultInit::Integer(value as i128))
@@ -572,6 +587,7 @@ pub fn eval_const_field_default_init_for_layout(
                 expr,
                 registry,
                 const_params,
+                const_char_params,
                 const_derived_field_inits,
             )
         }
@@ -584,6 +600,7 @@ fn eval_const_derived_default_init(
     expr: &crate::ast::expr::SpannedExpr,
     registry: &TypeLayoutRegistry,
     const_params: &HashMap<String, i64>,
+    const_char_params: &HashMap<String, String>,
     const_derived_field_inits: &HashMap<String, FieldDefaultInit>,
 ) -> Option<FieldDefaultInit> {
     use crate::ast::expr::{Expr, SectionSubscript};
@@ -621,6 +638,7 @@ fn eval_const_derived_default_init(
             value_expr,
             registry,
             const_params,
+            const_char_params,
             const_derived_field_inits,
         )?;
         overrides.push((field.name.clone(), init));
@@ -758,6 +776,7 @@ pub fn compute_layout(
     layout: crate::target::TargetLayout,
 ) -> TypeLayout {
     let const_derived_field_inits = HashMap::new();
+    let const_char_params = HashMap::new();
     compute_layout_with_attrs(
         type_name,
         host_module,
@@ -768,6 +787,7 @@ pub fn compute_layout(
         false,
         registry,
         const_params,
+        &const_char_params,
         &const_derived_field_inits,
         layout,
     )
@@ -783,6 +803,7 @@ pub fn compute_layout_with_attrs(
     is_abstract: bool,
     registry: &TypeLayoutRegistry,
     const_params: &HashMap<String, i64>,
+    const_char_params: &HashMap<String, String>,
     const_derived_field_inits: &HashMap<String, FieldDefaultInit>,
     layout: crate::target::TargetLayout,
 ) -> TypeLayout {
@@ -908,6 +929,7 @@ pub fn compute_layout_with_attrs(
                             init,
                             registry,
                             const_params,
+                            const_char_params,
                             const_derived_field_inits,
                         )
                     })

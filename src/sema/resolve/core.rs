@@ -287,6 +287,7 @@ pub(super) fn resolve_unit(
                             scope: st.current_scope(),
                             arg_names: vec![],
                             const_value: None,
+                            const_char_value: None,
                         })?;
                     }
                 }
@@ -337,6 +338,7 @@ pub(super) fn resolve_unit(
                         scope: st.current_scope(),
                         arg_names: vec![],
                         const_value: None,
+                        const_char_value: None,
                     })?;
                 }
             }
@@ -351,6 +353,7 @@ pub(super) fn resolve_unit(
                 scope: st.current_scope(),
                 arg_names: vec![],
                 const_value: None,
+                const_char_value: None,
             })?;
             process_uses(st, uses, module_search_paths, layouts)?;
             process_implicit(st, implicit)?;
@@ -583,6 +586,7 @@ pub(super) fn resolve_unit(
                     scope: st.current_scope(),
                     arg_names,
                     const_value: None,
+                    const_char_value: None,
                 });
             }
 
@@ -607,6 +611,7 @@ pub(super) fn resolve_unit(
                         scope: st.current_scope(),
                         arg_names: merged_specifics.clone(),
                         const_value: None,
+                        const_char_value: None,
                     });
                     if define_result.is_err() {
                         let key = generic_name.to_ascii_lowercase();
@@ -635,8 +640,11 @@ fn compute_all_layouts(
     layouts: &mut crate::sema::type_layout::TypeLayoutRegistry,
 ) {
     let inherited_params = HashMap::new();
+    let inherited_char_params = HashMap::new();
     let mut visible_param_cache: HashMap<ScopeId, HashMap<String, i64>> = HashMap::new();
     let mut exported_param_cache: HashMap<ScopeId, HashMap<String, i64>> = HashMap::new();
+    let mut visible_char_param_cache: HashMap<ScopeId, HashMap<String, String>> = HashMap::new();
+    let mut exported_char_param_cache: HashMap<ScopeId, HashMap<String, String>> = HashMap::new();
     for unit in units {
         let scope_id = find_unit_scope(st, 0, &unit.node).unwrap_or(0);
         collect_derived_type_layouts(
@@ -646,8 +654,11 @@ fn compute_all_layouts(
             st,
             layouts,
             &inherited_params,
+            &inherited_char_params,
             &mut visible_param_cache,
             &mut exported_param_cache,
+            &mut visible_char_param_cache,
+            &mut exported_char_param_cache,
         );
     }
 }
@@ -866,6 +877,64 @@ fn exported_const_int_params(
     out
 }
 
+fn exported_const_char_params(
+    st: &SymbolTable,
+    scope_id: ScopeId,
+    _visible_cache: &mut HashMap<ScopeId, HashMap<String, String>>,
+    exported_cache: &mut HashMap<ScopeId, HashMap<String, String>>,
+) -> HashMap<String, String> {
+    if let Some(cached) = exported_cache.get(&scope_id) {
+        return cached.clone();
+    }
+
+    let scope = st.scope(scope_id);
+    let mut out = HashMap::new();
+
+    for (name, sym) in &scope.symbols {
+        if sym.attrs.parameter && sym.attrs.access != Access::Private {
+            if let Some(value) = &sym.const_char_value {
+                out.entry(name.clone()).or_insert_with(|| value.clone());
+            }
+        }
+    }
+
+    for assoc in &scope.use_associations {
+        let sym = st
+            .scope(assoc.source_scope)
+            .symbols
+            .get(&assoc.original_name)
+            .or_else(|| st.lookup_in(assoc.source_scope, &assoc.original_name));
+        if let Some(sym) = sym {
+            if sym.attrs.parameter
+                && (sym.attrs.access != Access::Private || assoc.is_submodule_access)
+            {
+                if let Some(value) = &sym.const_char_value {
+                    out.entry(assoc.local_name.clone())
+                        .or_insert_with(|| value.clone());
+                }
+            }
+        }
+    }
+
+    let mut seen_use_scopes = HashSet::new();
+    for assoc in &scope.use_associations {
+        if assoc.local_name != assoc.original_name {
+            continue;
+        }
+        if !seen_use_scopes.insert(assoc.source_scope) {
+            continue;
+        }
+        for (name, value) in
+            exported_const_char_params(st, assoc.source_scope, _visible_cache, exported_cache)
+        {
+            out.entry(name).or_insert(value);
+        }
+    }
+
+    exported_cache.insert(scope_id, out.clone());
+    out
+}
+
 fn visible_const_int_params(
     st: &SymbolTable,
     scope_id: ScopeId,
@@ -935,6 +1004,76 @@ fn visible_const_int_params(
     out
 }
 
+fn visible_const_char_params(
+    st: &SymbolTable,
+    scope_id: ScopeId,
+    visible_cache: &mut HashMap<ScopeId, HashMap<String, String>>,
+    exported_cache: &mut HashMap<ScopeId, HashMap<String, String>>,
+) -> HashMap<String, String> {
+    if let Some(cached) = visible_cache.get(&scope_id) {
+        return cached.clone();
+    }
+
+    let scope = st.scope(scope_id);
+    let mut out = HashMap::new();
+
+    for (name, sym) in &scope.symbols {
+        if sym.attrs.parameter {
+            if let Some(value) = &sym.const_char_value {
+                out.entry(name.clone()).or_insert_with(|| value.clone());
+            }
+        }
+    }
+
+    for assoc in &scope.use_associations {
+        if out.contains_key(&assoc.local_name) {
+            continue;
+        }
+        let sym = st
+            .scope(assoc.source_scope)
+            .symbols
+            .get(&assoc.original_name)
+            .or_else(|| st.lookup_in(assoc.source_scope, &assoc.original_name));
+        if let Some(sym) = sym {
+            if sym.attrs.parameter
+                && (sym.attrs.access != Access::Private || assoc.is_submodule_access)
+            {
+                if let Some(value) = &sym.const_char_value {
+                    out.insert(assoc.local_name.clone(), value.clone());
+                }
+            }
+        }
+    }
+
+    let mut seen_use_scopes = HashSet::new();
+    for assoc in &scope.use_associations {
+        if assoc.local_name != assoc.original_name {
+            continue;
+        }
+        if !seen_use_scopes.insert(assoc.source_scope) {
+            continue;
+        }
+        for (name, value) in
+            exported_const_char_params(st, assoc.source_scope, visible_cache, exported_cache)
+        {
+            out.entry(name).or_insert(value);
+        }
+    }
+
+    if let Some(parent) = scope.parent {
+        if st.scope(parent).kind != ScopeKind::Global {
+            for (name, value) in
+                visible_const_char_params(st, parent, visible_cache, exported_cache)
+            {
+                out.entry(name).or_insert(value);
+            }
+        }
+    }
+
+    visible_cache.insert(scope_id, out.clone());
+    out
+}
+
 fn collect_derived_type_layouts(
     target_layout: crate::target::TargetLayout,
     unit: &ProgramUnit,
@@ -942,8 +1081,11 @@ fn collect_derived_type_layouts(
     st: &SymbolTable,
     layouts: &mut crate::sema::type_layout::TypeLayoutRegistry,
     inherited_params: &HashMap<String, i64>,
+    inherited_char_params: &HashMap<String, String>,
     visible_param_cache: &mut HashMap<ScopeId, HashMap<String, i64>>,
     exported_param_cache: &mut HashMap<ScopeId, HashMap<String, i64>>,
+    visible_char_param_cache: &mut HashMap<ScopeId, HashMap<String, String>>,
+    exported_char_param_cache: &mut HashMap<ScopeId, HashMap<String, String>>,
 ) {
     let (decls, contains) = match unit {
         ProgramUnit::Program {
@@ -975,7 +1117,15 @@ fn collect_derived_type_layouts(
         | crate::sema::symtab::ScopeKind::Submodule(module_name) => Some(module_name.as_str()),
         _ => None,
     };
-    let const_params = collect_const_int_params(decls, &seed_params);
+    let mut seed_char_params = inherited_char_params.clone();
+    seed_char_params.extend(visible_const_char_params(
+        st,
+        scope_id,
+        visible_char_param_cache,
+        exported_char_param_cache,
+    ));
+    let const_params = collect_const_int_params(decls, &seed_params, &seed_char_params);
+    let const_char_params = collect_const_char_params(decls, &seed_char_params, &const_params);
     let empty_derived_field_inits = HashMap::new();
     register_local_type_layouts(
         target_layout,
@@ -983,16 +1133,18 @@ fn collect_derived_type_layouts(
         host_module,
         layouts,
         &const_params,
+        &const_char_params,
         &empty_derived_field_inits,
     );
     let const_derived_field_inits =
-        collect_const_derived_field_inits(decls, layouts, &const_params);
+        collect_const_derived_field_inits(decls, layouts, &const_params, &const_char_params);
     register_local_type_layouts(
         target_layout,
         decls,
         host_module,
         layouts,
         &const_params,
+        &const_char_params,
         &const_derived_field_inits,
     );
     resolve_proc_pointer_default_targets(st, scope_id, layouts);
@@ -1005,8 +1157,11 @@ fn collect_derived_type_layouts(
             st,
             layouts,
             &const_params,
+            &const_char_params,
             visible_param_cache,
             exported_param_cache,
+            visible_char_param_cache,
+            exported_char_param_cache,
         );
     }
 }
@@ -1038,21 +1193,122 @@ fn selected_char_kind_value(name: &str) -> i64 {
 
 fn eval_const_char_expr_with_params(
     expr: &crate::ast::expr::SpannedExpr,
+    const_params: &HashMap<String, i64>,
     const_char_params: &HashMap<String, String>,
 ) -> Option<String> {
     use crate::ast::expr::Expr;
     match &expr.node {
         Expr::StringLiteral { value, .. } => Some(value.clone()),
         Expr::Name { name } => const_char_params.get(&name.to_lowercase()).cloned(),
-        Expr::ParenExpr { inner } => eval_const_char_expr_with_params(inner, const_char_params),
+        Expr::ParenExpr { inner } => {
+            eval_const_char_expr_with_params(inner, const_params, const_char_params)
+        }
         Expr::BinaryOp {
             op: crate::ast::expr::BinaryOp::Concat,
             left,
             right,
         } => {
-            let mut out = eval_const_char_expr_with_params(left, const_char_params)?;
-            out.push_str(&eval_const_char_expr_with_params(right, const_char_params)?);
+            let mut out = eval_const_char_expr_with_params(left, const_params, const_char_params)?;
+            out.push_str(&eval_const_char_expr_with_params(
+                right,
+                const_params,
+                const_char_params,
+            )?);
             Some(out)
+        }
+        Expr::FunctionCall { callee, args } => {
+            let Expr::Name { name } = &callee.node else {
+                return None;
+            };
+            match name.to_lowercase().as_str() {
+                "char" | "achar" => {
+                    let first_arg = args.first().and_then(|arg| {
+                        if let crate::ast::expr::SectionSubscript::Element(expr) = &arg.value {
+                            Some(expr)
+                        } else {
+                            None
+                        }
+                    })?;
+                    let code = eval_const_int_expr_with_params(
+                        first_arg,
+                        const_params,
+                        const_char_params,
+                    )?;
+                    if !(0..=255).contains(&code) {
+                        return None;
+                    }
+                    Some((code as u8 as char).to_string())
+                }
+                "new_line" => Some("\n".to_string()),
+                "repeat" if args.len() == 2 => {
+                    let pattern = match &args[0].value {
+                        crate::ast::expr::SectionSubscript::Element(expr) => {
+                            eval_const_char_expr_with_params(expr, const_params, const_char_params)?
+                        }
+                        _ => return None,
+                    };
+                    let copies = match &args[1].value {
+                        crate::ast::expr::SectionSubscript::Element(expr) => {
+                            eval_const_int_expr_with_params(expr, const_params, const_char_params)?
+                        }
+                        _ => return None,
+                    };
+                    if copies < 0 {
+                        return None;
+                    }
+                    Some(pattern.repeat(copies as usize))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn eval_const_char_expr(expr: &crate::ast::expr::SpannedExpr, st: &SymbolTable) -> Option<String> {
+    use crate::ast::expr::Expr;
+    match &expr.node {
+        Expr::StringLiteral { value, .. } => Some(value.clone()),
+        Expr::Name { name } => {
+            let sym = st.lookup_in(st.current_scope(), &name.to_lowercase())?;
+            if sym.attrs.parameter {
+                sym.const_char_value.clone()
+            } else {
+                None
+            }
+        }
+        Expr::ParenExpr { inner } => eval_const_char_expr(inner, st),
+        Expr::BinaryOp {
+            op: crate::ast::expr::BinaryOp::Concat,
+            left,
+            right,
+        } => {
+            let mut out = eval_const_char_expr(left, st)?;
+            out.push_str(&eval_const_char_expr(right, st)?);
+            Some(out)
+        }
+        Expr::FunctionCall { callee, args } => {
+            let Expr::Name { name } = &callee.node else {
+                return None;
+            };
+            match name.to_lowercase().as_str() {
+                "char" | "achar" => {
+                    let first_arg = args.first().and_then(|arg| {
+                        if let crate::ast::expr::SectionSubscript::Element(expr) = &arg.value {
+                            Some(expr)
+                        } else {
+                            None
+                        }
+                    })?;
+                    let code = eval_const_int_expr(first_arg, st)?;
+                    if !(0..=255).contains(&code) {
+                        return None;
+                    }
+                    Some((code as u8 as char).to_string())
+                }
+                "new_line" => Some("\n".to_string()),
+                _ => None,
+            }
         }
         _ => None,
     }
@@ -1150,7 +1406,7 @@ fn eval_const_int_expr_with_params(
                     let crate::ast::expr::SectionSubscript::Element(e) = &arg.value else {
                         return None;
                     };
-                    eval_const_char_expr_with_params(e, const_char_params)
+                    eval_const_char_expr_with_params(e, const_params, const_char_params)
                         .map(|name| selected_char_kind_value(name.trim()))
                 }
                 "kind" => {
@@ -1198,9 +1454,72 @@ fn eval_const_int_expr_with_params(
 fn collect_const_int_params(
     decls: &[SpannedDecl],
     inherited_params: &HashMap<String, i64>,
+    inherited_char_params: &HashMap<String, String>,
 ) -> HashMap<String, i64> {
     let mut params = inherited_params.clone();
-    let mut char_params = HashMap::new();
+    let mut char_params = inherited_char_params.clone();
+    for decl in decls {
+        let Decl::TypeDecl {
+            attrs, entities, ..
+        } = &decl.node
+        else {
+            continue;
+        };
+        if !attrs.iter().any(|a| matches!(a, Attribute::Parameter)) {
+            continue;
+        }
+        for entity in entities {
+            let key = entity.name.to_lowercase();
+            params.remove(&key);
+            char_params.remove(&key);
+        }
+    }
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for decl in decls {
+            let Decl::TypeDecl {
+                attrs, entities, ..
+            } = &decl.node
+            else {
+                continue;
+            };
+            if !attrs.iter().any(|a| matches!(a, Attribute::Parameter)) {
+                continue;
+            }
+            for entity in entities {
+                let key = entity.name.to_lowercase();
+                if params.contains_key(&key) {
+                    continue;
+                }
+                let Some(init) = entity.init.as_ref() else {
+                    continue;
+                };
+                if let Some(value) = eval_const_int_expr_with_params(init, &params, &char_params) {
+                    params.insert(key, value);
+                    changed = true;
+                } else if !char_params.contains_key(&key) {
+                    if let Some(value) =
+                        eval_const_char_expr_with_params(init, &params, &char_params)
+                    {
+                        char_params.insert(key, value);
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    params
+}
+
+fn collect_const_char_params(
+    decls: &[SpannedDecl],
+    inherited_char_params: &HashMap<String, String>,
+    const_params: &HashMap<String, i64>,
+) -> HashMap<String, String> {
+    let mut params = inherited_char_params.clone();
     for decl in decls {
         let Decl::TypeDecl {
             attrs, entities, ..
@@ -1237,14 +1556,9 @@ fn collect_const_int_params(
                 let Some(init) = entity.init.as_ref() else {
                     continue;
                 };
-                if let Some(value) = eval_const_int_expr_with_params(init, &params, &char_params) {
+                if let Some(value) = eval_const_char_expr_with_params(init, const_params, &params) {
                     params.insert(key, value);
                     changed = true;
-                } else if !char_params.contains_key(&key) {
-                    if let Some(value) = eval_const_char_expr_with_params(init, &char_params) {
-                        char_params.insert(key, value);
-                        changed = true;
-                    }
                 }
             }
         }
@@ -1257,6 +1571,7 @@ fn collect_const_derived_field_inits(
     decls: &[SpannedDecl],
     layouts: &crate::sema::type_layout::TypeLayoutRegistry,
     const_params: &HashMap<String, i64>,
+    const_char_params: &HashMap<String, String>,
 ) -> HashMap<String, crate::sema::type_layout::FieldDefaultInit> {
     use crate::sema::type_layout::{
         derived_param_field_lookup_key, eval_const_field_default_init_for_layout, FieldDefaultInit,
@@ -1298,6 +1613,7 @@ fn collect_const_derived_field_inits(
                         init_expr,
                         layouts,
                         const_params,
+                        const_char_params,
                         &field_inits,
                     )
                 else {
@@ -1341,6 +1657,7 @@ fn register_local_type_layouts(
     host_module: Option<&str>,
     layouts: &mut crate::sema::type_layout::TypeLayoutRegistry,
     const_params: &HashMap<String, i64>,
+    const_char_params: &HashMap<String, String>,
     const_derived_field_inits: &HashMap<String, crate::sema::type_layout::FieldDefaultInit>,
 ) {
     for decl in decls {
@@ -1368,6 +1685,7 @@ fn register_local_type_layouts(
                 is_abstract,
                 layouts,
                 const_params,
+                const_char_params,
                 const_derived_field_inits,
                 target_layout,
             );
@@ -1637,6 +1955,14 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                         } else {
                             None
                         };
+                        let const_char_value = if sym_attrs.parameter {
+                            entity
+                                .init
+                                .as_ref()
+                                .and_then(|e| eval_const_char_expr(e, st))
+                        } else {
+                            None
+                        };
                         st.define(Symbol {
                             name: entity.name.clone(),
                             kind: kind.clone(),
@@ -1646,6 +1972,7 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                             scope: st.current_scope(),
                             arg_names: arg_names.clone(),
                             const_value,
+                            const_char_value,
                         })?;
                     }
                 }
@@ -1671,6 +1998,7 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                     scope: st.current_scope(),
                     arg_names: vec![],
                     const_value: None,
+                    const_char_value: None,
                 })?;
             }
             Decl::EnumDef {
@@ -1716,6 +2044,7 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                         scope: st.current_scope(),
                         arg_names: vec![],
                         const_value: Some(const_value),
+                        const_char_value: None,
                     })?;
                 }
             }
@@ -1824,6 +2153,7 @@ fn process_contains(
                     scope: st.current_scope(),
                     arg_names,
                     const_value: None,
+                    const_char_value: None,
                 });
             }
             ProgramUnit::Function {
@@ -1889,6 +2219,7 @@ fn process_contains(
                     scope: st.current_scope(),
                     arg_names: vec![],
                     const_value: None,
+                    const_char_value: None,
                 });
             }
             _ => {}
@@ -2001,11 +2332,8 @@ pub(super) fn eval_const_int_expr(
                         let crate::ast::expr::SectionSubscript::Element(e) = &arg.value else {
                             return None;
                         };
-                        if let Expr::StringLiteral { value, .. } = &e.node {
-                            Some(selected_char_kind_value(value.trim()))
-                        } else {
-                            None
-                        }
+                        eval_const_char_expr(e, st)
+                            .map(|value| selected_char_kind_value(value.trim()))
                     }
                     "kind" => {
                         if let Some(arg) = args.first() {

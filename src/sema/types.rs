@@ -1799,6 +1799,7 @@ mod tests {
             scope: 0,
             arg_names: vec![],
             const_value: None,
+            const_char_value: None,
         })
         .unwrap();
 
@@ -1970,6 +1971,7 @@ mod tests {
             scope: 0,
             arg_names: vec![],
             const_value: None,
+            const_char_value: None,
         })
         .unwrap();
 
@@ -2021,6 +2023,7 @@ mod tests {
             scope: 0,
             arg_names: vec![],
             const_value: None,
+            const_char_value: None,
         })
         .unwrap();
 
@@ -2079,6 +2082,7 @@ mod tests {
             scope: 0,
             arg_names: vec!["new_label".into()],
             const_value: None,
+            const_char_value: None,
         })
         .unwrap();
 
@@ -2137,6 +2141,7 @@ mod tests {
             scope: 0,
             arg_names: vec!["new_label".into()],
             const_value: None,
+            const_char_value: None,
         })
         .unwrap();
         st.push_scope(ScopeKind::Module("hidden".into()));
@@ -2149,6 +2154,7 @@ mod tests {
             scope: 1,
             arg_names: vec!["new_label".into()],
             const_value: None,
+            const_char_value: None,
         })
         .unwrap();
 

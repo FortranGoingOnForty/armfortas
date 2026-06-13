@@ -597,6 +597,10 @@ fn emit_parameter(
         type_info_to_string(sym.type_info.as_ref())
     };
     let is_private = sym.attrs.access == Access::Private;
+    let const_char_hex = sym
+        .const_char_value
+        .as_ref()
+        .map(|value| hex_encode_bytes(value.as_bytes()));
     if let Some(cv) = sym
         .const_value
         .map(i128::from)
@@ -605,7 +609,16 @@ fn emit_parameter(
         // Place `, private` after the value so parse_var's
         // rfind(" = ") inside type_str continues to work.
         let suf = if is_private { ", private" } else { "" };
-        writeln!(out, "@param {} : {} = {}{}", name, type_str, cv, suf).unwrap();
+        let char_suf = const_char_hex
+            .as_ref()
+            .map(|hex| format!(" @charhex {}", hex))
+            .unwrap_or_default();
+        writeln!(
+            out,
+            "@param {} : {} = {}{}{}",
+            name, type_str, cv, suf, char_suf
+        )
+        .unwrap();
     } else if let Some(info) = global_info {
         // For @ir-backed params, attach `, private` to the type so
         // the parser sees it in attr_str rather than after @ir.
@@ -614,15 +627,23 @@ fn emit_parameter(
         } else {
             type_str
         };
+        let char_suf = const_char_hex
+            .as_ref()
+            .map(|hex| format!(" @charhex {}", hex))
+            .unwrap_or_default();
         writeln!(
             out,
-            "@param {} : {} @ir {}",
-            name, type_with_attr, info.symbol
+            "@param {} : {} @ir {}{}",
+            name, type_with_attr, info.symbol, char_suf
         )
         .unwrap();
     } else {
         let suf = if is_private { ", private" } else { "" };
-        writeln!(out, "@param {} : {}{}", name, type_str, suf).unwrap();
+        let char_suf = const_char_hex
+            .as_ref()
+            .map(|hex| format!(" @charhex {}", hex))
+            .unwrap_or_default();
+        writeln!(out, "@param {} : {}{}{}", name, type_str, suf, char_suf).unwrap();
     }
 }
 
@@ -1385,6 +1406,7 @@ pub struct AmodVar {
     pub deferred_char: bool,
     pub dims: Vec<(i64, i64)>,
     pub const_value: Option<i64>,
+    pub const_char_value: Option<String>,
     /// Access level. F2008 §11.2.3 requires private parent symbols to
     /// be visible in submodules, so the writer emits private entries
     /// with a `private` attribute and the loader honors them via
@@ -1615,10 +1637,10 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
 }
 
 fn parse_var(line: &str, is_param: bool) -> AmodVar {
-    // @var name : type[, attrs...] [@ir symbol] [@deferred_char] [@dims ...]
+    // @var name : type[, attrs...] [@ir symbol] [@charhex hex] [@deferred_char] [@dims ...]
     let rest = line.strip_prefix("@var ").unwrap_or(line);
-    let (name_type, ir_part) = if let Some(idx) = rest.find(" @ir ") {
-        (&rest[..idx], Some(&rest[idx + 5..]))
+    let (name_type, meta_part) = if let Some(idx) = rest.find(" @") {
+        (&rest[..idx], Some(&rest[idx + 1..]))
     } else {
         (rest, None)
     };
@@ -1636,6 +1658,7 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
     };
 
     let mut const_value = None;
+    let mut const_char_value = None;
     // For @param with `= value`, strip the value suffix from the
     // type string before parsing the type.
     let clean_type_str = if is_param {
@@ -1668,14 +1691,22 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
     let mut deferred_char = false;
     let mut dims = Vec::new();
 
-    if let Some(ir) = ir_part {
-        let parts: Vec<&str> = ir.split_whitespace().collect();
-        if !parts.is_empty() {
-            ir_symbol = Some(parts[0].to_string());
-        }
-        let mut i = 1;
+    if let Some(meta) = meta_part {
+        let parts: Vec<&str> = meta.split_whitespace().collect();
+        let mut i = 0;
         while i < parts.len() {
-            if parts[i] == "@deferred_char" {
+            if parts[i] == "@ir" {
+                if let Some(symbol) = parts.get(i + 1) {
+                    ir_symbol = Some((*symbol).to_string());
+                }
+                i += 2;
+            } else if parts[i] == "@charhex" {
+                if let Some(hex) = parts.get(i + 1) {
+                    const_char_value =
+                        hex_decode_bytes(hex).and_then(|bytes| String::from_utf8(bytes).ok());
+                }
+                i += 2;
+            } else if parts[i] == "@deferred_char" {
                 deferred_char = true;
                 i += 1;
             } else if parts[i] == "@dims" {
@@ -1709,6 +1740,7 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
         deferred_char,
         dims,
         const_value,
+        const_char_value,
         access,
     }
 }

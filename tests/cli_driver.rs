@@ -24363,6 +24363,109 @@ fn char_parameter_round_trips_through_amod_import() {
 }
 
 #[test]
+fn imported_char_parameter_component_default_round_trips_through_amod() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_char_parameter_component_default_round_trips_through_amod count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("char_param_component_default_amod");
+    let constants_src = write_program_in(
+        &dir,
+        "path_constants.f90",
+        "module path_constants\n  implicit none\n  character(len=*), parameter :: dot = '.'\nend module\n",
+    );
+    let type_src = write_program_in(
+        &dir,
+        "path_state.f90",
+        "module path_state\n  use path_constants, only: dot\n  implicit none\n  type :: core_t\n    character(len=1) :: sep = dot\n  end type\nend module\n",
+    );
+    let user_src = write_program_in(
+        &dir,
+        "user.f90",
+        "program p\n  use path_state, only: core_t\n  implicit none\n  type(core_t) :: state\n  if (state%sep /= '.') error stop 1\n  print *, 'ok'\nend program\n",
+    );
+    let constants_obj = dir.join("path_constants.o");
+    let type_obj = dir.join("path_state.o");
+    let user_obj = dir.join("user.o");
+    let out = dir.join("user_bin");
+
+    for (src, obj) in [
+        (&constants_src, &constants_obj),
+        (&type_src, &type_obj),
+        (&user_src, &user_obj),
+    ] {
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                "-c",
+                "-I",
+                dir.to_str().unwrap(),
+                "-J",
+                dir.to_str().unwrap(),
+                src.to_str().unwrap(),
+                "-o",
+                obj.to_str().unwrap(),
+            ])
+            .output()
+            .expect("char component default compile spawn failed");
+        assert!(
+            compile.status.success(),
+            "char component default compile failed for {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let constants_amod =
+        std::fs::read_to_string(dir.join("path_constants.amod")).expect("read path_constants.amod");
+    assert!(
+        constants_amod.contains("@param dot : character(len=1) @ir")
+            && constants_amod.contains("@charhex 2e"),
+        "character parameter value should be exported through .amod:\n{}",
+        constants_amod
+    );
+    let type_amod =
+        std::fs::read_to_string(dir.join("path_state.amod")).expect("read path_state.amod");
+    assert!(
+        type_amod.contains("@field sep : character(len=1)")
+            && type_amod.contains("@init=charhex:2e"),
+        "imported character parameter default should fold into type layout:\n{}",
+        type_amod
+    );
+
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            constants_obj.to_str().unwrap(),
+            type_obj.to_str().unwrap(),
+            user_obj.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("char component default link spawn failed");
+    assert!(
+        link.status.success(),
+        "char component default link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "char component default runtime failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn char_parameter_substrings_keep_fixed_len_through_amod_import() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
