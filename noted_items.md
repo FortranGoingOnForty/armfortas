@@ -282,3 +282,12 @@ Found during l04 (2026-06-12):
     allocate-before-free invariant. This is the hard part and why it's
     deferred rather than rushed.
   Owner: l04 follow-up (l04a) or fold into l05's I/O/runtime work.
+
+- **SPLIT does not bounds-check POS** (found l04, 2026-06-12):
+  gfortran's split_3/split_4 dg-shouldfail tests expect a runtime
+  error when POS is out of range (or BACK with POS at the string
+  start). armfortas intrinsics don't emit runtime argument bounds
+  checks, so these run and exit 0. Kept XFAIL. SELECTED_CHAR_KIND
+  (F2003, used by split_2) is also unimplemented (undefined symbol at
+  link). Owners: intrinsic runtime-bounds pass / F2003 intrinsic
+  backlog respectively.
