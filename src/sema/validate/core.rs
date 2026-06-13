@@ -491,6 +491,380 @@ fn conditional_operand_type(
     }
 }
 
+// ---- F2023 enumeration types (7.6.2) ----
+//
+// Enumeration types are a distinct TKR: no implicit conversion to or
+// from INTEGER exists in either direction. All safety is frontend-only
+// (values lower to i32 ordinals), so these checks are the only thing
+// standing between a typo and a silently-working integer program.
+
+/// Conservative enumeration classification of an expression. `Unknown`
+/// suppresses diagnostics — only classify `NotEnum` when the type is
+/// positively known, so untypeable expressions (intrinsic calls,
+/// generics, components) never produce false positives.
+#[derive(Clone, PartialEq)]
+enum EnumClass {
+    Enum(String),
+    NotEnum,
+    Unknown,
+}
+
+fn enum_class_of(ctx: &Ctx<'_>, expr: &crate::ast::expr::SpannedExpr) -> EnumClass {
+    match &expr.node {
+        Expr::Name { name } => match ctx.lookup(name) {
+            Some(sym) if matches!(sym.kind, crate::sema::symtab::SymbolKind::EnumerationType) => {
+                // A bare type name in expression position is an error
+                // elsewhere; don't classify it as a value.
+                EnumClass::Unknown
+            }
+            Some(sym) => match &sym.type_info {
+                Some(TypeInfo::Enumeration(type_name)) => EnumClass::Enum(type_name.clone()),
+                Some(_) => EnumClass::NotEnum,
+                None => EnumClass::Unknown,
+            },
+            None => EnumClass::Unknown,
+        },
+        Expr::ParenExpr { inner } => enum_class_of(ctx, inner),
+        Expr::ConditionalExpr { then_val, .. } => enum_class_of(ctx, then_val),
+        Expr::IntegerLiteral { .. }
+        | Expr::RealLiteral { .. }
+        | Expr::StringLiteral { .. }
+        | Expr::LogicalLiteral { .. }
+        | Expr::ComplexLiteral { .. }
+        | Expr::BozLiteral { .. } => EnumClass::NotEnum,
+        // Operators never yield enumeration values (misuse of an
+        // enumeration operand is flagged at the operator itself).
+        Expr::BinaryOp { .. } | Expr::UnaryOp { .. } => EnumClass::NotEnum,
+        Expr::FunctionCall { callee, args: _ } => match &callee.node {
+            Expr::Name { name } => match ctx.lookup(name) {
+                // Constructor color(n) — yields a value of the type.
+                Some(sym)
+                    if matches!(sym.kind, crate::sema::symtab::SymbolKind::EnumerationType) =>
+                {
+                    EnumClass::Enum(sym.name.clone())
+                }
+                // Element of an enumeration array, or a function whose
+                // result is an enumeration type.
+                Some(sym) => match &sym.type_info {
+                    Some(TypeInfo::Enumeration(type_name)) => EnumClass::Enum(type_name.clone()),
+                    _ => EnumClass::Unknown,
+                },
+                None => EnumClass::Unknown,
+            },
+            _ => EnumClass::Unknown,
+        },
+        _ => EnumClass::Unknown,
+    }
+}
+
+fn check_enum_binary_op(
+    ctx: &mut Ctx<'_>,
+    span: Span,
+    op: &crate::ast::expr::BinaryOp,
+    left: &crate::ast::expr::SpannedExpr,
+    right: &crate::ast::expr::SpannedExpr,
+) {
+    use crate::ast::expr::BinaryOp as B;
+    let lc = enum_class_of(ctx, left);
+    let rc = enum_class_of(ctx, right);
+    if !matches!(lc, EnumClass::Enum(_)) && !matches!(rc, EnumClass::Enum(_)) {
+        return;
+    }
+    match op {
+        // All six relational ops are valid between values of the SAME
+        // enumeration type (ordinal order, F2023 10.1.5.5.2).
+        B::Eq | B::Ne | B::Lt | B::Le | B::Gt | B::Ge => match (lc, rc) {
+            (EnumClass::Enum(a), EnumClass::Enum(b)) if a != b => {
+                ctx.error(
+                    span,
+                    format!(
+                        "operands of '{}' must have the same enumeration type \
+                         ('{}' vs '{}')",
+                        op, a, b
+                    ),
+                );
+            }
+            (EnumClass::Enum(a), EnumClass::NotEnum) | (EnumClass::NotEnum, EnumClass::Enum(a)) => {
+                ctx.error(
+                    span,
+                    format!(
+                        "cannot compare enumeration type '{}' with a \
+                         non-enumeration value; convert with INT(v)",
+                        a
+                    ),
+                );
+            }
+            _ => {}
+        },
+        // A user-defined operator could be legitimately overloaded for
+        // an enumeration type; stay silent.
+        B::Defined(_) => {}
+        _ => {
+            let name = match (&lc, &rc) {
+                (EnumClass::Enum(a), _) => a.clone(),
+                (_, EnumClass::Enum(b)) => b.clone(),
+                _ => unreachable!(),
+            };
+            ctx.error(
+                span,
+                format!(
+                    "operator '{}' is not defined for enumeration type '{}' \
+                     (F2023 7.6.2); convert with INT(v)",
+                    op, name
+                ),
+            );
+        }
+    }
+}
+
+fn check_enum_unary_op(
+    ctx: &mut Ctx<'_>,
+    span: Span,
+    op: &crate::ast::expr::UnaryOp,
+    operand: &crate::ast::expr::SpannedExpr,
+) {
+    if matches!(op, crate::ast::expr::UnaryOp::Defined(_)) {
+        return;
+    }
+    if let EnumClass::Enum(name) = enum_class_of(ctx, operand) {
+        ctx.error(
+            span,
+            format!(
+                "unary operator '{}' is not defined for enumeration type '{}' \
+                 (F2023 7.6.2); convert with INT(v)",
+                op, name
+            ),
+        );
+    }
+}
+
+/// R771 constructor `type-name(int-expr)`: exactly one integer argument;
+/// a constant argument must be a valid 1-based ordinal.
+fn check_enum_constructor(
+    ctx: &mut Ctx<'_>,
+    span: Span,
+    type_name: &str,
+    enumerator_count: usize,
+    args: &[crate::ast::expr::Argument],
+) {
+    let one_int_expr = "the enumeration constructor takes exactly one integer expression";
+    if args.len() != 1 {
+        ctx.error(
+            span,
+            format!("{} ('{}(int-expr)')", one_int_expr, type_name),
+        );
+        return;
+    }
+    let crate::ast::expr::SectionSubscript::Element(arg) = &args[0].value else {
+        ctx.error(
+            span,
+            format!("{} ('{}(int-expr)')", one_int_expr, type_name),
+        );
+        return;
+    };
+    if let EnumClass::Enum(arg_type) = enum_class_of(ctx, arg) {
+        ctx.error(
+            arg.span,
+            format!(
+                "the argument of the '{}' constructor must be an integer \
+                 expression, not a value of enumeration type '{}'",
+                type_name, arg_type
+            ),
+        );
+        return;
+    }
+    if let Ok(Some(value)) = eval_const_int_expr_checked(ctx, arg) {
+        if value.value < 1 || value.value > enumerator_count as i128 {
+            ctx.error(
+                arg.span,
+                format!(
+                    "value {} is out of range for enumeration type '{}' \
+                     (valid ordinals are 1..{})",
+                    value.value, type_name, enumerator_count
+                ),
+            );
+        }
+    }
+}
+
+/// Statement-level enumeration checks: intrinsic assignment requires
+/// the same enumeration type on both sides, and list-directed I/O of
+/// an enumeration value is invalid (F2023 7.6.2 — write INT(v) with an
+/// I edit descriptor instead).
+fn validate_stmt_enum_usage(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
+    fn check_list_directed_items(
+        ctx: &mut Ctx<'_>,
+        items: &[crate::ast::expr::SpannedExpr],
+        verb: &str,
+    ) {
+        for item in items {
+            if let EnumClass::Enum(name) = enum_class_of(ctx, item) {
+                ctx.error(
+                    item.span,
+                    format!(
+                        "list-directed {} of enumeration type '{}' is not \
+                         allowed (F2023 7.6.2); {} INT(v) instead",
+                        verb, name, verb
+                    ),
+                );
+            }
+        }
+    }
+    fn is_star(expr: &crate::ast::expr::SpannedExpr) -> bool {
+        matches!(&expr.node, Expr::Name { name } if name == "*")
+    }
+    // fmt= is the second positional control or the FMT= keyword; a
+    // bare `*` there means list-directed.
+    fn io_is_list_directed(controls: &[crate::ast::stmt::IoControl]) -> bool {
+        let mut positional = 0;
+        for control in controls {
+            match control.keyword.as_deref() {
+                Some(kw) if kw.eq_ignore_ascii_case("fmt") => return is_star(&control.value),
+                Some(_) => {}
+                None => {
+                    positional += 1;
+                    if positional == 2 {
+                        return is_star(&control.value);
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    match &stmt.node {
+        Stmt::Assignment { target, value } => {
+            let t = enum_class_of(ctx, target);
+            let v = enum_class_of(ctx, value);
+            match (t, v) {
+                (EnumClass::Enum(a), EnumClass::Enum(b)) if a != b => {
+                    ctx.error(
+                        stmt.span,
+                        format!(
+                            "cannot assign a value of enumeration type '{}' to a \
+                             variable of enumeration type '{}'",
+                            b, a
+                        ),
+                    );
+                }
+                (EnumClass::Enum(a), EnumClass::NotEnum) => {
+                    ctx.error(
+                        stmt.span,
+                        format!(
+                            "cannot assign a non-enumeration value to a variable \
+                             of enumeration type '{}'; use the constructor \
+                             '{}(int-expr)' (F2023 7.6.2)",
+                            a, a
+                        ),
+                    );
+                }
+                (EnumClass::NotEnum, EnumClass::Enum(b)) => {
+                    ctx.error(
+                        stmt.span,
+                        format!(
+                            "cannot assign a value of enumeration type '{}' to a \
+                             non-enumeration variable; convert with INT(v)",
+                            b
+                        ),
+                    );
+                }
+                _ => {}
+            }
+        }
+        // Argument association: an enumeration actual requires a dummy
+        // of the same enumeration type and vice versa (no implicit
+        // INTEGER bridge — an integer actual against an enumeration
+        // dummy read garbage before this check existed). Checked for
+        // CALL to a uniquely-resolvable subroutine; anything ambiguous
+        // (generics, externals without a visible body) is skipped.
+        Stmt::Call { callee, args } => {
+            let Expr::Name { name } = &callee.node else {
+                return;
+            };
+            let Some(arg_names) = ctx.lookup(name).and_then(|sym| {
+                matches!(sym.kind, crate::sema::symtab::SymbolKind::Subroutine)
+                    .then(|| sym.arg_names.clone())
+            }) else {
+                return;
+            };
+            let target = name.to_ascii_lowercase();
+            let mut scopes = ctx.st.all_scopes().iter().filter(|scope| {
+                matches!(&scope.kind, crate::sema::symtab::ScopeKind::Subroutine(n)
+                    if n.eq_ignore_ascii_case(&target))
+            });
+            let (Some(callee_scope), None) = (scopes.next(), scopes.next()) else {
+                return;
+            };
+            for (i, arg) in args.iter().enumerate() {
+                let dummy_name = match arg.keyword.as_deref() {
+                    Some(kw) => kw.to_ascii_lowercase(),
+                    None => match arg_names.get(i) {
+                        Some(n) => n.to_ascii_lowercase(),
+                        None => continue,
+                    },
+                };
+                let dummy_enum =
+                    callee_scope
+                        .symbols
+                        .get(&dummy_name)
+                        .and_then(|sym| match &sym.type_info {
+                            Some(TypeInfo::Enumeration(n)) => Some(EnumClass::Enum(n.clone())),
+                            Some(_) => Some(EnumClass::NotEnum),
+                            None => None,
+                        });
+                let crate::ast::expr::SectionSubscript::Element(actual) = &arg.value else {
+                    continue;
+                };
+                let actual_enum = enum_class_of(ctx, actual);
+                match (dummy_enum, actual_enum) {
+                    (Some(EnumClass::Enum(a)), EnumClass::Enum(b)) if a != b => {
+                        ctx.error(
+                            actual.span,
+                            format!(
+                                "actual argument of enumeration type '{}' is not \
+                                 compatible with dummy '{}' of enumeration type '{}'",
+                                b, dummy_name, a
+                            ),
+                        );
+                    }
+                    (Some(EnumClass::Enum(a)), EnumClass::NotEnum) => {
+                        ctx.error(
+                            actual.span,
+                            format!(
+                                "dummy argument '{}' has enumeration type '{}'; pass \
+                                 a value of that type (constructor '{}(int-expr)')",
+                                dummy_name, a, a
+                            ),
+                        );
+                    }
+                    (Some(EnumClass::NotEnum), EnumClass::Enum(b)) => {
+                        ctx.error(
+                            actual.span,
+                            format!(
+                                "actual argument of enumeration type '{}' is not \
+                                 compatible with non-enumeration dummy '{}'; convert \
+                                 with INT(v)",
+                                b, dummy_name
+                            ),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Stmt::Print { format, items } if is_star(format) => {
+            check_list_directed_items(ctx, items, "output");
+        }
+        Stmt::Write { controls, items } if io_is_list_directed(controls) => {
+            check_list_directed_items(ctx, items, "output");
+        }
+        Stmt::Read { controls, items } if io_is_list_directed(controls) => {
+            check_list_directed_items(ctx, items, "input");
+        }
+        _ => {}
+    }
+}
+
 /// Syntactic + symbol-table probe for an array-valued conditional arm:
 /// a whole-array name, an array constructor, or a section (a call-form
 /// expression with a range subscript). Conservative — anything it
@@ -620,6 +994,7 @@ fn validate_const_int_expr_tree(ctx: &mut Ctx<'_>, expr: &crate::ast::expr::Span
             }
         }
         Expr::UnaryOp { op, operand } => {
+            check_enum_unary_op(ctx, expr.span, op, operand);
             if matches!(
                 op,
                 crate::ast::expr::UnaryOp::Plus | crate::ast::expr::UnaryOp::Minus
@@ -634,6 +1009,7 @@ fn validate_const_int_expr_tree(ctx: &mut Ctx<'_>, expr: &crate::ast::expr::Span
             }
         }
         Expr::BinaryOp { op, left, right } => {
+            check_enum_binary_op(ctx, expr.span, op, left, right);
             if matches!(
                 op,
                 crate::ast::expr::BinaryOp::Add
@@ -657,6 +1033,15 @@ fn validate_const_int_expr_tree(ctx: &mut Ctx<'_>, expr: &crate::ast::expr::Span
         }
         Expr::FunctionCall { callee, args } => {
             validate_const_int_expr_tree(ctx, callee);
+            if let Expr::Name { name } = &callee.node {
+                let enum_ctor = ctx.lookup(name).and_then(|sym| {
+                    matches!(sym.kind, crate::sema::symtab::SymbolKind::EnumerationType)
+                        .then(|| (sym.name.clone(), sym.arg_names.len()))
+                });
+                if let Some((type_name, count)) = enum_ctor {
+                    check_enum_constructor(ctx, expr.span, &type_name, count, args);
+                }
+            }
             // F2023 conditional arguments in FUNCTION references would
             // need association-selecting lowering on the fn-call path;
             // until that lands, reject for user procedures (a value
@@ -1537,25 +1922,28 @@ fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
                             | Some(crate::sema::symtab::TypeInfo::TypeStar) => ctx.error(
                                 decl.span,
                                 format!(
-                                    "{}({}) of an unlimited polymorphic or assumed-type                                      entity is not allowed",
+                                    "{}({}) of an unlimited polymorphic or assumed-type \
+                                     entity is not allowed",
                                     if is_classof { "CLASSOF" } else { "TYPEOF" },
                                     entity
                                 ),
                             ),
-                            Some(ti) if is_classof => {
-                                if !matches!(
-                                    ti,
-                                    crate::sema::symtab::TypeInfo::Derived(_)
-                                        | crate::sema::symtab::TypeInfo::Class(_)
-                                ) {
-                                    ctx.error(
-                                        decl.span,
-                                        format!(
-                                            "CLASSOF({}) requires an entity of derived or                                              CLASS type",
-                                            entity
-                                        ),
-                                    );
-                                }
+                            Some(ti)
+                                if is_classof
+                                    && !matches!(
+                                        ti,
+                                        crate::sema::symtab::TypeInfo::Derived(_)
+                                            | crate::sema::symtab::TypeInfo::Class(_)
+                                    ) =>
+                            {
+                                ctx.error(
+                                    decl.span,
+                                    format!(
+                                        "CLASSOF({}) requires an entity of derived or \
+                                         CLASS type",
+                                        entity
+                                    ),
+                                );
                             }
                             _ => {}
                         },
@@ -1612,6 +2000,21 @@ fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
 
         if matches!(decl.node, Decl::UseStmt { .. }) {
             ctx.require_std(decl.span, FortranStandard::F90, "USE statement");
+        }
+
+        if let Decl::EnumDef { type_name, .. } = &decl.node {
+            ctx.require_std(decl.span, FortranStandard::F2003, "ENUM, BIND(C)");
+            if type_name.is_some() {
+                ctx.require_std(
+                    decl.span,
+                    FortranStandard::F2023,
+                    "named interoperable ENUM type",
+                );
+            }
+        }
+
+        if matches!(decl.node, Decl::EnumerationTypeDef { .. }) {
+            ctx.require_std(decl.span, FortranStandard::F2023, "ENUMERATION TYPE");
         }
 
         if let Decl::CommonBlock { vars, .. } = &decl.node {
@@ -1685,6 +2088,7 @@ fn validate_stmts(ctx: &mut Ctx, stmts: &[SpannedStmt]) {
 
 fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
     validate_stmt_const_int_exprs(ctx, stmt);
+    validate_stmt_enum_usage(ctx, stmt);
 
     match &stmt.node {
         // ---- Assignment ----
@@ -3026,6 +3430,183 @@ mod tests {
             .filter(|d| d.kind == DiagKind::Error)
             .map(|d| d.msg.clone())
             .collect()
+    }
+
+    // ---- F2023 enumeration types ----
+
+    const ENUM_PRELUDE: &str = "\
+program p
+  implicit none
+  enumeration type :: color
+    enumerator :: red, green, blue
+  end enumeration type
+  enumeration type :: fruit
+    enumerator :: apple, pear
+  end enumeration type
+  type(color) :: c
+  type(fruit) :: f
+  integer :: n
+";
+
+    fn enum_errors(body: &str) -> Vec<String> {
+        errors_from(&format!("{}{}\nend program\n", ENUM_PRELUDE, body))
+    }
+
+    #[test]
+    fn enum_assign_integer_rejected() {
+        let errs = enum_errors("  c = 1");
+        assert!(
+            errs.iter().any(|e| e.contains("use the constructor")),
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn enum_assign_cross_type_rejected() {
+        let errs = enum_errors("  f = red");
+        assert!(
+            errs.iter().any(|e| e.contains("enumeration type 'color'")
+                && e.contains("enumeration type 'fruit'")),
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn enum_assign_to_integer_rejected() {
+        let errs = enum_errors("  c = red\n  n = c");
+        assert!(
+            errs.iter().any(|e| e.contains("convert with INT(v)")),
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn enum_arithmetic_rejected() {
+        let errs = enum_errors("  c = red\n  n = int(c) + 1\n  c = c + 1");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("operator '+' is not defined for enumeration type 'color'")),
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn enum_same_type_relational_allowed() {
+        let errs = enum_errors(
+            "  c = red\n  if (c == red) n = 1\n  if (c < blue) n = 2\n  if (c >= green) n = 3",
+        );
+        assert!(errs.is_empty(), "{:?}", errs);
+    }
+
+    #[test]
+    fn enum_cross_type_relational_rejected() {
+        let errs = enum_errors("  if (red == apple) n = 1");
+        assert!(
+            errs.iter().any(|e| e.contains("same enumeration type")),
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn enum_integer_relational_rejected() {
+        let errs = enum_errors("  c = red\n  if (c == 1) n = 1");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("cannot compare enumeration type")),
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn enum_constructor_range_checked() {
+        let errs = enum_errors("  c = color(0)\n  c = color(4)\n  c = color(3)");
+        assert_eq!(
+            errs.iter().filter(|e| e.contains("out of range")).count(),
+            2,
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn enum_list_directed_print_rejected() {
+        let errs = enum_errors("  c = red\n  print *, c\n  print *, int(c)");
+        assert_eq!(
+            errs.iter()
+                .filter(|e| e.contains("list-directed output"))
+                .count(),
+            1,
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn enum_call_argument_mismatch_rejected() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  enumeration type :: color
+    enumerator :: red, green, blue
+  end enumeration type
+  type(color) :: c
+  c = red
+  call takes_int(c)
+  call takes_color(2)
+  call takes_color(c)
+contains
+  subroutine takes_int(n)
+    integer, intent(in) :: n
+    print *, n
+  end subroutine
+  subroutine takes_color(x)
+    type(color), intent(in) :: x
+    integer :: m
+    m = int(x)
+  end subroutine
+end program
+",
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("non-enumeration dummy 'n'")),
+            "{:?}",
+            errs
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("dummy argument 'x' has enumeration type 'color'")),
+            "{:?}",
+            errs
+        );
+        assert_eq!(errs.len(), 2, "{:?}", errs);
+    }
+
+    #[test]
+    fn enumeration_type_requires_f2023() {
+        let src = "\
+program p
+  implicit none
+  enumeration type :: color
+    enumerator :: red, green, blue
+  end enumeration type
+end program
+";
+        let errs = errors_with_std(src, FortranStandard::F2018);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("ENUMERATION TYPE requires --std=F2023")),
+            "{:?}",
+            errs
+        );
+        let errs = errors_with_std(src, FortranStandard::F2023);
+        assert!(errs.is_empty(), "{:?}", errs);
     }
 
     // ---- Character VALUE dummies ----

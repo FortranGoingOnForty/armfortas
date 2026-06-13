@@ -2171,6 +2171,15 @@ fn parse_type_info(s: &str) -> Option<TypeInfo> {
     if let Some(inner) = s.strip_prefix("class(").and_then(|r| r.strip_suffix(')')) {
         return Some(TypeInfo::Class(inner.to_string()));
     }
+    // l07 flag: preserves the type identity of enumeration-typed
+    // symbols; re-registering the type itself (and its enumerators)
+    // from a .amod is the l07 round-trip row.
+    if let Some(inner) = s
+        .strip_prefix("enumeration(")
+        .and_then(|r| r.strip_suffix(')'))
+    {
+        return Some(TypeInfo::Enumeration(inner.to_string()));
+    }
 
     None
 }

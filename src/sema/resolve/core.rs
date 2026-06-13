@@ -1672,7 +1672,9 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                     },
                     defined_at: decl.span,
                     scope: st.current_scope(),
-                    arg_names: vec![],
+                    // Enumerators in declaration order: the constructor
+                    // range check (R771) needs the count.
+                    arg_names: enumerators.clone(),
                     const_value: None,
                 })?;
                 for (i, ename) in enumerators.iter().enumerate() {
@@ -1716,7 +1718,11 @@ fn process_contains(
             matches!(st.scope(st.current_scope()).kind, ScopeKind::Submodule(_));
         match &unit.node {
             ProgramUnit::Subroutine {
-                name, prefix, bind, ..
+                name,
+                args,
+                prefix,
+                bind,
+                ..
             } => {
                 let elemental = prefix
                     .iter()
@@ -1736,6 +1742,16 @@ fn process_contains(
                     is_separate_module_procedure: is_smp,
                     ..Default::default()
                 };
+                let arg_names = args
+                    .iter()
+                    .filter_map(|a| {
+                        if let DummyArg::Name(n) = a {
+                            Some(n.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
                 let _ignore_dup = st.define(Symbol {
                     name: name.clone(),
                     kind: SymbolKind::Subroutine,
@@ -1743,7 +1759,7 @@ fn process_contains(
                     attrs,
                     defined_at: unit.span,
                     scope: st.current_scope(),
-                    arg_names: vec![],
+                    arg_names,
                     const_value: None,
                 });
             }

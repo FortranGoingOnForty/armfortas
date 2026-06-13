@@ -1495,15 +1495,13 @@ impl<'a> Parser<'a> {
         // END ENUMERATION TYPE [name] — C7115: a trailing name must
         // match.
         self.consume_end("enumeration")?;
-        if self.eat_ident("type") {
-            if self.peek() == &TokenKind::Identifier {
-                let end_name = self.advance().clone().text;
-                if !end_name.eq_ignore_ascii_case(&name) {
-                    return Err(self.error(format!(
-                        "END ENUMERATION TYPE name '{}' does not match '{}' (C7115)",
-                        end_name, name
-                    )));
-                }
+        if self.eat_ident("type") && self.peek() == &TokenKind::Identifier {
+            let end_name = self.advance().clone().text;
+            if !end_name.eq_ignore_ascii_case(&name) {
+                return Err(self.error(format!(
+                    "END ENUMERATION TYPE name '{}' does not match '{}' (C7115)",
+                    end_name, name
+                )));
             }
         }
         let span = crate::parser::expr::span_from_to(start, self.prev_span());

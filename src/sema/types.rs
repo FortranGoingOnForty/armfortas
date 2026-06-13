@@ -753,6 +753,13 @@ pub fn expr_type(
                                 name: sym.name.clone(),
                             });
                     }
+                    // Enumeration constructor (F2023 R771): color(n)
+                    // yields a value of the enumeration type.
+                    if matches!(sym.kind, super::symtab::SymbolKind::EnumerationType) {
+                        return FortranType::Enumeration {
+                            name: sym.name.clone(),
+                        };
+                    }
                     if matches!(sym.kind, super::symtab::SymbolKind::NamedInterface) {
                         if let Some(ty) = same_name_derived_constructor_type(symtab, name) {
                             return ty;
