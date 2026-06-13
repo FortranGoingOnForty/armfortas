@@ -235,3 +235,15 @@ Found during l04 (2026-06-12):
   of scope for l04 (the F2023 trig additions match the existing
   intrinsics' lack of checking by design). Owner: a dedicated
   intrinsic-signature-checking sprint if a target project surfaces it.
+
+- **SYSTEM_CLOCK runtime is not integer-kind aware** (found l04,
+  2026-06-12): afs_system_clock writes i64 COUNT (nanoseconds, ~1.7e18)
+  and COUNT_MAX (i64::MAX) into the caller's temp, which the lowering
+  then truncates to the argument kind. With default integer (kind 4)
+  COUNT and COUNT_MAX overflow — COUNT_MAX reads back as -1. gfortran
+  picks a rate/max that fits the argument kind (rate 1000, max
+  HUGE(kind)). Fix needs the kind threaded into the runtime call (new
+  signature or per-kind entry points). l04 delivered the F2023
+  argument-kind RESTRICTIONS (validation); this runtime value-range
+  fix is separate. Owner: l05 (I/O + runtime) or a dedicated
+  system-intrinsics pass.
