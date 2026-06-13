@@ -43,6 +43,18 @@ pub extern "C" fn afs_stop() {
     process::exit(0);
 }
 
+/// Fortran `STOP <int>` statement.
+#[no_mangle]
+pub extern "C" fn afs_stop_int(code: i64) {
+    afs_program_finalize();
+    let exit_code = if code >= 0 && code <= 255 {
+        code as i32
+    } else {
+        1
+    };
+    process::exit(exit_code);
+}
+
 /// Fortran ERROR STOP statement.
 #[no_mangle]
 pub extern "C" fn afs_error_stop() {

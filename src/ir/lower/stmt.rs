@@ -3903,7 +3903,32 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             }
         }
 
-        Stmt::Stop { .. } => {
+        Stmt::Stop { code, .. } => {
+            let stop_code = if let Some(code_expr) = code {
+                let is_char = expr_is_character_expr(
+                    b,
+                    &ctx.locals,
+                    code_expr,
+                    ctx.st,
+                    Some(ctx.type_layouts),
+                ) || matches!(code_expr.node, Expr::StringLiteral { .. });
+                if is_char {
+                    None
+                } else {
+                    let val = super::expr::lower_expr_ctx(b, ctx, code_expr);
+                    let val_ty = b
+                        .func()
+                        .value_type(val)
+                        .unwrap_or(IrType::Int(IntWidth::I64));
+                    Some(match val_ty {
+                        IrType::Int(IntWidth::I64) => val,
+                        IrType::Int(_) => b.int_extend(val, IntWidth::I64, true),
+                        _ => val,
+                    })
+                }
+            } else {
+                None
+            };
             let skip = if matches!(
                 ctx.hidden_result_abi,
                 HiddenResultAbi::ArrayDescriptor | HiddenResultAbi::DerivedAggregate
@@ -3922,7 +3947,15 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 Some(ctx.contained_host_refs),
                 skip,
             );
-            b.runtime_call(RuntimeFunc::Stop, vec![], IrType::Void);
+            if let Some(widened) = stop_code {
+                b.call(
+                    FuncRef::External("afs_stop_int".into()),
+                    vec![widened],
+                    IrType::Void,
+                );
+            } else {
+                b.runtime_call(RuntimeFunc::Stop, vec![], IrType::Void);
+            }
             b.unreachable();
         }
         Stmt::ErrorStop { code, .. } => {
