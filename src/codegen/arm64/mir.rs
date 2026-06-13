@@ -111,8 +111,8 @@ pub enum ArmOpcode {
     MulV4S, // MUL Vd.4s, Vn.4s, Vm.4s    (integer; 2D not in NEON)
     NegV4S,
     NegV2D,
-    AbsV4S, // ABS Vd.4s, Vn.4s          (integer abs; signed)
-    AbsV2D, // ABS Vd.2d, Vn.2d
+    AbsV4S,  // ABS Vd.4s, Vn.4s          (integer abs; signed)
+    AbsV2D,  // ABS Vd.2d, Vn.2d
     FaddV4S, // FADD Vd.4s, Vn.4s, Vm.4s
     FaddV2D, // FADD Vd.2d, Vn.2d, Vm.2d
     FsubV4S,

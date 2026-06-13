@@ -847,6 +847,13 @@ fn select_inst(
             let va = ctx.lookup_vreg(*a);
             let vb = ctx.lookup_vreg(*b);
             let is_mul = matches!(inst.kind, InstKind::VMul(..));
+            // Signed/unsigned i32 has no native packed multiply at SSE2
+            // (pmulld is SSE4.1) — synthesize via two pmuludq (x10c-3).
+            // Gated to i32 by vec_analysis; i64/div never reach here.
+            if is_mul && matches!(vec_elem_of(&inst.ty), IrType::Int(IntWidth::I32)) {
+                emit_packed_imul(mf, mb, va, vb, dest);
+                return mb;
+            }
             let opcode = match vec_elem_of(&inst.ty) {
                 IrType::Float(FloatWidth::F32) => {
                     if is_mul {
@@ -1242,8 +1249,12 @@ fn select_inst(
                 (InstKind::VReduceMax(_), IrType::Float(FloatWidth::F64)) => {
                     ReduceStep::Op(X86Opcode::Maxpd)
                 }
-                (InstKind::VReduceMin(_), IrType::Int(IntWidth::I32)) => ReduceStep::IntMinMax(true),
-                (InstKind::VReduceMax(_), IrType::Int(IntWidth::I32)) => ReduceStep::IntMinMax(false),
+                (InstKind::VReduceMin(_), IrType::Int(IntWidth::I32)) => {
+                    ReduceStep::IntMinMax(true)
+                }
+                (InstKind::VReduceMax(_), IrType::Int(IntWidth::I32)) => {
+                    ReduceStep::IntMinMax(false)
+                }
                 (k, e) => panic!("x10: reduce {:?} on {:?} should not reach isel", k, e),
             };
             // Fold the upper half onto the lower, then (for 4-lane
@@ -3115,6 +3126,64 @@ fn emit_packed_iabs(mf: &mut X86Function, mb: MBlockId, vx: X86VReg, dest: X86VR
     let xored = mf.new_vreg(X86RegClass::Xmm128);
     push(mf, X86Opcode::Pxor, vx, mask, xored); // x ^ mask
     push(mf, X86Opcode::Psubd, xored, mask, dest); // (x ^ mask) - mask
+}
+
+/// Packed v4i32 multiply synthesis for SSE2 (no `pmulld` until SSE4.1).
+/// Two `pmuludq` (which multiply the even 32-bit lanes 0,2 into 64-bit
+/// products) cover the even and odd lanes; the low 32 bits of each
+/// product are the desired i32 results, gathered back into lane order
+/// with a shufps + pshufd. This is the gfortran/LLVM SSE2 lowering of
+/// `mul <4 x i32>`. Bit-exact for signed and unsigned (low 32 of the
+/// product is identical).
+///
+///   Aodd = pshufd A,0xF5  -> [a1,a1,a3,a3]   (lanes 1,3 into even slots)
+///   Bodd = pshufd B,0xF5
+///   Ev   = pmuludq A,B     -> [a0*b0 (64), a2*b2 (64)] = [e0,_,e2,_]
+///   Od   = pmuludq Aodd,Bodd -> [a1*b1, a3*b3]         = [o1,_,o3,_]
+///   t    = shufps Ev,Od,0x88 -> [e0,e2,o1,o3]
+///   dst  = pshufd t,0xD8     -> [e0,o1,e2,o3]
+fn emit_packed_imul(mf: &mut X86Function, mb: MBlockId, va: X86VReg, vb: X86VReg, dest: X86VReg) {
+    let v = |mf: &mut X86Function, opc, ops: Vec<X86Operand>, d: X86VReg| {
+        mf.block_mut(mb).insts.push(X86Inst {
+            opcode: opc,
+            size: OpSize::Q,
+            operands: ops,
+            def: Some(X86Operand::VReg(d)),
+        });
+    };
+    let reg = X86Operand::VReg;
+    let a_odd = mf.new_vreg(X86RegClass::Xmm128);
+    let b_odd = mf.new_vreg(X86RegClass::Xmm128);
+    v(
+        mf,
+        X86Opcode::Pshufd,
+        vec![reg(va), X86Operand::Imm(0xF5)],
+        a_odd,
+    );
+    v(
+        mf,
+        X86Opcode::Pshufd,
+        vec![reg(vb), X86Operand::Imm(0xF5)],
+        b_odd,
+    );
+    let evens = mf.new_vreg(X86RegClass::Xmm128);
+    let odds = mf.new_vreg(X86RegClass::Xmm128);
+    v(mf, X86Opcode::Pmuludq, vec![reg(va), reg(vb)], evens);
+    v(mf, X86Opcode::Pmuludq, vec![reg(a_odd), reg(b_odd)], odds);
+    let merged = mf.new_vreg(X86RegClass::Xmm128);
+    // shufps dst,src,imm: result low half from dst(=evens), high from src.
+    v(
+        mf,
+        X86Opcode::Shufps,
+        vec![reg(evens), reg(odds), X86Operand::Imm(0x88)],
+        merged,
+    );
+    v(
+        mf,
+        X86Opcode::Pshufd,
+        vec![reg(merged), X86Operand::Imm(0xD8)],
+        dest,
+    );
 }
 
 /// One step of a packed across-lane reduction tree: either a single
