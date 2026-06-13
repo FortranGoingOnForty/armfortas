@@ -3860,7 +3860,7 @@ pub fn is_intrinsic_name(name: &str) -> bool {
         "aimag" | "dimag" | "char" | "ichar" | "achar" | "iachar" |
         "len" | "len_trim" | "trim" | "adjustl" | "adjustr" |
         "index" | "scan" | "verify" | "repeat" | "lge" | "lgt" | "lle" | "llt" |
-        "kind" | "selected_int_kind" | "selected_real_kind" |
+        "kind" | "selected_int_kind" | "selected_real_kind" | "selected_char_kind" |
         "size" | "shape" | "rank" | "lbound" | "ubound" | "allocated" | "associated" |
         "present" | "merge" | "pack" | "unpack" | "spread" | "reshape" |
         "sum" | "product" | "maxval" | "minval" | "maxloc" | "minloc" | "findloc" | "count" | "any" | "all" |

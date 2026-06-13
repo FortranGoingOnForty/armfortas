@@ -327,6 +327,28 @@ fn eval_const_int_expr(
                         -1
                     })
                 }
+                "selected_char_kind" => {
+                    let arg = args.first()?;
+                    let crate::ast::expr::SectionSubscript::Element(e) = &arg.value else {
+                        return None;
+                    };
+                    if let Expr::StringLiteral { value, .. } = &e.node {
+                        let name = value.trim();
+                        Some(
+                            if name.eq_ignore_ascii_case("default")
+                                || name.eq_ignore_ascii_case("ascii")
+                            {
+                                1
+                            } else if name.eq_ignore_ascii_case("iso_10646") {
+                                4
+                            } else {
+                                -1
+                            },
+                        )
+                    } else {
+                        None
+                    }
+                }
                 "kind" => {
                     let arg = args.first()?;
                     let crate::ast::expr::SectionSubscript::Element(e) = &arg.value else {

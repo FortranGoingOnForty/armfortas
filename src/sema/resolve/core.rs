@@ -1026,9 +1026,42 @@ fn parse_boz_i64(text: &str, base: crate::ast::expr::BozBase) -> Option<i64> {
     i64::from_str_radix(&digits, radix).ok()
 }
 
+fn selected_char_kind_value(name: &str) -> i64 {
+    if name.eq_ignore_ascii_case("default") || name.eq_ignore_ascii_case("ascii") {
+        1
+    } else if name.eq_ignore_ascii_case("iso_10646") {
+        4
+    } else {
+        -1
+    }
+}
+
+fn eval_const_char_expr_with_params(
+    expr: &crate::ast::expr::SpannedExpr,
+    const_char_params: &HashMap<String, String>,
+) -> Option<String> {
+    use crate::ast::expr::Expr;
+    match &expr.node {
+        Expr::StringLiteral { value, .. } => Some(value.clone()),
+        Expr::Name { name } => const_char_params.get(&name.to_lowercase()).cloned(),
+        Expr::ParenExpr { inner } => eval_const_char_expr_with_params(inner, const_char_params),
+        Expr::BinaryOp {
+            op: crate::ast::expr::BinaryOp::Concat,
+            left,
+            right,
+        } => {
+            let mut out = eval_const_char_expr_with_params(left, const_char_params)?;
+            out.push_str(&eval_const_char_expr_with_params(right, const_char_params)?);
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
 fn eval_const_int_expr_with_params(
     expr: &crate::ast::expr::SpannedExpr,
     const_params: &HashMap<String, i64>,
+    const_char_params: &HashMap<String, String>,
 ) -> Option<i64> {
     use crate::ast::expr::Expr;
     match &expr.node {
@@ -1039,7 +1072,7 @@ fn eval_const_int_expr_with_params(
         Expr::BozLiteral { text, base } => parse_boz_i64(text, *base),
         Expr::Name { name } => const_params.get(&name.to_lowercase()).copied(),
         Expr::UnaryOp { op, operand } => {
-            let v = eval_const_int_expr_with_params(operand, const_params)?;
+            let v = eval_const_int_expr_with_params(operand, const_params, const_char_params)?;
             match op {
                 crate::ast::expr::UnaryOp::Minus => Some(-v),
                 crate::ast::expr::UnaryOp::Plus => Some(v),
@@ -1047,8 +1080,8 @@ fn eval_const_int_expr_with_params(
             }
         }
         Expr::BinaryOp { op, left, right } => {
-            let l = eval_const_int_expr_with_params(left, const_params)?;
-            let r = eval_const_int_expr_with_params(right, const_params)?;
+            let l = eval_const_int_expr_with_params(left, const_params, const_char_params)?;
+            let r = eval_const_int_expr_with_params(right, const_params, const_char_params)?;
             match op {
                 crate::ast::expr::BinaryOp::Add => Some(l + r),
                 crate::ast::expr::BinaryOp::Sub => Some(l - r),
@@ -1057,14 +1090,16 @@ fn eval_const_int_expr_with_params(
                 _ => None,
             }
         }
-        Expr::ParenExpr { inner } => eval_const_int_expr_with_params(inner, const_params),
+        Expr::ParenExpr { inner } => {
+            eval_const_int_expr_with_params(inner, const_params, const_char_params)
+        }
         Expr::FunctionCall { callee, args } => {
             let Expr::Name { name } = &callee.node else {
                 return None;
             };
             let first_arg_val = args.first().and_then(|a| {
                 if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
-                    eval_const_int_expr_with_params(e, const_params)
+                    eval_const_int_expr_with_params(e, const_params, const_char_params)
                 } else {
                     None
                 }
@@ -1110,6 +1145,14 @@ fn eval_const_int_expr_with_params(
                         -1
                     })
                 }
+                "selected_char_kind" => {
+                    let arg = args.first()?;
+                    let crate::ast::expr::SectionSubscript::Element(e) = &arg.value else {
+                        return None;
+                    };
+                    eval_const_char_expr_with_params(e, const_char_params)
+                        .map(|name| selected_char_kind_value(name.trim()))
+                }
                 "kind" => {
                     let arg = args.first()?;
                     let crate::ast::expr::SectionSubscript::Element(e) = &arg.value else {
@@ -1142,7 +1185,7 @@ fn eval_const_int_expr_with_params(
                             .parse::<f64>()
                             .ok()
                             .map(|v| v.trunc() as i64),
-                        _ => eval_const_int_expr_with_params(e, const_params),
+                        _ => eval_const_int_expr_with_params(e, const_params, const_char_params),
                     }
                 }
                 _ => None,
@@ -1157,6 +1200,7 @@ fn collect_const_int_params(
     inherited_params: &HashMap<String, i64>,
 ) -> HashMap<String, i64> {
     let mut params = inherited_params.clone();
+    let mut char_params = HashMap::new();
     for decl in decls {
         let Decl::TypeDecl {
             attrs, entities, ..
@@ -1193,9 +1237,14 @@ fn collect_const_int_params(
                 let Some(init) = entity.init.as_ref() else {
                     continue;
                 };
-                if let Some(value) = eval_const_int_expr_with_params(init, &params) {
+                if let Some(value) = eval_const_int_expr_with_params(init, &params, &char_params) {
                     params.insert(key, value);
                     changed = true;
+                } else if !char_params.contains_key(&key) {
+                    if let Some(value) = eval_const_char_expr_with_params(init, &char_params) {
+                        char_params.insert(key, value);
+                        changed = true;
+                    }
                 }
             }
         }
@@ -1946,6 +1995,17 @@ pub(super) fn eval_const_int_expr(
                         } else {
                             -1
                         })
+                    }
+                    "selected_char_kind" => {
+                        let arg = args.first()?;
+                        let crate::ast::expr::SectionSubscript::Element(e) = &arg.value else {
+                            return None;
+                        };
+                        if let Expr::StringLiteral { value, .. } = &e.node {
+                            Some(selected_char_kind_value(value.trim()))
+                        } else {
+                            None
+                        }
                     }
                     "kind" => {
                         if let Some(arg) = args.first() {

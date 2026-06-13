@@ -39046,6 +39046,43 @@ fn type_bound_generic_reshape_result_actual_uses_array_specific() {
 }
 
 #[test]
+fn selected_char_kind_folds_character_parameter_name() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=selected_char_kind_folds_character_parameter_name count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module kinds\n  implicit none\n  integer, parameter :: cdk = selected_char_kind('DEFAULT')\n  character(kind=cdk,len=*), parameter :: json_fortran_string_kind = 'ISO_10646'\n  integer, parameter :: ck = selected_char_kind(json_fortran_string_kind)\ncontains\n  subroutine check()\n    if (cdk /= 1) error stop 1\n    if (ck /= 4) error stop 2\n  end subroutine\nend module\n\nprogram p\n  use kinds, only : check\n  implicit none\n  if (selected_char_kind('ASCII') /= 1) error stop 3\n  if (selected_char_kind('ISO_10646') /= 4) error stop 4\n  call check()\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("selected_char_kind_param_name", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("selected_char_kind compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "selected_char_kind compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("selected_char_kind run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "selected_char_kind: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn user_op_dispatch_recognises_derived_type_constructor_as_scalar() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

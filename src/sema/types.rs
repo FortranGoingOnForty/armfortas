@@ -1025,7 +1025,9 @@ pub fn intrinsic_result_type(name: &str, args: &[FortranType]) -> Option<Fortran
         "int" | "nint" | "floor" | "ceiling" => Some(FortranType::default_integer()),
         "len" | "len_trim" | "index" | "scan" | "verify" => Some(FortranType::default_integer()),
         "size" | "lbound" | "ubound" | "shape" | "rank" => Some(FortranType::default_integer()),
-        "kind" | "selected_int_kind" | "selected_real_kind" => Some(FortranType::default_integer()),
+        "kind" | "selected_int_kind" | "selected_real_kind" | "selected_char_kind" => {
+            Some(FortranType::default_integer())
+        }
         "iand" | "ior" | "ieor" | "not" | "ishft" | "ishftc" | "shiftl" | "shiftr" | "shifta"
         | "ibits" | "ibset" | "ibclr" | "merge_bits" | "dshiftl" | "dshiftr" => {
             args.first().cloned()

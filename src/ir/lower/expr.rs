@@ -2091,6 +2091,29 @@ pub(crate) fn lower_expr_full(
                         return result;
                     }
                 }
+                if !has_named_interface && key == "selected_char_kind" {
+                    let arg_expr = original_args.iter().find_map(|arg| {
+                        let matches_name = arg
+                            .keyword
+                            .as_deref()
+                            .is_none_or(|kw| kw.eq_ignore_ascii_case("name"));
+                        if !matches_name {
+                            return None;
+                        }
+                        match &arg.value {
+                            crate::ast::expr::SectionSubscript::Element(expr) => Some(expr),
+                            _ => None,
+                        }
+                    });
+                    if let Some(arg_expr) = arg_expr {
+                        if let crate::ast::expr::Expr::StringLiteral { value, .. } = &arg_expr.node
+                        {
+                            return b.const_i32(
+                                super::const_scalar::selected_char_kind_value(value) as i32,
+                            );
+                        }
+                    }
+                }
                 let intrinsic_result =
                     if !has_named_interface && crate::sema::validate::is_intrinsic_name(&key) {
                         let intrinsic_arg_slots =

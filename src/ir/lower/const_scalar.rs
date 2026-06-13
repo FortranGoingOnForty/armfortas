@@ -56,6 +56,17 @@ pub(super) fn parse_boz_const_scalar(
         .map(ConstScalar::Int)
 }
 
+pub(super) fn selected_char_kind_value(name: &str) -> i128 {
+    let name = name.trim();
+    if name.eq_ignore_ascii_case("default") || name.eq_ignore_ascii_case("ascii") {
+        1
+    } else if name.eq_ignore_ascii_case("iso_10646") {
+        4
+    } else {
+        -1
+    }
+}
+
 pub(super) fn eval_const_scalar(
     e: &crate::ast::expr::SpannedExpr,
     param_consts: &HashMap<String, ConstScalar>,
@@ -266,6 +277,17 @@ pub(super) fn eval_const_scalar(
                                 -1
                             };
                             Some(ConstScalar::Int(kind as i128))
+                        } else {
+                            None
+                        }
+                    }
+                    "selected_char_kind" => {
+                        let arg = args.first()?;
+                        let crate::ast::expr::SectionSubscript::Element(e) = &arg.value else {
+                            return None;
+                        };
+                        if let Expr::StringLiteral { value, .. } = &e.node {
+                            Some(ConstScalar::Int(selected_char_kind_value(value)))
                         } else {
                             None
                         }

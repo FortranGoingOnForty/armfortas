@@ -22,7 +22,7 @@ use std::rc::Rc;
 
 use super::const_scalar::{
     clamp_const_to_type, const_scalar_ir_type, eval_const_scalar, materialize_const_scalar,
-    ConstScalar,
+    selected_char_kind_value, ConstScalar,
 };
 use super::ctx::{
     active_block_uses, current_proc_scope, current_smp_extra_host, AmbiguousUseWarnings, CharKind,
@@ -8024,6 +8024,9 @@ pub(super) fn eval_const_scalar_with_decl_scope(
             };
             let key = name.to_ascii_lowercase();
             match key.as_str() {
+                "selected_char_kind" => {
+                    eval_selected_char_kind_with_decl_scope(args, decls, param_consts)
+                }
                 "huge" | "tiny" | "epsilon" | "precision" | "range" | "digits" | "radix"
                 | "bit_size" | "maxexponent" | "minexponent" => {
                     let arg = args.first()?;
@@ -8100,6 +8103,55 @@ pub(super) fn eval_const_scalar_with_decl_scope(
         }
         _ => None,
     }
+}
+
+fn eval_selected_char_kind_with_decl_scope(
+    args: &[crate::ast::expr::Argument],
+    decls: &[crate::ast::decl::SpannedDecl],
+    param_consts: &HashMap<String, ConstScalar>,
+) -> Option<ConstScalar> {
+    if args.len() != 1 {
+        return None;
+    }
+    let arg_expr = const_call_arg_expr(args.first()?)?;
+    let param_chars = collect_decl_param_char_consts_for_scalar_fold(decls, param_consts);
+    let bytes = eval_const_char_bytes(arg_expr, param_consts, &param_chars)?;
+    let name = std::str::from_utf8(&bytes).ok()?.trim();
+    Some(ConstScalar::Int(selected_char_kind_value(name)))
+}
+
+fn collect_decl_param_char_consts_for_scalar_fold(
+    decls: &[crate::ast::decl::SpannedDecl],
+    param_consts: &HashMap<String, ConstScalar>,
+) -> HashMap<String, Vec<u8>> {
+    let mut out = HashMap::new();
+    for decl in decls {
+        match &decl.node {
+            Decl::TypeDecl {
+                attrs, entities, ..
+            } if attrs
+                .iter()
+                .any(|a| matches!(a, crate::ast::decl::Attribute::Parameter)) =>
+            {
+                for entity in entities {
+                    if let Some(init) = entity.init.as_ref() {
+                        if let Some(bytes) = eval_const_char_bytes(init, param_consts, &out) {
+                            out.insert(entity.name.to_lowercase(), bytes);
+                        }
+                    }
+                }
+            }
+            Decl::ParameterStmt { pairs } => {
+                for (name, expr) in pairs {
+                    if let Some(bytes) = eval_const_char_bytes(expr, param_consts, &out) {
+                        out.insert(name.to_lowercase(), bytes);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 fn eval_const_minmax_with_decl_scope(
