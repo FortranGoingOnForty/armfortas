@@ -11323,7 +11323,7 @@ pub(super) fn generic_candidate_matches_slots_with_proc(
     b: &FuncBuilder,
     declared_args: &[&crate::sema::symtab::Symbol],
     arg_slots: &[Option<ValueId>],
-    _supplied: usize,
+    supplied: usize,
     formal_skip: usize,
     actual_is_procedure: &[bool],
 ) -> bool {
@@ -11331,7 +11331,7 @@ pub(super) fn generic_candidate_matches_slots_with_proc(
         b,
         declared_args,
         arg_slots,
-        _supplied,
+        supplied,
         formal_skip,
         actual_is_procedure,
         false,
@@ -11342,11 +11342,23 @@ pub(super) fn generic_candidate_matches_slots_with_proc_elemental(
     b: &FuncBuilder,
     declared_args: &[&crate::sema::symtab::Symbol],
     arg_slots: &[Option<ValueId>],
-    _supplied: usize,
+    supplied: usize,
     formal_skip: usize,
     actual_is_procedure: &[bool],
     elemental: bool,
 ) -> bool {
+    let required = declared_args
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| *idx >= formal_skip)
+        .map(|(_, sym)| *sym)
+        .filter(|sym| !sym.attrs.optional)
+        .count();
+    let max_supplied = declared_args.len().saturating_sub(formal_skip);
+    if supplied < required || supplied > max_supplied || arg_slots.len() > declared_args.len() {
+        return false;
+    }
+
     for (idx, decl_sym) in declared_args.iter().enumerate() {
         if idx < formal_skip {
             continue;

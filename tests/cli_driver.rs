@@ -37739,6 +37739,50 @@ fn chained_hidden_result_concat_with_stub_ansi_codes_runs() {
 }
 
 #[test]
+fn bound_generic_dispatch_rejects_specific_missing_extra_actuals() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=bound_generic_dispatch_rejects_specific_missing_extra_actuals count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type :: node_t\n    character(len=:), allocatable :: name\n  end type\n  type :: core_t\n  contains\n    procedure :: add_null\n    procedure :: add_integer_vec\n    generic :: add => add_null, add_integer_vec\n  end type\ncontains\n  subroutine add_null(self, node, name)\n    class(core_t), intent(inout) :: self\n    type(node_t), intent(inout) :: node\n    character(len=*), intent(in) :: name\n    node%name = 'wrong:' // trim(name)\n  end subroutine\n  subroutine add_integer_vec(self, node, name, vals)\n    class(core_t), intent(inout) :: self\n    type(node_t), intent(inout) :: node\n    character(len=*), intent(in) :: name\n    integer, intent(in) :: vals(:)\n    if (size(vals) /= 3) error stop 10\n    if (vals(2) /= 2) error stop 11\n    node%name = trim(name) // ':vec'\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(core_t) :: core\n  type(node_t) :: node\n  call core%add(node, 'ints', [1, 2, 3])\n  if (node%name /= 'ints:vec') error stop 1\n  print *, node%name\nend program\n",
+        "f90",
+    );
+    let out = unique_path("bound_generic_rejects_missing_extra_actual", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("bound generic missing-extra-actual compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "bound generic missing-extra-actual compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("bound generic missing-extra-actual run failed");
+    assert!(
+        run.status.success(),
+        "bound generic missing-extra-actual run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ints:vec"),
+        "unexpected bound generic missing-extra-actual output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn generic_type_bound_subroutine_dispatch_uses_matching_specific() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
