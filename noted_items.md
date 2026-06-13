@@ -194,3 +194,20 @@ Unexplained transient during x10 validation on nomad (2026-06-12):
   fresh-checkout macOS jobs never saw it. If it recurs: SAVE THE BAD
   COMPILER BINARY before rebuilding — that artifact is the evidence
   the investigation needs.
+
+Deferred from l03's enumeration type-safety pass (2026-06-12):
+
+- **Enumeration actuals to FUNCTION references are unchecked**: the
+  same-type argument-association check covers CALL statements only
+  (mirrors l02's conditional-argument CALL-only precedent). An
+  enumeration passed to a non-generic function's integer dummy, or
+  vice versa, compiles silently; the value is a valid by-ref i32 so
+  it reads the ordinal rather than garbage. Owner: l03 follow-up
+  audit.
+- **C7114 unenforced**: the access-spec on `ENUMERATION TYPE` is
+  accepted anywhere, not just in a module specification section.
+  Parser-side, one constraint. Owner: l03 follow-up audit.
+- **Enumeration components of derived types**: no type_layout field
+  representation; a `TYPE(enum)` component falls into the
+  unknown-derived path. Owner: l03 follow-up audit; promote to its
+  own row if a target project hits it.
