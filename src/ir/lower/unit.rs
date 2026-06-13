@@ -22,6 +22,39 @@ use super::ctx::{
 };
 use super::helpers::clamp_nonnegative_i64;
 
+fn install_procedure_dummy_closure_locals(
+    b: &mut FuncBuilder,
+    locals: &mut HashMap<String, LocalInfo>,
+    params: &[(String, Vec<ValueId>)],
+) {
+    let ptr_ty = IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)));
+    for (dummy_name, ids) in params {
+        for (slot_idx, pid) in ids.iter().enumerate() {
+            let slot = b.alloca(ptr_ty.clone());
+            b.store(*pid, slot);
+            locals.insert(
+                procedure_dummy_closure_local_name(dummy_name, slot_idx),
+                LocalInfo {
+                    addr: slot,
+                    ty: ptr_ty.clone(),
+                    dims: vec![],
+                    allocatable: false,
+                    descriptor_arg: false,
+                    by_ref: false,
+                    char_kind: CharKind::None,
+                    derived_type: None,
+                    inline_const: None,
+                    is_pointer: false,
+                    runtime_dim_upper: vec![],
+                    is_class: false,
+                    logical_kind: None,
+                    last_dim_assumed_size: false,
+                },
+            );
+        }
+    }
+}
+
 pub(crate) fn lower_unit(
     module: &mut Module,
     unit: &SpannedUnit,
@@ -362,6 +395,29 @@ pub(crate) fn lower_unit(
                 }
             }
 
+            let mut procedure_dummy_closure_params: Vec<(String, Vec<ValueId>)> = Vec::new();
+            let proc_closure_ty = IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)));
+            for arg in args {
+                let DummyArg::Name(n) = arg else {
+                    continue;
+                };
+                if !procedure_dummy_closure_param_slots_for_scope(st, proc_scope_id, n) {
+                    continue;
+                }
+                let mut ids = Vec::with_capacity(crate::sema::type_layout::PROC_PTR_CLOSURE_SLOTS);
+                for slot_idx in 0..crate::sema::type_layout::PROC_PTR_CLOSURE_SLOTS {
+                    let pid = ValueId(params.len() as u32);
+                    params.push(Param {
+                        name: procedure_dummy_closure_local_name(n, slot_idx),
+                        ty: proc_closure_ty.clone(),
+                        id: pid,
+                        fortran_noalias: false,
+                    });
+                    ids.push(pid);
+                }
+                procedure_dummy_closure_params.push((n.to_lowercase(), ids));
+            }
+
             // Host-association closure params. Trailing pointer params,
             // one per host-local variable this contained proc reads or
             // writes. Order matches contained_host_refs[name].
@@ -408,7 +464,11 @@ pub(crate) fn lower_unit(
             let param_info: Vec<(String, ValueId, IrType, bool)> = func
                 .params
                 .iter()
-                .filter(|p| !p.name.starts_with("__len_") && !p.name.starts_with("__host_"))
+                .filter(|p| {
+                    !p.name.starts_with("__len_")
+                        && !p.name.starts_with("__host_")
+                        && !p.name.starts_with("__proc_closure_")
+                })
                 .map(|p| {
                     let pname = p.name.to_lowercase();
                     let elem_ty = arg_type_from_decls(&pname, decls, Some(st));
@@ -489,6 +549,12 @@ pub(crate) fn lower_unit(
                         }
                     }
                 }
+
+                install_procedure_dummy_closure_locals(
+                    &mut b,
+                    &mut ctx.locals,
+                    &procedure_dummy_closure_params,
+                );
 
                 for (pname, _, _, is_value) in &param_info {
                     if *is_value || hidden_len_addrs.contains_key(pname) {
@@ -863,6 +929,28 @@ pub(crate) fn lower_unit(
                     }
                 }
             }
+            let mut procedure_dummy_closure_params: Vec<(String, Vec<ValueId>)> = Vec::new();
+            let proc_closure_ty = IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)));
+            for arg in args {
+                let DummyArg::Name(n) = arg else {
+                    continue;
+                };
+                if !procedure_dummy_closure_param_slots_for_scope(st, proc_scope_id, n) {
+                    continue;
+                }
+                let mut ids = Vec::with_capacity(crate::sema::type_layout::PROC_PTR_CLOSURE_SLOTS);
+                for slot_idx in 0..crate::sema::type_layout::PROC_PTR_CLOSURE_SLOTS {
+                    let pid = ValueId(func_params.len() as u32);
+                    func_params.push(Param {
+                        name: procedure_dummy_closure_local_name(n, slot_idx),
+                        ty: proc_closure_ty.clone(),
+                        id: pid,
+                        fortran_noalias: false,
+                    });
+                    ids.push(pid);
+                }
+                procedure_dummy_closure_params.push((n.to_lowercase(), ids));
+            }
             let host_ref_infos = build_host_ref_params(
                 name,
                 module.layout,
@@ -910,6 +998,7 @@ pub(crate) fn lower_unit(
                     p.name != "_sret"
                         && !p.name.starts_with("__len_")
                         && !p.name.starts_with("__host_")
+                        && !p.name.starts_with("__proc_closure_")
                 })
                 .map(|p| {
                     let pname = p.name.to_lowercase();
@@ -991,6 +1080,12 @@ pub(crate) fn lower_unit(
                         }
                     }
                 }
+
+                install_procedure_dummy_closure_locals(
+                    &mut b,
+                    &mut ctx.locals,
+                    &procedure_dummy_closure_params,
+                );
 
                 for (pname, _, _, is_value) in &param_info {
                     if *is_value || hidden_len_addrs.contains_key(pname) {

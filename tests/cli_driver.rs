@@ -35261,6 +35261,51 @@ fn bound_generic_procedure_actual_selects_procedure_dummy_specific() {
 }
 
 #[test]
+fn bound_procedure_dummy_forwards_contained_callback_closure() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=bound_procedure_dummy_forwards_contained_callback_closure count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type :: node_t\n    integer :: x = 0\n  end type node_t\n  type :: core_t\n  contains\n    generic :: get => get_by_path, get_array\n    procedure :: get_by_path\n    procedure :: get_array\n  end type core_t\n  abstract interface\n    subroutine cb_i(core, node, i, count)\n      import :: core_t, node_t\n      class(core_t), intent(inout) :: core\n      type(node_t), pointer, intent(in) :: node\n      integer, intent(in) :: i\n      integer, intent(in) :: count\n    end subroutine cb_i\n  end interface\ncontains\n  subroutine get_by_path(self, me, path, p)\n    class(core_t), intent(inout) :: self\n    type(node_t), pointer, intent(in) :: me\n    character(len=*), intent(in) :: path\n    type(node_t), pointer, intent(out) :: p\n    nullify(p)\n    if (associated(me)) self = self\n    if (len(path) == 0) error stop 9\n  end subroutine get_by_path\n\n  subroutine get_array(self, me, array_callback)\n    class(core_t), intent(inout) :: self\n    type(node_t), pointer, intent(in) :: me\n    procedure(cb_i) :: array_callback\n    integer :: i\n    do i = 1, 3\n      call array_callback(self, me, i, 3)\n    end do\n  end subroutine get_array\n\n  subroutine get_integer_vec(self, me, vec)\n    class(core_t), intent(inout) :: self\n    type(node_t), pointer, intent(in) :: me\n    integer, dimension(:), allocatable, intent(out) :: vec\n    logical :: initialized\n    initialized = .false.\n    call self%get(me, array_callback=fill)\n  contains\n    subroutine fill(core, node, i, count)\n      class(core_t), intent(inout) :: core\n      type(node_t), pointer, intent(in) :: node\n      integer, intent(in) :: i\n      integer, intent(in) :: count\n      if (.not. initialized) then\n        allocate(vec(count))\n        initialized = .true.\n      end if\n      if (.not. associated(node)) error stop 1\n      vec(i) = node%x + i\n      core = core\n    end subroutine fill\n  end subroutine get_integer_vec\nend module m\nprogram p\n  use m\n  implicit none\n  type(core_t) :: core\n  type(node_t), pointer :: root\n  integer, dimension(:), allocatable :: got\n  allocate(root)\n  root%x = 40\n  call get_integer_vec(core, root, got)\n  if (.not. allocated(got)) error stop 2\n  if (size(got) /= 3) error stop 3\n  if (any(got /= [41, 42, 43])) error stop 4\n  print *, got\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("bound_proc_dummy_closure_forward", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("bound proc dummy closure compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "bound proc dummy closure should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("bound proc dummy closure run failed to spawn");
+    assert!(
+        run.status.success(),
+        "bound proc dummy closure should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("41") && stdout.contains("42") && stdout.contains("43"),
+        "unexpected bound proc dummy closure output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn imported_generic_subroutine_with_optional_procedure_dummy_round_trips_through_amod() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

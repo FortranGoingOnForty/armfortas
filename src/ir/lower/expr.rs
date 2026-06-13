@@ -1294,7 +1294,7 @@ pub(crate) fn lower_expr_full(
                 let procptr_target = procedure_pointer_call_target(b, locals, st, &key);
                 let signature_key = procptr_target
                     .as_ref()
-                    .map(|(_, sig_key)| sig_key.clone())
+                    .map(|(_, _, sig_key)| sig_key.clone())
                     .unwrap_or_else(|| key.clone());
                 let has_named_interface = !internal_funcs
                     .is_some_and(|funcs| funcs.contains_key(&key))
@@ -2613,6 +2613,18 @@ pub(crate) fn lower_expr_full(
                     }
                 }
 
+                if procptr_target.is_none() {
+                    append_procedure_dummy_closure_args_for_call(
+                        b,
+                        locals,
+                        st,
+                        &callee_key,
+                        &arg_slots,
+                        contained_host_refs,
+                        &mut ref_arg_vals,
+                    );
+                }
+
                 // Host-association closure-passing ABI: append trailing
                 // pointer args for each host-local the callee references.
                 // Prefer the generic-resolved name's map entry; fall back
@@ -2634,6 +2646,8 @@ pub(crate) fn lower_expr_full(
                         closure_key,
                         &mut ref_arg_vals,
                     );
+                } else if let Some((_, closure_args, _)) = &procptr_target {
+                    ref_arg_vals.extend(closure_args.iter().copied());
                 }
 
                 // Look up callee return type from symbol table.
@@ -2641,7 +2655,7 @@ pub(crate) fn lower_expr_full(
                     callee_return_ir_type_for_caller(st, k, internal_funcs)
                 })
                 .unwrap_or(IrType::Int(IntWidth::I32));
-                let func_ref = if let Some((target, _)) = procptr_target {
+                let func_ref = if let Some((target, _, _)) = procptr_target {
                     FuncRef::Indirect(target)
                 } else {
                     same_unit_func_ref(

@@ -2670,7 +2670,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         procedure_pointer_call_target(b, &ctx.locals, ctx.st, &key);
                     let signature_key = procptr_target
                         .as_ref()
-                        .map(|(_, sig_key)| sig_key.clone())
+                        .map(|(_, _, sig_key)| sig_key.clone())
                         .unwrap_or_else(|| key.clone());
                     // Not an intrinsic — general subroutine call.
                     // Keyword-argument reordering (F2003 §12.4.1.2).
@@ -3014,6 +3014,19 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             }
                         }
                     }
+                    if procptr_target.is_none() {
+                        append_procedure_dummy_closure_args_for_call(
+                            b,
+                            &ctx.locals,
+                            ctx.st,
+                            &resolved_key,
+                            &arg_slots,
+                            Some(ctx.contained_host_refs),
+                            &mut arg_vals,
+                        );
+                    } else if let Some((_, closure_args, _)) = &procptr_target {
+                        arg_vals.extend(closure_args.iter().copied());
+                    }
                     // Host-association closure-passing ABI: if the
                     // callee is a contained procedure, append one
                     // address per host-local variable it reads or
@@ -3025,7 +3038,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     if procptr_target.is_none() {
                         append_host_closure_args(b, ctx, &resolved_key, &mut arg_vals);
                     }
-                    let func_ref = if let Some((target, _)) = procptr_target {
+                    let func_ref = if let Some((target, _, _)) = procptr_target {
                         FuncRef::Indirect(target)
                     } else {
                         same_unit_func_ref(

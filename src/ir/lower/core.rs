@@ -17368,6 +17368,16 @@ pub(super) fn emit_resolved_bound_proc_call(
         }
     }
 
+    append_procedure_dummy_closure_args_for_call(
+        b,
+        locals,
+        st,
+        &target_key,
+        &arg_slots,
+        contained_host_refs,
+        &mut call_args,
+    );
+
     let call_result = b.call(func_ref, call_args, ret_ty);
     if let Some(tl) = type_layouts {
         if let Some(type_name) = callee_return_stabilized_derived_type_name(st, &target_key) {
@@ -17974,7 +17984,7 @@ pub(super) fn procedure_pointer_call_target(
     locals: &HashMap<String, LocalInfo>,
     st: &SymbolTable,
     key: &str,
-) -> Option<(ValueId, String)> {
+) -> Option<(ValueId, Vec<ValueId>, String)> {
     let signature_key = procedure_pointer_signature_key(st, key)?;
     let info = locals.get(key)?;
     let load_ty = if info.ty.is_ptr() {
@@ -17982,7 +17992,136 @@ pub(super) fn procedure_pointer_call_target(
     } else {
         IrType::Ptr(Box::new(info.ty.clone()))
     };
-    Some((b.load_typed(info.addr, load_ty), signature_key))
+    Some((
+        b.load_typed(info.addr, load_ty),
+        procedure_dummy_closure_args_from_locals(b, locals, key),
+        signature_key,
+    ))
+}
+
+pub(super) fn procedure_dummy_closure_local_name(dummy_name: &str, slot_idx: usize) -> String {
+    format!("__proc_closure_{}_{}", dummy_name.to_lowercase(), slot_idx)
+}
+
+pub(super) fn procedure_dummy_closure_args_from_locals(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    dummy_name: &str,
+) -> Vec<ValueId> {
+    let ptr_ty = IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)));
+    (0..crate::sema::type_layout::PROC_PTR_CLOSURE_SLOTS)
+        .filter_map(|slot_idx| {
+            let key = procedure_dummy_closure_local_name(dummy_name, slot_idx);
+            locals
+                .get(&key)
+                .map(|info| b.load_typed(info.addr, ptr_ty.clone()))
+        })
+        .collect()
+}
+
+pub(super) fn procedure_dummy_closure_param_slots_for_scope(
+    st: &SymbolTable,
+    proc_scope_id: Option<crate::sema::symtab::ScopeId>,
+    dummy_name: &str,
+) -> bool {
+    let Some(scope_id) = proc_scope_id else {
+        return false;
+    };
+    let key = dummy_name.to_lowercase();
+    st.scope(scope_id)
+        .symbols
+        .get(&key)
+        .is_some_and(symbol_is_procedure_dummy)
+}
+
+pub(super) fn append_procedure_dummy_closure_args_for_call(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+    callee_key: &str,
+    arg_slots: &[Option<crate::ast::expr::Argument>],
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    out: &mut Vec<ValueId>,
+) {
+    let Some(scope) = callee_scope_for_lookup(st, callee_key) else {
+        return;
+    };
+    for (idx, arg_name) in scope.arg_order.iter().enumerate() {
+        let Some(sym) = scope.symbols.get(&arg_name.to_lowercase()) else {
+            continue;
+        };
+        if !symbol_is_procedure_dummy(sym) {
+            continue;
+        }
+        let mut closure_args = arg_slots
+            .get(idx)
+            .and_then(|slot| slot.as_ref())
+            .and_then(|arg| match &arg.value {
+                crate::ast::expr::SectionSubscript::Element(expr) => Some(
+                    procedure_actual_closure_args(b, locals, expr, st, contained_host_refs),
+                ),
+                _ => None,
+            })
+            .unwrap_or_default();
+        closure_args.truncate(crate::sema::type_layout::PROC_PTR_CLOSURE_SLOTS);
+        while closure_args.len() < crate::sema::type_layout::PROC_PTR_CLOSURE_SLOTS {
+            closure_args.push(null_procedure_closure_arg(b));
+        }
+        out.extend(closure_args);
+    }
+}
+
+fn null_procedure_closure_arg(b: &mut FuncBuilder) -> ValueId {
+    let zero = b.const_i64(0);
+    b.int_to_ptr(zero, IrType::Int(IntWidth::I8))
+}
+
+fn procedure_actual_closure_args(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+) -> Vec<ValueId> {
+    let Expr::Name { name } = &expr.node else {
+        return Vec::new();
+    };
+    let key = name.to_lowercase();
+    let forwarded = procedure_dummy_closure_args_from_locals(b, locals, &key);
+    if !forwarded.is_empty() {
+        return forwarded;
+    }
+    if find_linkable_symbol_any_scope(st, &key).is_none() {
+        return Vec::new();
+    }
+    let (_link_name, resolved_key) = resolved_symbol_call_target(st, &key, name);
+    let closure_key = if contained_host_refs
+        .map(|m| m.contains_key(&resolved_key))
+        .unwrap_or(false)
+    {
+        resolved_key.as_str()
+    } else {
+        key.as_str()
+    };
+    let mut closure_args = Vec::new();
+    append_host_closure_args_raw(
+        b,
+        locals,
+        contained_host_refs,
+        closure_key,
+        &mut closure_args,
+    );
+    closure_args
+}
+
+fn symbol_is_procedure_dummy(sym: &crate::sema::symtab::Symbol) -> bool {
+    sym.attrs.procedure_iface.is_some()
+        && (sym.attrs.external
+            || matches!(
+                sym.kind,
+                crate::sema::symtab::SymbolKind::ProcedurePointer
+                    | crate::sema::symtab::SymbolKind::ExternalProc
+            ))
 }
 
 pub(super) fn procedure_pointer_component_call_target(
