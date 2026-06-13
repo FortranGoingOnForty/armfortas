@@ -1,30 +1,33 @@
-//! Linear-scan register allocator for the x86_64 backend (x10a).
+//! Linear-scan register allocator for the x86_64 backend (x10a / x10a-1).
 //!
 //! Forked from `arm64::linearscan` (the MirView-share survey found the
 //! arm64 allocator too arm64-coupled to generalize cleanly — see the
-//! x10a sprint doc). This is the first correct version: it assigns
-//! registers and falls back to spilling, WITHOUT arm64's live-range
-//! splitter (that is a later optimization, not correctness).
+//! x10a sprint doc). Sort live intervals by start, walk in order,
+//! assign physical registers; on pressure, evict the furthest-ending
+//! active interval or spill. No live-range splitting yet (that and
+//! coalescing are x10a-2).
 //!
-//! ## Register pools — why so small (for now)
+//! ## Full register file via fixed intervals (x10a-1)
 //!
-//! x86 isel hard-codes physical registers all over: rax/rdx for idiv,
-//! imul-high, i128 pairs and returns; rcx for shift counts; rdi/rsi/
-//! rdx/rcx/r8/r9 and xmm0-7 for the SysV call sequence. Assigning a
-//! vreg to any of those risks a collision with an isel-placed `Reg`
-//! operand that overlaps the vreg's live range. Modelling those as
-//! fixed intervals is a later iteration; this version allocates ONLY
-//! registers isel never hard-codes:
-//!
-//!   GP: rbx, r12, r13, r14, r15  (callee-saved — survive calls)
-//!   FP: xmm8..xmm13              (caller-saved — clobbered by calls)
+//! x86 isel hard-codes physical registers everywhere: rax/rdx for idiv,
+//! i128 pairs and returns; rcx for shift counts; rdi/rsi/rdx/rcx/r8/r9
+//! and xmm0-7 for the SysV call sequence; and every Call clobbers all
+//! caller-saved registers. Rather than exclude those registers from the
+//! pool, the allocatable pool is the FULL file (GP minus rsp/rbp and the
+//! r10/r11 spill scratch; xmm0-13, with xmm14/15 scratch), and a
+//! fixed-interval check (`build_phys_occupancy` + `phys_free_over`)
+//! forbids assigning a vreg to register P over any range where isel
+//! references P. `implicit_phys_effects` supplies the register effects
+//! isel encodes in the opcode rather than the operand vector (Cltd/Cqto,
+//! Idiv, Call clobbers) — without it a wide pool miscompiles. The check
+//! subsumes call-crossing: a call occupies every caller-saved register,
+//! so a crossing interval lands on a callee-saved register or spills.
 //!
 //! r10/r11 and xmm14/xmm15 stay reserved as spill-reload scratch (the
-//! naive allocator's scratch set), kept OUT of the pool so a reload
-//! never clobbers an allocated value. GP allocations all land in
-//! callee-saved registers, so they survive calls automatically; FP
-//! call-crossing intervals have no safe callee-saved register on SysV
-//! and are spilled.
+//! naive allocator's set), kept OUT of the pool so a reload never
+//! clobbers an allocated value. The naive allocator remains the
+//! correctness reference, selected at O0 and behind
+//! `ARMFORTAS_USE_NAIVE_REGALLOC`.
 
 use super::liveness::{compute_liveness, LiveInterval, LivenessResult};
 use super::mir::{
@@ -39,9 +42,23 @@ use std::collections::{HashMap, HashSet};
 const GP_SCRATCH: [X86Reg; 2] = [X86Reg::R10, X86Reg::R11];
 const FP_SCRATCH: [X86Reg; 2] = [X86Reg::Xmm14, X86Reg::Xmm15];
 
-/// GP registers available for allocation: callee-saved only, none of
-/// which isel ever hard-codes.
-const GP_ALLOC_ORDER: [X86Reg; 5] = [
+/// GP registers available for allocation — the full file minus rsp/rbp
+/// (frame) and r10/r11 (spill scratch). Caller-saved first (free to use
+/// for intervals that don't cross a call; the fixed-interval check
+/// routes call-crossing intervals away from them), callee-saved last
+/// (cost a prologue save/restore). Assigning a vreg to a register isel
+/// also touches is prevented by the fixed-interval check, not by
+/// excluding the register here.
+const GP_ALLOC_ORDER: [X86Reg; 12] = [
+    // caller-saved
+    X86Reg::Rax,
+    X86Reg::Rcx,
+    X86Reg::Rdx,
+    X86Reg::Rsi,
+    X86Reg::Rdi,
+    X86Reg::R8,
+    X86Reg::R9,
+    // callee-saved
     X86Reg::Rbx,
     X86Reg::R12,
     X86Reg::R13,
@@ -49,9 +66,18 @@ const GP_ALLOC_ORDER: [X86Reg; 5] = [
     X86Reg::R15,
 ];
 
-/// XMM registers available for allocation: xmm8..xmm13 carry no fixed
-/// ABI role (xmm0-7 are arg/return, xmm14/xmm15 are spill scratch).
-const FP_ALLOC_ORDER: [X86Reg; 6] = [
+/// XMM registers available for allocation — xmm0..xmm13 (xmm14/xmm15 are
+/// spill scratch). All xmm are caller-saved on SysV; a call-crossing FP
+/// interval has no callee-saved xmm to land in and is spilled.
+const FP_ALLOC_ORDER: [X86Reg; 14] = [
+    X86Reg::Xmm0,
+    X86Reg::Xmm1,
+    X86Reg::Xmm2,
+    X86Reg::Xmm3,
+    X86Reg::Xmm4,
+    X86Reg::Xmm5,
+    X86Reg::Xmm6,
+    X86Reg::Xmm7,
     X86Reg::Xmm8,
     X86Reg::Xmm9,
     X86Reg::Xmm10,
@@ -65,6 +91,114 @@ fn is_callee_saved(reg: X86Reg) -> bool {
         reg,
         X86Reg::Rbx | X86Reg::R12 | X86Reg::R13 | X86Reg::R14 | X86Reg::R15
     )
+}
+
+/// Every caller-saved register a Call/CallReg clobbers (SysV: all GP
+/// except rbx/rbp/r12-r15, and all xmm). Used as the implicit defs of a
+/// call so the fixed-interval check keeps live values out of them across
+/// the call.
+const CALL_CLOBBER: [X86Reg; 25] = [
+    X86Reg::Rax,
+    X86Reg::Rcx,
+    X86Reg::Rdx,
+    X86Reg::Rsi,
+    X86Reg::Rdi,
+    X86Reg::R8,
+    X86Reg::R9,
+    X86Reg::R10,
+    X86Reg::R11,
+    X86Reg::Xmm0,
+    X86Reg::Xmm1,
+    X86Reg::Xmm2,
+    X86Reg::Xmm3,
+    X86Reg::Xmm4,
+    X86Reg::Xmm5,
+    X86Reg::Xmm6,
+    X86Reg::Xmm7,
+    X86Reg::Xmm8,
+    X86Reg::Xmm9,
+    X86Reg::Xmm10,
+    X86Reg::Xmm11,
+    X86Reg::Xmm12,
+    X86Reg::Xmm13,
+    X86Reg::Xmm14,
+    X86Reg::Xmm15,
+];
+
+/// Physical registers an opcode reads/writes IMPLICITLY — encoded by
+/// isel in the opcode rather than the operand vector. Returns
+/// (implicit uses, implicit defs). Without these the fixed-interval
+/// check would miss that Idiv clobbers rax:rdx or that a Call clobbers
+/// every caller-saved register, and a wide pool would miscompile.
+/// Verified against the isel physreg enumeration audit (2026-06-13).
+/// Shift counts, div dividend/result moves, call-arg setup, returns,
+/// and the AL varargs byte are NOT here — isel emits them as explicit
+/// `Reg` operands, which the occupancy walk already sees.
+fn implicit_phys_effects(opcode: X86Opcode) -> (&'static [X86Reg], &'static [X86Reg]) {
+    const RAX: [X86Reg; 1] = [X86Reg::Rax];
+    const RDX: [X86Reg; 1] = [X86Reg::Rdx];
+    const RAX_RDX: [X86Reg; 2] = [X86Reg::Rax, X86Reg::Rdx];
+    match opcode {
+        X86Opcode::Cltd | X86Opcode::Cqto => (&RAX, &RDX),
+        X86Opcode::Idiv => (&RAX_RDX, &RAX_RDX),
+        X86Opcode::Call | X86Opcode::CallReg => (&[], &CALL_CLOBBER),
+        _ => (&[], &[]),
+    }
+}
+
+/// Build, per physical register, the sorted positions where isel
+/// references it (explicit `Reg` in any operand or def, plus implicit
+/// effects). A vreg interval [s,e] may NOT use register P if any of
+/// P's occupied positions lies in [s,e] — that is the fixed-interval
+/// constraint. Position numbering matches `compute_liveness` (step 2
+/// per instruction, blocks in order).
+fn build_phys_occupancy(f: &X86Function) -> HashMap<X86Reg, Vec<u32>> {
+    let mut occ: HashMap<X86Reg, Vec<u32>> = HashMap::new();
+    let mut pos: u32 = 0;
+    for block in &f.blocks {
+        for inst in &block.insts {
+            let mut mark = |reg: X86Reg| occ.entry(reg).or_default().push(pos);
+            for op in inst.operands.iter().chain(inst.def.iter()) {
+                match op {
+                    X86Operand::Reg(r) => mark(*r),
+                    X86Operand::Mem { base, index, .. } => {
+                        if let Some(b) = base {
+                            mark(*b);
+                        }
+                        if let Some(i) = index {
+                            mark(*i);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let (iu, idf) = implicit_phys_effects(inst.opcode);
+            for &r in iu.iter().chain(idf.iter()) {
+                mark(r);
+            }
+            pos += 2;
+        }
+    }
+    for positions in occ.values_mut() {
+        positions.sort_unstable();
+        positions.dedup();
+    }
+    occ
+}
+
+/// Is register P free of any isel-fixed reference across [start, end]
+/// (inclusive)? Conservative-inclusive: a fixed reference exactly at the
+/// vreg's def or last-use position also blocks P (safe — coalescing
+/// such boundary cases is x10a-2's job).
+fn phys_free_over(occ: &HashMap<X86Reg, Vec<u32>>, reg: X86Reg, start: u32, end: u32) -> bool {
+    match occ.get(&reg) {
+        None => true,
+        Some(positions) => {
+            // First position >= start; if it's <= end, P is occupied.
+            let idx = positions.partition_point(|&p| p < start);
+            idx >= positions.len() || positions[idx] > end
+        }
+    }
 }
 
 fn is_fp_class(class: X86RegClass) -> bool {
@@ -131,6 +265,15 @@ pub fn linear_scan(f: &mut X86Function) -> AllocResult {
         .map(|i| (i.vreg, i.class))
         .collect();
 
+    // Fixed-interval occupancy: positions where isel references each
+    // physical register. A vreg may only take a register free of any
+    // such reference over its whole live range — this is what lets the
+    // pool include rax/rcx/rdx/rsi/rdi/r8/r9 and xmm0-7 safely. It also
+    // subsumes the call-crossing case: a call clobbers every
+    // caller-saved register, so a crossing interval is forced onto a
+    // callee-saved register or a spill with no special-casing.
+    let occ = build_phys_occupancy(f);
+
     let intervals: Vec<LiveInterval> = liveness.intervals.clone();
     for interval in &intervals {
         let is_fp = is_fp_class(interval.class);
@@ -141,60 +284,72 @@ pub fn linear_scan(f: &mut X86Function) -> AllocResult {
         };
         expire_intervals(active, free, interval.start);
 
-        // FP call-crossing intervals: the FP pool is caller-saved
-        // (clobbered by the call), and SysV has no callee-saved xmm, so
-        // spill rather than allocate. GP allocations are all
-        // callee-saved and survive calls, so no special case there.
-        if is_fp && interval.crosses_call {
-            let (sz, al) = spill_slot_size(interval.class);
-            let slot = f.alloc_frame_slot(sz, al);
-            spills.insert(interval.vreg, slot);
-            continue;
-        }
+        // First free register (pool preference order) with no fixed
+        // reference across [start,end]. A hint, when set, jumps the
+        // queue if it also passes.
+        let hinted: Option<X86Reg> = interval.hint.and_then(|h| {
+            FP_ALLOC_ORDER
+                .iter()
+                .chain(GP_ALLOC_ORDER.iter())
+                .copied()
+                .nth(h as usize)
+        });
+        let free_idx = hinted
+            .and_then(|hr| {
+                free.iter()
+                    .position(|&r| r == hr)
+                    .filter(|_| phys_free_over(&occ, hr, interval.start, interval.end))
+            })
+            .or_else(|| {
+                free.iter()
+                    .position(|&r| phys_free_over(&occ, r, interval.start, interval.end))
+            });
 
-        let reg_opt = if !free.is_empty() {
-            Some(free.remove(0))
-        } else {
-            None
-        };
-
-        if let Some(reg) = reg_opt {
+        if let Some(free_idx) = free_idx {
+            let reg = free.remove(free_idx);
             assignments.insert(interval.vreg, reg);
             active.push((reg, interval.end, interval.vreg));
             active.sort_by_key(|&(_, end, _)| end);
             if is_callee_saved(reg) {
                 callee_saved_used.insert(reg);
             }
-        } else if let Some(&(spill_reg, spill_end, victim)) = active.last() {
-            // No register free — spill the interval ending furthest.
-            let last_idx = active.len() - 1;
+            continue;
+        }
+
+        // No free register works. Evict the active interval that ends
+        // furthest among those whose register is fixed-free over our
+        // range; take it if it outlives us, otherwise spill ourselves.
+        let victim = active
+            .iter()
+            .enumerate()
+            .filter(|(_, &(reg, _, _))| phys_free_over(&occ, reg, interval.start, interval.end))
+            .max_by_key(|(_, &(_, end, _))| end)
+            .map(|(idx, &entry)| (idx, entry));
+
+        if let Some((vidx, (spill_reg, spill_end, victim_vreg))) = victim {
             if spill_end > interval.end {
-                // Evict the victim, take its register.
                 let vclass = vreg_class
-                    .get(&victim)
+                    .get(&victim_vreg)
                     .copied()
                     .unwrap_or(X86RegClass::Gp64);
                 let (sz, al) = spill_slot_size(vclass);
                 let slot = f.alloc_frame_slot(sz, al);
-                spills.insert(victim, slot);
-                assignments.remove(&victim);
+                spills.insert(victim_vreg, slot);
+                assignments.remove(&victim_vreg);
                 assignments.insert(interval.vreg, spill_reg);
-                active.remove(last_idx);
+                active.remove(vidx);
                 active.push((spill_reg, interval.end, interval.vreg));
                 active.sort_by_key(|&(_, end, _)| end);
                 if is_callee_saved(spill_reg) {
                     callee_saved_used.insert(spill_reg);
                 }
-            } else {
-                let (sz, al) = spill_slot_size(interval.class);
-                let slot = f.alloc_frame_slot(sz, al);
-                spills.insert(interval.vreg, slot);
+                continue;
             }
-        } else {
-            let (sz, al) = spill_slot_size(interval.class);
-            let slot = f.alloc_frame_slot(sz, al);
-            spills.insert(interval.vreg, slot);
         }
+
+        let (sz, al) = spill_slot_size(interval.class);
+        let slot = f.alloc_frame_slot(sz, al);
+        spills.insert(interval.vreg, slot);
     }
 
     let mut callee_saved: Vec<X86Reg> = callee_saved_used.into_iter().collect();
@@ -528,7 +683,8 @@ mod tests {
         }
         let mut mf = select_function(&func, &[], crate::target::TargetLayout::LP64);
         let result = linear_scan(&mut mf);
-        // Any GP assignment is callee-saved, so it must be recorded.
+        // The wide pool includes caller-saved registers; only the
+        // callee-saved ones that get used must be recorded for save/restore.
         for &reg in result.assignments.values() {
             if is_callee_saved(reg) {
                 assert!(
@@ -538,5 +694,40 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn implicit_effects_div_shift_call() {
+        // idiv reads+writes rax and rdx.
+        let (u, d) = implicit_phys_effects(X86Opcode::Idiv);
+        assert!(u.contains(&X86Reg::Rax) && u.contains(&X86Reg::Rdx));
+        assert!(d.contains(&X86Reg::Rax) && d.contains(&X86Reg::Rdx));
+        // cltd/cqto: use rax, def rdx.
+        let (u, d) = implicit_phys_effects(X86Opcode::Cltd);
+        assert_eq!(u, &[X86Reg::Rax]);
+        assert_eq!(d, &[X86Reg::Rdx]);
+        // A call clobbers every caller-saved register, none callee-saved.
+        let (_, d) = implicit_phys_effects(X86Opcode::Call);
+        assert!(d.contains(&X86Reg::Rax) && d.contains(&X86Reg::Xmm0));
+        assert!(!d.contains(&X86Reg::Rbx) && !d.contains(&X86Reg::R12));
+        // A plain ALU op has no implicit physreg effects.
+        let (u, d) = implicit_phys_effects(X86Opcode::Add);
+        assert!(u.is_empty() && d.is_empty());
+    }
+
+    #[test]
+    fn phys_free_over_boundaries() {
+        let mut occ: HashMap<X86Reg, Vec<u32>> = HashMap::new();
+        occ.insert(X86Reg::Rax, vec![4, 10]);
+        // [0,2] is before the first occupied position → free.
+        assert!(phys_free_over(&occ, X86Reg::Rax, 0, 2));
+        // [2,6] straddles position 4 → not free (inclusive).
+        assert!(!phys_free_over(&occ, X86Reg::Rax, 2, 6));
+        // [5,8] sits between 4 and 10 → free.
+        assert!(phys_free_over(&occ, X86Reg::Rax, 5, 8));
+        // Exact boundary at an occupied position → not free (conservative).
+        assert!(!phys_free_over(&occ, X86Reg::Rax, 4, 4));
+        // A register with no occupancy is always free.
+        assert!(phys_free_over(&occ, X86Reg::Rbx, 0, 1000));
     }
 }
