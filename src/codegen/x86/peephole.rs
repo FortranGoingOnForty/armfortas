@@ -49,8 +49,97 @@ pub fn run_peephole(f: &mut X86Function) -> usize {
 pub fn run_peephole_post_regalloc(f: &mut X86Function) -> usize {
     let mut changed = 0;
     changed += store_to_load_forward(f);
+    changed += lea_fold(f);
     changed += xor_zero(f);
     changed
+}
+
+/// Pattern 2 — lea folding (post-regalloc). An adjacent copy + add
+///
+///   mov %a, %d        (d != a)
+///   add %b, %d        (b != d)
+///
+/// becomes the non-destructive three-operand
+///
+///   lea (%a, %b), %d
+///
+/// dropping the copy. Post-regalloc because a 2-vreg address can't be
+/// represented pre-regalloc (the Mem operand carries physical registers
+/// only) and because the copy is a real instruction only once `a` and
+/// `d` are known to be distinct physical registers. lea does not write
+/// flags, so the fold is gated by flags-liveness: only when the add's
+/// RFLAGS result is dead. `b != d` is required for correctness — the
+/// folded lea reads the pre-copy registers, and `d`'s value comes from
+/// the copy being deleted. GP only.
+fn lea_fold(f: &mut X86Function) -> usize {
+    let mut changed = 0;
+    for block in &mut f.blocks {
+        let dead = flags_dead_after(&block.insts);
+        let mut out: Vec<X86Inst> = Vec::with_capacity(block.insts.len());
+        let mut i = 0;
+        while i < block.insts.len() {
+            if i + 1 < block.insts.len() {
+                if let Some(lea) = try_lea_fold(&block.insts[i], &block.insts[i + 1], dead[i + 1]) {
+                    out.push(lea);
+                    changed += 1;
+                    i += 2;
+                    continue;
+                }
+            }
+            out.push(block.insts[i].clone());
+            i += 1;
+        }
+        block.insts = out;
+    }
+    changed
+}
+
+/// The `mov %a,%d` + `add %b,%d` → `lea (%a,%b),%d` match. Returns the
+/// folded lea, or None if the pair does not qualify.
+fn try_lea_fold(mov: &X86Inst, add: &X86Inst, add_flags_dead: bool) -> Option<X86Inst> {
+    if !add_flags_dead || mov.opcode != X86Opcode::MovRR || add.opcode != X86Opcode::Add {
+        return None;
+    }
+    // mov: def = %d, operand 0 = %a.
+    let (Some(X86Operand::Reg(d)), Some(X86Operand::Reg(a))) =
+        (mov.def.as_ref(), mov.operands.first())
+    else {
+        return None;
+    };
+    let (d, a) = (*d, *a);
+    // add (two-address): def = %d, operands = [%d, %b].
+    let Some(X86Operand::Reg(add_def)) = add.def.as_ref() else {
+        return None;
+    };
+    let add_def = *add_def;
+    let (Some(X86Operand::Reg(add_op0)), Some(X86Operand::Reg(b))) =
+        (add.operands.first(), add.operands.get(1))
+    else {
+        return None;
+    };
+    if add_def != d || *add_op0 != d {
+        return None;
+    }
+    let b = *b;
+    // a != d (else the copy is a self-move and there is no win); b != d
+    // (else the index would read the value the deleted copy produced).
+    if a == d || b == d {
+        return None;
+    }
+    if !d.is_gp() || !a.is_gp() || !b.is_gp() {
+        return None;
+    }
+    Some(X86Inst {
+        opcode: X86Opcode::Lea,
+        size: add.size,
+        operands: vec![X86Operand::Mem {
+            base: Some(a),
+            index: Some(b),
+            scale: 1,
+            disp: 0,
+        }],
+        def: Some(X86Operand::Reg(d)),
+    })
 }
 
 /// The `disp` of a stack slot operand `[%rbp - n]` (base rbp, no index).
@@ -746,6 +835,77 @@ mod tests {
             f.blocks[0].insts[2].operands,
             vec![X86Operand::Reg(X86Reg::Rdx)]
         );
+    }
+
+    // ---- x10b post-regalloc: lea folding ----
+
+    fn movrr(d: X86Reg, s: X86Reg) -> X86Inst {
+        X86Inst {
+            opcode: X86Opcode::MovRR,
+            size: OpSize::Q,
+            operands: vec![X86Operand::Reg(s)],
+            def: Some(X86Operand::Reg(d)),
+        }
+    }
+
+    #[test]
+    fn lea_fold_basic() {
+        // mov %rsi,%rax; add %rcx,%rax; ret  =>  lea (%rsi,%rcx),%rax
+        let mut f = func_with(vec![
+            movrr(X86Reg::Rax, X86Reg::Rsi),
+            add_phys(X86Reg::Rax, X86Reg::Rcx),
+            ret(),
+        ]);
+        assert_eq!(lea_fold(&mut f), 1);
+        let insts = &f.blocks[0].insts;
+        assert_eq!(insts.len(), 2, "mov folded away: {:?}", insts);
+        assert_eq!(insts[0].opcode, X86Opcode::Lea);
+        assert_eq!(
+            insts[0].operands,
+            vec![X86Operand::Mem {
+                base: Some(X86Reg::Rsi),
+                index: Some(X86Reg::Rcx),
+                scale: 1,
+                disp: 0,
+            }]
+        );
+        assert_eq!(insts[0].def, Some(X86Operand::Reg(X86Reg::Rax)));
+    }
+
+    #[test]
+    fn lea_fold_blocked_when_flags_live() {
+        // mov; add; jcc — the add's flags feed the branch, so the flag
+        // write cannot be dropped.
+        let mut f = func_with(vec![
+            movrr(X86Reg::Rax, X86Reg::Rsi),
+            add_phys(X86Reg::Rax, X86Reg::Rcx),
+            jcc(X86Cond::E),
+        ]);
+        assert_eq!(lea_fold(&mut f), 0);
+        assert_eq!(f.blocks[0].insts[0].opcode, X86Opcode::MovRR);
+    }
+
+    #[test]
+    fn lea_fold_blocked_when_index_is_dest() {
+        // mov %rsi,%rax; add %rax,%rax — index == dest, folding would
+        // read the value the deleted copy produced.
+        let mut f = func_with(vec![
+            movrr(X86Reg::Rax, X86Reg::Rsi),
+            add_phys(X86Reg::Rax, X86Reg::Rax),
+            ret(),
+        ]);
+        assert_eq!(lea_fold(&mut f), 0);
+    }
+
+    #[test]
+    fn lea_fold_skips_self_move_source() {
+        // mov %rax,%rax; add %rcx,%rax — a == d, no copy to save.
+        let mut f = func_with(vec![
+            movrr(X86Reg::Rax, X86Reg::Rax),
+            add_phys(X86Reg::Rax, X86Reg::Rcx),
+            ret(),
+        ]);
+        assert_eq!(lea_fold(&mut f), 0);
     }
 
     #[test]
