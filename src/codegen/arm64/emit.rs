@@ -961,6 +961,8 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
         ArmOpcode::MulV4S => fmt_vbinop(inst, "mul", "4s"),
         ArmOpcode::NegV4S => fmt_vunop(inst, "neg", "4s"),
         ArmOpcode::NegV2D => fmt_vunop(inst, "neg", "2d"),
+        ArmOpcode::AbsV4S => fmt_vunop(inst, "abs", "4s"),
+        ArmOpcode::AbsV2D => fmt_vunop(inst, "abs", "2d"),
         ArmOpcode::FaddV4S => fmt_vbinop(inst, "fadd", "4s"),
         ArmOpcode::FaddV2D => fmt_vbinop(inst, "fadd", "2d"),
         ArmOpcode::FsubV4S => fmt_vbinop(inst, "fsub", "4s"),
