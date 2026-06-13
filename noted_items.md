@@ -247,3 +247,19 @@ Found during l04 (2026-06-12):
   argument-kind RESTRICTIONS (validation); this runtime value-range
   fix is separate. Owner: l05 (I/O + runtime) or a dedicated
   system-intrinsics pass.
+
+- **PRINT with a character format inserts spurious spaces** (found
+  l04, 2026-06-12): `print '(A,A,A)', 'x[', s(1:1), ']'` emits
+  `   x[ a ]` (leading spaces + spaces around the variable-length
+  item), while `write(*,'(A,A,A)') ...` emits `x[a]` correctly. PRINT
+  with an explicit char format is not honoring it like WRITE does.
+  Most fixtures dodge it via the harness's CHECK whitespace
+  normalization; bracketed-token output exposes it. Owner: l05 (I/O).
+
+- **No subroutine-as-function diagnostic** (found l04, 2026-06-12):
+  `r = system_clock()` and `r = split(s, set, p)` (intrinsic
+  subroutines used in function position) both compile silently. The
+  l04 doc assumed an existing "not a function" diagnostic to reuse,
+  but armfortas has none for any intrinsic subroutine. Adding one only
+  for SPLIT/TOKENIZE would be inconsistent. Owner: a dedicated
+  intrinsic-signature-checking pass (same owner as the arity gap).
