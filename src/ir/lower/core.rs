@@ -29858,8 +29858,12 @@ pub(super) fn actual_is_descriptor_backed(
         return false;
     };
 
+    // Only array-shaped descriptor storage is an unconditional descriptor
+    // fallback. Rank-0 allocatable/pointer components also occupy a 384-byte
+    // runtime descriptor, but an ordinary scalar dummy expects the component's
+    // payload address; descriptor association for scalar allocatable dummies is
+    // driven by the callee mask instead.
     field_uses_array_descriptor(field)
-        || (field.size == 384 && (field.allocatable || field.pointer))
 }
 
 const DESC_CHAR_SLOT_TABLE: i32 = 1 << 3;

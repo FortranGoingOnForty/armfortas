@@ -4676,6 +4676,51 @@ fn scalar_allocatable_components_store_into_descriptor_payloads() {
 }
 
 #[test]
+fn scalar_allocatable_component_actuals_pass_payloads() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=scalar_allocatable_component_actuals_pass_payloads count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  type :: value_t\n    real(8), allocatable :: dbl\n    logical, allocatable :: flag\n    integer, allocatable :: idx\n  end type value_t\n  type(value_t) :: v\n  character(len=64) :: buf\n  allocate(v%dbl, v%flag, v%idx)\n  v%dbl = 0.125d0\n  v%flag = .true.\n  v%idx = 42\n  call int_to_string(v%idx, buf)\n  if (trim(buf) /= '42') error stop 1\n  buf = ''\n  write(buf, '(I0)') v%idx\n  if (trim(buf) /= '42') error stop 2\n  call real_to_string(v%dbl, buf)\n  if (trim(adjustl(buf)) /= '0.125') error stop 3\n  buf = ''\n  write(buf, '(F7.3)') v%dbl\n  if (trim(adjustl(buf)) /= '0.125') error stop 4\n  call logical_to_string(v%flag, buf)\n  if (trim(buf) /= 'T') error stop 5\n  print *, 'ok'\ncontains\n  subroutine int_to_string(x, out)\n    integer, intent(in) :: x\n    character(len=*), intent(out) :: out\n    write(out, '(I0)') x\n  end subroutine int_to_string\n  subroutine real_to_string(x, out)\n    real(8), intent(in) :: x\n    character(len=*), intent(out) :: out\n    write(out, '(F7.3)') x\n  end subroutine real_to_string\n  subroutine logical_to_string(x, out)\n    logical, intent(in) :: x\n    character(len=*), intent(out) :: out\n    if (x) then\n      out = 'T'\n    else\n      out = 'F'\n    end if\n  end subroutine logical_to_string\nend program p\n",
+        "scalar_alloc_component_actual.f90",
+    );
+    let out = unique_path("scalar_alloc_component_actual", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("scalar allocatable component actual compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "scalar allocatable component actual compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("scalar allocatable component actual run failed");
+    assert!(
+        run.status.success(),
+        "scalar allocatable component actual run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected scalar allocatable component actual output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn pointer_function_result_associated_lowers_without_raw_symbol() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
