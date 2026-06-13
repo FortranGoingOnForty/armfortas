@@ -35299,6 +35299,50 @@ fn procedure_pointer_component_call_updates_integer_argument() {
 }
 
 #[test]
+fn procedure_pointer_component_default_passes_receiver() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=procedure_pointer_component_default_passes_receiver count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type :: core\n    integer :: seen = 0\n    procedure(parser), pointer :: parse => parse_impl\n  end type\n\n  abstract interface\n    subroutine parser(self, value)\n      import :: core\n      class(core), intent(inout) :: self\n      integer, intent(in) :: value\n    end subroutine\n  end interface\ncontains\n  subroutine parse_impl(self, value)\n    class(core), intent(inout) :: self\n    integer, intent(in) :: value\n    self%seen = value\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(core) :: c\n  call c%parse(7)\n  if (c%seen /= 7) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("procptr_component_pass_receiver", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("default-pass procptr component compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "default-pass procptr component compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("default-pass procptr component run failed");
+    assert!(
+        run.status.success(),
+        "default-pass procptr component run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected default-pass procptr component output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn imported_procptr_component_call_passes_assumed_shape_descriptors() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

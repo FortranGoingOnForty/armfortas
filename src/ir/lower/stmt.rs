@@ -2309,7 +2309,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         }
                     }
                 }
-                if let Some((target, closure_args, signature_key)) =
+                if let Some((target, closure_args, signature_key, procptr_nopass)) =
                     procedure_pointer_component_call_target(
                         b,
                         &ctx.locals,
@@ -2318,7 +2318,13 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         ctx.type_layouts,
                     )
                 {
-                    let arg_slots = reorder_args_by_keyword_slots(args, &signature_key, ctx.st);
+                    let formal_skip = if procptr_nopass { 0 } else { 1 };
+                    let arg_slots = reorder_args_by_keyword_slots_with_formal_skip(
+                        args,
+                        &signature_key,
+                        ctx.st,
+                        formal_skip,
+                    );
                     let abi_lookup_keys = procedure_abi_lookup_keys(ctx.st, &[&signature_key]);
                     let abi_primary_key = abi_lookup_keys
                         .first()
@@ -2348,15 +2354,47 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     });
                     let mut arg_vals: Vec<ValueId> = Vec::with_capacity(arg_slots.len());
                     for (i, slot) in arg_slots.iter().enumerate() {
-                        let is_value = value_mask
-                            .as_ref()
-                            .map(|mask| mask.get(i).copied().unwrap_or(false))
-                            .unwrap_or(false);
                         let mask_wants_descriptor = desc_mask
                             .as_ref()
                             .map(|mask| mask.get(i).copied().unwrap_or(false))
                             .unwrap_or(false);
                         let wants_bind_c_char = bind_c_char_mask
+                            .as_ref()
+                            .map(|mask| mask.get(i).copied().unwrap_or(false))
+                            .unwrap_or(false);
+                        if !procptr_nopass && i == 0 {
+                            arg_vals.push(if mask_wants_descriptor && !wants_bind_c_char {
+                                lower_arg_descriptor_full(
+                                    b,
+                                    &ctx.locals,
+                                    base,
+                                    ctx.st,
+                                    Some(ctx.type_layouts),
+                                    Some(ctx.internal_funcs),
+                                    Some(ctx.contained_host_refs),
+                                    Some(ctx.descriptor_params),
+                                    false,
+                                )
+                            } else {
+                                let dummy_is_class = class_mask
+                                    .as_ref()
+                                    .map(|mask| mask.get(i).copied().unwrap_or(false))
+                                    .unwrap_or(false);
+                                lower_arg_by_ref_for_dummy_full(
+                                    b,
+                                    &ctx.locals,
+                                    base,
+                                    ctx.st,
+                                    Some(ctx.type_layouts),
+                                    Some(ctx.internal_funcs),
+                                    Some(ctx.contained_host_refs),
+                                    Some(ctx.descriptor_params),
+                                    dummy_is_class,
+                                )
+                            });
+                            continue;
+                        }
+                        let is_value = value_mask
                             .as_ref()
                             .map(|mask| mask.get(i).copied().unwrap_or(false))
                             .unwrap_or(false);

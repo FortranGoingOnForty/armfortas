@@ -1105,6 +1105,9 @@ fn emit_type(out: &mut String, name: &str, type_layouts: &TypeLayoutRegistry) {
             if field.procedure_pointer {
                 attrs.push_str(" @procptr");
             }
+            if field.procedure_pointer_nopass {
+                attrs.push_str(" @nopass");
+            }
             if field.target {
                 attrs.push_str(" @target");
             }
@@ -2029,12 +2032,14 @@ fn parse_type(
                 let mut target = false;
                 let mut declared_array = false;
                 let mut procedure_pointer = false;
+                let mut procedure_pointer_nopass = false;
                 let mut default_init = None;
                 for token in flag_tail.split_whitespace() {
                     match token {
                         "@allocatable" => allocatable = true,
                         "@pointer" => pointer = true,
                         "@procptr" => procedure_pointer = true,
+                        "@nopass" => procedure_pointer_nopass = true,
                         "@target" => target = true,
                         "@declared_array" => declared_array = true,
                         _ => {
@@ -2057,6 +2062,7 @@ fn parse_type(
                     pointer,
                     target,
                     procedure_pointer,
+                    procedure_pointer_nopass,
                     default_init,
                 });
             }

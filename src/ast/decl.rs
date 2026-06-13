@@ -166,6 +166,7 @@ pub enum Attribute {
     Protected,
     Contiguous,
     External,
+    NoPass,
     Intrinsic,
     Bind(Option<String>), // bind(c, name="cfunc")
     Public,

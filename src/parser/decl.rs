@@ -1025,7 +1025,11 @@ impl<'a> Parser<'a> {
                                 self.advance();
                                 comp_attrs.push(crate::ast::decl::Attribute::Pointer);
                             }
-                            "nopass" | "pass" | "deferred" | "non_overridable" => {
+                            "nopass" => {
+                                self.advance();
+                                comp_attrs.push(crate::ast::decl::Attribute::NoPass);
+                            }
+                            "pass" | "deferred" | "non_overridable" => {
                                 self.advance();
                             }
                             _ => {

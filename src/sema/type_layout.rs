@@ -62,6 +62,7 @@ pub struct FieldLayout {
     pub pointer: bool,
     pub target: bool,
     pub procedure_pointer: bool,
+    pub procedure_pointer_nopass: bool,
     pub default_init: Option<FieldDefaultInit>,
 }
 
@@ -839,6 +840,10 @@ pub fn compute_layout_with_attrs(
                     && matches!(ti, TypeInfo::Derived(_))
                     && dims.is_empty()
                     && !declared_array;
+                let procedure_pointer_nopass = is_proc_pointer_component
+                    && attrs
+                        .iter()
+                        .any(|a| matches!(a, crate::ast::decl::Attribute::NoPass));
                 let (elem_size, elem_align) =
                     if matches!(&ti, TypeInfo::Character { len: None, .. })
                         && (is_allocatable || is_pointer)
@@ -921,6 +926,7 @@ pub fn compute_layout_with_attrs(
                     pointer: is_pointer,
                     target: is_target,
                     procedure_pointer: is_proc_pointer_component,
+                    procedure_pointer_nopass,
                     default_init,
                 });
                 offset += field_size;
@@ -1155,6 +1161,7 @@ mod tests {
                     pointer: false,
                     target: false,
                     procedure_pointer: false,
+                    procedure_pointer_nopass: false,
                     default_init: None,
                 },
                 FieldLayout {
@@ -1168,6 +1175,7 @@ mod tests {
                     pointer: false,
                     target: false,
                     procedure_pointer: false,
+                    procedure_pointer_nopass: false,
                     default_init: None,
                 },
             ],
@@ -1207,6 +1215,7 @@ mod tests {
                     pointer: false,
                     target: false,
                     procedure_pointer: false,
+                    procedure_pointer_nopass: false,
                     default_init: None,
                 },
                 FieldLayout {
@@ -1220,6 +1229,7 @@ mod tests {
                     pointer: false,
                     target: false,
                     procedure_pointer: false,
+                    procedure_pointer_nopass: false,
                     default_init: None,
                 },
                 FieldLayout {
@@ -1233,6 +1243,7 @@ mod tests {
                     pointer: false,
                     target: false,
                     procedure_pointer: false,
+                    procedure_pointer_nopass: false,
                     default_init: None,
                 },
             ],

@@ -2110,6 +2110,7 @@ fn attrs_to_symbol_attrs(attrs: &[Attribute], default_access: Access) -> SymbolA
             Attribute::Parameter => sa.parameter = true,
             Attribute::Value => sa.value = true,
             Attribute::External => sa.external = true,
+            Attribute::NoPass => {}
             Attribute::Intrinsic => sa.intrinsic = true,
             Attribute::Public => sa.access = Access::Public,
             Attribute::Private => sa.access = Access::Private,

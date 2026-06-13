@@ -17777,7 +17777,7 @@ pub(super) fn procedure_pointer_component_call_target(
     expr: &crate::ast::expr::SpannedExpr,
     st: &SymbolTable,
     type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
-) -> Option<(ValueId, Vec<ValueId>, String)> {
+) -> Option<(ValueId, Vec<ValueId>, String, bool)> {
     let (field_ptr, field) = resolve_component_field_access(b, locals, expr, st, type_layouts)?;
     if !field.pointer || !field.procedure_pointer {
         return None;
@@ -17796,7 +17796,12 @@ pub(super) fn procedure_pointer_component_call_target(
         let slot_ptr = b.gep(field_ptr, vec![offset], IrType::Int(IntWidth::I8));
         closure_args.push(b.load_typed(slot_ptr, load_ty.clone()));
     }
-    Some((target, closure_args, signature_name.to_lowercase()))
+    Some((
+        target,
+        closure_args,
+        signature_name.to_lowercase(),
+        field.procedure_pointer_nopass,
+    ))
 }
 
 pub(super) fn procedure_pointer_symbol_addr_elem_type(info: &LocalInfo) -> IrType {

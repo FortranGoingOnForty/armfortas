@@ -2712,11 +2712,14 @@ pub(crate) fn lower_expr_full(
                             // stdlib_hashmaps where `map % hasher(key)`
                             // dispatches through a proc-pointer field.
                             if bp_opt.is_none() {
-                                if let Some((target_ptr, closure_args, signature_key)) =
-                                    procedure_pointer_component_call_target(
-                                        b, locals, callee, st, tl,
-                                    )
-                                {
+                                if let Some((
+                                    target_ptr,
+                                    closure_args,
+                                    signature_key,
+                                    procptr_nopass,
+                                )) = procedure_pointer_component_call_target(
+                                    b, locals, callee, st, tl,
+                                ) {
                                     let abi_lookup_keys =
                                         procedure_abi_lookup_keys(st, &[&signature_key]);
                                     let ret_ty = first_procedure_lookup(&abi_lookup_keys, |k| {
@@ -2748,35 +2751,26 @@ pub(crate) fn lower_expr_full(
                                                 cached_param_mask_for_lookup(st, m, k)
                                             })
                                         });
-                                    let mut arg_vals: Vec<ValueId> = Vec::with_capacity(args.len());
-                                    for (i, arg) in args.iter().enumerate() {
-                                        if let crate::ast::expr::SectionSubscript::Element(e) =
-                                            &arg.value
-                                        {
-                                            let mask_says_descriptor = callee_descriptor_args
-                                                .as_ref()
-                                                .map(|mask| mask.get(i).copied().unwrap_or(false))
-                                                .unwrap_or(false);
-                                            // Fallback: if the lookup missed
-                                            // (abstract iface not in
-                                            // descriptor_params), inspect the
-                                            // actual itself. A descriptor-
-                                            // backed local must be passed by
-                                            // descriptor regardless.
-                                            let actual_uses_descriptor =
-                                                actual_is_descriptor_backed(
-                                                    locals,
-                                                    e,
-                                                    st,
-                                                    type_layouts,
-                                                );
-                                            let wants_descriptor =
-                                                mask_says_descriptor || actual_uses_descriptor;
-                                            let v = if wants_descriptor {
+                                    let formal_skip = if procptr_nopass { 0 } else { 1 };
+                                    let arg_slots = reorder_args_by_keyword_slots_with_formal_skip(
+                                        args,
+                                        &signature_key,
+                                        st,
+                                        formal_skip,
+                                    );
+                                    let mut arg_vals: Vec<ValueId> =
+                                        Vec::with_capacity(arg_slots.len());
+                                    for (i, slot) in arg_slots.iter().enumerate() {
+                                        let mask_says_descriptor = callee_descriptor_args
+                                            .as_ref()
+                                            .map(|mask| mask.get(i).copied().unwrap_or(false))
+                                            .unwrap_or(false);
+                                        if !procptr_nopass && i == 0 {
+                                            arg_vals.push(if mask_says_descriptor {
                                                 lower_arg_descriptor_full(
                                                     b,
                                                     locals,
-                                                    e,
+                                                    base,
                                                     st,
                                                     type_layouts,
                                                     internal_funcs,
@@ -2785,18 +2779,55 @@ pub(crate) fn lower_expr_full(
                                                     false,
                                                 )
                                             } else {
-                                                lower_arg_by_ref_full(
-                                                    b,
-                                                    locals,
-                                                    e,
-                                                    st,
-                                                    type_layouts,
-                                                    internal_funcs,
-                                                    contained_host_refs,
-                                                    descriptor_params,
-                                                )
-                                            };
-                                            arg_vals.push(v);
+                                                obj_addr
+                                            });
+                                            continue;
+                                        }
+                                        if let Some(arg) = slot {
+                                            if let crate::ast::expr::SectionSubscript::Element(e) =
+                                                &arg.value
+                                            {
+                                                // Fallback: if the lookup missed
+                                                // (abstract iface not in
+                                                // descriptor_params), inspect the
+                                                // actual itself. A descriptor-
+                                                // backed local must be passed by
+                                                // descriptor regardless.
+                                                let actual_uses_descriptor =
+                                                    actual_is_descriptor_backed(
+                                                        locals,
+                                                        e,
+                                                        st,
+                                                        type_layouts,
+                                                    );
+                                                let wants_descriptor =
+                                                    mask_says_descriptor || actual_uses_descriptor;
+                                                let v = if wants_descriptor {
+                                                    lower_arg_descriptor_full(
+                                                        b,
+                                                        locals,
+                                                        e,
+                                                        st,
+                                                        type_layouts,
+                                                        internal_funcs,
+                                                        contained_host_refs,
+                                                        descriptor_params,
+                                                        false,
+                                                    )
+                                                } else {
+                                                    lower_arg_by_ref_full(
+                                                        b,
+                                                        locals,
+                                                        e,
+                                                        st,
+                                                        type_layouts,
+                                                        internal_funcs,
+                                                        contained_host_refs,
+                                                        descriptor_params,
+                                                    )
+                                                };
+                                                arg_vals.push(v);
+                                            }
                                         }
                                     }
                                     arg_vals.extend(closure_args);
