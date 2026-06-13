@@ -6,7 +6,6 @@
 ! 16-byte integers (kind 16), so the precondition holds unconditionally.
 ! FLAGS: --std=f2023
 ! EXIT_CODE: 0
-! XFAIL: f2023 SELECTED_LOGICAL_KIND not implemented (l04); see .docs/audits/f2023-feature-matrix.md
 program selected
   implicit none
 
