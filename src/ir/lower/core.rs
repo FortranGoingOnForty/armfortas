@@ -603,6 +603,7 @@ pub(super) fn function_hidden_result_abi(
     return_type: Option<&TypeSpec>,
     decls: &[crate::ast::decl::SpannedDecl],
     bind: Option<&crate::ast::unit::BindInfo>,
+    st: Option<&SymbolTable>,
 ) -> HiddenResultAbi {
     use crate::ast::decl::Attribute;
     let result_key = result
@@ -646,7 +647,7 @@ pub(super) fn function_hidden_result_abi(
             }
             if bind.is_none()
                 && !decl_is_pointer(&result_key, decls)
-                && derived_type_name_for_result_var(&return_type.cloned(), &result_key, decls)
+                && derived_type_name_for_result_var(&return_type.cloned(), &result_key, decls, st)
                     .is_some()
             {
                 return HiddenResultAbi::DerivedAggregate;
@@ -667,7 +668,7 @@ pub(super) fn function_hidden_result_abi(
     }
     if bind.is_none()
         && !decl_is_pointer(&result_key, decls)
-        && derived_type_name_for_result_var(&return_type.cloned(), &result_key, decls).is_some()
+        && derived_type_name_for_result_var(&return_type.cloned(), &result_key, decls, st).is_some()
     {
         return HiddenResultAbi::DerivedAggregate;
     }
@@ -762,8 +763,17 @@ pub(super) fn collect_alloc_return_funcs(unit: &ProgramUnit, out: &mut HashSet<S
             bind,
             ..
         } => {
-            if function_hidden_result_abi(name, result, return_type.as_ref(), decls, bind.as_ref())
-                == HiddenResultAbi::ArrayDescriptor
+            // st: None is fine here — only the ArrayDescriptor answer is
+            // consumed, and the enumeration refinement only moves results
+            // out of DerivedAggregate.
+            if function_hidden_result_abi(
+                name,
+                result,
+                return_type.as_ref(),
+                decls,
+                bind.as_ref(),
+                None,
+            ) == HiddenResultAbi::ArrayDescriptor
             {
                 out.insert(name.to_lowercase());
             }
@@ -13515,6 +13525,22 @@ pub(super) fn generic_actual_expr_type_info(
                     st.find_symbol_any_scope(&key)
                         .and_then(|sym| sym.type_info.clone())
                 });
+            // F2023 7.6.2: enumeration values lower to plain i32
+            // scalars, so the LocalInfo types them Integer and generic
+            // dispatch would route the actual to an INTEGER specific.
+            // The symbol table is the only carrier of the enumeration
+            // identity — honor it when the local corroborates (plain
+            // scalar, no derived/char/class storage).
+            if let Some(TypeInfo::Enumeration(_)) = symbol_ti.as_ref() {
+                let local_is_plain_scalar = locals.get(&key).is_none_or(|info| {
+                    info.char_kind == CharKind::None
+                        && info.derived_type.is_none()
+                        && !info.is_class
+                });
+                if local_is_plain_scalar {
+                    return symbol_ti;
+                }
+            }
             name_expr_type_info(locals.get(&key), symbol_ti.as_ref())
         }
         Expr::ComponentAccess { base, component } => {
@@ -13543,6 +13569,15 @@ pub(super) fn generic_actual_expr_type_info(
                 .map(|field| field.type_info.clone())
         }
         Expr::FunctionCall { callee, args } => {
+            // Enumeration constructor (R771): color(n) is a value of
+            // the enumeration type, not an integer.
+            if let Expr::Name { name } = &callee.node {
+                if let Some(sym) = st.find_symbol_any_scope(&name.to_lowercase()) {
+                    if matches!(sym.kind, crate::sema::symtab::SymbolKind::EnumerationType) {
+                        return sym.type_info.clone();
+                    }
+                }
+            }
             let array_info = match &callee.node {
                 Expr::Name { name } => locals.get(&name.to_lowercase()).cloned(),
                 _ => None,
@@ -18556,6 +18591,7 @@ pub(super) fn allocate_runtime_shape_array_result(
 pub(super) fn arg_derived_type_name(
     arg_name: &str,
     decls: &[crate::ast::decl::SpannedDecl],
+    st: Option<&SymbolTable>,
 ) -> Option<String> {
     let key = arg_name.to_lowercase();
     for decl in decls {
@@ -18568,6 +18604,11 @@ pub(super) fn arg_derived_type_name(
             for entity in entities {
                 if entity.name.to_lowercase() == key {
                     if let TypeSpec::Type(ref name) | TypeSpec::Class(ref name) = type_spec {
+                        // TYPE(enumeration) dummies are plain by-ref
+                        // i32 scalars, not derived aggregates.
+                        if type_name_is_enumeration(name, st) {
+                            return None;
+                        }
                         return Some(name.clone());
                     }
                 }
@@ -18756,15 +18797,31 @@ pub(super) fn collect_referenced_names(stmt: &SpannedStmt, out: &mut Vec<String>
     }
 }
 
+/// True when `TYPE(name)` names an F2023 enumeration type rather
+/// than a derived type — enumeration values are plain default-integer
+/// ordinals, so results and locals of the type never take the
+/// derived-aggregate path. `None` symbol table (AST-only callers)
+/// keeps the historical derived classification.
+fn type_name_is_enumeration(name: &str, st: Option<&SymbolTable>) -> bool {
+    st.and_then(|st| st.find_symbol_any_scope(&name.to_lowercase()))
+        .is_some_and(|sym| matches!(sym.kind, crate::sema::symtab::SymbolKind::EnumerationType))
+}
+
 /// Extract the derived-type name from a function `return_type`
 /// declaration. Returns `Some("vec")` for `type(vec) function f()` and
 /// `None` for intrinsic-typed returns. Used by the Function lowering
 /// arm to decide whether the result variable needs derived-type
 /// storage and metadata.
-pub(super) fn derived_type_name_for_return(return_type: &Option<TypeSpec>) -> Option<String> {
+pub(super) fn derived_type_name_for_return(
+    return_type: &Option<TypeSpec>,
+    st: Option<&SymbolTable>,
+) -> Option<String> {
     if let Some(TypeSpec::Type(name)) = return_type {
         let lower = name.to_lowercase();
         if lower == "c_ptr" || lower == "c_funptr" {
+            return None;
+        }
+        if type_name_is_enumeration(name, st) {
             return None;
         }
         Some(name.clone())
@@ -18785,8 +18842,9 @@ pub(super) fn derived_type_name_for_result_var(
     return_type: &Option<TypeSpec>,
     result_name: &str,
     decls: &[crate::ast::decl::SpannedDecl],
+    st: Option<&SymbolTable>,
 ) -> Option<String> {
-    if let Some(n) = derived_type_name_for_return(return_type) {
+    if let Some(n) = derived_type_name_for_return(return_type, st) {
         return Some(n);
     }
     let key = result_name.to_lowercase();
@@ -18802,6 +18860,9 @@ pub(super) fn derived_type_name_for_result_var(
                     if let TypeSpec::Type(name) = type_spec {
                         let lower = name.to_lowercase();
                         if lower == "c_ptr" || lower == "c_funptr" {
+                            return None;
+                        }
+                        if type_name_is_enumeration(name, st) {
                             return None;
                         }
                         return Some(name.clone());
@@ -19166,7 +19227,7 @@ pub(super) fn build_host_ref_params(
         let large_explicit_shape = host_ref_explicit_array_uses_descriptor(&dims, &elem_ty, layout);
         let descriptor_arg =
             (uses_desc || alloc || large_explicit_shape) && !uses_string_descriptor;
-        let derived_type = arg_derived_type_name(hname, host_decls);
+        let derived_type = arg_derived_type_name(hname, host_decls, Some(st));
         let ptr_ty = by_ref_storage_ir_type(
             &elem_ty,
             descriptor_arg,
