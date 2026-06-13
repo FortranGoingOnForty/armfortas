@@ -10917,6 +10917,69 @@ fn operator_interface_specific_candidates(
     (!all_candidates.is_empty()).then_some(all_candidates)
 }
 
+fn operator_specific_candidates(
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    iface_name: &str,
+    operand_types: &[Option<&crate::sema::symtab::TypeInfo>],
+) -> Option<Vec<SpecificProcCandidate>> {
+    let mut all_candidates =
+        operator_interface_specific_candidates(st, iface_name).unwrap_or_default();
+    let mut seen_candidates: HashSet<(String, crate::sema::symtab::ScopeId)> = all_candidates
+        .iter()
+        .map(|candidate| (candidate.name.to_ascii_lowercase(), candidate.owner_scope))
+        .collect();
+    append_type_bound_operator_specific_candidates(
+        st,
+        type_layouts,
+        iface_name,
+        operand_types,
+        &mut all_candidates,
+        &mut seen_candidates,
+    );
+    (!all_candidates.is_empty()).then_some(all_candidates)
+}
+
+fn append_type_bound_operator_specific_candidates(
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    iface_name: &str,
+    operand_types: &[Option<&crate::sema::symtab::TypeInfo>],
+    specifics: &mut Vec<SpecificProcCandidate>,
+    seen: &mut HashSet<(String, crate::sema::symtab::ScopeId)>,
+) {
+    let Some(tl) = type_layouts else {
+        return;
+    };
+    let proc_scope_id = current_proc_scope();
+    for operand_ti in operand_types.iter().flatten() {
+        let raw_type_name = match operand_ti {
+            crate::sema::symtab::TypeInfo::Derived(name)
+            | crate::sema::symtab::TypeInfo::Class(name) => name,
+            _ => continue,
+        };
+        let layout_name =
+            canonical_layout_type_name_for_scope(st, proc_scope_id, raw_type_name, tl)
+                .unwrap_or_else(|| raw_type_name.clone());
+        let Some(layout) = tl.get(&layout_name) else {
+            continue;
+        };
+        for proc in layout.bound_proc_candidates(iface_name) {
+            let specific_name = proc.abi_name.to_ascii_lowercase();
+            let owner_scope = procedure_scope_by_name(st, &specific_name)
+                .and_then(|scope| scope.parent)
+                .or(proc_scope_id)
+                .unwrap_or(0);
+            if seen.insert((specific_name.clone(), owner_scope)) {
+                specifics.push(SpecificProcCandidate {
+                    name: specific_name,
+                    owner_scope,
+                });
+            }
+        }
+    }
+}
+
 pub(super) fn resolve_generic_call_slots(
     st: &SymbolTable,
     b: &FuncBuilder,
@@ -13417,7 +13480,8 @@ pub(super) fn defined_binary_operator_result_type_info(
     right_ti: Option<&crate::sema::symtab::TypeInfo>,
 ) -> Option<crate::sema::symtab::TypeInfo> {
     let iface_name = binary_op_interface_name(op)?;
-    let specifics = operator_interface_specific_candidates(st, &iface_name)?;
+    let specifics =
+        operator_specific_candidates(st, type_layouts, &iface_name, &[left_ti, right_ti])?;
     let left_actual_rank =
         locals.and_then(|locals| actual_expr_rank(left_expr, locals, st, type_layouts));
     let right_actual_rank =
@@ -13555,9 +13619,14 @@ pub(super) fn resolve_defined_binary_operator_specific_by_semantics(
     right_expr: &crate::ast::expr::SpannedExpr,
 ) -> Option<String> {
     let iface_name = binary_op_interface_name(op)?;
-    let specifics = operator_interface_specific_candidates(st, &iface_name)?;
     let left_ti = operator_expr_type_info(left_expr, locals, st, type_layouts);
     let right_ti = operator_expr_type_info(right_expr, locals, st, type_layouts);
+    let specifics = operator_specific_candidates(
+        st,
+        type_layouts,
+        &iface_name,
+        &[left_ti.as_ref(), right_ti.as_ref()],
+    )?;
     if operator_builtin_intrinsic_operand(left_ti.as_ref())
         && operator_builtin_intrinsic_operand(right_ti.as_ref())
     {
@@ -14993,10 +15062,14 @@ pub(super) fn resolve_operator_overload(
         return None;
     }
     let iface_name = binary_op_interface_name(op)?;
-    let all_candidates = operator_interface_specific_candidates(st, &iface_name)?;
-
     let left_semantic_ti = operator_expr_type_info(left_expr, Some(locals), st, type_layouts);
     let right_semantic_ti = operator_expr_type_info(right_expr, Some(locals), st, type_layouts);
+    let all_candidates = operator_specific_candidates(
+        st,
+        type_layouts,
+        &iface_name,
+        &[left_semantic_ti.as_ref(), right_semantic_ti.as_ref()],
+    )?;
     let semantic_candidates: Vec<SpecificProcCandidate> = all_candidates
         .iter()
         .filter_map(|candidate| {

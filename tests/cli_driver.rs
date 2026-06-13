@@ -38972,6 +38972,43 @@ fn user_op_dispatch_rank_filters_scalar_actual_to_scalar_specific() {
 }
 
 #[test]
+fn type_bound_defined_operator_accepts_character_result_left_operand() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=type_bound_defined_operator_accepts_character_result_left_operand count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type :: box\n    character(len=5) :: key = 'alpha'\n  contains\n    procedure, pass(rhs) :: has_key\n    generic :: operator(.in.) => has_key\n  end type\ncontains\n  function convert(path) result(out)\n    character(len=*), intent(in) :: path\n    character(len=:), allocatable :: out\n    out = path\n  end function\n\n  logical function has_key(lhs, rhs) result(found)\n    character(len=*), intent(in) :: lhs\n    class(box), intent(in) :: rhs\n    found = lhs == rhs%key\n  end function\n\n  logical function wrapped(path, rhs) result(found)\n    character(len=*), intent(in) :: path\n    class(box), intent(in) :: rhs\n    found = convert(path) .in. rhs\n  end function\nend module\n\nprogram p\n  use m, only : box, wrapped\n  implicit none\n  type(box) :: b\n  if (.not. wrapped('alpha', b)) error stop 1\n  if (wrapped('beta', b)) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("tbp_defined_operator_char_result", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("type-bound defined operator compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "type-bound defined operator compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("type-bound defined operator run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "type-bound defined operator: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn user_op_dispatch_recognises_derived_type_constructor_as_scalar() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
