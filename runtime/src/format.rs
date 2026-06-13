@@ -139,6 +139,31 @@ pub enum LeadingZeroMode {
     Suppress,
 }
 
+impl LeadingZeroMode {
+    /// Map a LEADING_ZERO= specifier value to a mode. `'PRINT'` and
+    /// `'SUPPRESS'` set the obvious modes; `'PROCESSOR_DEFINED'` and any
+    /// unrecognized value fall back to the processor default. Case- and
+    /// whitespace-insensitive, matching the existing specifier handling.
+    pub fn from_specifier(s: &str) -> LeadingZeroMode {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "print" => LeadingZeroMode::Print,
+            "suppress" => LeadingZeroMode::Suppress,
+            _ => LeadingZeroMode::Default,
+        }
+    }
+
+    /// The INQUIRE LEADING_ZERO= string for a formatted connection's
+    /// current mode (F2023 12.10.2.15). `UNDEFINED` is handled by the
+    /// caller for the no-connection / unformatted cases.
+    pub fn inquire_str(self) -> &'static str {
+        match self {
+            LeadingZeroMode::Print => "PRINT",
+            LeadingZeroMode::Suppress => "SUPPRESS",
+            LeadingZeroMode::Default => "PROCESSOR_DEFINED",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum BlankInterpretation {
     /// BN: blanks are null (ignored) in input.
@@ -1636,6 +1661,53 @@ mod tests {
             descs[4],
             FormatDesc::LeadingZero(LeadingZeroMode::Print)
         ));
+    }
+
+    #[test]
+    fn leading_zero_from_specifier_maps_values() {
+        // LEADING_ZERO= specifier values, case/space-insensitive. Anything
+        // else (including PROCESSOR_DEFINED) is the processor default.
+        assert_eq!(
+            LeadingZeroMode::from_specifier("PRINT"),
+            LeadingZeroMode::Print
+        );
+        assert_eq!(
+            LeadingZeroMode::from_specifier("  suppress "),
+            LeadingZeroMode::Suppress
+        );
+        assert_eq!(
+            LeadingZeroMode::from_specifier("Processor_Defined"),
+            LeadingZeroMode::Default
+        );
+        assert_eq!(LeadingZeroMode::from_specifier(""), LeadingZeroMode::Default);
+        assert_eq!(
+            LeadingZeroMode::from_specifier("garbage"),
+            LeadingZeroMode::Default
+        );
+    }
+
+    #[test]
+    fn leading_zero_inquire_str_round_trips() {
+        assert_eq!(LeadingZeroMode::Print.inquire_str(), "PRINT");
+        assert_eq!(LeadingZeroMode::Suppress.inquire_str(), "SUPPRESS");
+        assert_eq!(LeadingZeroMode::Default.inquire_str(), "PROCESSOR_DEFINED");
+    }
+
+    #[test]
+    fn connection_mode_seeds_engine_without_format_descriptor() {
+        // set_leading_zero models the OPEN/WRITE connection mode: a plain
+        // (F6.3) with no LZ descriptor honors the seeded mode, and an
+        // explicit LZP descriptor in the format overrides it mid-string.
+        let mut engine = FormatEngine::new(parse_format("(F6.3)"));
+        engine.set_leading_zero(LeadingZeroMode::Suppress);
+        assert_eq!(engine.format_values(&[IoValue::Real(0.25)]).trim(), ".250");
+
+        let mut overridden = FormatEngine::new(parse_format("(LZP, F6.3)"));
+        overridden.set_leading_zero(LeadingZeroMode::Suppress);
+        assert_eq!(
+            overridden.format_values(&[IoValue::Real(0.25)]).trim(),
+            "0.250"
+        );
     }
 
     #[test]
