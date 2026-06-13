@@ -14808,12 +14808,24 @@ fn defined_assignment_specific_has_scalar_formals(
 
 fn defined_assignment_semantic_candidates(
     st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
     lhs_semantic_ti: Option<&crate::sema::symtab::TypeInfo>,
     rhs_semantic_ti: Option<&crate::sema::symtab::TypeInfo>,
 ) -> Vec<SpecificProcCandidate> {
-    let Some(candidates) = named_interface_specific_candidates(st, "assignment(=)") else {
-        return Vec::new();
-    };
+    let mut candidates =
+        named_interface_specific_candidates(st, "assignment(=)").unwrap_or_default();
+    let mut seen: HashSet<(String, crate::sema::symtab::ScopeId)> = candidates
+        .iter()
+        .map(|candidate| (candidate.name.to_ascii_lowercase(), candidate.owner_scope))
+        .collect();
+    append_type_bound_operator_specific_candidates(
+        st,
+        type_layouts,
+        "assignment(=)",
+        &[lhs_semantic_ti, rhs_semantic_ti],
+        &mut candidates,
+        &mut seen,
+    );
 
     candidates
         .into_iter()
@@ -14842,6 +14854,14 @@ fn defined_assignment_semantic_candidates(
         .collect()
 }
 
+fn assignment_formal_wants_descriptor(arg: &crate::sema::symtab::Symbol) -> bool {
+    matches!(
+        arg.type_info.as_ref(),
+        Some(crate::sema::symtab::TypeInfo::Class(_))
+            | Some(crate::sema::symtab::TypeInfo::ClassStar)
+    )
+}
+
 pub(super) fn try_defined_assignment_for_array_element(
     b: &mut FuncBuilder,
     ctx: &mut LowerCtx,
@@ -14865,6 +14885,7 @@ pub(super) fn try_defined_assignment_for_array_element(
 
     let semantic_candidates = defined_assignment_semantic_candidates(
         ctx.st,
+        Some(ctx.type_layouts),
         lhs_semantic_ti.as_ref(),
         rhs_semantic_ti.as_ref(),
     );
@@ -14923,6 +14944,25 @@ pub(super) fn try_defined_assignment_for_array_element(
     let Some(resolved) = resolved else {
         return false;
     };
+    let Some(resolved_scope) = procedure_scope_for_candidate(ctx.st, &resolved) else {
+        return false;
+    };
+    let resolved_declared_args = declared_args_for_scope(resolved_scope);
+    let lhs_for_call = if resolved_declared_args
+        .first()
+        .is_some_and(|arg| assignment_formal_wants_descriptor(arg))
+    {
+        materialize_scalar_element_descriptor_from_info(
+            b,
+            &ctx.locals,
+            lhs_info,
+            args,
+            ctx.st,
+            Some(ctx.type_layouts),
+        )
+    } else {
+        lhs_val
+    };
 
     let rk = resolved.name.to_lowercase();
     let (call_name, _) = resolved_symbol_call_target_for_candidate(ctx.st, &resolved);
@@ -14973,6 +15013,9 @@ pub(super) fn try_defined_assignment_for_array_element(
         .as_ref()
         .and_then(|m| m.get(1).copied())
         .unwrap_or(false);
+    let rhs_wants_descriptor = resolved_declared_args
+        .get(1)
+        .is_some_and(|arg| assignment_formal_wants_descriptor(arg));
     let rhs_for_call_final = if rhs_is_char_star {
         lower_arg_by_ref_full(
             b,
@@ -14984,11 +15027,23 @@ pub(super) fn try_defined_assignment_for_array_element(
             Some(ctx.contained_host_refs),
             Some(ctx.descriptor_params),
         )
+    } else if rhs_wants_descriptor {
+        lower_arg_descriptor_full(
+            b,
+            &ctx.locals,
+            rhs,
+            ctx.st,
+            Some(ctx.type_layouts),
+            Some(ctx.internal_funcs),
+            Some(ctx.contained_host_refs),
+            Some(ctx.descriptor_params),
+            true,
+        )
     } else {
         rhs_for_call
     };
 
-    let mut call_args = vec![lhs_val, rhs_for_call_final];
+    let mut call_args = vec![lhs_for_call, rhs_for_call_final];
     if let Some(flags) = mask {
         if flags.first().copied().unwrap_or(false) {
             call_args.push(b.const_i64(0));
@@ -15055,6 +15110,7 @@ pub(super) fn try_defined_assignment(
 
     let semantic_candidates = defined_assignment_semantic_candidates(
         ctx.st,
+        Some(ctx.type_layouts),
         lhs_semantic_ti.as_ref(),
         rhs_semantic_ti.as_ref(),
     );
@@ -15165,6 +15221,18 @@ pub(super) fn try_defined_assignment(
     let Some(resolved) = resolved else {
         return false;
     };
+    let Some(resolved_scope) = procedure_scope_for_candidate(ctx.st, &resolved) else {
+        return false;
+    };
+    let resolved_declared_args = declared_args_for_scope(resolved_scope);
+    let lhs_for_call = if resolved_declared_args
+        .first()
+        .is_some_and(|arg| assignment_formal_wants_descriptor(arg))
+    {
+        lower_descriptor_actual_from_info(b, &lhs_info, Some(ctx.type_layouts), true)
+    } else {
+        lhs_val
+    };
     let rk = resolved.name.to_lowercase();
     let (call_name, _) = resolved_symbol_call_target_for_candidate(ctx.st, &resolved);
     let func_ref = same_unit_func_ref(
@@ -15251,6 +15319,9 @@ pub(super) fn try_defined_assignment(
         .as_ref()
         .and_then(|m| m.get(1).copied())
         .unwrap_or(false);
+    let rhs_wants_descriptor = resolved_declared_args
+        .get(1)
+        .is_some_and(|arg| assignment_formal_wants_descriptor(arg));
     let rhs_for_call_final = if rhs_is_char_star {
         lower_arg_by_ref_full(
             b,
@@ -15261,6 +15332,18 @@ pub(super) fn try_defined_assignment(
             Some(ctx.internal_funcs),
             Some(ctx.contained_host_refs),
             Some(ctx.descriptor_params),
+        )
+    } else if rhs_wants_descriptor {
+        lower_arg_descriptor_full(
+            b,
+            &ctx.locals,
+            rhs,
+            ctx.st,
+            Some(ctx.type_layouts),
+            Some(ctx.internal_funcs),
+            Some(ctx.contained_host_refs),
+            Some(ctx.descriptor_params),
+            true,
         )
     } else {
         rhs_for_call
@@ -15281,7 +15364,7 @@ pub(super) fn try_defined_assignment(
         );
         return true;
     }
-    let mut call_args = vec![lhs_val, rhs_for_call_final];
+    let mut call_args = vec![lhs_for_call, rhs_for_call_final];
     if let Some(flags) = mask {
         if flags.first().copied().unwrap_or(false) {
             // LHS at position 0 is normally the derived-type formal,

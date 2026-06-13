@@ -1752,10 +1752,18 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 // Character field: copy string data with space padding.
                                 if let CharKind::Fixed(flen) = field_char_kind(field) {
                                     let (src_ptr, src_len) = lower_string_expr_ctx(b, ctx, value);
+                                    let dest_ptr = if field.pointer {
+                                        b.load_typed(
+                                            field_ptr,
+                                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                                        )
+                                    } else {
+                                        field_ptr
+                                    };
                                     let dest_len = b.const_i64(flen);
                                     b.call(
                                         FuncRef::External("afs_assign_char_fixed".into()),
-                                        vec![field_ptr, dest_len, src_ptr, src_len],
+                                        vec![dest_ptr, dest_len, src_ptr, src_len],
                                         IrType::Void,
                                     );
                                     deallocate_owned_string_expr_temp(
@@ -1914,6 +1922,69 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         vec![field_ptr, src, sz],
                                         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
                                     );
+                                } else if field.pointer
+                                    && !field.procedure_pointer
+                                    && !field.allocatable
+                                    && field.dims.is_empty()
+                                    && !matches!(
+                                        field.type_info,
+                                        crate::sema::symtab::TypeInfo::ClassStar
+                                            | crate::sema::symtab::TypeInfo::TypeStar
+                                    )
+                                {
+                                    if matches!(
+                                        field.type_info,
+                                        crate::sema::symtab::TypeInfo::Derived(_)
+                                    ) && !is_opaque_c_handle_type(&field.type_info)
+                                    {
+                                        let src_ptr = super::expr::lower_expr_ctx_tl(b, ctx, value);
+                                        if let Some(nested_name) = field_derived_type_name(field) {
+                                            let dest_ptr = b.load_typed(
+                                                field_ptr,
+                                                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                                            );
+                                            emit_derived_value_copy(
+                                                b,
+                                                ctx.type_layouts,
+                                                &nested_name,
+                                                dest_ptr,
+                                                src_ptr,
+                                            );
+                                        }
+                                    } else if is_complex_ty(&type_info_to_ir_type(&field.type_info))
+                                    {
+                                        let raw = super::expr::lower_expr_ctx_tl(b, ctx, value);
+                                        let field_ir_ty = type_info_to_ir_type(&field.type_info);
+                                        let src_ty = b.func().value_type(raw);
+                                        let src = if matches!(&src_ty, Some(t) if is_complex_ptr_ty(t))
+                                        {
+                                            raw
+                                        } else {
+                                            let fw = complex_float_width(&field_ir_ty);
+                                            materialize_complex_operand(b, raw, fw)
+                                        };
+                                        let dest_ptr = b.load_typed(
+                                            field_ptr,
+                                            IrType::Ptr(Box::new(field_storage_ir_type(
+                                                field,
+                                                ctx.type_layouts,
+                                            ))),
+                                        );
+                                        let bytes = complex_byte_size(&field_ir_ty);
+                                        let sz = b.const_i64(bytes);
+                                        b.call(
+                                            FuncRef::External("memcpy".into()),
+                                            vec![dest_ptr, src, sz],
+                                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                                        );
+                                    } else {
+                                        let elem_ty = type_info_to_ir_type(&field.type_info);
+                                        let val = super::expr::lower_expr_ctx_tl(b, ctx, value);
+                                        let coerced = coerce_to_type(b, val, &elem_ty);
+                                        let dest_ptr =
+                                            b.load_typed(field_ptr, IrType::Ptr(Box::new(elem_ty)));
+                                        b.store(coerced, dest_ptr);
+                                    }
                                 } else if matches!(
                                     field.type_info,
                                     crate::sema::symtab::TypeInfo::ClassStar

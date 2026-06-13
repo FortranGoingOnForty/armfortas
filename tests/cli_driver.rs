@@ -25056,6 +25056,48 @@ fn public_defined_assignment_in_private_module_round_trips_through_amod_and_runs
 }
 
 #[test]
+fn type_bound_defined_assignment_overrides_intrinsic_pointer_copy() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=type_bound_defined_assignment_overrides_intrinsic_pointer_copy count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type :: box\n    integer, pointer :: p => null()\n  contains\n    procedure :: assign_box\n    generic :: assignment(=) => assign_box\n  end type box\ncontains\n  subroutine assign_box(lhs, rhs)\n    class(box), intent(out) :: lhs\n    type(box), intent(in) :: rhs\n    allocate(lhs%p)\n    lhs%p = rhs%p + 1\n  end subroutine assign_box\nend module m\nprogram p\n  use m\n  implicit none\n  type(box) :: a, b\n  allocate(a%p)\n  a%p = 41\n  b = a\n  if (.not. associated(b%p)) error stop 1\n  if (b%p /= 42) error stop 2\n  b%p = 99\n  if (a%p /= 41) error stop 3\n  print *, 'ok'\nend program p\n",
+        "type_bound_defined_assignment.f90",
+    );
+    let out = unique_path("type_bound_defined_assignment", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("type-bound defined assignment compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "type-bound defined assignment should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "type-bound defined assignment runtime failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected type-bound defined assignment output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn imported_fixed_logical_component_array_whole_assignment_clears_all_elements() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
