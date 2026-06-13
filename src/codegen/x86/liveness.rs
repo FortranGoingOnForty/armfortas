@@ -1,0 +1,367 @@
+//! Liveness analysis for the x86_64 Machine IR.
+//!
+//! Backward dataflow computing live intervals per virtual register,
+//! consumed by the x86 linear-scan allocator (x10a). The algorithm is
+//! the arch-neutral port of `arm64::liveness`; the x86-specific parts
+//! are the branch opcodes used to build the successor map (Jmp/Jcc),
+//! the call opcodes that mark interval call-crossings (Call/CallReg),
+//! and the fact that an `X86Operand` carries its register class inline
+//! (there is no separate vreg table as on arm64).
+
+use super::mir::*;
+use crate::codegen::shared::{MBlockId, VRegId};
+use std::collections::HashMap;
+
+/// A live interval: the range of instruction positions where a vreg is
+/// live. Positions increase by 2 so inserted moves get odd slots.
+#[derive(Debug, Clone)]
+pub struct LiveInterval {
+    pub vreg: VRegId,
+    pub class: X86RegClass,
+    pub start: u32,
+    pub end: u32,
+    /// True if any Call/CallReg falls strictly within (start, end).
+    pub crosses_call: bool,
+    /// Sorted positions of every call strictly inside (start, end).
+    pub call_crossings: Vec<u32>,
+    /// Preferred physical register index (allocator tries it first).
+    pub hint: Option<u8>,
+}
+
+/// Result of liveness analysis.
+pub struct LivenessResult {
+    pub intervals: Vec<LiveInterval>,
+    pub num_positions: u32,
+}
+
+/// Extract the virtual register id from an operand, if it is one.
+fn operand_vreg(op: &X86Operand) -> Option<X86VReg> {
+    if let X86Operand::VReg(v) = op {
+        Some(*v)
+    } else {
+        None
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct LiveSet {
+    words: Vec<u64>,
+}
+
+impl LiveSet {
+    fn new(num_vregs: usize) -> Self {
+        Self {
+            words: vec![0; num_vregs.div_ceil(64)],
+        }
+    }
+    fn clear(&mut self) {
+        self.words.fill(0);
+    }
+    fn copy_from(&mut self, other: &Self) {
+        self.words.copy_from_slice(&other.words);
+    }
+    fn insert(&mut self, vreg: VRegId) {
+        let idx = vreg.0 as usize;
+        if let Some(slot) = self.words.get_mut(idx / 64) {
+            *slot |= 1u64 << (idx % 64);
+        }
+    }
+    fn remove(&mut self, vreg: &VRegId) {
+        let idx = vreg.0 as usize;
+        if let Some(slot) = self.words.get_mut(idx / 64) {
+            *slot &= !(1u64 << (idx % 64));
+        }
+    }
+    fn union_with(&mut self, other: &Self) {
+        for (dst, src) in self.words.iter_mut().zip(&other.words) {
+            *dst |= *src;
+        }
+    }
+    fn iter(&self) -> LiveSetIter<'_> {
+        LiveSetIter {
+            words: &self.words,
+            word_idx: 0,
+            active_word: self.words.first().copied().unwrap_or(0),
+        }
+    }
+}
+
+struct LiveSetIter<'a> {
+    words: &'a [u64],
+    word_idx: usize,
+    active_word: u64,
+}
+
+impl Iterator for LiveSetIter<'_> {
+    type Item = VRegId;
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.active_word != 0 {
+                let bit = self.active_word.trailing_zeros() as usize;
+                self.active_word &= self.active_word - 1;
+                return Some(VRegId((self.word_idx * 64 + bit) as u32));
+            }
+            self.word_idx += 1;
+            if self.word_idx >= self.words.len() {
+                return None;
+            }
+            self.active_word = self.words[self.word_idx];
+        }
+    }
+}
+
+fn vreg_capacity(f: &X86Function) -> usize {
+    let mut max_idx = 0usize;
+    for block in &f.blocks {
+        for inst in &block.insts {
+            if let Some(def) = inst.def.as_ref().and_then(operand_vreg) {
+                max_idx = max_idx.max(def.id.0 as usize + 1);
+            }
+            for op in &inst.operands {
+                if let Some(v) = operand_vreg(op) {
+                    max_idx = max_idx.max(v.id.0 as usize + 1);
+                }
+            }
+        }
+    }
+    max_idx
+}
+
+/// Compute live intervals for all vregs in an x86 machine function.
+pub fn compute_liveness(f: &X86Function) -> LivenessResult {
+    let num_vregs = vreg_capacity(f);
+    let block_indices: HashMap<MBlockId, usize> = f
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(idx, block)| (block.id, idx))
+        .collect();
+
+    // Phase 1: linear position per instruction, stepping by 2.
+    let mut inst_positions: Vec<Vec<u32>> = Vec::with_capacity(f.blocks.len());
+    let mut block_start: Vec<u32> = Vec::with_capacity(f.blocks.len());
+    let mut block_end: Vec<u32> = Vec::with_capacity(f.blocks.len());
+    let mut pos: u32 = 0;
+    for block in &f.blocks {
+        block_start.push(pos);
+        let mut positions = Vec::with_capacity(block.insts.len());
+        for _ in &block.insts {
+            positions.push(pos);
+            pos += 2;
+        }
+        inst_positions.push(positions);
+        block_end.push(pos);
+    }
+    let num_positions = pos;
+
+    // Phase 2: successor map. Jmp carries its BlockRef at operand 0,
+    // Jcc at operand 1 (operand 0 is the condition) — the same shape
+    // as arm64 B / BCond.
+    let mut successors: Vec<Vec<usize>> = vec![Vec::new(); f.blocks.len()];
+    for (block_idx, block) in f.blocks.iter().enumerate() {
+        let mut succs = Vec::new();
+        for inst in &block.insts {
+            let target_op = match inst.opcode {
+                X86Opcode::Jmp => inst.operands.first(),
+                X86Opcode::Jcc => inst.operands.get(1),
+                _ => None,
+            };
+            if let Some(X86Operand::BlockRef(target)) = target_op {
+                if let Some(&succ_idx) = block_indices.get(target) {
+                    if !succs.contains(&succ_idx) {
+                        succs.push(succ_idx);
+                    }
+                }
+            }
+        }
+        successors[block_idx] = succs;
+    }
+
+    // Phase 3: backward dataflow to fixed point.
+    let mut live_in: Vec<LiveSet> = (0..f.blocks.len())
+        .map(|_| LiveSet::new(num_vregs))
+        .collect();
+    let mut live_out: Vec<LiveSet> = (0..f.blocks.len())
+        .map(|_| LiveSet::new(num_vregs))
+        .collect();
+    let mut scratch_out = LiveSet::new(num_vregs);
+    let mut scratch_in = LiveSet::new(num_vregs);
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block_idx in (0..f.blocks.len()).rev() {
+            let block = &f.blocks[block_idx];
+            scratch_out.clear();
+            for &succ_idx in &successors[block_idx] {
+                scratch_out.union_with(&live_in[succ_idx]);
+            }
+            scratch_in.copy_from(&scratch_out);
+            for inst in block.insts.iter().rev() {
+                if let Some(def) = inst.def.as_ref().and_then(operand_vreg) {
+                    scratch_in.remove(&def.id);
+                }
+                for op in &inst.operands {
+                    if let Some(v) = operand_vreg(op) {
+                        scratch_in.insert(v.id);
+                    }
+                }
+            }
+            if live_in[block_idx] != scratch_in {
+                live_in[block_idx].copy_from(&scratch_in);
+                changed = true;
+            }
+            if live_out[block_idx] != scratch_out {
+                live_out[block_idx].copy_from(&scratch_out);
+                changed = true;
+            }
+        }
+    }
+
+    // Phase 4: build intervals from def/use positions and block-level
+    // live-in/out extension.
+    let mut starts: Vec<Option<u32>> = vec![None; num_vregs];
+    let mut ends: Vec<Option<u32>> = vec![None; num_vregs];
+    let mut classes: Vec<X86RegClass> = vec![X86RegClass::Gp64; num_vregs];
+
+    for (block_idx, block) in f.blocks.iter().enumerate() {
+        let b_start = block_start[block_idx];
+        let b_end = block_end[block_idx];
+        for vreg in live_in[block_idx].iter() {
+            let idx = vreg.0 as usize;
+            ends[idx] = Some(ends[idx].map_or(b_end, |e| e.max(b_end)));
+            starts[idx] = Some(starts[idx].map_or(b_start, |s| s.min(b_start)));
+        }
+        for vreg in live_out[block_idx].iter() {
+            let idx = vreg.0 as usize;
+            ends[idx] = Some(ends[idx].map_or(b_end, |e| e.max(b_end)));
+            starts[idx] = Some(starts[idx].map_or(b_start, |s| s.min(b_start)));
+        }
+        for (i, inst) in block.insts.iter().enumerate() {
+            let p = inst_positions[block_idx][i];
+            if let Some(def) = inst.def.as_ref().and_then(operand_vreg) {
+                let idx = def.id.0 as usize;
+                starts[idx] = Some(starts[idx].map_or(p, |s| s.min(p)));
+                ends[idx] = Some(ends[idx].map_or(p, |e| e.max(p)));
+                classes[idx] = def.class;
+            }
+            for op in &inst.operands {
+                if let Some(v) = operand_vreg(op) {
+                    let idx = v.id.0 as usize;
+                    ends[idx] = Some(ends[idx].map_or(p, |e| e.max(p)));
+                    starts[idx] = Some(starts[idx].map_or(p, |s| s.min(p)));
+                    classes[idx] = v.class;
+                }
+            }
+        }
+    }
+
+    // Call positions for crosses_call. Both direct (Call) and indirect
+    // (CallReg) clobber all caller-saved registers.
+    let mut call_positions: Vec<u32> = Vec::new();
+    for (block_idx, block) in f.blocks.iter().enumerate() {
+        for (i, inst) in block.insts.iter().enumerate() {
+            if matches!(inst.opcode, X86Opcode::Call | X86Opcode::CallReg) {
+                call_positions.push(inst_positions[block_idx][i]);
+            }
+        }
+    }
+    call_positions.sort_unstable();
+
+    let mut intervals: Vec<LiveInterval> = starts
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, start)| {
+            let start = (*start)?;
+            let end = ends[idx]?;
+            let call_crossings: Vec<u32> = call_positions
+                .iter()
+                .copied()
+                .filter(|&cp| cp > start && cp < end)
+                .collect();
+            Some(LiveInterval {
+                vreg: VRegId(idx as u32),
+                class: classes[idx],
+                start,
+                end,
+                crosses_call: !call_crossings.is_empty(),
+                call_crossings,
+                hint: None,
+            })
+        })
+        .collect();
+
+    // Deterministic order: by start, tie-broken on vreg id. Linear
+    // scan walks this vector, so a stable order keeps assembly
+    // reproducible across runs (the arm64 select_type.f90 lesson).
+    intervals.sort_by_key(|i| (i.start, i.vreg.0));
+
+    LivenessResult {
+        intervals,
+        num_positions,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codegen::x86::isel::select_function;
+    use crate::ir::builder::FuncBuilder;
+    use crate::ir::inst::*;
+    use crate::ir::types::*;
+
+    #[test]
+    fn liveness_simple_function() {
+        let mut func = Function::new("test".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+            let x = b.const_i32(10);
+            let y = b.const_i32(20);
+            let _z = b.iadd(x, y);
+            b.ret_void();
+        }
+        let mf = select_function(&func, &[], crate::target::TargetLayout::LP64);
+        let result = compute_liveness(&mf);
+        assert!(!result.intervals.is_empty());
+        assert!(result.num_positions > 0);
+    }
+
+    #[test]
+    fn liveness_has_fp_class() {
+        let mut func = Function::new("test".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+            let a = b.const_f64(3.14);
+            let c = b.const_f64(2.0);
+            let _d = b.fadd(a, c);
+            b.ret_void();
+        }
+        let mf = select_function(&func, &[], crate::target::TargetLayout::LP64);
+        let result = compute_liveness(&mf);
+        assert!(
+            result
+                .intervals
+                .iter()
+                .any(|i| matches!(i.class, X86RegClass::Xmm | X86RegClass::Xmm128)),
+            "should have an Xmm interval"
+        );
+    }
+
+    #[test]
+    fn liveness_branching() {
+        let mut func = Function::new("test".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+            let cond = b.const_bool(true);
+            let bb_t = b.create_block("then");
+            let bb_f = b.create_block("else");
+            b.cond_branch(cond, bb_t, vec![], bb_f, vec![]);
+            b.set_block(bb_t);
+            b.ret_void();
+            b.set_block(bb_f);
+            b.ret_void();
+        }
+        let mf = select_function(&func, &[], crate::target::TargetLayout::LP64);
+        let result = compute_liveness(&mf);
+        assert!(result.num_positions > 0);
+    }
+}
