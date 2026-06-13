@@ -29,16 +29,124 @@
 
 use std::collections::HashMap;
 
-use super::mir::{X86Function, X86Opcode, X86Operand};
+use super::mir::{OpSize, X86Function, X86Inst, X86Opcode, X86Operand};
 use crate::codegen::shared::VRegId;
 
-/// Run all peephole patterns over one function. Returns the number of
-/// instructions rewritten or removed (tests assert on it; the driver
-/// ignores it).
+/// Run all pre-regalloc peephole patterns over one function. Returns the
+/// number of instructions rewritten or removed (tests assert on it; the
+/// driver ignores it).
 pub fn run_peephole(f: &mut X86Function) -> usize {
     let mut changed = 0;
     changed += cmp_zero_to_test(f);
     changed += drop_self_moves(f);
+    changed
+}
+
+/// Run all post-regalloc peephole patterns (x10b round 2). These work on
+/// physical registers and frame slots — values that only exist after
+/// allocation — so they run after `apply_allocation`/`regalloc_naive`,
+/// gated at O2+ by the driver.
+pub fn run_peephole_post_regalloc(f: &mut X86Function) -> usize {
+    xor_zero(f)
+}
+
+/// How an opcode affects RFLAGS. The MIR has no flags register class
+/// (mir.rs: "RFLAGS is implicit"), so flags-liveness is reconstructed
+/// from the opcode here.
+#[derive(Clone, Copy, PartialEq)]
+enum FlagEffect {
+    /// Fully defines RFLAGS without reading it.
+    Writer,
+    /// Reads RFLAGS.
+    Reader,
+    /// Reads and writes (the i128 pair ops).
+    ReadWrite,
+    /// No effect on RFLAGS.
+    Transparent,
+}
+
+fn flag_effect(op: X86Opcode) -> FlagEffect {
+    use X86Opcode::*;
+    match op {
+        // Idiv leaves flags undefined — treat as a clobbering writer.
+        Add | Sub | Imul | And | Or | Xor | Neg | Shl | Shr | Sar | Cmp | Test | Idiv => {
+            FlagEffect::Writer
+        }
+        Jcc | Setcc => FlagEffect::Reader,
+        Adc | Sbb => FlagEffect::ReadWrite,
+        // Everything else (Mov*, Lea, Cltd/Cqto, Not, Push/Pop, Call,
+        // Ret, all SSE) leaves RFLAGS untouched. `not` notably does NOT
+        // modify flags on x86.
+        _ => FlagEffect::Transparent,
+    }
+}
+
+/// For each instruction in a block, is RFLAGS dead immediately *after*
+/// it executes? A pattern that introduces a flag write at position i is
+/// safe iff `dead[i]`. The block-local backward scan is exact within the
+/// block; the only approximation is the block's flags-live-out:
+///
+/// - A block ending in `Ret` has live-out = false: the SysV ABI does not
+///   preserve arithmetic flags across a function boundary, so no
+///   successor reads them. This captures the common "return 0" idiom.
+/// - Every other block (Jmp/Jcc/fallthrough terminators) uses the
+///   conservative live-out = true. A false "live" only forgoes an
+///   optimization; an under-approximated live-out would miscompile, so
+///   the conservative direction is the safe one and no successor-map
+///   dataflow (with its fallthrough-edge hazards) is attempted.
+fn flags_dead_after(insts: &[X86Inst]) -> Vec<bool> {
+    let n = insts.len();
+    let mut dead = vec![false; n];
+    let ends_in_ret = insts
+        .last()
+        .is_some_and(|i| i.opcode == X86Opcode::Ret);
+    // `live` = RFLAGS liveness at the point after the current instruction
+    // (= live-in of the next).
+    let mut live = !ends_in_ret;
+    for i in (0..n).rev() {
+        dead[i] = !live;
+        match flag_effect(insts[i].opcode) {
+            FlagEffect::Reader | FlagEffect::ReadWrite => live = true,
+            FlagEffect::Writer => live = false,
+            FlagEffect::Transparent => {}
+        }
+    }
+    dead
+}
+
+/// Pattern 1 — xor-zeroing. `mov $0, %r` → `xor %r, %r` (GP only), when
+/// RFLAGS is dead right after the materialization. `xorl %r32, %r32`
+/// zeroes the full 64-bit register (implicit zero-extension), encodes in
+/// 2-3 bytes vs 5-7 for `mov $0`, and breaks the false dependency. The
+/// flags-dead guard protects the i128 Adc/Sbb carry chains (Adc reads
+/// flags, so a zero between Add and Adc reports flags-live) and cmp/jcc
+/// adjacency.
+fn xor_zero(f: &mut X86Function) -> usize {
+    let mut changed = 0;
+    for block in &mut f.blocks {
+        let dead = flags_dead_after(&block.insts);
+        for (i, inst) in block.insts.iter_mut().enumerate() {
+            if inst.opcode != X86Opcode::MovRI {
+                continue;
+            }
+            if !matches!(inst.operands.first(), Some(X86Operand::Imm(0))) {
+                continue;
+            }
+            let Some(X86Operand::Reg(r)) = inst.def else {
+                continue;
+            };
+            if !r.is_gp() {
+                continue;
+            }
+            if !dead[i] {
+                continue;
+            }
+            inst.opcode = X86Opcode::Xor;
+            inst.size = OpSize::L;
+            inst.operands = vec![X86Operand::Reg(r), X86Operand::Reg(r)];
+            changed += 1;
+        }
+    }
     changed
 }
 
@@ -273,5 +381,134 @@ mod tests {
         }]);
         assert_eq!(run_peephole(&mut f), 1);
         assert!(f.blocks[0].insts.is_empty());
+    }
+
+    // ---- x10b post-regalloc: xor-zeroing ----
+
+    use crate::codegen::x86::mir::X86Reg;
+
+    fn movri_phys(dst: X86Reg, imm: i64) -> X86Inst {
+        X86Inst {
+            opcode: X86Opcode::MovRI,
+            size: OpSize::Q,
+            operands: vec![X86Operand::Imm(imm)],
+            def: Some(X86Operand::Reg(dst)),
+        }
+    }
+
+    fn cmp_phys(a: X86Reg, b: X86Reg) -> X86Inst {
+        X86Inst {
+            opcode: X86Opcode::Cmp,
+            size: OpSize::Q,
+            operands: vec![X86Operand::Reg(a), X86Operand::Reg(b)],
+            def: None,
+        }
+    }
+
+    fn jcc(cond: X86Cond) -> X86Inst {
+        X86Inst {
+            opcode: X86Opcode::Jcc,
+            size: OpSize::Q,
+            operands: vec![X86Operand::Cond(cond), X86Operand::BlockRef(MBlockId(0))],
+            def: None,
+        }
+    }
+
+    fn add_phys(d: X86Reg, s: X86Reg) -> X86Inst {
+        X86Inst {
+            opcode: X86Opcode::Add,
+            size: OpSize::Q,
+            operands: vec![X86Operand::Reg(d), X86Operand::Reg(s)],
+            def: Some(X86Operand::Reg(d)),
+        }
+    }
+
+    fn ret() -> X86Inst {
+        X86Inst {
+            opcode: X86Opcode::Ret,
+            size: OpSize::Q,
+            operands: vec![],
+            def: None,
+        }
+    }
+
+    #[test]
+    fn xor_zero_fires_when_flags_dead() {
+        // mov $0,%rax; ret — flags dead at the Ret boundary → xorl.
+        let mut f = func_with(vec![movri_phys(X86Reg::Rax, 0), ret()]);
+        assert_eq!(run_peephole_post_regalloc(&mut f), 1);
+        let inst = &f.blocks[0].insts[0];
+        assert_eq!(inst.opcode, X86Opcode::Xor);
+        assert_eq!(inst.size, OpSize::L);
+        assert_eq!(
+            inst.operands,
+            vec![X86Operand::Reg(X86Reg::Rax), X86Operand::Reg(X86Reg::Rax)]
+        );
+        assert_eq!(inst.def, Some(X86Operand::Reg(X86Reg::Rax)));
+    }
+
+    #[test]
+    fn xor_zero_blocked_at_block_tail_without_ret() {
+        // A zero as the last instruction of a non-Ret block keeps the
+        // conservative live-out, so it is not converted.
+        let mut f = func_with(vec![movri_phys(X86Reg::Rax, 0)]);
+        assert_eq!(run_peephole_post_regalloc(&mut f), 0);
+        assert_eq!(f.blocks[0].insts[0].opcode, X86Opcode::MovRI);
+    }
+
+    #[test]
+    fn xor_zero_blocked_when_flags_live_for_jcc() {
+        // cmp; mov $0; jcc — the zero sits between a flags producer and
+        // its consumer, so converting to xor would clobber the carry.
+        let mut f = func_with(vec![
+            cmp_phys(X86Reg::Rbx, X86Reg::Rcx),
+            movri_phys(X86Reg::Rax, 0),
+            jcc(X86Cond::E),
+        ]);
+        assert_eq!(run_peephole_post_regalloc(&mut f), 0);
+        assert_eq!(f.blocks[0].insts[1].opcode, X86Opcode::MovRI);
+    }
+
+    #[test]
+    fn xor_zero_blocked_between_add_and_adc() {
+        // i128 carry chain: add (low); mov $0; adc (high). Adc reads
+        // flags, so the zero must not become xor.
+        let adc = X86Inst {
+            opcode: X86Opcode::Adc,
+            size: OpSize::Q,
+            operands: vec![X86Operand::Reg(X86Reg::R8), X86Operand::Reg(X86Reg::R9)],
+            def: Some(X86Operand::Reg(X86Reg::R8)),
+        };
+        let mut f = func_with(vec![
+            add_phys(X86Reg::Rsi, X86Reg::Rdi),
+            movri_phys(X86Reg::Rax, 0),
+            adc,
+        ]);
+        assert_eq!(run_peephole_post_regalloc(&mut f), 0);
+    }
+
+    #[test]
+    fn xor_zero_fires_when_writer_shadows_later_reader() {
+        // mov $0; cmp; jcc — the cmp redefines flags before the jcc, so
+        // the zero's position has dead flags and converts.
+        let mut f = func_with(vec![
+            movri_phys(X86Reg::Rax, 0),
+            cmp_phys(X86Reg::Rbx, X86Reg::Rcx),
+            jcc(X86Cond::E),
+        ]);
+        assert_eq!(run_peephole_post_regalloc(&mut f), 1);
+        assert_eq!(f.blocks[0].insts[0].opcode, X86Opcode::Xor);
+    }
+
+    #[test]
+    fn xor_zero_ignores_nonzero_and_vreg_and_xmm() {
+        // Non-zero imm, an unallocated vreg def, and an xmm reg are all
+        // left alone.
+        let mut f = func_with(vec![
+            movri_phys(X86Reg::Rax, 7),
+            movri(5, 0),
+            movri_phys(X86Reg::Xmm0, 0),
+        ]);
+        assert_eq!(run_peephole_post_regalloc(&mut f), 0);
     }
 }
