@@ -557,6 +557,270 @@ pub(super) fn walk_contained_host_refs_inner<'a>(
             out.insert(name.to_lowercase(), refs);
         }
     }
+
+    // Sibling contained procedures can be pure forwarders:
+    //
+    //   contains
+    //     subroutine go()
+    //       call leaf()
+    //     end
+    //     subroutine leaf()
+    //       host_var = ...
+    //     end
+    //
+    // `go` does not directly reference `host_var`, but it must still
+    // carry and forward the hidden host-closure arg required by `leaf`.
+    // Propagate required refs across the sibling call graph to a fixed
+    // point after all direct/nested refs in this host scope are known.
+    let mut sibling_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut ancestor_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for anc in &next_ancestors {
+        for decl in *anc {
+            if let Decl::TypeDecl { entities, .. } = &decl.node {
+                for e in entities {
+                    ancestor_names.insert(e.name.to_lowercase());
+                }
+            }
+        }
+    }
+    for sub in contains {
+        if let ProgramUnit::Subroutine { name, .. } | ProgramUnit::Function { name, .. } = &sub.node
+        {
+            sibling_names.insert(name.to_lowercase());
+        }
+    }
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for sub in contains {
+            let name = match &sub.node {
+                ProgramUnit::Subroutine { name, .. } | ProgramUnit::Function { name, .. } => {
+                    name.to_lowercase()
+                }
+                _ => continue,
+            };
+            let mut called = std::collections::HashSet::new();
+            collect_called_contained_names(&sub.node, &mut called);
+            let mut refs: std::collections::HashSet<String> = out
+                .get(&name)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            for callee in called {
+                if !sibling_names.contains(&callee) {
+                    continue;
+                }
+                let Some(callee_refs) = out.get(&callee).cloned() else {
+                    continue;
+                };
+                for r in callee_refs {
+                    if ancestor_names.contains(&r) && refs.insert(r) {
+                        changed = true;
+                    }
+                }
+            }
+            if changed {
+                let mut sorted: Vec<String> = refs.into_iter().collect();
+                sorted.sort();
+                out.insert(name, sorted);
+            }
+        }
+    }
+}
+
+fn collect_called_contained_names(unit: &ProgramUnit, out: &mut std::collections::HashSet<String>) {
+    let body: &[crate::ast::stmt::SpannedStmt] = match unit {
+        ProgramUnit::Subroutine { body, .. } | ProgramUnit::Function { body, .. } => body,
+        _ => return,
+    };
+    for stmt in body {
+        collect_called_contained_names_stmt(stmt, out);
+    }
+}
+
+fn collect_called_contained_names_stmt(
+    stmt: &crate::ast::stmt::SpannedStmt,
+    out: &mut std::collections::HashSet<String>,
+) {
+    use crate::ast::stmt::Stmt;
+    match &stmt.node {
+        Stmt::Call { callee, args } => {
+            if let Expr::Name { name } = &callee.node {
+                out.insert(name.to_lowercase());
+            }
+            collect_called_contained_names_expr(callee, out);
+            for arg in args {
+                if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
+                    collect_called_contained_names_expr(e, out);
+                }
+            }
+        }
+        Stmt::Assignment { target, value } | Stmt::PointerAssignment { target, value } => {
+            collect_called_contained_names_expr(target, out);
+            collect_called_contained_names_expr(value, out);
+        }
+        Stmt::IfStmt { condition, action } => {
+            collect_called_contained_names_expr(condition, out);
+            collect_called_contained_names_stmt(action, out);
+        }
+        Stmt::IfConstruct {
+            condition,
+            then_body,
+            else_ifs,
+            else_body,
+            ..
+        } => {
+            collect_called_contained_names_expr(condition, out);
+            for s in then_body {
+                collect_called_contained_names_stmt(s, out);
+            }
+            for (cond, body) in else_ifs {
+                collect_called_contained_names_expr(cond, out);
+                for s in body {
+                    collect_called_contained_names_stmt(s, out);
+                }
+            }
+            if let Some(body) = else_body {
+                for s in body {
+                    collect_called_contained_names_stmt(s, out);
+                }
+            }
+        }
+        Stmt::DoLoop {
+            start,
+            end,
+            step,
+            body,
+            ..
+        } => {
+            if let Some(e) = start {
+                collect_called_contained_names_expr(e, out);
+            }
+            if let Some(e) = end {
+                collect_called_contained_names_expr(e, out);
+            }
+            if let Some(e) = step {
+                collect_called_contained_names_expr(e, out);
+            }
+            for s in body {
+                collect_called_contained_names_stmt(s, out);
+            }
+        }
+        Stmt::DoWhile {
+            condition, body, ..
+        } => {
+            collect_called_contained_names_expr(condition, out);
+            for s in body {
+                collect_called_contained_names_stmt(s, out);
+            }
+        }
+        Stmt::Block { body, .. } => {
+            for s in body {
+                collect_called_contained_names_stmt(s, out);
+            }
+        }
+        Stmt::SelectCase {
+            selector, cases, ..
+        } => {
+            collect_called_contained_names_expr(selector, out);
+            for case in cases {
+                for s in &case.body {
+                    collect_called_contained_names_stmt(s, out);
+                }
+            }
+        }
+        Stmt::SelectType {
+            selector, guards, ..
+        } => {
+            collect_called_contained_names_expr(selector, out);
+            for guard in guards {
+                let body = match guard {
+                    TypeGuard::TypeIs { body, .. }
+                    | TypeGuard::ClassIs { body, .. }
+                    | TypeGuard::ClassDefault { body } => body,
+                };
+                for s in body {
+                    collect_called_contained_names_stmt(s, out);
+                }
+            }
+        }
+        Stmt::SelectRank {
+            selector, guards, ..
+        } => {
+            collect_called_contained_names_expr(selector, out);
+            for guard in guards {
+                let body = match guard {
+                    RankGuard::Rank { body, .. }
+                    | RankGuard::RankStar { body }
+                    | RankGuard::RankDefault { body } => body,
+                };
+                for s in body {
+                    collect_called_contained_names_stmt(s, out);
+                }
+            }
+        }
+        Stmt::Associate { assocs, body, .. } => {
+            for (_, e) in assocs {
+                collect_called_contained_names_expr(e, out);
+            }
+            for s in body {
+                collect_called_contained_names_stmt(s, out);
+            }
+        }
+        Stmt::WhereStmt { mask, stmt } => {
+            collect_called_contained_names_expr(mask, out);
+            collect_called_contained_names_stmt(stmt, out);
+        }
+        Stmt::WhereConstruct {
+            mask,
+            body,
+            elsewhere,
+            ..
+        } => {
+            collect_called_contained_names_expr(mask, out);
+            for s in body {
+                collect_called_contained_names_stmt(s, out);
+            }
+            for (mask, body) in elsewhere {
+                if let Some(mask) = mask {
+                    collect_called_contained_names_expr(mask, out);
+                }
+                for s in body {
+                    collect_called_contained_names_stmt(s, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_called_contained_names_expr(
+    expr: &crate::ast::expr::SpannedExpr,
+    out: &mut std::collections::HashSet<String>,
+) {
+    match &expr.node {
+        Expr::FunctionCall { callee, args } => {
+            if let Expr::Name { name } = &callee.node {
+                out.insert(name.to_lowercase());
+            }
+            collect_called_contained_names_expr(callee, out);
+            for arg in args {
+                if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
+                    collect_called_contained_names_expr(e, out);
+                }
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_called_contained_names_expr(left, out);
+            collect_called_contained_names_expr(right, out);
+        }
+        Expr::UnaryOp { operand, .. } => collect_called_contained_names_expr(operand, out),
+        Expr::ComponentAccess { base, .. } => collect_called_contained_names_expr(base, out),
+        Expr::ParenExpr { inner } => collect_called_contained_names_expr(inner, out),
+        _ => {}
+    }
 }
 
 pub(super) fn collect_internal_func_names(

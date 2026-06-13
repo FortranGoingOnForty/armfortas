@@ -35589,6 +35589,51 @@ fn procedure_dummy_closure_survives_contained_helper_call() {
 }
 
 #[test]
+fn sibling_contained_forwarder_carries_callee_host_closure() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=sibling_contained_forwarder_carries_callee_host_closure count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: got\n  call outer(got)\n  if (got /= 42) error stop 1\n  print *, got\ncontains\n  subroutine outer(out)\n    integer, intent(out) :: out\n    integer :: bias\n    bias = 40\n    call go()\n  contains\n    subroutine go()\n      call leaf()\n    end subroutine go\n    subroutine leaf()\n      out = bias + 2\n    end subroutine leaf\n  end subroutine outer\nend program p\n",
+        "sibling_forwarder_host_closure.f90",
+    );
+    let out = unique_path("sibling_forwarder_host_closure", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("sibling forwarder host-closure compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "sibling forwarder host-closure should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("sibling forwarder host-closure run failed to spawn");
+    assert!(
+        run.status.success(),
+        "sibling forwarder host-closure should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("42"),
+        "unexpected sibling forwarder host-closure output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn imported_generic_subroutine_with_optional_procedure_dummy_round_trips_through_amod() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
