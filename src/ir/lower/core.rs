@@ -11828,6 +11828,21 @@ pub(super) fn actual_expr_rank(
                         }
                     }
                 }
+                if key == "reshape" {
+                    let arg_slots = reorder_args_by_keyword_slots(args, "reshape", st);
+                    if let Some(crate::ast::expr::Argument {
+                        value: crate::ast::expr::SectionSubscript::Element(shape_expr),
+                        ..
+                    }) = arg_slots.get(1).and_then(|slot| slot.as_ref())
+                    {
+                        return reshape_result_rank_from_shape_expr(
+                            shape_expr,
+                            locals,
+                            st,
+                            type_layouts,
+                        );
+                    }
+                }
                 if matches!(
                     key.as_str(),
                     "all" | "any" | "count" | "sum" | "product" | "maxval" | "minval" | "norm2"
@@ -11860,6 +11875,35 @@ pub(super) fn actual_expr_rank(
         | Expr::StringLiteral { .. }
         | Expr::ComplexLiteral { .. }
         | Expr::BozLiteral { .. } => Some(0),
+    }
+}
+
+fn reshape_result_rank_from_shape_expr(
+    expr: &crate::ast::expr::SpannedExpr,
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> Option<usize> {
+    match &expr.node {
+        Expr::ParenExpr { inner } => {
+            reshape_result_rank_from_shape_expr(inner, locals, st, type_layouts)
+        }
+        Expr::ArrayConstructor { values, .. } => Some(values.len()),
+        Expr::FunctionCall { callee, args } => {
+            let Expr::Name { name } = &callee.node else {
+                return None;
+            };
+            if !name.eq_ignore_ascii_case("shape") {
+                return None;
+            }
+            args.first().and_then(|arg| match &arg.value {
+                crate::ast::expr::SectionSubscript::Element(source_expr) => {
+                    actual_expr_rank(source_expr, locals, st, type_layouts)
+                }
+                _ => None,
+            })
+        }
+        _ => None,
     }
 }
 

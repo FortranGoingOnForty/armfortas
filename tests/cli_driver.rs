@@ -39009,6 +39009,43 @@ fn type_bound_defined_operator_accepts_character_result_left_operand() {
 }
 
 #[test]
+fn type_bound_generic_reshape_result_actual_uses_array_specific() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=type_bound_generic_reshape_result_actual_uses_array_specific count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type :: sink\n    integer :: n = 0\n  contains\n    procedure :: add_scalar\n    procedure :: add_vec\n    generic :: add => add_scalar, add_vec\n  end type\ncontains\n  subroutine add_scalar(self, val)\n    class(sink), intent(inout) :: self\n    real, intent(in) :: val\n    self%n = -1\n  end subroutine\n\n  subroutine add_vec(self, val)\n    class(sink), intent(inout) :: self\n    real, intent(in) :: val(:)\n    self%n = size(val)\n  end subroutine\nend module\n\nprogram p\n  use m, only : sink\n  implicit none\n  type(sink) :: s\n  real :: raw(2, 3)\n  raw = 1.0\n  call s%add(reshape(raw, [size(raw)]))\n  if (s%n /= 6) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("tbp_generic_reshape_actual", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("type-bound reshape generic compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "type-bound reshape generic compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("type-bound reshape generic run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "type-bound reshape generic: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn user_op_dispatch_recognises_derived_type_constructor_as_scalar() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
