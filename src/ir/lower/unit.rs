@@ -300,7 +300,7 @@ pub(crate) fn lower_unit(
                             arg_uses_descriptor_for_lowering(n, decls, st, proc_scope_id);
                         let uses_string_descriptor =
                             arg_uses_string_descriptor_from_decls(n, decls);
-                        let is_derived = arg_derived_type_name(n, decls).is_some();
+                        let is_derived = arg_derived_type_name(n, decls, Some(st)).is_some();
                         if arg_has_value_attr(n, decls) {
                             // VALUE: pass by value (raw type, not pointer).
                             Some(Param {
@@ -439,7 +439,7 @@ pub(crate) fn lower_unit(
                             arg_uses_descriptor_for_lowering(pname, decls, st, proc_scope_id);
                         let uses_string_descriptor =
                             arg_uses_string_descriptor_from_decls(pname, decls);
-                        let dt_name = arg_derived_type_name(pname, decls);
+                        let dt_name = arg_derived_type_name(pname, decls, Some(st));
                         let is_pointer = decl_is_pointer(pname, decls);
                         let local_elem_ty = dummy_local_ir_type(
                             elem_ty,
@@ -696,6 +696,7 @@ pub(crate) fn lower_unit(
                 return_type.as_ref(),
                 decls,
                 bind.as_ref(),
+                Some(st),
             );
             let uses_hidden_result = hidden_result_abi != HiddenResultAbi::None;
 
@@ -705,7 +706,7 @@ pub(crate) fn lower_unit(
                     HiddenResultAbi::StringDescriptor => 32,
                     HiddenResultAbi::DerivedAggregate => {
                         let result_name = result.as_deref().unwrap_or(name.as_str()).to_lowercase();
-                        derived_type_name_for_result_var(return_type, &result_name, decls)
+                        derived_type_name_for_result_var(return_type, &result_name, decls, Some(st))
                             .and_then(|dt_name| {
                                 type_layouts
                                     .get(&dt_name)
@@ -752,7 +753,7 @@ pub(crate) fn lower_unit(
                                 arg_uses_descriptor_for_lowering(n, decls, st, proc_scope_id);
                             let uses_string_descriptor =
                                 arg_uses_string_descriptor_from_decls(n, decls);
-                            let is_derived = arg_derived_type_name(n, decls).is_some();
+                            let is_derived = arg_derived_type_name(n, decls, Some(st)).is_some();
                             if arg_has_value_attr(n, decls) {
                                 Some(Param {
                                     name: n.clone(),
@@ -808,7 +809,7 @@ pub(crate) fn lower_unit(
                                 arg_uses_descriptor_for_lowering(n, decls, st, proc_scope_id);
                             let uses_string_descriptor =
                                 arg_uses_string_descriptor_from_decls(n, decls);
-                            let is_derived = arg_derived_type_name(n, decls).is_some();
+                            let is_derived = arg_derived_type_name(n, decls, Some(st)).is_some();
                             if arg_has_value_attr(n, decls) {
                                 Some(Param {
                                     name: n.clone(),
@@ -939,7 +940,7 @@ pub(crate) fn lower_unit(
                             arg_uses_descriptor_for_lowering(pname, decls, st, proc_scope_id);
                         let uses_string_descriptor =
                             arg_uses_string_descriptor_from_decls(pname, decls);
-                        let dt_name = arg_derived_type_name(pname, decls);
+                        let dt_name = arg_derived_type_name(pname, decls, Some(st));
                         let is_pointer = decl_is_pointer(pname, decls);
                         let local_elem_ty = dummy_local_ir_type(
                             elem_ty,
@@ -1054,7 +1055,7 @@ pub(crate) fn lower_unit(
                         CharKind::Fixed(len) => fixed_char_storage_ir_type(len),
                         _ => arg_type_from_decls(&result_name, decls, Some(st)),
                     };
-                    let result_derived_type = arg_derived_type_name(&result_name, decls);
+                    let result_derived_type = arg_derived_type_name(&result_name, decls, Some(st));
                     let local_elem_ty = derived_local_storage_ir_type(
                         &elem_ty,
                         result_derived_type.as_deref(),
@@ -1082,9 +1083,13 @@ pub(crate) fn lower_unit(
                         },
                     );
                 } else if hidden_result_abi == HiddenResultAbi::DerivedAggregate {
-                    let dt_name =
-                        derived_type_name_for_result_var(return_type, &result_name, decls)
-                            .expect("derived hidden-result function missing result type");
+                    let dt_name = derived_type_name_for_result_var(
+                        return_type,
+                        &result_name,
+                        decls,
+                        Some(st),
+                    )
+                    .expect("derived hidden-result function missing result type");
                     if let Some(layout) = type_layouts.get(&dt_name) {
                         if derived_layout_needs_runtime_initialization(layout, type_layouts) {
                             initialize_derived_storage(&mut b, ValueId(0), layout, type_layouts);
@@ -1195,6 +1200,7 @@ pub(crate) fn lower_unit(
                                 return_type,
                                 &result_name,
                                 decls,
+                                Some(st),
                             ),
                             inline_const: None,
                             is_pointer: true,
@@ -1207,7 +1213,7 @@ pub(crate) fn lower_unit(
                     ctx.result_addr = Some(result_addr);
                     ctx.result_type = Some(ir_ret_ty.clone());
                 } else if let Some(dt_name) =
-                    derived_type_name_for_result_var(return_type, &result_name, decls)
+                    derived_type_name_for_result_var(return_type, &result_name, decls, Some(st))
                 {
                     // Derived-type FUNCTION result: allocate a struct-shaped
                     // buffer ([i8 x layout.size]) and register the result
@@ -1342,8 +1348,12 @@ pub(crate) fn lower_unit(
                         .get(&result_name)
                         .map(|info| info.is_pointer)
                         .unwrap_or(false);
-                    let derived_result_type =
-                        derived_type_name_for_result_var(return_type, &result_name, decls);
+                    let derived_result_type = derived_type_name_for_result_var(
+                        return_type,
+                        &result_name,
+                        decls,
+                        Some(st),
+                    );
                     let skip = if matches!(
                         hidden_result_abi,
                         HiddenResultAbi::ArrayDescriptor | HiddenResultAbi::DerivedAggregate

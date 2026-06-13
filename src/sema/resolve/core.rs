@@ -1610,7 +1610,28 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                     const_value: None,
                 })?;
             }
-            Decl::EnumDef { enumerators } => {
+            Decl::EnumDef {
+                type_name,
+                enumerators,
+            } => {
+                // F2023 R760: a named interoperable enum defines a
+                // weakly-typed alias of its integer kind; TYPE(name)
+                // declarations resolve through this symbol.
+                if let Some(tn) = type_name {
+                    st.define(Symbol {
+                        name: tn.clone(),
+                        kind: SymbolKind::EnumerationType,
+                        type_info: Some(TypeInfo::Integer { kind: None }),
+                        attrs: SymbolAttrs {
+                            access: st.default_access(st.current_scope()),
+                            ..Default::default()
+                        },
+                        defined_at: decl.span,
+                        scope: st.current_scope(),
+                        arg_names: vec![],
+                        const_value: None,
+                    })?;
+                }
                 let mut next_value = 0i64;
                 for (name, value_expr) in enumerators {
                     let const_value = if let Some(expr) = value_expr {
@@ -1632,6 +1653,44 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                         scope: st.current_scope(),
                         arg_names: vec![],
                         const_value: Some(const_value),
+                    })?;
+                }
+            }
+            Decl::EnumerationTypeDef { name, enumerators } => {
+                // F2023 7.6.2: the type name, then each enumerator as
+                // a typed constant of the enumeration type with its
+                // 1-based ordinal — NOT integer parameters (contrast
+                // EnumDef above; reusing that flattening would erase
+                // all type safety).
+                st.define(Symbol {
+                    name: name.clone(),
+                    kind: SymbolKind::EnumerationType,
+                    type_info: Some(TypeInfo::Enumeration(name.clone())),
+                    attrs: SymbolAttrs {
+                        access: st.default_access(st.current_scope()),
+                        ..Default::default()
+                    },
+                    defined_at: decl.span,
+                    scope: st.current_scope(),
+                    // Enumerators in declaration order: the constructor
+                    // range check (R771) needs the count.
+                    arg_names: enumerators.clone(),
+                    const_value: None,
+                })?;
+                for (i, ename) in enumerators.iter().enumerate() {
+                    st.define(Symbol {
+                        name: ename.clone(),
+                        kind: SymbolKind::Enumerator,
+                        type_info: Some(TypeInfo::Enumeration(name.clone())),
+                        attrs: SymbolAttrs {
+                            access: st.default_access(st.current_scope()),
+                            parameter: true,
+                            ..Default::default()
+                        },
+                        defined_at: decl.span,
+                        scope: st.current_scope(),
+                        arg_names: vec![],
+                        const_value: Some((i + 1) as i64),
                     })?;
                 }
             }
@@ -1659,7 +1718,11 @@ fn process_contains(
             matches!(st.scope(st.current_scope()).kind, ScopeKind::Submodule(_));
         match &unit.node {
             ProgramUnit::Subroutine {
-                name, prefix, bind, ..
+                name,
+                args,
+                prefix,
+                bind,
+                ..
             } => {
                 let elemental = prefix
                     .iter()
@@ -1679,6 +1742,16 @@ fn process_contains(
                     is_separate_module_procedure: is_smp,
                     ..Default::default()
                 };
+                let arg_names = args
+                    .iter()
+                    .filter_map(|a| {
+                        if let DummyArg::Name(n) = a {
+                            Some(n.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
                 let _ignore_dup = st.define(Symbol {
                     name: name.clone(),
                     kind: SymbolKind::Subroutine,
@@ -1686,7 +1759,7 @@ fn process_contains(
                     attrs,
                     defined_at: unit.span,
                     scope: st.current_scope(),
-                    arg_names: vec![],
+                    arg_names,
                     const_value: None,
                 });
             }

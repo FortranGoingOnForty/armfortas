@@ -1284,7 +1284,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     // 4. Parse.
     let phase = phases.start("parse");
     let mut parser = Parser::new(&tokens);
-    let units = match parser.parse_file() {
+    let mut units = match parser.parse_file() {
         Ok(units) => units,
         Err(e) => {
             phase.end(&mut phases);
@@ -1405,6 +1405,11 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     for ext_mod in &resolve_result.external_modules {
         external_char_len_star.extend(crate::sema::amod::extract_char_len_star_params(ext_mod));
     }
+
+    // Resolve TYPEOF/CLASSOF declaration specs to the concrete types
+    // sema recorded, so every lowering pre-pass sees the same spec the
+    // resolver did (F2023 l03).
+    lower::normalize_typeof_specs(&mut units, &st);
 
     let (mut ir_module, module_globals) = lower::lower_file(
         &units,

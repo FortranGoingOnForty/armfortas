@@ -603,6 +603,7 @@ pub(super) fn function_hidden_result_abi(
     return_type: Option<&TypeSpec>,
     decls: &[crate::ast::decl::SpannedDecl],
     bind: Option<&crate::ast::unit::BindInfo>,
+    st: Option<&SymbolTable>,
 ) -> HiddenResultAbi {
     use crate::ast::decl::Attribute;
     let result_key = result
@@ -646,7 +647,7 @@ pub(super) fn function_hidden_result_abi(
             }
             if bind.is_none()
                 && !decl_is_pointer(&result_key, decls)
-                && derived_type_name_for_result_var(&return_type.cloned(), &result_key, decls)
+                && derived_type_name_for_result_var(&return_type.cloned(), &result_key, decls, st)
                     .is_some()
             {
                 return HiddenResultAbi::DerivedAggregate;
@@ -667,7 +668,7 @@ pub(super) fn function_hidden_result_abi(
     }
     if bind.is_none()
         && !decl_is_pointer(&result_key, decls)
-        && derived_type_name_for_result_var(&return_type.cloned(), &result_key, decls).is_some()
+        && derived_type_name_for_result_var(&return_type.cloned(), &result_key, decls, st).is_some()
     {
         return HiddenResultAbi::DerivedAggregate;
     }
@@ -762,8 +763,17 @@ pub(super) fn collect_alloc_return_funcs(unit: &ProgramUnit, out: &mut HashSet<S
             bind,
             ..
         } => {
-            if function_hidden_result_abi(name, result, return_type.as_ref(), decls, bind.as_ref())
-                == HiddenResultAbi::ArrayDescriptor
+            // st: None is fine here — only the ArrayDescriptor answer is
+            // consumed, and the enumeration refinement only moves results
+            // out of DerivedAggregate.
+            if function_hidden_result_abi(
+                name,
+                result,
+                return_type.as_ref(),
+                decls,
+                bind.as_ref(),
+                None,
+            ) == HiddenResultAbi::ArrayDescriptor
             {
                 out.insert(name.to_lowercase());
             }
@@ -1281,6 +1291,111 @@ pub(super) fn smp_parent_interface_scope(
     })
 }
 
+/// Rewrite `TYPEOF(entity)` / `CLASSOF(entity)` declaration specs to
+/// the concrete specs resolution recorded on the declared symbols,
+/// recursing through CONTAINS. Runs once in the driver before
+/// lowering: every lowering pre-pass (descriptor params, class-dummy
+/// detection, result ABI, derived storage) keys on the syntactic
+/// TypeSpec, so an unresolved TypeOf silently took the unknown-type
+/// fallbacks — a TYPEOF(point) local dropped its component stores and
+/// a CLASSOF dummy missed the caller-side class descriptor.
+pub fn normalize_typeof_specs(units: &mut [crate::ast::Spanned<ProgramUnit>], st: &SymbolTable) {
+    for unit in units {
+        normalize_typeof_specs_in_unit(&mut unit.node, st);
+    }
+}
+
+fn normalize_typeof_specs_in_unit(unit: &mut ProgramUnit, st: &SymbolTable) {
+    use crate::sema::symtab::ScopeKind;
+    let (scope_id, decls, contains) = match unit {
+        ProgramUnit::Program {
+            name,
+            decls,
+            contains,
+            ..
+        } => {
+            let target = name.clone();
+            let sid = st
+                .all_scopes()
+                .iter()
+                .find(|s| match (&s.kind, target.as_deref()) {
+                    (ScopeKind::Program(n), Some(t)) => n.eq_ignore_ascii_case(t),
+                    (ScopeKind::Program(_), None) => true,
+                    _ => false,
+                })
+                .map(|s| s.id);
+            (sid, decls, contains)
+        }
+        ProgramUnit::Function {
+            name,
+            decls,
+            contains,
+            ..
+        }
+        | ProgramUnit::Subroutine {
+            name,
+            decls,
+            contains,
+            ..
+        } => (
+            procedure_scope_by_name(st, name).map(|s| s.id),
+            decls,
+            contains,
+        ),
+        ProgramUnit::Module {
+            name,
+            decls,
+            contains,
+            ..
+        }
+        | ProgramUnit::Submodule {
+            name,
+            decls,
+            contains,
+            ..
+        } => (st.find_module_scope(name), decls, contains),
+        _ => return,
+    };
+    rewrite_typeof_decls(decls, st, scope_id);
+    for contained in contains {
+        normalize_typeof_specs_in_unit(&mut contained.node, st);
+    }
+}
+
+fn rewrite_typeof_decls(
+    decls: &mut [crate::ast::decl::SpannedDecl],
+    st: &SymbolTable,
+    scope_id: Option<crate::sema::symtab::ScopeId>,
+) {
+    use crate::ast::decl::TypeSpec;
+    for d in decls {
+        let Decl::TypeDecl {
+            type_spec,
+            entities,
+            ..
+        } = &mut d.node
+        else {
+            continue;
+        };
+        if !matches!(type_spec, TypeSpec::TypeOf(_) | TypeSpec::ClassOf(_)) {
+            continue;
+        }
+        // The declared entity's own symbol carries the type that
+        // resolution computed for the TYPEOF/CLASSOF spec.
+        let Some(entity) = entities.first() else {
+            continue;
+        };
+        let key = entity.name.to_lowercase();
+        let ti = scope_id
+            .and_then(|sid| st.lookup_in(sid, &key))
+            .or_else(|| st.find_symbol_any_scope(&key))
+            .and_then(|sym| sym.type_info.clone());
+        if let Some(ti) = ti {
+            *type_spec = type_info_to_type_spec(Some(&ti));
+        }
+    }
+}
+
 /// Sprint35-SMP Phase 2: convert a sema TypeInfo back to an AST TypeSpec
 /// so the synthesizer can build a Decl::TypeDecl that matches what the
 /// parser would have produced from the original interface body. Kind
@@ -1297,6 +1412,9 @@ pub(super) fn type_info_to_type_spec(
     };
 
     match type_info {
+        // Enumeration values are integer ordinals; their TypeSpec
+        // round-trips through TYPE(name) (the standard's spelling).
+        Some(TypeInfo::Enumeration(name)) => TypeSpec::Type(name.clone()),
         Some(TypeInfo::Integer { kind }) => TypeSpec::Integer(make_kind(*kind)),
         Some(TypeInfo::Real { kind }) => TypeSpec::Real(make_kind(*kind)),
         Some(TypeInfo::DoublePrecision) => TypeSpec::DoublePrecision,
@@ -3197,6 +3315,10 @@ pub(super) fn collect_name_refs_decls(
             | TypeSpec::Class(_)
             | TypeSpec::ClassStar
             | TypeSpec::TypeStar => {}
+            // TYPEOF/CLASSOF reference an already-declared entity;
+            // collecting the name here would synthesize a bogus
+            // implicit local.
+            TypeSpec::TypeOf(_) | TypeSpec::ClassOf(_) => {}
         }
     }
 
@@ -3255,7 +3377,8 @@ pub(super) fn collect_name_refs_decls(
             | Decl::ImplicitStmt { .. }
             | Decl::UseStmt { .. }
             | Decl::CommonBlock { .. }
-            | Decl::EnumDef { .. } => {}
+            | Decl::EnumDef { .. }
+            | Decl::EnumerationTypeDef { .. } => {}
         }
     }
 }
@@ -12450,6 +12573,11 @@ pub(super) fn defined_assignment_arg_semantic_match(
         declared.unwrap_or(default) == actual.unwrap_or(default)
     }
     match declared {
+        TypeInfo::Enumeration(decl_name) => matches!(
+            actual,
+            Some(TypeInfo::Enumeration(actual_name))
+                if actual_name.eq_ignore_ascii_case(decl_name)
+        ),
         TypeInfo::Derived(decl_name) => matches!(
             actual,
             Some(TypeInfo::Derived(actual_name))
@@ -12498,6 +12626,11 @@ pub(super) fn operator_arg_semantic_match(
     use crate::sema::symtab::TypeInfo;
 
     match declared {
+        TypeInfo::Enumeration(decl_name) => matches!(
+            actual,
+            Some(TypeInfo::Enumeration(actual_name))
+                if actual_name.eq_ignore_ascii_case(decl_name)
+        ),
         TypeInfo::Character { .. } => matches!(actual, Some(TypeInfo::Character { .. })),
         TypeInfo::Derived(decl_name) => matches!(
             actual,
@@ -12582,6 +12715,11 @@ pub(super) fn generic_declared_semantic_match(
     };
 
     match declared {
+        TypeInfo::Enumeration(decl_name) => matches!(
+            actual,
+            TypeInfo::Enumeration(actual_name)
+                if actual_name.eq_ignore_ascii_case(decl_name)
+        ),
         TypeInfo::Integer {
             kind: declared_kind,
         } => matches!(
@@ -12771,6 +12909,7 @@ pub(super) fn fortran_type_to_type_info(
             kind: Some(*kind),
         }),
         FortranType::Derived { name } => Some(TypeInfo::Derived(name.clone())),
+        FortranType::Enumeration { name } => Some(TypeInfo::Enumeration(name.clone())),
         FortranType::ClassOf { base } => Some(TypeInfo::Class(base.clone())),
         FortranType::UnlimitedPoly => Some(TypeInfo::ClassStar),
         FortranType::AssumedType => Some(TypeInfo::TypeStar),
@@ -13491,6 +13630,22 @@ pub(super) fn generic_actual_expr_type_info(
                     st.find_symbol_any_scope(&key)
                         .and_then(|sym| sym.type_info.clone())
                 });
+            // F2023 7.6.2: enumeration values lower to plain i32
+            // scalars, so the LocalInfo types them Integer and generic
+            // dispatch would route the actual to an INTEGER specific.
+            // The symbol table is the only carrier of the enumeration
+            // identity — honor it when the local corroborates (plain
+            // scalar, no derived/char/class storage).
+            if let Some(TypeInfo::Enumeration(_)) = symbol_ti.as_ref() {
+                let local_is_plain_scalar = locals.get(&key).is_none_or(|info| {
+                    info.char_kind == CharKind::None
+                        && info.derived_type.is_none()
+                        && !info.is_class
+                });
+                if local_is_plain_scalar {
+                    return symbol_ti;
+                }
+            }
             name_expr_type_info(locals.get(&key), symbol_ti.as_ref())
         }
         Expr::ComponentAccess { base, component } => {
@@ -13519,6 +13674,15 @@ pub(super) fn generic_actual_expr_type_info(
                 .map(|field| field.type_info.clone())
         }
         Expr::FunctionCall { callee, args } => {
+            // Enumeration constructor (R771): color(n) is a value of
+            // the enumeration type, not an integer.
+            if let Expr::Name { name } = &callee.node {
+                if let Some(sym) = st.find_symbol_any_scope(&name.to_lowercase()) {
+                    if matches!(sym.kind, crate::sema::symtab::SymbolKind::EnumerationType) {
+                        return sym.type_info.clone();
+                    }
+                }
+            }
             let array_info = match &callee.node {
                 Expr::Name { name } => locals.get(&name.to_lowercase()).cloned(),
                 _ => None,
@@ -18532,6 +18696,7 @@ pub(super) fn allocate_runtime_shape_array_result(
 pub(super) fn arg_derived_type_name(
     arg_name: &str,
     decls: &[crate::ast::decl::SpannedDecl],
+    st: Option<&SymbolTable>,
 ) -> Option<String> {
     let key = arg_name.to_lowercase();
     for decl in decls {
@@ -18544,6 +18709,11 @@ pub(super) fn arg_derived_type_name(
             for entity in entities {
                 if entity.name.to_lowercase() == key {
                     if let TypeSpec::Type(ref name) | TypeSpec::Class(ref name) = type_spec {
+                        // TYPE(enumeration) dummies are plain by-ref
+                        // i32 scalars, not derived aggregates.
+                        if type_name_is_enumeration(name, st) {
+                            return None;
+                        }
                         return Some(name.clone());
                     }
                 }
@@ -18732,15 +18902,31 @@ pub(super) fn collect_referenced_names(stmt: &SpannedStmt, out: &mut Vec<String>
     }
 }
 
+/// True when `TYPE(name)` names an F2023 enumeration type rather
+/// than a derived type — enumeration values are plain default-integer
+/// ordinals, so results and locals of the type never take the
+/// derived-aggregate path. `None` symbol table (AST-only callers)
+/// keeps the historical derived classification.
+fn type_name_is_enumeration(name: &str, st: Option<&SymbolTable>) -> bool {
+    st.and_then(|st| st.find_symbol_any_scope(&name.to_lowercase()))
+        .is_some_and(|sym| matches!(sym.kind, crate::sema::symtab::SymbolKind::EnumerationType))
+}
+
 /// Extract the derived-type name from a function `return_type`
 /// declaration. Returns `Some("vec")` for `type(vec) function f()` and
 /// `None` for intrinsic-typed returns. Used by the Function lowering
 /// arm to decide whether the result variable needs derived-type
 /// storage and metadata.
-pub(super) fn derived_type_name_for_return(return_type: &Option<TypeSpec>) -> Option<String> {
+pub(super) fn derived_type_name_for_return(
+    return_type: &Option<TypeSpec>,
+    st: Option<&SymbolTable>,
+) -> Option<String> {
     if let Some(TypeSpec::Type(name)) = return_type {
         let lower = name.to_lowercase();
         if lower == "c_ptr" || lower == "c_funptr" {
+            return None;
+        }
+        if type_name_is_enumeration(name, st) {
             return None;
         }
         Some(name.clone())
@@ -18761,8 +18947,9 @@ pub(super) fn derived_type_name_for_result_var(
     return_type: &Option<TypeSpec>,
     result_name: &str,
     decls: &[crate::ast::decl::SpannedDecl],
+    st: Option<&SymbolTable>,
 ) -> Option<String> {
-    if let Some(n) = derived_type_name_for_return(return_type) {
+    if let Some(n) = derived_type_name_for_return(return_type, st) {
         return Some(n);
     }
     let key = result_name.to_lowercase();
@@ -18778,6 +18965,9 @@ pub(super) fn derived_type_name_for_result_var(
                     if let TypeSpec::Type(name) = type_spec {
                         let lower = name.to_lowercase();
                         if lower == "c_ptr" || lower == "c_funptr" {
+                            return None;
+                        }
+                        if type_name_is_enumeration(name, st) {
                             return None;
                         }
                         return Some(name.clone());
@@ -19142,7 +19332,7 @@ pub(super) fn build_host_ref_params(
         let large_explicit_shape = host_ref_explicit_array_uses_descriptor(&dims, &elem_ty, layout);
         let descriptor_arg =
             (uses_desc || alloc || large_explicit_shape) && !uses_string_descriptor;
-        let derived_type = arg_derived_type_name(hname, host_decls);
+        let derived_type = arg_derived_type_name(hname, host_decls, Some(st));
         let ptr_ty = by_ref_storage_ir_type(
             &elem_ty,
             descriptor_arg,
@@ -21861,11 +22051,36 @@ pub(super) fn lower_type_spec_with_param_consts(
             let lower_name = name.to_lowercase();
             if lower_name == "c_ptr" || lower_name == "c_funptr" {
                 IrType::Int(IntWidth::I64)
+            } else if let Some(st) = st {
+                // TYPE(name) also spells F2023 enumeration and named
+                // interoperable enum types (7.6.2 NOTE) — those are
+                // scalar integer ordinals, not struct pointers.
+                match st.find_symbol_any_scope(&lower_name) {
+                    Some(sym)
+                        if matches!(sym.kind, crate::sema::symtab::SymbolKind::EnumerationType) =>
+                    {
+                        match &sym.type_info {
+                            Some(ti) => type_info_to_ir_type(ti),
+                            None => IrType::Int(IntWidth::I32),
+                        }
+                    }
+                    _ => IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                }
             } else {
                 // User-defined derived types are byte pointers (struct layout resolved elsewhere).
                 IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)))
             }
         }
+        // F2023 TYPEOF/CLASSOF: the declared type of the referenced
+        // entity; resolution validated the reference, so a failed
+        // lookup here only happens on already-rejected programs.
+        TypeSpec::TypeOf(entity) | TypeSpec::ClassOf(entity) => match st
+            .and_then(|st| st.find_symbol_any_scope(&entity.to_lowercase()))
+            .and_then(|sym| sym.type_info.clone())
+        {
+            Some(ti) => type_info_to_ir_type(&ti),
+            None => IrType::Int(IntWidth::I32),
+        },
         _ => IrType::Int(IntWidth::I32), // fallback
     }
 }

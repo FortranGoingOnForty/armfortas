@@ -923,6 +923,39 @@ pub(crate) fn alloc_decls(
                         );
                     }
                 } else if let TypeSpec::Type(ref type_name) = type_spec {
+                    // TYPE(name) also spells F2023 enumeration and
+                    // named-enum types — scalar integer ordinals, not
+                    // struct storage (7.6.2 NOTE uses Type(v_value)).
+                    if let Some(sym) = st.find_symbol_any_scope(&type_name.to_lowercase()) {
+                        if matches!(sym.kind, crate::sema::symtab::SymbolKind::EnumerationType) {
+                            let scalar_ty = sym
+                                .type_info
+                                .as_ref()
+                                .map(crate::ir::lower::core::type_info_to_ir_type)
+                                .unwrap_or(IrType::Int(IntWidth::I32));
+                            let addr = b.alloca(scalar_ty.clone());
+                            locals.insert(
+                                key,
+                                LocalInfo {
+                                    addr,
+                                    ty: scalar_ty,
+                                    dims: vec![],
+                                    allocatable: false,
+                                    descriptor_arg: false,
+                                    by_ref: false,
+                                    char_kind: CharKind::None,
+                                    derived_type: None,
+                                    inline_const: None,
+                                    is_pointer: false,
+                                    runtime_dim_upper: vec![],
+                                    is_class: false,
+                                    logical_kind: None,
+                                    last_dim_assumed_size: false,
+                                },
+                            );
+                            continue;
+                        }
+                    }
                     // Derived type variable: allocate struct-sized byte array.
                     if let Some(layout) = type_layouts.get(type_name) {
                         let struct_ty =

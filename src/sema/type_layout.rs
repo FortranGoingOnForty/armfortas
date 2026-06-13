@@ -195,6 +195,8 @@ impl TypeLayoutRegistry {
 /// threading a layout they cannot consume.
 pub fn size_of_scalar_kind(ti: &TypeInfo) -> Option<(usize, usize)> {
     match ti {
+        // Enumeration values are default-integer ordinals.
+        TypeInfo::Enumeration(_) => Some((4, 4)),
         TypeInfo::Integer { kind } => {
             // No explicit kind selector → honour the driver's
             // -fdefault-integer-8 (sprint 32 #504).  Standard
@@ -673,6 +675,10 @@ fn type_spec_to_type_info(
         TypeSpec::Class(name) => TypeInfo::Class(name.clone()),
         TypeSpec::ClassStar => TypeInfo::ClassStar,
         TypeSpec::TypeStar => TypeInfo::TypeStar,
+        // TYPEOF/CLASSOF in derived-type components are an l03
+        // deferral (this context has no symbol table to resolve the
+        // entity); validation rejects them before layout matters.
+        TypeSpec::TypeOf(_) | TypeSpec::ClassOf(_) => TypeInfo::TypeStar,
     }
 }
 

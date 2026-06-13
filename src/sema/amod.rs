@@ -1244,6 +1244,10 @@ fn type_info_to_string(info: Option<&TypeInfo>) -> String {
             Some(k) => format!("integer({})", k),
             None => "integer".to_string(),
         },
+        // l07 flag: enumeration types need full .amod round-trip
+        // support when multi-file lands; the string form keeps
+        // hashing/diagnostics honest meanwhile.
+        Some(TypeInfo::Enumeration(name)) => format!("enumeration({})", name),
         Some(TypeInfo::Real { kind }) => match kind {
             Some(k) => format!("real({})", k),
             None => "real".to_string(),
@@ -2166,6 +2170,15 @@ fn parse_type_info(s: &str) -> Option<TypeInfo> {
     }
     if let Some(inner) = s.strip_prefix("class(").and_then(|r| r.strip_suffix(')')) {
         return Some(TypeInfo::Class(inner.to_string()));
+    }
+    // l07 flag: preserves the type identity of enumeration-typed
+    // symbols; re-registering the type itself (and its enumerators)
+    // from a .amod is the l07 round-trip row.
+    if let Some(inner) = s
+        .strip_prefix("enumeration(")
+        .and_then(|r| r.strip_suffix(')'))
+    {
+        return Some(TypeInfo::Enumeration(inner.to_string()));
     }
 
     None

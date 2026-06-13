@@ -6,17 +6,37 @@
 /// A Fortran type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FortranType {
-    Integer { kind: u8 }, // kind in bytes: 1, 2, 4, 8, 16
-    Real { kind: u8 },    // 4 (single), 8 (double), 16 (quad)
-    Complex { kind: u8 }, // 4, 8, 16
-    Logical { kind: u8 }, // 1, 2, 4, 8
-    Character { kind: u8, len: CharLen },
-    Derived { name: String },
-    ClassOf { base: String }, // CLASS(t)
-    UnlimitedPoly,            // CLASS(*)
-    AssumedType,              // TYPE(*)
-    Void,                     // subroutine (no return value)
-    Unknown,                  // not yet determined
+    Integer {
+        kind: u8,
+    }, // kind in bytes: 1, 2, 4, 8, 16
+    Real {
+        kind: u8,
+    }, // 4 (single), 8 (double), 16 (quad)
+    Complex {
+        kind: u8,
+    }, // 4, 8, 16
+    Logical {
+        kind: u8,
+    }, // 1, 2, 4, 8
+    Character {
+        kind: u8,
+        len: CharLen,
+    },
+    Derived {
+        name: String,
+    },
+    /// F2023 enumeration type (7.6.2): strict name-based identity;
+    /// values are 1-based ordinals represented as default integer.
+    Enumeration {
+        name: String,
+    },
+    ClassOf {
+        base: String,
+    }, // CLASS(t)
+    UnlimitedPoly, // CLASS(*)
+    AssumedType,   // TYPE(*)
+    Void,          // subroutine (no return value)
+    Unknown,       // not yet determined
 }
 
 /// Character length.
@@ -341,6 +361,7 @@ pub fn disambiguate_call(
 pub fn type_info_to_fortran_type(info: &super::symtab::TypeInfo) -> FortranType {
     use super::symtab::TypeInfo;
     match info {
+        TypeInfo::Enumeration(name) => FortranType::Enumeration { name: name.clone() },
         TypeInfo::Integer { kind } => FortranType::Integer {
             kind: kind.unwrap_or(4),
         },
@@ -731,6 +752,13 @@ pub fn expr_type(
                             .unwrap_or_else(|| FortranType::Derived {
                                 name: sym.name.clone(),
                             });
+                    }
+                    // Enumeration constructor (F2023 R771): color(n)
+                    // yields a value of the enumeration type.
+                    if matches!(sym.kind, super::symtab::SymbolKind::EnumerationType) {
+                        return FortranType::Enumeration {
+                            name: sym.name.clone(),
+                        };
                     }
                     if matches!(sym.kind, super::symtab::SymbolKind::NamedInterface) {
                         if let Some(ty) = same_name_derived_constructor_type(symtab, name) {

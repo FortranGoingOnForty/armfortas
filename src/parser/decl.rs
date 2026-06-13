@@ -67,8 +67,41 @@ impl<'a> Parser<'a> {
                 self.advance();
                 Some(self.parse_type_or_class_spec(true))
             }
+            // F2023 TYPEOF(entity) / CLASSOF(entity): the parenthesized
+            // name references a previously declared ENTITY, not a type.
+            "typeof" | "classof" => {
+                let is_classof = text == "classof";
+                let next_pos = self.pos + 1;
+                if next_pos < self.tokens.len() && self.tokens[next_pos].kind == TokenKind::LParen {
+                    self.advance();
+                    Some(self.parse_typeof_spec(is_classof))
+                } else {
+                    None
+                }
+            }
             _ => None,
         }
+    }
+
+    /// F2023 `TYPEOF ( data-ref )` / `CLASSOF ( data-ref )`. l03
+    /// accepts a plain entity name (the common form); component refs
+    /// are a matrix-noted follow-up.
+    fn parse_typeof_spec(&mut self, is_classof: bool) -> Result<TypeSpec, ParseError> {
+        self.expect(&TokenKind::LParen)?;
+        if self.peek() != &TokenKind::Identifier {
+            return Err(self.error(format!(
+                "expected an entity name in {}(...), got {}",
+                if is_classof { "CLASSOF" } else { "TYPEOF" },
+                self.peek()
+            )));
+        }
+        let name = self.advance().clone().text;
+        self.expect(&TokenKind::RParen)?;
+        Ok(if is_classof {
+            TypeSpec::ClassOf(name)
+        } else {
+            TypeSpec::TypeOf(name)
+        })
     }
 
     /// Parse a type specifier for IMPLICIT — without consuming a kind selector,
@@ -1337,6 +1370,17 @@ impl<'a> Parser<'a> {
             self.expect(&TokenKind::RParen)?;
         }
 
+        // F2023 R760: optional `:: enum-type-name` names the
+        // interoperable enum type.
+        let type_name = if self.eat(&TokenKind::ColonColon) {
+            if self.peek() != &TokenKind::Identifier {
+                return Err(self.error("expected enum type name after ::".into()));
+            }
+            Some(self.advance().clone().text)
+        } else {
+            None
+        };
+
         self.skip_newlines();
         let mut enumerators = Vec::new();
         loop {
@@ -1373,7 +1417,98 @@ impl<'a> Parser<'a> {
 
         self.consume_end("enum")?;
         let span = crate::parser::expr::span_from_to(start, self.prev_span());
-        Ok(Spanned::new(Decl::EnumDef { enumerators }, span))
+        Ok(Spanned::new(
+            Decl::EnumDef {
+                type_name,
+                enumerators,
+            },
+            span,
+        ))
+    }
+
+    /// F2023 R766 (7.6.2): `ENUMERATION TYPE [[, access-spec] ::]
+    /// name` ... `ENUMERATOR [::] name-list` ... `END ENUMERATION
+    /// TYPE [name]`. Enumerators take no `= value`; declaration
+    /// order defines 1-based ordinals (positional, unlike the
+    /// interoperable ENUM above).
+    pub fn parse_enumeration_type_def(&mut self) -> Result<SpannedDecl, ParseError> {
+        let start = self.current_span();
+        self.advance(); // consume ENUMERATION
+        if !self.eat_ident("type") {
+            return Err(self.error("expected TYPE after ENUMERATION".into()));
+        }
+
+        // Optional `, access-spec` (C7114 restricts to module
+        // specification parts — enforced in sema, not here).
+        if self.eat(&TokenKind::Comma) {
+            let acc = self.peek_text().to_lowercase();
+            if acc == "public" || acc == "private" {
+                self.advance();
+            } else {
+                return Err(self.error(format!(
+                    "expected PUBLIC or PRIVATE after ENUMERATION TYPE, got '{}'",
+                    self.peek_text()
+                )));
+            }
+        }
+        self.eat(&TokenKind::ColonColon);
+        if self.peek() != &TokenKind::Identifier {
+            return Err(self.error("expected enumeration type name".into()));
+        }
+        let name = self.advance().clone().text;
+
+        self.skip_newlines();
+        let mut enumerators = Vec::new();
+        loop {
+            self.skip_newlines();
+            let text = self.peek_text().to_lowercase();
+            if text == "end" || text == "endenumeration" {
+                break;
+            }
+            if text != "enumerator" {
+                return Err(self.error(format!(
+                    "expected ENUMERATOR or END ENUMERATION TYPE, got '{}'",
+                    self.peek_text()
+                )));
+            }
+            self.advance(); // consume ENUMERATOR
+            self.eat(&TokenKind::ColonColon);
+            loop {
+                if self.peek() != &TokenKind::Identifier {
+                    return Err(self.error("expected enumerator name".into()));
+                }
+                let ename = self.advance().clone().text;
+                if self.peek() == &TokenKind::Assign {
+                    return Err(self.error(
+                        "enumerators of an ENUMERATION TYPE take no value;                          ordinals follow declaration order (F2023 R768)"
+                            .into(),
+                    ));
+                }
+                enumerators.push(ename);
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.skip_newlines();
+        }
+
+        // END ENUMERATION TYPE [name] — C7115: a trailing name must
+        // match.
+        self.consume_end("enumeration")?;
+        if self.eat_ident("type") && self.peek() == &TokenKind::Identifier {
+            let end_name = self.advance().clone().text;
+            if !end_name.eq_ignore_ascii_case(&name) {
+                return Err(self.error(format!(
+                    "END ENUMERATION TYPE name '{}' does not match '{}' (C7115)",
+                    end_name, name
+                )));
+            }
+        }
+        let span = crate::parser::expr::span_from_to(start, self.prev_span());
+        Ok(Spanned::new(
+            Decl::EnumerationTypeDef { name, enumerators },
+            span,
+        ))
     }
 }
 
@@ -1666,7 +1801,7 @@ mod tests {
     #[test]
     fn enum_bind_c() {
         let d = parse_decl("enum, bind(c)\n  enumerator :: red = 1, blue = 2\nend enum\n");
-        if let Decl::EnumDef { enumerators } = &d.node {
+        if let Decl::EnumDef { enumerators, .. } = &d.node {
             assert_eq!(enumerators.len(), 2);
             assert_eq!(enumerators[0].0, "red");
             assert_eq!(enumerators[1].0, "blue");
