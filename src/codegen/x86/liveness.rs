@@ -24,8 +24,12 @@ pub struct LiveInterval {
     pub crosses_call: bool,
     /// Sorted positions of every call strictly inside (start, end).
     pub call_crossings: Vec<u32>,
-    /// Preferred physical register index (allocator tries it first).
-    pub hint: Option<u8>,
+    /// Preferred physical register: this vreg is moved to/from this
+    /// register by isel (an arg-setup `mov vreg, %rdi`, a return value,
+    /// a div dividend, …). Allocating the vreg here turns the move into
+    /// a self-move that coalescing then drops. The allocator tries it
+    /// first if free and fixed-interval-clear over the vreg's range.
+    pub hint: Option<X86Reg>,
 }
 
 /// Result of liveness analysis.
@@ -267,6 +271,35 @@ pub fn compute_liveness(f: &X86Function) -> LivenessResult {
     }
     call_positions.sort_unstable();
 
+    // Register hints: a register-to-register move between a vreg and a
+    // physical register (isel's arg setup, return value, div dividend,
+    // …) hints the vreg toward that physreg, so the allocator can place
+    // it there and coalescing drops the resulting self-move. First
+    // hint wins (an earlier move's preference is more likely the def
+    // site). Move opcodes that carry a value verbatim: MovRR (GP) and
+    // the scalar/packed FP moves.
+    let mut hints: HashMap<VRegId, X86Reg> = HashMap::new();
+    for block in &f.blocks {
+        for inst in &block.insts {
+            if !matches!(
+                inst.opcode,
+                X86Opcode::MovRR | X86Opcode::Movss | X86Opcode::Movsd | X86Opcode::Movaps
+            ) {
+                continue;
+            }
+            let def = inst.def.as_ref();
+            let src = inst.operands.first();
+            // mov vreg -> %phys  (def phys, src vreg)
+            if let (Some(X86Operand::Reg(p)), Some(X86Operand::VReg(v))) = (def, src) {
+                hints.entry(v.id).or_insert(*p);
+            }
+            // mov %phys -> vreg  (def vreg, src phys)
+            if let (Some(X86Operand::VReg(v)), Some(X86Operand::Reg(p))) = (def, src) {
+                hints.entry(v.id).or_insert(*p);
+            }
+        }
+    }
+
     let mut intervals: Vec<LiveInterval> = starts
         .iter()
         .enumerate()
@@ -285,7 +318,7 @@ pub fn compute_liveness(f: &X86Function) -> LivenessResult {
                 end,
                 crosses_call: !call_crossings.is_empty(),
                 call_crossings,
-                hint: None,
+                hint: hints.get(&VRegId(idx as u32)).copied(),
             })
         })
         .collect();
