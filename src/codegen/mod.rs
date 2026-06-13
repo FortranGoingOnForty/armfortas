@@ -60,6 +60,17 @@ pub fn emit_module(
                 } else {
                     x86::regalloc::regalloc_naive(f);
                 }
+                // Post-regalloc peephole (x10b, O2+): patterns over
+                // physical registers and spill slots that only exist
+                // after allocation (xor-zeroing, store-to-load
+                // forwarding, lea folding). `ARMFORTAS_NO_POST_PEEP`
+                // disables it — a bisection knob for peephole-induced
+                // miscompiles, mirroring the allocator's env toggles.
+                if opts.opt_level >= crate::driver::OptLevel::O2
+                    && std::env::var_os("ARMFORTAS_NO_POST_PEEP").is_none()
+                {
+                    x86::peephole::run_peephole_post_regalloc(f);
+                }
                 text.push_str(&x86::emit::emit_function(f));
                 for (label, bits) in &f.rodata {
                     text.push_str(&x86::emit::emit_rodata_f64(label, f64::from_bits(*bits)));
