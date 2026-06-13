@@ -2658,6 +2658,50 @@ fn allocatable_character_component_descriptor_starts_zeroed() {
 }
 
 #[test]
+fn allocatable_derived_array_character_component_deallocates_elements() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_derived_array_character_component_deallocates_elements count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  type :: alloc_str\n    character(len=:), allocatable :: str\n  end type alloc_str\n  type(alloc_str), dimension(:), allocatable :: names\n  integer :: i\n  allocate(names(3))\n  names(1)%str = 'a'\n  names(2)%str = 'bb'\n  names(3)%str = 'ccc'\n  if (names(1)%str /= 'a') error stop 1\n  if (names(2)%str /= 'bb') error stop 2\n  if (names(3)%str /= 'ccc') error stop 3\n  do i = 1, 3\n    if (allocated(names(i)%str)) deallocate(names(i)%str)\n  end do\n  deallocate(names)\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("alloc_derived_array_char_component_dealloc", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("allocatable derived array char component compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "allocatable derived array char component should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("allocatable derived array char component run failed");
+    assert!(
+        run.status.success(),
+        "allocatable derived array char component should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected allocatable derived array char component output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn allocatable_character_component_update_through_inout_dummy_runs() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

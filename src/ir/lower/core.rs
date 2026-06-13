@@ -23754,7 +23754,13 @@ pub(super) fn lower_array_element_addr(
 ) -> ValueId {
     let idx64 = compute_flat_elem_offset(b, locals, info, args, st, type_layouts);
     let base = array_base_addr(b, info);
-    b.gep(base, vec![idx64], info.ty.clone())
+    let elem_ty = info
+        .derived_type
+        .as_deref()
+        .filter(|name| !is_opaque_c_handle_name(name))
+        .and_then(|name| type_layouts.and_then(|tl| derived_storage_ir_type(name, tl)))
+        .unwrap_or_else(|| info.ty.clone());
+    b.gep(base, vec![idx64], elem_ty)
 }
 
 pub(super) fn emit_bounds_check(
