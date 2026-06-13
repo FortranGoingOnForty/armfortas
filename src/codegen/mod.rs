@@ -45,11 +45,16 @@ pub fn emit_module(
                     x86::peephole::run_peephole(f);
                 }
                 x86::twoaddr::convert_to_two_address(f);
-                // x10a: opt-in linear-scan allocator. Default stays the
-                // naive allocator (the correctness reference) until the
-                // linear scan is proven; flip the default at O1+ once it
-                // passes the full matrix + benchmark gate.
-                if std::env::var_os("ARMFORTAS_USE_LINEAR_REGALLOC").is_some() {
+                // x10a-1: linear-scan allocator at O1+, naive at O0
+                // (compile speed / debuggability), mirroring arm64.
+                // `ARMFORTAS_USE_NAIVE_REGALLOC` forces naive everywhere
+                // (the bisectable correctness reference);
+                // `ARMFORTAS_USE_LINEAR_REGALLOC` forces linear at O0 too.
+                let force_naive = std::env::var_os("ARMFORTAS_USE_NAIVE_REGALLOC").is_some();
+                let force_linear = std::env::var_os("ARMFORTAS_USE_LINEAR_REGALLOC").is_some();
+                let use_linear =
+                    !force_naive && (force_linear || opts.opt_level >= crate::driver::OptLevel::O1);
+                if use_linear {
                     let result = x86::linearscan::linear_scan(f);
                     x86::linearscan::apply_allocation(f, &result);
                 } else {
