@@ -232,18 +232,6 @@ pub fn apply_allocation(f: &mut X86Function, result: &AllocResult) {
         callee_slot.push((reg, f.alloc_frame_slot(8, 8)));
     }
 
-    // Per-vreg class, for spill load/store sizing.
-    let mut vreg_class: HashMap<VRegId, X86RegClass> = HashMap::new();
-    for block in &f.blocks {
-        for inst in &block.insts {
-            for op in inst.operands.iter().chain(inst.def.iter()) {
-                if let X86Operand::VReg(v) = op {
-                    vreg_class.insert(v.id, v.class);
-                }
-            }
-        }
-    }
-
     // Frame layout: slot id → negative rbp displacement (identical to
     // regalloc_naive Phase 2).
     let mut offset: i64 = 0;
@@ -283,15 +271,29 @@ pub fn apply_allocation(f: &mut X86Function, result: &AllocResult) {
         for mut inst in insts {
             let mut gp_used = 0usize;
             let mut fp_used = 0usize;
+            // At most two spilled operands per class fit the 2 scratch
+            // registers. Every current isel shape stays within that
+            // (the naive allocator proves it for ALL vregs, and spilled
+            // is a subset). Assert loudly rather than silently aliasing
+            // a third spill onto scratch[1] — a silent wrong answer is
+            // worse than a panic.
             let next_scratch = |class: X86RegClass, gp: &mut usize, fp: &mut usize| -> X86Reg {
                 match class {
                     X86RegClass::Xmm | X86RegClass::Xmm128 => {
-                        let r = FP_SCRATCH[(*fp).min(1)];
+                        assert!(
+                            *fp < FP_SCRATCH.len(),
+                            "x86 linear scan: >2 spilled FP operands"
+                        );
+                        let r = FP_SCRATCH[*fp];
                         *fp += 1;
                         r
                     }
                     _ => {
-                        let r = GP_SCRATCH[(*gp).min(1)];
+                        assert!(
+                            *gp < GP_SCRATCH.len(),
+                            "x86 linear scan: >2 spilled GP operands"
+                        );
+                        let r = GP_SCRATCH[*gp];
                         *gp += 1;
                         r
                     }
