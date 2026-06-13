@@ -26809,6 +26809,20 @@ pub(super) fn lower_array_read_item(
             lower_whole_array_read(b, &info, mode);
             true
         }
+        Expr::ComponentAccess { .. } => {
+            let Some(info) =
+                component_array_local_info(b, &ctx.locals, item, ctx.st, ctx.type_layouts).or_else(
+                    || component_field_local_info(b, &ctx.locals, item, ctx.st, ctx.type_layouts),
+                )
+            else {
+                return false;
+            };
+            if !local_is_array_like(&info) {
+                return false;
+            }
+            lower_whole_array_read(b, &info, mode);
+            true
+        }
         Expr::FunctionCall { callee, args } => {
             let has_range = args
                 .iter()
@@ -42683,7 +42697,11 @@ pub(super) fn field_char_kind(field: &crate::sema::type_layout::FieldLayout) -> 
     match &field.type_info {
         crate::sema::symtab::TypeInfo::Character { len: Some(n), .. } => CharKind::Fixed(*n),
         crate::sema::symtab::TypeInfo::Character { len: None, .. } => {
-            if (field.pointer || field.allocatable) && field.size == 32 {
+            if field_uses_array_descriptor(field) {
+                // Scalar deferred character uses the 32-byte descriptor case below.
+                // Descriptor-backed character arrays with no explicit LEN are len=1.
+                CharKind::Fixed(1)
+            } else if (field.pointer || field.allocatable) && field.size == 32 {
                 CharKind::Deferred
             } else if field.pointer || field.allocatable {
                 CharKind::None
@@ -42794,6 +42812,11 @@ pub(super) fn field_storage_ir_type(
     match &field.type_info {
         crate::sema::symtab::TypeInfo::Character { len: Some(n), .. } => {
             fixed_char_storage_ir_type(*n)
+        }
+        crate::sema::symtab::TypeInfo::Character { len: None, .. }
+            if field_uses_array_descriptor(field) =>
+        {
+            fixed_char_storage_ir_type(1)
         }
         crate::sema::symtab::TypeInfo::Character { len: None, .. }
             if field.pointer || field.allocatable =>

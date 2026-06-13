@@ -887,6 +887,57 @@ fn stream_unformatted_char_array_section_read_preserves_byte_count() {
 }
 
 #[test]
+fn stream_unformatted_pos_char_array_read_preserves_chunk_bytes() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=stream_unformatted_pos_char_array_read_preserves_chunk_bytes count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let input = unique_path("stream_unformatted_pos_char_array_read", "bin");
+    std::fs::write(&input, b"abcdef").expect("cannot seed positioned stream char input");
+
+    let src = write_program(
+        &format!(
+            "program p\n  implicit none\n  type :: parser_state\n    integer :: ipos = 3\n    integer :: filesize = 0\n    character, allocatable :: chunk(:)\n  end type parser_state\n  type(parser_state) :: state\n  integer :: unit_num, ios\n  character :: next\n  allocate(state%chunk(8))\n  state%chunk = 'Z'\n  open(newunit=unit_num, file='{}', status='old', action='read', access='stream', form='unformatted', iostat=ios)\n  if (ios /= 0) error stop 1\n  inquire(unit=unit_num, size=state%filesize, iostat=ios)\n  if (ios /= 0) error stop 2\n  if (state%filesize < state%ipos + size(state%chunk) - 1) then\n    deallocate(state%chunk)\n    allocate(state%chunk(state%filesize - state%ipos + 1))\n    state%chunk = 'Z'\n  end if\n  read(unit_num, pos=state%ipos, iostat=ios) state%chunk\n  if (ios /= 0) error stop 3\n  if (size(state%chunk) /= 4) error stop 4\n  if (state%chunk(1) /= 'c') error stop 5\n  if (state%chunk(2) /= 'd') error stop 6\n  if (state%chunk(3) /= 'e') error stop 7\n  if (state%chunk(4) /= 'f') error stop 8\n  read(unit_num, iostat=ios) next\n  if (ios == 0) error stop 9\n  print *, 'ok'\n  close(unit_num)\nend program\n",
+            input.display()
+        ),
+        "stream_unformatted_pos_char_array_read.f90",
+    );
+    let out = unique_path("stream_unformatted_pos_char_array_read", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("positioned stream char array read compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "positioned stream char array read compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("positioned stream char array read run failed");
+    assert!(
+        run.status.success(),
+        "positioned stream char array read failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected ok output, got: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&input);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn stream_unformatted_real_array_read_preserves_raw_f32_bytes() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
