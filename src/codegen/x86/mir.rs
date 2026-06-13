@@ -372,6 +372,12 @@ pub enum X86Opcode {
     Paddq,
     Psubd,
     Psubq,
+    /// Packed unsigned 32×32→64 multiply of the even lanes (tied):
+    /// `pmuludq` multiplies lanes 0 and 2 of each operand into the two
+    /// 64-bit result lanes. The building block for v4i32 multiply at
+    /// SSE2 (no pmulld until SSE4.1) — two pmuludq over even/odd lanes
+    /// plus a shuffle merge (x10c-3).
+    Pmuludq,
     /// Packed bitwise (tied): mask select via pand/pandn/por.
     Pand,
     Pandn,
@@ -413,10 +419,9 @@ impl X86Opcode {
             // SSE family. pshufd is NOT tied (imm + src → dst);
             // sqrtps/pd likewise (src → dst).
             Addps | Addpd | Subps | Subpd | Mulps | Mulpd | Divps | Divpd | Minps | Minpd
-            | Maxps | Maxpd | Paddd | Paddq | Psubd | Psubq | Pand | Pandn | Por | Pxor
-            | Pcmpgtd | Pcmpeqd | Cmpps | Cmppd | Shufps | Movhlps | Unpcklpd | Punpcklqdq => {
-                Some(0)
-            }
+            | Maxps | Maxpd | Paddd | Paddq | Psubd | Psubq | Pmuludq | Pand | Pandn | Por
+            | Pxor | Pcmpgtd | Pcmpeqd | Cmpps | Cmppd | Shufps | Movhlps | Unpcklpd
+            | Punpcklqdq => Some(0),
             // Sqrtss/Sqrtsd are two-operand non-destructive
             // (`sqrtsd %src, %dst`) — deliberately not tied.
             _ => None,

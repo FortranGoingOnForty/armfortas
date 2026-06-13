@@ -328,8 +328,8 @@ fn emit_inst(inst: &X86Inst, func: &X86Function) -> String {
         // SSE block above: src = operands[1], dst = def (== tied
         // operands[0] after twoaddr). ----
         Addps | Addpd | Subps | Subpd | Mulps | Mulpd | Divps | Divpd | Minps | Minpd | Maxps
-        | Maxpd | Paddd | Paddq | Psubd | Psubq | Pand | Pandn | Por | Pxor | Pcmpgtd | Pcmpeqd
-        | Movhlps | Unpcklpd | Punpcklqdq => {
+        | Maxpd | Paddd | Paddq | Psubd | Psubq | Pmuludq | Pand | Pandn | Por | Pxor | Pcmpgtd
+        | Pcmpeqd | Movhlps | Unpcklpd | Punpcklqdq => {
             let mn = match inst.opcode {
                 Addps => "addps",
                 Addpd => "addpd",
@@ -347,6 +347,7 @@ fn emit_inst(inst: &X86Inst, func: &X86Function) -> String {
                 Paddq => "paddq",
                 Psubd => "psubd",
                 Psubq => "psubq",
+                Pmuludq => "pmuludq",
                 Pand => "pand",
                 Pandn => "pandn",
                 Por => "por",

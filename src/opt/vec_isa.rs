@@ -9,10 +9,11 @@ use crate::target::Arch;
 
 pub struct VectorIsa {
     pub name: &'static str,
-    /// Element-wise integer lane multiply. NEON has `mul.4s`; SSE2
-    /// has no 32-bit lane multiply (`pmulld` is SSE4.1; the
-    /// `pmuludq` even/odd-shuffle synthesis is deferred until the
-    /// benchmark gate can judge it).
+    /// Element-wise integer lane multiply (i32). NEON has `mul.4s`;
+    /// SSE2 has no `pmulld` (SSE4.1) so x86 synthesizes it from two
+    /// `pmuludq` (even/odd lanes) plus shuffles (x10c-3). i64 lane mul
+    /// is unsupported on both (no NEON 2D mul, no SSE2 pmullq) and stays
+    /// scalar — vec_analysis gates this flag to i32.
     pub int_mul: bool,
     /// Element-wise integer min/max (select-of-compare). NEON has
     /// `smax/smin.4s`; SSE2 has no native i32 form (`pminsd`/`pmaxsd`
@@ -46,7 +47,9 @@ pub const NEON: VectorIsa = VectorIsa {
 
 pub const SSE2_BASELINE: VectorIsa = VectorIsa {
     name: "sse2",
-    int_mul: false,
+    // i32 lane multiply via the pmuludq even/odd synthesis (x10c-3);
+    // i64 stays scalar (no pmullq at SSE2). Gated to i32 in vec_analysis.
+    int_mul: true,
     // Signed i32 min/max via pcmpgtd compare-and-blend (x10c-1).
     int_min_max: true,
     reduce_min_max_i32: true,

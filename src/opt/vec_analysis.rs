@@ -566,9 +566,11 @@ pub(crate) fn classify_body_op(
             loop_defs,
         ),
         InstKind::IMul(l, r) => {
-            // Integer lane multiply is per-ISA (NEON mul.4s; SSE2
-            // has none at baseline).
-            if !isa.int_mul {
+            // Integer lane multiply is per-ISA (NEON mul.4s; x86 via the
+            // pmuludq even/odd synthesis). i32 only: NEON has no integer
+            // 2D multiply and x86 has no pmullq at SSE2, so i64 lane mul
+            // must stay scalar on both (its V2D path is unimplemented).
+            if !isa.int_mul || !matches!(dest.elem_ty, IrType::Int(IntWidth::I32)) {
                 return None;
             }
             binop_body(
@@ -1280,7 +1282,11 @@ pub(crate) fn build_where_plan(
                 let kind = match inst.kind {
                     InstKind::IAdd(..) | InstKind::FAdd(..) => BinaryKind::Add,
                     InstKind::ISub(..) | InstKind::FSub(..) => BinaryKind::Sub,
-                    InstKind::IMul(..) if !isa.int_mul => return None,
+                    InstKind::IMul(..)
+                        if !isa.int_mul || !matches!(inst.ty, IrType::Int(IntWidth::I32)) =>
+                    {
+                        return None
+                    }
                     InstKind::IMul(..) | InstKind::FMul(..) => BinaryKind::Mul,
                     InstKind::FDiv(..) => BinaryKind::Div,
                     _ => unreachable!(),
@@ -1469,7 +1475,12 @@ pub(crate) fn build_where_plan(
                         let kind = match inst.kind {
                             InstKind::IAdd(..) | InstKind::FAdd(..) => BinaryKind::Add,
                             InstKind::ISub(..) | InstKind::FSub(..) => BinaryKind::Sub,
-                            InstKind::IMul(..) if !isa.int_mul => return None,
+                            InstKind::IMul(..)
+                                if !isa.int_mul
+                                    || !matches!(inst.ty, IrType::Int(IntWidth::I32)) =>
+                            {
+                                return None
+                            }
                             InstKind::IMul(..) | InstKind::FMul(..) => BinaryKind::Mul,
                             InstKind::FDiv(..) => BinaryKind::Div,
                             _ => unreachable!(),
@@ -1976,8 +1987,13 @@ pub(crate) fn detect_reduction_plan(
             }
         }
         // The integer dot fold multiplies lanes element-wise before
-        // the sum, so it needs the ISA's integer lane multiply.
-        (IrType::Int(_), InstKind::IMul(..)) if !isa.int_mul => return None,
+        // the sum, so it needs the ISA's integer lane multiply (i32
+        // only — see the elementwise IMul arm).
+        (IrType::Int(_), InstKind::IMul(..))
+            if !isa.int_mul || !matches!(elem_ty, IrType::Int(IntWidth::I32)) =>
+        {
+            return None
+        }
         (IrType::Int(_), InstKind::IMul(la, lb)) | (IrType::Float(_), InstKind::FMul(la, lb)) => {
             let load_a_inst = defs.get(la)?;
             let load_b_inst = defs.get(lb)?;
