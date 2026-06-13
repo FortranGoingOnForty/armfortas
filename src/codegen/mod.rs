@@ -45,7 +45,16 @@ pub fn emit_module(
                     x86::peephole::run_peephole(f);
                 }
                 x86::twoaddr::convert_to_two_address(f);
-                x86::regalloc::regalloc_naive(f);
+                // x10a: opt-in linear-scan allocator. Default stays the
+                // naive allocator (the correctness reference) until the
+                // linear scan is proven; flip the default at O1+ once it
+                // passes the full matrix + benchmark gate.
+                if std::env::var_os("ARMFORTAS_USE_LINEAR_REGALLOC").is_some() {
+                    let result = x86::linearscan::linear_scan(f);
+                    x86::linearscan::apply_allocation(f, &result);
+                } else {
+                    x86::regalloc::regalloc_naive(f);
+                }
                 text.push_str(&x86::emit::emit_function(f));
                 for (label, bits) in &f.rodata {
                     text.push_str(&x86::emit::emit_rodata_f64(label, f64::from_bits(*bits)));

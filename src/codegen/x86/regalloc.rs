@@ -248,7 +248,7 @@ pub fn regalloc_naive(f: &mut X86Function) {
 /// double source with movss (top half zeroed) — both silent wrong
 /// answers at runtime. Returns (use_width, def_width) for XMM-class
 /// operands.
-fn xmm_width_override(opcode: X86Opcode) -> (Option<OpSize>, Option<OpSize>) {
+pub(super) fn xmm_width_override(opcode: X86Opcode) -> (Option<OpSize>, Option<OpSize>) {
     match opcode {
         X86Opcode::Cvtsi2ss => (None, Some(OpSize::L)),
         X86Opcode::Cvtsi2sd => (None, Some(OpSize::Q)),
@@ -262,7 +262,7 @@ fn xmm_width_override(opcode: X86Opcode) -> (Option<OpSize>, Option<OpSize>) {
 
 /// Which operand index, if any, carries an address-in-vreg (the
 /// `X86Opcode::MovRM` convention) or address-as-def store form.
-fn addr_operand_position(inst: &X86Inst) -> Option<usize> {
+pub(super) fn addr_operand_position(inst: &X86Inst) -> Option<usize> {
     match inst.opcode {
         // MovRM and the extending loads: operand 0 is the source address.
         X86Opcode::MovRM | X86Opcode::MovzxRM { .. } | X86Opcode::MovsxRM { .. } => Some(0),
@@ -291,7 +291,7 @@ fn addr_operand_position(inst: &X86Inst) -> Option<usize> {
     }
 }
 
-fn load(scratch: X86Reg, class: X86RegClass, mem: X86Operand, size: OpSize) -> X86Inst {
+pub(super) fn load(scratch: X86Reg, class: X86RegClass, mem: X86Operand, size: OpSize) -> X86Inst {
     match class {
         X86RegClass::Xmm128 => X86Inst {
             opcode: X86Opcode::Movups,
@@ -318,7 +318,7 @@ fn load(scratch: X86Reg, class: X86RegClass, mem: X86Operand, size: OpSize) -> X
     }
 }
 
-fn store(scratch: X86Reg, class: X86RegClass, mem: X86Operand, size: OpSize) -> X86Inst {
+pub(super) fn store(scratch: X86Reg, class: X86RegClass, mem: X86Operand, size: OpSize) -> X86Inst {
     match class {
         X86RegClass::Xmm128 => X86Inst {
             opcode: X86Opcode::Movups,

@@ -27,9 +27,17 @@
 //! and are spilled.
 
 use super::liveness::{compute_liveness, LiveInterval, LivenessResult};
-use super::mir::{X86Function, X86Reg, X86RegClass};
+use super::mir::{
+    OpSize, X86Function, X86Inst, X86Opcode, X86Operand, X86Reg, X86RegClass, X86VReg,
+};
+use super::regalloc::{addr_operand_position, load, store, xmm_width_override};
 use crate::codegen::shared::VRegId;
 use std::collections::{HashMap, HashSet};
+
+/// GP / FP spill-reload scratch — the naive allocator's set, kept out
+/// of the allocation pool so a reload never clobbers an allocated value.
+const GP_SCRATCH: [X86Reg; 2] = [X86Reg::R10, X86Reg::R11];
+const FP_SCRATCH: [X86Reg; 2] = [X86Reg::Xmm14, X86Reg::Xmm15];
 
 /// GP registers available for allocation: callee-saved only, none of
 /// which isel ever hard-codes.
@@ -197,6 +205,267 @@ pub fn linear_scan(f: &mut X86Function) -> AllocResult {
         spills,
         callee_saved_used: callee_saved,
         liveness,
+    }
+}
+
+/// How a vreg occurrence resolves after allocation.
+enum Resolved {
+    /// Lives in a physical register — use it directly, no spill traffic.
+    Reg(X86Reg),
+    /// Spilled to a frame slot — load/store through scratch.
+    Slot(i32),
+}
+
+/// Apply the allocation: rewrite vreg operands to physical registers
+/// (assigned) or scratch load/store sequences (spilled), lay out the
+/// frame, and bracket the body with callee-save save/restore. Mirrors
+/// the naive allocator's per-instruction rewrite (reusing its
+/// `load`/`store`/`addr_operand_position`/`xmm_width_override`
+/// helpers) but only spilled vregs go through scratch — assigned vregs
+/// become physical registers in place. After this pass no `VReg` or
+/// `FrameSlot` operands remain and `frame_bytes` is final.
+pub fn apply_allocation(f: &mut X86Function, result: &AllocResult) {
+    // Slot per callee-saved register (saved/restored via the frame, not
+    // push/pop, so emit's rbp-relative epilogue is untouched).
+    let mut callee_slot: Vec<(X86Reg, i32)> = Vec::new();
+    for &reg in &result.callee_saved_used {
+        callee_slot.push((reg, f.alloc_frame_slot(8, 8)));
+    }
+
+    // Per-vreg class, for spill load/store sizing.
+    let mut vreg_class: HashMap<VRegId, X86RegClass> = HashMap::new();
+    for block in &f.blocks {
+        for inst in &block.insts {
+            for op in inst.operands.iter().chain(inst.def.iter()) {
+                if let X86Operand::VReg(v) = op {
+                    vreg_class.insert(v.id, v.class);
+                }
+            }
+        }
+    }
+
+    // Frame layout: slot id → negative rbp displacement (identical to
+    // regalloc_naive Phase 2).
+    let mut offset: i64 = 0;
+    let mut slot_disp: HashMap<i32, i64> = HashMap::new();
+    for slot in &f.frame_slots {
+        let align = slot.align.max(1) as i64;
+        offset = -(((-offset) + slot.size as i64 + align - 1) & !(align - 1));
+        slot_disp.insert(slot.id, offset);
+    }
+    let locals = -offset;
+    f.frame_bytes = (locals + f.outgoing_arg_bytes + 15) & !15;
+
+    let mem_for_slot = |slot: i32| -> X86Operand {
+        X86Operand::Mem {
+            base: Some(X86Reg::Rbp),
+            index: None,
+            scale: 1,
+            disp: *slot_disp
+                .get(&slot)
+                .unwrap_or_else(|| panic!("frame slot {} has no layout", slot)),
+        }
+    };
+    let resolve = |v: &X86VReg| -> Resolved {
+        if let Some(&phys) = result.assignments.get(&v.id) {
+            Resolved::Reg(phys)
+        } else if let Some(&slot) = result.spills.get(&v.id) {
+            Resolved::Slot(slot)
+        } else {
+            // Every vreg is either assigned or spilled.
+            panic!("vreg {:?} neither assigned nor spilled", v.id);
+        }
+    };
+
+    for block_idx in 0..f.blocks.len() {
+        let insts = std::mem::take(&mut f.blocks[block_idx].insts);
+        let mut out = Vec::with_capacity(insts.len() * 2);
+        for mut inst in insts {
+            let mut gp_used = 0usize;
+            let mut fp_used = 0usize;
+            let next_scratch = |class: X86RegClass, gp: &mut usize, fp: &mut usize| -> X86Reg {
+                match class {
+                    X86RegClass::Xmm | X86RegClass::Xmm128 => {
+                        let r = FP_SCRATCH[(*fp).min(1)];
+                        *fp += 1;
+                        r
+                    }
+                    _ => {
+                        let r = GP_SCRATCH[(*gp).min(1)];
+                        *gp += 1;
+                        r
+                    }
+                }
+            };
+
+            let tied = inst.opcode.tied_use().is_some()
+                && matches!((&inst.def, inst.operands.first()),
+                    (Some(X86Operand::VReg(d)), Some(X86Operand::VReg(a))) if d.id == a.id);
+
+            let mut def_store: Option<(X86Reg, X86RegClass, i32)> = None;
+
+            if tied {
+                let v = match inst.operands[0] {
+                    X86Operand::VReg(v) => v,
+                    _ => unreachable!(),
+                };
+                match resolve(&v) {
+                    Resolved::Reg(phys) => {
+                        inst.operands[0] = X86Operand::Reg(phys);
+                        inst.def = Some(X86Operand::Reg(phys));
+                    }
+                    Resolved::Slot(slot) => {
+                        let scratch = next_scratch(v.class, &mut gp_used, &mut fp_used);
+                        out.push(load(scratch, v.class, mem_for_slot(slot), inst.size));
+                        inst.operands[0] = X86Operand::Reg(scratch);
+                        inst.def = Some(X86Operand::Reg(scratch));
+                        def_store = Some((scratch, v.class, slot));
+                    }
+                }
+            }
+
+            let addr_position = addr_operand_position(&inst);
+            let (xmm_use_width, xmm_def_width) = xmm_width_override(inst.opcode);
+            for (i, op) in inst.operands.iter_mut().enumerate() {
+                if tied && i == 0 {
+                    continue;
+                }
+                match op {
+                    X86Operand::VReg(v) => {
+                        let is_addr = Some(i) == addr_position;
+                        match resolve(v) {
+                            Resolved::Reg(phys) => {
+                                *op = if is_addr {
+                                    X86Operand::Mem {
+                                        base: Some(phys),
+                                        index: None,
+                                        scale: 1,
+                                        disp: 0,
+                                    }
+                                } else {
+                                    X86Operand::Reg(phys)
+                                };
+                            }
+                            Resolved::Slot(slot) => {
+                                let scratch = next_scratch(v.class, &mut gp_used, &mut fp_used);
+                                let load_size = if is_addr {
+                                    OpSize::Q
+                                } else if v.class == X86RegClass::Xmm {
+                                    xmm_use_width.unwrap_or(inst.size)
+                                } else {
+                                    inst.size
+                                };
+                                out.push(load(scratch, v.class, mem_for_slot(slot), load_size));
+                                *op = if is_addr {
+                                    X86Operand::Mem {
+                                        base: Some(scratch),
+                                        index: None,
+                                        scale: 1,
+                                        disp: 0,
+                                    }
+                                } else {
+                                    X86Operand::Reg(scratch)
+                                };
+                            }
+                        }
+                    }
+                    X86Operand::FrameSlot(slot) => {
+                        *op = mem_for_slot(*slot);
+                    }
+                    _ => {}
+                }
+            }
+
+            if !tied {
+                if let Some(X86Operand::VReg(v)) = inst.def.clone() {
+                    let is_fp_store_addr = matches!(
+                        inst.opcode,
+                        X86Opcode::Movss | X86Opcode::Movsd | X86Opcode::Movups
+                    ) && v.class != X86RegClass::Xmm
+                        && v.class != X86RegClass::Xmm128;
+                    match resolve(&v) {
+                        Resolved::Reg(phys) => {
+                            inst.def = Some(if is_fp_store_addr {
+                                X86Operand::Mem {
+                                    base: Some(phys),
+                                    index: None,
+                                    scale: 1,
+                                    disp: 0,
+                                }
+                            } else {
+                                X86Operand::Reg(phys)
+                            });
+                        }
+                        Resolved::Slot(slot) => {
+                            let scratch = next_scratch(v.class, &mut gp_used, &mut fp_used);
+                            if is_fp_store_addr {
+                                out.push(load(scratch, v.class, mem_for_slot(slot), OpSize::Q));
+                                inst.def = Some(X86Operand::Mem {
+                                    base: Some(scratch),
+                                    index: None,
+                                    scale: 1,
+                                    disp: 0,
+                                });
+                            } else {
+                                inst.def = Some(X86Operand::Reg(scratch));
+                                def_store = Some((scratch, v.class, slot));
+                            }
+                        }
+                    }
+                } else if let Some(X86Operand::FrameSlot(slot)) = inst.def.clone() {
+                    inst.def = Some(mem_for_slot(slot));
+                }
+            }
+
+            let size = inst.size;
+            out.push(inst);
+            if let Some((scratch, class, slot)) = def_store {
+                let store_size = if class == X86RegClass::Xmm {
+                    xmm_def_width.unwrap_or(size)
+                } else if size == OpSize::L {
+                    // 32-bit ops zero-extend through bit 63 — store the
+                    // full quad so an i64 consumer sees a clean value
+                    // (X64-O1-002).
+                    OpSize::Q
+                } else {
+                    size
+                };
+                out.push(store(scratch, class, mem_for_slot(slot), store_size));
+            }
+        }
+        f.blocks[block_idx].insts = out;
+    }
+
+    // Callee-save save (block-0 prologue) and restore (before each Ret).
+    if !callee_slot.is_empty() {
+        let saves: Vec<X86Inst> = callee_slot
+            .iter()
+            .map(|&(reg, slot)| store(reg, X86RegClass::Gp64, mem_for_slot(slot), OpSize::Q))
+            .collect();
+        let restores: Vec<X86Inst> = callee_slot
+            .iter()
+            .map(|&(reg, slot)| load(reg, X86RegClass::Gp64, mem_for_slot(slot), OpSize::Q))
+            .collect();
+        // Restores before every Ret.
+        for block in &mut f.blocks {
+            let mut i = 0;
+            while i < block.insts.len() {
+                if matches!(block.insts[i].opcode, X86Opcode::Ret) {
+                    for (k, r) in restores.iter().enumerate() {
+                        block.insts.insert(i + k, r.clone());
+                    }
+                    i += restores.len() + 1;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        // Saves at the very start of block 0 (runs after emit's frame
+        // setup, which establishes rbp before any block-0 instruction).
+        let head = &mut f.blocks[0].insts;
+        for (k, s) in saves.into_iter().enumerate() {
+            head.insert(k, s);
+        }
     }
 }
 
