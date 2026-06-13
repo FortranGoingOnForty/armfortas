@@ -19932,6 +19932,10 @@ pub(super) struct HostRefParamInfo {
     /// host var is a `character(*)` (assumed-length) variable that needs
     /// its runtime length forwarded alongside the pointer.
     assumed_len_id: Option<ValueId>,
+    /// Extra hidden closure payload parameters when the host reference is a
+    /// procedure dummy. Nested contained procedures must forward these when
+    /// they call the captured procedure dummy.
+    procedure_dummy_closure_ids: Vec<ValueId>,
 }
 
 pub(super) fn arg_is_assumed_len_char(
@@ -19954,6 +19958,33 @@ pub(super) fn arg_is_assumed_len_char(
                     return false;
                 }
             }
+        }
+    }
+    false
+}
+
+fn decl_is_procedure_dummy_ref(name: &str, decls: &[crate::ast::decl::SpannedDecl]) -> bool {
+    let key = name.to_lowercase();
+    for decl in decls {
+        let Decl::TypeDecl {
+            type_spec,
+            attrs,
+            entities,
+        } = &decl.node
+        else {
+            continue;
+        };
+        if !matches!(type_spec, TypeSpec::Type(_)) {
+            continue;
+        }
+        if !attrs
+            .iter()
+            .any(|a| matches!(a, crate::ast::decl::Attribute::External))
+        {
+            continue;
+        }
+        if entities.iter().any(|e| e.name.eq_ignore_ascii_case(&key)) {
+            return true;
         }
     }
     false
@@ -20028,6 +20059,24 @@ pub(super) fn build_host_ref_params(
         } else {
             None
         };
+        let procedure_dummy_closure_ids = if decl_is_procedure_dummy_ref(hname, host_decls) {
+            let mut ids = Vec::with_capacity(crate::sema::type_layout::PROC_PTR_CLOSURE_SLOTS);
+            let proc_closure_ty = IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)));
+            for slot_idx in 0..crate::sema::type_layout::PROC_PTR_CLOSURE_SLOTS {
+                let pid = ValueId(next_id);
+                next_id += 1;
+                out_params.push(Param {
+                    name: procedure_dummy_closure_local_name(hname, slot_idx),
+                    ty: proc_closure_ty.clone(),
+                    id: pid,
+                    fortran_noalias: false,
+                });
+                ids.push(pid);
+            }
+            ids
+        } else {
+            Vec::new()
+        };
         infos.push(HostRefParamInfo {
             name: hname.clone(),
             id: pid,
@@ -20040,6 +20089,7 @@ pub(super) fn build_host_ref_params(
             allocatable: alloc,
             is_pointer: ptr_is_pointer,
             assumed_len_id,
+            procedure_dummy_closure_ids,
         });
     }
     infos
@@ -20152,6 +20202,14 @@ pub(super) fn append_host_closure_args_raw(
         if let Some(len) = forwarded_len {
             arg_vals.push(len);
         }
+        let mut proc_closure_args = procedure_dummy_closure_args_from_locals(b, locals, hname);
+        if !proc_closure_args.is_empty() {
+            proc_closure_args.truncate(crate::sema::type_layout::PROC_PTR_CLOSURE_SLOTS);
+            while proc_closure_args.len() < crate::sema::type_layout::PROC_PTR_CLOSURE_SLOTS {
+                proc_closure_args.push(null_procedure_closure_arg(b));
+            }
+            arg_vals.extend(proc_closure_args);
+        }
     }
 }
 
@@ -20202,6 +20260,32 @@ pub(super) fn install_host_ref_locals(
                 last_dim_assumed_size: false,
             },
         );
+        if !info.procedure_dummy_closure_ids.is_empty() {
+            let ptr_ty = IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)));
+            for (slot_idx, pid) in info.procedure_dummy_closure_ids.iter().enumerate() {
+                let slot = b.alloca(ptr_ty.clone());
+                b.store(*pid, slot);
+                locals.insert(
+                    procedure_dummy_closure_local_name(&info.name, slot_idx),
+                    LocalInfo {
+                        addr: slot,
+                        ty: ptr_ty.clone(),
+                        dims: vec![],
+                        allocatable: false,
+                        descriptor_arg: false,
+                        by_ref: false,
+                        char_kind: CharKind::None,
+                        derived_type: None,
+                        inline_const: None,
+                        is_pointer: false,
+                        runtime_dim_upper: vec![],
+                        is_class: false,
+                        logical_kind: None,
+                        last_dim_assumed_size: false,
+                    },
+                );
+            }
+        }
     }
 }
 

@@ -35350,6 +35350,51 @@ fn bound_procedure_dummy_forwards_contained_callback_closure() {
 }
 
 #[test]
+fn procedure_dummy_closure_survives_contained_helper_call() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=procedure_dummy_closure_survives_contained_helper_call count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type :: core_t\n    integer :: marker = 0\n  end type core_t\n  type :: value_t\n    integer :: marker = 0\n  end type value_t\n  abstract interface\n    subroutine cb_i(core, value, done)\n      import :: core_t, value_t\n      type(core_t), intent(inout) :: core\n      type(value_t), pointer, intent(in) :: value\n      logical, intent(out) :: done\n    end subroutine cb_i\n  end interface\ncontains\n  subroutine bridge(core, value, cb)\n    type(core_t), intent(inout) :: core\n    type(value_t), pointer, intent(in) :: value\n    procedure(cb_i) :: cb\n    logical :: done\n    call inner(value)\n  contains\n    subroutine inner(value)\n      type(value_t), pointer, intent(in) :: value\n      call cb(core, value, done)\n    end subroutine inner\n  end subroutine bridge\n\n  subroutine caller(name, path)\n    character(len=:), allocatable, intent(out), optional :: name\n    character(len=:), allocatable, intent(out), optional :: path\n    type(core_t) :: core\n    type(value_t), pointer :: value\n    allocate(value)\n    call bridge(core, value, callback)\n    deallocate(value)\n  contains\n    subroutine callback(core, value, done)\n      type(core_t), intent(inout) :: core\n      type(value_t), pointer, intent(in) :: value\n      logical, intent(out) :: done\n      call sink(name, path)\n      done = associated(value) .or. core%marker == 0\n    end subroutine callback\n  end subroutine caller\n\n  subroutine sink(name, path)\n    character(len=:), allocatable, intent(out), optional :: name\n    character(len=:), allocatable, intent(out), optional :: path\n    if (present(name)) name = 'bad'\n    if (present(path)) path = 'ok'\n  end subroutine sink\nend module m\nprogram p\n  use m\n  implicit none\n  character(len=:), allocatable :: path\n  call caller(path=path)\n  if (.not. allocated(path)) error stop 1\n  if (path /= 'ok') error stop 2\n  print *, path\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("proc_dummy_contained_helper_closure", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("procedure dummy contained-helper closure compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "procedure dummy contained-helper closure should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("procedure dummy contained-helper closure run failed to spawn");
+    assert!(
+        run.status.success(),
+        "procedure dummy contained-helper closure should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected procedure dummy contained-helper closure output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn imported_generic_subroutine_with_optional_procedure_dummy_round_trips_through_amod() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
