@@ -9,7 +9,7 @@ use crate::ir::inst::*;
 use crate::ir::types::*;
 
 use super::core::*;
-use super::ctx::{CharKind, LowerCtx};
+use super::ctx::{CharKind, LocalInfo, LowerCtx};
 use super::helpers::coerce_to_type;
 use crate::ast::expr::Expr;
 
@@ -213,6 +213,26 @@ pub(crate) fn lower_intrinsic_subroutine(
         }
     }
 
+    /// The descriptor address and a clone of the LocalInfo for an
+    /// allocatable rank-1 array passed by name. Used by TOKENIZE to
+    /// allocate FIRST/LAST/TOKENS/SEPARATOR through the runtime.
+    fn nth_arg_alloc_array(
+        b: &mut FuncBuilder,
+        ctx: &LowerCtx,
+        args: &[Option<crate::ast::expr::Argument>],
+        n: usize,
+    ) -> Option<(ValueId, LocalInfo)> {
+        let e = nth_arg_expr(args, n)?;
+        if let Expr::Name { name } = &e.node {
+            let info = ctx.locals.get(&name.to_lowercase())?.clone();
+            if local_uses_array_descriptor(&info) {
+                let desc = array_descriptor_addr(b, &info);
+                return Some((desc, info));
+            }
+        }
+        None
+    }
+
     match name {
         "move_alloc" => {
             let from_expr = args.first().and_then(|arg| {
@@ -306,6 +326,51 @@ pub(crate) fn lower_intrinsic_subroutine(
                 let raw = b.load(wb.tmp_ptr);
                 let coerced = coerce_to_type(b, raw, &wb.dest_ty);
                 b.store(coerced, wb.dest_ptr);
+            }
+            true
+        }
+        "tokenize" => {
+            // CALL TOKENIZE(STRING, SET, FIRST, LAST)         — Form 2
+            // CALL TOKENIZE(STRING, SET, TOKENS [, SEPARATOR]) — Form 1
+            // The form is decided by the third argument's type: a
+            // character array is TOKENS (Form 1), an integer array is
+            // FIRST (Form 2). The runtime allocates each output array.
+            let (str_ptr, str_len) = nth_arg_str(b, ctx, args, 0);
+            let (set_ptr, set_len) = nth_arg_str(b, ctx, args, 1);
+            let tokens_is_char = nth_arg_expr(args, 2).is_some_and(|e| {
+                expr_is_character_expr(b, &ctx.locals, e, ctx.st, Some(ctx.type_layouts))
+            });
+            if tokens_is_char {
+                if let Some((tok_desc, _)) = nth_arg_alloc_array(b, ctx, args, 2) {
+                    let sep_desc = nth_arg_alloc_array(b, ctx, args, 3)
+                        .map(|(d, _)| d)
+                        .unwrap_or_else(|| b.const_i64(0));
+                    let char_kind = b.const_i64(1);
+                    b.call(
+                        FuncRef::External("afs_tokenize_tokens".into()),
+                        vec![
+                            str_ptr, str_len, set_ptr, set_len, tok_desc, sep_desc, char_kind,
+                        ],
+                        IrType::Void,
+                    );
+                }
+            } else if let (Some((first_desc, first_info)), Some((last_desc, _))) = (
+                nth_arg_alloc_array(b, ctx, args, 2),
+                nth_arg_alloc_array(b, ctx, args, 3),
+            ) {
+                let kind_bytes = first_info
+                    .ty
+                    .int_width()
+                    .map(|w| (w.bits() / 8) as i64)
+                    .unwrap_or(4);
+                let int_kind = b.const_i64(kind_bytes);
+                b.call(
+                    FuncRef::External("afs_tokenize_positions".into()),
+                    vec![
+                        str_ptr, str_len, set_ptr, set_len, first_desc, last_desc, int_kind,
+                    ],
+                    IrType::Void,
+                );
             }
             true
         }
