@@ -4631,6 +4631,51 @@ fn pointer_dummy_actual_to_non_pointer_dummy_passes_target() {
 }
 
 #[test]
+fn scalar_allocatable_components_store_into_descriptor_payloads() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=scalar_allocatable_components_store_into_descriptor_payloads count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  type :: value_t\n    real(8), allocatable :: dbl\n    logical, allocatable :: flag\n    integer, allocatable :: idx\n  end type value_t\n  type(value_t) :: v\n  allocate(v%dbl, v%flag, v%idx)\n  v%dbl = 0.1d0\n  v%flag = .true.\n  v%idx = 42\n  if (.not. allocated(v%dbl)) error stop 1\n  if (.not. allocated(v%flag)) error stop 2\n  if (.not. allocated(v%idx)) error stop 3\n  if (abs(v%dbl - 0.1d0) > 1.0d-12) error stop 4\n  if (.not. v%flag) error stop 5\n  if (v%idx /= 42) error stop 6\n  deallocate(v%dbl)\n  deallocate(v%flag)\n  deallocate(v%idx)\n  if (allocated(v%dbl)) error stop 7\n  if (allocated(v%flag)) error stop 8\n  if (allocated(v%idx)) error stop 9\n  print *, 'ok'\nend program p\n",
+        "scalar_alloc_component_payload.f90",
+    );
+    let out = unique_path("scalar_alloc_component_payload", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("scalar allocatable component compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "scalar allocatable component compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("scalar allocatable component run failed");
+    assert!(
+        run.status.success(),
+        "scalar allocatable component run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected scalar allocatable component output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn pointer_function_result_associated_lowers_without_raw_symbol() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

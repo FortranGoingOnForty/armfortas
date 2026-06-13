@@ -3342,6 +3342,18 @@ pub(crate) fn lower_expr_full(
                                 return field_ptr;
                             }
 
+                            if field.allocatable
+                                && !field.pointer
+                                && !field.declared_array
+                                && field.dims.is_empty()
+                                && field.size == 384
+                            {
+                                let ir_ty = type_info_to_ir_type(&field.type_info);
+                                let data_ptr =
+                                    b.load_typed(field_ptr, IrType::Ptr(Box::new(ir_ty.clone())));
+                                return b.load_typed(data_ptr, ir_ty);
+                            }
+
                             if field.pointer {
                                 let slot_ty =
                                     IrType::Ptr(Box::new(type_info_to_ir_type(&field.type_info)));

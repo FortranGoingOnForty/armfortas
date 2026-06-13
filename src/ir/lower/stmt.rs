@@ -1936,6 +1936,51 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         // rather than emit invalid IR.
                                         // Better than truncating to i32.
                                     }
+                                } else if field.allocatable
+                                    && !field.pointer
+                                    && !field.declared_array
+                                    && field.dims.is_empty()
+                                    && field.size == 384
+                                {
+                                    let desc = field_ptr;
+                                    let allocated = b.call(
+                                        FuncRef::External("afs_allocated".into()),
+                                        vec![desc],
+                                        IrType::Int(IntWidth::I32),
+                                    );
+                                    let zero32 = b.const_i32(0);
+                                    let needs_alloc = b.icmp(CmpOp::Eq, allocated, zero32);
+                                    let alloc_bb =
+                                        b.create_block("component_scalar_intrinsic_assign_alloc");
+                                    let store_bb =
+                                        b.create_block("component_scalar_intrinsic_assign_store");
+                                    let done_bb =
+                                        b.create_block("component_scalar_intrinsic_assign_done");
+                                    b.cond_branch(needs_alloc, alloc_bb, vec![], store_bb, vec![]);
+
+                                    b.set_block(alloc_bb);
+                                    let elem_ty = type_info_to_ir_type(&field.type_info);
+                                    let elem_size =
+                                        b.const_i64(ir_scalar_byte_size(&elem_ty, b.layout));
+                                    let rank_val = b.const_i32(0);
+                                    let null_ptr = b.const_i64(0);
+                                    b.call(
+                                        FuncRef::External("afs_allocate_array".into()),
+                                        vec![desc, elem_size, rank_val, null_ptr, null_ptr],
+                                        IrType::Void,
+                                    );
+                                    b.branch(store_bb, vec![]);
+
+                                    b.set_block(store_bb);
+                                    let elem_ty = type_info_to_ir_type(&field.type_info);
+                                    let val = super::expr::lower_expr_ctx_tl(b, ctx, value);
+                                    let coerced = coerce_to_type(b, val, &elem_ty);
+                                    let dest_ptr =
+                                        b.load_typed(desc, IrType::Ptr(Box::new(elem_ty)));
+                                    b.store(coerced, dest_ptr);
+                                    b.branch(done_bb, vec![]);
+
+                                    b.set_block(done_bb);
                                 } else {
                                     let val = super::expr::lower_expr_ctx_tl(b, ctx, value);
                                     let coerced = coerce_to_type(
