@@ -225,3 +225,13 @@ Found running the FULL workspace suite on FreeBSD for the first time
   of the multi-platform campaign. Until then `cargo test --workspace`
   is macOS-only; the FreeBSD surface is `cargo test -p armfortas`
   plus the armfortas integration suites (all green here).
+
+Found during l04 (2026-06-12):
+
+- **No general intrinsic argument-count checking.** `atan2(1.0)` (one
+  arg to a two-arg intrinsic) compiles silently, as does `atan2d(1.0)`.
+  armfortas has no arity gate for elemental/transformational
+  intrinsics; misuse is caught only if lowering happens to panic. Out
+  of scope for l04 (the F2023 trig additions match the existing
+  intrinsics' lack of checking by design). Owner: a dedicated
+  intrinsic-signature-checking sprint if a target project surfaces it.
