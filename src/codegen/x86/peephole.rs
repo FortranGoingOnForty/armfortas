@@ -29,7 +29,7 @@
 
 use std::collections::HashMap;
 
-use super::mir::{OpSize, X86Function, X86Inst, X86Opcode, X86Operand};
+use super::mir::{OpSize, X86Function, X86Inst, X86Opcode, X86Operand, X86Reg};
 use crate::codegen::shared::VRegId;
 
 /// Run all pre-regalloc peephole patterns over one function. Returns the
@@ -47,7 +47,151 @@ pub fn run_peephole(f: &mut X86Function) -> usize {
 /// allocation — so they run after `apply_allocation`/`regalloc_naive`,
 /// gated at O2+ by the driver.
 pub fn run_peephole_post_regalloc(f: &mut X86Function) -> usize {
-    xor_zero(f)
+    let mut changed = 0;
+    changed += store_to_load_forward(f);
+    changed += xor_zero(f);
+    changed
+}
+
+/// The `disp` of a stack slot operand `[%rbp - n]` (base rbp, no index).
+/// Spill/frame slots are always this shape (`mem_for_slot`); anything
+/// else (an index register, a non-rbp base) is not a statically-known
+/// slot and must be treated as a possible alias of every slot.
+fn rbp_slot_disp(op: &X86Operand) -> Option<i64> {
+    match op {
+        X86Operand::Mem {
+            base: Some(X86Reg::Rbp),
+            index: None,
+            disp,
+            ..
+        } => Some(*disp),
+        _ => None,
+    }
+}
+
+/// Registers an instruction may overwrite — used to invalidate a
+/// forwarded value held in a register. Explicit `Reg` def plus the
+/// implicit defs isel encodes in the opcode (Idiv/Cltd/Cqto). Call is
+/// handled by the caller (clears everything).
+fn clobbered_regs(inst: &X86Inst) -> Vec<X86Reg> {
+    let mut regs = Vec::new();
+    if let Some(X86Operand::Reg(r)) = inst.def {
+        regs.push(r);
+    }
+    match inst.opcode {
+        X86Opcode::Idiv => {
+            regs.push(X86Reg::Rax);
+            regs.push(X86Reg::Rdx);
+        }
+        X86Opcode::Cltd | X86Opcode::Cqto => regs.push(X86Reg::Rdx),
+        _ => {}
+    }
+    regs
+}
+
+/// Pattern 3 — store-to-load forwarding (GP, post-regalloc). Within a
+/// block, a `mov %rs, [slot]` followed by `mov [slot], %rd` with the slot
+/// untouched and `%rs` unclobbered in between becomes `mov %rs, %rd`,
+/// eliminating the reload. Block-local and conservative:
+///
+/// - a Call/CallReg clears all tracked slots (clobbers caller-saved and
+///   may write the frame);
+/// - a store to a non-slot address (unknown base/index) clears all
+///   tracked slots (possible alias);
+/// - a write to a known slot invalidates just that slot;
+/// - any redefinition of the held value register drops that entry;
+/// - only same-size forwards (the stored width must equal the loaded
+///   width — a value register is only valid for the bytes that were
+///   stored).
+fn store_to_load_forward(f: &mut X86Function) -> usize {
+    let mut changed = 0;
+    for block in &mut f.blocks {
+        // slot disp -> (register holding the stored value, store size)
+        let mut avail: HashMap<i64, (X86Reg, OpSize)> = HashMap::new();
+        for inst in &mut block.insts {
+            // 1. Rewrite a forwardable load before anything else mutates
+            //    state for this instruction.
+            if inst.opcode == X86Opcode::MovRM {
+                if let (Some(X86Operand::Reg(rd)), Some(slot_op)) =
+                    (inst.def.as_ref(), inst.operands.first())
+                {
+                    let rd = *rd;
+                    if let Some(disp) = rbp_slot_disp(slot_op) {
+                        if let Some(&(rs, sz)) = avail.get(&disp) {
+                            if sz == inst.size && rd.is_gp() {
+                                inst.opcode = X86Opcode::MovRR;
+                                inst.operands = vec![X86Operand::Reg(rs)];
+                                changed += 1;
+                                // `rd` now holds the value too, but it is
+                                // also a fresh def — fall through to the
+                                // clobber step so other slots holding `rd`
+                                // are invalidated.
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 2. Call clobbers caller-saved registers and may touch the
+            //    frame — drop everything.
+            if matches!(inst.opcode, X86Opcode::Call | X86Opcode::CallReg) {
+                avail.clear();
+                continue;
+            }
+
+            // 3. Invalidate entries whose held register this instruction
+            //    overwrites.
+            for r in clobbered_regs(inst) {
+                avail.retain(|_, &mut (held, _)| held != r);
+            }
+
+            // 4. Memory writes. A GP store (MovMR: operands [reg, mem])
+            //    or any def to memory updates/invalidates a slot; a write
+            //    to a non-slot address may alias any slot.
+            let mut handled_store = false;
+            if inst.opcode == X86Opcode::MovMR {
+                if let (Some(X86Operand::Reg(rs)), Some(mem)) =
+                    (inst.operands.first(), inst.operands.get(1))
+                {
+                    if let Some(disp) = rbp_slot_disp(mem) {
+                        avail.insert(disp, (*rs, inst.size));
+                        handled_store = true;
+                    } else {
+                        // store to an unknown address: alias-clear.
+                        avail.clear();
+                        handled_store = true;
+                    }
+                }
+            }
+            if !handled_store {
+                // Any other write to memory (MovMI, FP stores with a Mem
+                // def, etc.): invalidate the named slot, or clear all if
+                // the destination address is not a known slot.
+                if let Some(def) = &inst.def {
+                    if matches!(def, X86Operand::Mem { .. }) {
+                        match rbp_slot_disp(def) {
+                            Some(disp) => {
+                                avail.remove(&disp);
+                            }
+                            None => avail.clear(),
+                        }
+                    }
+                }
+                // MovMI store: mem <- imm, def None, operands [imm, mem].
+                if inst.opcode == X86Opcode::MovMI {
+                    if let Some(mem) = inst.operands.get(1) {
+                        match rbp_slot_disp(mem) {
+                            Some(disp) => {
+                                avail.remove(&disp);
+                            }
+                            None => avail.clear(),
+                        }
+                    }
+                }
+            }
+        }
+    }
+    changed
 }
 
 /// How an opcode affects RFLAGS. The MIR has no flags register class
@@ -385,8 +529,6 @@ mod tests {
 
     // ---- x10b post-regalloc: xor-zeroing ----
 
-    use crate::codegen::x86::mir::X86Reg;
-
     fn movri_phys(dst: X86Reg, imm: i64) -> X86Inst {
         X86Inst {
             opcode: X86Opcode::MovRI,
@@ -498,6 +640,129 @@ mod tests {
         ]);
         assert_eq!(run_peephole_post_regalloc(&mut f), 1);
         assert_eq!(f.blocks[0].insts[0].opcode, X86Opcode::Xor);
+    }
+
+    // ---- x10b post-regalloc: store-to-load forwarding ----
+
+    fn slot(disp: i64) -> X86Operand {
+        X86Operand::Mem {
+            base: Some(X86Reg::Rbp),
+            index: None,
+            scale: 1,
+            disp,
+        }
+    }
+
+    fn store_slot(rs: X86Reg, disp: i64, size: OpSize) -> X86Inst {
+        X86Inst {
+            opcode: X86Opcode::MovMR,
+            size,
+            operands: vec![X86Operand::Reg(rs), slot(disp)],
+            def: None,
+        }
+    }
+
+    fn load_slot(rd: X86Reg, disp: i64, size: OpSize) -> X86Inst {
+        X86Inst {
+            opcode: X86Opcode::MovRM,
+            size,
+            operands: vec![slot(disp)],
+            def: Some(X86Operand::Reg(rd)),
+        }
+    }
+
+    fn call() -> X86Inst {
+        X86Inst {
+            opcode: X86Opcode::Call,
+            size: OpSize::Q,
+            operands: vec![],
+            def: None,
+        }
+    }
+
+    #[test]
+    fn store_load_forward_basic() {
+        // mov %rsi, -8(%rbp); ...; mov -8(%rbp), %rdi  =>  mov %rsi, %rdi
+        let mut f = func_with(vec![
+            store_slot(X86Reg::Rsi, -8, OpSize::Q),
+            add_phys(X86Reg::Rbx, X86Reg::Rcx),
+            load_slot(X86Reg::Rdi, -8, OpSize::Q),
+        ]);
+        assert_eq!(store_to_load_forward(&mut f), 1);
+        let load = &f.blocks[0].insts[2];
+        assert_eq!(load.opcode, X86Opcode::MovRR);
+        assert_eq!(load.operands, vec![X86Operand::Reg(X86Reg::Rsi)]);
+        assert_eq!(load.def, Some(X86Operand::Reg(X86Reg::Rdi)));
+    }
+
+    #[test]
+    fn store_load_blocked_by_clobber_of_value_reg() {
+        // The stored register rsi is overwritten before the load.
+        let mut f = func_with(vec![
+            store_slot(X86Reg::Rsi, -8, OpSize::Q),
+            X86Inst {
+                opcode: X86Opcode::MovRR,
+                size: OpSize::Q,
+                operands: vec![X86Operand::Reg(X86Reg::Rcx)],
+                def: Some(X86Operand::Reg(X86Reg::Rsi)),
+            },
+            load_slot(X86Reg::Rdi, -8, OpSize::Q),
+        ]);
+        assert_eq!(store_to_load_forward(&mut f), 0);
+        assert_eq!(f.blocks[0].insts[2].opcode, X86Opcode::MovRM);
+    }
+
+    #[test]
+    fn store_load_blocked_by_call() {
+        let mut f = func_with(vec![
+            store_slot(X86Reg::Rsi, -8, OpSize::Q),
+            call(),
+            load_slot(X86Reg::Rdi, -8, OpSize::Q),
+        ]);
+        assert_eq!(store_to_load_forward(&mut f), 0);
+    }
+
+    #[test]
+    fn store_load_blocked_by_size_mismatch() {
+        // 4-byte store, 8-byte load: the value reg is only valid for the
+        // stored width.
+        let mut f = func_with(vec![
+            store_slot(X86Reg::Rsi, -8, OpSize::L),
+            load_slot(X86Reg::Rdi, -8, OpSize::Q),
+        ]);
+        assert_eq!(store_to_load_forward(&mut f), 0);
+    }
+
+    #[test]
+    fn store_load_forwards_most_recent_store() {
+        // A second store to the same slot replaces the source.
+        let mut f = func_with(vec![
+            store_slot(X86Reg::Rsi, -8, OpSize::Q),
+            store_slot(X86Reg::Rdx, -8, OpSize::Q),
+            load_slot(X86Reg::Rdi, -8, OpSize::Q),
+        ]);
+        assert_eq!(store_to_load_forward(&mut f), 1);
+        assert_eq!(
+            f.blocks[0].insts[2].operands,
+            vec![X86Operand::Reg(X86Reg::Rdx)]
+        );
+    }
+
+    #[test]
+    fn store_load_blocked_by_idiv_clobber() {
+        // Idiv clobbers rax/rdx implicitly; a value held in rax is stale.
+        let idiv = X86Inst {
+            opcode: X86Opcode::Idiv,
+            size: OpSize::Q,
+            operands: vec![X86Operand::Reg(X86Reg::Rcx)],
+            def: None,
+        };
+        let mut f = func_with(vec![
+            store_slot(X86Reg::Rax, -8, OpSize::Q),
+            idiv,
+            load_slot(X86Reg::Rdi, -8, OpSize::Q),
+        ]);
+        assert_eq!(store_to_load_forward(&mut f), 0);
     }
 
     #[test]
