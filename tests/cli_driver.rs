@@ -27148,6 +27148,49 @@ fn formatted_write_iterates_whole_array_real_and_int() {
 }
 
 #[test]
+fn formatted_e_huge_real_internal_write_round_trips() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=formatted_e_huge_real_internal_write_round_trips count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  real(kind=8) :: x, y\n  character(len=64) :: text\n  x = huge(1.0d0)\n  write(text, '(E30.18E3)') x\n  read(text, *) y\n  if (y /= x) then\n    write(*, '(A)') trim(adjustl(text))\n    error stop 1\n  end if\n  write(*, '(A)') trim(adjustl(text))\nend program\n",
+        "f90",
+    );
+    let out = unique_path("formatted_e_huge_real", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("formatted E huge real compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "formatted E huge real should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "formatted E huge real should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("0.179") && stdout.contains("E+309") && !stdout.contains("0.000"),
+        "expected nonzero Fortran-E huge-real output, got: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn contained_subroutine_forwards_derived_dummy_by_ref() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

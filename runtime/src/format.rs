@@ -1117,6 +1117,14 @@ impl FormatEngine {
         exp_width: Option<usize>,
         exp_char: char,
     ) -> String {
+        if matches!(
+            self.round_mode,
+            RoundMode::Compatible | RoundMode::ProcessorDefined
+        ) && self.scale_factor == 0
+        {
+            return self.format_e_style_default(v, decimals, exp_width, exp_char);
+        }
+
         if v == 0.0 {
             let ew = exp_width.unwrap_or(2);
             return format!(
@@ -1153,6 +1161,54 @@ impl FormatEngine {
             fort_exp,
             ew = ew + 1
         )
+    }
+
+    fn format_e_style_default(
+        &self,
+        v: f64,
+        decimals: usize,
+        exp_width: Option<usize>,
+        exp_char: char,
+    ) -> String {
+        if v == 0.0 {
+            let ew = exp_width.unwrap_or(2);
+            return format!(
+                "0.{:0>d$}{}{:+0ew$}",
+                "",
+                exp_char,
+                0,
+                d = decimals,
+                ew = ew + 1
+            );
+        }
+
+        let sci_decimals = decimals.saturating_sub(1);
+        let raw = format!("{:.*E}", sci_decimals, v.abs());
+        let Some(pos) = raw.find('E') else {
+            return raw;
+        };
+        let raw_mantissa = &raw[..pos];
+        let raw_exp = raw[pos + 1..].parse::<i32>().unwrap_or(0);
+        let sign = if v < 0.0 {
+            "-"
+        } else if matches!(self.sign_mode, SignMode::Plus) {
+            "+"
+        } else {
+            ""
+        };
+
+        let mut digits: String = raw_mantissa.chars().filter(|c| *c != '.').collect();
+        if digits.len() < decimals {
+            digits.extend(std::iter::repeat('0').take(decimals - digits.len()));
+        }
+        let mantissa = if decimals == 0 {
+            format!("{sign}0")
+        } else {
+            format!("{sign}0.{}", &digits[..decimals])
+        };
+
+        let ew = exp_width.unwrap_or(2);
+        format!("{}{}{:+0ew$}", mantissa, exp_char, raw_exp + 1, ew = ew + 1)
     }
 
     /// Format in ES style (scientific): mantissa in [1.0, 10.0).
@@ -1924,6 +1980,23 @@ mod tests {
             IoValue::Real(f64::INFINITY),
         ]);
         assert_eq!(out.split_whitespace().collect::<Vec<_>>(), vec!["Inf"; 4]);
+    }
+
+    #[test]
+    fn format_e_huge_real_has_roundtripping_mantissa() {
+        let descs = parse_format("(E30.18E3)");
+        let mut engine = FormatEngine::new(descs);
+        let out = engine.format_values(&[IoValue::Real(f64::MAX)]);
+        let text = out.trim();
+        assert!(
+            text.starts_with("0.179"),
+            "expected a nonzero Fortran-E mantissa for huge real, got {text}"
+        );
+        assert!(
+            text.ends_with("E+309"),
+            "expected Fortran-E exponent one larger than scientific exponent, got {text}"
+        );
+        assert_eq!(text.parse::<f64>().unwrap(), f64::MAX);
     }
 
     #[test]
