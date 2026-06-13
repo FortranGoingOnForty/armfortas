@@ -3,14 +3,16 @@
 ! SSE4.1). The signedness matters — negatives must order below
 ! positives — so this exercises a mix of signs across the lanes and
 ! the reduction tree. OPT_EQ ties the vectorized O2+ output to the
-! scalar O0 result; the ASM_CHECK pins the synthesis on x86.
+! scalar O0 result across every level — the correctness guarantee for
+! the synthesis (matching the do_loop_vectorize_* fixtures, which pin no
+! instruction: ASM_CHECK has no opt-level scope and vectorization is
+! O2+ only).
 ! FLAGS: --std=f2023
 ! CHECK: emax 8
 ! CHECK: emin -26
 ! CHECK: rmax 8
 ! CHECK: rmin -26
 ! CHECK: ok
-! ASM_CHECK: pcmpgtd
 ! OPT_EQ: O0,O1,O2,O3,Os,Ofast => stdout|stderr|exit
 program x10c_int_minmax_signed
   implicit none
