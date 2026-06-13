@@ -17494,12 +17494,11 @@ pub(super) fn emit_resolved_bound_proc_call(
             .and_then(|m| cached_param_mask_for_lookup(st, m, k))
             .or_else(|| callee_optional_arg_mask(st, k))
     });
-    let callee_char_len_star_args =
-        first_procedure_lookup(&abi_lookup_keys, |k| {
-            char_len_star_params
-                .and_then(|m| cached_param_mask_for_lookup(st, m, k))
-                .or_else(|| callee_char_len_star_mask(st, k))
-        });
+    let callee_char_len_star_args = first_procedure_lookup(&abi_lookup_keys, |k| {
+        char_len_star_params
+            .and_then(|m| cached_param_mask_for_lookup(st, m, k))
+            .or_else(|| callee_char_len_star_mask(st, k))
+    });
 
     let mut call_args =
         Vec::with_capacity(arg_slots.len() + hidden_result.is_some() as usize + (!nopass) as usize);
@@ -41071,75 +41070,81 @@ pub(super) fn lower_pointer_intrinsic(
     let crate::ast::expr::SectionSubscript::Element(expr) = &first.value else {
         return None;
     };
-    let raw = if let Expr::Name { name: ptr_name } = &expr.node {
-        let info = locals.get(&ptr_name.to_lowercase())?.clone();
-        if !info.is_pointer {
-            return None;
-        }
-        let zero_off = b.const_i64(0);
-        let ptr_slot = if info.by_ref {
-            b.load(info.addr)
-        } else {
-            info.addr
-        };
-        let base_ptr = b.gep(ptr_slot, vec![zero_off], IrType::Int(IntWidth::I64));
-        b.load_typed(base_ptr, IrType::Int(IntWidth::I64))
-    } else if let Some(tl) = type_layouts {
-        let (field_ptr, field) = resolve_component_field_access(b, locals, expr, st, tl)?;
-        if is_deferred_char_component_field(&field) {
-            let (ptr, _len) = load_string_descriptor_view(b, field_ptr);
-            coerce_to_type(b, ptr, &IrType::Int(IntWidth::I64))
-        } else {
-            let ptr = b.load_typed(field_ptr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
-            coerce_to_type(b, ptr, &IrType::Int(IntWidth::I64))
-        }
-    } else {
-        return None;
-    };
+    let raw = associated_target_address_for_expr(b, locals, expr, st, type_layouts, false)?;
     let zero = b.const_i64(0);
 
     if args.len() >= 2 {
         // Two-argument form: ASSOCIATED(p, target).
-        // True iff p's stored address equals the target's address.
-        // Both values are compared as raw i64 representations.
+        // True iff p is associated and its stored address equals the
+        // target's address. Both values are compared as raw i64
+        // representations.
         let second = &args[1];
         let crate::ast::expr::SectionSubscript::Element(tgt_expr) = &second.value else {
             return Some(b.icmp(CmpOp::Ne, raw, zero));
         };
-        let Expr::Name { name: tgt_name } = &tgt_expr.node else {
+        let Some(tgt_addr) =
+            associated_target_address_for_expr(b, locals, tgt_expr, st, type_layouts, true)
+        else {
             return Some(b.icmp(CmpOp::Ne, raw, zero));
         };
-        let Some(tgt_info) = locals.get(&tgt_name.to_lowercase()) else {
-            return Some(b.icmp(CmpOp::Ne, raw, zero));
-        };
-        // Get the target's address as i64 for comparison.
-        // For a pointer: load the stored address from its slot.
-        // For a by-ref dummy target: load the caller's target address
-        // from the local slot. For a plain local variable: use its
-        // storage address directly.
-        let tgt_addr = if tgt_info.is_pointer {
-            let off = b.const_i64(0);
-            let ptr_slot = if tgt_info.by_ref {
-                b.load(tgt_info.addr)
-            } else {
-                tgt_info.addr
-            };
-            let tgt_slot = b.gep(ptr_slot, vec![off], IrType::Int(IntWidth::I64));
-            b.load_typed(tgt_slot, IrType::Int(IntWidth::I64))
-        } else {
-            let target_ptr = if tgt_info.by_ref {
-                b.load(tgt_info.addr)
-            } else {
-                tgt_info.addr
-            };
-            let scratch = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
-            b.store(target_ptr, scratch);
-            b.load_typed(scratch, IrType::Int(IntWidth::I64))
-        };
-        return Some(b.icmp(CmpOp::Eq, raw, tgt_addr));
+        let is_associated = b.icmp(CmpOp::Ne, raw, zero);
+        let same_target = b.icmp(CmpOp::Eq, raw, tgt_addr);
+        return Some(b.and(is_associated, same_target));
     }
 
     Some(b.icmp(CmpOp::Ne, raw, zero))
+}
+
+fn associated_target_address_for_expr(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    allow_non_pointer_target: bool,
+) -> Option<ValueId> {
+    match &expr.node {
+        Expr::Name { name } => {
+            let info = locals.get(&name.to_lowercase())?;
+            if info.is_pointer {
+                let zero_off = b.const_i64(0);
+                let ptr_slot = if info.by_ref {
+                    b.load(info.addr)
+                } else {
+                    info.addr
+                };
+                let base_ptr = b.gep(ptr_slot, vec![zero_off], IrType::Int(IntWidth::I64));
+                Some(b.load_typed(base_ptr, IrType::Int(IntWidth::I64)))
+            } else if allow_non_pointer_target {
+                let target_ptr = if info.by_ref {
+                    b.load(info.addr)
+                } else {
+                    info.addr
+                };
+                let scratch = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                b.store(target_ptr, scratch);
+                Some(b.load_typed(scratch, IrType::Int(IntWidth::I64)))
+            } else {
+                None
+            }
+        }
+        Expr::ComponentAccess { .. } => {
+            let tl = type_layouts?;
+            let (field_ptr, field) = resolve_component_field_access(b, locals, expr, st, tl)?;
+            if field.pointer {
+                let ptr = b.load_typed(field_ptr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                Some(coerce_to_type(b, ptr, &IrType::Int(IntWidth::I64)))
+            } else if allow_non_pointer_target {
+                Some(coerce_to_type(b, field_ptr, &IrType::Int(IntWidth::I64)))
+            } else if is_deferred_char_component_field(&field) {
+                let (ptr, _len) = load_string_descriptor_view(b, field_ptr);
+                Some(coerce_to_type(b, ptr, &IrType::Int(IntWidth::I64)))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 pub(super) fn lower_scalar_allocated_intrinsic(

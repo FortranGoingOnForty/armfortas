@@ -4688,6 +4688,51 @@ fn pointer_dummy_associated_lowers_without_raw_symbol() {
 }
 
 #[test]
+fn associated_pointer_dummy_compares_component_target() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=associated_pointer_dummy_compares_component_target count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  type :: node_t\n    integer :: value = 0\n    type(node_t), pointer :: next => null()\n  end type node_t\n  type(node_t), pointer :: first\n  type(node_t), pointer :: second\n  type(node_t), pointer :: empty\n\n  allocate(first)\n  allocate(second)\n  first%value = 1\n  second%value = 2\n  first%next => second\n  nullify(empty)\n\n  if (associated(first, first%next)) error stop 1\n  if (.not. associated(second, first%next)) error stop 2\n  if (.not. associated(first%next, second)) error stop 3\n  if (associated(empty, empty)) error stop 4\n  call check(first)\n  print *, 'ok'\ncontains\n  recursive subroutine check(node)\n    type(node_t), pointer, intent(in) :: node\n    if (.not. associated(node%next)) error stop 5\n    if (associated(node, node%next)) error stop 6\n  end subroutine check\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("associated_pointer_component_target", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("associated pointer component compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "associated pointer component compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("associated pointer component run failed");
+    assert!(
+        run.status.success(),
+        "associated pointer component run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "associated pointer component output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn local_derived_pointer_actual_passes_target_to_pointer_dummy() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
