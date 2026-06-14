@@ -44,11 +44,12 @@ Deferred items from the l00 F2023 inventory (2026-06-10):
   `'(lzs, f6.2)'` printed nothing, both exit 0 (nomad, 2026-06-10).
   Bites typo'd formats today; l05 makes unknown descriptors a runtime
   error as part of the AT/LZ work.
-- F2023-syntax collisions producing silent wrong answers today (accepted
-  and mis-lowered, garbage at runtime): `real :: a([2,3])` (R818),
-  `allocate(x([2,3]))` (R937), pointer rank-remapping with array bounds.
-  Details in `.docs/audits/f2023-feature-matrix.md`; owned by l01 —
-  until then these spellings corrupt silently rather than erroring.
+- F2023-syntax collision producing silent wrong answers today (accepted
+  and mis-lowered, garbage at runtime): `real :: a([2,3])` (R818, an
+  array-constructor bound in a type declaration). Details in
+  `.docs/audits/f2023-feature-matrix.md`. The ALLOCATE (R937) and
+  pointer-remap array-constructor forms are now lowered (l02a items 1+2);
+  R818 in declarations is still open.
 
 Resolved during x06 (kept as a lesson for x07's parity sweep):
 
@@ -131,15 +132,25 @@ Found while unblocking l02's CI (2026-06-10, all pre-existing on trunk):
   internal procedures also exposed a name-mangling mismatch (`<main>`
   scope vs `main` lowering prefix) — aligned. Fixture
   `l02_bare_main_contains.f90`.
-- Standalone attribute statements are not parsed: `allocatable :: g`
-  (allocatable function result, gfortran-dg conditional_8.f90), and
-  presumably the pointer/target forms. Parse error today.
-- Conditional expression inside a character LEN spec
-  (`character(len=(n > 5 ? n : 5))`, conditional_7.f90) is not parsed —
-  the len-spec consumes the opening paren before the conditional check.
-- DO CONCURRENT index-in-LOCAL locality constraint is not validated:
-  conditional_9.f90 is a dg-error test we accept silently (vacuous
-  accept; the conditional in it compiles fine).
+- Standalone attribute statements (`allocatable :: x`, `pointer :: p`,
+  `target :: t`) are implemented for VARIABLES (l02a item 6, 2026-06-14):
+  the parser folds each into the named entity's type declaration, splitting
+  a multi-entity declaration so only that entity gets the attribute, so the
+  ordinary `Decl::TypeDecl` lowering handles storage with no new plumbing.
+  Two follow-ups remain:
+  1. An array-spec on the statement (`allocatable :: a(:)`) is rejected
+     loudly — AttributeStmt carries only names, so the deferred shape has
+     nowhere to fold. Declare the shape on the type declaration instead.
+     Lifting this needs per-entity array-spec on the attribute statement.
+  2. Allocatable SCALAR function results: the attribute on a function
+     RESULT (no type declaration to fold into) is currently inert, and
+     allocatable scalar results SEGV when called even via the inline
+     `result()` form (`integer, allocatable :: r`; exit 139) — a
+     pre-existing allocatable-result ABI gap. conditional_8 passes only
+     because its `g()` is short-circuited away (never called).
+  Note: SAVE-as-a-statement (`save :: c`) is still a latent no-op (parsed
+  to AttributeStmt, applied nowhere) — out of scope here; the fold pass
+  deliberately handles allocatable/pointer/target only.
 
 Found during x08's differential/coverage work (2026-06-11, both
 pre-existing on all targets, both now sema-rejected loudly, owned by
@@ -198,8 +209,7 @@ Unexplained transient during x10 validation on nomad (2026-06-12):
 Deferred from l03's enumeration type-safety pass (2026-06-12):
 
 - **Enumeration actuals to FUNCTION references are unchecked**: the
-  same-type argument-association check covers CALL statements only
-  (mirrors l02's conditional-argument CALL-only precedent). An
+  same-type argument-association check covers CALL statements only. An
   enumeration passed to a non-generic function's integer dummy, or
   vice versa, compiles silently; the value is a valid by-ref i32 so
   it reads the ordinal rather than garbage. Owner: l03 follow-up

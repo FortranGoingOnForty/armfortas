@@ -4,7 +4,6 @@
 ! Conversion notes: tests/fixtures/gfortran-dg/README.md
 ! FLAGS: --std=f2023
 ! EXIT_CODE: 0
-! XFAIL: conditional arguments in function references are CALL-only after l02 (value-temp hazard); see the f2023 matrix follow-up
 program conditional_arg
   implicit none
   integer :: a = 4

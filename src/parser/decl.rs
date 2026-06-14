@@ -259,7 +259,17 @@ impl<'a> Parser<'a> {
             } else if self.eat(&TokenKind::Colon) {
                 LenSpec::Colon
             } else {
-                LenSpec::Expr(self.parse_expr()?)
+                let e = self.parse_expr()?;
+                // F2023 conditional expression `(cond ? then : else)` in a
+                // len spec. We consumed the opening `(` above, so the
+                // conditional probe in parse_prefix's LParen arm never
+                // fired — replicate it here on the same inner expression.
+                let e = if self.eat(&TokenKind::Question) {
+                    self.parse_conditional_after_question(e)?
+                } else {
+                    e
+                };
+                LenSpec::Expr(e)
             };
             self.expect(&TokenKind::RParen)?;
             return Ok(inner);
@@ -1676,6 +1686,25 @@ mod tests {
             assert!(attrs.contains(&Attribute::Allocatable));
         } else {
             panic!("not TypeDecl");
+        }
+    }
+
+    #[test]
+    fn character_len_conditional_expr() {
+        // F2023: a conditional expression as the len spec. The len-spec
+        // parser must not swallow the opening paren before the `?` probe.
+        let d = parse_decl("character(len=(n > 5 ? n : 5)) :: str");
+        let Decl::TypeDecl { type_spec, .. } = &d.node else {
+            panic!("not TypeDecl");
+        };
+        let TypeSpec::Character(Some(cs)) = type_spec else {
+            panic!("not character type");
+        };
+        match &cs.len {
+            Some(LenSpec::Expr(e)) => {
+                assert!(matches!(e.node, crate::ast::expr::Expr::ConditionalExpr { .. }));
+            }
+            other => panic!("expected conditional len expr, got {other:?}"),
         }
     }
 

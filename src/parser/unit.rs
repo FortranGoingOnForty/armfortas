@@ -956,6 +956,57 @@ impl<'a> Parser<'a> {
                 }
             }
 
+            // ALLOCATABLE / POINTER / TARGET attribute statements
+            // (F2018 R526/R535/R859): `allocatable :: a, b`, `pointer p`,
+            // `target :: t`. Parsed to AttributeStmt; fold_attribute_statements
+            // (run at end of the unit body) merges each into the entity's
+            // type declaration. Disambiguate from a same-named variable by
+            // requiring `::` or an entity identifier next — `pointer = x`
+            // (`=`) and `pointer(i) = x` (`(`) fall through to assignment.
+            if text == "allocatable" || text == "pointer" || text == "target" {
+                let next_kind = self.tokens.get(self.pos + 1).map(|t| t.kind.clone());
+                let is_attr_stmt = matches!(
+                    next_kind,
+                    Some(TokenKind::ColonColon) | Some(TokenKind::Identifier)
+                );
+                if is_attr_stmt {
+                    let start = self.current_span();
+                    let attr = match text.as_str() {
+                        "allocatable" => crate::ast::decl::Attribute::Allocatable,
+                        "pointer" => crate::ast::decl::Attribute::Pointer,
+                        _ => crate::ast::decl::Attribute::Target,
+                    };
+                    self.advance(); // consume the attribute keyword
+                    let _ = self.eat(&TokenKind::ColonColon);
+                    let mut entities = Vec::new();
+                    while self.peek() == &TokenKind::Identifier {
+                        entities.push(self.advance().clone().text);
+                        // F2018 permits an array-spec here (`allocatable ::
+                        // a(:)`), but AttributeStmt carries only names —
+                        // reject the spec form loudly rather than silently
+                        // dropping the shape.
+                        if self.peek() == &TokenKind::LParen {
+                            return Err(self.error(
+                                "array-spec in a standalone ALLOCATABLE/POINTER/TARGET \
+                                 statement is not supported yet; declare the shape on \
+                                 the type declaration instead"
+                                    .to_string(),
+                            ));
+                        }
+                        if !self.eat(&TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                    self.skip_newlines();
+                    let span = span_from_to(start, self.prev_span());
+                    decls.push(crate::ast::Spanned::new(
+                        crate::ast::decl::Decl::AttributeStmt { attr, entities },
+                        span,
+                    ));
+                    continue;
+                }
+            }
+
             // PRIVATE / PUBLIC access statements.
             if text == "private" || text == "public" {
                 let start = self.current_span();
@@ -1011,6 +1062,7 @@ impl<'a> Parser<'a> {
             body.push(self.parse_stmt()?);
         }
 
+        fold_attribute_statements(&mut decls);
         Ok((uses, imports, implicit, decls, body, interfaces))
     }
 
@@ -1190,6 +1242,108 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// Fold standalone ALLOCATABLE/POINTER/TARGET attribute statements into the
+/// type declaration of each named entity, so every downstream consumer
+/// (resolve plus all lowering storage sites) sees the attribute through the
+/// normal `Decl::TypeDecl` path with no extra plumbing.
+///
+/// A declaration that names several entities is split so the attribute lands
+/// on only its entity: `integer :: y, z` + `allocatable :: y` becomes
+/// `integer :: z` and `integer, allocatable :: y`. An entity with no type
+/// declaration in this scope — e.g. a function result typed by its function
+/// statement — has no fold target; its statement is left in place (inert),
+/// and the allocatable-result ABI remains a separate concern.
+fn fold_attribute_statements(decls: &mut Vec<SpannedDecl>) {
+    use crate::ast::decl::{Attribute, Decl};
+    let mut i = 0;
+    while i < decls.len() {
+        let (attr, entities) = match &decls[i].node {
+            Decl::AttributeStmt { attr, entities }
+                if matches!(
+                    attr,
+                    Attribute::Allocatable | Attribute::Pointer | Attribute::Target
+                ) =>
+            {
+                (attr.clone(), entities.clone())
+            }
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let unfolded: Vec<String> = entities
+            .into_iter()
+            .filter(|name| !fold_one_attribute(decls, name, &attr))
+            .collect();
+        if unfolded.is_empty() {
+            decls.remove(i); // fully folded — drop the now-redundant statement
+        } else {
+            if let Decl::AttributeStmt { entities, .. } = &mut decls[i].node {
+                *entities = unfolded;
+            }
+            i += 1;
+        }
+    }
+}
+
+/// Apply `attr` to the type declaration of entity `name`, splitting a
+/// multi-entity declaration so only `name` gets it. Returns false if no type
+/// declaration in `decls` declares `name`.
+fn fold_one_attribute(
+    decls: &mut Vec<SpannedDecl>,
+    name: &str,
+    attr: &crate::ast::decl::Attribute,
+) -> bool {
+    use crate::ast::decl::Decl;
+    let mut found: Option<(usize, usize, usize)> = None;
+    for (di, d) in decls.iter().enumerate() {
+        if let Decl::TypeDecl { entities, .. } = &d.node {
+            if let Some(ei) = entities
+                .iter()
+                .position(|e| e.name.eq_ignore_ascii_case(name))
+            {
+                found = Some((di, ei, entities.len()));
+                break;
+            }
+        }
+    }
+    let Some((di, ei, count)) = found else {
+        return false;
+    };
+    if count == 1 {
+        if let Decl::TypeDecl { attrs, .. } = &mut decls[di].node {
+            if !attrs.iter().any(|a| a == attr) {
+                attrs.push(attr.clone());
+            }
+        }
+    } else {
+        let span = decls[di].span;
+        let (type_spec, mut new_attrs, ent) = match &mut decls[di].node {
+            Decl::TypeDecl {
+                type_spec,
+                attrs,
+                entities,
+            } => {
+                let ent = entities.remove(ei);
+                (type_spec.clone(), attrs.clone(), ent)
+            }
+            _ => unreachable!(),
+        };
+        if !new_attrs.iter().any(|a| a == attr) {
+            new_attrs.push(attr.clone());
+        }
+        decls.push(Spanned::new(
+            Decl::TypeDecl {
+                type_spec,
+                attrs: new_attrs,
+                entities: vec![ent],
+            },
+            span,
+        ));
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1247,6 +1401,44 @@ mod tests {
         } else {
             panic!("not Program");
         }
+    }
+
+    #[test]
+    fn standalone_attribute_statement_folds_into_type_decl() {
+        use crate::ast::decl::{Attribute, Decl};
+        // `allocatable :: a` folds onto a (splitting the `integer :: a, b`
+        // declaration) without affecting b; the AttributeStmt is consumed.
+        let u = parse_unit(
+            "program p\n  integer :: a, b\n  allocatable :: a\n  a = 0\nend program\n",
+        );
+        let ProgramUnit::Program { decls, .. } = &u.node else {
+            panic!("not Program");
+        };
+        assert!(
+            !decls
+                .iter()
+                .any(|d| matches!(d.node, Decl::AttributeStmt { .. })),
+            "AttributeStmt should have been folded away"
+        );
+        let mut a_allocatable = false;
+        let mut b_allocatable = false;
+        for d in decls {
+            if let Decl::TypeDecl {
+                attrs, entities, ..
+            } = &d.node
+            {
+                let has_alloc = attrs.iter().any(|x| matches!(x, Attribute::Allocatable));
+                for e in entities {
+                    match e.name.as_str() {
+                        "a" => a_allocatable = has_alloc,
+                        "b" => b_allocatable = has_alloc,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        assert!(a_allocatable, "a should be allocatable");
+        assert!(!b_allocatable, "b should not be allocatable");
     }
 
     // ---- SUBROUTINE ----

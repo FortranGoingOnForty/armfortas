@@ -126,6 +126,12 @@ pub(super) struct Ctx<'a> {
     /// the only context where a conditional arm may be `.NIL.` and
     /// where conditional arguments select associations (F2023).
     pub(super) in_call_arg: bool,
+    /// True while validating a conditional expression that is the direct
+    /// RHS of an array assignment (or a directly-nested arm of one). Such
+    /// conditionals lower via a per-arm branch (lower_array_conditional_assign),
+    /// so array-valued arms are allowed here; everywhere else they are
+    /// rejected because the merge has no descriptor lowering.
+    pub(super) allow_array_cond_rhs: bool,
     /// True while validating a BIND(C) procedure (including interface
     /// bodies). BIND(C) `character(kind=c_char), value` dummies have a
     /// working byte-copy lowering; only the Fortran-internal character
@@ -165,6 +171,7 @@ impl<'a> Ctx<'a> {
             warn_deprecated,
             current_args: HashSet::new(),
             in_call_arg: false,
+            allow_array_cond_rhs: false,
             in_bind_c_unit: false,
         }
     }
@@ -803,6 +810,29 @@ fn validate_stmt_enum_usage(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
                         None => continue,
                     },
                 };
+                // F2023 C1525: a `.NIL.` conditional-argument arm selects
+                // the absent association — legal only against an OPTIONAL
+                // dummy. Passing it to a required dummy hands the callee a
+                // null it must dereference (PRESENT() would be false but
+                // the storage is absent).
+                if let crate::ast::expr::SectionSubscript::Element(actual) = &arg.value {
+                    if expr_has_nil_arm(actual) {
+                        let dummy_optional = callee_scope
+                            .symbols
+                            .get(&dummy_name)
+                            .map(|sym| sym.attrs.optional)
+                            .unwrap_or(false);
+                        if !dummy_optional {
+                            ctx.error(
+                                actual.span,
+                                format!(
+                                    "a .NIL. conditional-argument arm requires an OPTIONAL \
+                                     dummy, but '{dummy_name}' is not OPTIONAL (F2023 C1525)"
+                                ),
+                            );
+                        }
+                    }
+                }
                 let dummy_enum =
                     callee_scope
                         .symbols
@@ -870,6 +900,19 @@ fn validate_stmt_enum_usage(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
 /// expression with a range subscript). Conservative — anything it
 /// misses is caught by the same garbage-descriptor class this guards,
 /// so keep it in sync with the lowering when array merges land.
+/// True if a conditional actual argument has a `.NIL.` arm anywhere in its
+/// (possibly chained) conditional tree. Such an argument selects the absent
+/// association, which F2023 C1525 permits only for an OPTIONAL dummy.
+fn expr_has_nil_arm(expr: &crate::ast::expr::SpannedExpr) -> bool {
+    match &expr.node {
+        Expr::NilArgument => true,
+        Expr::ConditionalExpr {
+            then_val, else_val, ..
+        } => expr_has_nil_arm(then_val) || expr_has_nil_arm(else_val),
+        _ => false,
+    }
+}
+
 fn conditional_arm_is_arraylike(ctx: &Ctx<'_>, expr: &crate::ast::expr::SpannedExpr) -> bool {
     match &expr.node {
         Expr::ArrayConstructor { .. } => true,
@@ -960,16 +1003,22 @@ fn validate_const_int_expr_tree(ctx: &mut Ctx<'_>, expr: &crate::ast::expr::Span
                     ),
                 );
             }
-            // Array-valued arms are not lowered yet — they built a
-            // corrupt merge before this check existed. Error loudly
-            // until descriptor-merge lowering lands (matrix-noted).
-            for arm in [then_val, else_val] {
-                if conditional_arm_is_arraylike(ctx, arm) {
-                    ctx.error(
-                        arm.span,
-                        "conditional expressions with array-valued arms are not \
-                         supported yet; assign through an IF construct instead",
-                    );
+            // Array-valued arms only lower when this conditional is the
+            // direct RHS of an array assignment — lower_array_conditional_assign
+            // branches per arm and reuses the ordinary assignment path.
+            // Anywhere else the merge has no array-descriptor lowering, so
+            // reject loudly (it built a corrupt merge before this guard).
+            let allow_array_arms = ctx.allow_array_cond_rhs;
+            if !allow_array_arms {
+                for arm in [then_val, else_val] {
+                    if conditional_arm_is_arraylike(ctx, arm) {
+                        ctx.error(
+                            arm.span,
+                            "conditional expressions with array-valued arms are only \
+                             supported as the right-hand side of an assignment; assign \
+                             through an IF construct instead",
+                        );
+                    }
                 }
             }
             for arm in [then_val, else_val] {
@@ -981,12 +1030,21 @@ fn validate_const_int_expr_tree(ctx: &mut Ctx<'_>, expr: &crate::ast::expr::Span
                     );
                 }
             }
+            ctx.allow_array_cond_rhs = false;
             validate_const_int_expr_tree(ctx, cond);
             for arm in [then_val, else_val] {
                 if !matches!(arm.node, Expr::NilArgument) {
+                    // Propagate the allowance only into a directly-nested
+                    // conditional arm (a chained `c1 ? a : c2 ? b : c`),
+                    // which lowers through the same per-arm branch. An array
+                    // conditional buried in a larger arm expression stays
+                    // rejected.
+                    ctx.allow_array_cond_rhs =
+                        allow_array_arms && matches!(arm.node, Expr::ConditionalExpr { .. });
                     validate_const_int_expr_tree(ctx, arm);
                 }
             }
+            ctx.allow_array_cond_rhs = false;
         }
         Expr::IntegerLiteral { .. } => {
             if let Err(diag) = eval_const_int_expr_checked(ctx, expr) {
@@ -1052,33 +1110,10 @@ fn validate_const_int_expr_tree(ctx: &mut Ctx<'_>, expr: &crate::ast::expr::Span
                     ctx.require_std(expr.span, FortranStandard::F2023, "SELECTED_LOGICAL_KIND");
                 }
             }
-            // F2023 conditional arguments in FUNCTION references would
-            // need association-selecting lowering on the fn-call path;
-            // until that lands, reject for user procedures (a value
-            // temp would break INTENT(OUT)/INOUT silently). Intrinsic
-            // arguments are value-consumed, so a conditional VALUE is
-            // fine there.
-            let user_proc = matches!(
-                &callee.node,
-                Expr::Name { name } if ctx.lookup(name).is_some_and(|sym| matches!(
-                    sym.kind,
-                    crate::sema::symtab::SymbolKind::Function
-                        | crate::sema::symtab::SymbolKind::Subroutine
-                        | crate::sema::symtab::SymbolKind::ProcedurePointer
-                ))
-            );
+            // F2023 conditional arguments in FUNCTION references select the
+            // argument association per arm on the fn-call lowering path
+            // (lower_call_arg_maybe_conditional), the same as CALL.
             for arg in args {
-                if user_proc {
-                    if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
-                        if matches!(e.node, Expr::ConditionalExpr { .. }) {
-                            ctx.error(
-                                e.span,
-                                "conditional arguments to user procedures are only \
-                                 supported in CALL statements so far",
-                            );
-                        }
-                    }
-                }
                 validate_const_int_subscript(ctx, &arg.value);
             }
         }
@@ -1243,11 +1278,94 @@ fn validate_decl_const_int_exprs(ctx: &mut Ctx<'_>, decl: &crate::ast::decl::Spa
     }
 }
 
+/// Collect the (lowercased) names of all variables referenced anywhere in
+/// an expression tree. Function/array-callee names are included too — a
+/// harmless superset for the LOCAL-locality check, which only cares about
+/// names that also appear in a locality-spec.
+fn collect_expr_var_names(
+    expr: &crate::ast::expr::SpannedExpr,
+    out: &mut std::collections::HashSet<String>,
+) {
+    use crate::ast::expr::SectionSubscript;
+    match &expr.node {
+        Expr::Name { name } => {
+            out.insert(name.to_lowercase());
+        }
+        Expr::ComponentAccess { base, .. } => collect_expr_var_names(base, out),
+        Expr::UnaryOp { operand, .. } => collect_expr_var_names(operand, out),
+        Expr::BinaryOp { left, right, .. } => {
+            collect_expr_var_names(left, out);
+            collect_expr_var_names(right, out);
+        }
+        Expr::ComplexLiteral { real, imag } => {
+            collect_expr_var_names(real, out);
+            collect_expr_var_names(imag, out);
+        }
+        Expr::FunctionCall { callee, args } => {
+            collect_expr_var_names(callee, out);
+            for arg in args {
+                match &arg.value {
+                    SectionSubscript::Element(e) => collect_expr_var_names(e, out),
+                    SectionSubscript::Range { start, end, stride } => {
+                        for e in [start, end, stride].into_iter().flatten() {
+                            collect_expr_var_names(e, out);
+                        }
+                    }
+                }
+            }
+        }
+        Expr::ArrayConstructor { values, .. } => {
+            for v in values {
+                collect_ac_value_var_names(v, out);
+            }
+        }
+        Expr::ParenExpr { inner } => collect_expr_var_names(inner, out),
+        Expr::ConditionalExpr {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            collect_expr_var_names(cond, out);
+            collect_expr_var_names(then_val, out);
+            collect_expr_var_names(else_val, out);
+        }
+        _ => {}
+    }
+}
+
+fn collect_ac_value_var_names(
+    v: &crate::ast::expr::AcValue,
+    out: &mut std::collections::HashSet<String>,
+) {
+    use crate::ast::expr::AcValue;
+    match v {
+        AcValue::Expr(e) => collect_expr_var_names(e, out),
+        AcValue::ImpliedDo(ido) => {
+            // ido.var is a loop-local binding, not an outer reference.
+            collect_expr_var_names(&ido.start, out);
+            collect_expr_var_names(&ido.end, out);
+            if let Some(step) = &ido.step {
+                collect_expr_var_names(step, out);
+            }
+            for inner in &ido.values {
+                collect_ac_value_var_names(inner, out);
+            }
+        }
+    }
+}
+
 fn validate_stmt_const_int_exprs(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
     match &stmt.node {
         Stmt::Assignment { target, value } | Stmt::PointerAssignment { target, value } => {
             validate_const_int_expr_tree(ctx, target);
+            // F2023: an array-valued conditional as the assignment RHS lowers
+            // via a per-arm branch, so allow array arms there (but only for
+            // a true assignment, not a pointer assignment).
+            let allow = matches!(stmt.node, Stmt::Assignment { .. })
+                && matches!(value.node, Expr::ConditionalExpr { .. });
+            ctx.allow_array_cond_rhs = allow;
             validate_const_int_expr_tree(ctx, value);
+            ctx.allow_array_cond_rhs = false;
         }
         Stmt::IfConstruct {
             condition,
@@ -1318,7 +1436,12 @@ fn validate_stmt_const_int_exprs(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
                 }
             }
         }
-        Stmt::DoConcurrent { controls, mask, .. } => {
+        Stmt::DoConcurrent {
+            controls,
+            mask,
+            locality,
+            ..
+        } => {
             for control in controls {
                 validate_const_int_expr_tree(ctx, &control.start);
                 validate_const_int_expr_tree(ctx, &control.end);
@@ -1328,6 +1451,37 @@ fn validate_stmt_const_int_exprs(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
             }
             if let Some(mask) = mask {
                 validate_const_int_expr_tree(ctx, mask);
+            }
+            // F2023 C1133: a variable referenced in the concurrent-header
+            // (loop bounds, step, mask) must not appear in a LOCAL
+            // locality-spec — a LOCAL variable is undefined on entry, so
+            // reading it in the header is meaningless. (LOCAL_INIT is
+            // initialized from the outer scope, so it is exempt.)
+            let mut header_names = std::collections::HashSet::new();
+            for control in controls {
+                collect_expr_var_names(&control.start, &mut header_names);
+                collect_expr_var_names(&control.end, &mut header_names);
+                if let Some(step) = &control.step {
+                    collect_expr_var_names(step, &mut header_names);
+                }
+            }
+            if let Some(mask) = mask {
+                collect_expr_var_names(mask, &mut header_names);
+            }
+            for spec in locality {
+                if let crate::ast::stmt::LocalitySpec::Local(vars) = spec {
+                    for v in vars {
+                        if header_names.contains(&v.to_lowercase()) {
+                            ctx.error(
+                                stmt.span,
+                                format!(
+                                    "variable '{v}' referenced in the concurrent-header \
+                                     must not appear in a LOCAL locality-spec (F2023 C1133)"
+                                ),
+                            );
+                        }
+                    }
+                }
             }
         }
         Stmt::WhereConstruct {
@@ -2110,24 +2264,8 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
             }
         }
         Stmt::PointerAssignment { target, value, .. } => {
-            // F2023 10.2.2.2: bounds-spec / bounds-remapping written as
-            // one array expression (`q([2, 3]) => t`). Unimplemented in
-            // lowering — was a silent wrong answer (shape(q) read 0).
-            // Reject loudly until the remap lowering lands.
-            if let Expr::FunctionCall { args, .. } = &target.node {
-                for arg in args {
-                    if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
-                        if matches!(e.node, Expr::ArrayConstructor { .. }) {
-                            ctx.error(
-                                stmt.span,
-                                "pointer bounds remapping from an array expression \
-                                 (F2023 10.2.2.2) is not implemented yet; use the \
-                                 per-dimension form (`q(1:2, 1:3) => t`)",
-                            );
-                        }
-                    }
-                }
-            }
+            // F2023 10.2.2.2 bounds remapping from an array constructor
+            // (`q([2, 3]) => t`) lowers via remap_bounds_args.
             validate_pointer_assignment(ctx, target, value, stmt.span);
             reject_pure_nonlocal_definition(ctx, target, stmt.span, "pointer assignment");
         }
@@ -2158,26 +2296,9 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
                 if !has_source && !has_mold && allocate_item_needs_explicit_shape(ctx, item) {
                     ctx.error(item.span, "array ALLOCATE requires bounds or SOURCE=/MOLD=");
                 }
-                // F2023 R936-R937 lets one array expression supply all
-                // bounds (`allocate(x([2, 3]))`). The lowering cannot
-                // build that descriptor yet; before l01 this compiled
-                // into garbage extents. Reject loudly until the
-                // vector-bounds lowering lands (tracked in the f2023
-                // matrix).
-                if let Expr::FunctionCall { args, .. } = &item.node {
-                    for arg in args {
-                        if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
-                            if matches!(e.node, Expr::ArrayConstructor { .. }) {
-                                ctx.error(
-                                    item.span,
-                                    "ALLOCATE bounds from an array expression (F2023 R937) \
-                                     are not implemented yet; spell the bounds per dimension \
-                                     (`allocate(x(2, 3))`)",
-                                );
-                            }
-                        }
-                    }
-                }
+                // F2023 R936-R937: one array constructor may supply all
+                // bounds (`allocate(x([2, 3]))`); lowered via
+                // lower_alloc_bounds_list.
             }
         }
         Stmt::Deallocate { items, .. } => {
@@ -4442,6 +4563,176 @@ end program
         assert!(errs
             .iter()
             .any(|e| e.contains("DO CONCURRENT") && e.contains("F2008")));
+    }
+
+    #[test]
+    fn do_concurrent_local_referenced_in_header_rejected() {
+        // F2023 C1133: reading a LOCAL variable in the concurrent-header.
+        let errs = errors_from(
+            "\
+program test
+  implicit none
+  integer :: i, j
+  do concurrent (i = j:10) local(j)
+  end do
+end program
+",
+        );
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("LOCAL locality") && e.contains("C1133")));
+    }
+
+    #[test]
+    fn do_concurrent_local_not_in_header_ok() {
+        // A LOCAL variable not referenced in the header is legal.
+        let errs = errors_from(
+            "\
+program test
+  implicit none
+  integer :: i, j
+  do concurrent (i = 1:10) local(j)
+    j = i
+  end do
+end program
+",
+        );
+        assert!(!errs.iter().any(|e| e.contains("C1133")));
+    }
+
+    #[test]
+    fn do_concurrent_local_init_in_header_ok() {
+        // LOCAL_INIT is initialized from the outer scope, so referencing
+        // it in the header is allowed — C1133 covers LOCAL only.
+        let errs = errors_from(
+            "\
+program test
+  implicit none
+  integer :: i, j
+  do concurrent (i = j:10) local_init(j)
+  end do
+end program
+",
+        );
+        assert!(!errs.iter().any(|e| e.contains("C1133")));
+    }
+
+    #[test]
+    fn array_conditional_rhs_accepted() {
+        // F2023: an array-valued conditional as an assignment RHS lowers
+        // via a per-arm branch, so it is accepted.
+        let errs = errors_from(
+            "\
+program test
+  implicit none
+  integer :: a(3), b(3), x(3)
+  logical :: c
+  c = .true.
+  x = (c ? a : b)
+end program
+",
+        );
+        assert!(
+            !errs.iter().any(|e| e.contains("array-valued arms")),
+            "array conditional RHS should be accepted, got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn array_conditional_in_binop_rejected() {
+        // Array conditional buried in a larger expression has no descriptor
+        // lowering and stays rejected.
+        let errs = errors_from(
+            "\
+program test
+  implicit none
+  integer :: a(3), b(3), x(3)
+  logical :: c
+  c = .true.
+  x = (c ? a : b) + a
+end program
+",
+        );
+        assert!(errs.iter().any(|e| e.contains("array-valued arms")));
+    }
+
+    #[test]
+    fn array_conditional_in_print_rejected() {
+        let errs = errors_from(
+            "\
+program test
+  implicit none
+  integer :: a(3), b(3)
+  logical :: c
+  c = .true.
+  print *, (c ? a : b)
+end program
+",
+        );
+        assert!(errs.iter().any(|e| e.contains("array-valued arms")));
+    }
+
+    #[test]
+    fn nil_arm_to_required_dummy_rejected() {
+        // F2023 C1525: .NIL. against a non-optional dummy.
+        let errs = errors_from(
+            "\
+program test
+  implicit none
+  integer :: a
+  a = 3
+  call req((a > 0 ? a : .nil.))
+contains
+  subroutine req(x)
+    integer, intent(in) :: x
+  end subroutine req
+end program
+",
+        );
+        assert!(errs.iter().any(|e| e.contains("C1525")));
+    }
+
+    #[test]
+    fn nil_arm_to_optional_dummy_accepted() {
+        let errs = errors_from(
+            "\
+program test
+  implicit none
+  call maybe((.true. ? 7 : .nil.))
+contains
+  subroutine maybe(o)
+    integer, intent(in), optional :: o
+  end subroutine maybe
+end program
+",
+        );
+        assert!(!errs.iter().any(|e| e.contains("C1525")));
+    }
+
+    #[test]
+    fn conditional_arg_in_function_reference_accepted() {
+        // F2023: a conditional actual argument in a function reference is
+        // lowered like the CALL path (association selection), so it is no
+        // longer rejected.
+        let errs = errors_from(
+            "\
+program test
+  implicit none
+  integer :: a, r
+  a = 3
+  r = twice((a > 0 ? a : 1))
+contains
+  integer function twice(x)
+    integer, intent(in) :: x
+    twice = 2 * x
+  end function twice
+end program
+",
+        );
+        assert!(
+            !errs.iter().any(|e| e.contains("only supported in CALL")),
+            "conditional arg in a function reference should be accepted, got {errs:?}"
+        );
     }
 
     #[test]
