@@ -126,6 +126,12 @@ pub(super) struct Ctx<'a> {
     /// the only context where a conditional arm may be `.NIL.` and
     /// where conditional arguments select associations (F2023).
     pub(super) in_call_arg: bool,
+    /// True while validating a conditional expression that is the direct
+    /// RHS of an array assignment (or a directly-nested arm of one). Such
+    /// conditionals lower via a per-arm branch (lower_array_conditional_assign),
+    /// so array-valued arms are allowed here; everywhere else they are
+    /// rejected because the merge has no descriptor lowering.
+    pub(super) allow_array_cond_rhs: bool,
     /// True while validating a BIND(C) procedure (including interface
     /// bodies). BIND(C) `character(kind=c_char), value` dummies have a
     /// working byte-copy lowering; only the Fortran-internal character
@@ -165,6 +171,7 @@ impl<'a> Ctx<'a> {
             warn_deprecated,
             current_args: HashSet::new(),
             in_call_arg: false,
+            allow_array_cond_rhs: false,
             in_bind_c_unit: false,
         }
     }
@@ -960,16 +967,22 @@ fn validate_const_int_expr_tree(ctx: &mut Ctx<'_>, expr: &crate::ast::expr::Span
                     ),
                 );
             }
-            // Array-valued arms are not lowered yet — they built a
-            // corrupt merge before this check existed. Error loudly
-            // until descriptor-merge lowering lands (matrix-noted).
-            for arm in [then_val, else_val] {
-                if conditional_arm_is_arraylike(ctx, arm) {
-                    ctx.error(
-                        arm.span,
-                        "conditional expressions with array-valued arms are not \
-                         supported yet; assign through an IF construct instead",
-                    );
+            // Array-valued arms only lower when this conditional is the
+            // direct RHS of an array assignment — lower_array_conditional_assign
+            // branches per arm and reuses the ordinary assignment path.
+            // Anywhere else the merge has no array-descriptor lowering, so
+            // reject loudly (it built a corrupt merge before this guard).
+            let allow_array_arms = ctx.allow_array_cond_rhs;
+            if !allow_array_arms {
+                for arm in [then_val, else_val] {
+                    if conditional_arm_is_arraylike(ctx, arm) {
+                        ctx.error(
+                            arm.span,
+                            "conditional expressions with array-valued arms are only \
+                             supported as the right-hand side of an assignment; assign \
+                             through an IF construct instead",
+                        );
+                    }
                 }
             }
             for arm in [then_val, else_val] {
@@ -981,12 +994,21 @@ fn validate_const_int_expr_tree(ctx: &mut Ctx<'_>, expr: &crate::ast::expr::Span
                     );
                 }
             }
+            ctx.allow_array_cond_rhs = false;
             validate_const_int_expr_tree(ctx, cond);
             for arm in [then_val, else_val] {
                 if !matches!(arm.node, Expr::NilArgument) {
+                    // Propagate the allowance only into a directly-nested
+                    // conditional arm (a chained `c1 ? a : c2 ? b : c`),
+                    // which lowers through the same per-arm branch. An array
+                    // conditional buried in a larger arm expression stays
+                    // rejected.
+                    ctx.allow_array_cond_rhs =
+                        allow_array_arms && matches!(arm.node, Expr::ConditionalExpr { .. });
                     validate_const_int_expr_tree(ctx, arm);
                 }
             }
+            ctx.allow_array_cond_rhs = false;
         }
         Expr::IntegerLiteral { .. } => {
             if let Err(diag) = eval_const_int_expr_checked(ctx, expr) {
@@ -1323,7 +1345,14 @@ fn validate_stmt_const_int_exprs(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
     match &stmt.node {
         Stmt::Assignment { target, value } | Stmt::PointerAssignment { target, value } => {
             validate_const_int_expr_tree(ctx, target);
+            // F2023: an array-valued conditional as the assignment RHS lowers
+            // via a per-arm branch, so allow array arms there (but only for
+            // a true assignment, not a pointer assignment).
+            let allow = matches!(stmt.node, Stmt::Assignment { .. })
+                && matches!(value.node, Expr::ConditionalExpr { .. });
+            ctx.allow_array_cond_rhs = allow;
             validate_const_int_expr_tree(ctx, value);
+            ctx.allow_array_cond_rhs = false;
         }
         Stmt::IfConstruct {
             condition,
@@ -4573,6 +4602,61 @@ end program
 ",
         );
         assert!(!errs.iter().any(|e| e.contains("C1133")));
+    }
+
+    #[test]
+    fn array_conditional_rhs_accepted() {
+        // F2023: an array-valued conditional as an assignment RHS lowers
+        // via a per-arm branch, so it is accepted.
+        let errs = errors_from(
+            "\
+program test
+  implicit none
+  integer :: a(3), b(3), x(3)
+  logical :: c
+  c = .true.
+  x = (c ? a : b)
+end program
+",
+        );
+        assert!(
+            !errs.iter().any(|e| e.contains("array-valued arms")),
+            "array conditional RHS should be accepted, got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn array_conditional_in_binop_rejected() {
+        // Array conditional buried in a larger expression has no descriptor
+        // lowering and stays rejected.
+        let errs = errors_from(
+            "\
+program test
+  implicit none
+  integer :: a(3), b(3), x(3)
+  logical :: c
+  c = .true.
+  x = (c ? a : b) + a
+end program
+",
+        );
+        assert!(errs.iter().any(|e| e.contains("array-valued arms")));
+    }
+
+    #[test]
+    fn array_conditional_in_print_rejected() {
+        let errs = errors_from(
+            "\
+program test
+  implicit none
+  integer :: a(3), b(3)
+  logical :: c
+  c = .true.
+  print *, (c ? a : b)
+end program
+",
+        );
+        assert!(errs.iter().any(|e| e.contains("array-valued arms")));
     }
 
     #[test]

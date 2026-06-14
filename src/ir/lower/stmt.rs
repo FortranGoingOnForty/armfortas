@@ -255,6 +255,51 @@ fn lower_call_arg_maybe_conditional(
     }
 }
 
+/// Lower `target = (cond ? then_val : else_val)` for an array-valued
+/// conditional by branching on the condition and reusing the ordinary
+/// assignment lowering on each arm. F2023 short-circuit holds: exactly one
+/// arm's assignment is reached. A chained conditional (`c1 ? a : c2 ? b : c`)
+/// recurses — the else-arm is itself a conditional assignment.
+fn lower_array_conditional_assign(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    target: &crate::ast::expr::SpannedExpr,
+    cond: &crate::ast::expr::SpannedExpr,
+    then_val: &crate::ast::expr::SpannedExpr,
+    else_val: &crate::ast::expr::SpannedExpr,
+) {
+    let assign_arm = |arm: &crate::ast::expr::SpannedExpr| -> SpannedStmt {
+        crate::ast::Spanned::new(
+            Stmt::Assignment {
+                target: target.clone(),
+                value: arm.clone(),
+            },
+            target.span,
+        )
+    };
+    // Constant condition folds to the chosen arm with no extra blocks.
+    if let Expr::LogicalLiteral { value, .. } = &cond.node {
+        let arm = if *value { then_val } else { else_val };
+        lower_stmt(b, ctx, &assign_arm(arm));
+        return;
+    }
+    let cond_val = super::expr::lower_expr_ctx(b, ctx, cond);
+    let bb_then = b.create_block("arrcond_then");
+    let bb_else = b.create_block("arrcond_else");
+    let bb_done = b.create_block("arrcond_done");
+    b.cond_branch(cond_val, bb_then, vec![], bb_else, vec![]);
+
+    b.set_block(bb_then);
+    lower_stmt(b, ctx, &assign_arm(then_val));
+    b.branch(bb_done, vec![]);
+
+    b.set_block(bb_else);
+    lower_stmt(b, ctx, &assign_arm(else_val));
+    b.branch(bb_done, vec![]);
+
+    b.set_block(bb_done);
+}
+
 /// Lower a single statement.
 pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &SpannedStmt) {
     match &stmt.node {
@@ -269,6 +314,27 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     if ctx.lookup_statement_function(name).is_some() {
                         return;
                     }
+                }
+            }
+            // F2023 array-valued conditional expression as an assignment
+            // RHS (`x = (c ? a : b)` with array arms). Lower it as a
+            // runtime branch that performs the per-arm assignment through
+            // the normal (shape-correct) assignment path, instead of
+            // building a descriptor merge. Each arm reuses every existing
+            // array path — allocatable auto-realloc, sections, constructors
+            // — so no array shape is mishandled. Scalar conditionals fall
+            // through to the scalar expression path below.
+            if let Expr::ConditionalExpr {
+                cond,
+                then_val,
+                else_val,
+            } = &value.node
+            {
+                if actual_expr_rank(value, &ctx.locals, ctx.st, Some(ctx.type_layouts))
+                    .is_some_and(|r| r > 0)
+                {
+                    lower_array_conditional_assign(b, ctx, target, cond, then_val, else_val);
+                    return;
                 }
             }
             match &target.node {
