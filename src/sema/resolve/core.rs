@@ -2021,6 +2021,7 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                         scope: st.current_scope(),
                         arg_names: vec![],
                         const_value: None,
+                        const_char_value: None,
                     })?;
                 }
                 let mut next_value = 0i64;
@@ -2068,6 +2069,7 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                     // range check (R771) needs the count.
                     arg_names: enumerators.clone(),
                     const_value: None,
+                    const_char_value: None,
                 })?;
                 for (i, ename) in enumerators.iter().enumerate() {
                     st.define(Symbol {
@@ -2083,6 +2085,7 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                         scope: st.current_scope(),
                         arg_names: vec![],
                         const_value: Some((i + 1) as i64),
+                        const_char_value: None,
                     })?;
                 }
             }
