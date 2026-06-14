@@ -135,9 +135,6 @@ Found while unblocking l02's CI (2026-06-10, all pre-existing on trunk):
 - Standalone attribute statements are not parsed: `allocatable :: g`
   (allocatable function result, gfortran-dg conditional_8.f90), and
   presumably the pointer/target forms. Parse error today.
-- Conditional expression inside a character LEN spec
-  (`character(len=(n > 5 ? n : 5))`, conditional_7.f90) is not parsed —
-  the len-spec consumes the opening paren before the conditional check.
 - DO CONCURRENT index-in-LOCAL locality constraint is not validated:
   conditional_9.f90 is a dg-error test we accept silently (vacuous
   accept; the conditional in it compiles fine).

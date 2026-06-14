@@ -124,7 +124,7 @@ impl<'a> Parser<'a> {
     /// like `( c1 ? v1 : c2 ? v2 : v3 )` group as
     /// `c1 ? v1 : (c2 ? v2 : v3)` without nested parentheses
     /// (F2023; gfortran conditional_1.f90 line 16 relies on this).
-    fn parse_conditional_after_question(
+    pub(super) fn parse_conditional_after_question(
         &mut self,
         cond: SpannedExpr,
     ) -> Result<SpannedExpr, ParseError> {
