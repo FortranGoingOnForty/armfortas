@@ -4,7 +4,6 @@
 ! Conversion notes: tests/fixtures/gfortran-dg/README.md
 ! FLAGS: --std=f2023
 ! EXIT_CODE: 0
-! XFAIL: standalone ALLOCATABLE attribute statement (`allocatable :: g`, allocatable function result) is not parsed (parser gap, noted_items)
 implicit none
 integer :: aa(2)
 aa = [1, 2]
