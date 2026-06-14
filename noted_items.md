@@ -193,8 +193,7 @@ Unexplained transient during x10 validation on nomad (2026-06-12):
 Deferred from l03's enumeration type-safety pass (2026-06-12):
 
 - **Enumeration actuals to FUNCTION references are unchecked**: the
-  same-type argument-association check covers CALL statements only
-  (mirrors l02's conditional-argument CALL-only precedent). An
+  same-type argument-association check covers CALL statements only. An
   enumeration passed to a non-generic function's integer dummy, or
   vice versa, compiles silently; the value is a valid by-ref i32 so
   it reads the ordinal rather than garbage. Owner: l03 follow-up

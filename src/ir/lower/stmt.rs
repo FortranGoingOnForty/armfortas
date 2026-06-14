@@ -163,9 +163,15 @@ fn conform_condarg_to_slot(b: &mut FuncBuilder, val: ValueId, slot_ty: &IrType) 
 /// OPTIONAL gets (`missing_optional_call_arg`) — one null convention,
 /// so PRESENT() in the callee just works. Never a value temporary:
 /// INTENT(OUT)/INOUT writes land in the selected actual.
-fn lower_call_arg_maybe_conditional(
+#[allow(clippy::too_many_arguments)]
+pub(super) fn lower_call_arg_maybe_conditional(
     b: &mut FuncBuilder,
-    ctx: &LowerCtx,
+    locals: &HashMap<String, LocalInfo>,
+    st: &crate::sema::symtab::SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
     e: &crate::ast::expr::SpannedExpr,
     callee_key: &str,
     arg_index: usize,
@@ -174,7 +180,7 @@ fn lower_call_arg_maybe_conditional(
 ) -> ValueId {
     use crate::ast::expr::Expr;
     match &e.node {
-        Expr::NilArgument => missing_optional_call_arg(b, ctx.st, callee_key, arg_index, is_value),
+        Expr::NilArgument => missing_optional_call_arg(b, st, callee_key, arg_index, is_value),
         Expr::ConditionalExpr {
             cond,
             then_val,
@@ -184,7 +190,12 @@ fn lower_call_arg_maybe_conditional(
                 let arm = if *value { then_val } else { else_val };
                 return lower_call_arg_maybe_conditional(
                     b,
-                    ctx,
+                    locals,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
                     arm,
                     callee_key,
                     arg_index,
@@ -194,13 +205,13 @@ fn lower_call_arg_maybe_conditional(
             }
             let cond_val = super::expr::lower_expr_full(
                 b,
-                &ctx.locals,
+                locals,
                 cond,
-                ctx.st,
-                Some(ctx.type_layouts),
-                Some(ctx.internal_funcs),
-                Some(ctx.contained_host_refs),
-                Some(ctx.descriptor_params),
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
             );
             let bb_then = b.create_block("condarg_then");
             let bb_else = b.create_block("condarg_else");
@@ -215,7 +226,12 @@ fn lower_call_arg_maybe_conditional(
             // then conforms (and vice versa).
             let t_raw = lower_call_arg_maybe_conditional(
                 b,
-                ctx,
+                locals,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
                 then_val,
                 callee_key,
                 arg_index,
@@ -238,7 +254,12 @@ fn lower_call_arg_maybe_conditional(
             b.set_block(bb_else);
             let e_val = lower_call_arg_maybe_conditional(
                 b,
-                ctx,
+                locals,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
                 else_val,
                 callee_key,
                 arg_index,
@@ -2452,7 +2473,12 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     };
                                         lower_call_arg_maybe_conditional(
                                             b,
-                                            ctx,
+                                            &ctx.locals,
+                                            ctx.st,
+                                            Some(ctx.type_layouts),
+                                            Some(ctx.internal_funcs),
+                                            Some(ctx.contained_host_refs),
+                                            Some(ctx.descriptor_params),
                                             arg_expr,
                                             abi_primary_key,
                                             i,
@@ -2769,7 +2795,12 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     };
                                         lower_call_arg_maybe_conditional(
                                             b,
-                                            ctx,
+                                            &ctx.locals,
+                                            ctx.st,
+                                            Some(ctx.type_layouts),
+                                            Some(ctx.internal_funcs),
+                                            Some(ctx.contained_host_refs),
+                                            Some(ctx.descriptor_params),
                                             arg_expr,
                                             abi_primary_key,
                                             i,

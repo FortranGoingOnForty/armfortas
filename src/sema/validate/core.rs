@@ -1074,33 +1074,10 @@ fn validate_const_int_expr_tree(ctx: &mut Ctx<'_>, expr: &crate::ast::expr::Span
                     ctx.require_std(expr.span, FortranStandard::F2023, "SELECTED_LOGICAL_KIND");
                 }
             }
-            // F2023 conditional arguments in FUNCTION references would
-            // need association-selecting lowering on the fn-call path;
-            // until that lands, reject for user procedures (a value
-            // temp would break INTENT(OUT)/INOUT silently). Intrinsic
-            // arguments are value-consumed, so a conditional VALUE is
-            // fine there.
-            let user_proc = matches!(
-                &callee.node,
-                Expr::Name { name } if ctx.lookup(name).is_some_and(|sym| matches!(
-                    sym.kind,
-                    crate::sema::symtab::SymbolKind::Function
-                        | crate::sema::symtab::SymbolKind::Subroutine
-                        | crate::sema::symtab::SymbolKind::ProcedurePointer
-                ))
-            );
+            // F2023 conditional arguments in FUNCTION references select the
+            // argument association per arm on the fn-call lowering path
+            // (lower_call_arg_maybe_conditional), the same as CALL.
             for arg in args {
-                if user_proc {
-                    if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
-                        if matches!(e.node, Expr::ConditionalExpr { .. }) {
-                            ctx.error(
-                                e.span,
-                                "conditional arguments to user procedures are only \
-                                 supported in CALL statements so far",
-                            );
-                        }
-                    }
-                }
                 validate_const_int_subscript(ctx, &arg.value);
             }
         }
@@ -4657,6 +4634,32 @@ end program
 ",
         );
         assert!(errs.iter().any(|e| e.contains("array-valued arms")));
+    }
+
+    #[test]
+    fn conditional_arg_in_function_reference_accepted() {
+        // F2023: a conditional actual argument in a function reference is
+        // lowered like the CALL path (association selection), so it is no
+        // longer rejected.
+        let errs = errors_from(
+            "\
+program test
+  implicit none
+  integer :: a, r
+  a = 3
+  r = twice((a > 0 ? a : 1))
+contains
+  integer function twice(x)
+    integer, intent(in) :: x
+    twice = 2 * x
+  end function twice
+end program
+",
+        );
+        assert!(
+            !errs.iter().any(|e| e.contains("only supported in CALL")),
+            "conditional arg in a function reference should be accepted, got {errs:?}"
+        );
     }
 
     #[test]
