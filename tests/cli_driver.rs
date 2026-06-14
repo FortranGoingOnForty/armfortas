@@ -24184,6 +24184,58 @@ fn open_with_newunit_and_iostat_uses_keyword_specs() {
 }
 
 #[test]
+fn open_status_new_failure_branches_to_err_label() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=open_status_new_failure_branches_to_err_label count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("open_status_new_err");
+    let input = dir.join("already-there.txt");
+    fs::write(&input, "old\n").expect("write preexisting file");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        &format!(
+            "program p\n  implicit none\n  integer :: u, ios\n  logical :: opened\n  u = -77\n  ios = -88\n  open(newunit=u, file='{}', status='new', action='write', iostat=ios, err=90)\n  print *, 'bad-success', u, ios\n  error stop 1\n90 continue\n  if (ios == 0) error stop 2\n  inquire(unit=u, opened=opened)\n  if (opened) error stop 3\n  open(newunit=u, file='{}', status='old', action='write', position='rewind', iostat=ios)\n  if (ios /= 0) error stop 4\n  inquire(unit=u, opened=opened)\n  if (.not. opened) error stop 5\n  close(u)\n  print *, 'ok'\nend program\n",
+            input.display(),
+            input.display()
+        ),
+    );
+    let out = dir.join("open_status_new_err.bin");
+    let compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        compile.status.success(),
+        "OPEN STATUS=NEW/ERR compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "OPEN STATUS=NEW/ERR runtime failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "OPEN STATUS=NEW/ERR should branch and recover: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn char_concat_actual_to_assumed_len_dummy_runs() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
