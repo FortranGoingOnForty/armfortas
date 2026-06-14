@@ -5305,9 +5305,7 @@ pub(super) fn eval_const_char_bytes(
                     _ => return None,
                 }
             }
-            let Some(arg_expr) = code_arg else {
-                return None;
-            };
+            let arg_expr = code_arg?;
             let code = eval_const_char_int_expr(arg_expr, param_consts, param_chars)?;
             if !(0..=255).contains(&code) {
                 return None;
@@ -28288,27 +28286,27 @@ pub(super) fn lower_fmt_push(
     // Non-character array expressions: descriptor-materializing
     // expressions are walked by descriptor. Character arrays produced
     // by simple local names/sections have already been handled above.
-    if !is_char {
-        if matches!(
+    if !is_char
+        && matches!(
             item.node,
             Expr::BinaryOp { .. }
                 | Expr::UnaryOp { .. }
                 | Expr::ParenExpr { .. }
                 | Expr::FunctionCall { .. }
+        )
+    {
+        if let Some((desc, elem_ty)) = lower_array_expr_descriptor(
+            b,
+            &ctx.locals,
+            item,
+            ctx.st,
+            Some(ctx.type_layouts),
+            Some(ctx.internal_funcs),
+            Some(ctx.contained_host_refs),
+            Some(ctx.descriptor_params),
         ) {
-            if let Some((desc, elem_ty)) = lower_array_expr_descriptor(
-                b,
-                &ctx.locals,
-                item,
-                ctx.st,
-                Some(ctx.type_layouts),
-                Some(ctx.internal_funcs),
-                Some(ctx.contained_host_refs),
-                Some(ctx.descriptor_params),
-            ) {
-                fmt_push_array_desc_loop(b, desc, &elem_ty);
-                return;
-            }
+            fmt_push_array_desc_loop(b, desc, &elem_ty);
+            return;
         }
     }
 

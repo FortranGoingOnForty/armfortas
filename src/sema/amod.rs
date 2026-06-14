@@ -1035,7 +1035,7 @@ fn emit_procedure(
             if let Some(arg_sym) = pscope.symbols.get(&arg_name.to_lowercase()) {
                 let is_assumed_len = declared_char_len_star_params
                     .and_then(|flags| flags.get(arg_idx).copied())
-                    .unwrap_or_else(|| {
+                    .unwrap_or({
                         matches!(
                             arg_sym.type_info,
                             Some(TypeInfo::Character { len: None, .. })

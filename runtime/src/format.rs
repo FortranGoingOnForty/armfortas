@@ -1199,7 +1199,7 @@ impl FormatEngine {
 
         let mut digits: String = raw_mantissa.chars().filter(|c| *c != '.').collect();
         if digits.len() < decimals {
-            digits.extend(std::iter::repeat('0').take(decimals - digits.len()));
+            digits.extend(std::iter::repeat_n('0', decimals - digits.len()));
         }
         let mantissa = if decimals == 0 {
             format!("{sign}0")

@@ -47,7 +47,7 @@ pub extern "C" fn afs_stop() {
 #[no_mangle]
 pub extern "C" fn afs_stop_int(code: i64) {
     afs_program_finalize();
-    let exit_code = if code >= 0 && code <= 255 {
+    let exit_code = if (0..=255).contains(&code) {
         code as i32
     } else {
         1
