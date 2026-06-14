@@ -3611,10 +3611,64 @@ pub extern "C" fn afs_fmt_begin_internal_ex(
     });
 }
 
+extern "C" {
+    fn malloc(size: usize) -> *mut u8;
+    fn free(ptr: *mut u8);
+}
+
+/// Reallocate a deferred-length StringDescriptor to hold `bytes` and copy
+/// them in; returns false on allocation failure (descriptor left intact).
+///
+/// This mirrors `afs_assign_char_deferred` but lives here, in io_system,
+/// on purpose: routing the formatted-write path through string.rs would
+/// link the whole string-intrinsics object (SPLIT/TOKENIZE/…, ~1 MB) into
+/// every binary that does formatted I/O. `bytes` is the formatter's owned
+/// output and never aliases the descriptor, so a plain grow/copy is safe —
+/// the allocate-before-free dance afs_assign_char_deferred needs for
+/// self-referential assignment does not apply here. Storage is malloc'd to
+/// match `afs_dealloc_string`'s free.
+fn store_internal_alloc_record(
+    desc: *mut crate::descriptor::StringDescriptor,
+    bytes: &[u8],
+) -> bool {
+    use crate::descriptor::{STR_ALLOCATED, STR_DEFERRED};
+    if desc.is_null() {
+        return true;
+    }
+    let d = unsafe { &mut *desc };
+    let n = bytes.len() as i64;
+    if n <= 0 {
+        d.len = 0;
+        d.flags |= STR_ALLOCATED | STR_DEFERRED;
+        return true;
+    }
+    if n > d.capacity || d.data.is_null() {
+        let newp = unsafe { malloc(n as usize) };
+        if newp.is_null() {
+            return false;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), newp, n as usize);
+            if d.is_allocated() && !d.data.is_null() {
+                free(d.data);
+            }
+        }
+        d.data = newp;
+        d.capacity = n;
+    } else {
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), d.data, n as usize);
+        }
+    }
+    d.len = n;
+    d.flags |= STR_ALLOCATED | STR_DEFERRED;
+    true
+}
+
 /// Begin a formatted internal write whose target is a deferred-length
 /// allocatable `character(:), allocatable` scalar. `desc` points at the
 /// 32-byte StringDescriptor; at `afs_fmt_end` the formatted record is
-/// assigned to it via `afs_assign_char_deferred`, reallocating to the
+/// stored into it via `store_internal_alloc_record`, reallocating to the
 /// exact record length (F2008/F2018 auto-reallocation).
 #[no_mangle]
 pub extern "C" fn afs_fmt_begin_internal_alloc(
@@ -3793,16 +3847,13 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                     }
                     match engine.format_values_checked(&c.values) {
                         Ok(output) => {
-                            // Reallocate the descriptor to the exact record
-                            // length and copy the bytes. Reuses the
-                            // deferred-length assignment path (allocate new
-                            // before free), so a self-referential target
-                            // (write(s,...) reading s) stays safe.
-                            crate::string::afs_assign_char_deferred(
+                            if !store_internal_alloc_record(
                                 desc as *mut crate::descriptor::StringDescriptor,
-                                output.as_ptr(),
-                                output.len() as i64,
-                            );
+                                output.as_bytes(),
+                            ) {
+                                io_status = 1;
+                                io_msg = Some("out of memory");
+                            }
                         }
                         Err(_) => {
                             io_status = 1;
