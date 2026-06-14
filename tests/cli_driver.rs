@@ -42194,6 +42194,43 @@ fn allocate_stat_int64_writes_back_to_user_variable() {
 }
 
 #[test]
+fn complex_dp_rank1_vector_subscript_gathers_full_element() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=complex_dp_rank1_vector_subscript_gathers_full_element count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  integer, parameter :: dp = kind(1.0d0)\n  real(dp), parameter :: zero = 0.0_dp\n  real(dp), parameter :: one = 1.0_dp\n  real(dp), parameter :: tol = sqrt(epsilon(zero))\n  complex(dp), parameter :: cone = (one, zero)\n  complex(dp), parameter :: czero = (zero, zero)\n  complex(dp) :: lambda(2), lres(2)\n  real(dp) :: diff(2)\n  lambda = [2*cone, czero]\n  lres = [czero, 2*cone]\n  diff = abs(lambda - lres([2, 1]))\n  if (.not. all(diff <= tol)) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("complex_dp_vector_subscript_gather", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("complex dp vector-subscript compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "complex dp vector-subscript compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("complex dp vector-subscript run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "complex dp vector-subscript run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn rank2_section_with_vector_subscript_gathers_into_fresh_descriptor() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

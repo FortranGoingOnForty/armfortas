@@ -36255,8 +36255,19 @@ pub(super) fn lower_vector_subscript_gather_descriptor(
     };
     let one = b.const_i64(1);
     let zero_based = b.isub(idx_i64, one);
-    let val = load_rank1_array_desc_elem(b, base_desc, &elem_ty, zero_based);
-    store_rank1_array_desc_elem(b, result_desc, &elem_ty, idx, val);
+    if is_complex_ty(&elem_ty) {
+        let src_ptr = rank1_array_desc_elem_ptr(b, base_desc, &elem_ty, zero_based);
+        let dst_ptr = rank1_array_desc_elem_ptr(b, result_desc, &elem_ty, idx);
+        let elem_bytes = b.const_i64(ir_scalar_byte_size(&elem_ty, b.layout));
+        b.call(
+            FuncRef::External("memcpy".into()),
+            vec![dst_ptr, src_ptr, elem_bytes],
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        );
+    } else {
+        let val = load_rank1_array_desc_elem(b, base_desc, &elem_ty, zero_based);
+        store_rank1_array_desc_elem(b, result_desc, &elem_ty, idx, val);
+    }
 
     let next = b.iadd(idx, one);
     b.store(next, i_addr);
