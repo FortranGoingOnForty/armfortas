@@ -2110,24 +2110,8 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
             }
         }
         Stmt::PointerAssignment { target, value, .. } => {
-            // F2023 10.2.2.2: bounds-spec / bounds-remapping written as
-            // one array expression (`q([2, 3]) => t`). Unimplemented in
-            // lowering — was a silent wrong answer (shape(q) read 0).
-            // Reject loudly until the remap lowering lands.
-            if let Expr::FunctionCall { args, .. } = &target.node {
-                for arg in args {
-                    if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
-                        if matches!(e.node, Expr::ArrayConstructor { .. }) {
-                            ctx.error(
-                                stmt.span,
-                                "pointer bounds remapping from an array expression \
-                                 (F2023 10.2.2.2) is not implemented yet; use the \
-                                 per-dimension form (`q(1:2, 1:3) => t`)",
-                            );
-                        }
-                    }
-                }
-            }
+            // F2023 10.2.2.2 bounds remapping from an array constructor
+            // (`q([2, 3]) => t`) lowers via remap_bounds_args.
             validate_pointer_assignment(ctx, target, value, stmt.span);
             reject_pure_nonlocal_definition(ctx, target, stmt.span, "pointer assignment");
         }
@@ -2158,26 +2142,9 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
                 if !has_source && !has_mold && allocate_item_needs_explicit_shape(ctx, item) {
                     ctx.error(item.span, "array ALLOCATE requires bounds or SOURCE=/MOLD=");
                 }
-                // F2023 R936-R937 lets one array expression supply all
-                // bounds (`allocate(x([2, 3]))`). The lowering cannot
-                // build that descriptor yet; before l01 this compiled
-                // into garbage extents. Reject loudly until the
-                // vector-bounds lowering lands (tracked in the f2023
-                // matrix).
-                if let Expr::FunctionCall { args, .. } = &item.node {
-                    for arg in args {
-                        if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
-                            if matches!(e.node, Expr::ArrayConstructor { .. }) {
-                                ctx.error(
-                                    item.span,
-                                    "ALLOCATE bounds from an array expression (F2023 R937) \
-                                     are not implemented yet; spell the bounds per dimension \
-                                     (`allocate(x(2, 3))`)",
-                                );
-                            }
-                        }
-                    }
-                }
+                // F2023 R936-R937: one array constructor may supply all
+                // bounds (`allocate(x([2, 3]))`); lowered via
+                // lower_alloc_bounds_list.
             }
         }
         Stmt::Deallocate { items, .. } => {

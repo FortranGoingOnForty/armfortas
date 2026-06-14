@@ -23329,6 +23329,79 @@ pub(super) fn lower_alloc_bounds(
     }
 }
 
+/// Expand ALLOCATE / pointer-remap subscripts into per-dimension
+/// (lower, upper) i64 bounds.
+///
+/// Normally each subscript supplies one dimension (`allocate(a(2,3))`).
+/// F2023 R937 also lets a single rank-1 array constructor supply every
+/// upper bound (`allocate(x([2,3]))`): each element becomes one
+/// dimension's upper bound with a lower bound of 1. Only a flat
+/// constructor of plain element expressions expands this way — an
+/// implied-do has no compile-time element count, so it falls through to
+/// one-subscript-per-dimension.
+pub(super) fn lower_alloc_bounds_list(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    args: &[crate::ast::expr::Argument],
+) -> Vec<(ValueId, ValueId)> {
+    use crate::ast::expr::{AcValue, SectionSubscript};
+    if let [arg] = args {
+        if let SectionSubscript::Element(e) = &arg.value {
+            if let Expr::ArrayConstructor { values, .. } = &e.node {
+                if !values.is_empty() && values.iter().all(|v| matches!(v, AcValue::Expr(_))) {
+                    let one = b.const_i64(1);
+                    return values
+                        .iter()
+                        .map(|v| {
+                            let AcValue::Expr(elem) = v else { unreachable!() };
+                            let up = super::expr::lower_expr_ctx(b, ctx, elem);
+                            (one, widen_idx_to_i64(b, up))
+                        })
+                        .collect();
+                }
+            }
+        }
+    }
+    args.iter()
+        .map(|arg| lower_alloc_bounds(b, ctx, &arg.value))
+        .collect()
+}
+
+/// Rewrite a pointer-remap subscript list so the F2023 array-constructor
+/// bounds form (`q([2,3]) => t`) becomes per-dimension `1:ub` ranges,
+/// equivalent to `q(1:2, 1:3) => t`. Each constructor element supplies
+/// one dimension's upper bound (lower defaults to 1). Non-constructor
+/// subscript lists pass through unchanged so the existing per-dimension
+/// remap path is unaffected.
+pub(super) fn remap_bounds_args(
+    args: &[crate::ast::expr::Argument],
+) -> Vec<crate::ast::expr::Argument> {
+    use crate::ast::expr::{AcValue, Argument, SectionSubscript};
+    if let [arg] = args {
+        if let SectionSubscript::Element(e) = &arg.value {
+            if let Expr::ArrayConstructor { values, .. } = &e.node {
+                if !values.is_empty() && values.iter().all(|v| matches!(v, AcValue::Expr(_))) {
+                    return values
+                        .iter()
+                        .map(|v| {
+                            let AcValue::Expr(elem) = v else { unreachable!() };
+                            Argument {
+                                keyword: None,
+                                value: SectionSubscript::Range {
+                                    start: None,
+                                    end: Some(elem.clone()),
+                                    stride: None,
+                                },
+                            }
+                        })
+                        .collect();
+                }
+            }
+        }
+    }
+    args.to_vec()
+}
+
 /// Element-byte size for an IR scalar type. Used by array
 /// constructor lowering to compute byte offsets into a destination
 /// buffer. Defaults to 8 for unknown/wide types so we never

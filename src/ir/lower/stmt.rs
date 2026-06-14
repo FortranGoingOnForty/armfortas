@@ -3749,7 +3749,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         }
                         if field.size == 384 && (field.allocatable || field.pointer) {
                             let elem_ty = field_storage_ir_type(&field, ctx.type_layouts);
-                            let rank = args.len();
+                            let bounds = lower_alloc_bounds_list(b, ctx, args);
+                            let rank = bounds.len();
                             let field_info = LocalInfo {
                                 addr: field_ptr,
                                 ty: elem_ty.clone(),
@@ -3826,8 +3827,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     Box::new(IrType::Int(IntWidth::I8)),
                                     dim_buf_bytes,
                                 ));
-                                for (i, arg) in args.iter().enumerate() {
-                                    let (lo64, up64) = lower_alloc_bounds(b, ctx, &arg.value);
+                                for (i, &(lo64, up64)) in bounds.iter().enumerate() {
                                     let base = (i * 24) as i64;
                                     let off_lo = b.const_i64(base);
                                     let off_up = b.const_i64(base + 8);
@@ -4140,7 +4140,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             local_storage_size_bytes(&info, ctx.type_layouts, ctx.layout);
 
                         if info.allocatable || info.descriptor_arg {
-                            let rank = args.len();
+                            let bounds = lower_alloc_bounds_list(b, ctx, args);
+                            let rank = bounds.len();
                             let source_scalar_layout = if source_desc.is_none() {
                                 source_expr.and_then(|expr| {
                                     expr_type_layout(expr, None, ctx.st, ctx.type_layouts)
@@ -4205,8 +4206,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     Box::new(IrType::Int(IntWidth::I8)),
                                     dim_buf_bytes,
                                 ));
-                                for (i, arg) in args.iter().enumerate() {
-                                    let (lo64, up64) = lower_alloc_bounds(b, ctx, &arg.value);
+                                for (i, &(lo64, up64)) in bounds.iter().enumerate() {
                                     let base = (i * 24) as i64;
                                     let off_lo = b.const_i64(base);
                                     let off_up = b.const_i64(base + 8);
@@ -5831,13 +5831,17 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         .get(&tgt_key)
                         .map(|info| info.is_pointer && local_uses_array_descriptor(info))
                         .unwrap_or(false);
-                    let all_ranges = !args.is_empty()
-                        && args.iter().all(|a| {
+                    // F2023 10.2.2.2: `q([2,3]) => t` gives all upper bounds
+                    // as one array constructor. Rewrite to per-dimension
+                    // `1:ub` ranges so the rank-remap path below handles it.
+                    let remap_args = remap_bounds_args(args);
+                    let all_ranges = !remap_args.is_empty()
+                        && remap_args.iter().all(|a| {
                             matches!(a.value, crate::ast::expr::SectionSubscript::Range { .. })
                         });
                     if is_remap_target
                         && all_ranges
-                        && lower_rank_remap_pointer_assignment(b, ctx, &tgt_key, args, value)
+                        && lower_rank_remap_pointer_assignment(b, ctx, &tgt_key, &remap_args, value)
                     {
                         return;
                     }
