@@ -810,6 +810,29 @@ fn validate_stmt_enum_usage(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
                         None => continue,
                     },
                 };
+                // F2023 C1525: a `.NIL.` conditional-argument arm selects
+                // the absent association — legal only against an OPTIONAL
+                // dummy. Passing it to a required dummy hands the callee a
+                // null it must dereference (PRESENT() would be false but
+                // the storage is absent).
+                if let crate::ast::expr::SectionSubscript::Element(actual) = &arg.value {
+                    if expr_has_nil_arm(actual) {
+                        let dummy_optional = callee_scope
+                            .symbols
+                            .get(&dummy_name)
+                            .map(|sym| sym.attrs.optional)
+                            .unwrap_or(false);
+                        if !dummy_optional {
+                            ctx.error(
+                                actual.span,
+                                format!(
+                                    "a .NIL. conditional-argument arm requires an OPTIONAL \
+                                     dummy, but '{dummy_name}' is not OPTIONAL (F2023 C1525)"
+                                ),
+                            );
+                        }
+                    }
+                }
                 let dummy_enum =
                     callee_scope
                         .symbols
@@ -877,6 +900,19 @@ fn validate_stmt_enum_usage(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
 /// expression with a range subscript). Conservative — anything it
 /// misses is caught by the same garbage-descriptor class this guards,
 /// so keep it in sync with the lowering when array merges land.
+/// True if a conditional actual argument has a `.NIL.` arm anywhere in its
+/// (possibly chained) conditional tree. Such an argument selects the absent
+/// association, which F2023 C1525 permits only for an OPTIONAL dummy.
+fn expr_has_nil_arm(expr: &crate::ast::expr::SpannedExpr) -> bool {
+    match &expr.node {
+        Expr::NilArgument => true,
+        Expr::ConditionalExpr {
+            then_val, else_val, ..
+        } => expr_has_nil_arm(then_val) || expr_has_nil_arm(else_val),
+        _ => false,
+    }
+}
+
 fn conditional_arm_is_arraylike(ctx: &Ctx<'_>, expr: &crate::ast::expr::SpannedExpr) -> bool {
     match &expr.node {
         Expr::ArrayConstructor { .. } => true,
@@ -4634,6 +4670,43 @@ end program
 ",
         );
         assert!(errs.iter().any(|e| e.contains("array-valued arms")));
+    }
+
+    #[test]
+    fn nil_arm_to_required_dummy_rejected() {
+        // F2023 C1525: .NIL. against a non-optional dummy.
+        let errs = errors_from(
+            "\
+program test
+  implicit none
+  integer :: a
+  a = 3
+  call req((a > 0 ? a : .nil.))
+contains
+  subroutine req(x)
+    integer, intent(in) :: x
+  end subroutine req
+end program
+",
+        );
+        assert!(errs.iter().any(|e| e.contains("C1525")));
+    }
+
+    #[test]
+    fn nil_arm_to_optional_dummy_accepted() {
+        let errs = errors_from(
+            "\
+program test
+  implicit none
+  call maybe((.true. ? 7 : .nil.))
+contains
+  subroutine maybe(o)
+    integer, intent(in), optional :: o
+  end subroutine maybe
+end program
+",
+        );
+        assert!(!errs.iter().any(|e| e.contains("C1525")));
     }
 
     #[test]
