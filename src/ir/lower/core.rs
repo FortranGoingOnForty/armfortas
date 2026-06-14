@@ -25109,6 +25109,41 @@ pub(super) fn internal_io_buffer(
     Some(lower_string_expr_ctx(b, ctx, &control.value))
 }
 
+/// If `control` designates a deferred-length allocatable
+/// `character(:), allocatable` scalar (a bare name — not a substring,
+/// array element, or pointer), return its StringDescriptor address for
+/// the reallocating internal-write path (F2008/F2018 auto-realloc).
+/// Substrings and array elements are fixed-length views and stay on the
+/// fixed-buffer path.
+pub(super) fn internal_io_alloc_target(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    control: &crate::ast::stmt::IoControl,
+) -> Option<ValueId> {
+    if control
+        .keyword
+        .as_deref()
+        .map(|k| !k.eq_ignore_ascii_case("unit"))
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let name = match &control.value.node {
+        Expr::Name { name } => name,
+        _ => return None,
+    };
+    let info = ctx.locals.get(&name.to_lowercase())?;
+    // Deferred-length allocatable character *scalar* only. A deferred-shape
+    // allocatable char array carries one `(1, 0)` placeholder per rank, so
+    // `dims.is_empty()` is the scalar discriminator; `is_pointer` excludes
+    // `character(:), pointer` (no reallocation on assignment).
+    if info.char_kind == CharKind::Deferred && info.dims.is_empty() && !info.is_pointer {
+        Some(string_descriptor_addr(b, info))
+    } else {
+        None
+    }
+}
+
 pub(super) fn lower_internal_write_items(
     b: &mut FuncBuilder,
     ctx: &mut LowerCtx,
