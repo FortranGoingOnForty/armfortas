@@ -27200,6 +27200,57 @@ fn formatted_write_iterates_whole_array_real_and_int() {
 }
 
 #[test]
+fn formatted_write_iterates_character_array_items() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=formatted_write_iterates_character_array_items count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // json-fortran's RFC6901 test writes a scalar prefix followed by
+    // an allocatable CHARACTER array. The scalar character path used to
+    // claim the whole array and print descriptor bytes instead of each
+    // fixed-length element.
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=10), allocatable :: vals(:)\n  allocate(vals(2))\n  vals(1) = 'bar'\n  vals(2) = 'baz'\n  if (vals(1) /= 'bar') error stop 1\n  if (vals(2) /= 'baz') error stop 2\n  write(*,'(A)') 'HEAD=', vals\n  write(*,'(A)') 'SLICE=', vals(2:2)\nend program\n",
+        "f90",
+    );
+    let out = unique_path("formatted_char_array_iter", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("formatted character array iter compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "formatted character array iter should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "formatted character array iter should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("HEAD=") && stdout.contains("SLICE="),
+        "expected scalar prefixes in formatted output: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("bar") && stdout.matches("baz").count() >= 2,
+        "expected character array elements in formatted output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn formatted_e_huge_real_internal_write_round_trips() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

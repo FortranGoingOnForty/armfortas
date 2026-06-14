@@ -28247,47 +28247,48 @@ pub(super) fn lower_fmt_push(
 
     let is_char = expr_is_character_expr(b, &ctx.locals, item, ctx.st, Some(ctx.type_layouts));
 
-    // Array-shaped items: iterate elements and push each through the
-    // per-element fmt_push helper. Without this, a formatted write of
-    // an array name or section silently emitted nothing because the
-    // descriptor pointer fell into the IrType::Ptr arm and dispatched
-    // to afs_fmt_push_string with a junk length. Mirrors the array
-    // detection in lower_write_items_adv.
-    if !is_char {
-        if let Expr::Name { name } = &item.node {
-            let key = name.to_lowercase();
-            if let Some(info) = ctx.locals.get(&key).cloned() {
-                // Outer arm is the array path. Scalar complex
-                // formatting is handled separately; this case just
-                // needs the array predicate.
-                if local_is_array_like(&info) {
-                    fmt_push_whole_array(b, &info);
-                    return;
-                }
+    // Array-shaped local items: iterate elements and push each through
+    // the per-element fmt_push helper. This must run before the scalar
+    // character path; otherwise a CHARACTER array name is treated as a
+    // single string pointer and the descriptor bytes get printed.
+    if let Expr::Name { name } = &item.node {
+        let key = name.to_lowercase();
+        if let Some(info) = ctx.locals.get(&key).cloned() {
+            // Outer arm is the array path. Scalar complex formatting is
+            // handled separately; this case just needs the array predicate.
+            if local_is_array_like(&info) {
+                fmt_push_whole_array(b, &info);
+                return;
             }
         }
-        if let Expr::FunctionCall { callee, args } = &item.node {
-            if let Expr::Name { name } = &callee.node {
-                let key = name.to_lowercase();
-                if let Some(info) = ctx.locals.get(&key).cloned() {
-                    if local_is_array_like(&info) {
-                        let has_range = args.iter().any(|a| {
-                            matches!(a.value, crate::ast::expr::SectionSubscript::Range { .. })
-                        });
-                        if has_range {
-                            if local_uses_array_descriptor(&info) {
-                                fmt_push_alloc_section_nd(b, ctx, &info, args);
-                            } else if args.len() == 1 {
-                                fmt_push_1d_slice(b, ctx, &info, &args[0]);
-                            } else {
-                                fmt_push_section_nd(b, ctx, &info, args);
-                            }
-                            return;
+    }
+    if let Expr::FunctionCall { callee, args } = &item.node {
+        if let Expr::Name { name } = &callee.node {
+            let key = name.to_lowercase();
+            if let Some(info) = ctx.locals.get(&key).cloned() {
+                if local_is_array_like(&info) {
+                    let has_range = args.iter().any(|a| {
+                        matches!(a.value, crate::ast::expr::SectionSubscript::Range { .. })
+                    });
+                    if has_range {
+                        if local_uses_array_descriptor(&info) {
+                            fmt_push_alloc_section_nd(b, ctx, &info, args);
+                        } else if args.len() == 1 {
+                            fmt_push_1d_slice(b, ctx, &info, &args[0]);
+                        } else {
+                            fmt_push_section_nd(b, ctx, &info, args);
                         }
+                        return;
                     }
                 }
             }
         }
+    }
+
+    // Non-character array expressions: descriptor-materializing
+    // expressions are walked by descriptor. Character arrays produced
+    // by simple local names/sections have already been handled above.
+    if !is_char {
         if matches!(
             item.node,
             Expr::BinaryOp { .. }
