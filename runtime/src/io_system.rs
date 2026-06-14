@@ -3495,6 +3495,11 @@ use std::cell::RefCell;
 enum FmtSink {
     Unit(i32),
     Internal { buf: *mut u8, buf_len: usize },
+    /// Internal write whose target is a deferred-length allocatable
+    /// `character(:), allocatable` scalar. The formatted record is
+    /// assigned to the StringDescriptor, reallocating it to the record
+    /// length (F2008/F2018 auto-reallocation).
+    InternalAlloc { desc: *mut u8 },
 }
 
 /// Thread-local state for the current formatted I/O operation.
@@ -3596,6 +3601,34 @@ pub extern "C" fn afs_fmt_begin_internal_ex(
                 buf,
                 buf_len: buf_len.max(0) as usize,
             },
+            format_str: fmt,
+            values: Vec::new(),
+            iostat,
+            iomsg,
+            iomsg_len,
+            stmt_leading_zero: None,
+        });
+    });
+}
+
+/// Begin a formatted internal write whose target is a deferred-length
+/// allocatable `character(:), allocatable` scalar. `desc` points at the
+/// 32-byte StringDescriptor; at `afs_fmt_end` the formatted record is
+/// assigned to it via `afs_assign_char_deferred`, reallocating to the
+/// exact record length (F2008/F2018 auto-reallocation).
+#[no_mangle]
+pub extern "C" fn afs_fmt_begin_internal_alloc(
+    desc: *mut u8,
+    fmt_str: *const u8,
+    fmt_len: i64,
+    iostat: *mut i32,
+    iomsg: *mut u8,
+    iomsg_len: i64,
+) {
+    let fmt = unsafe_str(fmt_str, fmt_len);
+    FMT_CTX.with(|ctx| {
+        *ctx.borrow_mut() = Some(FmtContext {
+            sink: FmtSink::InternalAlloc { desc },
             format_str: fmt,
             values: Vec::new(),
             iostat,
@@ -3746,6 +3779,29 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                                 0,
                                 output.as_bytes(),
                                 std::ptr::null_mut(),
+                            );
+                        }
+                        Err(_) => {
+                            io_status = 1;
+                            io_msg = Some("format error");
+                        }
+                    }
+                }
+                FmtSink::InternalAlloc { desc } => {
+                    if let Some(mode) = c.stmt_leading_zero {
+                        engine.set_leading_zero(mode);
+                    }
+                    match engine.format_values_checked(&c.values) {
+                        Ok(output) => {
+                            // Reallocate the descriptor to the exact record
+                            // length and copy the bytes. Reuses the
+                            // deferred-length assignment path (allocate new
+                            // before free), so a self-referential target
+                            // (write(s,...) reading s) stays safe.
+                            crate::string::afs_assign_char_deferred(
+                                desc as *mut crate::descriptor::StringDescriptor,
+                                output.as_ptr(),
+                                output.len() as i64,
                             );
                         }
                         Err(_) => {
@@ -5041,6 +5097,49 @@ mod tests {
         assert_eq!(lines[0].trim(), ".250", "connection SUPPRESS drops zero");
         assert_eq!(lines[1].trim(), "0.250", "statement PRINT keeps zero");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn internal_write_realloc_grows_and_shrinks_deferred_target() {
+        use crate::descriptor::StringDescriptor;
+        let mut desc = StringDescriptor::zeroed();
+        let dptr = &mut desc as *mut StringDescriptor as *mut u8;
+
+        // Grow from unallocated: write 'val=42!' (7 chars).
+        afs_fmt_begin_internal_alloc(
+            dptr,
+            "(A,I0,A)".as_ptr(),
+            8,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        );
+        afs_fmt_push_string("val=".as_ptr(), 4);
+        afs_fmt_push_int(42);
+        afs_fmt_push_string("!".as_ptr(), 1);
+        afs_fmt_end(0);
+        assert_eq!(desc.len, 7);
+        let bytes = unsafe { std::slice::from_raw_parts(desc.data, desc.len as usize) };
+        assert_eq!(bytes, b"val=42!");
+        let grown_cap = desc.capacity;
+
+        // Shrink to 'x' (1 char): reuses the larger buffer, len updates.
+        afs_fmt_begin_internal_alloc(
+            dptr,
+            "(A)".as_ptr(),
+            3,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        );
+        afs_fmt_push_string("x".as_ptr(), 1);
+        afs_fmt_end(0);
+        assert_eq!(desc.len, 1);
+        assert!(desc.capacity >= grown_cap, "shrink must not lose capacity");
+        let bytes = unsafe { std::slice::from_raw_parts(desc.data, desc.len as usize) };
+        assert_eq!(bytes, b"x");
+
+        crate::string::afs_dealloc_string(dptr as *mut StringDescriptor);
     }
 
     #[test]
