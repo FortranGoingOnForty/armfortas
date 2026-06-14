@@ -1243,6 +1243,82 @@ fn validate_decl_const_int_exprs(ctx: &mut Ctx<'_>, decl: &crate::ast::decl::Spa
     }
 }
 
+/// Collect the (lowercased) names of all variables referenced anywhere in
+/// an expression tree. Function/array-callee names are included too — a
+/// harmless superset for the LOCAL-locality check, which only cares about
+/// names that also appear in a locality-spec.
+fn collect_expr_var_names(
+    expr: &crate::ast::expr::SpannedExpr,
+    out: &mut std::collections::HashSet<String>,
+) {
+    use crate::ast::expr::SectionSubscript;
+    match &expr.node {
+        Expr::Name { name } => {
+            out.insert(name.to_lowercase());
+        }
+        Expr::ComponentAccess { base, .. } => collect_expr_var_names(base, out),
+        Expr::UnaryOp { operand, .. } => collect_expr_var_names(operand, out),
+        Expr::BinaryOp { left, right, .. } => {
+            collect_expr_var_names(left, out);
+            collect_expr_var_names(right, out);
+        }
+        Expr::ComplexLiteral { real, imag } => {
+            collect_expr_var_names(real, out);
+            collect_expr_var_names(imag, out);
+        }
+        Expr::FunctionCall { callee, args } => {
+            collect_expr_var_names(callee, out);
+            for arg in args {
+                match &arg.value {
+                    SectionSubscript::Element(e) => collect_expr_var_names(e, out),
+                    SectionSubscript::Range { start, end, stride } => {
+                        for e in [start, end, stride].into_iter().flatten() {
+                            collect_expr_var_names(e, out);
+                        }
+                    }
+                }
+            }
+        }
+        Expr::ArrayConstructor { values, .. } => {
+            for v in values {
+                collect_ac_value_var_names(v, out);
+            }
+        }
+        Expr::ParenExpr { inner } => collect_expr_var_names(inner, out),
+        Expr::ConditionalExpr {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            collect_expr_var_names(cond, out);
+            collect_expr_var_names(then_val, out);
+            collect_expr_var_names(else_val, out);
+        }
+        _ => {}
+    }
+}
+
+fn collect_ac_value_var_names(
+    v: &crate::ast::expr::AcValue,
+    out: &mut std::collections::HashSet<String>,
+) {
+    use crate::ast::expr::AcValue;
+    match v {
+        AcValue::Expr(e) => collect_expr_var_names(e, out),
+        AcValue::ImpliedDo(ido) => {
+            // ido.var is a loop-local binding, not an outer reference.
+            collect_expr_var_names(&ido.start, out);
+            collect_expr_var_names(&ido.end, out);
+            if let Some(step) = &ido.step {
+                collect_expr_var_names(step, out);
+            }
+            for inner in &ido.values {
+                collect_ac_value_var_names(inner, out);
+            }
+        }
+    }
+}
+
 fn validate_stmt_const_int_exprs(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
     match &stmt.node {
         Stmt::Assignment { target, value } | Stmt::PointerAssignment { target, value } => {
@@ -1318,7 +1394,12 @@ fn validate_stmt_const_int_exprs(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
                 }
             }
         }
-        Stmt::DoConcurrent { controls, mask, .. } => {
+        Stmt::DoConcurrent {
+            controls,
+            mask,
+            locality,
+            ..
+        } => {
             for control in controls {
                 validate_const_int_expr_tree(ctx, &control.start);
                 validate_const_int_expr_tree(ctx, &control.end);
@@ -1328,6 +1409,37 @@ fn validate_stmt_const_int_exprs(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
             }
             if let Some(mask) = mask {
                 validate_const_int_expr_tree(ctx, mask);
+            }
+            // F2023 C1133: a variable referenced in the concurrent-header
+            // (loop bounds, step, mask) must not appear in a LOCAL
+            // locality-spec — a LOCAL variable is undefined on entry, so
+            // reading it in the header is meaningless. (LOCAL_INIT is
+            // initialized from the outer scope, so it is exempt.)
+            let mut header_names = std::collections::HashSet::new();
+            for control in controls {
+                collect_expr_var_names(&control.start, &mut header_names);
+                collect_expr_var_names(&control.end, &mut header_names);
+                if let Some(step) = &control.step {
+                    collect_expr_var_names(step, &mut header_names);
+                }
+            }
+            if let Some(mask) = mask {
+                collect_expr_var_names(mask, &mut header_names);
+            }
+            for spec in locality {
+                if let crate::ast::stmt::LocalitySpec::Local(vars) = spec {
+                    for v in vars {
+                        if header_names.contains(&v.to_lowercase()) {
+                            ctx.error(
+                                stmt.span,
+                                format!(
+                                    "variable '{v}' referenced in the concurrent-header \
+                                     must not appear in a LOCAL locality-spec (F2023 C1133)"
+                                ),
+                            );
+                        }
+                    }
+                }
             }
         }
         Stmt::WhereConstruct {
@@ -4409,6 +4521,58 @@ end program
         assert!(errs
             .iter()
             .any(|e| e.contains("DO CONCURRENT") && e.contains("F2008")));
+    }
+
+    #[test]
+    fn do_concurrent_local_referenced_in_header_rejected() {
+        // F2023 C1133: reading a LOCAL variable in the concurrent-header.
+        let errs = errors_from(
+            "\
+program test
+  implicit none
+  integer :: i, j
+  do concurrent (i = j:10) local(j)
+  end do
+end program
+",
+        );
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("LOCAL locality") && e.contains("C1133")));
+    }
+
+    #[test]
+    fn do_concurrent_local_not_in_header_ok() {
+        // A LOCAL variable not referenced in the header is legal.
+        let errs = errors_from(
+            "\
+program test
+  implicit none
+  integer :: i, j
+  do concurrent (i = 1:10) local(j)
+    j = i
+  end do
+end program
+",
+        );
+        assert!(!errs.iter().any(|e| e.contains("C1133")));
+    }
+
+    #[test]
+    fn do_concurrent_local_init_in_header_ok() {
+        // LOCAL_INIT is initialized from the outer scope, so referencing
+        // it in the header is allowed — C1133 covers LOCAL only.
+        let errs = errors_from(
+            "\
+program test
+  implicit none
+  integer :: i, j
+  do concurrent (i = j:10) local_init(j)
+  end do
+end program
+",
+        );
+        assert!(!errs.iter().any(|e| e.contains("C1133")));
     }
 
     #[test]

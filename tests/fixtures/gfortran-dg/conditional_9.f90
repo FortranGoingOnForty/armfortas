@@ -10,7 +10,6 @@
 ! diagnostic is still required for this to pass.
 ! FLAGS: --std=f2023
 ! ERROR_EXPECTED: LOCAL locality
-! XFAIL: DO CONCURRENT index-in-LOCAL locality constraint is not validated (vacuous accept, noted_items)
 implicit none
 integer :: i, j
 do concurrent (i=(j > 1 ? 0 : 1) : 5) local(j) ! original dg-error: "must not appear in LOCAL ..." (truncated)

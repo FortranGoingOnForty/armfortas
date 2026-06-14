@@ -135,9 +135,6 @@ Found while unblocking l02's CI (2026-06-10, all pre-existing on trunk):
 - Standalone attribute statements are not parsed: `allocatable :: g`
   (allocatable function result, gfortran-dg conditional_8.f90), and
   presumably the pointer/target forms. Parse error today.
-- DO CONCURRENT index-in-LOCAL locality constraint is not validated:
-  conditional_9.f90 is a dg-error test we accept silently (vacuous
-  accept; the conditional in it compiles fine).
 
 Found during x08's differential/coverage work (2026-06-11, both
 pre-existing on all targets, both now sema-rejected loudly, owned by
