@@ -12,6 +12,31 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Detect whether a change can affect the afs-as assembler suite. afs-as
+  # is a standalone workspace crate (`cargo test -p afs-as`) that does not
+  # depend on the armfortas compiler crate, so an armfortas-only PR cannot
+  # break it — those ~14 macOS jobs just burn runner slots. Gate them on
+  # paths that actually reach afs-as: the submodule itself, the workspace
+  # manifest/lockfile (shared deps), and this workflow. Skipped required
+  # jobs count as passing for branch protection.
+  changes:
+    name: "Detect changed paths"
+    runs-on: ubuntu-latest
+    outputs:
+      afs_as: ${{ steps.filter.outputs.afs_as }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            afs_as:
+              - 'afs-as'
+              - 'afs-as/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/workflows/ci.yml'
+
   build:
     name: Build
     runs-on: macos-latest
@@ -88,6 +113,8 @@ jobs:
   test-afs-as-unit:
     name: "Tests: afs-as unit"
     runs-on: macos-latest
+    needs: changes
+    if: needs.changes.outputs.afs_as == 'true'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -98,6 +125,8 @@ jobs:
   test-afs-as-harness:
     name: "Tests: afs-as differential harness"
     runs-on: macos-latest
+    needs: changes
+    if: needs.changes.outputs.afs_as == 'true'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -108,6 +137,8 @@ jobs:
   test-afs-as-corpus:
     name: "Tests: afs-as corpus compatibility"
     runs-on: macos-latest
+    needs: changes
+    if: needs.changes.outputs.afs_as == 'true'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -118,6 +149,8 @@ jobs:
   test-afs-as-roundtrip:
     name: "Tests: afs-as round-trip"
     runs-on: macos-latest
+    needs: changes
+    if: needs.changes.outputs.afs_as == 'true'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -128,6 +161,8 @@ jobs:
   test-afs-as-system:
     name: "Tests: afs-as vs system assembler"
     runs-on: macos-latest
+    needs: changes
+    if: needs.changes.outputs.afs_as == 'true'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -138,6 +173,8 @@ jobs:
   test-afs-as-e2e:
     name: "Tests: afs-as end-to-end"
     runs-on: macos-latest
+    needs: changes
+    if: needs.changes.outputs.afs_as == 'true'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -148,6 +185,8 @@ jobs:
   test-afs-as-cli:
     name: "Tests: afs-as cli smoke"
     runs-on: macos-latest
+    needs: changes
+    if: needs.changes.outputs.afs_as == 'true'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -158,6 +197,8 @@ jobs:
   test-afs-as-diagnostics:
     name: "Tests: afs-as diagnostic snapshots"
     runs-on: macos-latest
+    needs: changes
+    if: needs.changes.outputs.afs_as == 'true'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -168,6 +209,8 @@ jobs:
   test-afs-as-clang-dashboard:
     name: "Tests: afs-as clang probe dashboard"
     runs-on: macos-latest
+    needs: changes
+    if: needs.changes.outputs.afs_as == 'true'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -178,6 +221,8 @@ jobs:
   test-afs-as-generated-stress:
     name: "Tests: afs-as generated stress"
     runs-on: macos-latest
+    needs: changes
+    if: needs.changes.outputs.afs_as == 'true'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -188,6 +233,8 @@ jobs:
   test-afs-as-differential-fuzz:
     name: "Tests: afs-as differential fuzz"
     runs-on: macos-latest
+    needs: changes
+    if: needs.changes.outputs.afs_as == 'true'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -198,6 +245,8 @@ jobs:
   test-afs-as-malformed-mutation:
     name: "Tests: afs-as malformed mutation"
     runs-on: macos-latest
+    needs: changes
+    if: needs.changes.outputs.afs_as == 'true'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -208,6 +257,8 @@ jobs:
   test-afs-as-perf:
     name: "Tests: afs-as performance sanity"
     runs-on: macos-latest
+    needs: changes
+    if: needs.changes.outputs.afs_as == 'true'
     steps:
       - uses: actions/checkout@v4
         with:
