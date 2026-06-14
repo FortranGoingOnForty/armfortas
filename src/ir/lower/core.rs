@@ -26583,6 +26583,31 @@ pub(super) fn lower_formatted_char_read_item_with_runtime_advance(
 }
 
 /// Push a single I/O item value for formatted output via afs_fmt_push_*.
+/// Emit the per-statement LEADING_ZERO= override hook for a formatted
+/// WRITE (F2023). No-op when the statement carries no LEADING_ZERO=
+/// specifier. Must be called after `afs_fmt_begin*` and before the value
+/// pushes so the engine picks it up at `afs_fmt_end`.
+pub(super) fn lower_fmt_leading_zero_override(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    ctrl: Option<&IoControl>,
+) {
+    if let Some(c) = ctrl {
+        let (ptr, len) = lower_string_expr_with_layouts(
+            b,
+            &ctx.locals,
+            &c.value,
+            ctx.st,
+            Some(ctx.type_layouts),
+        );
+        b.call(
+            FuncRef::External("afs_fmt_set_leading_zero".into()),
+            vec![ptr, len],
+            IrType::Void,
+        );
+    }
+}
+
 pub(super) fn lower_fmt_push(
     b: &mut FuncBuilder,
     ctx: &mut LowerCtx,

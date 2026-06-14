@@ -284,3 +284,18 @@ Found during l04 (2026-06-12):
   (F2003, used by split_2) is also unimplemented (undefined symbol at
   link). Owners: intrinsic runtime-bounds pass / F2003 intrinsic
   backlog respectively.
+
+- **`print '(format)'` with multiple items ignores the format** (found
+  l05-2, 2026-06-13): a multi-item `print` with an explicit format
+  literal lowers as if list-directed. `print '(A,I0)', 'n=', 5`
+  emits ` n= 5` (leading blank + blank separator) instead of `n=5`;
+  `print '(A,A,A)', 'x|', 'ab', '|'` emits ` x| ab |` instead of
+  `x|ab|`. The equivalent `write(*,'(A,A,A)') ...` is correct, and a
+  single-item `print '(A)', 'ok'` is correct, so the bug is specific to
+  multi-item PRINT carrying a format. Existing fixtures dodge it
+  because their CHECKs are `contains`-based and tolerate the extra
+  blanks (e.g. x10c's `print '(A,16(1X,I0))'` already has explicit 1X
+  separators). The l05-2 fixture uses `write(*,...)` to assert exact
+  field contents. Owner: PRINT-statement lowering (src/ir/lower/stmt.rs
+  Stmt::Print vs Stmt::Write) — likely PRINT routes format-carrying
+  output through the list-directed path.

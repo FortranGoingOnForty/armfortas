@@ -152,6 +152,10 @@ struct Unit {
     formatted_read_cursor: usize,
     /// True for STATUS='SCRATCH' units: backing file is deleted on close or exit.
     scratch: bool,
+    /// Connection-level LEADING_ZERO= mode (F2023). Seeds the format
+    /// engine's leading-zero state at the start of each formatted WRITE
+    /// unless the statement carries its own LEADING_ZERO= override.
+    leading_zero: LeadingZeroMode,
     /// In-flight sequential-unformatted record buffer. Set by
     /// `afs_list_write_begin` and drained by `afs_list_write_end`.
     /// While Some, list-directed write helpers append raw bytes here
@@ -377,6 +381,7 @@ impl IoState {
                 formatted_read_record: None,
                 formatted_read_cursor: 0,
                 scratch: false,
+                leading_zero: LeadingZeroMode::Default,
                 pending_record: None,
                 pending_read: None,
             },
@@ -396,6 +401,7 @@ impl IoState {
                 formatted_read_record: None,
                 formatted_read_cursor: 0,
                 scratch: false,
+                leading_zero: LeadingZeroMode::Default,
                 pending_record: None,
                 pending_read: None,
             },
@@ -415,6 +421,7 @@ impl IoState {
                 formatted_read_record: None,
                 formatted_read_cursor: 0,
                 scratch: false,
+                leading_zero: LeadingZeroMode::Default,
                 pending_record: None,
                 pending_read: None,
             },
@@ -459,6 +466,11 @@ pub struct OpenControlBlock {
     pub newunit: *mut i32,
     pub position: *const u8,
     pub position_len: i64,
+    /// LEADING_ZERO= specifier (F2023). Appended after `position_len`;
+    /// the lowering writes the matching offsets (see stmt.rs OPEN). Empty
+    /// (null/0) when the OPEN carried no LEADING_ZERO=.
+    pub leading_zero: *const u8,
+    pub leading_zero_len: i64,
 }
 
 /// Simple OPEN with the most common specifiers (fits in 8 registers).
@@ -490,6 +502,8 @@ pub extern "C" fn afs_open_simple(
         newunit: std::ptr::null_mut(),
         position: std::ptr::null(),
         position_len: 0,
+        leading_zero: std::ptr::null(),
+        leading_zero_len: 0,
     };
     afs_open(&cb);
 }
@@ -511,6 +525,9 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
     let access_str = unsafe_str(cb.access, cb.access_len).to_lowercase();
     let form_str = unsafe_str(cb.form, cb.form_len).to_lowercase();
     let position_str = unsafe_str(cb.position, cb.position_len).to_lowercase();
+    let leading_zero_str = unsafe_str(cb.leading_zero, cb.leading_zero_len);
+    let leading_zero_specified = !leading_zero_str.trim().is_empty();
+    let leading_zero_mode = LeadingZeroMode::from_specifier(&leading_zero_str);
     let recl = cb.recl;
     let iostat = cb.iostat;
     let newunit = cb.newunit;
@@ -589,6 +606,9 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
                     _ => {}
                 },
                 _ => {}
+            }
+            if leading_zero_specified {
+                unit.leading_zero = leading_zero_mode;
             }
         }
         if !iostat.is_null() {
@@ -726,6 +746,7 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
                     formatted_read_record: None,
                     formatted_read_cursor: 0,
                     scratch: is_scratch,
+                    leading_zero: leading_zero_mode,
                     pending_record: None,
                     pending_read: None,
                 },
@@ -2961,6 +2982,18 @@ fn write_inquire_string(buf: *mut u8, buf_len: i64, value: &str) {
     }
 }
 
+/// INQUIRE LEADING_ZERO= readback (F2023 12.10.2.15). A formatted
+/// connection reports its current mode (`PRINT`/`SUPPRESS`/
+/// `PROCESSOR_DEFINED`); no connection or an unformatted connection is
+/// `UNDEFINED` — not `PROCESSOR_DEFINED`.
+fn write_leading_zero_capability(unit: Option<&Unit>, buf: *mut u8, buf_len: i64) {
+    let s = match unit {
+        Some(u) if u.form == Form::Formatted => u.leading_zero.inquire_str(),
+        _ => "UNDEFINED",
+    };
+    write_inquire_string(buf, buf_len, s);
+}
+
 /// INQUIRE by file: check if a file exists, report its properties.
 #[no_mangle]
 pub extern "C" fn afs_inquire_file(
@@ -2996,6 +3029,8 @@ pub extern "C" fn afs_inquire_file(
     formatted_buf_len: i64,
     unformatted_buf: *mut u8,
     unformatted_buf_len: i64,
+    leading_zero_buf: *mut u8,
+    leading_zero_buf_len: i64,
 ) {
     let fname = fortran_file_name(filename, filename_len);
 
@@ -3054,6 +3089,7 @@ pub extern "C" fn afs_inquire_file(
             unformatted_buf,
             unformatted_buf_len,
         );
+        write_leading_zero_capability(Some(u), leading_zero_buf, leading_zero_buf_len);
     } else {
         write_inquire_string(access_buf, access_buf_len, "UNDEFINED");
         write_inquire_string(form_buf, form_buf_len, "UNDEFINED");
@@ -3083,6 +3119,7 @@ pub extern "C" fn afs_inquire_file(
             unformatted_buf,
             unformatted_buf_len,
         );
+        write_leading_zero_capability(None, leading_zero_buf, leading_zero_buf_len);
     }
 
     // File size via metadata.
@@ -3136,6 +3173,8 @@ pub extern "C" fn afs_inquire_unit(
     formatted_buf_len: i64,
     unformatted_buf: *mut u8,
     unformatted_buf_len: i64,
+    leading_zero_buf: *mut u8,
+    leading_zero_buf_len: i64,
 ) {
     let state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     let unit_entry = state.units.get(&unit);
@@ -3188,6 +3227,7 @@ pub extern "C" fn afs_inquire_unit(
             unformatted_buf,
             unformatted_buf_len,
         );
+        write_leading_zero_capability(Some(u), leading_zero_buf, leading_zero_buf_len);
 
         if !size_out.is_null() {
             let sz = if !u.filename.is_empty() {
@@ -3231,6 +3271,7 @@ pub extern "C" fn afs_inquire_unit(
             unformatted_buf,
             unformatted_buf_len,
         );
+        write_leading_zero_capability(None, leading_zero_buf, leading_zero_buf_len);
         if !size_out.is_null() {
             unsafe {
                 *size_out = -1;
@@ -3448,7 +3489,7 @@ pub extern "C" fn afs_io_finalize() {
 //   afs_fmt_push_int(val) / afs_fmt_push_int128(&val) / afs_fmt_push_real(val) / ...
 //   afs_fmt_end()
 
-use crate::format::{parse_format, FormatDesc, FormatEngine, IoValue};
+use crate::format::{parse_format, FormatDesc, FormatEngine, IoValue, LeadingZeroMode};
 use std::cell::RefCell;
 
 enum FmtSink {
@@ -3464,6 +3505,11 @@ struct FmtContext {
     iostat: *mut i32,
     iomsg: *mut u8,
     iomsg_len: i64,
+    /// Per-statement LEADING_ZERO= override (F2023). When set it seeds the
+    /// format engine's leading-zero mode for this statement, beating the
+    /// connection-level mode; format LZ/LZS/LZP descriptors still override
+    /// it mid-string.
+    stmt_leading_zero: Option<LeadingZeroMode>,
 }
 
 // SAFETY: FmtContext only lives inside a thread-local; the raw
@@ -3508,6 +3554,7 @@ pub extern "C" fn afs_fmt_begin_ex(
             iostat,
             iomsg,
             iomsg_len,
+            stmt_leading_zero: None,
         });
     });
 }
@@ -3554,7 +3601,24 @@ pub extern "C" fn afs_fmt_begin_internal_ex(
             iostat,
             iomsg,
             iomsg_len,
+            stmt_leading_zero: None,
         });
+    });
+}
+
+/// Set the per-statement LEADING_ZERO= override for the in-flight
+/// formatted write. Called between `afs_fmt_begin*` and `afs_fmt_end`
+/// when the WRITE statement carries a LEADING_ZERO= specifier. The
+/// string is the specifier value (`'PRINT'`/`'SUPPRESS'`/
+/// `'PROCESSOR_DEFINED'`); it overrides the connection-level mode for
+/// this statement only.
+#[no_mangle]
+pub extern "C" fn afs_fmt_set_leading_zero(ptr: *const u8, len: i64) {
+    let mode = LeadingZeroMode::from_specifier(&unsafe_str(ptr, len));
+    FMT_CTX.with(|ctx| {
+        if let Some(ref mut c) = *ctx.borrow_mut() {
+            c.stmt_leading_zero = Some(mode);
+        }
     });
 }
 
@@ -3636,9 +3700,20 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
             let mut io_msg: Option<&'static str> = None;
 
             match c.sink {
-                FmtSink::Unit(unit) => match engine.format_values_reverting_checked(&c.values) {
+                FmtSink::Unit(unit) => {
+                    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+                    // Seed the leading-zero mode: the statement override
+                    // (LEADING_ZERO= on WRITE) beats the connection mode
+                    // (LEADING_ZERO= on OPEN); format LZ/LZS/LZP descriptors
+                    // still override mid-string via apply_descriptors.
+                    let conn_mode = state
+                        .units
+                        .get(&unit)
+                        .map(|u| u.leading_zero)
+                        .unwrap_or(LeadingZeroMode::Default);
+                    engine.set_leading_zero(c.stmt_leading_zero.unwrap_or(conn_mode));
+                    match engine.format_values_reverting_checked(&c.values) {
                     Ok(output) => {
-                        let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
                         if let Some(u) = state.get_unit(unit) {
                             if u.write_str(&output).is_err() {
                                 io_status = 1;
@@ -3657,8 +3732,12 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                         io_status = 1;
                         io_msg = Some("format error");
                     }
-                },
+                    }
+                }
                 FmtSink::Internal { buf, buf_len } => {
+                    if let Some(mode) = c.stmt_leading_zero {
+                        engine.set_leading_zero(mode);
+                    }
                     match engine.format_values_checked(&c.values) {
                         Ok(output) => {
                             write_to_buffer(
@@ -4687,6 +4766,8 @@ mod tests {
             newunit: std::ptr::null_mut(),
             position: "append".as_ptr(),
             position_len: 6,
+            leading_zero: std::ptr::null(),
+            leading_zero_len: 0,
         };
 
         afs_open(&cb);
@@ -4739,6 +4820,8 @@ mod tests {
             newunit: std::ptr::null_mut(),
             position: std::ptr::null(),
             position_len: 0,
+            leading_zero: std::ptr::null(),
+            leading_zero_len: 0,
         };
 
         afs_open(&cb);
@@ -4779,6 +4862,8 @@ mod tests {
             newunit: std::ptr::null_mut(),
             position: std::ptr::null(),
             position_len: 0,
+            leading_zero: std::ptr::null(),
+            leading_zero_len: 0,
         };
         afs_open(&write_cb);
         assert_eq!(iostat, 0, "expected stream OPEN for writing to succeed");
@@ -4847,6 +4932,8 @@ mod tests {
             newunit: std::ptr::null_mut(),
             position: std::ptr::null(),
             position_len: 0,
+            leading_zero: std::ptr::null(),
+            leading_zero_len: 0,
         };
 
         afs_open(&cb);
@@ -4858,6 +4945,101 @@ mod tests {
 
         let content = std::fs::read(&path).unwrap();
         assert_eq!(content, b"alpha", "stream default must be unformatted");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_leading_zero_connection_mode_and_inquire() {
+        // OPEN(...,LEADING_ZERO='SUPPRESS') seeds the connection mode; a
+        // plain (F6.3) write to that unit drops the leading zero. A WRITE
+        // statement override beats the connection mode; INQUIRE reads the
+        // connection's current mode back.
+        let path = format!(
+            "/tmp/afs_lz_conn_{}_{}.txt",
+            std::process::id(),
+            line!()
+        );
+        let _ = std::fs::remove_file(&path);
+        let mut iostat = -99i32;
+        let cb = OpenControlBlock {
+            unit: 821,
+            filename: path.as_ptr(),
+            filename_len: path.len() as i64,
+            status: "replace".as_ptr(),
+            status_len: 7,
+            action: "write".as_ptr(),
+            action_len: 5,
+            access: std::ptr::null(),
+            access_len: 0,
+            form: std::ptr::null(),
+            form_len: 0,
+            recl: 0,
+            iostat: &mut iostat,
+            newunit: std::ptr::null_mut(),
+            position: std::ptr::null(),
+            position_len: 0,
+            leading_zero: "SUPPRESS".as_ptr(),
+            leading_zero_len: 8,
+        };
+        afs_open(&cb);
+        assert_eq!(iostat, 0, "expected formatted OPEN to succeed");
+
+        // INQUIRE reads back the connection mode.
+        let mut lz = [b'?'; 16];
+        afs_inquire_unit(
+            821,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            lz.as_mut_ptr(),
+            lz.len() as i64,
+        );
+        assert_eq!(&lz[..8], b"SUPPRESS");
+
+        // Connection mode applies to a plain format with no LZ descriptor.
+        afs_fmt_begin(821, "(F6.3)".as_ptr(), 6);
+        afs_fmt_push_real(0.25);
+        afs_fmt_end(1);
+
+        // Statement override (PRINT) beats the SUPPRESS connection mode.
+        afs_fmt_begin(821, "(F6.3)".as_ptr(), 6);
+        afs_fmt_set_leading_zero("PRINT".as_ptr(), 5);
+        afs_fmt_push_real(0.25);
+        afs_fmt_end(1);
+
+        afs_close(821, &mut iostat);
+        assert_eq!(iostat, 0, "expected close to succeed");
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines[0].trim(), ".250", "connection SUPPRESS drops zero");
+        assert_eq!(lines[1].trim(), "0.250", "statement PRINT keeps zero");
         let _ = std::fs::remove_file(&path);
     }
 
