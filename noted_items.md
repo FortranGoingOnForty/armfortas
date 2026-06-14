@@ -132,9 +132,30 @@ Found while unblocking l02's CI (2026-06-10, all pre-existing on trunk):
   internal procedures also exposed a name-mangling mismatch (`<main>`
   scope vs `main` lowering prefix) — aligned. Fixture
   `l02_bare_main_contains.f90`.
-- Standalone attribute statements are not parsed: `allocatable :: g`
-  (allocatable function result, gfortran-dg conditional_8.f90), and
-  presumably the pointer/target forms. Parse error today.
+- Standalone attribute statements (`allocatable :: x`, `pointer :: p`,
+  `target :: t`; gfortran-dg conditional_8.f90) are not parsed — clean
+  parse error today. (l02a item 6, deferred 2026-06-14.) This is NOT just
+  a parser gap: a prototype that parses them and applies the attribute to
+  the symbol surfaced two deeper problems.
+  1. The attribute must reach LOWERING's storage decision, not only the
+     symbol attrs. Lowering builds a variable's allocatable/pointer storage
+     from the owning `Decl::TypeDecl`'s attrs at several independent sites
+     (module-global setup ~core.rs:3421, the local-var path, plus the many
+     `decl_is_allocatable`/inline `attrs.contains(Allocatable)` checks).
+     Setting `sym.attrs.allocatable` post-hoc makes use-sites disagree with
+     the storage shape → `IR verify: store ptr<i32> vs pointee i32`.
+     `EntityDecl` has no per-entity attrs, so the attribute can't be folded
+     into the AST when a TypeDecl declares several names. A correct fix
+     needs either per-entity AST attrs threaded through every storage site,
+     or making the storage build read per-entity SYMBOL attrs. Broad.
+  2. SAVE-as-a-statement (`save :: c`) is the same latent bug: it parses to
+     `Decl::AttributeStmt` but is applied nowhere, so the SAVE never takes
+     effect (a var saved via the statement form does not persist). Fixing
+     the general AttributeStmt→storage path fixes SAVE too.
+  Separately, allocatable SCALAR function results SEGV when called even via
+  the inline `result()` form (`integer, allocatable :: r`; exit 139) — a
+  pre-existing allocatable-result ABI gap, independent of the parser.
+  conditional_8 keeps its XFAIL.
 
 Found during x08's differential/coverage work (2026-06-11, both
 pre-existing on all targets, both now sema-rejected loudly, owned by
