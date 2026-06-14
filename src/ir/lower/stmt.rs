@@ -1988,6 +1988,38 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             };
 
             if let Some(ctrl) = controls.first() {
+                // Formatted internal WRITE to a deferred-length allocatable
+                // `character(:), allocatable` scalar: reallocate the target
+                // to the record length (F2008/F2018). List-directed to such
+                // a target stays on the fixed-buffer path below.
+                if !is_list_directed {
+                    if let Some(desc) = internal_io_alloc_target(b, ctx, ctrl) {
+                        let (fmt_ptr, fmt_len) = lower_string_expr_with_layouts(
+                            b,
+                            &ctx.locals,
+                            &fmt_control.unwrap().value,
+                            ctx.st,
+                            Some(ctx.type_layouts),
+                        );
+                        b.call(
+                            FuncRef::External("afs_fmt_begin_internal_alloc".into()),
+                            vec![desc, fmt_ptr, fmt_len, iostat_ptr, iomsg_ptr, iomsg_len],
+                            IrType::Void,
+                        );
+                        lower_fmt_leading_zero_override(b, ctx, leading_zero_ctrl);
+                        for item in items {
+                            lower_fmt_push(b, ctx, item);
+                        }
+                        let adv = advance_runtime
+                            .unwrap_or_else(|| b.const_i32(if advance { 1 } else { 0 }));
+                        b.call(
+                            FuncRef::External("afs_fmt_end".into()),
+                            vec![adv],
+                            IrType::Void,
+                        );
+                        return;
+                    }
+                }
                 if let Some((buf_ptr, buf_len)) = internal_io_buffer(b, ctx, ctrl) {
                     if is_list_directed {
                         lower_internal_write_items(b, ctx, items, buf_ptr, buf_len);
