@@ -44,11 +44,12 @@ Deferred items from the l00 F2023 inventory (2026-06-10):
   `'(lzs, f6.2)'` printed nothing, both exit 0 (nomad, 2026-06-10).
   Bites typo'd formats today; l05 makes unknown descriptors a runtime
   error as part of the AT/LZ work.
-- F2023-syntax collisions producing silent wrong answers today (accepted
-  and mis-lowered, garbage at runtime): `real :: a([2,3])` (R818),
-  `allocate(x([2,3]))` (R937), pointer rank-remapping with array bounds.
-  Details in `.docs/audits/f2023-feature-matrix.md`; owned by l01 —
-  until then these spellings corrupt silently rather than erroring.
+- F2023-syntax collision producing silent wrong answers today (accepted
+  and mis-lowered, garbage at runtime): `real :: a([2,3])` (R818, an
+  array-constructor bound in a type declaration). Details in
+  `.docs/audits/f2023-feature-matrix.md`. The ALLOCATE (R937) and
+  pointer-remap array-constructor forms are now lowered (l02a items 1+2);
+  R818 in declarations is still open.
 
 Resolved during x06 (kept as a lesson for x07's parity sweep):
 
