@@ -41574,6 +41574,47 @@ fn default_cmplx_array_assignment_converts_lanes_to_complex_dp() {
 }
 
 #[test]
+fn complex_dp_row_section_real_constructor_materializes_lanes() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=complex_dp_row_section_real_constructor_materializes_lanes count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // Stdlib's complex(dp) linalg tests initialize matrices with repeated
+    // row-section assignments from real constructors. The rank-reduced
+    // multi-dimensional section path must materialize each real source
+    // element as a full complex(dp) value before copying it into the row.
+    let src = write_program(
+        "program p\n  implicit none\n  integer, parameter :: dp = kind(0.0d0)\n  complex(dp) :: a(3,3)\n  a(1,:) = [6.0_dp, 15.0_dp, 55.0_dp]\n  a(2,:) = [15.0_dp, 55.0_dp, 225.0_dp]\n  a(3,:) = [55.0_dp, 225.0_dp, 979.0_dp]\n  if (abs(real(a(1,1), kind=dp) - 6.0_dp) > 1.0d-12) error stop 1\n  if (abs(real(a(2,1), kind=dp) - 15.0_dp) > 1.0d-12) error stop 2\n  if (abs(real(a(3,1), kind=dp) - 55.0_dp) > 1.0d-12) error stop 3\n  if (abs(real(a(1,2), kind=dp) - 15.0_dp) > 1.0d-12) error stop 4\n  if (abs(real(a(2,2), kind=dp) - 55.0_dp) > 1.0d-12) error stop 5\n  if (abs(real(a(3,2), kind=dp) - 225.0_dp) > 1.0d-12) error stop 6\n  if (abs(real(a(1,3), kind=dp) - 55.0_dp) > 1.0d-12) error stop 7\n  if (abs(real(a(2,3), kind=dp) - 225.0_dp) > 1.0d-12) error stop 8\n  if (abs(real(a(3,3), kind=dp) - 979.0_dp) > 1.0d-12) error stop 9\n  if (maxval(abs(aimag(a))) > 1.0d-12) error stop 10\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("complex_dp_row_section_real_ctor", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("complex row section compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "complex row section compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("complex row section run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "complex row section run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn elemental_character_array_swap_and_constructor_equality_runs() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

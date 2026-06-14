@@ -38722,8 +38722,10 @@ pub(super) fn lower_vector_subscript_section_assign(
             src_off = b.iadd(src_off, stride_bytes);
         }
         let src_ptr = b.gep(src_base, vec![src_off], IrType::Int(IntWidth::I8));
-        if is_complex_ty(&elem_ty) && is_complex_ty(src_ty) {
-            let src_ptr = if complex_float_width(src_ty) == complex_float_width(&elem_ty) {
+        if is_complex_ty(&elem_ty) {
+            let src_ptr = if is_complex_ty(src_ty)
+                && complex_float_width(src_ty) == complex_float_width(&elem_ty)
+            {
                 src_ptr
             } else {
                 let raw = b.load_typed(src_ptr, src_ty.clone());
@@ -38908,8 +38910,10 @@ pub(super) fn lower_multi_d_section_assign(
             src_off = b.iadd(src_off, stride_bytes);
         }
         let src_ptr = b.gep(src_base, vec![src_off], IrType::Int(IntWidth::I8));
-        if is_complex_ty(&elem_ty) && is_complex_ty(src_ty) {
-            let src_ptr = if complex_float_width(src_ty) == complex_float_width(&elem_ty) {
+        if is_complex_ty(&elem_ty) {
+            let src_ptr = if is_complex_ty(src_ty)
+                && complex_float_width(src_ty) == complex_float_width(&elem_ty)
+            {
                 src_ptr
             } else {
                 let raw = b.load_typed(src_ptr, src_ty.clone());
