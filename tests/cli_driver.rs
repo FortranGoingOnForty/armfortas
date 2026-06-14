@@ -33868,6 +33868,46 @@ fn bit_manipulation_intrinsics_lower_inline() {
 }
 
 #[test]
+fn small_integer_bit_intrinsics_use_declared_width() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=small_integer_bit_intrinsics_use_declared_width count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // stdlib_distribution_uniform's int8/int16 paths rely on logical
+    // shifts and bit counts over the declared kind width. AArch64 carries
+    // small signed integers in sign-filled registers, so these intrinsics
+    // must mask to the Fortran bit width before doing unsigned operations.
+    let src = write_program(
+        "program p\n  use iso_fortran_env, only: int8, int16\n  implicit none\n  integer(int8) :: m8\n  integer(int16) :: m16\n  m8 = shiftr(not(0_int8), 1)\n  m16 = shiftr(not(0_int16), 1)\n  if (leadz(100_int8) /= 1) error stop 1\n  if (leadz(100_int16) /= 9) error stop 2\n  if (trailz(0_int8) /= 8) error stop 3\n  if (trailz(0_int16) /= 16) error stop 4\n  if (popcnt(not(0_int8)) /= 8) error stop 5\n  if (popcnt(not(0_int16)) /= 16) error stop 6\n  if (m8 /= 127_int8) error stop 7\n  if (m16 /= 32767_int16) error stop 8\n  if (.not. btest(not(0_int8), 7)) error stop 9\n  if (ibits(not(0_int16), 8, 8) /= 255_int16) error stop 10\n  if (ishft(not(0_int8), -1) /= 127_int8) error stop 11\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("small_integer_bit_intrinsics", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        compile.status.success(),
+        "small integer bit intrinsics should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("failed to run binary");
+    assert!(
+        run.status.success(),
+        "small integer bit intrinsics should run cleanly:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok output, got: {}", stdout);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn scalar_intrinsic_arguments_use_runtime_values_not_dispatch_probes() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
