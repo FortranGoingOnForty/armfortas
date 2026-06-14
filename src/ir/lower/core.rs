@@ -17161,7 +17161,8 @@ pub(super) fn emit_named_function_call(
         let value = match &arg.value {
             crate::ast::expr::SectionSubscript::Element(e) => {
                 let wants_descriptor = (mask_wants_descriptor
-                    || actual_is_descriptor_backed(locals, e, st, type_layouts))
+                    || (callee_descriptor_args.is_none()
+                        && actual_is_descriptor_backed(locals, e, st, type_layouts)))
                     && !wants_bind_c_char;
                 let wants_polymorphic_descriptor = wants_descriptor && dummy_is_class;
                 let value = if is_value && wants_bind_c_char {
@@ -46547,7 +46548,7 @@ pub(super) fn lower_arg_by_ref_full(
                     };
                     return b.load_typed(caller_slot, pointee_ty);
                 }
-                if info.descriptor_arg {
+                if info.descriptor_arg || local_uses_array_descriptor(info) {
                     return array_data_ptr_for_call(b, info);
                 }
                 // Already a pointer to caller's storage — load and pass it.

@@ -2805,11 +2805,14 @@ pub(crate) fn lower_expr_full(
                                                 // Fallback: if the lookup missed
                                                 // (abstract iface not in
                                                 // descriptor_params), inspect the
-                                                // actual itself. A descriptor-
-                                                // backed local must be passed by
-                                                // descriptor regardless.
-                                                let actual_uses_descriptor =
-                                                    actual_is_descriptor_backed(
+                                                // actual itself. When the callee
+                                                // mask is present and says this
+                                                // slot is raw by-ref storage, a
+                                                // descriptor-backed actual still
+                                                // passes its payload base.
+                                                let actual_uses_descriptor = callee_descriptor_args
+                                                    .is_none()
+                                                    && actual_is_descriptor_backed(
                                                         locals,
                                                         e,
                                                         st,

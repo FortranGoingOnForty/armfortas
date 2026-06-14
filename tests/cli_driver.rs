@@ -41871,6 +41871,50 @@ fn random_number_on_array_fills_every_element() {
 }
 
 #[test]
+fn array_result_local_passed_to_by_ref_dummy_uses_base_addr() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=array_result_local_passed_to_by_ref_dummy_uses_base_addr count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // An explicit-shape array function result is descriptor-backed inside
+    // the function body. Passing that result variable to an ordinary
+    // fixed-shape by-ref dummy must pass the payload base address, not the
+    // hidden result descriptor address. The stdlib Spooky hash int8 path
+    // hit this as `call spookyhash_128(key, hash_code)`: the callee wrote
+    // through `hash_code(1)` into descriptor word 0 and corrupted base_addr.
+    let src = write_program(
+        "module m\ncontains\n  function pair_from_bytes(x, seed) result(hash_code)\n    integer(1), intent(in) :: x(:)\n    integer(8), intent(in) :: seed(2)\n    integer(8) :: hash_code(2)\n    hash_code(:) = seed\n    call mix_bytes(x, hash_code)\n  end function\n  subroutine mix_bytes(key, hash_inout)\n    integer(1), intent(in), target :: key(0:)\n    integer(8), intent(inout) :: hash_inout(2)\n    hash_inout(1) = hash_inout(1) + size(key, kind=8)\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  integer(1) :: bytes(4)\n  integer(8) :: seed(2)\n  integer(8) :: hash(2)\n  bytes = [1_1, 2_1, 3_1, 4_1]\n  seed = [10_8, 20_8]\n  hash = pair_from_bytes(bytes(2:3), seed)\n  print *, hash(1), hash(2)\nend program\n",
+        "f90",
+    );
+    let out = unique_path("array_result_by_ref_dummy_base", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("array result by-ref dummy compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "array result by-ref dummy compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("array result by-ref dummy run failed");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        run.status.success() && stdout.contains("12 20"),
+        "array result by-ref dummy run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        stdout,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn allocatable_array_component_passed_to_assumed_size_unwraps_descriptor() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

@@ -2567,12 +2567,13 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                            e: &crate::ast::expr::SpannedExpr|
                                      -> ValueId {
                                     let wants_descriptor = (mask_wants_descriptor
-                                        || actual_is_descriptor_backed(
-                                            &ctx.locals,
-                                            e,
-                                            ctx.st,
-                                            Some(ctx.type_layouts),
-                                        ))
+                                        || (desc_mask.is_none()
+                                            && actual_is_descriptor_backed(
+                                                &ctx.locals,
+                                                e,
+                                                ctx.st,
+                                                Some(ctx.type_layouts),
+                                            )))
                                         && !wants_bind_c_char;
                                     let value = if is_value && wants_bind_c_char {
                                         lower_bind_c_char_value_arg(
@@ -2906,12 +2907,13 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                            e: &crate::ast::expr::SpannedExpr|
                                      -> ValueId {
                                     let wants_descriptor = (mask_wants_descriptor
-                                        || actual_is_descriptor_backed(
-                                            &ctx.locals,
-                                            e,
-                                            ctx.st,
-                                            Some(ctx.type_layouts),
-                                        ))
+                                        || (desc_mask.is_none()
+                                            && actual_is_descriptor_backed(
+                                                &ctx.locals,
+                                                e,
+                                                ctx.st,
+                                                Some(ctx.type_layouts),
+                                            )))
                                         && !wants_bind_c_char;
                                     let wants_polymorphic_descriptor =
                                         wants_descriptor && dummy_is_class;
