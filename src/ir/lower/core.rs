@@ -17197,6 +17197,60 @@ pub(super) fn resolve_polymorphic_component_method_base_for_dispatch(
                 b.load_typed(desc_addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
             Some((desc_addr, obj_addr, base_type))
         }
+        // `arr(i)%method()`: dispatch on a polymorphic array element. The
+        // array descriptor carries the dynamic type's tag and vtable
+        // pointer (populated at ALLOCATE — a polymorphic array's elements
+        // share one dynamic type). Synthesize a scalar polymorphic
+        // descriptor view of the element that inherits them, so dispatch
+        // resolves to the runtime type rather than the declared one.
+        Expr::FunctionCall { callee, args } => {
+            let Expr::Name { name } = &callee.node else {
+                return None;
+            };
+            // Only plain element subscripts — a section `arr(1:3)%m()` is
+            // not a single dispatch.
+            if !args.iter().all(|a| {
+                matches!(a.value, crate::ast::expr::SectionSubscript::Element(_))
+            }) {
+                return None;
+            }
+            let key = name.to_lowercase();
+            let info = locals.get(&key)?;
+            if !info.is_class || !local_uses_array_descriptor(info) {
+                return None;
+            }
+            let proc_scope_id = callee_scope_id_for_lookup(st, b.func().name.as_str());
+            let type_info = proc_scope_id
+                .and_then(|scope_id| st.lookup_in(scope_id, &key))
+                .and_then(|sym| sym.type_info.as_ref())
+                .or_else(|| st.lookup(&key).and_then(|sym| sym.type_info.as_ref()))
+                .or_else(|| {
+                    st.find_symbol_any_scope(&key)
+                        .and_then(|sym| sym.type_info.as_ref())
+                });
+            let base_type = match type_info {
+                Some(crate::sema::symtab::TypeInfo::Class(base_type)) => {
+                    canonical_layout_type_name_for_scope(st, proc_scope_id, base_type, tl)
+                        .or_else(|| Some(base_type.clone()))?
+                }
+                _ => info.derived_type.clone()?,
+            };
+            let arr_desc = array_descriptor_addr(b, info);
+            let elem_addr = lower_array_element_addr(b, locals, info, args, st, Some(tl));
+            let elem_size = load_array_desc_i64_field(b, arr_desc, 8);
+            let tag = load_array_desc_type_tag(b, arr_desc);
+            let vtable = load_array_desc_vtable_ptr(b, arr_desc);
+            let view = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+            store_scalar_polymorphic_descriptor_view(
+                b,
+                view,
+                elem_addr,
+                Some(elem_size),
+                Some(tag),
+                Some(vtable),
+            );
+            Some((view, elem_addr, base_type))
+        }
         _ => None,
     }
 }

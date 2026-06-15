@@ -4041,7 +4041,11 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     );
                                 }
                             }
-                            if rank == 0 {
+                            // Polymorphic metadata (tag + vtable) for both
+                            // scalars and arrays; a polymorphic array
+                            // component's elements share one dynamic type.
+                            // Derived default-init below stays scalar-only.
+                            {
                                 let field_type_name = field_derived_type_name(&field);
                                 let type_tag = if source_desc.is_some() {
                                     None
@@ -4134,7 +4138,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 let copied_from_source = source_desc.is_some()
                                     || source_scalar_desc.is_some()
                                     || source_expr.is_some();
-                                if !copied_from_source {
+                                if !copied_from_source && rank == 0 {
                                     if let Some(layout) = dynamic_layout {
                                         let base_ptr = b.load_typed(
                                             field_ptr,
@@ -4420,7 +4424,15 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     );
                                 }
                             }
-                            if rank == 0 {
+                            // Polymorphic metadata (dynamic type tag and
+                            // vtable pointer) is set for both scalars and
+                            // arrays — a polymorphic array's elements share
+                            // one dynamic type, so one tag + table pointer
+                            // in the descriptor serves every element-wise
+                            // TBP dispatch. (Derived default-init below
+                            // stays scalar-only; whole-array element init is
+                            // a separate concern.)
+                            {
                                 let type_tag = if source_desc.is_some() {
                                     None
                                 } else if let Some(source_expr) = source_expr {
@@ -4512,7 +4524,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 let copied_from_source = source_desc.is_some()
                                     || source_scalar_desc.is_some()
                                     || source_expr.is_some();
-                                if !copied_from_source {
+                                if !copied_from_source && rank == 0 {
                                     if let Some(layout) = dynamic_layout {
                                         let base_ptr = b.load_typed(
                                             desc,
