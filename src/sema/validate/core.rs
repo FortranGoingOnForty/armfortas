@@ -788,6 +788,15 @@ fn validate_stmt_enum_usage(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
             let Expr::Name { name } = &callee.node else {
                 return;
             };
+            if name.eq_ignore_ascii_case("c_f_strpointer") {
+                validate_c_f_strpointer(ctx, args);
+                // Intrinsic — no user subroutine scope to walk below.
+                return;
+            }
+            if name.eq_ignore_ascii_case("c_f_pointer") {
+                validate_c_f_pointer(ctx, args);
+                return;
+            }
             let Some(arg_names) = ctx.lookup(name).and_then(|sym| {
                 matches!(sym.kind, crate::sema::symtab::SymbolKind::Subroutine)
                     .then(|| sym.arg_names.clone())
@@ -900,6 +909,169 @@ fn validate_stmt_enum_usage(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
 /// expression with a range subscript). Conservative — anything it
 /// misses is caught by the same garbage-descriptor class this guards,
 /// so keep it in sync with the lowering when array merges land.
+/// F2023 18.2.3.5 constraints on `CALL C_F_STRPOINTER(...)`. FSTRPTR must
+/// be a deferred-length character pointer; NCHARS is required when the
+/// source is a `type(c_ptr)` (the byte count cannot be inferred otherwise).
+/// Only flags positively-determined violations — an unresolved actual is
+/// left for the general resolver, never a false positive here.
+fn validate_c_f_strpointer(ctx: &mut Ctx<'_>, args: &[crate::ast::expr::Argument]) {
+    use crate::ast::expr::SectionSubscript;
+
+    fn arg<'a>(
+        args: &'a [crate::ast::expr::Argument],
+        kw: &str,
+        pos: usize,
+    ) -> Option<&'a crate::ast::expr::SpannedExpr> {
+        if let Some(a) = args
+            .iter()
+            .find(|a| a.keyword.as_deref().is_some_and(|k| k.eq_ignore_ascii_case(kw)))
+        {
+            if let SectionSubscript::Element(e) = &a.value {
+                return Some(e);
+            }
+        }
+        args.iter()
+            .filter(|a| a.keyword.is_none())
+            .nth(pos)
+            .and_then(|a| match &a.value {
+                SectionSubscript::Element(e) => Some(e),
+                _ => None,
+            })
+    }
+
+    let src = arg(args, "cstrarray", 0).or_else(|| arg(args, "cstrptr", 0));
+    let fstrptr = arg(args, "fstrptr", 1);
+    let nchars_present = arg(args, "nchars", 2).is_some();
+
+    // FSTRPTR must be a character pointer (deferred-length, kind=c_char).
+    if let Some(f) = fstrptr {
+        if let Expr::Name { name } = &f.node {
+            if let Some(sym) = ctx.lookup(name) {
+                let is_char = matches!(sym.type_info, Some(TypeInfo::Character { .. }));
+                let is_ptr = sym.attrs.pointer;
+                if !(is_char && is_ptr) {
+                    ctx.error(
+                        f.span,
+                        format!(
+                            "C_F_STRPOINTER: FSTRPTR ('{name}') must be a deferred-length \
+                             character (kind=c_char) pointer (F2023 18.2.3.5)"
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    // NCHARS is required when the source is a c_ptr: a scalar address has no
+    // size, so the length cannot be bounded without it.
+    if let Some(s) = src {
+        if let Expr::Name { name } = &s.node {
+            if let Some(sym) = ctx.lookup(name) {
+                let is_cptr = matches!(
+                    &sym.type_info,
+                    Some(TypeInfo::Derived(n)) if n.eq_ignore_ascii_case("c_ptr")
+                );
+                if is_cptr && !nchars_present {
+                    ctx.error(
+                        s.span,
+                        "C_F_STRPOINTER: NCHARS is required when the source is a \
+                         type(c_ptr) (F2023 18.2.3.5)"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// F2023 C_F_POINTER LOWER constraints (gfortran.dg/c_f_pointer_shape_tests_8):
+/// the optional LOWER argument must be INTEGER and rank 1, and its size must
+/// match SHAPE. Only positively-determined violations are flagged.
+fn validate_c_f_pointer(ctx: &mut Ctx<'_>, args: &[crate::ast::expr::Argument]) {
+    use crate::ast::expr::SectionSubscript;
+
+    fn arg<'a>(
+        args: &'a [crate::ast::expr::Argument],
+        kw: &str,
+        pos: usize,
+    ) -> Option<&'a crate::ast::expr::SpannedExpr> {
+        if let Some(a) = args
+            .iter()
+            .find(|a| a.keyword.as_deref().is_some_and(|k| k.eq_ignore_ascii_case(kw)))
+        {
+            if let SectionSubscript::Element(e) = &a.value {
+                return Some(e);
+            }
+        }
+        args.iter()
+            .filter(|a| a.keyword.is_none())
+            .nth(pos)
+            .and_then(|a| match &a.value {
+                SectionSubscript::Element(e) => Some(e),
+                _ => None,
+            })
+    }
+
+    // Static rank of an actual: array constructor → 1, named array → its
+    // declared rank. None when not determinable.
+    fn rank_of(ctx: &Ctx<'_>, e: &crate::ast::expr::SpannedExpr) -> Option<usize> {
+        match &e.node {
+            Expr::ArrayConstructor { .. } => Some(1),
+            Expr::Name { name } => ctx.lookup(name).map(|s| s.attrs.array_spec.len()),
+            _ => None,
+        }
+    }
+    // Static element count of a rank-1 actual. Only inline constructors give a
+    // sound compile-time count without const-evaluating declared bounds; named
+    // arrays return None and skip the conformance check (no false positives).
+    fn static_len(_ctx: &Ctx<'_>, e: &crate::ast::expr::SpannedExpr) -> Option<usize> {
+        match &e.node {
+            Expr::ArrayConstructor { values, .. } => Some(values.len()),
+            _ => None,
+        }
+    }
+
+    let shape = arg(args, "shape", 2);
+    let Some(lower) = arg(args, "lower", 3) else {
+        return; // LOWER absent — nothing to check.
+    };
+
+    // LOWER must be INTEGER.
+    let lower_ty = crate::sema::types::expr_type(lower, ctx.st);
+    if !matches!(lower_ty, crate::sema::types::FortranType::Integer { .. }) {
+        ctx.error(
+            lower.span,
+            "C_F_POINTER LOWER argument must be of type INTEGER (F2023)".to_string(),
+        );
+    }
+
+    // LOWER must be rank 1.
+    if let Some(r) = rank_of(ctx, lower) {
+        if r != 1 {
+            ctx.error(
+                lower.span,
+                format!("C_F_POINTER LOWER argument must be of rank 1, not rank {r} (F2023)"),
+            );
+        }
+    }
+
+    // LOWER size must match SHAPE size (conformance).
+    if let (Some(s), Some(l)) = (
+        shape.and_then(|s| static_len(ctx, s)),
+        static_len(ctx, lower),
+    ) {
+        if s != l {
+            ctx.error(
+                lower.span,
+                format!(
+                    "C_F_POINTER LOWER has {l} element(s) but SHAPE has {s}; \
+                     they must conform (F2023)"
+                ),
+            );
+        }
+    }
+}
+
 /// True if a conditional actual argument has a `.NIL.` arm anywhere in its
 /// (possibly chained) conditional tree. Such an argument selects the absent
 /// association, which F2023 C1525 permits only for an OPTIONAL dummy.
@@ -2015,9 +2187,10 @@ fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
             // Character VALUE dummies are not lowered with copy-in
             // semantics yet: the callee receives the caller's storage
             // pointer, so mutation corrupts the caller (or SEGVs on a
-            // literal actual). Found by x08's VALUE coverage; owned by
-            // l06. BIND(C) procedures are exempt: their c_char VALUE
-            // dummies take the working byte-copy path.
+            // literal actual). Correct lowering is a dedicated
+            // calling-convention effort (see noted_items.md, "CHARACTER
+            // VALUE copy-in"). BIND(C) procedures are exempt: their
+            // c_char VALUE dummies take the working byte-copy path.
             if attrs.iter().any(|a| matches!(a, Attribute::Value))
                 && matches!(type_spec, crate::ast::decl::TypeSpec::Character(_))
                 && !ctx.in_bind_c_unit
@@ -2025,7 +2198,7 @@ fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
                 ctx.error(
                     decl.span,
                     "the VALUE attribute on CHARACTER dummies is not supported yet \
-                     (copy-in lowering lands with the C-interop string work)",
+                     (copy-in lowering is a separate calling-convention change)",
                 );
             }
 
@@ -2181,32 +2354,10 @@ fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
             ctx.require_std(decl.span, FortranStandard::F2023, "ENUMERATION TYPE");
         }
 
-        if let Decl::CommonBlock { vars, .. } = &decl.node {
+        if let Decl::CommonBlock { .. } = &decl.node {
             warn_legacy_feature(ctx, decl.span, "COMMON block");
-            // Character members are not lowered with storage-
-            // association semantics: the member became a POINTER slot
-            // holding the string's address instead of inline bytes,
-            // and reads passed length 0 — silently empty on every
-            // target (found by x08's cross-TU COMMON test; owned by
-            // l06 alongside the string-representation work).
-            for var in vars {
-                let is_char = ctx.lookup(var).is_some_and(|sym| {
-                    matches!(
-                        sym.type_info,
-                        Some(crate::sema::symtab::TypeInfo::Character { .. })
-                    )
-                });
-                if is_char {
-                    ctx.error(
-                        decl.span,
-                        format!(
-                            "character member '{}' in a COMMON block is not supported \
-                             yet (storage association needs inline character bytes)",
-                            var
-                        ),
-                    );
-                }
-            }
+            // Character members now lower with inline-byte storage
+            // (fixed-length); storage association works. See l06.
         }
 
         if matches!(decl.node, Decl::EquivalenceStmt { .. }) {
@@ -3578,6 +3729,7 @@ pub fn is_intrinsic_name(name: &str) -> bool {
         "execute_command_line" | "compiler_version" | "compiler_options" |
         "is_iostat_end" | "is_iostat_eor" |
         "c_loc" | "c_funloc" | "c_f_pointer" | "c_associated" | "c_sizeof" |
+        "c_f_strpointer" | "f_c_string" |
         "ieee_is_nan" | "ieee_is_finite" | "ieee_value" |
         "ieee_support_datatype" | "ieee_support_denormal" |
         "ieee_selected_real_kind" |

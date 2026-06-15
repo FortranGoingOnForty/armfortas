@@ -1070,6 +1070,11 @@ pub fn intrinsic_result_type(name: &str, args: &[FortranType]) -> Option<Fortran
             kind: 1,
             len: CharLen::Unknown,
         }),
+        // F2023 F_C_STRING: deferred-length c_char result (TRIM//NUL).
+        "f_c_string" => Some(FortranType::Character {
+            kind: 1,
+            len: CharLen::Deferred,
+        }),
         "char" | "achar" => Some(FortranType::Character {
             kind: 1,
             len: CharLen::Known(1),

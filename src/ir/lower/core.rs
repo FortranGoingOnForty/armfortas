@@ -212,7 +212,7 @@ pub fn lower_file(
     // Audit6 BLOCKING-2.
     let mut emitted_common: HashSet<String> = HashSet::new();
     for unit in units {
-        collect_and_emit_common_globals(&unit.node, &mut module, &mut emitted_common);
+        collect_and_emit_common_globals(&unit.node, &mut module, &mut emitted_common, st);
     }
 
     // Pass 1.7: collect optional-parameter bitmaps for every subroutine/function.
@@ -1969,10 +1969,28 @@ pub(super) fn common_slot_symbol(block: &str, slot_idx: usize) -> String {
     format!("afs_common_{}_{}", block, slot_idx)
 }
 
+/// The IR storage type and char kind for a COMMON member. Character
+/// members need inline byte storage (`[i8 x N]`) so storage association
+/// works — a plain `arg_type_from_decls` would give `Ptr<i8>`, i.e. an
+/// 8-byte pointer slot, and every read came back length 0 (silently
+/// empty). Mirrors a normal fixed-length character local.
+pub(super) fn common_member_storage(
+    var: &str,
+    decls: &[crate::ast::decl::SpannedDecl],
+    st: &SymbolTable,
+) -> (IrType, CharKind) {
+    let key = var.to_lowercase();
+    match arg_char_kind_from_decls(&key, decls, st) {
+        CharKind::Fixed(len) => (fixed_char_storage_ir_type(len), CharKind::Fixed(len)),
+        _ => (arg_type_from_decls(&key, decls, Some(st)), CharKind::None),
+    }
+}
+
 pub(super) fn collect_and_emit_common_globals(
     unit: &ProgramUnit,
     module: &mut Module,
     emitted: &mut HashSet<String>,
+    st: &SymbolTable,
 ) {
     use crate::ast::decl::Decl;
     let emit_for_decls = |decls: &[crate::ast::decl::SpannedDecl],
@@ -1987,7 +2005,7 @@ pub(super) fn collect_and_emit_common_globals(
                         continue;
                     }
                     emitted.insert(symbol.clone());
-                    let elem_ty = arg_type_from_decls(&var.to_lowercase(), decls, None);
+                    let (elem_ty, _) = common_member_storage(var, decls, st);
                     module.add_global(Global {
                         name: symbol,
                         ty: elem_ty,
@@ -2003,7 +2021,7 @@ pub(super) fn collect_and_emit_common_globals(
         } => {
             emit_for_decls(decls, module, emitted);
             for sub in contains {
-                collect_and_emit_common_globals(&sub.node, module, emitted);
+                collect_and_emit_common_globals(&sub.node, module, emitted, st);
             }
         }
         ProgramUnit::Subroutine {
@@ -2011,7 +2029,7 @@ pub(super) fn collect_and_emit_common_globals(
         } => {
             emit_for_decls(decls, module, emitted);
             for sub in contains {
-                collect_and_emit_common_globals(&sub.node, module, emitted);
+                collect_and_emit_common_globals(&sub.node, module, emitted, st);
             }
         }
         ProgramUnit::Function {
@@ -2019,7 +2037,7 @@ pub(super) fn collect_and_emit_common_globals(
         } => {
             emit_for_decls(decls, module, emitted);
             for sub in contains {
-                collect_and_emit_common_globals(&sub.node, module, emitted);
+                collect_and_emit_common_globals(&sub.node, module, emitted, st);
             }
         }
         _ => {}
@@ -2035,6 +2053,7 @@ pub(super) fn install_common_locals(
     b: &mut FuncBuilder,
     locals: &mut HashMap<String, LocalInfo>,
     decls: &[crate::ast::decl::SpannedDecl],
+    st: &SymbolTable,
 ) {
     use crate::ast::decl::Decl;
     for decl in decls {
@@ -2046,7 +2065,7 @@ pub(super) fn install_common_locals(
                     continue;
                 }
                 let symbol = common_slot_symbol(&block_name, slot_idx);
-                let elem_ty = arg_type_from_decls(&key, decls, None);
+                let (elem_ty, char_kind) = common_member_storage(&key, decls, st);
                 let addr = b.global_addr(&symbol, elem_ty.clone());
                 locals.insert(
                     key,
@@ -2057,7 +2076,7 @@ pub(super) fn install_common_locals(
                         allocatable: false,
                         descriptor_arg: false,
                         by_ref: false,
-                        char_kind: CharKind::None,
+                        char_kind,
                         derived_type: None,
                         inline_const: None,
                         is_pointer: false,
@@ -15513,7 +15532,8 @@ pub(super) fn intrinsic_subroutine_arg_order(callee_key: &str) -> Option<&'stati
         "random_number" => Some(&["harvest"]),
         "random_seed" => Some(&["size", "put", "get"]),
         "execute_command_line" => Some(&["command", "wait", "exitstat", "cmdstat"]),
-        "c_f_pointer" => Some(&["cptr", "fptr", "shape"]),
+        "c_f_pointer" => Some(&["cptr", "fptr", "shape", "lower"]),
+        "c_f_strpointer" => Some(&["cstrarray", "fstrptr", "nchars"]),
         "cmplx" => Some(&["x", "y", "kind"]),
         "reshape" => Some(&["source", "shape", "pad", "order"]),
         "pack" => Some(&["array", "mask", "vector"]),
@@ -17902,6 +17922,98 @@ pub(super) fn c_f_pointer_shape_values(
         Some(values.as_slice())
     } else {
         None
+    }
+}
+
+/// Per-dimension value source for a C_F_POINTER SHAPE/LOWER argument: an
+/// inline array constructor (`[3,4]`) or a runtime integer array variable
+/// (`myshape`), in which case we hold a typed base pointer and element type
+/// to load each element from.
+pub(super) enum CfpDimSource<'a> {
+    Literal(&'a [crate::ast::expr::AcValue]),
+    Runtime(ValueId, IrType),
+}
+
+/// Resolve C_F_POINTER arg `idx` (2 = SHAPE, 3 = LOWER) to a dim source.
+/// Emits the base-pointer load for the runtime-array case.
+pub(super) fn c_f_pointer_dim_arg<'a>(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    args: &'a [Option<crate::ast::expr::Argument>],
+    idx: usize,
+) -> Option<CfpDimSource<'a>> {
+    let arg = args.get(idx)?.as_ref()?;
+    let crate::ast::expr::SectionSubscript::Element(expr) = &arg.value else {
+        return None;
+    };
+    if let Expr::ArrayConstructor { values, .. } = &expr.node {
+        return Some(CfpDimSource::Literal(values.as_slice()));
+    }
+    let (desc, elem_ty) = lower_array_expr_descriptor(
+        b,
+        &ctx.locals,
+        expr,
+        ctx.st,
+        Some(ctx.type_layouts),
+        Some(ctx.internal_funcs),
+        Some(ctx.contained_host_refs),
+        Some(ctx.descriptor_params),
+    )?;
+    let base = b.load_typed(desc, IrType::Ptr(Box::new(elem_ty.clone())));
+    Some(CfpDimSource::Runtime(base, elem_ty))
+}
+
+/// Compile-time rank implied by a C_F_POINTER SHAPE argument: a rank-1
+/// integer array, so its element count is the result rank. Handles an
+/// inline constructor (its length) and a named array variable (its
+/// declared extent). None when neither is determinable.
+pub(super) fn c_f_pointer_shape_static_rank(
+    ctx: &LowerCtx,
+    args: &[Option<crate::ast::expr::Argument>],
+) -> Option<usize> {
+    let arg = args.get(2)?.as_ref()?;
+    let crate::ast::expr::SectionSubscript::Element(expr) = &arg.value else {
+        return None;
+    };
+    match &expr.node {
+        Expr::ArrayConstructor { values, .. } => Some(values.len()),
+        Expr::Name { name } => {
+            let info = ctx.locals.get(&name.to_lowercase())?;
+            // rank-1 array: the single dimension's extent is the rank.
+            match info.dims.as_slice() {
+                [(_, extent)] if *extent > 0 => Some(*extent as usize),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Load the i-th dimension value from a SHAPE/LOWER source as an i64.
+pub(super) fn c_f_pointer_dim_value(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    src: &CfpDimSource<'_>,
+    i: usize,
+) -> Option<ValueId> {
+    let to_i64 = |b: &mut FuncBuilder, v: ValueId| match b.func().value_type(v) {
+        Some(IrType::Int(IntWidth::I64)) => v,
+        _ => b.int_extend(v, IntWidth::I64, true),
+    };
+    match src {
+        CfpDimSource::Literal(vals) => {
+            let crate::ast::expr::AcValue::Expr(e) = vals.get(i)? else {
+                return None;
+            };
+            let raw = super::expr::lower_expr_ctx(b, ctx, e);
+            Some(to_i64(b, raw))
+        }
+        CfpDimSource::Runtime(base, elem_ty) => {
+            let idx = b.const_i64(i as i64);
+            let ep = b.gep(*base, vec![idx], elem_ty.clone());
+            let raw = b.load_typed(ep, elem_ty.clone());
+            Some(to_i64(b, raw))
+        }
     }
 }
 
@@ -20326,6 +20438,7 @@ pub(super) fn string_expr_lowers_to_owned_heap_temp(
                 .unwrap_or(false);
             match name.to_ascii_lowercase().as_str() {
                 "trim" | "adjustl" | "adjustr" => args.len() == 1 && first_is_char,
+                "f_c_string" => first_is_char,
                 "repeat" => args.len() >= 2 && first_is_char,
                 _ => false,
             }
@@ -20715,6 +20828,99 @@ pub(super) fn lower_string_expr_full(
                                 src_ptr,
                             );
                             return (buf, trimmed_len);
+                        }
+                    }
+                    "f_c_string" => {
+                        // F2023 18.2.3.4: F_C_STRING(STRING [, ASIS]) returns
+                        // TRIM(STRING)//C_NULL_CHAR, or STRING//C_NULL_CHAR when
+                        // ASIS is true. The result length includes the NUL.
+                        fn elem(
+                            a: &crate::ast::expr::Argument,
+                        ) -> Option<&crate::ast::expr::SpannedExpr> {
+                            if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+                                Some(e)
+                            } else {
+                                None
+                            }
+                        }
+                        let string_arg = args
+                            .iter()
+                            .find(|a| {
+                                a.keyword
+                                    .as_deref()
+                                    .is_some_and(|k| k.eq_ignore_ascii_case("string"))
+                            })
+                            .or_else(|| args.iter().find(|a| a.keyword.is_none()))
+                            .and_then(elem);
+                        let asis_arg = args
+                            .iter()
+                            .find(|a| {
+                                a.keyword
+                                    .as_deref()
+                                    .is_some_and(|k| k.eq_ignore_ascii_case("asis"))
+                            })
+                            .or_else(|| args.iter().filter(|a| a.keyword.is_none()).nth(1))
+                            .and_then(elem);
+                        if let Some(s) = string_arg {
+                            let (src_ptr, src_len) = lower_string_expr_full(
+                                b,
+                                locals,
+                                s,
+                                st,
+                                type_layouts,
+                                internal_funcs,
+                                contained_host_refs,
+                                descriptor_params,
+                            );
+                            // content length: full LEN when ASIS true, else LEN_TRIM.
+                            let trimmed = b.call(
+                                FuncRef::External("afs_len_trim".into()),
+                                vec![src_ptr, src_len],
+                                IrType::Int(IntWidth::I64),
+                            );
+                            let content_len = if let Some(asis) = asis_arg {
+                                let asis_val = super::expr::lower_expr_full(
+                                    b,
+                                    locals,
+                                    asis,
+                                    st,
+                                    type_layouts,
+                                    internal_funcs,
+                                    contained_host_refs,
+                                    descriptor_params,
+                                );
+                                b.select(asis_val, src_len, trimmed)
+                            } else {
+                                trimmed
+                            };
+                            // Allocate content + 1 (NUL); memset zeroes the NUL.
+                            let one = b.const_i64(1);
+                            let total = b.iadd(content_len, one);
+                            let buf = b.runtime_call(
+                                RuntimeFunc::Allocate,
+                                vec![total],
+                                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                            );
+                            let zero = b.const_i32(0);
+                            b.call(
+                                FuncRef::External("memset".into()),
+                                vec![buf, zero, total],
+                                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                            );
+                            b.call(
+                                FuncRef::External("memcpy".into()),
+                                vec![buf, src_ptr, content_len],
+                                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                            );
+                            deallocate_owned_string_expr_temp(
+                                b,
+                                locals,
+                                s,
+                                st,
+                                type_layouts,
+                                src_ptr,
+                            );
+                            return (buf, total);
                         }
                     }
                     "repeat" => {
@@ -42458,6 +42664,7 @@ pub(super) fn expr_is_character_expr(
                         | "achar"
                         | "new_line"
                         | "repeat"
+                        | "f_c_string"
                         | "compiler_version"
                         | "compiler_options"
                 ) || (key == "merge"

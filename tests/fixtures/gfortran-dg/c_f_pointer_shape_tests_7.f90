@@ -4,7 +4,7 @@
 ! Conversion notes: tests/fixtures/gfortran-dg/README.md
 ! FLAGS: --std=f2023
 ! EXIT_CODE: 0
-! XFAIL: f2023 C_F_POINTER LOWER= not implemented (l06): compiles, but emits unresolvable external lbound/ubound calls and LOWER honoring is unverified; see .docs/audits/f2023-feature-matrix.md
+! XFAIL: C_F_POINTER LOWER= is implemented and honored (l06) — verified end to end by test_programs/l06_c_f_pointer_lower.f90 (scalar-dim bounds + element access). This test still XFAILs only on the whole-array form of lbound/ubound (no dim arg), a general array-intrinsic gap that emits unresolvable external lbound/ubound symbols for every array, not just C_F_POINTER pointers; see .docs/audits/f2023-feature-matrix.md
 program lower
   use iso_c_binding
   type(c_ptr) :: x

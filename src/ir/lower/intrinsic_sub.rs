@@ -667,8 +667,29 @@ pub(crate) fn lower_intrinsic_subroutine(
                             elem_size,
                         );
 
-                        let shape_vals = c_f_pointer_shape_values(args);
-                        let rank = shape_vals.map_or(0, |vals| vals.len());
+                        // SHAPE and optional LOWER (F2023). Both may be inline
+                        // constructors or runtime integer arrays. Rank comes
+                        // from a literal shape's length, else from the FPTR's
+                        // declared rank. Each dim stores {lower, upper, 1}
+                        // where upper = lower + extent - 1 (lower defaults to
+                        // 1 — preserving the pre-LOWER behavior exactly).
+                        let shape_src = c_f_pointer_dim_arg(b, ctx, args, 2);
+                        let lower_src = c_f_pointer_dim_arg(b, ctx, args, 3);
+                        let fptr_rank = match &expr.node {
+                            Expr::Name { name } => {
+                                ctx.locals.get(&name.to_lowercase()).map(|i| i.dims.len())
+                            }
+                            _ => None,
+                        };
+                        let rank = match &shape_src {
+                            Some(CfpDimSource::Literal(vals)) => vals.len(),
+                            Some(CfpDimSource::Runtime(..)) => {
+                                c_f_pointer_shape_static_rank(ctx, args)
+                                    .or(fptr_rank)
+                                    .unwrap_or(0)
+                            }
+                            None => 0,
+                        };
                         let rank_val = b.const_i32(rank as i32);
                         store_byte_aggregate_field(
                             b,
@@ -691,40 +712,48 @@ pub(crate) fn lower_intrinsic_subroutine(
                             flags,
                         );
 
-                        if let Some(values) = shape_vals {
-                            for (i, value) in values.iter().enumerate() {
-                                let crate::ast::expr::AcValue::Expr(extent_expr) = value else {
+                        if let Some(shape_src) = &shape_src {
+                            // Column-major strides accumulate across dims:
+                            // stride[0] = 1, stride[i] = stride[i-1] *
+                            // extent[i-1]. The pre-LOWER code stored 1 for
+                            // every dim, which only happened to work for
+                            // rank-1 pointers; rank>1 element access was wrong.
+                            let mut running_stride = b.const_i64(1);
+                            for i in 0..rank {
+                                let Some(extent) = c_f_pointer_dim_value(b, ctx, shape_src, i)
+                                else {
                                     continue;
                                 };
-                                let raw_extent = super::expr::lower_expr_ctx(b, ctx, extent_expr);
-                                let extent = match b.func().value_type(raw_extent) {
-                                    Some(IrType::Int(IntWidth::I64)) => raw_extent,
-                                    _ => b.int_extend(raw_extent, IntWidth::I64, true),
-                                };
-                                let base = 24 + (i as i64) * 24;
+                                let lower = lower_src
+                                    .as_ref()
+                                    .and_then(|ls| c_f_pointer_dim_value(b, ctx, ls, i))
+                                    .unwrap_or_else(|| b.const_i64(1));
+                                let sum = b.iadd(lower, extent);
                                 let one64 = b.const_i64(1);
+                                let upper = b.isub(sum, one64);
+                                let base = 24 + (i as i64) * 24;
                                 store_byte_aggregate_field(
                                     b,
                                     target_addr,
                                     base,
                                     IrType::Int(IntWidth::I64),
-                                    one64,
+                                    lower,
                                 );
                                 store_byte_aggregate_field(
                                     b,
                                     target_addr,
                                     base + 8,
                                     IrType::Int(IntWidth::I64),
-                                    extent,
+                                    upper,
                                 );
-                                let stride64 = b.const_i64(1);
                                 store_byte_aggregate_field(
                                     b,
                                     target_addr,
                                     base + 16,
                                     IrType::Int(IntWidth::I64),
-                                    stride64,
+                                    running_stride,
                                 );
+                                running_stride = b.imul(running_stride, extent);
                             }
                         }
                         return true;
@@ -754,6 +783,91 @@ pub(crate) fn lower_intrinsic_subroutine(
                 .unwrap_or(IrType::Int(IntWidth::I8));
             let ptr_val = b.int_to_ptr(cptr, inner_pointee);
             b.store(ptr_val, fptr);
+            true
+        }
+
+        "c_f_strpointer" => {
+            // F2023 18.2.3.5:
+            //   CALL C_F_STRPOINTER(CSTRARRAY, FSTRPTR [, NCHARS])
+            //   CALL C_F_STRPOINTER(CSTRPTR,  FSTRPTR,  NCHARS)
+            // Associate a deferred-length c_char pointer with a C string. The
+            // length is the longest NUL-free prefix bounded by NCHARS (if
+            // present) or the source array's size. No copy: FSTRPTR aliases
+            // the C bytes, so afs_c_f_strpointer marks the descriptor pointer
+            // (not allocatable) and no free path will touch the memory.
+            let to_i64 = |b: &mut FuncBuilder, v: ValueId| match b.func().value_type(v) {
+                Some(IrType::Int(IntWidth::I64)) => v,
+                _ => b.int_extend(v, IntWidth::I64, true),
+            };
+            let src_expr = nth_arg_expr(args, 0);
+            let fptr_expr = nth_arg_expr(args, 1);
+            let nchars_present = matches!(args.get(2), Some(Some(_)));
+
+            let out_desc = fptr_expr.and_then(|e| match &e.node {
+                Expr::Name { name } => ctx.locals.get(&name.to_lowercase()).and_then(|info| {
+                    if matches!(info.char_kind, CharKind::Deferred) {
+                        Some(string_descriptor_addr(b, info))
+                    } else {
+                        None
+                    }
+                }),
+                _ => None,
+            });
+            // FSTRPTR shape and form constraints are diagnosed in sema; bail
+            // quietly if we somehow reach lowering with an invalid call.
+            let (Some(out_desc), Some(src_expr)) = (out_desc, src_expr) else {
+                return true;
+            };
+
+            let src_is_char =
+                expr_is_character_expr(b, &ctx.locals, src_expr, ctx.st, Some(ctx.type_layouts));
+
+            let (data_ptr, max_len) = if src_is_char {
+                // CSTRARRAY form: base address + (NCHARS or array size) bound.
+                let Some((desc, _elem_ty)) = lower_array_expr_descriptor(
+                    b,
+                    &ctx.locals,
+                    src_expr,
+                    ctx.st,
+                    Some(ctx.type_layouts),
+                    Some(ctx.internal_funcs),
+                    Some(ctx.contained_host_refs),
+                    Some(ctx.descriptor_params),
+                ) else {
+                    return true;
+                };
+                let base = b.load_typed(desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                let bound = if nchars_present {
+                    let n = nth_arg_val(b, ctx, args, 2, 0);
+                    to_i64(b, n)
+                } else {
+                    b.call(
+                        FuncRef::External("afs_array_size".into()),
+                        vec![desc],
+                        IrType::Int(IntWidth::I64),
+                    )
+                };
+                (base, bound)
+            } else {
+                // CSTRPTR form: type(c_ptr) address by value. NCHARS is
+                // required (sema); -1 is an unbounded-strlen safety fallback.
+                let addr = nth_arg_val(b, ctx, args, 0, 0);
+                let addr64 = to_i64(b, addr);
+                let data = b.int_to_ptr(addr64, IrType::Int(IntWidth::I8));
+                let bound = if nchars_present {
+                    let n = nth_arg_val(b, ctx, args, 2, 0);
+                    to_i64(b, n)
+                } else {
+                    b.const_i64(-1)
+                };
+                (data, bound)
+            };
+
+            b.call(
+                FuncRef::External("afs_c_f_strpointer".into()),
+                vec![data_ptr, max_len, out_desc],
+                IrType::Void,
+            );
             true
         }
 

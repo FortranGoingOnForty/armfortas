@@ -110,7 +110,7 @@ pub(crate) fn lower_unit(
             {
                 let mut b = FuncBuilder::new(&mut func, ctx.layout);
                 let _setup_proc_scope_guard = ProcScopeGuard::enter(ctx.proc_scope_id);
-                install_common_locals(&mut b, &mut ctx.locals, decls);
+                install_common_locals(&mut b, &mut ctx.locals, decls, ctx.st);
                 install_equivalence_locals(
                     &mut b,
                     &mut ctx.locals,
@@ -555,7 +555,7 @@ pub(crate) fn lower_unit(
                     type_layouts,
                 );
 
-                install_common_locals(&mut b, &mut ctx.locals, decls);
+                install_common_locals(&mut b, &mut ctx.locals, decls, ctx.st);
                 install_equivalence_locals(
                     &mut b,
                     &mut ctx.locals,
@@ -1263,7 +1263,7 @@ pub(crate) fn lower_unit(
                     ctx.result_type = Some(ir_ret_ty.clone());
                 }
 
-                install_common_locals(&mut b, &mut ctx.locals, decls);
+                install_common_locals(&mut b, &mut ctx.locals, decls, ctx.st);
                 install_equivalence_locals(
                     &mut b,
                     &mut ctx.locals,
