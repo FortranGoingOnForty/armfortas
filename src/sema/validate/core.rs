@@ -2210,12 +2210,31 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             ctx.in_bind_c_unit = saved_bind_c;
         }
         ProgramUnit::Submodule {
+            parent,
             uses,
             decls,
             contains,
             ..
         } => {
             ctx.require_std(unit.span, FortranStandard::F2008, "SUBMODULE");
+            // F2008 C1113: the parent (ancestor module or parent
+            // submodule) must be available. If neither a module nor a
+            // submodule of that name is in scope (in-file or loaded from
+            // an .amod), the submodule can't inherit anything — diagnose
+            // it instead of silently producing a dangling unit.
+            let parent_exists = ctx.st.find_module_scope(parent).is_some()
+                || ctx.st.all_scopes().iter().any(|s| {
+                    matches!(&s.kind, ScopeKind::Submodule(n) if n.eq_ignore_ascii_case(parent))
+                });
+            if !parent_exists {
+                ctx.error(
+                    unit.span,
+                    format!(
+                        "SUBMODULE parent '{parent}' not found — no such module or \
+                         submodule is available (compile it first or provide its .amod)"
+                    ),
+                );
+            }
             for use_stmt in uses {
                 ctx.require_std(use_stmt.span, FortranStandard::F90, "USE statement");
             }
