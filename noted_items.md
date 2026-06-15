@@ -1,5 +1,19 @@
 # Noted Items
 
+Pre-existing x86 host failure surfaced while running the full armfortas
+integration suite on dorado (FreeBSD 15 x86_64) during l06 (2026-06-14),
+NOT caused by l06 (the branch touches only sema + intrinsic lowering — no
+vectorizer/codegen/opt files; `git diff trunk...HEAD` confirms):
+
+- `tests/vectorize_dot_product.rs::o3_vectorizes_manual_dot_product_loop`
+  fails on x86: the test asserts the i32 dot loop stays scalar on SSE2
+  (no i32 lane multiply per `vec_isa.rs int_mul = false`), but at O3 the
+  vectorizer still emits `vbroadcast <4 x i32>` / vmul. So either the
+  vectorizer ignores the SSE2 int-mul gate or the x86 cost model is
+  incomplete. macOS arm64 (the CI gate) takes the aarch64 branch and
+  passes, so this is purely an x86-bringup vectorizer-policy gap — own it
+  in the x86 vectorizer/x09 work, not l06.
+
 Pre-existing failure surfaced during sprint-gate runs on nomad
 (2026-06-10), NOT caused by x00/l00 (reproduces on a trunk+x00 tree):
 
