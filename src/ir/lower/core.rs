@@ -20326,6 +20326,7 @@ pub(super) fn string_expr_lowers_to_owned_heap_temp(
                 .unwrap_or(false);
             match name.to_ascii_lowercase().as_str() {
                 "trim" | "adjustl" | "adjustr" => args.len() == 1 && first_is_char,
+                "f_c_string" => first_is_char,
                 "repeat" => args.len() >= 2 && first_is_char,
                 _ => false,
             }
@@ -20715,6 +20716,99 @@ pub(super) fn lower_string_expr_full(
                                 src_ptr,
                             );
                             return (buf, trimmed_len);
+                        }
+                    }
+                    "f_c_string" => {
+                        // F2023 18.2.3.4: F_C_STRING(STRING [, ASIS]) returns
+                        // TRIM(STRING)//C_NULL_CHAR, or STRING//C_NULL_CHAR when
+                        // ASIS is true. The result length includes the NUL.
+                        fn elem(
+                            a: &crate::ast::expr::Argument,
+                        ) -> Option<&crate::ast::expr::SpannedExpr> {
+                            if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+                                Some(e)
+                            } else {
+                                None
+                            }
+                        }
+                        let string_arg = args
+                            .iter()
+                            .find(|a| {
+                                a.keyword
+                                    .as_deref()
+                                    .is_some_and(|k| k.eq_ignore_ascii_case("string"))
+                            })
+                            .or_else(|| args.iter().find(|a| a.keyword.is_none()))
+                            .and_then(elem);
+                        let asis_arg = args
+                            .iter()
+                            .find(|a| {
+                                a.keyword
+                                    .as_deref()
+                                    .is_some_and(|k| k.eq_ignore_ascii_case("asis"))
+                            })
+                            .or_else(|| args.iter().filter(|a| a.keyword.is_none()).nth(1))
+                            .and_then(elem);
+                        if let Some(s) = string_arg {
+                            let (src_ptr, src_len) = lower_string_expr_full(
+                                b,
+                                locals,
+                                s,
+                                st,
+                                type_layouts,
+                                internal_funcs,
+                                contained_host_refs,
+                                descriptor_params,
+                            );
+                            // content length: full LEN when ASIS true, else LEN_TRIM.
+                            let trimmed = b.call(
+                                FuncRef::External("afs_len_trim".into()),
+                                vec![src_ptr, src_len],
+                                IrType::Int(IntWidth::I64),
+                            );
+                            let content_len = if let Some(asis) = asis_arg {
+                                let asis_val = super::expr::lower_expr_full(
+                                    b,
+                                    locals,
+                                    asis,
+                                    st,
+                                    type_layouts,
+                                    internal_funcs,
+                                    contained_host_refs,
+                                    descriptor_params,
+                                );
+                                b.select(asis_val, src_len, trimmed)
+                            } else {
+                                trimmed
+                            };
+                            // Allocate content + 1 (NUL); memset zeroes the NUL.
+                            let one = b.const_i64(1);
+                            let total = b.iadd(content_len, one);
+                            let buf = b.runtime_call(
+                                RuntimeFunc::Allocate,
+                                vec![total],
+                                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                            );
+                            let zero = b.const_i32(0);
+                            b.call(
+                                FuncRef::External("memset".into()),
+                                vec![buf, zero, total],
+                                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                            );
+                            b.call(
+                                FuncRef::External("memcpy".into()),
+                                vec![buf, src_ptr, content_len],
+                                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                            );
+                            deallocate_owned_string_expr_temp(
+                                b,
+                                locals,
+                                s,
+                                st,
+                                type_layouts,
+                                src_ptr,
+                            );
+                            return (buf, total);
                         }
                     }
                     "repeat" => {
@@ -42458,6 +42552,7 @@ pub(super) fn expr_is_character_expr(
                         | "achar"
                         | "new_line"
                         | "repeat"
+                        | "f_c_string"
                         | "compiler_version"
                         | "compiler_options"
                 ) || (key == "merge"
