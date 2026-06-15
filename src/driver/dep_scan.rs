@@ -11,10 +11,21 @@ use std::path::{Path, PathBuf};
 #[derive(Debug)]
 pub struct FileDeps {
     pub path: PathBuf,
-    /// Module names this file defines (lowercase).
+    /// Module names this file defines (lowercase). For a file containing
+    /// `submodule (A) C`, also includes the submodule identifier
+    /// `A:C` (ancestor:name) so a nested submodule `submodule (A:C) G`
+    /// can depend on it.
     pub defines: Vec<String>,
-    /// Module names this file USEs (lowercase).
+    /// Module names this file USEs (lowercase). A submodule depends on
+    /// its parent (the module or parent submodule must compile first so
+    /// the `.amod` exists), so the parent reference is recorded here too.
     pub uses: Vec<String>,
+    /// For a submodule file: `Some((ancestor_module, parent))` where
+    /// `parent` is the module name (direct submodule) or the parent
+    /// submodule identifier `ancestor:parent` (nested). None for
+    /// non-submodule files. Submodule objects must always be in the link
+    /// set even when no consumer names them — they hold the SMP bodies.
+    pub submodule_of: Option<(String, String)>,
 }
 
 /// Scan a source file for MODULE and USE statements.
@@ -25,11 +36,46 @@ pub fn scan_file(path: &Path) -> Result<FileDeps, String> {
 
     let mut defines = Vec::new();
     let mut uses = Vec::new();
+    let mut submodule_of: Option<(String, String)> = None;
 
     for line in content.lines() {
         let trimmed = line.trim().to_lowercase();
         // Skip comments and empty lines.
         if trimmed.starts_with('!') || trimmed.is_empty() {
+            continue;
+        }
+
+        // SUBMODULE (<parent-spec>) <name> — F2008. The parent spec is
+        // either a bare ancestor module name (`(a) c`) or an
+        // `ancestor:parent` pair for a nested submodule (`(a:b) c`). The
+        // submodule must compile after its parent (so the parent `.amod`
+        // exists), so record the parent reference as a USE edge and the
+        // submodule's own `ancestor:name` identifier as a definition.
+        if let Some(rest) = trimmed.strip_prefix("submodule") {
+            let rest = rest.trim_start();
+            if let Some(open) = rest.strip_prefix('(') {
+                if let Some(close_idx) = open.find(')') {
+                    let parent_spec = open[..close_idx].trim();
+                    let after = open[close_idx + 1..].trim();
+                    let name = after
+                        .split(|c: char| !c.is_alphanumeric() && c != '_')
+                        .find(|s| !s.is_empty());
+                    if let (false, Some(name)) = (parent_spec.is_empty(), name) {
+                        // ancestor = first component of the parent spec.
+                        let ancestor = parent_spec.split(':').next().unwrap_or(parent_spec).trim();
+                        // Parent reference to depend on: the full parent
+                        // spec (module name, or `ancestor:parent` for a
+                        // nested submodule — both appear in some file's
+                        // `defines`).
+                        let parent_ref = parent_spec.to_string();
+                        uses.push(parent_ref.clone());
+                        // This submodule's own identifier, so nested
+                        // children (`submodule (ancestor:name) g`) resolve.
+                        defines.push(format!("{ancestor}:{name}"));
+                        submodule_of = Some((ancestor.to_string(), parent_ref));
+                    }
+                }
+            }
             continue;
         }
 
@@ -94,6 +140,7 @@ pub fn scan_file(path: &Path) -> Result<FileDeps, String> {
         path: path.to_path_buf(),
         defines,
         uses,
+        submodule_of,
     })
 }
 
@@ -197,7 +244,104 @@ mod tests {
         let deps = scan_file(&f).unwrap();
         assert_eq!(deps.defines, vec!["mymod"]);
         assert_eq!(deps.uses, vec!["other_mod"]);
+        assert_eq!(deps.submodule_of, None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_direct_submodule() {
+        let dir = std::env::temp_dir().join("dep_scan_submod_1");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("impl.f90");
+        std::fs::write(
+            &f,
+            "submodule (myparent) impl\ncontains\n  module procedure foo\n  end procedure\nend submodule\n",
+        )
+        .unwrap();
+        let deps = scan_file(&f).unwrap();
+        // Depends on the parent module; `module procedure foo` is not a def.
+        assert_eq!(deps.uses, vec!["myparent"]);
+        assert_eq!(deps.defines, vec!["myparent:impl"]);
+        assert_eq!(
+            deps.submodule_of,
+            Some(("myparent".to_string(), "myparent".to_string()))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_nested_submodule() {
+        let dir = std::env::temp_dir().join("dep_scan_submod_2");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("grand.f90");
+        std::fs::write(&f, "submodule (anc:par) grand\nend submodule\n").unwrap();
+        let deps = scan_file(&f).unwrap();
+        assert_eq!(deps.uses, vec!["anc:par"]);
+        assert_eq!(deps.defines, vec!["anc:grand"]);
+        assert_eq!(
+            deps.submodule_of,
+            Some(("anc".to_string(), "anc:par".to_string()))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn topo_sort_submodule_after_parent() {
+        // Worst input order: submodule, then its parent module, then a
+        // consumer. The submodule must land after the parent.
+        let files = vec![
+            FileDeps {
+                path: "child.f90".into(),
+                defines: vec!["mp:impl".into()],
+                uses: vec!["mp".into()],
+                submodule_of: Some(("mp".into(), "mp".into())),
+            },
+            FileDeps {
+                path: "parent.f90".into(),
+                defines: vec!["mp".into()],
+                uses: vec![],
+                submodule_of: None,
+            },
+            FileDeps {
+                path: "main.f90".into(),
+                defines: vec![],
+                uses: vec!["mp".into()],
+                submodule_of: None,
+            },
+        ];
+        let order = resolve_compilation_order(&files).unwrap();
+        let pos = |i: usize| order.iter().position(|&x| x == i).unwrap();
+        assert!(pos(1) < pos(0), "parent must precede child submodule");
+        assert!(pos(1) < pos(2), "parent must precede consumer");
+    }
+
+    #[test]
+    fn topo_sort_nested_submodule_chain() {
+        // grand -> child -> module: nested submodule chain in worst order.
+        let files = vec![
+            FileDeps {
+                path: "grand.f90".into(),
+                defines: vec!["nm:grand".into()],
+                uses: vec!["nm:child".into()],
+                submodule_of: Some(("nm".into(), "nm:child".into())),
+            },
+            FileDeps {
+                path: "child.f90".into(),
+                defines: vec!["nm:child".into()],
+                uses: vec!["nm".into()],
+                submodule_of: Some(("nm".into(), "nm".into())),
+            },
+            FileDeps {
+                path: "mod.f90".into(),
+                defines: vec!["nm".into()],
+                uses: vec![],
+                submodule_of: None,
+            },
+        ];
+        let order = resolve_compilation_order(&files).unwrap();
+        let pos = |i: usize| order.iter().position(|&x| x == i).unwrap();
+        assert!(pos(2) < pos(1), "module before child");
+        assert!(pos(1) < pos(0), "child before grand");
     }
 
     #[test]
@@ -207,16 +351,19 @@ mod tests {
                 path: "c.f90".into(),
                 defines: vec!["c".into()],
                 uses: vec![],
+                submodule_of: None,
             },
             FileDeps {
                 path: "b.f90".into(),
                 defines: vec!["b".into()],
                 uses: vec!["c".into()],
+                submodule_of: None,
             },
             FileDeps {
                 path: "a.f90".into(),
                 defines: vec!["a".into()],
                 uses: vec!["b".into()],
+                submodule_of: None,
             },
         ];
         let order = resolve_compilation_order(&files).unwrap();
@@ -235,11 +382,13 @@ mod tests {
                 path: "a.f90".into(),
                 defines: vec!["a".into()],
                 uses: vec!["b".into()],
+                submodule_of: None,
             },
             FileDeps {
                 path: "b.f90".into(),
                 defines: vec!["b".into()],
                 uses: vec!["a".into()],
+                submodule_of: None,
             },
         ];
         let err = resolve_compilation_order(&files).unwrap_err();
@@ -257,21 +406,25 @@ mod tests {
                 path: "d.f90".into(),
                 defines: vec!["d".into()],
                 uses: vec![],
+                submodule_of: None,
             },
             FileDeps {
                 path: "b.f90".into(),
                 defines: vec!["b".into()],
                 uses: vec!["d".into()],
+                submodule_of: None,
             },
             FileDeps {
                 path: "c.f90".into(),
                 defines: vec!["c".into()],
                 uses: vec!["d".into()],
+                submodule_of: None,
             },
             FileDeps {
                 path: "a.f90".into(),
                 defines: vec!["a".into()],
                 uses: vec!["b".into(), "c".into()],
+                submodule_of: None,
             },
         ];
         let order = resolve_compilation_order(&files).unwrap();

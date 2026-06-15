@@ -1231,12 +1231,25 @@ pub(super) fn smp_body_proc_scope(
             if !matches!(parent_kind, crate::sema::symtab::ScopeKind::Submodule(_)) {
                 return None;
             }
-            // Sema injects arg_order + symbols into the body scope. If
-            // arg_order is empty, this isn't an SMP body that needs
-            // synthesis (e.g. a no-arg procedure body) — fall through
-            // and let the regular lowering handle the empty-args case.
+            // Sema injects arg_order + symbols into the body scope. An
+            // empty arg_order means a no-arg procedure. A no-arg
+            // SUBROUTINE needs no synthesis — fall through to regular
+            // lowering. But a no-arg FUNCTION still needs its result
+            // variable synthesized from the parent interface (otherwise
+            // the result falls to implicit typing and the body lowers as
+            // a subroutine, returning garbage), so don't bail for it.
             if scope.arg_order.is_empty() {
-                return None;
+                let parent_is_function = smp_parent_interface_scope(st, idx, proc_name)
+                    .map(|pid| {
+                        matches!(
+                            st.scope(pid).kind,
+                            crate::sema::symtab::ScopeKind::Function(_)
+                        )
+                    })
+                    .unwrap_or(false);
+                if !parent_is_function {
+                    return None;
+                }
             }
             Some(idx)
         })

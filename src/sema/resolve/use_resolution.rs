@@ -484,7 +484,15 @@ pub(super) fn load_external_module(
         // and reject `allocate(result(...))`. Use a doubly-underscored
         // synth name so SMP-body synthesis can find it (via the body
         // scope after sema injection) but no user code can collide.
-        if matches!(proc.kind, crate::sema::symtab::SymbolKind::Function) && proc.result_rank > 0 {
+        //
+        // l07: this must fire for SCALAR results too (`result_rank == 0`),
+        // not just arrays. Without it a separately-compiled SMP function
+        // body (`module function f() result(r)`) never receives r's type
+        // from the parent .amod, so r falls to implicit typing — e.g. an
+        // integer result named `r` becomes REAL, returned in xmm0 while
+        // the caller reads eax (silent garbage). The array-spec logic
+        // below already handles rank 0 (empty spec).
+        if matches!(proc.kind, crate::sema::symtab::SymbolKind::Function) {
             let synth_name = format!(
                 "__amod_result_{}",
                 proc.result_name.as_deref().unwrap_or(&proc.name)

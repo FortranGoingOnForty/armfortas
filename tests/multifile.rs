@@ -586,3 +586,218 @@ fn module_private_default() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// l07: a separately-compiled submodule whose body implements a parent
+// MODULE FUNCTION must return the right type. The result variable's type
+// comes from the parent interface via the `.amod`; before l07 it fell to
+// implicit typing (an integer result named `r` became REAL, returned in a
+// different register than the caller read) — a silent wrong answer. Covers
+// both the with-args and no-arg function forms plus a subroutine control.
+#[test]
+fn cross_tu_submodule_scalar_function_returns_correct_type() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=cross_tu_submodule_scalar_function_returns_correct_type count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let parent_f90 = dir.join("sm_parent.f90");
+    let child_f90 = dir.join("sm_child.f90");
+    let main_f90 = dir.join("sm_main.f90");
+    let parent_o = dir.join("sm_parent.o");
+    let child_o = dir.join("sm_child.o");
+    let main_o = dir.join("sm_main.o");
+    let binary = dir.join("sm_bin");
+
+    std::fs::write(
+        &parent_f90,
+        r#"module sm
+  implicit none
+  interface
+    module function dbl(x) result(r)
+      integer, intent(in) :: x
+      integer :: r
+    end function
+    module function answer() result(r)
+      integer :: r
+    end function
+    module subroutine setit(v)
+      integer, intent(out) :: v
+    end subroutine
+  end interface
+end module
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &child_f90,
+        r#"submodule (sm) sm_impl
+contains
+  module procedure dbl
+    r = 2 * x
+  end procedure
+  module procedure answer
+    r = 42
+  end procedure
+  module procedure setit
+    v = 99
+  end procedure
+end submodule
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &main_f90,
+        r#"program p
+  use sm
+  implicit none
+  integer :: v
+  if (dbl(21) /= 42) error stop 1
+  if (answer() /= 42) error stop 2
+  call setit(v)
+  if (v /= 99) error stop 3
+  print *, "ok"
+end program
+"#,
+    )
+    .unwrap();
+
+    compile_file(&compiler, &parent_f90, &parent_o, None);
+    compile_file(&compiler, &child_f90, &child_o, Some(&dir));
+    compile_file(&compiler, &main_f90, &main_o, Some(&dir));
+    link_files(&[&main_o, &child_o, &parent_o], &binary);
+    let output = run_binary(&binary);
+    assert!(
+        output.contains("ok"),
+        "cross-TU submodule scalar function returned wrong value (or wrong register):\n{}",
+        output
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// l07 DoD: the multi-source driver (`armfortas a.f90 b.f90 ...` in one
+// invocation) topologically orders submodules after their parents, even
+// when files are given in the worst order. Before l07's dep_scan support,
+// the submodule compiled before its parent's `.amod` existed and produced
+// a silent wrong answer.
+#[test]
+fn multi_source_submodule_wrong_order_builds_and_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=multi_source_submodule_wrong_order_builds_and_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let parent_f90 = dir.join("ms_parent.f90");
+    let child_f90 = dir.join("ms_child.f90");
+    let main_f90 = dir.join("ms_main.f90");
+    let binary = dir.join("ms_bin");
+
+    std::fs::write(
+        &parent_f90,
+        "module ms\n  implicit none\n  interface\n    module function dbl(x) result(r)\n      integer, intent(in) :: x\n      integer :: r\n    end function\n  end interface\nend module\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &child_f90,
+        "submodule (ms) ms_impl\ncontains\n  module procedure dbl\n    r = 2 * x\n  end procedure\nend submodule\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &main_f90,
+        "program p\n  use ms\n  if (dbl(21) /= 42) error stop 1\n  print *, \"ok\"\nend program\n",
+    )
+    .unwrap();
+
+    // Deliberately worst order: child before parent.
+    let result = std::process::Command::new(&compiler)
+        .current_dir(&dir)
+        .args([
+            child_f90.to_str().unwrap(),
+            parent_f90.to_str().unwrap(),
+            main_f90.to_str().unwrap(),
+            "-o",
+            binary.to_str().unwrap(),
+        ])
+        .output()
+        .expect("compiler launch failed");
+    assert!(
+        result.status.success(),
+        "multi-source submodule build failed:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let output = run_binary(&binary);
+    assert!(
+        output.contains("ok"),
+        "multi-source submodule wrong-order run gave wrong answer:\n{}",
+        output
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// l07: a type-bound procedure whose target is a separate module procedure,
+// with the module and its submodule in separate TUs. Exercises the
+// TBP-thunk ownership rule across compilation units (the thunk must have
+// exactly one owning object, or the link fails with a duplicate symbol).
+#[test]
+fn cross_tu_tbp_targets_submodule_procedure() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=cross_tu_tbp_targets_submodule_procedure count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let mod_f90 = dir.join("tb_mod.f90");
+    let child_f90 = dir.join("tb_child.f90");
+    let main_f90 = dir.join("tb_main.f90");
+    let binary = dir.join("tb_bin");
+
+    std::fs::write(
+        &mod_f90,
+        "module tb\n  implicit none\n  type :: counter\n    integer :: n = 0\n  contains\n    procedure :: bump\n  end type\n  interface\n    module subroutine bump(self, by)\n      class(counter), intent(inout) :: self\n      integer, intent(in) :: by\n    end subroutine\n  end interface\nend module\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &child_f90,
+        "submodule (tb) tb_impl\ncontains\n  module procedure bump\n    self%n = self%n + by\n  end procedure\nend submodule\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &main_f90,
+        "program p\n  use tb\n  type(counter) :: c\n  call c%bump(5)\n  call c%bump(7)\n  if (c%n /= 12) error stop 1\n  print *, \"ok\"\nend program\n",
+    )
+    .unwrap();
+
+    // Worst order again.
+    let result = std::process::Command::new(&compiler)
+        .current_dir(&dir)
+        .args([
+            child_f90.to_str().unwrap(),
+            mod_f90.to_str().unwrap(),
+            main_f90.to_str().unwrap(),
+            "-o",
+            binary.to_str().unwrap(),
+        ])
+        .output()
+        .expect("compiler launch failed");
+    assert!(
+        result.status.success(),
+        "cross-TU TBP→SMP build failed:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let output = run_binary(&binary);
+    assert!(output.contains("ok"), "cross-TU TBP→SMP wrong result:\n{}", output);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

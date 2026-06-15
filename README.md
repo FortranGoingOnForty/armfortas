@@ -118,6 +118,8 @@ Correctness invariant: every program that produces correct output at `-O0` must 
 
 `iso_c_binding` and `iso_fortran_env` are built-in and always available. Authored modules compile correctly. Multi-file module dependency resolution and `.amod` files are in progress (Sprint 30).
 
+Submodules (F2008) work: separate module procedure bodies (both the `module procedure NAME` and `module function`/`module subroutine` prefix forms), nested submodule trees, submodule host association (a submodule sees the parent's PRIVATE entities), and SMPs as type-bound-procedure targets or behind generic interfaces. The multi-source driver topologically orders submodules after their parents, so an unordered file list compiles in one invocation; interface/implementation mismatches and unknown-parent submodules are compile-time errors. Scope note: the dependency scanner is line-based, so a `SUBMODULE` statement split across continuation lines is not recognized (same limitation as the `MODULE`/`USE` scan).
+
 ## What Doesn't Work Yet
 
 **In progress or deferred:**
@@ -130,7 +132,6 @@ Correctness invariant: every program that produces correct output at `-O0` must 
 - Loop unrolling, GVN, SROA, dead store elimination — later optimizer sprints
 - `ieee_arithmetic`, `ieee_exceptions` modules
 - Coarray Fortran
-- Submodules
 - Vtable-based polymorphic dispatch through `CLASS` variables
 
 ## Architecture
