@@ -12,7 +12,7 @@ use crate::lexer::Span;
 pub fn register_intrinsic_modules(st: &mut SymbolTable) {
     register_iso_c_binding(st);
     register_iso_fortran_env(st);
-    register_ieee_stubs(st);
+    register_ieee_modules(st);
 }
 
 fn builtin_span() -> Span {
@@ -258,10 +258,13 @@ fn register_iso_fortran_env(st: &mut SymbolTable) {
     st.pop_scope();
 }
 
-/// Register stub IEEE module scopes so `USE ieee_arithmetic` etc.
-/// don't produce a "module not found" error.  The procedures
-/// themselves are not yet implemented (sprint 30.7).
-fn register_ieee_stubs(st: &mut SymbolTable) {
+/// Register the IEEE module scopes (`ieee_arithmetic`,
+/// `ieee_exceptions`, `ieee_features`) so `USE` resolves: the opaque
+/// tag types, the class/round/flag named constants, and the procedure
+/// names. The procedures are implemented in IR lowering
+/// (`src/ir/lower/intrinsic.rs`, `intrinsic_sub.rs`) and the runtime
+/// (`runtime/src/ieee.rs`); see the l09 support matrix there.
+fn register_ieee_modules(st: &mut SymbolTable) {
     for name in ["ieee_arithmetic", "ieee_exceptions", "ieee_features"] {
         let m = st.push_scope(ScopeKind::Module(name.into()));
         // Populate with commonly-referenced symbols so USE ONLY

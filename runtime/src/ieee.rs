@@ -335,48 +335,58 @@ pub extern "C" fn afs_ieee_next_after_r4(x: f32, y: f32) -> f32 {
 const QNAN_F64: f64 = f64::from_bits(0x7ff8_0000_0000_0000);
 const QNAN_F32: f32 = f32::from_bits(0x7fc0_0000);
 
+// Callers exclude NaN. On the ±0 tie (x == y is true for 0.0/-0.0),
+// maximum picks +0 and minimum picks -0.
 fn max_val_f64(x: f64, y: f64) -> f64 {
-    if x > y {
+    if x == y {
+        if x.is_sign_negative() {
+            y
+        } else {
+            x
+        }
+    } else if x > y {
         x
-    } else if y > x {
-        y
-    } else if x.is_sign_negative() {
-        y // equal (incl. ±0): maximum picks +0 / the non-negative sign
     } else {
-        x
+        y
     }
 }
 
 fn min_val_f64(x: f64, y: f64) -> f64 {
-    if x < y {
+    if x == y {
+        if x.is_sign_negative() {
+            x
+        } else {
+            y
+        }
+    } else if x < y {
         x
-    } else if y < x {
-        y
-    } else if x.is_sign_negative() {
-        x // equal (incl. ±0): minimum picks -0
     } else {
         y
     }
 }
 
 fn max_val_f32(x: f32, y: f32) -> f32 {
-    if x > y {
+    if x == y {
+        if x.is_sign_negative() {
+            y
+        } else {
+            x
+        }
+    } else if x > y {
         x
-    } else if y > x {
-        y
-    } else if x.is_sign_negative() {
-        y
     } else {
-        x
+        y
     }
 }
 
 fn min_val_f32(x: f32, y: f32) -> f32 {
-    if x < y {
-        x
-    } else if y < x {
-        y
-    } else if x.is_sign_negative() {
+    if x == y {
+        if x.is_sign_negative() {
+            x
+        } else {
+            y
+        }
+    } else if x < y {
         x
     } else {
         y
