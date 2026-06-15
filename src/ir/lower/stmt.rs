@@ -6301,13 +6301,15 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         }
                     }
                 }
-                let (ptr, len) = lower_string_expr_with_layouts(
-                    b,
-                    &ctx.locals,
-                    value,
-                    ctx.st,
-                    Some(ctx.type_layouts),
-                );
+                // Use the ctx variant so descriptor_params / internal_funcs
+                // thread through: a char-pointer-returning RHS function with
+                // a polymorphic (class) actual needs the actual passed as
+                // its descriptor, not a scalar data pointer. With the
+                // _with_layouts variant (descriptor_params = None) the
+                // callee's `select type` saw a garbage tag and fell to
+                // `class default`, dropping the value (toml-f get_string:
+                // `val => cast_string(self%val)` returned '').
+                let (ptr, len) = lower_string_expr_ctx(b, ctx, value);
                 store_string_descriptor_view(b, tgt_desc, ptr, len);
                 return;
             }
