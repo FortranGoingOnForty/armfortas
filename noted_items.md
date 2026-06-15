@@ -67,6 +67,32 @@ Deferred items from the l00 F2023 inventory (2026-06-10):
   `'(lzs, f6.2)'` printed nothing, both exit 0 (nomad, 2026-06-10).
   Bites typo'd formats today; l05 makes unknown descriptors a runtime
   error as part of the AT/LZ work.
+- CHARACTER VALUE copy-in (x08 deferred intake, attempted in l06, reverted):
+  non-BIND(C) `character(N), value` dummies stay loudly sema-rejected.
+  Making them work is a dedicated calling-convention change, not a bounded
+  patch. The COMMON-char half of the same intake item shipped (l06); this
+  half did not. Findings from the attempt (so the next try doesn't
+  re-derive them):
+  - A by-ref char dummy is DOUBLY indirect: param `ptr<ptr<i8>>` → a cell
+    holding the char data pointer → bytes (two loads to reach data). The
+    VALUE signature branch instead emits `ptr<i8>` (one level). `character`
+    lowers to `Ptr<i8>`, so `elem_ty != by_ref_storage_ir_type(char)` —
+    they differ by one indirection. Easy to conflate; I did, and it cost a
+    debugging cycle.
+  - Correct copy-in: load slot→cell, load cell→data, memcpy into a private
+    `[i8 x N]` buffer, point a private cell at the buffer, store that cell
+    into the slot (preserves the double indirection, isolates writes).
+  - The change spans MANY coordinated sites: 3 signature value-branches in
+    unit.rs (one Subroutine, two Function/sret), the external call site
+    (expr.rs materialize closure), the callee param setup in BOTH the
+    Subroutine and Function arms, the copy-in, AND the internal/contained
+    call path (separate from the masks-based external path). My attempt
+    still SEGV'd at runtime on both external and contained calls — the
+    signature/call ABI didn't line up across all paths. `--emit-ir`
+    produced no output for the failing program, which made IR-level
+    debugging hard; resolve that first.
+  - Assumed-length (`character(*), value`) additionally needs the length on
+    a hidden parameter; keep it rejected even after fixed-length works.
 - F2023-syntax collision producing silent wrong answers today (accepted
   and mis-lowered, garbage at runtime): `real :: a([2,3])` (R818, an
   array-constructor bound in a type declaration). Details in

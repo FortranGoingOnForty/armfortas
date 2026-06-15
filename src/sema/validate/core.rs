@@ -2187,9 +2187,10 @@ fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
             // Character VALUE dummies are not lowered with copy-in
             // semantics yet: the callee receives the caller's storage
             // pointer, so mutation corrupts the caller (or SEGVs on a
-            // literal actual). Found by x08's VALUE coverage; owned by
-            // l06. BIND(C) procedures are exempt: their c_char VALUE
-            // dummies take the working byte-copy path.
+            // literal actual). Correct lowering is a dedicated
+            // calling-convention effort (see noted_items.md, "CHARACTER
+            // VALUE copy-in"). BIND(C) procedures are exempt: their
+            // c_char VALUE dummies take the working byte-copy path.
             if attrs.iter().any(|a| matches!(a, Attribute::Value))
                 && matches!(type_spec, crate::ast::decl::TypeSpec::Character(_))
                 && !ctx.in_bind_c_unit
@@ -2197,7 +2198,7 @@ fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
                 ctx.error(
                     decl.span,
                     "the VALUE attribute on CHARACTER dummies is not supported yet \
-                     (copy-in lowering lands with the C-interop string work)",
+                     (copy-in lowering is a separate calling-convention change)",
                 );
             }
 
