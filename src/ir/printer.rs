@@ -39,6 +39,16 @@ pub fn print_module(module: &Module) -> String {
                     let s: Vec<String> = vs.iter().map(|v| v.to_string()).collect();
                     write!(out, " = [{}]", s.join(", ")).unwrap();
                 }
+                GlobalInit::QuadTable(slots) => {
+                    let s: Vec<String> = slots
+                        .iter()
+                        .map(|slot| match slot {
+                            crate::ir::inst::QuadSlot::Int(v) => v.to_string(),
+                            crate::ir::inst::QuadSlot::Sym(name) => format!("@{}", name),
+                        })
+                        .collect();
+                    write!(out, " = table[{}]", s.join(", ")).unwrap();
+                }
             }
         }
         writeln!(out).unwrap();
