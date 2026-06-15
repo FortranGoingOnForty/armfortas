@@ -678,3 +678,67 @@ end program
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// l07 DoD: the multi-source driver (`armfortas a.f90 b.f90 ...` in one
+// invocation) topologically orders submodules after their parents, even
+// when files are given in the worst order. Before l07's dep_scan support,
+// the submodule compiled before its parent's `.amod` existed and produced
+// a silent wrong answer.
+#[test]
+fn multi_source_submodule_wrong_order_builds_and_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=multi_source_submodule_wrong_order_builds_and_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let parent_f90 = dir.join("ms_parent.f90");
+    let child_f90 = dir.join("ms_child.f90");
+    let main_f90 = dir.join("ms_main.f90");
+    let binary = dir.join("ms_bin");
+
+    std::fs::write(
+        &parent_f90,
+        "module ms\n  implicit none\n  interface\n    module function dbl(x) result(r)\n      integer, intent(in) :: x\n      integer :: r\n    end function\n  end interface\nend module\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &child_f90,
+        "submodule (ms) ms_impl\ncontains\n  module procedure dbl\n    r = 2 * x\n  end procedure\nend submodule\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &main_f90,
+        "program p\n  use ms\n  if (dbl(21) /= 42) error stop 1\n  print *, \"ok\"\nend program\n",
+    )
+    .unwrap();
+
+    // Deliberately worst order: child before parent.
+    let result = std::process::Command::new(&compiler)
+        .current_dir(&dir)
+        .args([
+            child_f90.to_str().unwrap(),
+            parent_f90.to_str().unwrap(),
+            main_f90.to_str().unwrap(),
+            "-o",
+            binary.to_str().unwrap(),
+        ])
+        .output()
+        .expect("compiler launch failed");
+    assert!(
+        result.status.success(),
+        "multi-source submodule build failed:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let output = run_binary(&binary);
+    assert!(
+        output.contains("ok"),
+        "multi-source submodule wrong-order run gave wrong answer:\n{}",
+        output
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
