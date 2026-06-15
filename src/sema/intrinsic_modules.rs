@@ -286,11 +286,35 @@ fn register_ieee_stubs(st: &mut SymbolTable) {
                 ] {
                     insert_param_val(st, m, name, ik4.clone(), Some(value));
                 }
+                // Rounding-mode constants (ieee_round_type, modeled as
+                // integer tags). Values match runtime/src/ieee.rs.
+                for (name, value) in [
+                    ("ieee_nearest", 0),
+                    ("ieee_to_zero", 1),
+                    ("ieee_up", 2),
+                    ("ieee_down", 3),
+                    ("ieee_away", 4),
+                    ("ieee_other", 5),
+                ] {
+                    insert_param_val(st, m, name, ik4.clone(), Some(value));
+                }
                 insert_proc(st, m, "ieee_is_nan");
                 insert_proc(st, m, "ieee_is_finite");
                 insert_proc(st, m, "ieee_is_normal");
                 insert_proc(st, m, "ieee_value");
                 insert_proc(st, m, "ieee_class");
+                for op in [
+                    "ieee_max",
+                    "ieee_min",
+                    "ieee_max_mag",
+                    "ieee_min_mag",
+                    "ieee_max_num",
+                    "ieee_min_num",
+                    "ieee_max_num_mag",
+                    "ieee_min_num_mag",
+                ] {
+                    insert_proc(st, m, op);
+                }
                 insert_proc(st, m, "ieee_selected_real_kind");
                 insert_proc(st, m, "ieee_support_datatype");
                 insert_proc(st, m, "ieee_support_denormal");
@@ -321,6 +345,18 @@ fn register_ieee_stubs(st: &mut SymbolTable) {
             "ieee_exceptions" => {
                 insert_type(st, m, "ieee_flag_type");
                 insert_type(st, m, "ieee_status_type");
+                // Exception-flag constants (ieee_flag_type, integer tags).
+                // Values match the flag bit indices in runtime/src/ieee.rs.
+                let ik4 = TypeInfo::Integer { kind: Some(4) };
+                for (name, value) in [
+                    ("ieee_invalid", 1),
+                    ("ieee_divide_by_zero", 2),
+                    ("ieee_overflow", 3),
+                    ("ieee_underflow", 4),
+                    ("ieee_inexact", 5),
+                ] {
+                    insert_param_val(st, m, name, ik4.clone(), Some(value));
+                }
                 insert_proc(st, m, "ieee_get_flag");
                 insert_proc(st, m, "ieee_set_flag");
                 insert_proc(st, m, "ieee_get_halting_mode");

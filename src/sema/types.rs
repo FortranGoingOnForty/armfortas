@@ -1145,7 +1145,10 @@ pub fn intrinsic_result_type(name: &str, args: &[FortranType]) -> Option<Fortran
         "ieee_class" => Some(FortranType::default_integer()),
         // KIND follows the (first) real argument.
         "ieee_value" | "ieee_copy_sign" | "ieee_logb" | "ieee_rint" | "ieee_scalb"
-        | "ieee_next_after" => args.first().cloned(),
+        | "ieee_next_after" | "ieee_max" | "ieee_min" | "ieee_max_mag" | "ieee_min_mag"
+        | "ieee_max_num" | "ieee_min_num" | "ieee_max_num_mag" | "ieee_min_num_mag" => {
+            args.first().cloned()
+        }
 
         _ => None, // Unknown intrinsic.
     }

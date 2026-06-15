@@ -1547,6 +1547,27 @@ pub(crate) fn lower_intrinsic(
                 ))
             }
         }
+        // F2023 / 60559:2020 maximum/minimum family. The runtime entry
+        // point name is the intrinsic name with `ieee_`→`afs_ieee_` and
+        // an r4/r8 suffix.
+        "ieee_max" | "ieee_min" | "ieee_max_mag" | "ieee_min_mag" | "ieee_max_num"
+        | "ieee_min_num" | "ieee_max_num_mag" | "ieee_min_num_mag" => {
+            if args.len() < 2 {
+                None
+            } else {
+                let suffix = ieee_float_suffix(b, args[0]);
+                let ty = b
+                    .func()
+                    .value_type(args[0])
+                    .unwrap_or(IrType::Float(FloatWidth::F64));
+                let op = &name["ieee_".len()..];
+                Some(b.call(
+                    FuncRef::External(format!("afs_ieee_{}_{}", op, suffix)),
+                    vec![args[0], args[1]],
+                    ty,
+                ))
+            }
+        }
         // Honest support answers (l09 deliverable 1 matrix). True only for
         // what is implemented and tested; the rest say false so the
         // stdlib probe-before-use pattern routes around them.

@@ -324,6 +324,233 @@ pub extern "C" fn afs_ieee_next_after_r4(x: f32, y: f32) -> f32 {
     f32::from_bits(next)
 }
 
+// ---- F2023 / ISO/IEC 60559:2020 maximum/minimum family ----
+//
+// The `ieee_max`/`ieee_min`(`_mag`) functions propagate NaN: a NaN
+// operand yields a quiet NaN. The `*_num`(`_mag`) functions follow the
+// 60559:2020 maximumNumber/minimumNumber family: a quiet-NaN operand is
+// ignored (the number is returned). Both families order signed zeros
+// (+0 > -0). `_mag` compares by magnitude, breaking ties by value.
+
+const QNAN_F64: f64 = f64::from_bits(0x7ff8_0000_0000_0000);
+const QNAN_F32: f32 = f32::from_bits(0x7fc0_0000);
+
+fn max_val_f64(x: f64, y: f64) -> f64 {
+    if x > y {
+        x
+    } else if y > x {
+        y
+    } else if x.is_sign_negative() {
+        y // equal (incl. ±0): maximum picks +0 / the non-negative sign
+    } else {
+        x
+    }
+}
+
+fn min_val_f64(x: f64, y: f64) -> f64 {
+    if x < y {
+        x
+    } else if y < x {
+        y
+    } else if x.is_sign_negative() {
+        x // equal (incl. ±0): minimum picks -0
+    } else {
+        y
+    }
+}
+
+fn max_val_f32(x: f32, y: f32) -> f32 {
+    if x > y {
+        x
+    } else if y > x {
+        y
+    } else if x.is_sign_negative() {
+        y
+    } else {
+        x
+    }
+}
+
+fn min_val_f32(x: f32, y: f32) -> f32 {
+    if x < y {
+        x
+    } else if y < x {
+        y
+    } else if x.is_sign_negative() {
+        x
+    } else {
+        y
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_ieee_max_r8(x: f64, y: f64) -> f64 {
+    if x.is_nan() || y.is_nan() {
+        QNAN_F64
+    } else {
+        max_val_f64(x, y)
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_ieee_min_r8(x: f64, y: f64) -> f64 {
+    if x.is_nan() || y.is_nan() {
+        QNAN_F64
+    } else {
+        min_val_f64(x, y)
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_ieee_max_mag_r8(x: f64, y: f64) -> f64 {
+    if x.is_nan() || y.is_nan() {
+        QNAN_F64
+    } else if x.abs() > y.abs() {
+        x
+    } else if y.abs() > x.abs() {
+        y
+    } else {
+        max_val_f64(x, y)
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_ieee_min_mag_r8(x: f64, y: f64) -> f64 {
+    if x.is_nan() || y.is_nan() {
+        QNAN_F64
+    } else if x.abs() < y.abs() {
+        x
+    } else if y.abs() < x.abs() {
+        y
+    } else {
+        min_val_f64(x, y)
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_ieee_max_num_r8(x: f64, y: f64) -> f64 {
+    match (x.is_nan(), y.is_nan()) {
+        (true, true) => QNAN_F64,
+        (true, false) => y,
+        (false, true) => x,
+        (false, false) => max_val_f64(x, y),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_ieee_min_num_r8(x: f64, y: f64) -> f64 {
+    match (x.is_nan(), y.is_nan()) {
+        (true, true) => QNAN_F64,
+        (true, false) => y,
+        (false, true) => x,
+        (false, false) => min_val_f64(x, y),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_ieee_max_num_mag_r8(x: f64, y: f64) -> f64 {
+    match (x.is_nan(), y.is_nan()) {
+        (true, true) => QNAN_F64,
+        (true, false) => y,
+        (false, true) => x,
+        (false, false) => afs_ieee_max_mag_r8(x, y),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_ieee_min_num_mag_r8(x: f64, y: f64) -> f64 {
+    match (x.is_nan(), y.is_nan()) {
+        (true, true) => QNAN_F64,
+        (true, false) => y,
+        (false, true) => x,
+        (false, false) => afs_ieee_min_mag_r8(x, y),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_ieee_max_r4(x: f32, y: f32) -> f32 {
+    if x.is_nan() || y.is_nan() {
+        QNAN_F32
+    } else {
+        max_val_f32(x, y)
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_ieee_min_r4(x: f32, y: f32) -> f32 {
+    if x.is_nan() || y.is_nan() {
+        QNAN_F32
+    } else {
+        min_val_f32(x, y)
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_ieee_max_mag_r4(x: f32, y: f32) -> f32 {
+    if x.is_nan() || y.is_nan() {
+        QNAN_F32
+    } else if x.abs() > y.abs() {
+        x
+    } else if y.abs() > x.abs() {
+        y
+    } else {
+        max_val_f32(x, y)
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_ieee_min_mag_r4(x: f32, y: f32) -> f32 {
+    if x.is_nan() || y.is_nan() {
+        QNAN_F32
+    } else if x.abs() < y.abs() {
+        x
+    } else if y.abs() < x.abs() {
+        y
+    } else {
+        min_val_f32(x, y)
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_ieee_max_num_r4(x: f32, y: f32) -> f32 {
+    match (x.is_nan(), y.is_nan()) {
+        (true, true) => QNAN_F32,
+        (true, false) => y,
+        (false, true) => x,
+        (false, false) => max_val_f32(x, y),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_ieee_min_num_r4(x: f32, y: f32) -> f32 {
+    match (x.is_nan(), y.is_nan()) {
+        (true, true) => QNAN_F32,
+        (true, false) => y,
+        (false, true) => x,
+        (false, false) => min_val_f32(x, y),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_ieee_max_num_mag_r4(x: f32, y: f32) -> f32 {
+    match (x.is_nan(), y.is_nan()) {
+        (true, true) => QNAN_F32,
+        (true, false) => y,
+        (false, true) => x,
+        (false, false) => afs_ieee_max_mag_r4(x, y),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_ieee_min_num_mag_r4(x: f32, y: f32) -> f32 {
+    match (x.is_nan(), y.is_nan()) {
+        (true, true) => QNAN_F32,
+        (true, false) => y,
+        (false, true) => x,
+        (false, false) => afs_ieee_min_mag_r4(x, y),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,6 +609,29 @@ mod tests {
         }
         assert_eq!(afs_ieee_is_nan_r8(afs_ieee_value_r8(IEEE_QUIET_NAN)), 1);
         assert_eq!(afs_ieee_is_nan_r4(afs_ieee_value_r4(IEEE_QUIET_NAN)), 1);
+    }
+
+    #[test]
+    fn max_min_family() {
+        // NaN propagates for the plain family.
+        assert!(afs_ieee_max_r8(1.0, f64::NAN).is_nan());
+        assert!(afs_ieee_min_r8(f64::NAN, 2.0).is_nan());
+        assert_eq!(afs_ieee_max_r8(1.0, 2.0), 2.0);
+        assert_eq!(afs_ieee_min_r8(1.0, 2.0), 1.0);
+        // Signed zeros ordered.
+        assert!(afs_ieee_max_r8(-0.0, 0.0).is_sign_positive());
+        assert!(afs_ieee_min_r8(-0.0, 0.0).is_sign_negative());
+        // Magnitude family.
+        assert_eq!(afs_ieee_max_mag_r8(-3.0, 2.0), -3.0);
+        assert_eq!(afs_ieee_min_mag_r8(-3.0, 2.0), 2.0);
+        // Number family ignores NaN.
+        assert_eq!(afs_ieee_max_num_r8(1.0, f64::NAN), 1.0);
+        assert_eq!(afs_ieee_min_num_r8(f64::NAN, 5.0), 5.0);
+        assert!(afs_ieee_max_num_r8(f64::NAN, f64::NAN).is_nan());
+        assert_eq!(afs_ieee_max_num_mag_r8(-7.0, f64::NAN), -7.0);
+        // r4 spot checks.
+        assert_eq!(afs_ieee_max_r4(1.0, 2.0), 2.0);
+        assert_eq!(afs_ieee_min_num_r4(f32::NAN, 5.0), 5.0);
     }
 
     #[test]
