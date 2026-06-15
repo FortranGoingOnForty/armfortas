@@ -19203,8 +19203,15 @@ pub(super) fn clear_intent_out_derived_params(
         let Some(info) = locals.get(pname) else {
             continue;
         };
+        // `intent(out)` on an ALLOCATABLE dummy means "deallocate on
+        // entry" (it becomes unallocated), never "default-initialize the
+        // components". For a `class(_), allocatable` dummy `info.allocatable`
+        // is false (polymorphic descriptors are tracked separately), so
+        // gate on the declaration too — otherwise we default-init through
+        // the now-NULL data pointer and segfault (toml-f new_keyval_).
         if info.is_pointer
             || info.allocatable
+            || decl_is_allocatable(pname, decls)
             || (local_uses_array_descriptor(info) && !info.is_class)
             || !info.dims.is_empty()
         {
