@@ -275,6 +275,8 @@ fn emit_inst(inst: &X86Inst, func: &X86Function) -> String {
             };
             format!("{}{} {}, {}", mn, suf, count, def())
         }
+        Bsr => format!("bsr{} {}, {}", suf, op(0), def()),
+        Bsf => format!("bsf{} {}, {}", suf, op(0), def()),
         Cltd => "cltd".to_string(),
         Cqto => "cqto".to_string(),
         Idiv => format!("idiv{} {}", suf, op(0)),
