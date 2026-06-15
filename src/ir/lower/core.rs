@@ -15513,7 +15513,7 @@ pub(super) fn intrinsic_subroutine_arg_order(callee_key: &str) -> Option<&'stati
         "random_number" => Some(&["harvest"]),
         "random_seed" => Some(&["size", "put", "get"]),
         "execute_command_line" => Some(&["command", "wait", "exitstat", "cmdstat"]),
-        "c_f_pointer" => Some(&["cptr", "fptr", "shape"]),
+        "c_f_pointer" => Some(&["cptr", "fptr", "shape", "lower"]),
         "c_f_strpointer" => Some(&["cstrarray", "fstrptr", "nchars"]),
         "cmplx" => Some(&["x", "y", "kind"]),
         "reshape" => Some(&["source", "shape", "pad", "order"]),
@@ -17903,6 +17903,98 @@ pub(super) fn c_f_pointer_shape_values(
         Some(values.as_slice())
     } else {
         None
+    }
+}
+
+/// Per-dimension value source for a C_F_POINTER SHAPE/LOWER argument: an
+/// inline array constructor (`[3,4]`) or a runtime integer array variable
+/// (`myshape`), in which case we hold a typed base pointer and element type
+/// to load each element from.
+pub(super) enum CfpDimSource<'a> {
+    Literal(&'a [crate::ast::expr::AcValue]),
+    Runtime(ValueId, IrType),
+}
+
+/// Resolve C_F_POINTER arg `idx` (2 = SHAPE, 3 = LOWER) to a dim source.
+/// Emits the base-pointer load for the runtime-array case.
+pub(super) fn c_f_pointer_dim_arg<'a>(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    args: &'a [Option<crate::ast::expr::Argument>],
+    idx: usize,
+) -> Option<CfpDimSource<'a>> {
+    let arg = args.get(idx)?.as_ref()?;
+    let crate::ast::expr::SectionSubscript::Element(expr) = &arg.value else {
+        return None;
+    };
+    if let Expr::ArrayConstructor { values, .. } = &expr.node {
+        return Some(CfpDimSource::Literal(values.as_slice()));
+    }
+    let (desc, elem_ty) = lower_array_expr_descriptor(
+        b,
+        &ctx.locals,
+        expr,
+        ctx.st,
+        Some(ctx.type_layouts),
+        Some(ctx.internal_funcs),
+        Some(ctx.contained_host_refs),
+        Some(ctx.descriptor_params),
+    )?;
+    let base = b.load_typed(desc, IrType::Ptr(Box::new(elem_ty.clone())));
+    Some(CfpDimSource::Runtime(base, elem_ty))
+}
+
+/// Compile-time rank implied by a C_F_POINTER SHAPE argument: a rank-1
+/// integer array, so its element count is the result rank. Handles an
+/// inline constructor (its length) and a named array variable (its
+/// declared extent). None when neither is determinable.
+pub(super) fn c_f_pointer_shape_static_rank(
+    ctx: &LowerCtx,
+    args: &[Option<crate::ast::expr::Argument>],
+) -> Option<usize> {
+    let arg = args.get(2)?.as_ref()?;
+    let crate::ast::expr::SectionSubscript::Element(expr) = &arg.value else {
+        return None;
+    };
+    match &expr.node {
+        Expr::ArrayConstructor { values, .. } => Some(values.len()),
+        Expr::Name { name } => {
+            let info = ctx.locals.get(&name.to_lowercase())?;
+            // rank-1 array: the single dimension's extent is the rank.
+            match info.dims.as_slice() {
+                [(_, extent)] if *extent > 0 => Some(*extent as usize),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Load the i-th dimension value from a SHAPE/LOWER source as an i64.
+pub(super) fn c_f_pointer_dim_value(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    src: &CfpDimSource<'_>,
+    i: usize,
+) -> Option<ValueId> {
+    let to_i64 = |b: &mut FuncBuilder, v: ValueId| match b.func().value_type(v) {
+        Some(IrType::Int(IntWidth::I64)) => v,
+        _ => b.int_extend(v, IntWidth::I64, true),
+    };
+    match src {
+        CfpDimSource::Literal(vals) => {
+            let crate::ast::expr::AcValue::Expr(e) = vals.get(i)? else {
+                return None;
+            };
+            let raw = super::expr::lower_expr_ctx(b, ctx, e);
+            Some(to_i64(b, raw))
+        }
+        CfpDimSource::Runtime(base, elem_ty) => {
+            let idx = b.const_i64(i as i64);
+            let ep = b.gep(*base, vec![idx], elem_ty.clone());
+            let raw = b.load_typed(ep, elem_ty.clone());
+            Some(to_i64(b, raw))
+        }
     }
 }
 

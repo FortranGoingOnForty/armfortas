@@ -667,8 +667,29 @@ pub(crate) fn lower_intrinsic_subroutine(
                             elem_size,
                         );
 
-                        let shape_vals = c_f_pointer_shape_values(args);
-                        let rank = shape_vals.map_or(0, |vals| vals.len());
+                        // SHAPE and optional LOWER (F2023). Both may be inline
+                        // constructors or runtime integer arrays. Rank comes
+                        // from a literal shape's length, else from the FPTR's
+                        // declared rank. Each dim stores {lower, upper, 1}
+                        // where upper = lower + extent - 1 (lower defaults to
+                        // 1 — preserving the pre-LOWER behavior exactly).
+                        let shape_src = c_f_pointer_dim_arg(b, ctx, args, 2);
+                        let lower_src = c_f_pointer_dim_arg(b, ctx, args, 3);
+                        let fptr_rank = match &expr.node {
+                            Expr::Name { name } => {
+                                ctx.locals.get(&name.to_lowercase()).map(|i| i.dims.len())
+                            }
+                            _ => None,
+                        };
+                        let rank = match &shape_src {
+                            Some(CfpDimSource::Literal(vals)) => vals.len(),
+                            Some(CfpDimSource::Runtime(..)) => {
+                                c_f_pointer_shape_static_rank(ctx, args)
+                                    .or(fptr_rank)
+                                    .unwrap_or(0)
+                            }
+                            None => 0,
+                        };
                         let rank_val = b.const_i32(rank as i32);
                         store_byte_aggregate_field(
                             b,
@@ -691,40 +712,48 @@ pub(crate) fn lower_intrinsic_subroutine(
                             flags,
                         );
 
-                        if let Some(values) = shape_vals {
-                            for (i, value) in values.iter().enumerate() {
-                                let crate::ast::expr::AcValue::Expr(extent_expr) = value else {
+                        if let Some(shape_src) = &shape_src {
+                            // Column-major strides accumulate across dims:
+                            // stride[0] = 1, stride[i] = stride[i-1] *
+                            // extent[i-1]. The pre-LOWER code stored 1 for
+                            // every dim, which only happened to work for
+                            // rank-1 pointers; rank>1 element access was wrong.
+                            let mut running_stride = b.const_i64(1);
+                            for i in 0..rank {
+                                let Some(extent) = c_f_pointer_dim_value(b, ctx, shape_src, i)
+                                else {
                                     continue;
                                 };
-                                let raw_extent = super::expr::lower_expr_ctx(b, ctx, extent_expr);
-                                let extent = match b.func().value_type(raw_extent) {
-                                    Some(IrType::Int(IntWidth::I64)) => raw_extent,
-                                    _ => b.int_extend(raw_extent, IntWidth::I64, true),
-                                };
-                                let base = 24 + (i as i64) * 24;
+                                let lower = lower_src
+                                    .as_ref()
+                                    .and_then(|ls| c_f_pointer_dim_value(b, ctx, ls, i))
+                                    .unwrap_or_else(|| b.const_i64(1));
+                                let sum = b.iadd(lower, extent);
                                 let one64 = b.const_i64(1);
+                                let upper = b.isub(sum, one64);
+                                let base = 24 + (i as i64) * 24;
                                 store_byte_aggregate_field(
                                     b,
                                     target_addr,
                                     base,
                                     IrType::Int(IntWidth::I64),
-                                    one64,
+                                    lower,
                                 );
                                 store_byte_aggregate_field(
                                     b,
                                     target_addr,
                                     base + 8,
                                     IrType::Int(IntWidth::I64),
-                                    extent,
+                                    upper,
                                 );
-                                let stride64 = b.const_i64(1);
                                 store_byte_aggregate_field(
                                     b,
                                     target_addr,
                                     base + 16,
                                     IrType::Int(IntWidth::I64),
-                                    stride64,
+                                    running_stride,
                                 );
+                                running_stride = b.imul(running_stride, extent);
                             }
                         }
                         return true;
