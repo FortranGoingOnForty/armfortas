@@ -2353,32 +2353,10 @@ fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
             ctx.require_std(decl.span, FortranStandard::F2023, "ENUMERATION TYPE");
         }
 
-        if let Decl::CommonBlock { vars, .. } = &decl.node {
+        if let Decl::CommonBlock { .. } = &decl.node {
             warn_legacy_feature(ctx, decl.span, "COMMON block");
-            // Character members are not lowered with storage-
-            // association semantics: the member became a POINTER slot
-            // holding the string's address instead of inline bytes,
-            // and reads passed length 0 — silently empty on every
-            // target (found by x08's cross-TU COMMON test; owned by
-            // l06 alongside the string-representation work).
-            for var in vars {
-                let is_char = ctx.lookup(var).is_some_and(|sym| {
-                    matches!(
-                        sym.type_info,
-                        Some(crate::sema::symtab::TypeInfo::Character { .. })
-                    )
-                });
-                if is_char {
-                    ctx.error(
-                        decl.span,
-                        format!(
-                            "character member '{}' in a COMMON block is not supported \
-                             yet (storage association needs inline character bytes)",
-                            var
-                        ),
-                    );
-                }
-            }
+            // Character members now lower with inline-byte storage
+            // (fixed-length); storage association works. See l06.
         }
 
         if matches!(decl.node, Decl::EquivalenceStmt { .. }) {

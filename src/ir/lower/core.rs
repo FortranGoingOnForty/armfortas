@@ -212,7 +212,7 @@ pub fn lower_file(
     // Audit6 BLOCKING-2.
     let mut emitted_common: HashSet<String> = HashSet::new();
     for unit in units {
-        collect_and_emit_common_globals(&unit.node, &mut module, &mut emitted_common);
+        collect_and_emit_common_globals(&unit.node, &mut module, &mut emitted_common, st);
     }
 
     // Pass 1.7: collect optional-parameter bitmaps for every subroutine/function.
@@ -1969,10 +1969,28 @@ pub(super) fn common_slot_symbol(block: &str, slot_idx: usize) -> String {
     format!("afs_common_{}_{}", block, slot_idx)
 }
 
+/// The IR storage type and char kind for a COMMON member. Character
+/// members need inline byte storage (`[i8 x N]`) so storage association
+/// works — a plain `arg_type_from_decls` would give `Ptr<i8>`, i.e. an
+/// 8-byte pointer slot, and every read came back length 0 (silently
+/// empty). Mirrors a normal fixed-length character local.
+pub(super) fn common_member_storage(
+    var: &str,
+    decls: &[crate::ast::decl::SpannedDecl],
+    st: &SymbolTable,
+) -> (IrType, CharKind) {
+    let key = var.to_lowercase();
+    match arg_char_kind_from_decls(&key, decls, st) {
+        CharKind::Fixed(len) => (fixed_char_storage_ir_type(len), CharKind::Fixed(len)),
+        _ => (arg_type_from_decls(&key, decls, Some(st)), CharKind::None),
+    }
+}
+
 pub(super) fn collect_and_emit_common_globals(
     unit: &ProgramUnit,
     module: &mut Module,
     emitted: &mut HashSet<String>,
+    st: &SymbolTable,
 ) {
     use crate::ast::decl::Decl;
     let emit_for_decls = |decls: &[crate::ast::decl::SpannedDecl],
@@ -1987,7 +2005,7 @@ pub(super) fn collect_and_emit_common_globals(
                         continue;
                     }
                     emitted.insert(symbol.clone());
-                    let elem_ty = arg_type_from_decls(&var.to_lowercase(), decls, None);
+                    let (elem_ty, _) = common_member_storage(var, decls, st);
                     module.add_global(Global {
                         name: symbol,
                         ty: elem_ty,
@@ -2003,7 +2021,7 @@ pub(super) fn collect_and_emit_common_globals(
         } => {
             emit_for_decls(decls, module, emitted);
             for sub in contains {
-                collect_and_emit_common_globals(&sub.node, module, emitted);
+                collect_and_emit_common_globals(&sub.node, module, emitted, st);
             }
         }
         ProgramUnit::Subroutine {
@@ -2011,7 +2029,7 @@ pub(super) fn collect_and_emit_common_globals(
         } => {
             emit_for_decls(decls, module, emitted);
             for sub in contains {
-                collect_and_emit_common_globals(&sub.node, module, emitted);
+                collect_and_emit_common_globals(&sub.node, module, emitted, st);
             }
         }
         ProgramUnit::Function {
@@ -2019,7 +2037,7 @@ pub(super) fn collect_and_emit_common_globals(
         } => {
             emit_for_decls(decls, module, emitted);
             for sub in contains {
-                collect_and_emit_common_globals(&sub.node, module, emitted);
+                collect_and_emit_common_globals(&sub.node, module, emitted, st);
             }
         }
         _ => {}
@@ -2035,6 +2053,7 @@ pub(super) fn install_common_locals(
     b: &mut FuncBuilder,
     locals: &mut HashMap<String, LocalInfo>,
     decls: &[crate::ast::decl::SpannedDecl],
+    st: &SymbolTable,
 ) {
     use crate::ast::decl::Decl;
     for decl in decls {
@@ -2046,7 +2065,7 @@ pub(super) fn install_common_locals(
                     continue;
                 }
                 let symbol = common_slot_symbol(&block_name, slot_idx);
-                let elem_ty = arg_type_from_decls(&key, decls, None);
+                let (elem_ty, char_kind) = common_member_storage(&key, decls, st);
                 let addr = b.global_addr(&symbol, elem_ty.clone());
                 locals.insert(
                     key,
@@ -2057,7 +2076,7 @@ pub(super) fn install_common_locals(
                         allocatable: false,
                         descriptor_arg: false,
                         by_ref: false,
-                        char_kind: CharKind::None,
+                        char_kind,
                         derived_type: None,
                         inline_const: None,
                         is_pointer: false,
