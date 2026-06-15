@@ -3578,6 +3578,7 @@ pub fn is_intrinsic_name(name: &str) -> bool {
         "execute_command_line" | "compiler_version" | "compiler_options" |
         "is_iostat_end" | "is_iostat_eor" |
         "c_loc" | "c_funloc" | "c_f_pointer" | "c_associated" | "c_sizeof" |
+        "c_f_strpointer" | "f_c_string" |
         "ieee_is_nan" | "ieee_is_finite" | "ieee_value" |
         "ieee_support_datatype" | "ieee_support_denormal" |
         "ieee_selected_real_kind" |

@@ -187,6 +187,9 @@ fn register_iso_c_binding(st: &mut SymbolTable) {
         "c_f_procpointer",
         "c_associated",
         "c_sizeof",
+        // F2023 18.2.3: C string interop.
+        "c_f_strpointer",
+        "f_c_string",
     ] {
         insert_proc(st, m, name);
     }
