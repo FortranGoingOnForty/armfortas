@@ -22272,6 +22272,13 @@ pub(super) fn lower_type_spec_with_param_consts(
             let lower_name = name.to_lowercase();
             if lower_name == "c_ptr" || lower_name == "c_funptr" {
                 IrType::Int(IntWidth::I64)
+            } else if let Some(kind) =
+                crate::sema::resolve::type_resolution::ieee_opaque_int_kind(&lower_name)
+            {
+                // IEEE opaque types are integer ordinals (class/round/flag)
+                // or a 16-byte FP-env save buffer (status), under the hood
+                // (l09).
+                IrType::int_from_kind(kind)
             } else if let Some(st) = st {
                 // TYPE(name) also spells F2023 enumeration and named
                 // interoperable enum types (7.6.2 NOTE) — those are

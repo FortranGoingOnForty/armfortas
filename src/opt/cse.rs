@@ -251,10 +251,21 @@ impl Pass for LocalCse {
             // function with N CSE candidates ran N full walks for an
             // overall O(N · function_size). The batched form is one
             // walk with HashMap-driven renaming.
+            // In a function that changes the FP rounding mode, rounding-
+            // dependent FP ops must not be CSE'd (two identical `fdiv`
+            // across a mode change differ); l09.
+            let fpenv_barrier = func
+                .blocks
+                .iter()
+                .flat_map(|b| b.insts.iter())
+                .any(|inst| super::gvn::is_fpenv_rounding_barrier(&inst.kind));
             let mut rewrite_map: HashMap<ValueId, ValueId> = HashMap::new();
             for block in &func.blocks {
                 let mut seen: HashMap<Key, ValueId> = HashMap::new();
                 for inst in &block.insts {
+                    if fpenv_barrier && super::gvn::is_rounding_dependent_fp(&inst.kind) {
+                        continue;
+                    }
                     let Some(k) = key_of(inst) else { continue };
                     if let Some(&first) = seen.get(&k) {
                         rewrite_map.insert(inst.id, first);

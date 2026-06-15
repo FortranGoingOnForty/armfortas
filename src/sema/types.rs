@@ -1133,8 +1133,22 @@ pub fn intrinsic_result_type(name: &str, args: &[FortranType]) -> Option<Fortran
         // result element type and bails to the rank-1-only scalarization
         // path (which corrupts rank-N callers).
         "ieee_is_nan" | "ieee_is_finite" | "ieee_is_negative" | "ieee_is_normal"
-        | "ieee_signbit" => Some(FortranType::default_logical()),
-        "ieee_value" => args.first().cloned(),
+        | "ieee_signbit" | "ieee_unordered" => Some(FortranType::default_logical()),
+        // IEEE_SUPPORT_* inquiry functions return default logical.
+        "ieee_support_datatype" | "ieee_support_denormal" | "ieee_support_inf"
+        | "ieee_support_nan" | "ieee_support_subnormal" | "ieee_support_divide"
+        | "ieee_support_sqrt" | "ieee_support_io" | "ieee_support_rounding"
+        | "ieee_support_flag" | "ieee_support_halting" | "ieee_support_standard"
+        | "ieee_support_underflow_control" => Some(FortranType::default_logical()),
+        // IEEE_CLASS returns an IEEE_CLASS_TYPE value, modeled as default
+        // integer so `ieee_class(x) == ieee_quiet_nan` (also integer) works.
+        "ieee_class" => Some(FortranType::default_integer()),
+        // KIND follows the (first) real argument.
+        "ieee_value" | "ieee_copy_sign" | "ieee_logb" | "ieee_rint" | "ieee_scalb"
+        | "ieee_next_after" | "ieee_max" | "ieee_min" | "ieee_max_mag" | "ieee_min_mag"
+        | "ieee_max_num" | "ieee_min_num" | "ieee_max_num_mag" | "ieee_min_num_mag" => {
+            args.first().cloned()
+        }
 
         _ => None, // Unknown intrinsic.
     }

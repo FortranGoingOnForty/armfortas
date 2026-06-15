@@ -3865,6 +3865,13 @@ pub fn is_intrinsic_name(name: &str) -> bool {
         "present" | "merge" | "pack" | "unpack" | "spread" | "reshape" |
         "sum" | "product" | "maxval" | "minval" | "maxloc" | "minloc" | "findloc" | "count" | "any" | "all" |
         "ieee_support_inf" | "ieee_support_nan" | "ieee_support_subnormal" |
+        "ieee_support_divide" | "ieee_support_sqrt" | "ieee_support_io" |
+        "ieee_support_rounding" | "ieee_support_flag" | "ieee_support_halting" |
+        "ieee_support_standard" | "ieee_support_underflow_control" |
+        "ieee_is_normal" | "ieee_class" | "ieee_unordered" | "ieee_copy_sign" |
+        "ieee_logb" | "ieee_rint" | "ieee_scalb" | "ieee_next_after" |
+        "ieee_max" | "ieee_min" | "ieee_max_mag" | "ieee_min_mag" |
+        "ieee_max_num" | "ieee_min_num" | "ieee_max_num_mag" | "ieee_min_num_mag" |
         "matmul" | "dot_product" | "transpose" |
         "huge" | "tiny" | "epsilon" | "precision" | "range" | "radix" |
         "maxexponent" | "minexponent" | "digits" | "bit_size" | "storage_size" |

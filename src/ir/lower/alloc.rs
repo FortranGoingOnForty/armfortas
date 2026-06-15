@@ -956,6 +956,35 @@ pub(crate) fn alloc_decls(
                             continue;
                         }
                     }
+                    // IEEE opaque types are integer ordinals (class/round/
+                    // flag) or a 16-byte FP-env save buffer (status), under
+                    // the hood (l09), not struct storage.
+                    if let Some(kind) =
+                        crate::sema::resolve::type_resolution::ieee_opaque_int_kind(type_name)
+                    {
+                        let scalar_ty = IrType::int_from_kind(kind);
+                        let addr = b.alloca(scalar_ty.clone());
+                        locals.insert(
+                            key,
+                            LocalInfo {
+                                addr,
+                                ty: scalar_ty,
+                                dims: vec![],
+                                allocatable: false,
+                                descriptor_arg: false,
+                                by_ref: false,
+                                char_kind: CharKind::None,
+                                derived_type: None,
+                                inline_const: None,
+                                is_pointer: false,
+                                runtime_dim_upper: vec![],
+                                is_class: false,
+                                logical_kind: None,
+                                last_dim_assumed_size: false,
+                            },
+                        );
+                        continue;
+                    }
                     // Derived type variable: allocate struct-sized byte array.
                     if let Some(layout) = type_layouts.get(type_name) {
                         let struct_ty =

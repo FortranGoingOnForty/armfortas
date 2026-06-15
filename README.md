@@ -78,6 +78,10 @@ target/debug/armfortas --emit-ir hello.f90   # emit IR
 
 Full `iso_c_binding` module: kind parameters (`C_INT`, `C_DOUBLE`, `C_CHAR`, etc.), `C_PTR`, `C_NULL_PTR`, `C_LOC`, `C_FUNPTR`, `BIND(C)` procedures with correct ABI including `VALUE` argument dispatch.
 
+### IEEE arithmetic (`ieee_arithmetic`, `ieee_exceptions`)
+
+Value-class inquiry and construction (`ieee_is_nan/finite/normal`, `ieee_class`, `ieee_value`, `ieee_unordered`, `ieee_copy_sign`, `ieee_logb`, `ieee_rint`, `ieee_scalb`, `ieee_next_after`) via bit-pattern runtime helpers, so NaN detection survives `-Ofast`. Rounding-mode and exception-flag get/set reach the hardware control word (FPCR/FPSR on ARM64, MXCSR on x86_64); GVN/CSE will not merge rounding-dependent FP ops across a mode change. The F2023/IEEE 754-2019 `ieee_max`/`ieee_min`(`_mag`) and `*_num`(`_mag`) family is implemented. `IEEE_SUPPORT_*` answers honestly — `underflow_control`, `halting`, and `standard` report false rather than pretend.
+
 ### I/O
 
 - `PRINT` and `WRITE` with format strings and list-directed I/O
@@ -131,7 +135,6 @@ Submodules (F2008) work: separate module procedure bodies (both the `module proc
 - Function inlining — not yet implemented at any level
 - Multi-file compilation and `.amod` module files — Sprint 30
 - Loop unrolling, GVN, SROA, dead store elimination — later optimizer sprints
-- `ieee_arithmetic`, `ieee_exceptions` modules
 - Coarray Fortran
 
 ## Architecture

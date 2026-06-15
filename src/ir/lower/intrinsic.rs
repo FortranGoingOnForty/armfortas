@@ -1442,36 +1442,148 @@ pub(crate) fn lower_intrinsic(
         }
 
         // ---- IEEE arithmetic intrinsics ----
-        "ieee_is_nan" => {
-            // IEEE_IS_NAN(x) → x != x (NaN is the only value that is not equal to itself)
-            args.first().map(|arg| b.fcmp(CmpOp::Ne, *arg, *arg))
-        }
-        "ieee_is_finite" => {
-            // IEEE_IS_FINITE(x) → (x - x) == 0.0
-            // For finite values, x-x is 0.0. For inf, x-x is NaN. For NaN, x-x is NaN.
-            if let Some(arg) = args.first() {
-                let diff = b.fsub(*arg, *arg);
-                let ty = b
-                    .func()
-                    .value_type(*arg)
-                    .unwrap_or(IrType::Float(FloatWidth::F64));
-                let zero = match &ty {
-                    IrType::Float(FloatWidth::F32) => b.const_f32(0.0),
-                    _ => b.const_f64(0.0),
+        // Predicates and classification go through runtime bit-pattern
+        // helpers (`runtime/src/ieee.rs`) rather than compare-based IR: a
+        // call is opaque to const folding, so `x /= x`-style identities
+        // that passes rewrite to `.false.` can't break NaN detection.
+        "ieee_is_nan" | "ieee_is_finite" | "ieee_is_normal" => {
+            args.first().map(|arg| {
+                let suffix = ieee_float_suffix(b, *arg);
+                let op = match name {
+                    "ieee_is_nan" => "is_nan",
+                    "ieee_is_finite" => "is_finite",
+                    _ => "is_normal",
                 };
-                Some(b.fcmp(CmpOp::Eq, diff, zero))
-            } else {
+                let r = b.call(
+                    FuncRef::External(format!("afs_ieee_{}_{}", op, suffix)),
+                    vec![*arg],
+                    IrType::Int(IntWidth::I32),
+                );
+                let zero = b.const_i32(0);
+                b.icmp(CmpOp::Ne, r, zero)
+            })
+        }
+        "ieee_unordered" => {
+            if args.len() < 2 {
                 None
+            } else {
+                let suffix = ieee_float_suffix(b, args[0]);
+                let r = b.call(
+                    FuncRef::External(format!("afs_ieee_unordered_{}", suffix)),
+                    vec![args[0], args[1]],
+                    IrType::Int(IntWidth::I32),
+                );
+                let zero = b.const_i32(0);
+                Some(b.icmp(CmpOp::Ne, r, zero))
             }
         }
+        "ieee_class" => args.first().map(|arg| {
+            let suffix = ieee_float_suffix(b, *arg);
+            b.call(
+                FuncRef::External(format!("afs_ieee_class_{}", suffix)),
+                vec![*arg],
+                IrType::Int(IntWidth::I32),
+            )
+        }),
+        "ieee_copy_sign" => {
+            if args.len() < 2 {
+                None
+            } else {
+                let suffix = ieee_float_suffix(b, args[0]);
+                let ty = b
+                    .func()
+                    .value_type(args[0])
+                    .unwrap_or(IrType::Float(FloatWidth::F64));
+                Some(b.call(
+                    FuncRef::External(format!("afs_ieee_copy_sign_{}", suffix)),
+                    vec![args[0], args[1]],
+                    ty,
+                ))
+            }
+        }
+        "ieee_logb" | "ieee_rint" => args.first().map(|arg| {
+            let suffix = ieee_float_suffix(b, *arg);
+            let op = if name == "ieee_logb" { "logb" } else { "rint" };
+            let ty = b
+                .func()
+                .value_type(*arg)
+                .unwrap_or(IrType::Float(FloatWidth::F64));
+            b.call(
+                FuncRef::External(format!("afs_ieee_{}_{}", op, suffix)),
+                vec![*arg],
+                ty,
+            )
+        }),
+        "ieee_scalb" => {
+            if args.len() < 2 {
+                None
+            } else {
+                let suffix = ieee_float_suffix(b, args[0]);
+                let ty = b
+                    .func()
+                    .value_type(args[0])
+                    .unwrap_or(IrType::Float(FloatWidth::F64));
+                let i = ieee_as_i32(b, args[1]);
+                Some(b.call(
+                    FuncRef::External(format!("afs_ieee_scalb_{}", suffix)),
+                    vec![args[0], i],
+                    ty,
+                ))
+            }
+        }
+        "ieee_next_after" => {
+            if args.len() < 2 {
+                None
+            } else {
+                let suffix = ieee_float_suffix(b, args[0]);
+                let ty = b
+                    .func()
+                    .value_type(args[0])
+                    .unwrap_or(IrType::Float(FloatWidth::F64));
+                Some(b.call(
+                    FuncRef::External(format!("afs_ieee_next_after_{}", suffix)),
+                    vec![args[0], args[1]],
+                    ty,
+                ))
+            }
+        }
+        // F2023 / 60559:2020 maximum/minimum family. The runtime entry
+        // point name is the intrinsic name with `ieee_`→`afs_ieee_` and
+        // an r4/r8 suffix.
+        "ieee_max" | "ieee_min" | "ieee_max_mag" | "ieee_min_mag" | "ieee_max_num"
+        | "ieee_min_num" | "ieee_max_num_mag" | "ieee_min_num_mag" => {
+            if args.len() < 2 {
+                None
+            } else {
+                let suffix = ieee_float_suffix(b, args[0]);
+                let ty = b
+                    .func()
+                    .value_type(args[0])
+                    .unwrap_or(IrType::Float(FloatWidth::F64));
+                let op = &name["ieee_".len()..];
+                Some(b.call(
+                    FuncRef::External(format!("afs_ieee_{}_{}", op, suffix)),
+                    vec![args[0], args[1]],
+                    ty,
+                ))
+            }
+        }
+        // Honest support answers (l09 deliverable 1 matrix). True only for
+        // what is implemented and tested; the rest say false so the
+        // stdlib probe-before-use pattern routes around them.
         "ieee_support_datatype"
         | "ieee_support_denormal"
         | "ieee_support_inf"
         | "ieee_support_nan"
-        | "ieee_support_subnormal" => {
-            // ARM64 + Apple Silicon supports the full IEEE 754 model.
-            Some(b.const_bool(true))
-        }
+        | "ieee_support_subnormal"
+        | "ieee_support_divide"
+        | "ieee_support_sqrt"
+        | "ieee_support_io"
+        | "ieee_support_rounding"
+        | "ieee_support_flag" => Some(b.const_bool(true)),
+        "ieee_support_underflow_control"
+        | "ieee_support_halting"
+        | "ieee_support_standard" => Some(b.const_bool(false)),
         "maxexponent" => {
             // F2018 §16.9.124: returns the maximum exponent in the model
             // for the same kind as the argument. For IEEE binary32 = 128,
@@ -1500,45 +1612,48 @@ pub(crate) fn lower_intrinsic(
             Some(b.const_i32(val))
         }
         "ieee_value" => {
+            // IEEE_VALUE(X, CLASS): the value's KIND comes from X, the
+            // value itself from CLASS. Going through the runtime keeps the
+            // NaN/Inf results from being const-folded away at -Ofast
+            // (`0.0/0.0` would fold to a non-signaling pattern or be
+            // dropped); a call is opaque to folding.
             if args.len() < 2 {
                 None
             } else {
+                let suffix = ieee_float_suffix(b, args[0]);
                 let ty = b
                     .func()
                     .value_type(args[0])
                     .unwrap_or(IrType::Float(FloatWidth::F64));
-                let class = extract_const_int_from_value(b, args[1]).unwrap_or(0);
-                let zero = match ty {
-                    IrType::Float(FloatWidth::F32) => b.const_f32(0.0),
-                    _ => b.const_f64(0.0),
-                };
-                let one = match ty {
-                    IrType::Float(FloatWidth::F32) => b.const_f32(1.0),
-                    _ => b.const_f64(1.0),
-                };
-                match class {
-                    1 | 4 => Some(b.fdiv(zero, zero)),
-                    2 => Some(b.fdiv(one, zero)),
-                    3 => {
-                        let neg_one = match ty {
-                            IrType::Float(FloatWidth::F32) => b.const_f32(-1.0),
-                            _ => b.const_f64(-1.0),
-                        };
-                        Some(b.fdiv(neg_one, zero))
-                    }
-                    5 => Some(zero),
-                    6 => {
-                        let neg_one = match ty {
-                            IrType::Float(FloatWidth::F32) => b.const_f32(-1.0),
-                            _ => b.const_f64(-1.0),
-                        };
-                        Some(b.fmul(neg_one, zero))
-                    }
-                    _ => Some(args[0]),
-                }
+                let class = ieee_as_i32(b, args[1]);
+                Some(b.call(
+                    FuncRef::External(format!("afs_ieee_value_{}", suffix)),
+                    vec![class],
+                    ty,
+                ))
             }
         }
 
         _ => None,
+    }
+}
+
+/// `r4`/`r8` runtime-symbol suffix for an IEEE intrinsic argument, from
+/// its IR float width (defaults to double).
+fn ieee_float_suffix(b: &FuncBuilder, v: ValueId) -> &'static str {
+    match b.func().value_type(v) {
+        Some(IrType::Float(FloatWidth::F32)) => "r4",
+        _ => "r8",
+    }
+}
+
+/// Coerce an integer value to i32 for the `extern "C" fn(.., i32)` IEEE
+/// runtime entry points. Wider integers truncate; i32 passes through.
+fn ieee_as_i32(b: &mut FuncBuilder, v: ValueId) -> ValueId {
+    match b.func().value_type(v) {
+        Some(IrType::Int(IntWidth::I32)) => v,
+        Some(IrType::Int(IntWidth::I64 | IntWidth::I128)) => b.int_trunc(v, IntWidth::I32),
+        Some(IrType::Int(IntWidth::I8 | IntWidth::I16)) => b.int_extend(v, IntWidth::I32, true),
+        _ => v,
     }
 }

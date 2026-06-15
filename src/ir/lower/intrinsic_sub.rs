@@ -59,6 +59,18 @@ pub(crate) fn lower_intrinsic_subroutine(
         b.const_i32(default)
     }
 
+    /// Helper: store an i32 runtime result into an out-arg pointer,
+    /// coercing to the destination's pointee type (e.g. i32 tag into a
+    /// default-logical or default-integer slot). No-op on a null ptr.
+    fn ieee_store_to_ref(b: &mut FuncBuilder, value: ValueId, dest: ValueId) {
+        let pointee = match b.func().value_type(dest) {
+            Some(IrType::Ptr(inner)) => (*inner).clone(),
+            _ => IrType::Int(IntWidth::I32),
+        };
+        let coerced = coerce_to_type(b, value, &pointee);
+        b.store(coerced, dest);
+    }
+
     /// Helper: get the nth positional arg as a (ptr, len) string pair, or (null, 0).
     fn nth_arg_str(
         b: &mut FuncBuilder,
@@ -611,6 +623,86 @@ pub(crate) fn lower_intrinsic_subroutine(
                 vec![unit, null],
                 IrType::Void,
             );
+            true
+        }
+
+        // ---- IEEE FP-environment subroutines ----
+        // These touch the hardware FP control/status word, so the call
+        // is a barrier the optimizer must not move FP ops across; the
+        // runtime call is conservatively a barrier already (l09).
+        "ieee_set_rounding_mode" => {
+            let mode = nth_arg_val(b, ctx, args, 0, 0);
+            let mode = coerce_to_type(b, mode, &IrType::Int(IntWidth::I32));
+            b.call(
+                FuncRef::External("afs_ieee_set_rounding".into()),
+                vec![mode],
+                IrType::Void,
+            );
+            true
+        }
+        "ieee_get_rounding_mode" => {
+            let dest = nth_arg_ref(b, ctx, args, 0);
+            let r = b.call(
+                FuncRef::External("afs_ieee_get_rounding".into()),
+                vec![],
+                IrType::Int(IntWidth::I32),
+            );
+            ieee_store_to_ref(b, r, dest);
+            true
+        }
+        "ieee_set_flag" => {
+            let flag = nth_arg_val(b, ctx, args, 0, 0);
+            let flag = coerce_to_type(b, flag, &IrType::Int(IntWidth::I32));
+            let val = nth_arg_val(b, ctx, args, 1, 0);
+            let val = coerce_to_type(b, val, &IrType::Int(IntWidth::I32));
+            b.call(
+                FuncRef::External("afs_ieee_set_flag".into()),
+                vec![flag, val],
+                IrType::Void,
+            );
+            true
+        }
+        "ieee_get_flag" => {
+            let flag = nth_arg_val(b, ctx, args, 0, 0);
+            let flag = coerce_to_type(b, flag, &IrType::Int(IntWidth::I32));
+            let dest = nth_arg_ref(b, ctx, args, 1);
+            let r = b.call(
+                FuncRef::External("afs_ieee_test_flag".into()),
+                vec![flag],
+                IrType::Int(IntWidth::I32),
+            );
+            ieee_store_to_ref(b, r, dest);
+            true
+        }
+        "ieee_get_status" => {
+            let dest = nth_arg_ref(b, ctx, args, 0);
+            b.call(
+                FuncRef::External("afs_ieee_get_status".into()),
+                vec![dest],
+                IrType::Void,
+            );
+            true
+        }
+        "ieee_set_status" => {
+            let src = nth_arg_ref(b, ctx, args, 0);
+            b.call(
+                FuncRef::External("afs_ieee_set_status".into()),
+                vec![src],
+                IrType::Void,
+            );
+            true
+        }
+        "ieee_get_halting_mode" => {
+            // Halting (trap) is unsupported (ieee_support_halting=false);
+            // report it disabled rather than lie.
+            let dest = nth_arg_ref(b, ctx, args, 1);
+            let zero = b.const_i32(0);
+            ieee_store_to_ref(b, zero, dest);
+            true
+        }
+        "ieee_set_halting_mode" => {
+            // No-op: traps are unsupported. A conformant program checks
+            // ieee_support_halting first and never requests enabling.
             true
         }
 

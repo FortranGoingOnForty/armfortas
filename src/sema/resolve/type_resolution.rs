@@ -13,6 +13,25 @@ use crate::sema::symtab::{SymbolTable, TypeInfo};
 
 use super::core::eval_const_int_expr;
 
+/// Integer kind backing an IEEE intrinsic-module opaque type (l09),
+/// or `None` if `name` is not one. The class/round/flag tag types are
+/// small ordinals (default integer); `ieee_status_type` is a 16-byte
+/// save buffer for the FP control+status words, modeled as integer(16).
+/// Case-insensitive; shared by declaration resolution, derived-type
+/// layout, and IR lowering so every path agrees on storage size.
+pub(crate) fn ieee_opaque_int_kind(name: &str) -> Option<u8> {
+    match name.to_lowercase().as_str() {
+        "ieee_class_type" | "ieee_round_type" | "ieee_flag_type" => Some(4),
+        "ieee_status_type" => Some(16),
+        _ => None,
+    }
+}
+
+/// True if `name` is one of the IEEE opaque types modeled as an integer.
+pub(crate) fn is_ieee_opaque_type(name: &str) -> bool {
+    ieee_opaque_int_kind(name).is_some()
+}
+
 pub(super) fn extract_kind(sel: &Option<decl::KindSelector>, st: &SymbolTable) -> Option<u8> {
     use crate::ast::expr::Expr;
     match sel {
@@ -113,6 +132,16 @@ pub(super) fn type_spec_to_info(ts: &TypeSpec, st: &SymbolTable) -> TypeInfo {
             len: extract_char_len(sel, st),
             kind: None,
         },
+        TypeSpec::Type(name) if ieee_opaque_int_kind(name).is_some() => {
+            // The IEEE_ARITHMETIC/IEEE_EXCEPTIONS opaque types carry a
+            // small enumerated tag (class/round/flag) or an FP-env save
+            // buffer (status). We model them as integer under the hood
+            // (l09 deliverable 2, documented ABI): assignment, `==`/`/=`,
+            // and named-constant equality become plain integer ops.
+            TypeInfo::Integer {
+                kind: ieee_opaque_int_kind(name),
+            }
+        }
         TypeSpec::Type(name) => {
             // TYPE(name) covers derived types AND F2023 enumeration /
             // named-enum types (the standard reuses the spelling —

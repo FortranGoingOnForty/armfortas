@@ -447,13 +447,49 @@ fn flatten_assoc(
     out
 }
 
+/// A call that changes the hardware FP rounding mode (l09). Rounding-
+/// dependent FP ops must not be value-numbered across it: two textually
+/// identical `fdiv a, b` separated by such a call can produce different
+/// results, so GVN must not treat them as the same value.
+pub(super) fn is_fpenv_rounding_barrier(kind: &InstKind) -> bool {
+    matches!(
+        kind,
+        InstKind::Call(FuncRef::External(name), _)
+            if name == "afs_ieee_set_rounding" || name == "afs_ieee_set_status"
+    )
+}
+
+/// True if an op's result depends on the current rounding mode, so it
+/// must not be GVN'd/CSE'd in a function that changes that mode.
+pub(super) fn is_rounding_dependent_fp(kind: &InstKind) -> bool {
+    matches!(
+        kind,
+        InstKind::FAdd(..)
+            | InstKind::FSub(..)
+            | InstKind::FMul(..)
+            | InstKind::FDiv(..)
+            | InstKind::FSqrt(..)
+            | InstKind::FPow(..)
+            | InstKind::IntToFloat(..)
+            | InstKind::FloatTrunc(..)
+    )
+}
+
 fn key_of(
     inst: &Inst,
     replacements: &HashMap<ValueId, ValueId>,
     pure_calls: &[PureCallPolicy],
     wrapper_values: &HashMap<ValueId, ValueId>,
     defs: &HashMap<ValueId, &Inst>,
+    fpenv_barrier: bool,
 ) -> Option<Key> {
+    // In a function that changes the rounding mode, rounding-dependent FP
+    // ops are not value-numbered at all (conservative — the merge across
+    // a mode change is the bug; FP-env code is rare so the lost CSE is
+    // cheap).
+    if fpenv_barrier && is_rounding_dependent_fp(&inst.kind) {
+        return None;
+    }
     let mk = |tag: u32, ops: Vec<ValueId>, aux: i128| -> Option<Key> {
         Some(Key {
             tag,
@@ -622,6 +658,11 @@ fn gvn_function(func: &mut Function, pure_calls: &[PureCallPolicy]) -> bool {
     let children = dominator_tree_children(&idoms);
     let wrapper_values = wrapper_alloca_values(func, pure_calls);
     let defs = inst_map(func);
+    let fpenv_barrier = func
+        .blocks
+        .iter()
+        .flat_map(|b| b.insts.iter())
+        .any(|inst| is_fpenv_rounding_barrier(&inst.kind));
 
     // Scoped value number table: Key → dominating ValueId.
     let mut vn_table: HashMap<Key, ValueId> = HashMap::new();
@@ -646,7 +687,9 @@ fn gvn_function(func: &mut Function, pure_calls: &[PureCallPolicy]) -> bool {
         let mut new_keys = Vec::new();
         let block = func.block(block_id);
         for inst in &block.insts {
-            if let Some(key) = key_of(inst, &replacements, pure_calls, &wrapper_values, &defs) {
+            if let Some(key) =
+                key_of(inst, &replacements, pure_calls, &wrapper_values, &defs, fpenv_barrier)
+            {
                 if let Some(&existing) = vn_table.get(&key) {
                     // This expression is already available from a dominating block.
                     replacements.insert(inst.id, existing);
@@ -1361,6 +1404,7 @@ mod tests {
             &pure_calls,
             &wrappers,
             &test_defs,
+            false,
         )
         .expect("call1 should key");
         let key2 = key_of(
@@ -1369,6 +1413,7 @@ mod tests {
             &pure_calls,
             &wrappers,
             &test_defs,
+            false,
         )
         .expect("call2 should key");
         assert_eq!(
