@@ -956,11 +956,13 @@ pub(crate) fn alloc_decls(
                             continue;
                         }
                     }
-                    // IEEE opaque tag types (ieee_class_type, etc.) are
-                    // default-integer ordinals under the hood (l09), not
-                    // struct storage.
-                    if crate::sema::resolve::type_resolution::is_ieee_opaque_type(type_name) {
-                        let scalar_ty = IrType::Int(IntWidth::I32);
+                    // IEEE opaque types are integer ordinals (class/round/
+                    // flag) or a 16-byte FP-env save buffer (status), under
+                    // the hood (l09), not struct storage.
+                    if let Some(kind) =
+                        crate::sema::resolve::type_resolution::ieee_opaque_int_kind(type_name)
+                    {
+                        let scalar_ty = IrType::int_from_kind(kind);
                         let addr = b.alloca(scalar_ty.clone());
                         locals.insert(
                             key,

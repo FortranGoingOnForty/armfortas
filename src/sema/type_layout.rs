@@ -686,11 +686,13 @@ fn type_spec_to_type_info(
             TypeInfo::Character { len, kind }
         }
         TypeSpec::Type(name)
-            if crate::sema::resolve::type_resolution::is_ieee_opaque_type(name) =>
+            if crate::sema::resolve::type_resolution::ieee_opaque_int_kind(name).is_some() =>
         {
-            // IEEE opaque tag types are integer under the hood (l09); a
+            // IEEE opaque types are integer under the hood (l09); a
             // derived-type component of one gets integer storage.
-            TypeInfo::Integer { kind: Some(4) }
+            TypeInfo::Integer {
+                kind: crate::sema::resolve::type_resolution::ieee_opaque_int_kind(name),
+            }
         }
         TypeSpec::Type(name) => TypeInfo::Derived(name.clone()),
         TypeSpec::Class(name) => TypeInfo::Class(name.clone()),
