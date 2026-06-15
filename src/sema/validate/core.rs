@@ -1072,6 +1072,135 @@ fn validate_c_f_pointer(ctx: &mut Ctx<'_>, args: &[crate::ast::expr::Argument]) 
     }
 }
 
+/// Two dummy/result types agree for separate-module-procedure matching
+/// (F2008 C1418): same category, and same kind/rank where both are known.
+/// Unknown kinds (`None`) are treated as compatible to avoid false
+/// positives from `.amod`-loaded interfaces that don't preserve a kind.
+fn smp_type_compatible(a: &TypeInfo, b: &TypeInfo) -> bool {
+    fn kinds_ok(a: &Option<u8>, b: &Option<u8>) -> bool {
+        matches!((a, b), (Some(x), Some(y)) if x == y) || a.is_none() || b.is_none()
+    }
+    match (a, b) {
+        (TypeInfo::Integer { kind: k1 }, TypeInfo::Integer { kind: k2 })
+        | (TypeInfo::Real { kind: k1 }, TypeInfo::Real { kind: k2 })
+        | (TypeInfo::Complex { kind: k1 }, TypeInfo::Complex { kind: k2 })
+        | (TypeInfo::Logical { kind: k1 }, TypeInfo::Logical { kind: k2 })
+        | (
+            TypeInfo::Character { kind: k1, .. },
+            TypeInfo::Character { kind: k2, .. },
+        ) => kinds_ok(k1, k2),
+        (TypeInfo::Derived(n1), TypeInfo::Derived(n2))
+        | (TypeInfo::Class(n1), TypeInfo::Class(n2)) => n1.eq_ignore_ascii_case(n2),
+        _ => std::mem::discriminant(a) == std::mem::discriminant(b),
+    }
+}
+
+/// F2008 §12.6.2.5 / C1414/C1418: a separate module procedure body must
+/// match its interface in the ancestor module — the interface must exist,
+/// and the dummy arguments must agree in number, type, kind, and rank.
+/// The interface association is enforced by the lowering regardless (it
+/// injects the interface signature), so this is a pure diagnostic. Runs
+/// for any procedure body carrying the MODULE prefix inside a submodule.
+fn validate_smp_body(ctx: &mut Ctx<'_>, name: &str, prefix: &[Prefix], span: Span) {
+    if !prefix.iter().any(|p| matches!(p, Prefix::Module)) {
+        return;
+    }
+    let body_scope = ctx.scope_id;
+    let Some(submod_id) = ctx.st.scope(body_scope).parent else {
+        return;
+    };
+    if !matches!(ctx.st.scope(submod_id).kind, ScopeKind::Submodule(_)) {
+        return;
+    }
+    let Some(parent_mod) = ctx
+        .st
+        .scope(submod_id)
+        .use_associations
+        .iter()
+        .find(|u| u.is_submodule_access)
+        .map(|u| u.source_scope)
+    else {
+        return;
+    };
+
+    // Locate the interface procedure scope in the ancestor module,
+    // tolerating one Interface-block hop (as the lowering does).
+    let proc_lc = name.to_lowercase();
+    let iface = ctx.st.all_scopes().iter().find_map(|s| {
+        let nm = match &s.kind {
+            ScopeKind::Function(n) | ScopeKind::Subroutine(n) => n,
+            _ => return None,
+        };
+        if !nm.eq_ignore_ascii_case(&proc_lc) {
+            return None;
+        }
+        let p = s.parent?;
+        if p == parent_mod
+            || (matches!(ctx.st.scope(p).kind, ScopeKind::Interface)
+                && ctx.st.scope(p).parent == Some(parent_mod))
+        {
+            Some(s.id)
+        } else {
+            None
+        }
+    });
+    let Some(iface) = iface else {
+        ctx.error(
+            span,
+            format!(
+                "separate module procedure '{name}' has no matching MODULE \
+                 FUNCTION/SUBROUTINE interface in the ancestor module (F2008 C1414)"
+            ),
+        );
+        return;
+    };
+
+    let iface_args = ctx.st.scope(iface).arg_order.clone();
+    let body_args = ctx.st.scope(body_scope).arg_order.clone();
+    if iface_args.len() != body_args.len() {
+        ctx.error(
+            span,
+            format!(
+                "separate module procedure '{name}' has {} dummy argument(s) but its \
+                 interface declares {} (F2008 C1418)",
+                body_args.len(),
+                iface_args.len()
+            ),
+        );
+        return;
+    }
+    for (ia, ba) in iface_args.iter().zip(body_args.iter()) {
+        let isym = ctx.st.scope(iface).symbols.get(ia).cloned();
+        let bsym = ctx.st.scope(body_scope).symbols.get(ba).cloned();
+        let (Some(isym), Some(bsym)) = (isym, bsym) else {
+            continue;
+        };
+        if let (Some(it), Some(bt)) = (&isym.type_info, &bsym.type_info) {
+            if !smp_type_compatible(it, bt) {
+                ctx.error(
+                    span,
+                    format!(
+                        "dummy argument '{ba}' of separate module procedure '{name}' does \
+                         not match its interface in the ancestor module (F2008 C1418: \
+                         type, kind, and rank must agree)"
+                    ),
+                );
+            }
+        }
+        if isym.attrs.array_spec.len() != bsym.attrs.array_spec.len() {
+            ctx.error(
+                span,
+                format!(
+                    "dummy argument '{ba}' of separate module procedure '{name}' has rank \
+                     {} but its interface declares rank {} (F2008 C1418)",
+                    bsym.attrs.array_spec.len(),
+                    isym.attrs.array_spec.len()
+                ),
+            );
+        }
+    }
+}
+
 /// True if a conditional actual argument has a `.NIL.` arm anywhere in its
 /// (possibly chained) conditional tree. Such an argument selects the absent
 /// association, which F2023 C1525 permits only for an OPTIONAL dummy.
@@ -1915,6 +2044,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             }
         }
         ProgramUnit::Subroutine {
+            name,
             prefix,
             uses,
             implicit,
@@ -1925,6 +2055,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             bind,
             ..
         } => {
+            validate_smp_body(ctx, name, prefix, unit.span);
             let saved_pure = ctx.in_pure;
             let saved_elemental = ctx.in_elemental;
             let saved_bind_c = ctx.in_bind_c_unit;
@@ -1997,6 +2128,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             ctx.in_bind_c_unit = saved_bind_c;
         }
         ProgramUnit::Function {
+            name,
             prefix,
             uses,
             implicit,
@@ -2007,6 +2139,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             bind,
             ..
         } => {
+            validate_smp_body(ctx, name, prefix, unit.span);
             let saved_pure = ctx.in_pure;
             let saved_elemental = ctx.in_elemental;
             let saved_bind_c = ctx.in_bind_c_unit;
