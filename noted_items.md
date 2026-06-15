@@ -1,5 +1,20 @@
 # Noted Items
 
+Pre-existing finalization bug surfaced during l08 (2026-06-15), NOT
+caused by l08 (reproduces with a direct field write, no dispatch
+involved; the deallocate→finalize path is untouched by the vtable work):
+
+- Finalizing a polymorphic allocatable on `DEALLOCATE` passes the FINAL
+  subroutine a zeroed copy of the object, not the live storage. Repro:
+  `class(t), allocatable :: r; allocate(t::r); r%handle = 99;
+  deallocate(r)` — the FINAL prints `handle = 0`, though `r%handle`
+  reads 99 just before. The FINAL *runs* (correct), but the object it
+  receives has lost its field values. Likely the deallocate path
+  finalizes a default-initialized temporary, or finalizes after zeroing
+  the storage. Own it in the finalization/deallocate area, not l08.
+  `test_programs/l08_vtable_final_after_dispatch.f90` works around it by
+  asserting the FINAL fires (not the field value).
+
 Pre-existing x86 host failure surfaced while running the full armfortas
 integration suite on dorado (FreeBSD 15 x86_64) during l06 (2026-06-14),
 NOT caused by l06 (the branch touches only sema + intrinsic lowering — no
