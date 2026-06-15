@@ -1397,9 +1397,28 @@ fn eval_const_int_expr_with_params(
                         4
                     } else if bits <= 64 {
                         8
+                    } else if bits <= 128 {
+                        16
                     } else {
                         -1
                     })
+                }
+                "max" | "min" => {
+                    let is_max = name.eq_ignore_ascii_case("max");
+                    let mut acc: Option<i64> = None;
+                    for arg in args {
+                        let crate::ast::expr::SectionSubscript::Element(e) = &arg.value else {
+                            return None;
+                        };
+                        let value =
+                            eval_const_int_expr_with_params(e, const_params, const_char_params)?;
+                        acc = Some(match acc {
+                            None => value,
+                            Some(prev) if is_max => prev.max(value),
+                            Some(prev) => prev.min(value),
+                        });
+                    }
+                    acc
                 }
                 "selected_char_kind" => {
                     let arg = args.first()?;
@@ -2326,9 +2345,27 @@ pub(super) fn eval_const_int_expr(
                             4
                         } else if bits <= 64 {
                             8
+                        } else if bits <= 128 {
+                            16
                         } else {
                             -1
                         })
+                    }
+                    "max" | "min" => {
+                        let is_max = key == "max";
+                        let mut acc: Option<i64> = None;
+                        for arg in args {
+                            let crate::ast::expr::SectionSubscript::Element(e) = &arg.value else {
+                                return None;
+                            };
+                            let value = eval_const_int_expr(e, st)?;
+                            acc = Some(match acc {
+                                None => value,
+                                Some(prev) if is_max => prev.max(value),
+                                Some(prev) => prev.min(value),
+                            });
+                        }
+                        acc
                     }
                     "selected_char_kind" => {
                         let arg = args.first()?;

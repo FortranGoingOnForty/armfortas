@@ -1,5 +1,5 @@
 ! l04: F2023 SELECTED_LOGICAL_KIND(BITS) — smallest logical kind with
-! at least BITS bits (8/16/32/64 → kinds 1/2/4/8), -1 if none.
+! at least BITS bits (8/16/32/64/128 → kinds 1/2/4/8/16), -1 if none.
 ! Constant-folded in sema (usable as a kind parameter) and available at
 ! runtime for non-constant arguments; held identical across opt levels.
 ! FLAGS: --std=f2023
@@ -7,6 +7,7 @@
 ! CHECK: k2 2
 ! CHECK: k4 4
 ! CHECK: k8 8
+! CHECK: k16 16
 ! CHECK: none -1
 ! CHECK: param 4
 ! CHECK: rt T
@@ -22,7 +23,8 @@ program l04_selected_logical_kind
   print '(A,1X,I0)', 'k2', selected_logical_kind(16)
   print '(A,1X,I0)', 'k4', selected_logical_kind(32)
   print '(A,1X,I0)', 'k8', selected_logical_kind(64)
-  print '(A,1X,I0)', 'none', selected_logical_kind(65)
+  print '(A,1X,I0)', 'k16', selected_logical_kind(128)
+  print '(A,1X,I0)', 'none', selected_logical_kind(129)
 
   ! Constant-folded into a kind parameter.
   print '(A,1X,I0)', 'param', kind(flag)

@@ -1483,7 +1483,8 @@ pub(crate) fn lower_intrinsic(
         }
         "selected_logical_kind" => {
             // SELECTED_LOGICAL_KIND(BITS): smallest logical kind whose
-            // storage is at least BITS bits (1/2/4/8 → 8/16/32/64 bits),
+            // storage is at least BITS bits
+            // (1/2/4/8/16 → 8/16/32/64/128 bits),
             // -1 if none. Const-foldable here; non-constant args fall to
             // the runtime helper (the kind set is fixed, no libm need).
             if let Some(arg) = args.first() {
@@ -1496,6 +1497,8 @@ pub(crate) fn lower_intrinsic(
                         4
                     } else if bits <= 64 {
                         8
+                    } else if bits <= 128 {
+                        16
                     } else {
                         -1
                     };

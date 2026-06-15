@@ -324,6 +324,8 @@ fn eval_const_int_expr(
                         4
                     } else if bits <= 64 {
                         8
+                    } else if bits <= 128 {
+                        16
                     } else {
                         -1
                     })

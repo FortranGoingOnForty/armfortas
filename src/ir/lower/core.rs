@@ -7613,6 +7613,17 @@ pub(super) fn eval_const_scalar_with_any_scope(
                     ConstScalar::Float(_) => None,
                 };
             }
+            if matches!(
+                key.as_str(),
+                "selected_int_kind" | "selected_real_kind" | "selected_logical_kind"
+            ) {
+                let ConstScalar::Int(arg) = const_call_arg_expr(args.first()?)
+                    .and_then(|e| eval_const_scalar_with_any_scope(e, param_consts, st))?
+                else {
+                    return None;
+                };
+                return selected_kind_const_value(&key, arg).map(ConstScalar::Int);
+            }
             if key == "int" {
                 let value = const_call_arg_expr(args.first()?)
                     .and_then(|e| eval_const_scalar_with_any_scope(e, param_consts, st))?;
@@ -7875,6 +7886,45 @@ fn eval_const_transfer_with_any_scope(
         &source_bytes,
         target_bytes,
     )))
+}
+
+fn selected_kind_const_value(name: &str, arg: i128) -> Option<i128> {
+    match name {
+        "selected_int_kind" => Some(if arg <= 2 {
+            1
+        } else if arg <= 4 {
+            2
+        } else if arg <= 9 {
+            4
+        } else if arg <= 18 {
+            8
+        } else if arg <= 38 {
+            16
+        } else {
+            -1
+        }),
+        "selected_real_kind" => Some(if arg <= 6 {
+            4
+        } else if arg <= 15 {
+            8
+        } else {
+            -1
+        }),
+        "selected_logical_kind" => Some(if arg <= 8 {
+            1
+        } else if arg <= 16 {
+            2
+        } else if arg <= 32 {
+            4
+        } else if arg <= 64 {
+            8
+        } else if arg <= 128 {
+            16
+        } else {
+            -1
+        }),
+        _ => None,
+    }
 }
 
 fn eval_const_transfer_with_decl_scope(
@@ -8424,6 +8474,15 @@ pub(super) fn eval_const_scalar_with_decl_scope(
             };
             let key = name.to_ascii_lowercase();
             match key.as_str() {
+                "selected_int_kind" | "selected_real_kind" | "selected_logical_kind" => {
+                    let ConstScalar::Int(arg) = const_call_arg_expr(args.first()?).and_then(|e| {
+                        eval_const_scalar_with_decl_scope(e, decls, param_consts, st)
+                    })?
+                    else {
+                        return None;
+                    };
+                    selected_kind_const_value(&key, arg).map(ConstScalar::Int)
+                }
                 "selected_char_kind" => {
                     eval_selected_char_kind_with_decl_scope(args, decls, param_consts)
                 }
@@ -23387,7 +23446,18 @@ pub(super) fn extract_kind_with_context(
             Expr::Name { name } => {
                 named_kind_value(name, None, param_consts, st).unwrap_or(default)
             }
-            _ => default,
+            _ => {
+                let value = if let Some(st) = st {
+                    let empty_params = HashMap::new();
+                    let params = param_consts.unwrap_or(&empty_params);
+                    eval_const_int_in_scope_or_any_scope(e, params, st)
+                } else {
+                    param_consts.and_then(|params| eval_const_int_in_scope(e, params))
+                };
+                value
+                    .and_then(|v| u8::try_from(v).ok())
+                    .unwrap_or(default)
+            }
         },
         None => default,
     }
@@ -23399,7 +23469,7 @@ pub(super) fn lower_type_spec(ts: &TypeSpec) -> IrType {
 }
 
 /// If `ts` is `TypeSpec::Logical(...)`, resolve its kind selector to a
-/// concrete logical kind (1, 2, 4, or 8). Returns None for non-logical
+/// concrete logical kind (1, 2, 4, 8, or 16). Returns None for non-logical
 /// type specifiers.  Used at every LocalInfo construction site that
 /// might be backing a logical declaration so dispatchers and printers
 /// can recover the original Fortran semantics even though the IR type
@@ -23457,7 +23527,7 @@ pub(super) fn lower_type_spec_with_param_consts(
         TypeSpec::DoubleComplex => IrType::Array(Box::new(IrType::Float(FloatWidth::F64)), 2),
         TypeSpec::Logical(sel) => {
             // F2018 §16.10.5: LOGICAL(KIND=k) where k is one of the supported
-            // logical kinds (1, 2, 4, 8). Storage matches the integer of
+            // logical kinds (1, 2, 4, 8, 16). Storage matches the integer of
             // the same kind. Default kind=4 keeps `IrType::Bool` so existing
             // print/compare/coerce paths see a known type. Other kinds map
             // to the matching `IrType::Int(width)` so storage size,
@@ -23469,6 +23539,7 @@ pub(super) fn lower_type_spec_with_param_consts(
                 1 => IrType::Int(IntWidth::I8),
                 2 => IrType::Int(IntWidth::I16),
                 8 => IrType::Int(IntWidth::I64),
+                16 => IrType::Int(IntWidth::I128),
                 _ => IrType::Bool,
             }
         }
