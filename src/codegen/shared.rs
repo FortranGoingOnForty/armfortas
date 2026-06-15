@@ -104,8 +104,13 @@ pub fn emit_globals(
             GlobalsDialect::MachO if !g.name.starts_with('_') => format!("_{}", g.name),
             _ => g.name.clone(),
         };
-        // Module globals need external linkage for multi-file.
-        let is_module_global = g.name.starts_with("afs_mod_") || g.name.starts_with("afs_common_");
+        // Module globals need external linkage for multi-file. Type-bound-
+        // procedure vtables (`afs_vtable_*`) are owned by one TU but
+        // referenced by consumers dispatching through a type they never
+        // saw the source of, so they need external linkage too.
+        let is_module_global = g.name.starts_with("afs_mod_")
+            || g.name.starts_with("afs_common_")
+            || g.name.starts_with("afs_vtable_");
 
         // Uninitialized COMMON storage is a COMMON symbol (.comm) on
         // BOTH formats: every TU declaring /blk/ emits the same
@@ -145,6 +150,32 @@ pub fn emit_globals(
                 writeln!(out, ".type {}, @object", symbol).unwrap();
                 writeln!(out, ".size {}, {}", symbol, g.ty.size_bytes(layout)).unwrap();
             }
+        }
+
+        // Vtables and other quad tables carry a mix of raw integers and
+        // symbol-address relocations. Emit one `.quad` per slot; symbol
+        // slots get the platform symbol prefix (same rule as the table's
+        // own name) so `.quad symbol` becomes a data relocation the
+        // assembler resolves (ARM64_RELOC_UNSIGNED / R_X86_64_64).
+        if let Some(GlobalInit::QuadTable(slots)) = &g.initializer {
+            use crate::ir::inst::QuadSlot;
+            writeln!(out, ".p2align 3").unwrap();
+            writeln!(out, "{}:", symbol).unwrap();
+            for slot in slots {
+                match slot {
+                    QuadSlot::Int(v) => writeln!(out, "    .quad {}", v).unwrap(),
+                    QuadSlot::Sym(name) => {
+                        let sym = match dialect {
+                            GlobalsDialect::MachO if !name.starts_with('_') => {
+                                format!("_{}", name)
+                            }
+                            _ => name.clone(),
+                        };
+                        writeln!(out, "    .quad {}", sym).unwrap();
+                    }
+                }
+            }
+            continue;
         }
 
         // Array globals carry `Array<elem_ty, count>`.  Pick the
@@ -265,6 +296,9 @@ pub fn emit_globals(
                 // shouldn't happen, but emit zero as a safe fallback.
                 default_zero.into()
             }
+            // QuadTable globals are emitted by the dedicated arm above
+            // and never reach this scalar path.
+            Some(GlobalInit::QuadTable(_)) => default_zero.into(),
         };
         writeln!(out, "    {} {}", directive, value).unwrap();
     }

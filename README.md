@@ -53,6 +53,7 @@ target/debug/armfortas --emit-ir hello.f90   # emit IR
 - Derived types with component access, type extension (`EXTENDS`), and type-bound procedures with `PASS`/`NOPASS`
 - `FINAL` procedures
 - `SELECT TYPE` with `TYPE IS` and `CLASS IS` guards
+- Polymorphic dispatch through `CLASS` variables via a single per-type constant vtable: each type with bound procedures emits one `_afs_vtable_<module>_<type>` table (type tag, parent-vtable pointer, then bindings in declaration order, parent slots first), and a dispatch is load-table → load-slot → indirect-call. Overrides reuse the parent's slot, so dispatch works across translation units that never saw the type's source, including on polymorphic array elements.
 - `ALLOCATABLE` scalars and arrays, including allocatable character strings
 - `POINTER` and `TARGET` attributes
 - `OPTIONAL` arguments with `PRESENT()` intrinsic
@@ -132,7 +133,6 @@ Submodules (F2008) work: separate module procedure bodies (both the `module proc
 - Loop unrolling, GVN, SROA, dead store elimination — later optimizer sprints
 - `ieee_arithmetic`, `ieee_exceptions` modules
 - Coarray Fortran
-- Vtable-based polymorphic dispatch through `CLASS` variables
 
 ## Architecture
 

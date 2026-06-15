@@ -801,3 +801,106 @@ fn cross_tu_tbp_targets_submodule_procedure() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// l08: vtable slot ordering must be identical whether a TU computes it
+// from the type's source or from its `.amod`. The owner module dispatches
+// `a()`/`b()` through `class(base)` (source-visible layout); the consumer
+// dispatches the same calls on the same dynamic type seen only through
+// the `.amod` (amod-only layout). The child overrides `a` (keeps the
+// parent slot) and adds `c` (new slot), so a slot-order skew between the
+// two views would call the wrong method and the two sums would diverge.
+#[test]
+fn cross_tu_vtable_slots_match_source_and_amod_views() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=cross_tu_vtable_slots_match_source_and_amod_views count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let mod_f90 = dir.join("vt_mod.f90");
+    let main_f90 = dir.join("vt_main.f90");
+    let binary = dir.join("vt_bin");
+
+    std::fs::write(
+        &mod_f90,
+        "module vt\n\
+         implicit none\n\
+         type :: base\n\
+         contains\n\
+         procedure :: a => a_base\n\
+         procedure :: b => b_base\n\
+         end type\n\
+         type, extends(base) :: child\n\
+         contains\n\
+         procedure :: a => a_child\n\
+         procedure :: c => c_child\n\
+         end type\n\
+         contains\n\
+         integer function a_base(self)\n\
+         class(base), intent(in) :: self\n\
+         a_base = 1\n\
+         end function\n\
+         integer function b_base(self)\n\
+         class(base), intent(in) :: self\n\
+         b_base = 2\n\
+         end function\n\
+         integer function a_child(self)\n\
+         class(child), intent(in) :: self\n\
+         a_child = 10\n\
+         end function\n\
+         integer function c_child(self)\n\
+         class(child), intent(in) :: self\n\
+         c_child = 30\n\
+         end function\n\
+         ! Source-visible dispatch: compiled in the owner TU.\n\
+         integer function via_owner(x)\n\
+         class(base), intent(in) :: x\n\
+         via_owner = x%a() + x%b() * 100\n\
+         end function\n\
+         end module\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &main_f90,
+        "program p\n\
+         use vt\n\
+         implicit none\n\
+         class(base), allocatable :: s\n\
+         integer :: owner_sum, consumer_sum\n\
+         allocate(child :: s)\n\
+         owner_sum = via_owner(s)            ! source-visible layout\n\
+         consumer_sum = s%a() + s%b() * 100  ! amod-only layout\n\
+         if (owner_sum /= 210) error stop 1\n\
+         if (consumer_sum /= 210) error stop 2\n\
+         print *, \"ok\"\n\
+         end program\n",
+    )
+    .unwrap();
+
+    let result = std::process::Command::new(&compiler)
+        .current_dir(&dir)
+        .args([
+            mod_f90.to_str().unwrap(),
+            main_f90.to_str().unwrap(),
+            "-o",
+            binary.to_str().unwrap(),
+        ])
+        .output()
+        .expect("compiler launch failed");
+    assert!(
+        result.status.success(),
+        "cross-TU vtable slot build failed:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let output = run_binary(&binary);
+    assert!(
+        output.contains("ok"),
+        "cross-TU vtable slot ordering mismatch (source vs amod):\n{}",
+        output
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

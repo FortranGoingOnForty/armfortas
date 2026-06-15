@@ -610,12 +610,12 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     ) {
                                         store_array_desc_type_tag(b, desc, tag);
                                     }
-                                    if let Some(lookup) = derived_type_tbp_lookup_value(
+                                    if let Some(lookup) = derived_type_vtable_value(
                                         b,
                                         info.derived_type.as_deref(),
                                         ctx.type_layouts,
                                     ) {
-                                        store_array_desc_tbp_lookup_ptr(b, desc, lookup);
+                                        store_array_desc_vtable_ptr(b, desc, lookup);
                                     }
                                     b.branch(done_bb, vec![]);
                                     b.set_block(done_bb);
@@ -1844,12 +1844,12 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     ) {
                                         store_array_desc_type_tag(b, desc, tag);
                                     }
-                                    if let Some(lookup) = derived_type_tbp_lookup_value(
+                                    if let Some(lookup) = derived_type_vtable_value(
                                         b,
                                         Some(type_name.as_str()),
                                         ctx.type_layouts,
                                     ) {
-                                        store_array_desc_tbp_lookup_ptr(b, desc, lookup);
+                                        store_array_desc_vtable_ptr(b, desc, lookup);
                                     }
                                     b.branch(done_bb, vec![]);
                                     b.set_block(done_bb);
@@ -3793,8 +3793,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             );
             let typed_type_tag =
                 typed_allocate_type_tag_value(b, type_spec.as_ref(), ctx.type_layouts);
-            let typed_tbp_lookup =
-                typed_allocate_tbp_lookup_value(b, type_spec.as_ref(), ctx.type_layouts);
+            let typed_vtable =
+                typed_allocate_vtable_value(b, type_spec.as_ref(), ctx.type_layouts);
             let typed_layout = typed_allocate_layout(type_spec.as_ref(), ctx.type_layouts);
             let source_desc = allocate_descriptor_keyword_expr(b, ctx, opts, "source");
             let mold_desc = allocate_descriptor_keyword_expr(b, ctx, opts, "mold");
@@ -4041,7 +4041,11 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     );
                                 }
                             }
-                            if rank == 0 {
+                            // Polymorphic metadata (tag + vtable) for both
+                            // scalars and arrays; a polymorphic array
+                            // component's elements share one dynamic type.
+                            // Derived default-init below stays scalar-only.
+                            {
                                 let field_type_name = field_derived_type_name(&field);
                                 let type_tag = if source_desc.is_some() {
                                     None
@@ -4078,10 +4082,10 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         )
                                     })
                                 };
-                                let tbp_lookup = if source_desc.is_some() {
+                                let vtable = if source_desc.is_some() {
                                     None
                                 } else if let Some(source_expr) = source_expr {
-                                    expr_tbp_lookup_value(
+                                    expr_vtable_value(
                                         b,
                                         source_expr,
                                         None,
@@ -4089,23 +4093,23 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         ctx.type_layouts,
                                     )
                                     .or_else(|| {
-                                        static_alloc_target_tbp_lookup_value(
+                                        static_alloc_target_vtable_value(
                                             b,
                                             item,
                                             ctx.st,
                                             ctx.type_layouts,
                                         )
                                     })
-                                } else if let Some(ptr) = typed_tbp_lookup {
+                                } else if let Some(ptr) = typed_vtable {
                                     Some(ptr)
                                 } else {
-                                    derived_type_tbp_lookup_value(
+                                    derived_type_vtable_value(
                                         b,
                                         field_type_name.as_deref(),
                                         ctx.type_layouts,
                                     )
                                     .or_else(|| {
-                                        static_alloc_target_tbp_lookup_value(
+                                        static_alloc_target_vtable_value(
                                             b,
                                             item,
                                             ctx.st,
@@ -4114,7 +4118,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     })
                                 };
                                 emit_scalar_alloc_polymorphic_metadata_on_success(
-                                    b, stat_addr, field_ptr, type_tag, tbp_lookup,
+                                    b, stat_addr, field_ptr, type_tag, vtable,
                                 );
                                 if let Some(source_desc) = source_desc {
                                     emit_scalar_alloc_source_descriptor_metadata_on_success(
@@ -4134,7 +4138,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 let copied_from_source = source_desc.is_some()
                                     || source_scalar_desc.is_some()
                                     || source_expr.is_some();
-                                if !copied_from_source {
+                                if !copied_from_source && rank == 0 {
                                     if let Some(layout) = dynamic_layout {
                                         let base_ptr = b.load_typed(
                                             field_ptr,
@@ -4420,7 +4424,15 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     );
                                 }
                             }
-                            if rank == 0 {
+                            // Polymorphic metadata (dynamic type tag and
+                            // vtable pointer) is set for both scalars and
+                            // arrays — a polymorphic array's elements share
+                            // one dynamic type, so one tag + table pointer
+                            // in the descriptor serves every element-wise
+                            // TBP dispatch. (Derived default-init below
+                            // stays scalar-only; whole-array element init is
+                            // a separate concern.)
+                            {
                                 let type_tag = if source_desc.is_some() {
                                     None
                                 } else if let Some(source_expr) = source_expr {
@@ -4456,10 +4468,10 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         )
                                     })
                                 };
-                                let tbp_lookup = if source_desc.is_some() {
+                                let vtable = if source_desc.is_some() {
                                     None
                                 } else if let Some(source_expr) = source_expr {
-                                    expr_tbp_lookup_value(
+                                    expr_vtable_value(
                                         b,
                                         source_expr,
                                         None,
@@ -4467,23 +4479,23 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         ctx.type_layouts,
                                     )
                                     .or_else(|| {
-                                        static_alloc_target_tbp_lookup_value(
+                                        static_alloc_target_vtable_value(
                                             b,
                                             item,
                                             ctx.st,
                                             ctx.type_layouts,
                                         )
                                     })
-                                } else if let Some(ptr) = typed_tbp_lookup {
+                                } else if let Some(ptr) = typed_vtable {
                                     Some(ptr)
                                 } else {
-                                    derived_type_tbp_lookup_value(
+                                    derived_type_vtable_value(
                                         b,
                                         info.derived_type.as_deref(),
                                         ctx.type_layouts,
                                     )
                                     .or_else(|| {
-                                        static_alloc_target_tbp_lookup_value(
+                                        static_alloc_target_vtable_value(
                                             b,
                                             item,
                                             ctx.st,
@@ -4492,7 +4504,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     })
                                 };
                                 emit_scalar_alloc_polymorphic_metadata_on_success(
-                                    b, stat_addr, desc, type_tag, tbp_lookup,
+                                    b, stat_addr, desc, type_tag, vtable,
                                 );
                                 if let Some(source_desc) = source_desc {
                                     emit_scalar_alloc_source_descriptor_metadata_on_success(
@@ -4512,7 +4524,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 let copied_from_source = source_desc.is_some()
                                     || source_scalar_desc.is_some()
                                     || source_expr.is_some();
-                                if !copied_from_source {
+                                if !copied_from_source && rank == 0 {
                                     if let Some(layout) = dynamic_layout {
                                         let base_ptr = b.load_typed(
                                             desc,
@@ -6519,11 +6531,11 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     let type_tag = static_expr_type_tag_value(b, value, ctx.st, ctx.type_layouts);
                     let elem_size = expr_type_layout(value, None, ctx.st, ctx.type_layouts)
                         .map(|layout| b.const_i64(layout.size as i64));
-                    let tbp_lookup =
-                        static_expr_tbp_lookup_value(b, value, ctx.st, ctx.type_layouts);
+                    let vtable =
+                        static_expr_vtable_value(b, value, ctx.st, ctx.type_layouts);
                     let tgt_desc = array_descriptor_addr(b, &tgt_info);
                     store_scalar_polymorphic_descriptor_view(
-                        b, tgt_desc, addr, elem_size, type_tag, tbp_lookup,
+                        b, tgt_desc, addr, elem_size, type_tag, vtable,
                     );
                 } else {
                     store_scalar_pointer_slot_value(b, &tgt_info, addr);
@@ -6652,10 +6664,10 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 let type_tag = static_expr_type_tag_value(b, value, ctx.st, ctx.type_layouts);
                 let elem_size = expr_type_layout(value, None, ctx.st, ctx.type_layouts)
                     .map(|layout| b.const_i64(layout.size as i64));
-                let tbp_lookup = static_expr_tbp_lookup_value(b, value, ctx.st, ctx.type_layouts);
+                let vtable = static_expr_vtable_value(b, value, ctx.st, ctx.type_layouts);
                 let tgt_desc = array_descriptor_addr(b, &tgt_info);
                 store_scalar_polymorphic_descriptor_view(
-                    b, tgt_desc, addr, elem_size, type_tag, tbp_lookup,
+                    b, tgt_desc, addr, elem_size, type_tag, vtable,
                 );
             } else {
                 store_scalar_pointer_slot_value(b, &tgt_info, addr);

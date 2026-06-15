@@ -434,6 +434,22 @@ pub enum GlobalInit {
     /// with Zero at lowering time.
     IntArray(Vec<i128>),
     FloatArray(Vec<f64>),
+    /// A table of 8-byte quad slots, each either a raw integer or the
+    /// address of a named symbol (a data relocation). Backs type-bound-
+    /// procedure vtables: header integers (type tag, parent vtable
+    /// pointer) followed by bound-procedure code pointers. Symbol names
+    /// are the IR-level unprefixed names; the emitter applies the
+    /// platform symbol prefix and emits one `.quad` per slot.
+    QuadTable(Vec<QuadSlot>),
+}
+
+/// One 8-byte entry in a [`GlobalInit::QuadTable`].
+#[derive(Debug, Clone)]
+pub enum QuadSlot {
+    /// A raw 64-bit integer value.
+    Int(i64),
+    /// The address of a named symbol (emitted as a data relocation).
+    Sym(String),
 }
 
 /// The top-level IR module.
