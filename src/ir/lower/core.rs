@@ -9223,6 +9223,99 @@ pub(super) fn actual_char_arg_runtime_len(
 ) -> Option<ValueId> {
     match &expr.node {
         Expr::StringLiteral { value, .. } => Some(b.const_i64(value.len() as i64)),
+        Expr::ConditionalExpr {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            if let Expr::LogicalLiteral { value, .. } = &cond.node {
+                let arm = if *value { then_val } else { else_val };
+                return actual_char_arg_runtime_len(
+                    b,
+                    locals,
+                    optional_locals,
+                    arm,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                );
+            }
+
+            let cond_val = super::expr::lower_expr_full(
+                b,
+                locals,
+                cond,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
+            let bb_then = b.create_block("cond_char_len_then");
+            let bb_else = b.create_block("cond_char_len_else");
+            let bb_merge = b.create_block("cond_char_len_merge");
+            let merged_len = b.add_block_param(bb_merge, IrType::Int(IntWidth::I64));
+            b.cond_branch(cond_val, bb_then, vec![], bb_else, vec![]);
+
+            b.set_block(bb_then);
+            let t_len = actual_char_arg_runtime_len(
+                b,
+                locals,
+                optional_locals,
+                then_val,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            )
+            .unwrap_or_else(|| {
+                lower_string_expr_full(
+                    b,
+                    locals,
+                    then_val,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                )
+                .1
+            });
+            b.branch(bb_merge, vec![t_len]);
+
+            b.set_block(bb_else);
+            let e_len = actual_char_arg_runtime_len(
+                b,
+                locals,
+                optional_locals,
+                else_val,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            )
+            .unwrap_or_else(|| {
+                lower_string_expr_full(
+                    b,
+                    locals,
+                    else_val,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                )
+                .1
+            });
+            b.branch(bb_merge, vec![e_len]);
+
+            b.set_block(bb_merge);
+            Some(merged_len)
+        }
         Expr::ArrayConstructor { values, .. } => {
             if let Some(len) = fixed_char_array_constructor_len(b, values, locals, st, type_layouts)
             {
