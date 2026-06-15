@@ -93,6 +93,22 @@ Deferred items from the l00 F2023 inventory (2026-06-10):
     debugging hard; resolve that first.
   - Assumed-length (`character(*), value`) additionally needs the length on
     a hidden parameter; keep it rejected even after fixed-length works.
+- l07 submodule deferrals (the sprint shipped the cross-TU SMP function
+  fix, dep_scan ordering, and interface-mismatch / unknown-parent
+  diagnostics; these are the remaining lower-value gaps):
+  - `END PROCEDURE wrong_name` (mismatched end-name on an SMP body) is
+    not diagnosed — parser-level check, not yet added.
+  - Duplicate SMP definitions across sibling submodules are not
+    diagnosed (would need cross-TU/cross-sibling tracking).
+  - The DoD's "real stdlib submodule cluster" check (stdlib_quadrature +
+    simps) can't run directly: those sources are `.fypp` fypp templates,
+    which armfortas doesn't preprocess. Validated submodule clusters via
+    the hand-written multifile/nested fixtures instead
+    (cross_tu_submodule_*, multi_source_submodule_*, nested chains).
+  - SMP mismatch diagnostics name the ancestor module + procedure rather
+    than quoting the interface's source span — `.amod` interfaces don't
+    carry source spans (the OPEN QUESTION in the sprint; confirmed: no
+    spans in the `.amod` format).
 - F2023-syntax collision producing silent wrong answers today (accepted
   and mis-lowered, garbage at runtime): `real :: a([2,3])` (R818, an
   array-constructor bound in a type declaration). Details in
