@@ -39,6 +39,15 @@ Deferred items from the l00 F2023 inventory (2026-06-10):
   `call @lbound` instead of descriptor reads (l00 probe 22); confirmed on
   nomad — links fail with `_lbound` undefined. Needs a reduction
   independent of F2023.
+- Whole-array `lbound(a)` / `ubound(a)` (no `dim` arg, returns a rank-1
+  array of bounds) emits unresolvable external `lbound`/`ubound` symbols
+  for EVERY array, not just pointers — `shape(a)` whole-array works, so
+  the array-returning infra exists and these should mirror it. This is
+  the sole remaining blocker for `gfortran.dg/c_f_pointer_shape_tests_7`
+  (still XFAIL): C_F_POINTER `LOWER` itself is implemented and honored
+  (l06, verified by `test_programs/l06_c_f_pointer_lower.f90` via the
+  scalar-`dim` form and by the differential `c_interop_strings` test).
+  General array-intrinsic work, not C-interop — own it outside l06.
 - The runtime format parser accepts unknown edit-descriptor sequences
   without raising an I/O error: `'(at)'` printed untrimmed text,
   `'(lzs, f6.2)'` printed nothing, both exit 0 (nomad, 2026-06-10).
