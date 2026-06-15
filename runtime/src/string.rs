@@ -138,6 +138,33 @@ pub extern "C" fn afs_dealloc_string(desc: *mut StringDescriptor) {
     desc.flags &= STR_DEFERRED; // keep deferred, clear everything else
 }
 
+/// Associate a deferred-length character pointer with a C string (F2023
+/// C_F_STRPOINTER, 18.2.3.5). `data` points at the C bytes; `max_len` is
+/// the scan bound — NCHARS if given, else the size of the source array.
+/// The result length is the largest prefix containing no NUL and not
+/// exceeding `max_len`. No copy: the descriptor aliases C memory, so
+/// STR_ALLOCATED is left clear (no free path will touch it) and
+/// STR_POINTER records the pointer (not allocatable) association.
+#[no_mangle]
+pub extern "C" fn afs_c_f_strpointer(data: *const u8, max_len: i64, out: *mut StringDescriptor) {
+    if out.is_null() {
+        return;
+    }
+    let out = unsafe { &mut *out };
+    let mut len: i64 = 0;
+    if !data.is_null() {
+        // max_len < 0 is the unbounded (NUL-terminated) fallback; otherwise
+        // scan no further than max_len bytes.
+        while (max_len < 0 || len < max_len) && unsafe { *data.add(len as usize) } != 0 {
+            len += 1;
+        }
+    }
+    out.data = data as *mut u8;
+    out.len = len;
+    out.capacity = len;
+    out.flags = STR_DEFERRED | STR_POINTER;
+}
+
 /// ALLOCATED(s) for deferred-length character descriptors.
 #[no_mangle]
 pub extern "C" fn afs_string_allocated(desc: *const StringDescriptor) -> i32 {
@@ -716,6 +743,55 @@ pub extern "C" fn afs_tokenize_tokens(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- C_F_STRPOINTER ----
+
+    #[test]
+    fn c_f_strpointer_scans_to_nul() {
+        let buf = b"hello\0junk";
+        let mut d = StringDescriptor::zeroed();
+        afs_c_f_strpointer(buf.as_ptr(), buf.len() as i64, &mut d);
+        assert_eq!(d.len, 5);
+        assert_eq!(d.data, buf.as_ptr() as *mut u8); // aliases, no copy
+    }
+
+    #[test]
+    fn c_f_strpointer_honors_nchars_before_nul() {
+        let buf = b"hello\0junk";
+        let mut d = StringDescriptor::zeroed();
+        afs_c_f_strpointer(buf.as_ptr(), 3, &mut d); // bound below the NUL
+        assert_eq!(d.len, 3);
+    }
+
+    #[test]
+    fn c_f_strpointer_unbounded_when_negative() {
+        let buf = b"abcd\0";
+        let mut d = StringDescriptor::zeroed();
+        afs_c_f_strpointer(buf.as_ptr(), -1, &mut d);
+        assert_eq!(d.len, 4);
+    }
+
+    #[test]
+    fn c_f_strpointer_marks_pointer_not_allocatable() {
+        let buf = b"x\0";
+        let mut d = StringDescriptor::zeroed();
+        afs_c_f_strpointer(buf.as_ptr(), buf.len() as i64, &mut d);
+        assert_eq!(d.flags & STR_POINTER, STR_POINTER);
+        assert_eq!(d.flags & STR_ALLOCATED, 0); // never freed
+        assert_eq!(d.flags & STR_DEFERRED, STR_DEFERRED);
+    }
+
+    #[test]
+    fn dealloc_string_does_not_free_aliased_pointer() {
+        // A C_F_STRPOINTER descriptor aliases stack/C memory. DEALLOCATE
+        // (afs_dealloc_string) must NOT free it — STR_ALLOCATED is clear.
+        let buf = b"data\0";
+        let mut d = StringDescriptor::zeroed();
+        afs_c_f_strpointer(buf.as_ptr(), buf.len() as i64, &mut d);
+        afs_dealloc_string(&mut d); // would segfault/corrupt if it free()d buf
+        assert!(d.data.is_null());
+        assert_eq!(d.len, 0);
+    }
 
     // ---- TOKENIZE ----
 

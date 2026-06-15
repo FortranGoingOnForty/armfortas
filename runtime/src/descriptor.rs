@@ -220,6 +220,11 @@ pub struct StringDescriptor {
 /// String descriptor flags.
 pub const STR_ALLOCATED: u32 = 1 << 0;
 pub const STR_DEFERRED: u32 = 1 << 1;
+/// Set when the descriptor's data aliases storage owned elsewhere (a
+/// C string via C_F_STRPOINTER). STR_ALLOCATED is deliberately NOT set
+/// so the free paths never free C memory; this flag records that the
+/// association is pointer, not allocatable, so a DEALLOCATE can be caught.
+pub const STR_POINTER: u32 = 1 << 2;
 
 impl StringDescriptor {
     /// Create a zeroed (empty) string descriptor.
