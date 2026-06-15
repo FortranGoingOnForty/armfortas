@@ -956,6 +956,33 @@ pub(crate) fn alloc_decls(
                             continue;
                         }
                     }
+                    // IEEE opaque tag types (ieee_class_type, etc.) are
+                    // default-integer ordinals under the hood (l09), not
+                    // struct storage.
+                    if crate::sema::resolve::type_resolution::is_ieee_opaque_type(type_name) {
+                        let scalar_ty = IrType::Int(IntWidth::I32);
+                        let addr = b.alloca(scalar_ty.clone());
+                        locals.insert(
+                            key,
+                            LocalInfo {
+                                addr,
+                                ty: scalar_ty,
+                                dims: vec![],
+                                allocatable: false,
+                                descriptor_arg: false,
+                                by_ref: false,
+                                char_kind: CharKind::None,
+                                derived_type: None,
+                                inline_const: None,
+                                is_pointer: false,
+                                runtime_dim_upper: vec![],
+                                is_class: false,
+                                logical_kind: None,
+                                last_dim_assumed_size: false,
+                            },
+                        );
+                        continue;
+                    }
                     // Derived type variable: allocate struct-sized byte array.
                     if let Some(layout) = type_layouts.get(type_name) {
                         let struct_ty =
