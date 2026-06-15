@@ -793,6 +793,10 @@ fn validate_stmt_enum_usage(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
                 // Intrinsic — no user subroutine scope to walk below.
                 return;
             }
+            if name.eq_ignore_ascii_case("c_f_pointer") {
+                validate_c_f_pointer(ctx, args);
+                return;
+            }
             let Some(arg_names) = ctx.lookup(name).and_then(|sym| {
                 matches!(sym.kind, crate::sema::symtab::SymbolKind::Subroutine)
                     .then(|| sym.arg_names.clone())
@@ -976,6 +980,94 @@ fn validate_c_f_strpointer(ctx: &mut Ctx<'_>, args: &[crate::ast::expr::Argument
                     );
                 }
             }
+        }
+    }
+}
+
+/// F2023 C_F_POINTER LOWER constraints (gfortran.dg/c_f_pointer_shape_tests_8):
+/// the optional LOWER argument must be INTEGER and rank 1, and its size must
+/// match SHAPE. Only positively-determined violations are flagged.
+fn validate_c_f_pointer(ctx: &mut Ctx<'_>, args: &[crate::ast::expr::Argument]) {
+    use crate::ast::expr::SectionSubscript;
+
+    fn arg<'a>(
+        args: &'a [crate::ast::expr::Argument],
+        kw: &str,
+        pos: usize,
+    ) -> Option<&'a crate::ast::expr::SpannedExpr> {
+        if let Some(a) = args
+            .iter()
+            .find(|a| a.keyword.as_deref().is_some_and(|k| k.eq_ignore_ascii_case(kw)))
+        {
+            if let SectionSubscript::Element(e) = &a.value {
+                return Some(e);
+            }
+        }
+        args.iter()
+            .filter(|a| a.keyword.is_none())
+            .nth(pos)
+            .and_then(|a| match &a.value {
+                SectionSubscript::Element(e) => Some(e),
+                _ => None,
+            })
+    }
+
+    // Static rank of an actual: array constructor → 1, named array → its
+    // declared rank. None when not determinable.
+    fn rank_of(ctx: &Ctx<'_>, e: &crate::ast::expr::SpannedExpr) -> Option<usize> {
+        match &e.node {
+            Expr::ArrayConstructor { .. } => Some(1),
+            Expr::Name { name } => ctx.lookup(name).map(|s| s.attrs.array_spec.len()),
+            _ => None,
+        }
+    }
+    // Static element count of a rank-1 actual. Only inline constructors give a
+    // sound compile-time count without const-evaluating declared bounds; named
+    // arrays return None and skip the conformance check (no false positives).
+    fn static_len(_ctx: &Ctx<'_>, e: &crate::ast::expr::SpannedExpr) -> Option<usize> {
+        match &e.node {
+            Expr::ArrayConstructor { values, .. } => Some(values.len()),
+            _ => None,
+        }
+    }
+
+    let shape = arg(args, "shape", 2);
+    let Some(lower) = arg(args, "lower", 3) else {
+        return; // LOWER absent — nothing to check.
+    };
+
+    // LOWER must be INTEGER.
+    let lower_ty = crate::sema::types::expr_type(lower, ctx.st);
+    if !matches!(lower_ty, crate::sema::types::FortranType::Integer { .. }) {
+        ctx.error(
+            lower.span,
+            "C_F_POINTER LOWER argument must be of type INTEGER (F2023)".to_string(),
+        );
+    }
+
+    // LOWER must be rank 1.
+    if let Some(r) = rank_of(ctx, lower) {
+        if r != 1 {
+            ctx.error(
+                lower.span,
+                format!("C_F_POINTER LOWER argument must be of rank 1, not rank {r} (F2023)"),
+            );
+        }
+    }
+
+    // LOWER size must match SHAPE size (conformance).
+    if let (Some(s), Some(l)) = (
+        shape.and_then(|s| static_len(ctx, s)),
+        static_len(ctx, lower),
+    ) {
+        if s != l {
+            ctx.error(
+                lower.span,
+                format!(
+                    "C_F_POINTER LOWER has {l} element(s) but SHAPE has {s}; \
+                     they must conform (F2023)"
+                ),
+            );
         }
     }
 }

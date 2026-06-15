@@ -2,12 +2,10 @@
 ! (gcc commit b700707a77eeaa1d37f733c4b2d2e242063c29d2).
 ! Original directives: { dg-do compile } { dg-options "-std=f2023" } + 2x dg-error (LOWER must be INTEGER / rank 1)
 ! Conversion notes: tests/fixtures/gfortran-dg/README.md
-! Wanted diagnostic: LOWER argument must be INTEGER and rank 1. Today
-! armfortas accepts both calls with no diagnostic, so the XFAIL fires.
+! Wanted diagnostic: LOWER argument must be INTEGER and rank 1 (l06).
 ! Bare module (not runnable); ERROR_EXPECTED needs no runnable main.
 ! FLAGS: --std=f2023
 ! ERROR_EXPECTED: LOWER
-! XFAIL: f2023 C_F_POINTER LOWER argument validation not implemented (l06); see .docs/audits/f2023-feature-matrix.md
 ! Verify that the type and rank of the LOWER argument are enforced.
 module c_f_pointer_shape_tests_8
   use, intrinsic :: iso_c_binding
