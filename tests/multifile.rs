@@ -586,3 +586,95 @@ fn module_private_default() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// l07: a separately-compiled submodule whose body implements a parent
+// MODULE FUNCTION must return the right type. The result variable's type
+// comes from the parent interface via the `.amod`; before l07 it fell to
+// implicit typing (an integer result named `r` became REAL, returned in a
+// different register than the caller read) — a silent wrong answer. Covers
+// both the with-args and no-arg function forms plus a subroutine control.
+#[test]
+fn cross_tu_submodule_scalar_function_returns_correct_type() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=cross_tu_submodule_scalar_function_returns_correct_type count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let parent_f90 = dir.join("sm_parent.f90");
+    let child_f90 = dir.join("sm_child.f90");
+    let main_f90 = dir.join("sm_main.f90");
+    let parent_o = dir.join("sm_parent.o");
+    let child_o = dir.join("sm_child.o");
+    let main_o = dir.join("sm_main.o");
+    let binary = dir.join("sm_bin");
+
+    std::fs::write(
+        &parent_f90,
+        r#"module sm
+  implicit none
+  interface
+    module function dbl(x) result(r)
+      integer, intent(in) :: x
+      integer :: r
+    end function
+    module function answer() result(r)
+      integer :: r
+    end function
+    module subroutine setit(v)
+      integer, intent(out) :: v
+    end subroutine
+  end interface
+end module
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &child_f90,
+        r#"submodule (sm) sm_impl
+contains
+  module procedure dbl
+    r = 2 * x
+  end procedure
+  module procedure answer
+    r = 42
+  end procedure
+  module procedure setit
+    v = 99
+  end procedure
+end submodule
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &main_f90,
+        r#"program p
+  use sm
+  implicit none
+  integer :: v
+  if (dbl(21) /= 42) error stop 1
+  if (answer() /= 42) error stop 2
+  call setit(v)
+  if (v /= 99) error stop 3
+  print *, "ok"
+end program
+"#,
+    )
+    .unwrap();
+
+    compile_file(&compiler, &parent_f90, &parent_o, None);
+    compile_file(&compiler, &child_f90, &child_o, Some(&dir));
+    compile_file(&compiler, &main_f90, &main_o, Some(&dir));
+    link_files(&[&main_o, &child_o, &parent_o], &binary);
+    let output = run_binary(&binary);
+    assert!(
+        output.contains("ok"),
+        "cross-TU submodule scalar function returned wrong value (or wrong register):\n{}",
+        output
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
