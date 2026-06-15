@@ -8742,19 +8742,22 @@ pub(super) fn char_array_element_ptr_and_len(
         return None;
     }
     let idx64 = compute_flat_elem_offset(b, locals, info, args, st, type_layouts);
-    let elem_len = match info.char_kind {
-        CharKind::Fixed(n) => b.const_i64(n),
-        CharKind::FixedRuntime { len_addr } | CharKind::AssumedLen { len_addr } => b.load(len_addr),
-        CharKind::Deferred if local_uses_array_descriptor(info) => {
-            let desc = array_descriptor_addr(b, info);
-            descriptor_elem_size(b, desc)
+    let elem_len = if local_uses_array_descriptor(info) && info.char_kind != CharKind::None {
+        let desc = array_descriptor_addr(b, info);
+        descriptor_elem_size(b, desc)
+    } else {
+        match info.char_kind {
+            CharKind::Fixed(n) => b.const_i64(n),
+            CharKind::FixedRuntime { len_addr } | CharKind::AssumedLen { len_addr } => {
+                b.load(len_addr)
+            }
+            CharKind::Deferred => return None,
+            CharKind::None if descriptor_backed_runtime_char_array(info) => {
+                let desc = array_descriptor_addr(b, info);
+                descriptor_elem_size(b, desc)
+            }
+            CharKind::None => return None,
         }
-        CharKind::Deferred => return None,
-        CharKind::None if descriptor_backed_runtime_char_array(info) => {
-            let desc = array_descriptor_addr(b, info);
-            descriptor_elem_size(b, desc)
-        }
-        CharKind::None => return None,
     };
     if !local_uses_array_descriptor(info) && !info.by_ref {
         if inline_char_array_storage(info) {
@@ -8833,19 +8836,22 @@ pub(super) fn char_array_elem_ptr_and_len_from_flat_index(
     if info.char_kind == CharKind::None && !descriptor_backed_runtime_char_array(info) {
         return None;
     }
-    let elem_len = match info.char_kind {
-        CharKind::Fixed(n) => b.const_i64(n),
-        CharKind::FixedRuntime { len_addr } | CharKind::AssumedLen { len_addr } => b.load(len_addr),
-        CharKind::Deferred if local_uses_array_descriptor(info) => {
-            let desc = array_descriptor_addr(b, info);
-            descriptor_elem_size(b, desc)
+    let elem_len = if local_uses_array_descriptor(info) && info.char_kind != CharKind::None {
+        let desc = array_descriptor_addr(b, info);
+        descriptor_elem_size(b, desc)
+    } else {
+        match info.char_kind {
+            CharKind::Fixed(n) => b.const_i64(n),
+            CharKind::FixedRuntime { len_addr } | CharKind::AssumedLen { len_addr } => {
+                b.load(len_addr)
+            }
+            CharKind::Deferred => return None,
+            CharKind::None if descriptor_backed_runtime_char_array(info) => {
+                let desc = array_descriptor_addr(b, info);
+                descriptor_elem_size(b, desc)
+            }
+            CharKind::None => return None,
         }
-        CharKind::Deferred => return None,
-        CharKind::None if descriptor_backed_runtime_char_array(info) => {
-            let desc = array_descriptor_addr(b, info);
-            descriptor_elem_size(b, desc)
-        }
-        CharKind::None => return None,
     };
     if !local_uses_array_descriptor(info) && !info.by_ref {
         if inline_char_array_storage(info) {
@@ -9140,7 +9146,19 @@ pub(super) fn char_addr_and_substring_bound_len(
 
 pub(super) fn local_char_runtime_len(b: &mut FuncBuilder, info: &LocalInfo) -> Option<ValueId> {
     match &info.char_kind {
-        CharKind::Fixed(n) => Some(b.const_i64(*n)),
+        CharKind::Fixed(n) => {
+            if *n == 1
+                && local_uses_array_descriptor(info)
+                && info.allocatable
+                && info.dims.is_empty()
+                && !info.descriptor_arg
+            {
+                let desc = array_descriptor_addr(b, info);
+                Some(descriptor_elem_size(b, desc))
+            } else {
+                Some(b.const_i64(*n))
+            }
+        }
         CharKind::FixedRuntime { len_addr } | CharKind::AssumedLen { len_addr } => {
             Some(b.load(*len_addr))
         }
@@ -9689,7 +9707,22 @@ pub(super) fn lower_char_intrinsic(
             // F2018 §16.9.108: LEN returns default integer. Descriptor
             // length is stored as I64; truncate to I32 so generic
             // dispatch can match `integer` formals (kind=4).
-            let (_, len) = lower_string_arg(b, arg_spanned(0)?);
+            let arg = arg_spanned(0)?;
+            let len = if let Some(len) = actual_char_arg_runtime_len(
+                b,
+                locals,
+                None,
+                arg,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            ) {
+                len
+            } else {
+                lower_string_arg(b, arg).1
+            };
             let truncated = match b.func().value_type(len) {
                 Some(IrType::Int(IntWidth::I64)) => b.int_trunc(len, IntWidth::I32),
                 _ => len,
@@ -21304,6 +21337,13 @@ pub(super) fn allocated_array_elem_size(
     fallback_bytes: i64,
     typed_char_len: Option<ValueId>,
 ) -> ValueId {
+    if let Some(len) = typed_char_len {
+        if local_uses_array_descriptor(info)
+            && matches!(info.char_kind, CharKind::Fixed(_) | CharKind::Deferred)
+        {
+            return len;
+        }
+    }
     match info.char_kind {
         CharKind::Fixed(len) => b.const_i64(len),
         CharKind::FixedRuntime { len_addr } | CharKind::AssumedLen { len_addr } => b.load(len_addr),

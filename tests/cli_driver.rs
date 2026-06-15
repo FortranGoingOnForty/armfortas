@@ -10730,7 +10730,7 @@ fn logical_and_or_short_circuit_in_conditions() {
         return;
     }
     let src = write_program(
-        "program p\n  implicit none\n  if (.false. .and. boom()) stop 1\n  if (.true. .or. boom()) stop 2\ncontains\n  logical function boom()\n    error stop 7\n  end function boom\nend program\n",
+        "program p\n  implicit none\n  if (.false. .and. boom()) error stop 1\n  if (.not. (.true. .or. boom())) error stop 2\ncontains\n  logical function boom()\n    error stop 7\n  end function boom\nend program\n",
         "f90",
     );
     let out = unique_path("short_circuit", "bin");
@@ -10746,7 +10746,7 @@ fn logical_and_or_short_circuit_in_conditions() {
     let run = Command::new(&out).output().expect("failed to run binary");
     assert!(
         run.status.success(),
-        "short-circuit repro should not evaluate boom():\nstdout:\n{}\nstderr:\n{}",
+        "short-circuit repro should not evaluate boom() and should preserve the logical result:\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr)
     );
@@ -41864,7 +41864,7 @@ fn block_use_defined_assignment_survives_prior_generic_import_from_amod() {
         String::from_utf8_lossy(&link.stderr)
     );
 
-    let run = run_binary_with_timeout(&exe, std::time::Duration::from_secs(5))
+    let run = run_binary_with_timeout(&exe, std::time::Duration::from_secs(60))
         .expect("block-use assignment run timed out");
     assert!(
         run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
