@@ -1518,6 +1518,74 @@ mod tests {
     }
 
     #[test]
+    fn emit_vtable_quad_table_machos_symbols_get_underscore_prefix() {
+        let asm = emit_globals_lp64_test(&[Global {
+            name: "afs_vtable_m_t".into(),
+            ty: IrType::Array(Box::new(IrType::Int(IntWidth::I64)), 3),
+            initializer: Some(GlobalInit::QuadTable(vec![
+                QuadSlot::Int(42),
+                QuadSlot::Int(0),
+                QuadSlot::Sym("afs_modproc_m_method".into()),
+            ])),
+        }]);
+        // Vtables are externally visible (consumers in other TUs link to
+        // them) and 8-byte aligned.
+        assert!(
+            asm.contains(".globl _afs_vtable_m_t"),
+            "vtable needs external linkage:\n{}",
+            asm
+        );
+        assert!(
+            asm.contains(".p2align 3\n_afs_vtable_m_t:"),
+            "vtable needs 8-byte alignment:\n{}",
+            asm
+        );
+        // Header ints emit raw; symbol slots emit a relocation with the
+        // Mach-O symbol prefix.
+        assert!(asm.contains("    .quad 42\n"), "tag slot:\n{}", asm);
+        assert!(
+            asm.contains("    .quad _afs_modproc_m_method\n"),
+            "symbol slot needs the _ prefix on Mach-O:\n{}",
+            asm
+        );
+        assert_eq!(asm.matches(".quad").count(), 3, "three slots:\n{}", asm);
+    }
+
+    #[test]
+    fn emit_vtable_quad_table_elf_symbols_unprefixed() {
+        let asm = crate::codegen::shared::emit_globals(
+            &[Global {
+                name: "afs_vtable_m_t".into(),
+                ty: IrType::Array(Box::new(IrType::Int(IntWidth::I64)), 3),
+                initializer: Some(GlobalInit::QuadTable(vec![
+                    QuadSlot::Int(7),
+                    QuadSlot::Sym("afs_vtable_m_base".into()),
+                    QuadSlot::Sym("afs_modproc_m_method".into()),
+                ])),
+            }],
+            &crate::target::TargetLayout::LP64,
+            crate::codegen::shared::GlobalsDialect::Elf,
+        );
+        assert!(
+            asm.contains(".globl afs_vtable_m_t"),
+            "ELF vtable external linkage:\n{}",
+            asm
+        );
+        // ELF carries no symbol prefix: parent pointer and method slot
+        // are plain symbol names.
+        assert!(
+            asm.contains("    .quad afs_vtable_m_base\n"),
+            "parent pointer slot:\n{}",
+            asm
+        );
+        assert!(
+            asm.contains("    .quad afs_modproc_m_method\n"),
+            "method slot unprefixed on ELF:\n{}",
+            asm
+        );
+    }
+
+    #[test]
     fn emit_byte_array_global_uses_natural_alignment() {
         let asm = emit_globals_lp64_test(&[Global {
             name: "history".into(),
