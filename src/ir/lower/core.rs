@@ -286,7 +286,7 @@ pub fn lower_file(
             None,
         );
     }
-    emit_type_bound_lookup_thunks(&mut module, units, st, type_layouts, &internal_funcs);
+    emit_type_bound_vtables(&mut module, units, st, type_layouts, &internal_funcs);
     if crate::opt::pass::Pass::run(&crate::opt::dce::Dce, &mut module) {
         for func in &mut module.functions {
             func.rebuild_type_cache();
@@ -301,12 +301,12 @@ pub fn lower_file(
 }
 
 pub(super) fn collect_local_owner_modules(units: &[SpannedUnit]) -> HashSet<String> {
-    // Only the parent module's TU should emit TBP-lookup thunks for
-    // types it owns. Submodule TUs see the same `owner_module` on
-    // shared layouts but must NOT re-emit the thunk, otherwise the
-    // linker reports duplicate symbols when both objects end up in
-    // the same archive (e.g. `_afs_tbplookup_stdlib_bitsets_bitset_64`
-    // appearing in both stdlib_bitsets.o and stdlib_bitsets_64.o).
+    // Only the parent module's TU should emit the TBP vtable for types
+    // it owns. Submodule TUs see the same `owner_module` on shared
+    // layouts but must NOT re-emit the table, otherwise the linker
+    // reports duplicate symbols when both objects end up in the same
+    // archive (e.g. `_afs_vtable_stdlib_bitsets_bitset_64` appearing in
+    // both stdlib_bitsets.o and stdlib_bitsets_64.o).
     let mut out = HashSet::new();
     for unit in units {
         if let ProgramUnit::Module { name, .. } = &unit.node {
@@ -328,13 +328,55 @@ pub(super) fn bound_proc_target_is_local_to_owner(
         .starts_with(&format!("afs_modproc_{}_", owner.to_lowercase()))
 }
 
-pub(super) fn emit_type_bound_lookup_thunks(
+/// Resolve the linker symbol a bound-procedure slot points at, or `None`
+/// when no concrete target is visible (deferred binding on an abstract
+/// type, or a target this TU can't name). Shared by vtable emission and
+/// kept identical to the previous thunk's resolution so dispatch targets
+/// are unchanged — only the indirection mechanism moved from a switch
+/// function to a const table.
+fn bound_proc_slot_target_symbol(
+    layout: &crate::sema::type_layout::TypeLayout,
+    bp: &crate::sema::type_layout::BoundProc,
+    st: &SymbolTable,
+    internal_funcs: &HashMap<String, u32>,
+    available_targets: &HashSet<String>,
+) -> Option<String> {
+    let local_target = if layout.owner_module.is_none() {
+        find_procedure_scope_id(st, &bp.target_name)
+            .or_else(|| find_procedure_scope_id(st, &bp.abi_name))
+            .and_then(|scope_id| lowered_scope_symbol_name(st, internal_funcs, scope_id))
+    } else {
+        None
+    };
+    if let Some(local_target) = local_target {
+        return Some(local_target);
+    }
+    let target_is_external_inherited =
+        !layout.is_abstract && !bound_proc_target_is_local_to_owner(layout, &bp.target_name);
+    if available_targets.contains(&bp.target_name) || target_is_external_inherited {
+        Some(bp.target_name.clone())
+    } else {
+        None
+    }
+}
+
+/// Emit one constant vtable per concrete (and abstract, for parent
+/// chaining) derived type with bound procedures. Layout:
+///   `[type_tag i64, parent_vtable_ptr, slot_0, slot_1, ...]`
+/// Slots are in `bound_procs` binding order — parent bindings first in
+/// parent order, then new bindings; an override has already replaced the
+/// inherited slot in place (see `compute_layout`). A slot with no visible
+/// target (deferred binding on an abstract type) is null. Dispatch loads
+/// the table pointer from descriptor offset 32, then slot `index` at byte
+/// offset `16 + index*8`, and indirect-calls it.
+pub(super) fn emit_type_bound_vtables(
     module: &mut Module,
     units: &[SpannedUnit],
     st: &SymbolTable,
     type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
     internal_funcs: &HashMap<String, u32>,
 ) {
+    use crate::ir::inst::{Global, GlobalInit, QuadSlot};
     let local_modules = collect_local_owner_modules(units);
     let available_targets: HashSet<String> = module
         .functions
@@ -354,71 +396,56 @@ pub(super) fn emit_type_bound_lookup_thunks(
         })
         .collect();
     layouts.sort_by_key(|layout| {
-        type_layout_tbp_lookup_symbol(layout).unwrap_or_else(|| layout.name.to_lowercase())
+        type_layout_vtable_symbol(layout).unwrap_or_else(|| layout.name.to_lowercase())
     });
 
     for layout in layouts {
-        let Some(symbol) = type_layout_tbp_lookup_symbol(layout) else {
+        let Some(symbol) = type_layout_vtable_symbol(layout) else {
             continue;
         };
-        if module.functions.iter().any(|func| func.name == symbol) {
+        if module.globals.iter().any(|g| g.name == symbol) {
             continue;
         }
-        let slot_param = crate::ir::inst::Param {
-            name: "slot".into(),
-            ty: IrType::Int(IntWidth::I64),
-            id: ValueId(0),
-            fortran_noalias: false,
-        };
-        let mut func = Function::new(
-            symbol,
-            vec![slot_param],
-            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-        );
-        {
-            let mut b = FuncBuilder::new(&mut func, module.layout);
-            let default_bb = b.create_block("tbp_lookup_default");
-            let mut cases = Vec::with_capacity(layout.bound_procs.len());
-            let mut case_blocks = Vec::with_capacity(layout.bound_procs.len());
-            for (slot, _) in layout.bound_procs.iter().enumerate() {
-                let bb = b.create_block(&format!("tbp_lookup_case_{}", slot));
-                cases.push((slot as i64, bb));
-                case_blocks.push(bb);
-            }
-            b.switch(ValueId(0), cases, default_bb);
-            for (bb, bp) in case_blocks.into_iter().zip(layout.bound_procs.iter()) {
-                b.set_block(bb);
-                let local_target = if layout.owner_module.is_none() {
-                    find_procedure_scope_id(st, &bp.target_name)
-                        .or_else(|| find_procedure_scope_id(st, &bp.abi_name))
-                        .and_then(|scope_id| {
-                            lowered_scope_symbol_name(st, internal_funcs, scope_id)
-                        })
-                } else {
-                    None
-                };
-                let target_is_external_inherited = !layout.is_abstract
-                    && !bound_proc_target_is_local_to_owner(layout, &bp.target_name);
-                let addr = if let Some(local_target) = local_target {
-                    b.global_addr(&local_target, IrType::Int(IntWidth::I8))
-                } else if available_targets.contains(&bp.target_name)
-                    || target_is_external_inherited
-                {
-                    b.global_addr(&bp.target_name, IrType::Int(IntWidth::I8))
-                } else {
-                    let zero = b.const_i64(0);
-                    b.int_to_ptr(zero, IrType::Int(IntWidth::I8))
-                };
-                b.ret(Some(addr));
-            }
-            b.set_block(default_bb);
-            let zero = b.const_i64(0);
-            let null = b.int_to_ptr(zero, IrType::Int(IntWidth::I8));
-            b.ret(Some(null));
+        let mut slots: Vec<QuadSlot> = Vec::with_capacity(layout.bound_procs.len() + 2);
+        // Header: type tag, then the parent's vtable pointer (for a
+        // future runtime EXTENDS fast path), or null when the parent has
+        // no bound procedures of its own.
+        slots.push(QuadSlot::Int(layout.type_tag as i64));
+        let parent_vtable = layout
+            .parent
+            .as_ref()
+            .and_then(|parent| type_layouts.get(parent))
+            .and_then(type_layout_vtable_symbol);
+        slots.push(match parent_vtable {
+            Some(sym) => QuadSlot::Sym(sym),
+            None => QuadSlot::Int(0),
+        });
+        for bp in &layout.bound_procs {
+            slots.push(
+                match bound_proc_slot_target_symbol(
+                    layout,
+                    bp,
+                    st,
+                    internal_funcs,
+                    &available_targets,
+                ) {
+                    Some(sym) => QuadSlot::Sym(sym),
+                    None => QuadSlot::Int(0),
+                },
+            );
         }
-        module.add_function(func);
+        let len = slots.len() as u64;
+        module.add_global(Global {
+            name: symbol,
+            ty: IrType::Array(Box::new(IrType::Int(IntWidth::I64)), len),
+            initializer: Some(GlobalInit::QuadTable(slots)),
+        });
     }
 }
+
+/// Byte offset of slot 0 within a vtable (past the `[tag, parent]`
+/// header). Slot `i` lives at `VTABLE_HEADER_BYTES + i * 8`.
+pub(super) const VTABLE_HEADER_BYTES: i64 = 16;
 
 /// Recursively walk `unit` and, for every contained subprogram, record
 /// the ordered list of immediate-host-local variable names it reads or
@@ -16995,12 +17022,6 @@ pub(super) fn emit_dynamic_bound_proc_lookup_dispatch(
     )
     .or_else(|| base_layout.bound_proc(component))
     .unwrap_or_else(|| fail_unmatched_bound_proc_resolution(call_span, base_layout, component));
-    let candidates = concrete_bound_proc_dispatch_candidates(
-        type_layouts,
-        base_type,
-        component,
-        &declared_bp.abi_name,
-    );
     let slot_index = base_layout.bound_procs.iter().position(|bp| {
         bp.method_name.eq_ignore_ascii_case(component)
             && bp.abi_name.eq_ignore_ascii_case(&declared_bp.abi_name)
@@ -17023,26 +17044,31 @@ pub(super) fn emit_dynamic_bound_proc_lookup_dispatch(
         None
     };
 
-    let lookup_ptr = load_array_desc_tbp_lookup_ptr(b, desc_addr);
-    let lookup_raw = b.ptr_to_int(lookup_ptr);
+    // Single-table dispatch: load the vtable pointer from the
+    // descriptor (offset 32), index slot `slot_index` past the
+    // `[tag, parent]` header, and indirect-call the loaded code pointer.
+    // No tag-comparison chain — the table carries the dynamic type's
+    // target directly, including across TUs that never saw the type's
+    // source. A null table or null slot means dispatch on an
+    // unallocated/disassociated object (or a deferred binding); fail
+    // loudly with ERROR STOP rather than jumping through null.
+    let vtable_ptr = load_array_desc_vtable_ptr(b, desc_addr);
+    let vtable_raw = b.ptr_to_int(vtable_ptr);
     let zero = b.const_i64(0);
-    let has_lookup = b.icmp(CmpOp::Ne, lookup_raw, zero);
-    let lookup_bb = b.create_block("tbp_lookup_dispatch");
-    let fallback_bb = b.create_block("tbp_lookup_fallback");
-    let done_bb = b.create_block("tbp_lookup_done");
-    b.cond_branch(has_lookup, lookup_bb, vec![], fallback_bb, vec![]);
+    let has_vtable = b.icmp(CmpOp::Ne, vtable_raw, zero);
+    let dispatch_bb = b.create_block("vtable_dispatch");
+    let fail_bb = b.create_block("vtable_dispatch_fail");
+    let done_bb = b.create_block("vtable_dispatch_done");
+    b.cond_branch(has_vtable, dispatch_bb, vec![], fail_bb, vec![]);
 
-    b.set_block(lookup_bb);
-    let slot_val = b.const_i64(slot_index);
-    let target_ptr = b.call(
-        FuncRef::Indirect(lookup_ptr),
-        vec![slot_val],
-        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-    );
+    b.set_block(dispatch_bb);
+    let slot_off = b.const_i64(VTABLE_HEADER_BYTES + slot_index * 8);
+    let slot_ptr = b.gep(vtable_ptr, vec![slot_off], IrType::Int(IntWidth::I8));
+    let target_ptr = b.load_typed(slot_ptr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
     let target_raw = b.ptr_to_int(target_ptr);
     let target_ok = b.icmp(CmpOp::Ne, target_raw, zero);
-    let call_bb = b.create_block("tbp_lookup_call");
-    b.cond_branch(target_ok, call_bb, vec![], fallback_bb, vec![]);
+    let call_bb = b.create_block("vtable_dispatch_call");
+    b.cond_branch(target_ok, call_bb, vec![], fail_bb, vec![]);
 
     b.set_block(call_bb);
     let call_result = emit_resolved_bound_proc_call(
@@ -17066,60 +17092,6 @@ pub(super) fn emit_dynamic_bound_proc_lookup_dispatch(
         b.store(call_result, slot);
     }
     b.branch(done_bb, vec![]);
-
-    b.set_block(fallback_bb);
-    let fail_bb = b.create_block("tbp_dispatch_fail");
-    if candidates.is_empty() {
-        b.branch(fail_bb, vec![]);
-    } else {
-        let runtime_tag = load_array_desc_type_tag(b, desc_addr);
-        let test_blocks: Vec<BlockId> = candidates
-            .iter()
-            .enumerate()
-            .map(|(i, _)| b.create_block(&format!("tbp_dispatch_test_{}", i)))
-            .collect();
-        let case_blocks: Vec<BlockId> = candidates
-            .iter()
-            .enumerate()
-            .map(|(i, _)| b.create_block(&format!("tbp_dispatch_case_{}", i)))
-            .collect();
-        b.branch(test_blocks[0], vec![]);
-
-        for (idx, (type_tag, bp)) in candidates.iter().enumerate() {
-            b.set_block(test_blocks[idx]);
-            let expected_tag = b.const_i64(*type_tag as i64);
-            let is_match = b.icmp(CmpOp::Eq, runtime_tag, expected_tag);
-            let next_test = if idx + 1 < test_blocks.len() {
-                test_blocks[idx + 1]
-            } else {
-                fail_bb
-            };
-            b.cond_branch(is_match, case_blocks[idx], vec![], next_test, vec![]);
-
-            b.set_block(case_blocks[idx]);
-            let call_result = emit_resolved_bound_proc_call(
-                b,
-                locals,
-                st,
-                Some(type_layouts),
-                internal_funcs,
-                contained_host_refs,
-                optional_params,
-                descriptor_params,
-                obj_addr,
-                Some(desc_addr),
-                FuncRef::External(bp.target_name.clone()),
-                bp,
-                args,
-                None,
-                call_ret_ty.clone(),
-            )?;
-            if let Some(slot) = result_slot {
-                b.store(call_result, slot);
-            }
-            b.branch(done_bb, vec![]);
-        }
-    }
 
     b.set_block(fail_bb);
     b.runtime_call(RuntimeFunc::ErrorStop, vec![], IrType::Void);
@@ -17227,30 +17199,6 @@ pub(super) fn resolve_polymorphic_component_method_base_for_dispatch(
         }
         _ => None,
     }
-}
-
-pub(super) fn concrete_bound_proc_dispatch_candidates(
-    tl: &crate::sema::type_layout::TypeLayoutRegistry,
-    base_type: &str,
-    component: &str,
-    abi_name: &str,
-) -> Vec<(u64, crate::sema::type_layout::BoundProc)> {
-    let mut out: Vec<(u64, crate::sema::type_layout::BoundProc)> = tl
-        .layouts
-        .values()
-        .filter(|layout| !layout.is_abstract)
-        .filter(|layout| is_type_or_extends(&layout.name, base_type, tl))
-        .filter_map(|layout| {
-            layout
-                .bound_proc_candidates(component)
-                .into_iter()
-                .find(|bp| bp.abi_name.eq_ignore_ascii_case(abi_name))
-                .cloned()
-                .map(|bp| (layout.type_tag, bp))
-        })
-        .collect();
-    out.sort_by_key(|(tag, _)| *tag);
-    out
 }
 
 pub(super) fn concrete_type_dispatch_candidates(
@@ -28325,7 +28273,7 @@ pub(super) fn lower_parameter_derived_component_const(
     }
 }
 
-pub(super) fn load_array_desc_tbp_lookup_ptr(b: &mut FuncBuilder, desc: ValueId) -> ValueId {
+pub(super) fn load_array_desc_vtable_ptr(b: &mut FuncBuilder, desc: ValueId) -> ValueId {
     let off = b.const_i64(32);
     let ptr = b.gep(desc, vec![off], IrType::Int(IntWidth::I8));
     b.load_typed(ptr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
@@ -28364,17 +28312,13 @@ pub(super) fn store_array_desc_type_tag(b: &mut FuncBuilder, desc: ValueId, tag:
     b.set_block(done_bb);
 }
 
-pub(super) fn store_array_desc_tbp_lookup_ptr(
-    b: &mut FuncBuilder,
-    desc: ValueId,
-    lookup_ptr: ValueId,
-) {
+pub(super) fn store_array_desc_vtable_ptr(b: &mut FuncBuilder, desc: ValueId, vtable_ptr: ValueId) {
     store_byte_aggregate_field(
         b,
         desc,
         32,
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-        lookup_ptr,
+        vtable_ptr,
     );
 }
 
@@ -28407,7 +28351,7 @@ pub(super) fn store_scalar_polymorphic_descriptor_view(
         store_array_desc_type_tag(b, desc, tag);
     }
     if let Some(ptr) = lookup_ptr {
-        store_array_desc_tbp_lookup_ptr(b, desc, ptr);
+        store_array_desc_vtable_ptr(b, desc, ptr);
     }
 }
 
@@ -29932,8 +29876,8 @@ pub(super) fn lower_descriptor_actual_from_info(
                     );
                     let tag = b.const_i64(layout.type_tag as i64);
                     store_array_desc_type_tag(b, desc, tag);
-                    if let Some(lookup_ptr) = type_layout_tbp_lookup_value(b, layout) {
-                        store_array_desc_tbp_lookup_ptr(b, desc, lookup_ptr);
+                    if let Some(lookup_ptr) = type_layout_vtable_value(b, layout) {
+                        store_array_desc_vtable_ptr(b, desc, lookup_ptr);
                     }
                     return desc;
                 }
@@ -29974,12 +29918,12 @@ pub(super) fn lower_descriptor_actual_from_info(
             .and_then(|name| type_layouts.and_then(|layouts| layouts.get(name)))
             .map(|layout| b.const_i64(layout.size as i64))
             .or_else(|| Some(b.const_i64(descriptor_element_size_bytes(info, b.layout))));
-        let tbp_lookup = info
+        let vtable = info
             .derived_type
             .as_ref()
             .and_then(|name| type_layouts.and_then(|layouts| layouts.get(name)))
-            .and_then(|layout| type_layout_tbp_lookup_value(b, layout));
-        store_scalar_polymorphic_descriptor_view(b, desc, base, elem_size, tag, tbp_lookup);
+            .and_then(|layout| type_layout_vtable_value(b, layout));
+        store_scalar_polymorphic_descriptor_view(b, desc, base, elem_size, tag, vtable);
         desc
     } else if !info.dims.is_empty() {
         materialize_array_descriptor_for_info(b, info)
@@ -30011,12 +29955,12 @@ pub(super) fn materialize_scalar_element_descriptor_from_info(
         .as_ref()
         .and_then(|name| type_layouts.and_then(|layouts| layouts.get(name)))
         .map(|layout| b.const_i64(layout.type_tag as i64));
-    let tbp_lookup = info
+    let vtable = info
         .derived_type
         .as_ref()
         .and_then(|name| type_layouts.and_then(|layouts| layouts.get(name)))
-        .and_then(|layout| type_layout_tbp_lookup_value(b, layout));
-    store_scalar_polymorphic_descriptor_view(b, desc, elem_base, elem_size, tag, tbp_lookup);
+        .and_then(|layout| type_layout_vtable_value(b, layout));
+    store_scalar_polymorphic_descriptor_view(b, desc, elem_base, elem_size, tag, vtable);
     desc
 }
 
@@ -30232,15 +30176,15 @@ pub(super) fn box_actual_into_class_star_descriptor(
                 .or_else(|| {
                     type_layouts.and_then(|tl| expr_type_tag_value(b, expr, Some(locals), st, tl))
                 });
-        let tbp_lookup =
-            type_layouts.and_then(|tl| expr_tbp_lookup_value(b, expr, Some(locals), st, tl));
+        let vtable =
+            type_layouts.and_then(|tl| expr_vtable_value(b, expr, Some(locals), st, tl));
         store_scalar_polymorphic_descriptor_view(
             b,
             desc,
             base_ptr,
             Some(elem_size),
             type_tag,
-            tbp_lookup,
+            vtable,
         );
         return desc;
     }
@@ -30347,15 +30291,15 @@ pub(super) fn box_actual_into_class_star_descriptor(
             .or_else(|| {
                 type_layouts.and_then(|tl| expr_type_tag_value(b, expr, Some(locals), st, tl))
             });
-    let tbp_lookup =
-        type_layouts.and_then(|tl| expr_tbp_lookup_value(b, expr, Some(locals), st, tl));
+    let vtable =
+        type_layouts.and_then(|tl| expr_vtable_value(b, expr, Some(locals), st, tl));
     store_scalar_polymorphic_descriptor_view(
         b,
         desc,
         base_ptr,
         Some(elem_size),
         type_tag,
-        tbp_lookup,
+        vtable,
     );
     desc
 }
@@ -44140,9 +44084,9 @@ pub(super) fn emit_derived_array_desc_copy(
 
     b.set_block(bb_exit);
     let tag = load_array_desc_type_tag(b, source_desc);
-    let lookup = load_array_desc_tbp_lookup_ptr(b, source_desc);
+    let lookup = load_array_desc_vtable_ptr(b, source_desc);
     store_array_desc_type_tag(b, dest_desc, tag);
-    store_array_desc_tbp_lookup_ptr(b, dest_desc, lookup);
+    store_array_desc_vtable_ptr(b, dest_desc, lookup);
 }
 
 pub(super) fn emit_allocatable_source_copy_on_success(
@@ -44280,7 +44224,7 @@ pub(super) fn derived_type_tag_value(
         .map(|layout| b.const_i64(layout.type_tag as i64))
 }
 
-pub(super) fn type_layout_tbp_lookup_symbol(
+pub(super) fn type_layout_vtable_symbol(
     layout: &crate::sema::type_layout::TypeLayout,
 ) -> Option<String> {
     if layout.bound_procs.is_empty() {
@@ -44288,7 +44232,7 @@ pub(super) fn type_layout_tbp_lookup_symbol(
     }
     if let Some(owner) = layout.owner_module.as_ref() {
         return Some(format!(
-            "afs_tbplookup_{}_{}",
+            "afs_vtable_{}_{}",
             owner.to_lowercase(),
             layout.name.to_lowercase()
         ));
@@ -44307,38 +44251,38 @@ pub(super) fn type_layout_tbp_lookup_symbol(
         bp.nopass.hash(&mut hasher);
     }
     Some(format!(
-        "afs_tbplookup_local_{:016x}_{}",
+        "afs_vtable_local_{:016x}_{}",
         hasher.finish(),
         layout.name.to_lowercase()
     ))
 }
 
-pub(super) fn type_layout_tbp_lookup_value(
+pub(super) fn type_layout_vtable_value(
     b: &mut FuncBuilder,
     layout: &crate::sema::type_layout::TypeLayout,
 ) -> Option<ValueId> {
-    let symbol = type_layout_tbp_lookup_symbol(layout)?;
+    let symbol = type_layout_vtable_symbol(layout)?;
     Some(b.global_addr(&symbol, IrType::Int(IntWidth::I8)))
 }
 
-pub(super) fn static_expr_tbp_lookup_value(
+pub(super) fn static_expr_vtable_value(
     b: &mut FuncBuilder,
     expr: &SpannedExpr,
     st: &SymbolTable,
     type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
 ) -> Option<ValueId> {
     expr_type_layout(expr, None, st, type_layouts)
-        .and_then(|layout| type_layout_tbp_lookup_value(b, layout))
+        .and_then(|layout| type_layout_vtable_value(b, layout))
 }
 
-pub(super) fn derived_type_tbp_lookup_value(
+pub(super) fn derived_type_vtable_value(
     b: &mut FuncBuilder,
     type_name: Option<&str>,
     type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
 ) -> Option<ValueId> {
     type_name
         .and_then(|name| type_layouts.get(name))
-        .and_then(|layout| type_layout_tbp_lookup_value(b, layout))
+        .and_then(|layout| type_layout_vtable_value(b, layout))
 }
 
 pub(super) fn static_alloc_target_type_tag_value(
@@ -44350,14 +44294,14 @@ pub(super) fn static_alloc_target_type_tag_value(
     expr_type_layout(expr, None, st, type_layouts).map(|layout| b.const_i64(layout.type_tag as i64))
 }
 
-pub(super) fn static_alloc_target_tbp_lookup_value(
+pub(super) fn static_alloc_target_vtable_value(
     b: &mut FuncBuilder,
     expr: &SpannedExpr,
     st: &SymbolTable,
     type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
 ) -> Option<ValueId> {
     expr_type_layout(expr, None, st, type_layouts)
-        .and_then(|layout| type_layout_tbp_lookup_value(b, layout))
+        .and_then(|layout| type_layout_vtable_value(b, layout))
 }
 
 pub(super) fn expr_type_layout<'a>(
@@ -44406,7 +44350,7 @@ pub(super) fn expr_type_tag_value(
         .map(|layout| b.const_i64(layout.type_tag as i64))
 }
 
-pub(super) fn expr_tbp_lookup_value(
+pub(super) fn expr_vtable_value(
     b: &mut FuncBuilder,
     expr: &SpannedExpr,
     locals: Option<&HashMap<String, LocalInfo>>,
@@ -44414,7 +44358,7 @@ pub(super) fn expr_tbp_lookup_value(
     type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
 ) -> Option<ValueId> {
     expr_type_layout(expr, locals, st, type_layouts)
-        .and_then(|layout| type_layout_tbp_lookup_value(b, layout))
+        .and_then(|layout| type_layout_vtable_value(b, layout))
 }
 
 pub(super) fn expr_derived_type_name(
@@ -44440,7 +44384,7 @@ pub(super) fn typed_allocate_type_tag_value(
     }
 }
 
-pub(super) fn typed_allocate_tbp_lookup_value(
+pub(super) fn typed_allocate_vtable_value(
     b: &mut FuncBuilder,
     type_spec: Option<&crate::ast::decl::TypeSpec>,
     type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
@@ -44449,7 +44393,7 @@ pub(super) fn typed_allocate_tbp_lookup_value(
         Some(crate::ast::decl::TypeSpec::Type(name))
         | Some(crate::ast::decl::TypeSpec::Class(name)) => type_layouts
             .get(name)
-            .and_then(|layout| type_layout_tbp_lookup_value(b, layout)),
+            .and_then(|layout| type_layout_vtable_value(b, layout)),
         _ => None,
     }
 }
@@ -44476,7 +44420,7 @@ pub(super) fn emit_scalar_alloc_polymorphic_metadata_on_success(
         store_array_desc_type_tag(b, dest_desc, tag);
     }
     if let Some(ptr) = lookup_ptr {
-        store_array_desc_tbp_lookup_ptr(b, dest_desc, ptr);
+        store_array_desc_vtable_ptr(b, dest_desc, ptr);
     }
     b.branch(done_bb, vec![]);
     b.set_block(done_bb);
@@ -44497,9 +44441,9 @@ pub(super) fn emit_scalar_alloc_source_descriptor_metadata_on_success(
 
     b.set_block(set_bb);
     let tag = load_array_desc_type_tag(b, source_desc);
-    let lookup = load_array_desc_tbp_lookup_ptr(b, source_desc);
+    let lookup = load_array_desc_vtable_ptr(b, source_desc);
     store_array_desc_type_tag(b, dest_desc, tag);
-    store_array_desc_tbp_lookup_ptr(b, dest_desc, lookup);
+    store_array_desc_vtable_ptr(b, dest_desc, lookup);
     b.branch(done_bb, vec![]);
     b.set_block(done_bb);
 }
