@@ -742,3 +742,62 @@ fn multi_source_submodule_wrong_order_builds_and_runs() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// l07: a type-bound procedure whose target is a separate module procedure,
+// with the module and its submodule in separate TUs. Exercises the
+// TBP-thunk ownership rule across compilation units (the thunk must have
+// exactly one owning object, or the link fails with a duplicate symbol).
+#[test]
+fn cross_tu_tbp_targets_submodule_procedure() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=cross_tu_tbp_targets_submodule_procedure count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let mod_f90 = dir.join("tb_mod.f90");
+    let child_f90 = dir.join("tb_child.f90");
+    let main_f90 = dir.join("tb_main.f90");
+    let binary = dir.join("tb_bin");
+
+    std::fs::write(
+        &mod_f90,
+        "module tb\n  implicit none\n  type :: counter\n    integer :: n = 0\n  contains\n    procedure :: bump\n  end type\n  interface\n    module subroutine bump(self, by)\n      class(counter), intent(inout) :: self\n      integer, intent(in) :: by\n    end subroutine\n  end interface\nend module\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &child_f90,
+        "submodule (tb) tb_impl\ncontains\n  module procedure bump\n    self%n = self%n + by\n  end procedure\nend submodule\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &main_f90,
+        "program p\n  use tb\n  type(counter) :: c\n  call c%bump(5)\n  call c%bump(7)\n  if (c%n /= 12) error stop 1\n  print *, \"ok\"\nend program\n",
+    )
+    .unwrap();
+
+    // Worst order again.
+    let result = std::process::Command::new(&compiler)
+        .current_dir(&dir)
+        .args([
+            child_f90.to_str().unwrap(),
+            mod_f90.to_str().unwrap(),
+            main_f90.to_str().unwrap(),
+            "-o",
+            binary.to_str().unwrap(),
+        ])
+        .output()
+        .expect("compiler launch failed");
+    assert!(
+        result.status.success(),
+        "cross-TU TBP→SMP build failed:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let output = run_binary(&binary);
+    assert!(output.contains("ok"), "cross-TU TBP→SMP wrong result:\n{}", output);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
