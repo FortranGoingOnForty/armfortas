@@ -788,6 +788,11 @@ fn validate_stmt_enum_usage(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
             let Expr::Name { name } = &callee.node else {
                 return;
             };
+            if name.eq_ignore_ascii_case("c_f_strpointer") {
+                validate_c_f_strpointer(ctx, args);
+                // Intrinsic — no user subroutine scope to walk below.
+                return;
+            }
             let Some(arg_names) = ctx.lookup(name).and_then(|sym| {
                 matches!(sym.kind, crate::sema::symtab::SymbolKind::Subroutine)
                     .then(|| sym.arg_names.clone())
@@ -900,6 +905,81 @@ fn validate_stmt_enum_usage(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
 /// expression with a range subscript). Conservative — anything it
 /// misses is caught by the same garbage-descriptor class this guards,
 /// so keep it in sync with the lowering when array merges land.
+/// F2023 18.2.3.5 constraints on `CALL C_F_STRPOINTER(...)`. FSTRPTR must
+/// be a deferred-length character pointer; NCHARS is required when the
+/// source is a `type(c_ptr)` (the byte count cannot be inferred otherwise).
+/// Only flags positively-determined violations — an unresolved actual is
+/// left for the general resolver, never a false positive here.
+fn validate_c_f_strpointer(ctx: &mut Ctx<'_>, args: &[crate::ast::expr::Argument]) {
+    use crate::ast::expr::SectionSubscript;
+
+    fn arg<'a>(
+        args: &'a [crate::ast::expr::Argument],
+        kw: &str,
+        pos: usize,
+    ) -> Option<&'a crate::ast::expr::SpannedExpr> {
+        if let Some(a) = args
+            .iter()
+            .find(|a| a.keyword.as_deref().is_some_and(|k| k.eq_ignore_ascii_case(kw)))
+        {
+            if let SectionSubscript::Element(e) = &a.value {
+                return Some(e);
+            }
+        }
+        args.iter()
+            .filter(|a| a.keyword.is_none())
+            .nth(pos)
+            .and_then(|a| match &a.value {
+                SectionSubscript::Element(e) => Some(e),
+                _ => None,
+            })
+    }
+
+    let src = arg(args, "cstrarray", 0).or_else(|| arg(args, "cstrptr", 0));
+    let fstrptr = arg(args, "fstrptr", 1);
+    let nchars_present = arg(args, "nchars", 2).is_some();
+
+    // FSTRPTR must be a character pointer (deferred-length, kind=c_char).
+    if let Some(f) = fstrptr {
+        if let Expr::Name { name } = &f.node {
+            if let Some(sym) = ctx.lookup(name) {
+                let is_char = matches!(sym.type_info, Some(TypeInfo::Character { .. }));
+                let is_ptr = sym.attrs.pointer;
+                if !(is_char && is_ptr) {
+                    ctx.error(
+                        f.span,
+                        format!(
+                            "C_F_STRPOINTER: FSTRPTR ('{name}') must be a deferred-length \
+                             character (kind=c_char) pointer (F2023 18.2.3.5)"
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    // NCHARS is required when the source is a c_ptr: a scalar address has no
+    // size, so the length cannot be bounded without it.
+    if let Some(s) = src {
+        if let Expr::Name { name } = &s.node {
+            if let Some(sym) = ctx.lookup(name) {
+                let is_cptr = matches!(
+                    &sym.type_info,
+                    Some(TypeInfo::Derived(n)) if n.eq_ignore_ascii_case("c_ptr")
+                );
+                if is_cptr && !nchars_present {
+                    ctx.error(
+                        s.span,
+                        "C_F_STRPOINTER: NCHARS is required when the source is a \
+                         type(c_ptr) (F2023 18.2.3.5)"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// True if a conditional actual argument has a `.NIL.` arm anywhere in its
 /// (possibly chained) conditional tree. Such an argument selects the absent
 /// association, which F2023 C1525 permits only for an OPTIONAL dummy.

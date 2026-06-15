@@ -15514,6 +15514,7 @@ pub(super) fn intrinsic_subroutine_arg_order(callee_key: &str) -> Option<&'stati
         "random_seed" => Some(&["size", "put", "get"]),
         "execute_command_line" => Some(&["command", "wait", "exitstat", "cmdstat"]),
         "c_f_pointer" => Some(&["cptr", "fptr", "shape"]),
+        "c_f_strpointer" => Some(&["cstrarray", "fstrptr", "nchars"]),
         "cmplx" => Some(&["x", "y", "kind"]),
         "reshape" => Some(&["source", "shape", "pad", "order"]),
         "pack" => Some(&["array", "mask", "vector"]),

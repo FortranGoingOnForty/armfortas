@@ -757,6 +757,91 @@ pub(crate) fn lower_intrinsic_subroutine(
             true
         }
 
+        "c_f_strpointer" => {
+            // F2023 18.2.3.5:
+            //   CALL C_F_STRPOINTER(CSTRARRAY, FSTRPTR [, NCHARS])
+            //   CALL C_F_STRPOINTER(CSTRPTR,  FSTRPTR,  NCHARS)
+            // Associate a deferred-length c_char pointer with a C string. The
+            // length is the longest NUL-free prefix bounded by NCHARS (if
+            // present) or the source array's size. No copy: FSTRPTR aliases
+            // the C bytes, so afs_c_f_strpointer marks the descriptor pointer
+            // (not allocatable) and no free path will touch the memory.
+            let to_i64 = |b: &mut FuncBuilder, v: ValueId| match b.func().value_type(v) {
+                Some(IrType::Int(IntWidth::I64)) => v,
+                _ => b.int_extend(v, IntWidth::I64, true),
+            };
+            let src_expr = nth_arg_expr(args, 0);
+            let fptr_expr = nth_arg_expr(args, 1);
+            let nchars_present = matches!(args.get(2), Some(Some(_)));
+
+            let out_desc = fptr_expr.and_then(|e| match &e.node {
+                Expr::Name { name } => ctx.locals.get(&name.to_lowercase()).and_then(|info| {
+                    if matches!(info.char_kind, CharKind::Deferred) {
+                        Some(string_descriptor_addr(b, info))
+                    } else {
+                        None
+                    }
+                }),
+                _ => None,
+            });
+            // FSTRPTR shape and form constraints are diagnosed in sema; bail
+            // quietly if we somehow reach lowering with an invalid call.
+            let (Some(out_desc), Some(src_expr)) = (out_desc, src_expr) else {
+                return true;
+            };
+
+            let src_is_char =
+                expr_is_character_expr(b, &ctx.locals, src_expr, ctx.st, Some(ctx.type_layouts));
+
+            let (data_ptr, max_len) = if src_is_char {
+                // CSTRARRAY form: base address + (NCHARS or array size) bound.
+                let Some((desc, _elem_ty)) = lower_array_expr_descriptor(
+                    b,
+                    &ctx.locals,
+                    src_expr,
+                    ctx.st,
+                    Some(ctx.type_layouts),
+                    Some(ctx.internal_funcs),
+                    Some(ctx.contained_host_refs),
+                    Some(ctx.descriptor_params),
+                ) else {
+                    return true;
+                };
+                let base = b.load_typed(desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                let bound = if nchars_present {
+                    let n = nth_arg_val(b, ctx, args, 2, 0);
+                    to_i64(b, n)
+                } else {
+                    b.call(
+                        FuncRef::External("afs_array_size".into()),
+                        vec![desc],
+                        IrType::Int(IntWidth::I64),
+                    )
+                };
+                (base, bound)
+            } else {
+                // CSTRPTR form: type(c_ptr) address by value. NCHARS is
+                // required (sema); -1 is an unbounded-strlen safety fallback.
+                let addr = nth_arg_val(b, ctx, args, 0, 0);
+                let addr64 = to_i64(b, addr);
+                let data = b.int_to_ptr(addr64, IrType::Int(IntWidth::I8));
+                let bound = if nchars_present {
+                    let n = nth_arg_val(b, ctx, args, 2, 0);
+                    to_i64(b, n)
+                } else {
+                    b.const_i64(-1)
+                };
+                (data, bound)
+            };
+
+            b.call(
+                FuncRef::External("afs_c_f_strpointer".into()),
+                vec![data_ptr, max_len, out_desc],
+                IrType::Void,
+            );
+            true
+        }
+
         "mvbits" => {
             // F2018 §16.9.155: call mvbits(from, frompos, len, to, topos)
             // Copies len bits starting at bit `frompos` of `from` into
