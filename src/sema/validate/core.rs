@@ -1144,14 +1144,16 @@ fn validate_smp_body(ctx: &mut Ctx<'_>, name: &str, prefix: &[Prefix], span: Spa
             None
         }
     });
+    // No interface scope located. This is NOT necessarily an error: a
+    // separate module procedure can implement a specific inside a GENERIC
+    // interface, whose members are loaded from the parent `.amod` as
+    // NamedInterface symbols without a per-specific proc scope. Diagnosing
+    // "no matching interface" here would false-positive on those valid
+    // SMPs (cli_driver submodule_dispatching_private_parent_generic_…),
+    // so bail quietly — the signature checks below only run when a real
+    // interface scope is found, which keeps them false-positive-safe. A
+    // robust truly-missing-interface check is deferred (see noted_items).
     let Some(iface) = iface else {
-        ctx.error(
-            span,
-            format!(
-                "separate module procedure '{name}' has no matching MODULE \
-                 FUNCTION/SUBROUTINE interface in the ancestor module (F2008 C1414)"
-            ),
-        );
         return;
     };
 
