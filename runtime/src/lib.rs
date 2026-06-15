@@ -14,6 +14,7 @@
 pub mod array;
 pub mod descriptor;
 pub mod format;
+pub mod ieee;
 mod io;
 pub mod io_system;
 mod lifecycle;
