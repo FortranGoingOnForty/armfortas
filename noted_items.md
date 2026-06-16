@@ -401,3 +401,18 @@ Found during l04 (2026-06-12):
   field contents. Owner: PRINT-statement lowering (src/ir/lower/stmt.rs
   Stmt::Print vs Stmt::Write) — likely PRINT routes format-carrying
   output through the list-directed path.
+
+- **macOS arm64 run_programs gate is red on x12-campaign-x86** (found
+  x12 bug B work, 2026-06-16): a nomad run of `cargo test --test
+  run_programs --release` at the branch HEAD failed 113/7 — 7 programs
+  fail at EVERY opt level, including the named fixture
+  `defined_assignment_derived_operator_result` (which passes on x86 at
+  both -O0 and -O1+). These fail at O1+ too, where the bug B fix changes
+  nothing (the arm64 allocator path is byte-identical to before — the
+  arm64/mod.rs diff vs parent is comment-only), so they are PRE-EXISTING
+  macOS-arm64 regressions on this x86-campaign branch, not caused by bug
+  B. lib tests are green on macOS (1290/0); the failures are codegen/
+  runtime, surfaced only by the e2e run. Needs a dedicated macOS-arm64
+  triage: get the 7 program names (run_programs without the result-only
+  grep filter), bisect against trunk to find when the branch drifted from
+  macOS-green. Owner: x12 macOS-gate triage (separate from bug B).
