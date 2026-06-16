@@ -167,6 +167,67 @@ fn module_with_allocatable_array() {
     );
 }
 
+// Regression: gfortran/flang accept Fortran sources and prebuilt objects
+// mixed on one command line, e.g. `fc main.f90 mod.o -o prog`. fortsh's
+// unit-test rules use exactly this shape (`fc test.f90 build/foo.o -o test`).
+// armfortas used to reject it ("mixing Fortran sources with prebuilt
+// object/archive inputs is not yet supported"); now it compiles the sources
+// and links them with the artifacts in command order.
+#[test]
+fn mixed_source_and_object_in_one_invocation() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=mixed_source_and_object_in_one_invocation count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let mod_f90 = dir.join("mixmod.f90");
+    let main_f90 = dir.join("mixmain.f90");
+    let mod_o = dir.join("mixmod.o");
+    let binary = dir.join("mixbin");
+
+    std::fs::write(
+        &mod_f90,
+        "module mixmod\n  implicit none\ncontains\n  integer function answer() result(r)\n    r = 42\n  end function\nend module\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &main_f90,
+        "program p\n  use mixmod\n  print *, answer()\nend program\n",
+    )
+    .unwrap();
+
+    // Compile the module to an object up front.
+    compile_file(&compiler, &mod_f90, &mod_o, None);
+
+    // The fix under test: one invocation with a SOURCE and an OBJECT.
+    let result = Command::new(&compiler)
+        .arg(&main_f90)
+        .arg(&mod_o)
+        .arg("-o")
+        .arg(&binary)
+        .arg(format!("-I{}", dir.display()))
+        .output()
+        .expect("compiler launch failed for mixed source+object");
+    assert!(
+        result.status.success(),
+        "mixed source+object invocation failed:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let output = run_binary(&binary);
+    assert!(
+        output.contains("42"),
+        "expected '42' in output, got:\n{}",
+        output
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn module_with_derived_type() {
     if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
