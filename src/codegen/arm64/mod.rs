@@ -40,11 +40,14 @@ pub fn emit_module(ir_module: &Module, opts: &Options) -> String {
         }
     }
 
-    // Linear-scan is the allocator at every opt level. The naive
-    // spill-everything path gives every vreg its own stack slot, bloating
-    // frames and overflowing the stack on deep recursion; it survives only
-    // as a bisectable correctness reference behind the env var.
-    let use_naive_regalloc = std::env::var_os("ARMFORTAS_USE_NAIVE_REGALLOC").is_some();
+    // Naive allocator at -O0 (compile speed / debuggability), linear-scan
+    // at O1+. Bug B (deep-recursion stack overflow from spill-everything
+    // frames) is an x86/fortsh problem; the x86 backend routes -O0 through
+    // linear-scan (see codegen::mod), but arm64 stays on naive at -O0 so
+    // the macOS gate's codegen is unchanged. Flipping arm64 -O0 to
+    // linear-scan is a separate change needing its own macOS validation.
+    let use_naive_regalloc = opts.opt_level == OptLevel::O0
+        || std::env::var_os("ARMFORTAS_USE_NAIVE_REGALLOC").is_some();
 
     // Register allocation.
     for mf in &mut allocated {
