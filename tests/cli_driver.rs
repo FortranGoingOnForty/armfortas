@@ -27294,6 +27294,49 @@ fn formatted_e_huge_real_internal_write_round_trips() {
 }
 
 #[test]
+fn formatted_internal_write_preserves_allocated_deferred_char_length() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=formatted_internal_write_preserves_allocated_deferred_char_length count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=:), allocatable :: s\n  integer :: n\n  n = 33\n  allocate(character(len=8) :: s)\n  s = repeat('?', len(s))\n  write(s, \"('S', i0)\") n\n  if (len(s) /= 8) error stop 1\n  if (s(1:3) /= 'S33') error stop 2\n  if (s(4:8) /= '     ') error stop 3\n  s(4:4) = 'B'\n  s(5:8) = '0000'\n  if (s /= 'S33B0000') error stop 4\n  print *, s\nend program\n",
+        "f90",
+    );
+    let out = unique_path("formatted_internal_alloc_char_len", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("formatted internal alloc char compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "formatted internal alloc char should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "formatted internal alloc char should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("S33B0000"),
+        "expected preserved deferred-character buffer, got: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn contained_subroutine_forwards_derived_dummy_by_ref() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

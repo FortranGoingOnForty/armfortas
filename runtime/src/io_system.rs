@@ -3496,9 +3496,9 @@ enum FmtSink {
     Unit(i32),
     Internal { buf: *mut u8, buf_len: usize },
     /// Internal write whose target is a deferred-length allocatable
-    /// `character(:), allocatable` scalar. The formatted record is
-    /// assigned to the StringDescriptor, reallocating it to the record
-    /// length (F2008/F2018 auto-reallocation).
+    /// `character(:), allocatable` scalar. An already allocated target is
+    /// treated as a fixed internal file; an unallocated target is allocated
+    /// to the formatted record length.
     InternalAlloc { desc: *mut u8 },
 }
 
@@ -3616,17 +3616,14 @@ extern "C" {
     fn free(ptr: *mut u8);
 }
 
-/// Reallocate a deferred-length StringDescriptor to hold `bytes` and copy
-/// them in; returns false on allocation failure (descriptor left intact).
+/// Store formatted internal-write bytes into a deferred-length
+/// StringDescriptor; returns false on allocation failure.
 ///
-/// This mirrors `afs_assign_char_deferred` but lives here, in io_system,
-/// on purpose: routing the formatted-write path through string.rs would
-/// link the whole string-intrinsics object (SPLIT/TOKENIZE/…, ~1 MB) into
-/// every binary that does formatted I/O. `bytes` is the formatter's owned
-/// output and never aliases the descriptor, so a plain grow/copy is safe —
-/// the allocate-before-free dance afs_assign_char_deferred needs for
-/// self-referential assignment does not apply here. Storage is malloc'd to
-/// match `afs_dealloc_string`'s free.
+/// If the descriptor is already allocated, a formatted internal WRITE treats
+/// the existing allocation as the fixed internal file: copy/truncate the
+/// record into the current length and space-pad the remainder. If the
+/// descriptor is unallocated, allocate exactly enough storage for the record.
+/// Storage is malloc'd to match `afs_dealloc_string`'s free.
 fn store_internal_alloc_record(
     desc: *mut crate::descriptor::StringDescriptor,
     bytes: &[u8],
@@ -3637,6 +3634,17 @@ fn store_internal_alloc_record(
     }
     let d = unsafe { &mut *desc };
     let n = bytes.len() as i64;
+    if d.is_allocated() && !d.data.is_null() {
+        write_to_buffer(
+            d.data,
+            d.len.max(0) as usize,
+            0,
+            bytes,
+            std::ptr::null_mut(),
+        );
+        d.flags |= STR_DEFERRED;
+        return true;
+    }
     if n <= 0 {
         d.len = 0;
         d.flags |= STR_ALLOCATED | STR_DEFERRED;
@@ -3668,8 +3676,8 @@ fn store_internal_alloc_record(
 /// Begin a formatted internal write whose target is a deferred-length
 /// allocatable `character(:), allocatable` scalar. `desc` points at the
 /// 32-byte StringDescriptor; at `afs_fmt_end` the formatted record is
-/// stored into it via `store_internal_alloc_record`, reallocating to the
-/// exact record length (F2008/F2018 auto-reallocation).
+/// written into the existing allocation when present, or allocated when
+/// absent.
 #[no_mangle]
 pub extern "C" fn afs_fmt_begin_internal_alloc(
     desc: *mut u8,
@@ -5151,7 +5159,7 @@ mod tests {
     }
 
     #[test]
-    fn internal_write_realloc_grows_and_shrinks_deferred_target() {
+    fn internal_write_allocates_unallocated_and_preserves_allocated_len() {
         use crate::descriptor::StringDescriptor;
         let mut desc = StringDescriptor::zeroed();
         let dptr = &mut desc as *mut StringDescriptor as *mut u8;
@@ -5174,7 +5182,8 @@ mod tests {
         assert_eq!(bytes, b"val=42!");
         let grown_cap = desc.capacity;
 
-        // Shrink to 'x' (1 char): reuses the larger buffer, len updates.
+        // Already allocated: behave like a fixed internal file, preserving
+        // length and padding the remaining buffer with spaces.
         afs_fmt_begin_internal_alloc(
             dptr,
             "(A)".as_ptr(),
@@ -5185,10 +5194,10 @@ mod tests {
         );
         afs_fmt_push_string("x".as_ptr(), 1);
         afs_fmt_end(0);
-        assert_eq!(desc.len, 1);
-        assert!(desc.capacity >= grown_cap, "shrink must not lose capacity");
+        assert_eq!(desc.len, 7);
+        assert_eq!(desc.capacity, grown_cap);
         let bytes = unsafe { std::slice::from_raw_parts(desc.data, desc.len as usize) };
-        assert_eq!(bytes, b"x");
+        assert_eq!(bytes, b"x      ");
 
         crate::string::afs_dealloc_string(dptr as *mut StringDescriptor);
     }
