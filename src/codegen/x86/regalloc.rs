@@ -100,14 +100,26 @@ pub fn regalloc_naive(f: &mut X86Function) {
             let mut gp_used = 0usize;
             let mut fp_used = 0usize;
             let mut scratch_for = |v: &X86VReg| -> X86Reg {
+                // At most two spilled operands per class fit the two
+                // scratch registers. Assert loudly rather than clamping
+                // the index and silently aliasing a third spill onto
+                // scratch[1] — a wrong answer is worse than a panic.
                 match v.class {
                     X86RegClass::Xmm | X86RegClass::Xmm128 => {
-                        let r = FP_SCRATCH[fp_used.min(1)];
+                        assert!(
+                            fp_used < FP_SCRATCH.len(),
+                            "naive regalloc: >2 spilled FP operands on one instruction"
+                        );
+                        let r = FP_SCRATCH[fp_used];
                         fp_used += 1;
                         r
                     }
                     _ => {
-                        let r = GP_SCRATCH[gp_used.min(1)];
+                        assert!(
+                            gp_used < GP_SCRATCH.len(),
+                            "naive regalloc: >2 spilled GP operands on one instruction"
+                        );
+                        let r = GP_SCRATCH[gp_used];
                         gp_used += 1;
                         r
                     }
