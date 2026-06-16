@@ -353,7 +353,14 @@ fn bound_proc_slot_target_symbol(
     }
     let target_is_external_inherited =
         !layout.is_abstract && !bound_proc_target_is_local_to_owner(layout, &bp.target_name);
-    if available_targets.contains(&bp.target_name) || target_is_external_inherited {
+    // Parent modules own vtables, while submodules can own the procedure body.
+    let target_is_external_submodule = !layout.is_abstract
+        && layout.owner_module.is_some()
+        && !available_targets.contains(&bp.target_name);
+    if available_targets.contains(&bp.target_name)
+        || target_is_external_inherited
+        || target_is_external_submodule
+    {
         Some(bp.target_name.clone())
     } else {
         None

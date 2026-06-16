@@ -802,6 +802,60 @@ fn cross_tu_tbp_targets_submodule_procedure() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// A parent module can emit the owning vtable before submodule procedure bodies
+// are compiled. Concrete vtable slots must still point at those external
+// module-procedure symbols; otherwise a wrapper that dispatches through the
+// deferred binding lands on a null slot at runtime.
+#[test]
+fn parent_vtable_references_submodule_tbp_target() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=parent_vtable_references_submodule_tbp_target count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let mod_f90 = dir.join("vt_parent.f90");
+    let child_f90 = dir.join("vt_child.f90");
+    let main_f90 = dir.join("vt_main.f90");
+    let mod_o = dir.join("vt_parent.o");
+    let child_o = dir.join("vt_child.o");
+    let main_o = dir.join("vt_main.o");
+    let binary = dir.join("vt_bin");
+
+    std::fs::write(
+        &mod_f90,
+        "module vt_parent\n  implicit none\n  type :: counter\n    integer :: n = 0\n  contains\n    procedure :: bump\n    procedure :: ensure\n  end type\n  interface\n    module subroutine bump(self, by)\n      class(counter), intent(inout) :: self\n      integer, intent(in) :: by\n    end subroutine\n  end interface\ncontains\n  subroutine ensure(self)\n    class(counter), intent(inout) :: self\n    call self%bump(5)\n  end subroutine\nend module\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &child_f90,
+        "submodule (vt_parent) vt_child\ncontains\n  module procedure bump\n    self%n = self%n + by\n  end procedure\nend submodule\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &main_f90,
+        "program p\n  use vt_parent\n  implicit none\n  type(counter) :: c\n  call c%ensure()\n  if (c%n /= 5) error stop 1\n  print *, \"ok\"\nend program\n",
+    )
+    .unwrap();
+
+    compile_file(&compiler, &mod_f90, &mod_o, None);
+    compile_file(&compiler, &child_f90, &child_o, Some(&dir));
+    compile_file(&compiler, &main_f90, &main_o, Some(&dir));
+    link_files(&[&mod_o, &child_o, &main_o], &binary);
+
+    let output = run_binary(&binary);
+    assert!(
+        output.contains("ok"),
+        "submodule-backed TBP vtable dispatch failed:\n{}",
+        output
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // l08: vtable slot ordering must be identical whether a TU computes it
 // from the type's source or from its `.amod`. The owner module dispatches
 // `a()`/`b()` through `class(base)` (source-visible layout); the consumer
