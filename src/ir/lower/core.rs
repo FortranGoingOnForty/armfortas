@@ -17977,12 +17977,6 @@ pub(super) fn emit_dynamic_bound_proc_lookup_dispatch(
     )
     .or_else(|| base_layout.bound_proc(component))
     .unwrap_or_else(|| fail_unmatched_bound_proc_resolution(call_span, base_layout, component));
-    let candidates = concrete_bound_proc_dispatch_candidates(
-        type_layouts,
-        base_type,
-        component,
-        &declared_bp.abi_name,
-    );
     let slot_index = base_layout.bound_procs.iter().position(|bp| {
         bp.method_name.eq_ignore_ascii_case(component)
             && bp.abi_name.eq_ignore_ascii_case(&declared_bp.abi_name)
@@ -18018,10 +18012,9 @@ pub(super) fn emit_dynamic_bound_proc_lookup_dispatch(
     let zero = b.const_i64(0);
     let has_vtable = b.icmp(CmpOp::Ne, vtable_raw, zero);
     let dispatch_bb = b.create_block("vtable_dispatch");
-    let fallback_bb = b.create_block("vtable_dispatch_fallback");
     let fail_bb = b.create_block("vtable_dispatch_fail");
     let done_bb = b.create_block("vtable_dispatch_done");
-    b.cond_branch(has_vtable, dispatch_bb, vec![], fallback_bb, vec![]);
+    b.cond_branch(has_vtable, dispatch_bb, vec![], fail_bb, vec![]);
 
     b.set_block(dispatch_bb);
     let slot_off = b.const_i64(VTABLE_HEADER_BYTES + slot_index * 8);
@@ -18030,7 +18023,7 @@ pub(super) fn emit_dynamic_bound_proc_lookup_dispatch(
     let target_raw = b.ptr_to_int(target_ptr);
     let target_ok = b.icmp(CmpOp::Ne, target_raw, zero);
     let call_bb = b.create_block("vtable_dispatch_call");
-    b.cond_branch(target_ok, call_bb, vec![], fallback_bb, vec![]);
+    b.cond_branch(target_ok, call_bb, vec![], fail_bb, vec![]);
 
     b.set_block(call_bb);
     let call_result = emit_resolved_bound_proc_call(
@@ -18055,60 +18048,6 @@ pub(super) fn emit_dynamic_bound_proc_lookup_dispatch(
         b.store(call_result, slot);
     }
     b.branch(done_bb, vec![]);
-
-    b.set_block(fallback_bb);
-    if candidates.is_empty() {
-        b.branch(fail_bb, vec![]);
-    } else {
-        let runtime_tag = load_array_desc_type_tag(b, desc_addr);
-        let test_blocks: Vec<BlockId> = candidates
-            .iter()
-            .enumerate()
-            .map(|(i, _)| b.create_block(&format!("tbp_dispatch_test_{}", i)))
-            .collect();
-        let case_blocks: Vec<BlockId> = candidates
-            .iter()
-            .enumerate()
-            .map(|(i, _)| b.create_block(&format!("tbp_dispatch_case_{}", i)))
-            .collect();
-        b.branch(test_blocks[0], vec![]);
-
-        for (idx, (type_tag, bp)) in candidates.iter().enumerate() {
-            b.set_block(test_blocks[idx]);
-            let expected_tag = b.const_i64(*type_tag as i64);
-            let is_match = b.icmp(CmpOp::Eq, runtime_tag, expected_tag);
-            let next_test = if idx + 1 < test_blocks.len() {
-                test_blocks[idx + 1]
-            } else {
-                fail_bb
-            };
-            b.cond_branch(is_match, case_blocks[idx], vec![], next_test, vec![]);
-
-            b.set_block(case_blocks[idx]);
-            let call_result = emit_resolved_bound_proc_call(
-                b,
-                locals,
-                st,
-                Some(type_layouts),
-                internal_funcs,
-                contained_host_refs,
-                optional_params,
-                descriptor_params,
-                char_len_star_params,
-                obj_addr,
-                Some(desc_addr),
-                FuncRef::External(bp.target_name.clone()),
-                bp,
-                args,
-                None,
-                call_ret_ty.clone(),
-            )?;
-            if let Some(slot) = result_slot {
-                b.store(call_result, slot);
-            }
-            b.branch(done_bb, vec![]);
-        }
-    }
 
     b.set_block(fail_bb);
     b.runtime_call(RuntimeFunc::ErrorStop, vec![], IrType::Void);
@@ -18270,30 +18209,6 @@ pub(super) fn resolve_polymorphic_component_method_base_for_dispatch(
         }
         _ => None,
     }
-}
-
-pub(super) fn concrete_bound_proc_dispatch_candidates(
-    tl: &crate::sema::type_layout::TypeLayoutRegistry,
-    base_type: &str,
-    component: &str,
-    abi_name: &str,
-) -> Vec<(u64, crate::sema::type_layout::BoundProc)> {
-    let mut out: Vec<(u64, crate::sema::type_layout::BoundProc)> = tl
-        .layouts
-        .values()
-        .filter(|layout| !layout.is_abstract)
-        .filter(|layout| is_type_or_extends(&layout.name, base_type, tl))
-        .filter_map(|layout| {
-            layout
-                .bound_proc_candidates(component)
-                .into_iter()
-                .find(|bp| bp.abi_name.eq_ignore_ascii_case(abi_name))
-                .cloned()
-                .map(|bp| (layout.type_tag, bp))
-        })
-        .collect();
-    out.sort_by_key(|(tag, _)| *tag);
-    out
 }
 
 pub(super) fn concrete_type_dispatch_candidates(
