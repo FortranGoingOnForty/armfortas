@@ -45,15 +45,16 @@ pub fn emit_module(
                     x86::peephole::run_peephole(f);
                 }
                 x86::twoaddr::convert_to_two_address(f);
-                // x10a-1: linear-scan allocator at O1+, naive at O0
-                // (compile speed / debuggability), mirroring arm64.
-                // `ARMFORTAS_USE_NAIVE_REGALLOC` forces naive everywhere
-                // (the bisectable correctness reference);
-                // `ARMFORTAS_USE_LINEAR_REGALLOC` forces linear at O0 too.
+                // Linear-scan is the allocator at every opt level. The
+                // naive spill-everything allocator gives every vreg its
+                // own stack slot, which bloats frames ~6x and overflows
+                // the stack on deep recursion (e.g. fortsh's executor) —
+                // gfortran does real register allocation at -O0 too.
+                // `ARMFORTAS_USE_NAIVE_REGALLOC` keeps the naive path as a
+                // bisectable correctness reference. `ARMFORTAS_USE_LINEAR_REGALLOC`
+                // is now a no-op (linear is the default) but still honored.
                 let force_naive = std::env::var_os("ARMFORTAS_USE_NAIVE_REGALLOC").is_some();
-                let force_linear = std::env::var_os("ARMFORTAS_USE_LINEAR_REGALLOC").is_some();
-                let use_linear =
-                    !force_naive && (force_linear || opts.opt_level >= crate::driver::OptLevel::O1);
+                let use_linear = !force_naive;
                 if use_linear {
                     let result = x86::linearscan::linear_scan(f);
                     x86::linearscan::apply_allocation(f, &result);
