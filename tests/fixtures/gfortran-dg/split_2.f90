@@ -4,7 +4,6 @@
 ! Conversion notes: tests/fixtures/gfortran-dg/README.md
 ! FLAGS: --std=f2023
 ! EXIT_CODE: 0
-! XFAIL: SELECTED_CHAR_KIND (F2003) not implemented — links to undefined selected_char_kind; unrelated to SPLIT. See .docs/audits/f2023-feature-matrix.md
 program b
   integer, parameter :: ucs4 = selected_char_kind('ISO_10646')
   character(kind=ucs4, len=:), allocatable :: input, set

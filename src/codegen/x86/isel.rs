@@ -1530,10 +1530,14 @@ fn select_inst(
         InstKind::LShr(a, b) => emit_shift(mf, ctx, mb, inst, X86Opcode::Shr, *a, *b),
         InstKind::AShr(a, b) => emit_shift(mf, ctx, mb, inst, X86Opcode::Sar, *a, *b),
 
-        InstKind::CountLeadingZeros(_)
-        | InstKind::CountTrailingZeros(_)
-        | InstKind::PopCount(_) => {
-            panic!("x05 scope: bit-count ops deferred (no lzcnt/tzcnt/popcnt opcodes yet)")
+        InstKind::CountLeadingZeros(a) => {
+            return emit_bit_scan_count(mf, ctx, mb, inst, *a, X86Opcode::Bsr, true);
+        }
+        InstKind::CountTrailingZeros(a) => {
+            return emit_bit_scan_count(mf, ctx, mb, inst, *a, X86Opcode::Bsf, false);
+        }
+        InstKind::PopCount(_) => {
+            panic!("x05 scope: direct popcount IR deferred; Fortran popcnt lowers through afs_popcount")
         }
 
         // ---- Select: simple diamond over new machine blocks ----
@@ -2136,6 +2140,109 @@ fn emit_shift(
         vec![X86Operand::VReg(va), X86Operand::Reg(X86Reg::Rcx)],
         Some(X86Operand::VReg(dest)),
     );
+}
+
+/// CLZ/CTZ without BMI instructions. `bsr`/`bsf` leave the destination
+/// undefined for a zero source, so test first and materialize the IR
+/// semantics explicitly: zero maps to the operand bit width.
+fn emit_bit_scan_count(
+    mf: &mut X86Function,
+    ctx: &mut X86ISelCtx,
+    mb: MBlockId,
+    inst: &Inst,
+    a: ValueId,
+    scan: X86Opcode,
+    leading: bool,
+) -> MBlockId {
+    let dest = ctx.lookup_vreg(inst.id);
+    let src = ctx.lookup_vreg(a);
+    let size = op_size(&inst.ty);
+    let bits = match size {
+        OpSize::Q => 64,
+        _ => 32,
+    };
+    let zero_mb = mf.new_block();
+    let join_mb = mf.new_block();
+
+    push(
+        mf,
+        mb,
+        X86Opcode::Test,
+        size,
+        vec![X86Operand::VReg(src), X86Operand::VReg(src)],
+        None,
+    );
+    push(
+        mf,
+        mb,
+        X86Opcode::Jcc,
+        OpSize::Q,
+        vec![X86Operand::Cond(X86Cond::E), X86Operand::BlockRef(zero_mb)],
+        None,
+    );
+
+    let scan_out = mf.new_vreg(dest.class);
+    push(
+        mf,
+        mb,
+        scan,
+        size,
+        vec![X86Operand::VReg(src)],
+        Some(X86Operand::VReg(scan_out)),
+    );
+    if leading {
+        push(
+            mf,
+            mb,
+            X86Opcode::MovRI,
+            size,
+            vec![X86Operand::Imm((bits - 1) as i64)],
+            Some(X86Operand::VReg(dest)),
+        );
+        push(
+            mf,
+            mb,
+            X86Opcode::Sub,
+            size,
+            vec![X86Operand::VReg(dest), X86Operand::VReg(scan_out)],
+            Some(X86Operand::VReg(dest)),
+        );
+    } else {
+        push(
+            mf,
+            mb,
+            X86Opcode::MovRR,
+            size,
+            vec![X86Operand::VReg(scan_out)],
+            Some(X86Operand::VReg(dest)),
+        );
+    }
+    push(
+        mf,
+        mb,
+        X86Opcode::Jmp,
+        OpSize::Q,
+        vec![X86Operand::BlockRef(join_mb)],
+        None,
+    );
+
+    push(
+        mf,
+        zero_mb,
+        X86Opcode::MovRI,
+        size,
+        vec![X86Operand::Imm(bits as i64)],
+        Some(X86Operand::VReg(dest)),
+    );
+    push(
+        mf,
+        zero_mb,
+        X86Opcode::Jmp,
+        OpSize::Q,
+        vec![X86Operand::BlockRef(join_mb)],
+        None,
+    );
+    join_mb
 }
 
 /// setcc into a fresh Gp8 vreg + movzx to the Gp32 dest. ALWAYS
@@ -3718,6 +3825,26 @@ mod tests {
             .find(|i| i.opcode == X86Opcode::Shl)
             .expect("shl emitted");
         assert_eq!(shl.operands[1], X86Operand::Reg(X86Reg::Rcx));
+    }
+
+    #[test]
+    fn bit_counts_use_base_bit_scan_with_zero_diamond() {
+        let mf = select_simple(|b| {
+            let x = b.const_i32(100);
+            b.clz(x);
+            b.ctz(x);
+            b.ret_void();
+        });
+        let insts = all_insts(&mf);
+        assert!(insts.iter().any(|i| i.opcode == X86Opcode::Bsr));
+        assert!(insts.iter().any(|i| i.opcode == X86Opcode::Bsf));
+        assert!(insts.iter().any(|i| {
+            i.opcode == X86Opcode::Jcc
+                && matches!(i.operands.first(), Some(X86Operand::Cond(X86Cond::E)))
+        }));
+        assert!(insts
+            .iter()
+            .any(|i| { i.opcode == X86Opcode::MovRI && i.operands == vec![X86Operand::Imm(32)] }));
     }
 
     #[test]

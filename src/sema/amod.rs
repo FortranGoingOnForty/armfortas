@@ -14,7 +14,7 @@
 //!   - Polymorphic type tags (@tag)
 //!   - Human-editable for hand-written FFI descriptions
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write;
 use std::path::Path;
 
@@ -597,6 +597,10 @@ fn emit_parameter(
         type_info_to_string(sym.type_info.as_ref())
     };
     let is_private = sym.attrs.access == Access::Private;
+    let const_char_hex = sym
+        .const_char_value
+        .as_ref()
+        .map(|value| hex_encode_bytes(value.as_bytes()));
     if let Some(cv) = sym
         .const_value
         .map(i128::from)
@@ -605,7 +609,16 @@ fn emit_parameter(
         // Place `, private` after the value so parse_var's
         // rfind(" = ") inside type_str continues to work.
         let suf = if is_private { ", private" } else { "" };
-        writeln!(out, "@param {} : {} = {}{}", name, type_str, cv, suf).unwrap();
+        let char_suf = const_char_hex
+            .as_ref()
+            .map(|hex| format!(" @charhex {}", hex))
+            .unwrap_or_default();
+        writeln!(
+            out,
+            "@param {} : {} = {}{}{}",
+            name, type_str, cv, suf, char_suf
+        )
+        .unwrap();
     } else if let Some(info) = global_info {
         // For @ir-backed params, attach `, private` to the type so
         // the parser sees it in attr_str rather than after @ir.
@@ -614,15 +627,23 @@ fn emit_parameter(
         } else {
             type_str
         };
+        let char_suf = const_char_hex
+            .as_ref()
+            .map(|hex| format!(" @charhex {}", hex))
+            .unwrap_or_default();
         writeln!(
             out,
-            "@param {} : {} @ir {}",
-            name, type_with_attr, info.symbol
+            "@param {} : {} @ir {}{}",
+            name, type_with_attr, info.symbol, char_suf
         )
         .unwrap();
     } else {
         let suf = if is_private { ", private" } else { "" };
-        writeln!(out, "@param {} : {}{}", name, type_str, suf).unwrap();
+        let char_suf = const_char_hex
+            .as_ref()
+            .map(|hex| format!(" @charhex {}", hex))
+            .unwrap_or_default();
+        writeln!(out, "@param {} : {}{}{}", name, type_str, suf, char_suf).unwrap();
     }
 }
 
@@ -654,7 +675,7 @@ fn emit_procedure(
     mod_scope_id: ScopeId,
     ir_module: &IrModule,
     descriptor_params: &HashMap<String, Vec<bool>>,
-    _char_len_star_params: &HashMap<String, Vec<bool>>,
+    char_len_star_params: &HashMap<String, Vec<bool>>,
 ) {
     let is_func = matches!(sym.kind, SymbolKind::Function);
     let kind_str = if is_func { "function" } else { "subroutine" };
@@ -873,23 +894,28 @@ fn emit_procedure(
 
     let is_bind_c = sym.attrs.binding_label.is_some();
     let declared_descriptor_params = descriptor_params.get(&name.to_lowercase());
+    let declared_char_len_star_params = char_len_star_params.get(&name_lc);
 
-    // Compute hidden char-length count from the scope's arg types.
-    let mut hidden_count = 0usize;
-    if let Some(pscope) = proc_scope {
-        for arg_name in &pscope.arg_order {
-            if let Some(arg_sym) = pscope.symbols.get(&arg_name.to_lowercase()) {
-                if matches!(
-                    arg_sym.type_info,
-                    Some(TypeInfo::Character { len: None, .. })
-                ) && !arg_sym.attrs.allocatable
-                    && !is_bind_c
-                {
-                    hidden_count += 1;
+    let hidden_count = declared_char_len_star_params
+        .map(|flags| flags.iter().filter(|flag| **flag).count())
+        .unwrap_or_else(|| {
+            let mut count = 0usize;
+            if let Some(pscope) = proc_scope {
+                for arg_name in &pscope.arg_order {
+                    if let Some(arg_sym) = pscope.symbols.get(&arg_name.to_lowercase()) {
+                        if matches!(
+                            arg_sym.type_info,
+                            Some(TypeInfo::Character { len: None, .. })
+                        ) && !arg_sym.attrs.allocatable
+                            && !is_bind_c
+                        {
+                            count += 1;
+                        }
+                    }
                 }
             }
-        }
-    }
+            count
+        });
 
     // @abi line for the procedure.
     writeln!(out, "  @abi cc=aapcs64 hidden_char_lens={}", hidden_count).unwrap();
@@ -1000,18 +1026,22 @@ fn emit_procedure(
         }
     }
 
-    // Hidden character-length args — infer from the scope's arg types.
-    // Any arg with TypeInfo::Character { len: None } that isn't
-    // allocatable is an assumed-length (len=*) dummy that gets a
-    // hidden i64 length parameter appended after the normal args.
+    // Hidden character-length args. Prefer the exact lowering mask because
+    // TypeInfo cannot distinguish `len=*` from `len=:` once sema has lowered
+    // both to `len: None`; this matters for allocatable assumed-length
+    // character-array dummies.
     if let Some(pscope) = proc_scope {
-        for arg_name in &pscope.arg_order {
+        for (arg_idx, arg_name) in pscope.arg_order.iter().enumerate() {
             if let Some(arg_sym) = pscope.symbols.get(&arg_name.to_lowercase()) {
-                let is_assumed_len = matches!(
-                    arg_sym.type_info,
-                    Some(TypeInfo::Character { len: None, .. })
-                ) && !arg_sym.attrs.allocatable
-                    && !is_bind_c;
+                let is_assumed_len = declared_char_len_star_params
+                    .and_then(|flags| flags.get(arg_idx).copied())
+                    .unwrap_or({
+                        matches!(
+                            arg_sym.type_info,
+                            Some(TypeInfo::Character { len: None, .. })
+                        ) && !arg_sym.attrs.allocatable
+                            && !is_bind_c
+                    });
                 if is_assumed_len {
                     let reg = if reg_idx < 8 {
                         format!("x{}", reg_idx)
@@ -1104,6 +1134,9 @@ fn emit_type(out: &mut String, name: &str, type_layouts: &TypeLayoutRegistry) {
             }
             if field.procedure_pointer {
                 attrs.push_str(" @procptr");
+            }
+            if field.procedure_pointer_nopass {
+                attrs.push_str(" @nopass");
             }
             if field.target {
                 attrs.push_str(" @target");
@@ -1373,6 +1406,7 @@ pub struct AmodVar {
     pub deferred_char: bool,
     pub dims: Vec<(i64, i64)>,
     pub const_value: Option<i64>,
+    pub const_char_value: Option<String>,
     /// Access level. F2008 §11.2.3 requires private parent symbols to
     /// be visible in submodules, so the writer emits private entries
     /// with a `private` attribute and the loader honors them via
@@ -1603,10 +1637,10 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
 }
 
 fn parse_var(line: &str, is_param: bool) -> AmodVar {
-    // @var name : type[, attrs...] [@ir symbol] [@deferred_char] [@dims ...]
+    // @var name : type[, attrs...] [@ir symbol] [@charhex hex] [@deferred_char] [@dims ...]
     let rest = line.strip_prefix("@var ").unwrap_or(line);
-    let (name_type, ir_part) = if let Some(idx) = rest.find(" @ir ") {
-        (&rest[..idx], Some(&rest[idx + 5..]))
+    let (name_type, meta_part) = if let Some(idx) = rest.find(" @") {
+        (&rest[..idx], Some(&rest[idx + 1..]))
     } else {
         (rest, None)
     };
@@ -1624,6 +1658,7 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
     };
 
     let mut const_value = None;
+    let mut const_char_value = None;
     // For @param with `= value`, strip the value suffix from the
     // type string before parsing the type.
     let clean_type_str = if is_param {
@@ -1656,14 +1691,22 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
     let mut deferred_char = false;
     let mut dims = Vec::new();
 
-    if let Some(ir) = ir_part {
-        let parts: Vec<&str> = ir.split_whitespace().collect();
-        if !parts.is_empty() {
-            ir_symbol = Some(parts[0].to_string());
-        }
-        let mut i = 1;
+    if let Some(meta) = meta_part {
+        let parts: Vec<&str> = meta.split_whitespace().collect();
+        let mut i = 0;
         while i < parts.len() {
-            if parts[i] == "@deferred_char" {
+            if parts[i] == "@ir" {
+                if let Some(symbol) = parts.get(i + 1) {
+                    ir_symbol = Some((*symbol).to_string());
+                }
+                i += 2;
+            } else if parts[i] == "@charhex" {
+                if let Some(hex) = parts.get(i + 1) {
+                    const_char_value =
+                        hex_decode_bytes(hex).and_then(|bytes| String::from_utf8(bytes).ok());
+                }
+                i += 2;
+            } else if parts[i] == "@deferred_char" {
                 deferred_char = true;
                 i += 1;
             } else if parts[i] == "@dims" {
@@ -1697,6 +1740,7 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
         deferred_char,
         dims,
         const_value,
+        const_char_value,
         access,
     }
 }
@@ -2029,12 +2073,14 @@ fn parse_type(
                 let mut target = false;
                 let mut declared_array = false;
                 let mut procedure_pointer = false;
+                let mut procedure_pointer_nopass = false;
                 let mut default_init = None;
                 for token in flag_tail.split_whitespace() {
                     match token {
                         "@allocatable" => allocatable = true,
                         "@pointer" => pointer = true,
                         "@procptr" => procedure_pointer = true,
+                        "@nopass" => procedure_pointer_nopass = true,
                         "@target" => target = true,
                         "@declared_array" => declared_array = true,
                         _ => {
@@ -2057,6 +2103,7 @@ fn parse_type(
                     pointer,
                     target,
                     procedure_pointer,
+                    procedure_pointer_nopass,
                     default_init,
                 });
             }
@@ -2295,7 +2342,7 @@ pub fn extract_optional_params(iface: &ModuleInterface) -> HashMap<String, Vec<b
     for proc in &iface.procedures {
         let visible_args: Vec<&AmodArg> = proc.args.iter().filter(|a| !a.hidden).collect();
         let flags: Vec<bool> = visible_args.iter().map(|a| a.optional).collect();
-        if !flags.is_empty() {
+        if flags.iter().any(|flag| *flag) {
             let key = proc.name.to_lowercase();
             out.insert(key.clone(), flags.clone());
             out.insert(
@@ -2315,14 +2362,28 @@ pub fn extract_char_len_star_params(iface: &ModuleInterface) -> HashMap<String, 
     for proc in &iface.procedures {
         let is_bind_c = proc.binding_label.is_some();
         let visible_args: Vec<&AmodArg> = proc.args.iter().filter(|a| !a.hidden).collect();
-        let flags: Vec<bool> = visible_args
+        let hidden_len_args: HashSet<String> = proc
+            .args
             .iter()
-            .map(|a| {
-                matches!(a.type_info, Some(TypeInfo::Character { len: None, .. }))
-                    && !a.allocatable
-                    && !is_bind_c
-            })
+            .filter(|a| a.hidden)
+            .filter_map(|a| a.name.strip_suffix("@len"))
+            .map(|name| name.to_lowercase())
             .collect();
+        let flags: Vec<bool> = if hidden_len_args.is_empty() {
+            visible_args
+                .iter()
+                .map(|a| {
+                    matches!(a.type_info, Some(TypeInfo::Character { len: None, .. }))
+                        && !a.allocatable
+                        && !is_bind_c
+                })
+                .collect()
+        } else {
+            visible_args
+                .iter()
+                .map(|a| hidden_len_args.contains(&a.name.to_lowercase()))
+                .collect()
+        };
         if !flags.is_empty() {
             let key = proc.name.to_lowercase();
             out.insert(key.clone(), flags.clone());

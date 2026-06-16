@@ -755,11 +755,13 @@ impl<'a> Parser<'a> {
                     let mut attrs = Vec::new();
                     while self.eat(&TokenKind::Comma) {
                         let attr_text = self.peek_text().to_lowercase();
-                        if matches!(
-                            attr_text.as_str(),
-                            "nopass" | "pass" | "deferred" | "non_overridable"
-                        ) {
+                        if matches!(attr_text.as_str(), "pass" | "deferred" | "non_overridable") {
                             self.advance();
+                            continue;
+                        }
+                        if attr_text == "nopass" {
+                            self.advance();
+                            attrs.push(crate::ast::decl::Attribute::NoPass);
                             continue;
                         }
                         if let Some(attr) = self.try_parse_attribute() {

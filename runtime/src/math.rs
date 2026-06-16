@@ -371,8 +371,8 @@ f32_wrap1!(afs_atanpi_f32, afs_atanpi);
 f32_wrap2!(afs_atan2pi_f32, afs_atan2pi);
 
 /// SELECTED_LOGICAL_KIND(BITS) for non-constant arguments. The kind
-/// set is fixed (1/2/4/8 occupy 8/16/32/64 bits); returns the smallest
-/// kind with at least `bits` bits, or -1 if none. The compiler folds
+/// set is fixed (1/2/4/8/16 occupy 8/16/32/64/128 bits); returns the
+/// smallest kind with at least `bits` bits, or -1 if none. The compiler folds
 /// constant arguments inline; this covers the runtime path.
 #[no_mangle]
 pub extern "C" fn afs_selected_logical_kind(bits: i32) -> i32 {
@@ -384,6 +384,8 @@ pub extern "C" fn afs_selected_logical_kind(bits: i32) -> i32 {
         4
     } else if bits <= 64 {
         8
+    } else if bits <= 128 {
+        16
     } else {
         -1
     }

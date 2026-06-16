@@ -291,6 +291,10 @@ pub enum X86Opcode {
     Shl,
     Shr,
     Sar,
+    /// Bit scan reverse/forward. Used to synthesize CLZ/CTZ with an
+    /// explicit zero branch, avoiding BMI LZCNT/TZCNT.
+    Bsr,
+    Bsf,
 
     // ---- Division helpers ----
     /// Sign-extend %eax into %edx:%eax.

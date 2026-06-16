@@ -115,6 +115,27 @@ fn io_control_by_keyword<'a>(controls: &'a [IoControl], needle: &str) -> Option<
     })
 }
 
+fn inquire_size_storeback_type(
+    b: &FuncBuilder,
+    ctx: &LowerCtx<'_>,
+    expr: &crate::ast::expr::SpannedExpr,
+    dest_addr: ValueId,
+) -> IrType {
+    if let Some(ti) =
+        operator_expr_type_info(expr, Some(&ctx.locals), ctx.st, Some(ctx.type_layouts))
+    {
+        let ty = type_info_to_ir_type(&ti);
+        if matches!(ty, IrType::Int(_)) {
+            return ty;
+        }
+    }
+
+    match b.func().value_type(dest_addr) {
+        Some(IrType::Ptr(inner)) => (*inner).clone(),
+        _ => IrType::Int(IntWidth::I32),
+    }
+}
+
 fn lower_external_io_pos_seek(
     b: &mut FuncBuilder,
     ctx: &mut LowerCtx,
@@ -1731,10 +1752,18 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 // Character field: copy string data with space padding.
                                 if let CharKind::Fixed(flen) = field_char_kind(field) {
                                     let (src_ptr, src_len) = lower_string_expr_ctx(b, ctx, value);
+                                    let dest_ptr = if field.pointer {
+                                        b.load_typed(
+                                            field_ptr,
+                                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                                        )
+                                    } else {
+                                        field_ptr
+                                    };
                                     let dest_len = b.const_i64(flen);
                                     b.call(
                                         FuncRef::External("afs_assign_char_fixed".into()),
-                                        vec![field_ptr, dest_len, src_ptr, src_len],
+                                        vec![dest_ptr, dest_len, src_ptr, src_len],
                                         IrType::Void,
                                     );
                                     deallocate_owned_string_expr_temp(
@@ -1893,6 +1922,69 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         vec![field_ptr, src, sz],
                                         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
                                     );
+                                } else if field.pointer
+                                    && !field.procedure_pointer
+                                    && !field.allocatable
+                                    && field.dims.is_empty()
+                                    && !matches!(
+                                        field.type_info,
+                                        crate::sema::symtab::TypeInfo::ClassStar
+                                            | crate::sema::symtab::TypeInfo::TypeStar
+                                    )
+                                {
+                                    if matches!(
+                                        field.type_info,
+                                        crate::sema::symtab::TypeInfo::Derived(_)
+                                    ) && !is_opaque_c_handle_type(&field.type_info)
+                                    {
+                                        let src_ptr = super::expr::lower_expr_ctx_tl(b, ctx, value);
+                                        if let Some(nested_name) = field_derived_type_name(field) {
+                                            let dest_ptr = b.load_typed(
+                                                field_ptr,
+                                                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                                            );
+                                            emit_derived_value_copy(
+                                                b,
+                                                ctx.type_layouts,
+                                                &nested_name,
+                                                dest_ptr,
+                                                src_ptr,
+                                            );
+                                        }
+                                    } else if is_complex_ty(&type_info_to_ir_type(&field.type_info))
+                                    {
+                                        let raw = super::expr::lower_expr_ctx_tl(b, ctx, value);
+                                        let field_ir_ty = type_info_to_ir_type(&field.type_info);
+                                        let src_ty = b.func().value_type(raw);
+                                        let src = if matches!(&src_ty, Some(t) if is_complex_ptr_ty(t))
+                                        {
+                                            raw
+                                        } else {
+                                            let fw = complex_float_width(&field_ir_ty);
+                                            materialize_complex_operand(b, raw, fw)
+                                        };
+                                        let dest_ptr = b.load_typed(
+                                            field_ptr,
+                                            IrType::Ptr(Box::new(field_storage_ir_type(
+                                                field,
+                                                ctx.type_layouts,
+                                            ))),
+                                        );
+                                        let bytes = complex_byte_size(&field_ir_ty);
+                                        let sz = b.const_i64(bytes);
+                                        b.call(
+                                            FuncRef::External("memcpy".into()),
+                                            vec![dest_ptr, src, sz],
+                                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                                        );
+                                    } else {
+                                        let elem_ty = type_info_to_ir_type(&field.type_info);
+                                        let val = super::expr::lower_expr_ctx_tl(b, ctx, value);
+                                        let coerced = coerce_to_type(b, val, &elem_ty);
+                                        let dest_ptr =
+                                            b.load_typed(field_ptr, IrType::Ptr(Box::new(elem_ty)));
+                                        b.store(coerced, dest_ptr);
+                                    }
                                 } else if matches!(
                                     field.type_info,
                                     crate::sema::symtab::TypeInfo::ClassStar
@@ -1936,6 +2028,51 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         // rather than emit invalid IR.
                                         // Better than truncating to i32.
                                     }
+                                } else if field.allocatable
+                                    && !field.pointer
+                                    && !field.declared_array
+                                    && field.dims.is_empty()
+                                    && field.size == 384
+                                {
+                                    let desc = field_ptr;
+                                    let allocated = b.call(
+                                        FuncRef::External("afs_allocated".into()),
+                                        vec![desc],
+                                        IrType::Int(IntWidth::I32),
+                                    );
+                                    let zero32 = b.const_i32(0);
+                                    let needs_alloc = b.icmp(CmpOp::Eq, allocated, zero32);
+                                    let alloc_bb =
+                                        b.create_block("component_scalar_intrinsic_assign_alloc");
+                                    let store_bb =
+                                        b.create_block("component_scalar_intrinsic_assign_store");
+                                    let done_bb =
+                                        b.create_block("component_scalar_intrinsic_assign_done");
+                                    b.cond_branch(needs_alloc, alloc_bb, vec![], store_bb, vec![]);
+
+                                    b.set_block(alloc_bb);
+                                    let elem_ty = type_info_to_ir_type(&field.type_info);
+                                    let elem_size =
+                                        b.const_i64(ir_scalar_byte_size(&elem_ty, b.layout));
+                                    let rank_val = b.const_i32(0);
+                                    let null_ptr = b.const_i64(0);
+                                    b.call(
+                                        FuncRef::External("afs_allocate_array".into()),
+                                        vec![desc, elem_size, rank_val, null_ptr, null_ptr],
+                                        IrType::Void,
+                                    );
+                                    b.branch(store_bb, vec![]);
+
+                                    b.set_block(store_bb);
+                                    let elem_ty = type_info_to_ir_type(&field.type_info);
+                                    let val = super::expr::lower_expr_ctx_tl(b, ctx, value);
+                                    let coerced = coerce_to_type(b, val, &elem_ty);
+                                    let dest_ptr =
+                                        b.load_typed(desc, IrType::Ptr(Box::new(elem_ty)));
+                                    b.store(coerced, dest_ptr);
+                                    b.branch(done_bb, vec![]);
+
+                                    b.set_block(done_bb);
                                 } else {
                                     let val = super::expr::lower_expr_ctx_tl(b, ctx, value);
                                     let coerced = coerce_to_type(
@@ -2244,6 +2381,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     Some(ctx.contained_host_refs),
                     Some(ctx.optional_params),
                     Some(ctx.descriptor_params),
+                    Some(ctx.char_len_star_params),
                     callee.span,
                     base,
                     component,
@@ -2297,6 +2435,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 Some(ctx.contained_host_refs),
                                 Some(ctx.optional_params),
                                 Some(ctx.descriptor_params),
+                                Some(ctx.char_len_star_params),
                                 obj_addr,
                                 Some(pass_desc_addr),
                                 FuncRef::External(bp.target_name.clone()),
@@ -2309,7 +2448,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         }
                     }
                 }
-                if let Some((target, closure_args, signature_key)) =
+                if let Some((target, closure_args, signature_key, procptr_nopass)) =
                     procedure_pointer_component_call_target(
                         b,
                         &ctx.locals,
@@ -2318,7 +2457,13 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         ctx.type_layouts,
                     )
                 {
-                    let arg_slots = reorder_args_by_keyword_slots(args, &signature_key, ctx.st);
+                    let formal_skip = if procptr_nopass { 0 } else { 1 };
+                    let arg_slots = reorder_args_by_keyword_slots_with_formal_skip(
+                        args,
+                        &signature_key,
+                        ctx.st,
+                        formal_skip,
+                    );
                     let abi_lookup_keys = procedure_abi_lookup_keys(ctx.st, &[&signature_key]);
                     let abi_primary_key = abi_lookup_keys
                         .first()
@@ -2348,15 +2493,47 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     });
                     let mut arg_vals: Vec<ValueId> = Vec::with_capacity(arg_slots.len());
                     for (i, slot) in arg_slots.iter().enumerate() {
-                        let is_value = value_mask
-                            .as_ref()
-                            .map(|mask| mask.get(i).copied().unwrap_or(false))
-                            .unwrap_or(false);
                         let mask_wants_descriptor = desc_mask
                             .as_ref()
                             .map(|mask| mask.get(i).copied().unwrap_or(false))
                             .unwrap_or(false);
                         let wants_bind_c_char = bind_c_char_mask
+                            .as_ref()
+                            .map(|mask| mask.get(i).copied().unwrap_or(false))
+                            .unwrap_or(false);
+                        if !procptr_nopass && i == 0 {
+                            arg_vals.push(if mask_wants_descriptor && !wants_bind_c_char {
+                                lower_arg_descriptor_full(
+                                    b,
+                                    &ctx.locals,
+                                    base,
+                                    ctx.st,
+                                    Some(ctx.type_layouts),
+                                    Some(ctx.internal_funcs),
+                                    Some(ctx.contained_host_refs),
+                                    Some(ctx.descriptor_params),
+                                    false,
+                                )
+                            } else {
+                                let dummy_is_class = class_mask
+                                    .as_ref()
+                                    .map(|mask| mask.get(i).copied().unwrap_or(false))
+                                    .unwrap_or(false);
+                                lower_arg_by_ref_for_dummy_full(
+                                    b,
+                                    &ctx.locals,
+                                    base,
+                                    ctx.st,
+                                    Some(ctx.type_layouts),
+                                    Some(ctx.internal_funcs),
+                                    Some(ctx.contained_host_refs),
+                                    Some(ctx.descriptor_params),
+                                    dummy_is_class,
+                                )
+                            });
+                            continue;
+                        }
+                        let is_value = value_mask
                             .as_ref()
                             .map(|mask| mask.get(i).copied().unwrap_or(false))
                             .unwrap_or(false);
@@ -2372,10 +2549,12 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             .as_ref()
                             .map(|mask| mask.get(i).copied().unwrap_or(false))
                             .unwrap_or(false);
-                        let wants_polymorphic_descriptor = class_mask
-                            .as_ref()
-                            .map(|mask| mask.get(i).copied().unwrap_or(false))
-                            .unwrap_or(false);
+                        let dummy_is_class = mask_wants_descriptor
+                            && class_mask
+                                .as_ref()
+                                .map(|mask| mask.get(i).copied().unwrap_or(false))
+                                .unwrap_or(false);
+                        let wants_polymorphic_descriptor = dummy_is_class;
                         let wants_string_descriptor = wants_string_descriptor && !wants_bind_c_char;
                         let value = match slot {
                             Some(arg) => {
@@ -2388,7 +2567,13 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                            e: &crate::ast::expr::SpannedExpr|
                                      -> ValueId {
                                     let wants_descriptor = (mask_wants_descriptor
-                                        || actual_is_descriptor_array(&ctx.locals, e))
+                                        || (desc_mask.is_none()
+                                            && actual_is_descriptor_backed(
+                                                &ctx.locals,
+                                                e,
+                                                ctx.st,
+                                                Some(ctx.type_layouts),
+                                            )))
                                         && !wants_bind_c_char;
                                     let value = if is_value && wants_bind_c_char {
                                         lower_bind_c_char_value_arg(
@@ -2452,9 +2637,31 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                             Some(ctx.contained_host_refs),
                                             Some(ctx.descriptor_params),
                                         )
-                                        .unwrap_or_else(|| lower_arg_by_ref_ctx(b, ctx, e))
+                                        .unwrap_or_else(|| {
+                                            lower_arg_by_ref_for_dummy_full(
+                                                b,
+                                                &ctx.locals,
+                                                e,
+                                                ctx.st,
+                                                Some(ctx.type_layouts),
+                                                Some(ctx.internal_funcs),
+                                                Some(ctx.contained_host_refs),
+                                                Some(ctx.descriptor_params),
+                                                dummy_is_class,
+                                            )
+                                        })
                                     } else {
-                                        lower_arg_by_ref_ctx(b, ctx, e)
+                                        lower_arg_by_ref_for_dummy_full(
+                                            b,
+                                            &ctx.locals,
+                                            e,
+                                            ctx.st,
+                                            Some(ctx.type_layouts),
+                                            Some(ctx.internal_funcs),
+                                            Some(ctx.contained_host_refs),
+                                            Some(ctx.descriptor_params),
+                                            dummy_is_class,
+                                        )
                                     };
                                     optional_arg_absent_if_unallocated_allocatable_char(
                                         b,
@@ -2558,7 +2765,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         procedure_pointer_call_target(b, &ctx.locals, ctx.st, &key);
                     let signature_key = procptr_target
                         .as_ref()
-                        .map(|(_, sig_key)| sig_key.clone())
+                        .map(|(_, _, sig_key)| sig_key.clone())
                         .unwrap_or_else(|| key.clone());
                     // Not an intrinsic — general subroutine call.
                     // Keyword-argument reordering (F2003 §12.4.1.2).
@@ -2658,7 +2865,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             .as_ref()
                             .map(|mask| mask.get(i).copied().unwrap_or(false))
                             .unwrap_or(false);
-                        let wants_descriptor = desc_mask
+                        let mask_wants_descriptor = desc_mask
                             .as_ref()
                             .map(|mask| mask.get(i).copied().unwrap_or(false))
                             .unwrap_or(false);
@@ -2678,8 +2885,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             .as_ref()
                             .map(|mask| mask.get(i).copied().unwrap_or(false))
                             .unwrap_or(false);
-                        let wants_descriptor = wants_descriptor && !wants_bind_c_char;
-                        let wants_polymorphic_descriptor = wants_descriptor
+                        let dummy_is_class = mask_wants_descriptor
                             && class_mask
                                 .as_ref()
                                 .map(|mask| mask.get(i).copied().unwrap_or(false))
@@ -2700,6 +2906,17 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         let mut materialize = |b: &mut FuncBuilder,
                                                            e: &crate::ast::expr::SpannedExpr|
                                      -> ValueId {
+                                    let wants_descriptor = (mask_wants_descriptor
+                                        || (desc_mask.is_none()
+                                            && actual_is_descriptor_backed(
+                                                &ctx.locals,
+                                                e,
+                                                ctx.st,
+                                                Some(ctx.type_layouts),
+                                            )))
+                                        && !wants_bind_c_char;
+                                    let wants_polymorphic_descriptor =
+                                        wants_descriptor && dummy_is_class;
                                     let value = if is_value && wants_bind_c_char {
                                         lower_bind_c_char_value_arg(
                                             b,
@@ -2762,7 +2979,19 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                             Some(ctx.contained_host_refs),
                                             Some(ctx.descriptor_params),
                                         )
-                                        .unwrap_or_else(|| lower_arg_by_ref_ctx(b, ctx, e))
+                                        .unwrap_or_else(|| {
+                                            lower_arg_by_ref_for_dummy_full(
+                                                b,
+                                                &ctx.locals,
+                                                e,
+                                                ctx.st,
+                                                Some(ctx.type_layouts),
+                                                Some(ctx.internal_funcs),
+                                                Some(ctx.contained_host_refs),
+                                                Some(ctx.descriptor_params),
+                                                dummy_is_class,
+                                            )
+                                        })
                                     } else if wants_intent_in_array {
                                         lower_contiguous_intent_in_array_actual(
                                             b,
@@ -2774,9 +3003,31 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                             Some(ctx.contained_host_refs),
                                             Some(ctx.descriptor_params),
                                         )
-                                        .unwrap_or_else(|| lower_arg_by_ref_ctx(b, ctx, e))
+                                        .unwrap_or_else(|| {
+                                            lower_arg_by_ref_for_dummy_full(
+                                                b,
+                                                &ctx.locals,
+                                                e,
+                                                ctx.st,
+                                                Some(ctx.type_layouts),
+                                                Some(ctx.internal_funcs),
+                                                Some(ctx.contained_host_refs),
+                                                Some(ctx.descriptor_params),
+                                                dummy_is_class,
+                                            )
+                                        })
                                     } else {
-                                        lower_arg_by_ref_ctx(b, ctx, e)
+                                        lower_arg_by_ref_for_dummy_full(
+                                            b,
+                                            &ctx.locals,
+                                            e,
+                                            ctx.st,
+                                            Some(ctx.type_layouts),
+                                            Some(ctx.internal_funcs),
+                                            Some(ctx.contained_host_refs),
+                                            Some(ctx.descriptor_params),
+                                            dummy_is_class,
+                                        )
                                     };
                                     optional_arg_absent_if_unallocated_allocatable_char(
                                         b,
@@ -2859,6 +3110,19 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             }
                         }
                     }
+                    if procptr_target.is_none() {
+                        append_procedure_dummy_closure_args_for_call(
+                            b,
+                            &ctx.locals,
+                            ctx.st,
+                            &resolved_key,
+                            &arg_slots,
+                            Some(ctx.contained_host_refs),
+                            &mut arg_vals,
+                        );
+                    } else if let Some((_, closure_args, _)) = &procptr_target {
+                        arg_vals.extend(closure_args.iter().copied());
+                    }
                     // Host-association closure-passing ABI: if the
                     // callee is a contained procedure, append one
                     // address per host-local variable it reads or
@@ -2870,7 +3134,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     if procptr_target.is_none() {
                         append_host_closure_args(b, ctx, &resolved_key, &mut arg_vals);
                     }
-                    let func_ref = if let Some((target, _)) = procptr_target {
+                    let func_ref = if let Some((target, _, _)) = procptr_target {
                         FuncRef::Indirect(target)
                     } else {
                         same_unit_func_ref(
@@ -3641,7 +3905,32 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             }
         }
 
-        Stmt::Stop { .. } => {
+        Stmt::Stop { code, .. } => {
+            let stop_code = if let Some(code_expr) = code {
+                let is_char = expr_is_character_expr(
+                    b,
+                    &ctx.locals,
+                    code_expr,
+                    ctx.st,
+                    Some(ctx.type_layouts),
+                ) || matches!(code_expr.node, Expr::StringLiteral { .. });
+                if is_char {
+                    None
+                } else {
+                    let val = super::expr::lower_expr_ctx(b, ctx, code_expr);
+                    let val_ty = b
+                        .func()
+                        .value_type(val)
+                        .unwrap_or(IrType::Int(IntWidth::I64));
+                    Some(match val_ty {
+                        IrType::Int(IntWidth::I64) => val,
+                        IrType::Int(_) => b.int_extend(val, IntWidth::I64, true),
+                        _ => val,
+                    })
+                }
+            } else {
+                None
+            };
             let skip = if matches!(
                 ctx.hidden_result_abi,
                 HiddenResultAbi::ArrayDescriptor | HiddenResultAbi::DerivedAggregate
@@ -3660,7 +3949,15 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 Some(ctx.contained_host_refs),
                 skip,
             );
-            b.runtime_call(RuntimeFunc::Stop, vec![], IrType::Void);
+            if let Some(widened) = stop_code {
+                b.call(
+                    FuncRef::External("afs_stop_int".into()),
+                    vec![widened],
+                    IrType::Void,
+                );
+            } else {
+                b.runtime_call(RuntimeFunc::Stop, vec![], IrType::Void);
+            }
             b.unreachable();
         }
         Stmt::ErrorStop { code, .. } => {
@@ -5040,6 +5337,20 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     .map(|k| k.eq_ignore_ascii_case("iostat"))
                     .unwrap_or(false)
             });
+            let err_label = specs.iter().find_map(|s| {
+                if s.keyword
+                    .as_deref()
+                    .map(|k| k.eq_ignore_ascii_case("err"))
+                    .unwrap_or(false)
+                {
+                    match &s.value.node {
+                        Expr::IntegerLiteral { text, .. } => text.parse::<u64>().ok(),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            });
             let unit = if let Some(s) = unit_spec {
                 super::expr::lower_expr_ctx(b, ctx, &s.value)
             } else if newunit_spec.is_some() {
@@ -5178,6 +5489,16 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             let null = b.const_i64(0);
             let unit_i32 = coerce_to_type(b, unit, &IrType::Int(IntWidth::I32));
             let recl_i64 = coerce_to_type(b, recl_val, &IrType::Int(IntWidth::I64));
+            let open_iostat_ptr = match (iostat_spec, err_label) {
+                (Some(spec), _) => lower_arg_by_ref_ctx(b, ctx, &spec.value),
+                (None, Some(_)) => {
+                    let tmp = b.alloca(IrType::Int(IntWidth::I32));
+                    let zero = b.const_i32(0);
+                    b.store(zero, tmp);
+                    tmp
+                }
+                (None, None) => null,
+            };
 
             // Check if we have any extended specifiers beyond the basic 7-arg set.
             let has_access = specs.iter().any(|s| {
@@ -5212,6 +5533,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             });
             let has_iostat = iostat_spec.is_some();
             let has_newunit = newunit_spec.is_some();
+            let has_err = err_label.is_some();
 
             if !has_access
                 && !has_form
@@ -5220,6 +5542,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 && !has_leading_zero
                 && !has_iostat
                 && !has_newunit
+                && !has_err
             {
                 // Simple case: use 7-arg afs_open_simple (unit + 3 string pairs).
                 b.call(
@@ -5334,15 +5657,12 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     .func()
                     .value_type(leading_zero_ptr)
                     .unwrap_or(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
-                let iostat_ptr = iostat_spec
-                    .map(|spec| lower_arg_by_ref_ctx(b, ctx, &spec.value))
-                    .unwrap_or(null);
                 let newunit_ptr = newunit_spec
                     .map(|spec| lower_arg_by_ref_ctx(b, ctx, &spec.value))
                     .unwrap_or(null);
                 let iostat_ptr_ty = b
                     .func()
-                    .value_type(iostat_ptr)
+                    .value_type(open_iostat_ptr)
                     .unwrap_or(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
                 let newunit_ptr_ty = b
                     .func()
@@ -5361,7 +5681,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 store_at(b, cb, 72, form_ptr_ty, form_ptr);
                 store_at(b, cb, 80, IrType::Int(IntWidth::I64), form_len);
                 store_at(b, cb, 88, IrType::Int(IntWidth::I64), recl_i64);
-                store_at(b, cb, 96, iostat_ptr_ty, iostat_ptr);
+                store_at(b, cb, 96, iostat_ptr_ty, open_iostat_ptr);
                 store_at(b, cb, 104, newunit_ptr_ty, newunit_ptr);
                 store_at(b, cb, 112, position_ptr_ty, position_ptr);
                 store_at(b, cb, 120, IrType::Int(IntWidth::I64), position_len);
@@ -5370,6 +5690,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
 
                 b.call(FuncRef::External("afs_open".into()), vec![cb], IrType::Void);
             }
+            lower_read_err_branch(b, ctx, err_label, open_iostat_ptr);
         }
 
         Stmt::Close { specs } => {
@@ -5723,7 +6044,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             let (size_addr, size_storeback) = if let Some(spec) = size_spec {
                 let dest_addr = lower_arg_by_ref_ctx(b, ctx, &spec.value);
                 let temp = b.alloca(IrType::Int(IntWidth::I64));
-                (temp, Some(dest_addr))
+                let dest_ty = inquire_size_storeback_type(b, ctx, &spec.value, dest_addr);
+                (temp, Some((dest_addr, dest_ty)))
             } else {
                 (null, None)
             };
@@ -5817,12 +6139,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     IrType::Void,
                 );
             }
-            if let Some(dest_addr) = size_storeback {
+            if let Some((dest_addr, dest_ty)) = size_storeback {
                 let size_val = b.load(size_addr);
-                let dest_ty = match b.func().value_type(dest_addr) {
-                    Some(IrType::Ptr(inner)) => (*inner).clone(),
-                    _ => IrType::Int(IntWidth::I32),
-                };
                 let coerced = coerce_to_type(b, size_val, &dest_ty);
                 b.store(coerced, dest_addr);
             }
@@ -6301,13 +6619,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         }
                     }
                 }
-                let (ptr, len) = lower_string_expr_with_layouts(
-                    b,
-                    &ctx.locals,
-                    value,
-                    ctx.st,
-                    Some(ctx.type_layouts),
-                );
+                let (ptr, len) = lower_string_expr_ctx(b, ctx, value);
                 store_string_descriptor_view(b, tgt_desc, ptr, len);
                 return;
             }

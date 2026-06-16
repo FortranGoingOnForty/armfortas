@@ -36,6 +36,12 @@ fn insert_param_val(
     val: Option<i64>,
 ) {
     let span = builtin_span();
+    let const_char_value = match (&ti, val) {
+        (TypeInfo::Character { .. }, Some(v)) if (0..=255).contains(&v) => {
+            Some((v as u8 as char).to_string())
+        }
+        _ => None,
+    };
     st.scope_mut(mod_id).symbols.insert(
         name.to_lowercase(),
         Symbol {
@@ -50,6 +56,7 @@ fn insert_param_val(
             scope: mod_id,
             arg_names: vec![],
             const_value: val,
+            const_char_value,
         },
     );
 }
@@ -67,6 +74,7 @@ fn insert_type(st: &mut SymbolTable, mod_id: ScopeId, name: &str) {
             scope: mod_id,
             arg_names: vec![],
             const_value: None,
+            const_char_value: None,
         },
     );
 }
@@ -87,6 +95,7 @@ fn insert_proc(st: &mut SymbolTable, mod_id: ScopeId, name: &str) {
             scope: mod_id,
             arg_names: vec![],
             const_value: None,
+            const_char_value: None,
         },
     );
 }

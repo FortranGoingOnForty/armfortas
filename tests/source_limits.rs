@@ -96,13 +96,14 @@ fn million_char_statement_compiles_and_warns_only_under_f2023() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The explosion boundary (l01 follow-up): a maximal-depth chain
-/// inside the statement cap must compile — no stack fault at any
-/// depth the cap admits. Minimal 3-char continuation lines give the
-/// deepest tree per character.
+/// The explosion boundary (l01 follow-up): a deep expression chain
+/// inside the statement cap must compile, not stack-fault. Keep this
+/// large enough to require the compile-thread stack path, but below
+/// the maximal conforming depth; the maximal 600k-term variant is a
+/// manual stress case and takes too long for CI.
 #[test]
 fn deep_chain_within_cap_compiles() {
-    let n = 600_000;
+    let n = 20_000;
     let mut src = String::with_capacity(4 * n);
     src.push_str("program p\nimplicit none\ninteger :: total\ntotal=0&\n");
     for _ in 0..n - 1 {

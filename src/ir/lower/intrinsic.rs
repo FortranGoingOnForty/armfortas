@@ -10,6 +10,30 @@ use crate::ir::types::*;
 use super::core::*;
 use super::helpers::{coerce_to_type, storage_size_bits_for_ir_type};
 
+fn small_int_bits_as_i32(b: &mut FuncBuilder, value: ValueId, width: IntWidth) -> ValueId {
+    let widened = b.int_extend(value, IntWidth::I32, true);
+    let mask = match width {
+        IntWidth::I8 => b.const_i32(0xff),
+        IntWidth::I16 => b.const_i32(0xffff),
+        _ => return widened,
+    };
+    b.bit_and(widened, mask)
+}
+
+fn unsigned_bit_value_for_width(b: &mut FuncBuilder, value: ValueId, width: IntWidth) -> ValueId {
+    match width {
+        IntWidth::I8 | IntWidth::I16 => small_int_bits_as_i32(b, value, width),
+        _ => value,
+    }
+}
+
+fn truncate_bit_value_to_width(b: &mut FuncBuilder, value: ValueId, width: IntWidth) -> ValueId {
+    match width {
+        IntWidth::I8 | IntWidth::I16 => b.int_trunc(value, width),
+        _ => value,
+    }
+}
+
 /// Lower a Fortran intrinsic function call to IR instructions.
 /// Returns Some(ValueId) if recognized, None for external functions.
 pub(crate) fn lower_intrinsic(
@@ -558,13 +582,47 @@ pub(crate) fn lower_intrinsic(
             }
         }
         "not" => args.first().map(|a| b.bit_not(*a)),
-        "leadz" => args.first().map(|a| b.clz(*a)),
-        "trailz" => args.first().map(|a| b.ctz(*a)),
+        "leadz" => args.first().map(|a| {
+            let value_width = int_width_of_value(b, *a).unwrap_or(IntWidth::I32);
+            match value_width {
+                IntWidth::I8 | IntWidth::I16 => {
+                    let bits = small_int_bits_as_i32(b, *a, value_width);
+                    let raw = b.clz(bits);
+                    let adjust = b.const_i32((32 - value_width.bits()) as i32);
+                    b.isub(raw, adjust)
+                }
+                IntWidth::I64 => {
+                    let raw = b.clz(*a);
+                    b.int_trunc(raw, IntWidth::I32)
+                }
+                _ => b.clz(*a),
+            }
+        }),
+        "trailz" => args.first().map(|a| {
+            let value_width = int_width_of_value(b, *a).unwrap_or(IntWidth::I32);
+            match value_width {
+                IntWidth::I8 | IntWidth::I16 => {
+                    let bits = small_int_bits_as_i32(b, *a, value_width);
+                    let raw = b.ctz(bits);
+                    let zero = b.const_i32(0);
+                    let width = b.const_i32(value_width.bits() as i32);
+                    let is_zero = b.icmp(CmpOp::Eq, bits, zero);
+                    b.select(is_zero, width, raw)
+                }
+                IntWidth::I64 => {
+                    let raw = b.ctz(*a);
+                    b.int_trunc(raw, IntWidth::I32)
+                }
+                _ => b.ctz(*a),
+            }
+        }),
         "popcount" | "popcnt" => {
             // Use __builtin_popcountll via runtime call since ARM64 NEON popcount
             // requires a complex instruction sequence.
             args.first().map(|a| {
-                let widened = b.int_extend(*a, IntWidth::I64, false);
+                let value_width = int_width_of_value(b, *a).unwrap_or(IntWidth::I32);
+                let bits = unsigned_bit_value_for_width(b, *a, value_width);
+                let widened = b.int_extend(bits, IntWidth::I64, false);
                 b.call(
                     FuncRef::External("afs_popcount".into()),
                     vec![widened],
@@ -589,19 +647,16 @@ pub(crate) fn lower_intrinsic(
                 let value_width = int_width_of_value(b, args[0]).unwrap_or(IntWidth::I32);
                 let shift = coerce_int_like_to_width(b, args[1], value_width);
                 let neg_shift = coerce_int_like_to_width(b, neg_shift, value_width);
-                let masked_value = match value_width {
-                    IntWidth::I8 => {
-                        let mask = int_const_for_width(b, value_width, 0xFF);
-                        b.bit_and(args[0], mask)
+                let right = match value_width {
+                    IntWidth::I8 | IntWidth::I16 => {
+                        let bits = small_int_bits_as_i32(b, args[0], value_width);
+                        let shift32 = coerce_int_like_to_width(b, neg_shift, IntWidth::I32);
+                        let shifted = b.lshr(bits, shift32);
+                        b.int_trunc(shifted, value_width)
                     }
-                    IntWidth::I16 => {
-                        let mask = int_const_for_width(b, value_width, 0xFFFF);
-                        b.bit_and(args[0], mask)
-                    }
-                    _ => args[0],
+                    _ => b.lshr(args[0], neg_shift),
                 };
                 let left = b.shl(args[0], shift);
-                let right = b.lshr(masked_value, neg_shift);
                 Some(b.select(is_left, left, right))
             } else {
                 None
@@ -621,8 +676,14 @@ pub(crate) fn lower_intrinsic(
             // F2008 §13.7.151: logical right shift (zero fill).
             if args.len() >= 2 {
                 let value_width = int_width_of_value(b, args[0]).unwrap_or(IntWidth::I32);
-                let shift = coerce_int_like_to_width(b, args[1], value_width);
-                Some(b.lshr(args[0], shift))
+                let value = unsigned_bit_value_for_width(b, args[0], value_width);
+                let shift_width = match value_width {
+                    IntWidth::I8 | IntWidth::I16 => IntWidth::I32,
+                    _ => value_width,
+                };
+                let shift = coerce_int_like_to_width(b, args[1], shift_width);
+                let shifted = b.lshr(value, shift);
+                Some(truncate_bit_value_to_width(b, shifted, value_width))
             } else {
                 None
             }
@@ -658,11 +719,16 @@ pub(crate) fn lower_intrinsic(
             // btest(a, pos) = (a >> pos) & 1 /= 0
             if args.len() >= 2 {
                 let value_width = int_width_of_value(b, args[0]).unwrap_or(IntWidth::I32);
-                let pos = coerce_int_like_to_width(b, args[1], value_width);
-                let shifted = b.lshr(args[0], pos);
-                let one = int_const_for_width(b, value_width, 1);
+                let value = unsigned_bit_value_for_width(b, args[0], value_width);
+                let op_width = match value_width {
+                    IntWidth::I8 | IntWidth::I16 => IntWidth::I32,
+                    _ => value_width,
+                };
+                let pos = coerce_int_like_to_width(b, args[1], op_width);
+                let shifted = b.lshr(value, pos);
+                let one = int_const_for_width(b, op_width, 1);
                 let masked = b.bit_and(shifted, one);
-                let zero = int_const_for_width(b, value_width, 0);
+                let zero = int_const_for_width(b, op_width, 0);
                 Some(b.icmp(CmpOp::Ne, masked, zero))
             } else {
                 None
@@ -697,14 +763,20 @@ pub(crate) fn lower_intrinsic(
             // ibits(i, pos, len) = (i >> pos) & ((1 << len) - 1)
             if args.len() >= 3 {
                 let value_width = int_width_of_value(b, args[0]).unwrap_or(IntWidth::I32);
-                let pos = coerce_int_like_to_width(b, args[1], value_width);
-                let len = coerce_int_like_to_width(b, args[2], value_width);
-                let shifted = b.lshr(args[0], pos);
-                let one = int_const_for_width(b, value_width, 1);
+                let value = unsigned_bit_value_for_width(b, args[0], value_width);
+                let op_width = match value_width {
+                    IntWidth::I8 | IntWidth::I16 => IntWidth::I32,
+                    _ => value_width,
+                };
+                let pos = coerce_int_like_to_width(b, args[1], op_width);
+                let len = coerce_int_like_to_width(b, args[2], op_width);
+                let shifted = b.lshr(value, pos);
+                let one = int_const_for_width(b, op_width, 1);
                 let mask_hi = b.shl(one, len);
-                let one2 = int_const_for_width(b, value_width, 1);
+                let one2 = int_const_for_width(b, op_width, 1);
                 let mask = b.isub(mask_hi, one2);
-                Some(b.bit_and(shifted, mask))
+                let result = b.bit_and(shifted, mask);
+                Some(truncate_bit_value_to_width(b, result, value_width))
             } else {
                 None
             }
@@ -1411,7 +1483,8 @@ pub(crate) fn lower_intrinsic(
         }
         "selected_logical_kind" => {
             // SELECTED_LOGICAL_KIND(BITS): smallest logical kind whose
-            // storage is at least BITS bits (1/2/4/8 → 8/16/32/64 bits),
+            // storage is at least BITS bits
+            // (1/2/4/8/16 → 8/16/32/64/128 bits),
             // -1 if none. Const-foldable here; non-constant args fall to
             // the runtime helper (the kind set is fixed, no libm need).
             if let Some(arg) = args.first() {
@@ -1424,6 +1497,8 @@ pub(crate) fn lower_intrinsic(
                         4
                     } else if bits <= 64 {
                         8
+                    } else if bits <= 128 {
+                        16
                     } else {
                         -1
                     };

@@ -669,6 +669,8 @@ pub struct Symbol {
     pub arg_names: Vec<String>,
     /// Compile-time constant value (for PARAMETERs like c_int=4).
     pub const_value: Option<i64>,
+    /// Compile-time character value for character PARAMETERs.
+    pub const_char_value: Option<String>,
 }
 
 /// What kind of entity this symbol represents.
@@ -920,6 +922,7 @@ mod tests {
             scope: 0,
             arg_names: vec![],
             const_value: None,
+            const_char_value: None,
         }
     }
 

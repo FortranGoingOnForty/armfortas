@@ -302,9 +302,8 @@ fn flag_effect(op: X86Opcode) -> FlagEffect {
     use X86Opcode::*;
     match op {
         // Idiv leaves flags undefined — treat as a clobbering writer.
-        Add | Sub | Imul | And | Or | Xor | Neg | Shl | Shr | Sar | Cmp | Test | Idiv => {
-            FlagEffect::Writer
-        }
+        Add | Sub | Imul | And | Or | Xor | Neg | Shl | Shr | Sar | Bsr | Bsf | Cmp | Test
+        | Idiv => FlagEffect::Writer,
         Jcc | Setcc => FlagEffect::Reader,
         Adc | Sbb => FlagEffect::ReadWrite,
         // Everything else (Mov*, Lea, Cltd/Cqto, Not, Push/Pop, Call,

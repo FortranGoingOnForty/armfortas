@@ -1294,7 +1294,7 @@ pub(crate) fn lower_expr_full(
                 let procptr_target = procedure_pointer_call_target(b, locals, st, &key);
                 let signature_key = procptr_target
                     .as_ref()
-                    .map(|(_, sig_key)| sig_key.clone())
+                    .map(|(_, _, sig_key)| sig_key.clone())
                     .unwrap_or_else(|| key.clone());
                 let has_named_interface = !internal_funcs
                     .is_some_and(|funcs| funcs.contains_key(&key))
@@ -2091,6 +2091,29 @@ pub(crate) fn lower_expr_full(
                         return result;
                     }
                 }
+                if !has_named_interface && key == "selected_char_kind" {
+                    let arg_expr = original_args.iter().find_map(|arg| {
+                        let matches_name = arg
+                            .keyword
+                            .as_deref()
+                            .is_none_or(|kw| kw.eq_ignore_ascii_case("name"));
+                        if !matches_name {
+                            return None;
+                        }
+                        match &arg.value {
+                            crate::ast::expr::SectionSubscript::Element(expr) => Some(expr),
+                            _ => None,
+                        }
+                    });
+                    if let Some(arg_expr) = arg_expr {
+                        if let crate::ast::expr::Expr::StringLiteral { value, .. } = &arg_expr.node
+                        {
+                            return b.const_i32(
+                                super::const_scalar::selected_char_kind_value(value) as i32,
+                            );
+                        }
+                    }
+                }
                 let intrinsic_result =
                     if !has_named_interface && crate::sema::validate::is_intrinsic_name(&key) {
                         let intrinsic_arg_slots =
@@ -2402,11 +2425,12 @@ pub(crate) fn lower_expr_full(
                         .map(|mask| mask.get(i).copied().unwrap_or(false))
                         .unwrap_or(false);
                     let wants_descriptor = wants_descriptor && !wants_bind_c_char;
-                    let wants_polymorphic_descriptor = wants_descriptor
+                    let dummy_is_class = wants_descriptor
                         && callee_class_args
                             .as_ref()
                             .map(|mask| mask.get(i).copied().unwrap_or(false))
                             .unwrap_or(false);
+                    let wants_polymorphic_descriptor = wants_descriptor && dummy_is_class;
                     let wants_string_descriptor = wants_string_descriptor && !wants_bind_c_char;
                     let wants_pointer = callee_pointer_args
                         .as_ref()
@@ -2488,7 +2512,7 @@ pub(crate) fn lower_expr_full(
                                                 descriptor_params,
                                             )
                                             .unwrap_or_else(|| {
-                                                lower_arg_by_ref_full(
+                                                lower_arg_by_ref_for_dummy_full(
                                                     b,
                                                     locals,
                                                     e,
@@ -2497,10 +2521,11 @@ pub(crate) fn lower_expr_full(
                                                     internal_funcs,
                                                     contained_host_refs,
                                                     descriptor_params,
+                                                    dummy_is_class,
                                                 )
                                             })
                                         } else {
-                                            lower_arg_by_ref_full(
+                                            lower_arg_by_ref_for_dummy_full(
                                                 b,
                                                 locals,
                                                 e,
@@ -2509,6 +2534,7 @@ pub(crate) fn lower_expr_full(
                                                 internal_funcs,
                                                 contained_host_refs,
                                                 descriptor_params,
+                                                dummy_is_class,
                                             )
                                         };
                                         optional_arg_absent_if_unallocated_allocatable_char(
@@ -2587,6 +2613,18 @@ pub(crate) fn lower_expr_full(
                     }
                 }
 
+                if procptr_target.is_none() {
+                    append_procedure_dummy_closure_args_for_call(
+                        b,
+                        locals,
+                        st,
+                        &callee_key,
+                        &arg_slots,
+                        contained_host_refs,
+                        &mut ref_arg_vals,
+                    );
+                }
+
                 // Host-association closure-passing ABI: append trailing
                 // pointer args for each host-local the callee references.
                 // Prefer the generic-resolved name's map entry; fall back
@@ -2608,6 +2646,8 @@ pub(crate) fn lower_expr_full(
                         closure_key,
                         &mut ref_arg_vals,
                     );
+                } else if let Some((_, closure_args, _)) = &procptr_target {
+                    ref_arg_vals.extend(closure_args.iter().copied());
                 }
 
                 // Look up callee return type from symbol table.
@@ -2615,7 +2655,7 @@ pub(crate) fn lower_expr_full(
                     callee_return_ir_type_for_caller(st, k, internal_funcs)
                 })
                 .unwrap_or(IrType::Int(IntWidth::I32));
-                let func_ref = if let Some((target, _)) = procptr_target {
+                let func_ref = if let Some((target, _, _)) = procptr_target {
                     FuncRef::Indirect(target)
                 } else {
                     same_unit_func_ref(
@@ -2646,6 +2686,7 @@ pub(crate) fn lower_expr_full(
                         contained_host_refs,
                         None,
                         descriptor_params,
+                        None,
                         callee.span,
                         base,
                         component,
@@ -2686,11 +2727,14 @@ pub(crate) fn lower_expr_full(
                             // stdlib_hashmaps where `map % hasher(key)`
                             // dispatches through a proc-pointer field.
                             if bp_opt.is_none() {
-                                if let Some((target_ptr, closure_args, signature_key)) =
-                                    procedure_pointer_component_call_target(
-                                        b, locals, callee, st, tl,
-                                    )
-                                {
+                                if let Some((
+                                    target_ptr,
+                                    closure_args,
+                                    signature_key,
+                                    procptr_nopass,
+                                )) = procedure_pointer_component_call_target(
+                                    b, locals, callee, st, tl,
+                                ) {
                                     let abi_lookup_keys =
                                         procedure_abi_lookup_keys(st, &[&signature_key]);
                                     let ret_ty = first_procedure_lookup(&abi_lookup_keys, |k| {
@@ -2722,30 +2766,26 @@ pub(crate) fn lower_expr_full(
                                                 cached_param_mask_for_lookup(st, m, k)
                                             })
                                         });
-                                    let mut arg_vals: Vec<ValueId> = Vec::with_capacity(args.len());
-                                    for (i, arg) in args.iter().enumerate() {
-                                        if let crate::ast::expr::SectionSubscript::Element(e) =
-                                            &arg.value
-                                        {
-                                            let mask_says_descriptor = callee_descriptor_args
-                                                .as_ref()
-                                                .map(|mask| mask.get(i).copied().unwrap_or(false))
-                                                .unwrap_or(false);
-                                            // Fallback: if the lookup missed
-                                            // (abstract iface not in
-                                            // descriptor_params), inspect the
-                                            // actual itself. A descriptor-
-                                            // backed local must be passed by
-                                            // descriptor regardless.
-                                            let actual_is_descriptor_backed =
-                                                actual_is_descriptor_array(locals, e);
-                                            let wants_descriptor =
-                                                mask_says_descriptor || actual_is_descriptor_backed;
-                                            let v = if wants_descriptor {
+                                    let formal_skip = if procptr_nopass { 0 } else { 1 };
+                                    let arg_slots = reorder_args_by_keyword_slots_with_formal_skip(
+                                        args,
+                                        &signature_key,
+                                        st,
+                                        formal_skip,
+                                    );
+                                    let mut arg_vals: Vec<ValueId> =
+                                        Vec::with_capacity(arg_slots.len());
+                                    for (i, slot) in arg_slots.iter().enumerate() {
+                                        let mask_says_descriptor = callee_descriptor_args
+                                            .as_ref()
+                                            .map(|mask| mask.get(i).copied().unwrap_or(false))
+                                            .unwrap_or(false);
+                                        if !procptr_nopass && i == 0 {
+                                            arg_vals.push(if mask_says_descriptor {
                                                 lower_arg_descriptor_full(
                                                     b,
                                                     locals,
-                                                    e,
+                                                    base,
                                                     st,
                                                     type_layouts,
                                                     internal_funcs,
@@ -2754,18 +2794,58 @@ pub(crate) fn lower_expr_full(
                                                     false,
                                                 )
                                             } else {
-                                                lower_arg_by_ref_full(
-                                                    b,
-                                                    locals,
-                                                    e,
-                                                    st,
-                                                    type_layouts,
-                                                    internal_funcs,
-                                                    contained_host_refs,
-                                                    descriptor_params,
-                                                )
-                                            };
-                                            arg_vals.push(v);
+                                                obj_addr
+                                            });
+                                            continue;
+                                        }
+                                        if let Some(arg) = slot {
+                                            if let crate::ast::expr::SectionSubscript::Element(e) =
+                                                &arg.value
+                                            {
+                                                // Fallback: if the lookup missed
+                                                // (abstract iface not in
+                                                // descriptor_params), inspect the
+                                                // actual itself. When the callee
+                                                // mask is present and says this
+                                                // slot is raw by-ref storage, a
+                                                // descriptor-backed actual still
+                                                // passes its payload base.
+                                                let actual_uses_descriptor = callee_descriptor_args
+                                                    .is_none()
+                                                    && actual_is_descriptor_backed(
+                                                        locals,
+                                                        e,
+                                                        st,
+                                                        type_layouts,
+                                                    );
+                                                let wants_descriptor =
+                                                    mask_says_descriptor || actual_uses_descriptor;
+                                                let v = if wants_descriptor {
+                                                    lower_arg_descriptor_full(
+                                                        b,
+                                                        locals,
+                                                        e,
+                                                        st,
+                                                        type_layouts,
+                                                        internal_funcs,
+                                                        contained_host_refs,
+                                                        descriptor_params,
+                                                        false,
+                                                    )
+                                                } else {
+                                                    lower_arg_by_ref_full(
+                                                        b,
+                                                        locals,
+                                                        e,
+                                                        st,
+                                                        type_layouts,
+                                                        internal_funcs,
+                                                        contained_host_refs,
+                                                        descriptor_params,
+                                                    )
+                                                };
+                                                arg_vals.push(v);
+                                            }
                                         }
                                     }
                                     arg_vals.extend(closure_args);
@@ -3278,6 +3358,18 @@ pub(crate) fn lower_expr_full(
                                 // so chained access like x%inner%field can walk
                                 // the inline storage directly.
                                 return field_ptr;
+                            }
+
+                            if field.allocatable
+                                && !field.pointer
+                                && !field.declared_array
+                                && field.dims.is_empty()
+                                && field.size == 384
+                            {
+                                let ir_ty = type_info_to_ir_type(&field.type_info);
+                                let data_ptr =
+                                    b.load_typed(field_ptr, IrType::Ptr(Box::new(ir_ty.clone())));
+                                return b.load_typed(data_ptr, ir_ty);
                             }
 
                             if field.pointer {

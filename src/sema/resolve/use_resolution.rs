@@ -365,6 +365,7 @@ pub(super) fn load_external_module(
             scope: scope_id,
             arg_names: vec![],
             const_value: var.const_value,
+            const_char_value: var.const_char_value.clone(),
         });
     }
 
@@ -416,6 +417,7 @@ pub(super) fn load_external_module(
             scope: scope_id,
             arg_names: arg_names.clone(),
             const_value: None,
+            const_char_value: None,
         });
         // Synthesise a Function/Subroutine scope for this procedure
         // so arg types survive to generic dispatch.
@@ -473,6 +475,7 @@ pub(super) fn load_external_module(
                 scope: proc_scope,
                 arg_names: vec![],
                 const_value: None,
+                const_char_value: None,
             });
         }
         // Sprint35-SMP Phase 2: also define the function's result
@@ -543,6 +546,7 @@ pub(super) fn load_external_module(
                 scope: proc_scope,
                 arg_names: vec![],
                 const_value: None,
+                const_char_value: None,
             });
         }
         st.pop_scope();
@@ -566,6 +570,7 @@ pub(super) fn load_external_module(
             scope: scope_id,
             arg_names: vec![],
             const_value: None,
+            const_char_value: None,
         });
     }
 
@@ -590,6 +595,7 @@ pub(super) fn load_external_module(
             scope: scope_id,
             arg_names: iface_def.specifics.clone(),
             const_value: None,
+            const_char_value: None,
         });
         if define_result.is_err() {
             let key = iface_def.name.to_ascii_lowercase();

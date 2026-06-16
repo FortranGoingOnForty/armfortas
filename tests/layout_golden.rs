@@ -238,6 +238,7 @@ fn generate_dump(target_layout: armfortas::target::TargetLayout) -> String {
                 let is_abstract = attrs
                     .iter()
                     .any(|attr| matches!(attr, armfortas::ast::decl::TypeAttr::Abstract));
+                let empty_char_params = std::collections::HashMap::new();
                 let layout = compute_layout_with_attrs(
                     name,
                     Some("layout_corpus"),
@@ -248,6 +249,7 @@ fn generate_dump(target_layout: armfortas::target::TargetLayout) -> String {
                     is_abstract,
                     &registry,
                     &empty_params,
+                    &empty_char_params,
                     &empty_inits,
                     target_layout,
                 );
