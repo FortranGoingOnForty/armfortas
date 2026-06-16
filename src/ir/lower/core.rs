@@ -19545,6 +19545,7 @@ pub(super) fn build_host_ref_params(
     contained_host_refs: &HashMap<String, Vec<String>>,
     starting_id: u32,
     st: &SymbolTable,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
     out_params: &mut Vec<Param>,
 ) -> Vec<HostRefParamInfo> {
     let refs = match contained_host_refs.get(&callee_name.to_lowercase()) {
@@ -19560,16 +19561,30 @@ pub(super) fn build_host_ref_params(
     let mut infos = Vec::with_capacity(refs.len());
     let mut next_id = starting_id;
     for hname in refs.iter() {
-        let elem_ty = arg_type_from_decls(hname, host_decls, Some(st));
+        let raw_elem_ty = arg_type_from_decls(hname, host_decls, Some(st));
+        let ptr_is_pointer = decl_is_pointer(hname, host_decls);
+        let derived_type = arg_derived_type_name(hname, host_decls, Some(st));
+        // For a derived-type host var, resolve the element type to the
+        // type's real `[i8 x size]` layout, exactly like a normal dummy
+        // (dummy_local_ir_type). lower_type_spec only knows derived types
+        // are "byte pointers" (Ptr<i8>, 8 bytes); using that as the element
+        // type makes array indexing inside the contained proc stride by 8
+        // instead of the struct size, so element k>1 of a host-associated
+        // derived array (e.g. a `type(t), allocatable :: a(:)` whose `t`
+        // embeds an allocatable component, 32-byte string descriptor) is
+        // read at the wrong address — wrong data / SIGSEGV. Surfaced
+        // building fortsh (pipeline_helpers grow_temp_arrays over a
+        // string_t token array). Falls back to the raw type when layouts
+        // are unavailable.
+        let elem_ty =
+            dummy_local_ir_type(&raw_elem_ty, derived_type.as_deref(), ptr_is_pointer, type_layouts);
         let uses_desc = arg_uses_descriptor_from_decls(hname, host_decls);
         let uses_string_descriptor = arg_uses_string_descriptor_from_decls(hname, host_decls);
         let alloc = decl_is_allocatable(hname, host_decls);
-        let ptr_is_pointer = decl_is_pointer(hname, host_decls);
         let dims = arg_dims_from_decls(hname, host_decls, &host_visible, st);
         let large_explicit_shape = host_ref_explicit_array_uses_descriptor(&dims, &elem_ty, layout);
         let descriptor_arg =
             (uses_desc || alloc || large_explicit_shape) && !uses_string_descriptor;
-        let derived_type = arg_derived_type_name(hname, host_decls, Some(st));
         let ptr_ty = by_ref_storage_ir_type(
             &elem_ty,
             descriptor_arg,

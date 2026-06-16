@@ -373,6 +373,7 @@ pub(crate) fn lower_unit(
                 contained_host_refs,
                 params.len() as u32,
                 st,
+                type_layouts,
                 &mut params,
             );
 
@@ -871,6 +872,7 @@ pub(crate) fn lower_unit(
                 contained_host_refs,
                 func_params.len() as u32,
                 st,
+                type_layouts,
                 &mut func_params,
             );
 
