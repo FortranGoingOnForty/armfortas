@@ -459,6 +459,49 @@ pub(super) fn walk_contained_host_refs(unit: &ProgramUnit, out: &mut HashMap<Str
     walk_contained_host_refs_inner(unit, &[], out);
 }
 
+/// Names that resolve to a subprogram's OWN scope (args, the implicit
+/// result name, and locally declared entities) — i.e. names that must NOT
+/// be forwarded as host-association closure params because the subprogram
+/// shadows them.
+fn subprogram_local_names(sub: &ProgramUnit) -> std::collections::HashSet<String> {
+    let mut locals = std::collections::HashSet::new();
+    let (decls, args, name, result): (
+        &[crate::ast::decl::SpannedDecl],
+        &[DummyArg],
+        &str,
+        Option<&str>,
+    ) = match sub {
+        ProgramUnit::Subroutine {
+            decls, args, name, ..
+        } => (decls, args, name, None),
+        ProgramUnit::Function {
+            decls,
+            args,
+            name,
+            result,
+            ..
+        } => (decls, args, name, result.as_deref()),
+        _ => return locals,
+    };
+    locals.insert(name.to_lowercase());
+    if let Some(r) = result {
+        locals.insert(r.to_lowercase());
+    }
+    for a in args {
+        if let DummyArg::Name(n) = a {
+            locals.insert(n.to_lowercase());
+        }
+    }
+    for d in decls {
+        if let Decl::TypeDecl { entities, .. } = &d.node {
+            for e in entities {
+                locals.insert(e.name.to_lowercase());
+            }
+        }
+    }
+    locals
+}
+
 pub(super) fn walk_contained_host_refs_inner<'a>(
     unit: &'a ProgramUnit,
     ancestor_decls: &[&'a [crate::ast::decl::SpannedDecl]],
@@ -555,6 +598,66 @@ pub(super) fn walk_contained_host_refs_inner<'a>(
             let mut refs: Vec<String> = refs_set.into_iter().collect();
             refs.sort();
             out.insert(name.to_lowercase(), refs);
+        }
+    }
+
+    // Peer-call forwarding. The containment fold above only threads a
+    // proc's NESTED children's host-refs. But a contained proc may CALL a
+    // PEER (a sibling contained in the same host), and the closure ABI
+    // passes the callee's host-refs by reference at the call site — so the
+    // caller must itself carry those names as hidden params to forward
+    // them. Without this, a proc that calls a sibling needing a host var it
+    // doesn't reference directly (the classic test harness: `test_x` calls
+    // the sibling `assert_*`, both contained in the program, and assert
+    // touches the host pass/fail counters) passes a garbage pointer ->
+    // SIGSEGV. Over-approximate safely: union every peer's host-refs into
+    // each peer, restricted to ancestor names (genuine host vars) and minus
+    // the peer's own locals (so a peer that shadows a host name keeps its
+    // local rather than closing over the host's). The full-union form also
+    // covers transitive same-level chains (a calls b calls c) in one pass.
+    let mut level_union: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for sub in contains {
+        if let ProgramUnit::Subroutine { name, .. } | ProgramUnit::Function { name, .. } =
+            &sub.node
+        {
+            if let Some(refs) = out.get(&name.to_lowercase()) {
+                level_union.extend(refs.iter().cloned());
+            }
+        }
+    }
+    if !level_union.is_empty() {
+        let mut ancestor_names: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for anc in &next_ancestors {
+            for decl in *anc {
+                if let Decl::TypeDecl { entities, .. } = &decl.node {
+                    for e in entities {
+                        ancestor_names.insert(e.name.to_lowercase());
+                    }
+                }
+            }
+        }
+        for sub in contains {
+            let sub_name = match &sub.node {
+                ProgramUnit::Subroutine { name, .. } | ProgramUnit::Function { name, .. } => {
+                    name.to_lowercase()
+                }
+                _ => continue,
+            };
+            let sub_locals = subprogram_local_names(&sub.node);
+            let mut refs_set: std::collections::HashSet<String> =
+                out.get(&sub_name).cloned().unwrap_or_default().into_iter().collect();
+            let before = refs_set.len();
+            for r in &level_union {
+                if ancestor_names.contains(r) && !sub_locals.contains(r) {
+                    refs_set.insert(r.clone());
+                }
+            }
+            if refs_set.len() != before {
+                let mut refs: Vec<String> = refs_set.into_iter().collect();
+                refs.sort();
+                out.insert(sub_name, refs);
+            }
         }
     }
 }
