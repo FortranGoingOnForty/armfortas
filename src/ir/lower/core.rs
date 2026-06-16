@@ -45364,7 +45364,29 @@ pub(super) fn lower_arg_by_ref_full(
         if let IrType::Ptr(inner) = &ty {
             if let IrType::Array(elem, 384) = inner.as_ref() {
                 if matches!(elem.as_ref(), IrType::Int(IntWidth::I8)) {
-                    return b.load_typed(val, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                    // The base_addr extraction is correct ONLY for ARRAY
+                    // actuals — sections, array binops, array-result
+                    // functions — whose lowering yields a 384-byte array
+                    // DESCRIPTOR. A SCALAR derived-type value lowers to the
+                    // SAME `Ptr<[i8;384]>` when the type's storage is
+                    // descriptor-sized (e.g. toml-f's `toml_path`, whose
+                    // only component is an allocatable-array descriptor).
+                    // That buffer is a VALUE to pass by address, not a
+                    // descriptor to deref. Without this guard, `sub(f(...))`
+                    // / `sub(T(...))` loaded the buffer's first 8 bytes and
+                    // passed garbage, dropping the allocatable content
+                    // (toml-f set/get_value with a `toml_path(...)` temp:
+                    // walk_path saw an unallocated path). Use the actual's
+                    // declared rank: rank 0 = scalar (pass by address);
+                    // rank >= 1 or unknown = keep the descriptor extraction.
+                    let is_scalar =
+                        actual_expr_rank(expr, locals, st, type_layouts) == Some(0);
+                    if !is_scalar {
+                        return b.load_typed(
+                            val,
+                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                        );
+                    }
                 }
             }
         }
