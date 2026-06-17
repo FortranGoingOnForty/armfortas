@@ -25181,10 +25181,13 @@ fn array_constructor_expr_size_descriptor(
             None
         }
         Expr::FunctionCall { callee, .. } => {
-            let Expr::Name { name } = &callee.node else {
-                return None;
+            let supported_intrinsic = match &callee.node {
+                Expr::Name { name } => constructor_intrinsic_materializes_array(name),
+                _ => false,
             };
-            if !constructor_intrinsic_materializes_array(name) {
+            if !supported_intrinsic
+                && !array_constructor_expr_is_array(locals, expr, st, type_layouts)
+            {
                 return None;
             }
             lower_array_expr_descriptor(
@@ -25247,11 +25250,11 @@ fn array_constructor_expr_descriptor(
             array_constructor_expr_is_array(locals, expr, st, type_layouts)
         }
         Expr::FunctionCall { callee, .. } => {
-            let Expr::Name { name } = &callee.node else {
-                return None;
+            let supported_intrinsic = match &callee.node {
+                Expr::Name { name } => constructor_intrinsic_materializes_array(name),
+                _ => false,
             };
-            constructor_intrinsic_materializes_array(name)
-                && array_constructor_expr_is_array(locals, expr, st, type_layouts)
+            supported_intrinsic || array_constructor_expr_is_array(locals, expr, st, type_layouts)
         }
         _ => false,
     };

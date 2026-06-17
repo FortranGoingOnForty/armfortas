@@ -39880,6 +39880,38 @@ fn array_constructor_whole_array_expressions_flatten_full_size() {
 }
 
 #[test]
+fn array_constructor_array_sections_lower_through_descriptor_path() {
+    let src = write_program(
+        "program p\n  implicit none\n  logical, allocatable :: list(:)\n  integer :: place\n  allocate(list(3))\n  list = [.true., .false., .true.]\n  place = 2\n  list = [list(:place-1), .false., list(place:)]\nend program\n",
+        "f90",
+    );
+    let ir = unique_path("array_ctor_sections", "ir");
+    let emit = Command::new(compiler("armfortas"))
+        .args([
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("array constructor section IR compile failed to spawn");
+    assert!(
+        emit.status.success(),
+        "array constructor section IR compile failed: {}",
+        String::from_utf8_lossy(&emit.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&emit.stderr);
+    assert!(
+        !stderr.contains("coerce_to_type: unhandled coercion"),
+        "array constructor section lowered through scalar coercion path: {}",
+        stderr
+    );
+
+    let _ = std::fs::remove_file(&ir);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn mixed_numeric_array_binary_exprs_coerce_array_lanes() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
