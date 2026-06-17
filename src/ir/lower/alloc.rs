@@ -520,6 +520,7 @@ pub(crate) fn alloc_decls(
                                 vec![addr, es, n],
                                 IrType::Void,
                             );
+                            rewrite_heap_promoted_declared_bounds(b, addr, &dims);
                             let base = b
                                 .load_typed(addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
                             b.call(
@@ -832,6 +833,7 @@ pub(crate) fn alloc_decls(
                             vec![addr, es, n],
                             IrType::Void,
                         );
+                        rewrite_heap_promoted_declared_bounds(b, addr, &dims);
                         if let Some(ref type_name) = array_derived_type {
                             if let Some(layout) = type_layouts.get(type_name) {
                                 if derived_layout_needs_runtime_initialization(layout, type_layouts)
@@ -1188,5 +1190,31 @@ pub(crate) fn alloc_decls(
                 }
             }
         }
+    }
+}
+
+fn rewrite_heap_promoted_declared_bounds(b: &mut FuncBuilder, desc: ValueId, dims: &[(i64, i64)]) {
+    if dims.is_empty() {
+        return;
+    }
+
+    let rank = b.const_i32(dims.len() as i32);
+    store_byte_aggregate_field(b, desc, 16, IrType::Int(IntWidth::I32), rank);
+
+    let mut stride = 1_i64;
+    for (idx, (lower, extent)) in dims.iter().copied().enumerate() {
+        let offset = 24 + (idx as i64) * 24;
+        let upper = if extent <= 0 {
+            lower.saturating_sub(1)
+        } else {
+            lower.saturating_add(extent).saturating_sub(1)
+        };
+        let lower_val = b.const_i64(lower);
+        let upper_val = b.const_i64(upper);
+        let stride_val = b.const_i64(stride);
+        store_byte_aggregate_field(b, desc, offset, IrType::Int(IntWidth::I64), lower_val);
+        store_byte_aggregate_field(b, desc, offset + 8, IrType::Int(IntWidth::I64), upper_val);
+        store_byte_aggregate_field(b, desc, offset + 16, IrType::Int(IntWidth::I64), stride_val);
+        stride = stride.saturating_mul(extent.max(1));
     }
 }

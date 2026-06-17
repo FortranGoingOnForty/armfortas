@@ -27294,6 +27294,49 @@ fn formatted_e_huge_real_internal_write_round_trips() {
 }
 
 #[test]
+fn formatted_internal_write_preserves_allocated_deferred_char_length() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=formatted_internal_write_preserves_allocated_deferred_char_length count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=:), allocatable :: s\n  integer :: n\n  n = 33\n  allocate(character(len=8) :: s)\n  s = repeat('?', len(s))\n  write(s, \"('S', i0)\") n\n  if (len(s) /= 8) error stop 1\n  if (s(1:3) /= 'S33') error stop 2\n  if (s(4:8) /= '     ') error stop 3\n  s(4:4) = 'B'\n  s(5:8) = '0000'\n  if (s /= 'S33B0000') error stop 4\n  print *, s\nend program\n",
+        "f90",
+    );
+    let out = unique_path("formatted_internal_alloc_char_len", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("formatted internal alloc char compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "formatted internal alloc char should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "formatted internal alloc char should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("S33B0000"),
+        "expected preserved deferred-character buffer, got: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn contained_subroutine_forwards_derived_dummy_by_ref() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -27951,6 +27994,48 @@ fn host_associated_large_explicit_array_sections_pass_descriptor() {
     assert!(
         stdout.contains("ok"),
         "unexpected host large explicit array section output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn heap_promoted_explicit_array_preserves_declared_lower_bound() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=heap_promoted_explicit_array_preserves_declared_lower_bound count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  integer, parameter :: n = 70000\n  integer(1) :: values(0:n-1)\n  values = 0_1\n  values(n - 1) = 42_1\n  call check(values)\ncontains\n  subroutine check(arr)\n    integer(1), intent(in) :: arr(0:)\n    if (lbound(arr, 1) /= 0) error stop 1\n    if (ubound(arr, 1) /= n - 1) error stop 2\n    if (arr(n - 1) /= 42_1) error stop 3\n    print *, 'ok'\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("heap_promoted_explicit_lower_bound", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("heap-promoted explicit lower-bound compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "heap-promoted explicit lower-bound should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "heap-promoted explicit lower-bound should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected heap-promoted explicit lower-bound output: {}",
         stdout
     );
 
@@ -39319,6 +39404,94 @@ fn allocate_source_derived_array_deep_copies_allocatable_character_fields() {
     assert!(
         String::from_utf8_lossy(&run.stdout).contains("ok"),
         "unexpected alloc source derived-array deep-copy output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn derived_array_allocation_with_bound_proc_preserves_bounds() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=derived_array_allocation_with_bound_proc_preserves_bounds count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module repro\n  implicit none\n  type :: box_t\n    integer :: value = 0\n  contains\n    procedure :: touch\n  end type box_t\ncontains\n  subroutine touch(self)\n    class(box_t), intent(inout) :: self\n    self%value = self%value + 1\n  end subroutine touch\nend module repro\nprogram p\n  use repro\n  implicit none\n  type(box_t), allocatable :: buf(:)\n  allocate(buf(0:1))\n  if (lbound(buf, 1) /= 0) error stop 1\n  if (ubound(buf, 1) /= 1) error stop 2\n  call buf(0)%touch()\n  if (buf(0)%value /= 1) error stop 3\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("derived_array_bound_proc_bounds", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("derived array bound-proc bounds compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "derived array bound-proc bounds compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("derived array bound-proc bounds run failed");
+    assert!(
+        run.status.success(),
+        "derived array bound-proc bounds run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected derived array bound-proc bounds output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn polymorphic_array_element_dispatch_uses_array_vtable_sidecar() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=polymorphic_array_element_dispatch_uses_array_vtable_sidecar count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module repro\n  implicit none\n  type, abstract :: base_t\n  contains\n    procedure(value_i), deferred :: value\n  end type base_t\n  abstract interface\n    integer function value_i(self) result(out)\n      import :: base_t\n      class(base_t), intent(in) :: self\n    end function value_i\n  end interface\n  type, extends(base_t) :: child_t\n  contains\n    procedure :: value => child_value\n  end type child_t\ncontains\n  integer function child_value(self) result(out)\n    class(child_t), intent(in) :: self\n    out = 17\n  end function child_value\nend module repro\nprogram p\n  use repro\n  implicit none\n  class(base_t), allocatable :: items(:)\n  allocate(child_t :: items(0:1))\n  if (lbound(items, 1) /= 0) error stop 1\n  if (ubound(items, 1) /= 1) error stop 2\n  if (items(0)%value() /= 17) error stop 3\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("poly_array_vtable_sidecar", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("polymorphic array vtable sidecar compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "polymorphic array vtable sidecar compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("polymorphic array vtable sidecar run failed");
+    assert!(
+        run.status.success(),
+        "polymorphic array vtable sidecar run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected polymorphic array vtable sidecar output: {}",
         String::from_utf8_lossy(&run.stdout)
     );
 
