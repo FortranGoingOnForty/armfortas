@@ -39412,6 +39412,94 @@ fn allocate_source_derived_array_deep_copies_allocatable_character_fields() {
 }
 
 #[test]
+fn derived_array_allocation_with_bound_proc_preserves_bounds() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=derived_array_allocation_with_bound_proc_preserves_bounds count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module repro\n  implicit none\n  type :: box_t\n    integer :: value = 0\n  contains\n    procedure :: touch\n  end type box_t\ncontains\n  subroutine touch(self)\n    class(box_t), intent(inout) :: self\n    self%value = self%value + 1\n  end subroutine touch\nend module repro\nprogram p\n  use repro\n  implicit none\n  type(box_t), allocatable :: buf(:)\n  allocate(buf(0:1))\n  if (lbound(buf, 1) /= 0) error stop 1\n  if (ubound(buf, 1) /= 1) error stop 2\n  call buf(0)%touch()\n  if (buf(0)%value /= 1) error stop 3\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("derived_array_bound_proc_bounds", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("derived array bound-proc bounds compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "derived array bound-proc bounds compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("derived array bound-proc bounds run failed");
+    assert!(
+        run.status.success(),
+        "derived array bound-proc bounds run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected derived array bound-proc bounds output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn polymorphic_array_element_dispatch_uses_array_vtable_sidecar() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=polymorphic_array_element_dispatch_uses_array_vtable_sidecar count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module repro\n  implicit none\n  type, abstract :: base_t\n  contains\n    procedure(value_i), deferred :: value\n  end type base_t\n  abstract interface\n    integer function value_i(self) result(out)\n      import :: base_t\n      class(base_t), intent(in) :: self\n    end function value_i\n  end interface\n  type, extends(base_t) :: child_t\n  contains\n    procedure :: value => child_value\n  end type child_t\ncontains\n  integer function child_value(self) result(out)\n    class(child_t), intent(in) :: self\n    out = 17\n  end function child_value\nend module repro\nprogram p\n  use repro\n  implicit none\n  class(base_t), allocatable :: items(:)\n  allocate(child_t :: items(0:1))\n  if (lbound(items, 1) /= 0) error stop 1\n  if (ubound(items, 1) /= 1) error stop 2\n  if (items(0)%value() /= 17) error stop 3\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("poly_array_vtable_sidecar", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("polymorphic array vtable sidecar compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "polymorphic array vtable sidecar compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("polymorphic array vtable sidecar run failed");
+    assert!(
+        run.status.success(),
+        "polymorphic array vtable sidecar run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected polymorphic array vtable sidecar output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn intent_out_derived_dummy_resets_allocatable_components_between_calls() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

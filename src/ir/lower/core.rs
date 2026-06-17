@@ -29685,6 +29685,10 @@ pub(super) fn load_array_desc_i64_field(
 const ARRAY_DESC_RANK_OFFSET: i64 = 16;
 const ARRAY_DESC_FLAGS_OFFSET: i64 = 20;
 const ARRAY_DESC_SCALAR_TYPE_TAG_OFFSET: i64 = 24;
+const ARRAY_DESC_SCALAR_VTABLE_OFFSET: i64 = 32;
+const ARRAY_DESC_DIMS_OFFSET: i64 = 24;
+const ARRAY_DESC_DIM_BYTES: i64 = 24;
+const ARRAY_DESC_MAX_RANK: i32 = 15;
 const ARRAY_DESC_FLAGS_LOW_BITS_MASK: i32 = 0x0000_00ff;
 const ARRAY_DESC_TYPE_TAG_COMPACT_MASK: i64 = 0x00ff_ffff;
 const ARRAY_DESC_TYPE_TAG_FLAGS_SHIFT: i32 = 8;
@@ -29751,9 +29755,49 @@ pub(super) fn lower_parameter_derived_component_const(
 }
 
 pub(super) fn load_array_desc_vtable_ptr(b: &mut FuncBuilder, desc: ValueId) -> ValueId {
-    let off = b.const_i64(32);
+    // Scalars keep their full vtable pointer in dims[0].upper_bound.
+    // Arrays use the first unused DimDescriptor's lower_bound slot; active
+    // dimension fields are observable through LBOUND/UBOUND and finalizers.
+    let ptr_ty = IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)));
+    let rank = load_array_desc_i32_field(b, desc, ARRAY_DESC_RANK_OFFSET);
+    let zero32 = b.const_i32(0);
+    let is_scalar = b.icmp(CmpOp::Eq, rank, zero32);
+    let scalar_bb = b.create_block("desc_vtable_scalar");
+    let array_check_bb = b.create_block("desc_vtable_array_check");
+    let array_load_bb = b.create_block("desc_vtable_array_load");
+    let null_bb = b.create_block("desc_vtable_null");
+    let done_bb = b.create_block("desc_vtable_done");
+    let result = b.add_block_param(done_bb, ptr_ty.clone());
+    b.cond_branch(is_scalar, scalar_bb, vec![], array_check_bb, vec![]);
+
+    b.set_block(scalar_bb);
+    let off = b.const_i64(ARRAY_DESC_SCALAR_VTABLE_OFFSET);
     let ptr = b.gep(desc, vec![off], IrType::Int(IntWidth::I8));
-    b.load_typed(ptr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
+    let vtable = b.load_typed(ptr, ptr_ty.clone());
+    b.branch(done_bb, vec![vtable]);
+
+    b.set_block(array_check_bb);
+    let max_rank = b.const_i32(ARRAY_DESC_MAX_RANK);
+    let has_sidecar_slot = b.icmp(CmpOp::Lt, rank, max_rank);
+    b.cond_branch(has_sidecar_slot, array_load_bb, vec![], null_bb, vec![]);
+
+    b.set_block(array_load_bb);
+    let rank64 = b.int_extend(rank, IntWidth::I64, false);
+    let dim_bytes = b.const_i64(ARRAY_DESC_DIM_BYTES);
+    let sidecar_delta = b.imul(rank64, dim_bytes);
+    let dims_base = b.const_i64(ARRAY_DESC_DIMS_OFFSET);
+    let sidecar_off = b.iadd(dims_base, sidecar_delta);
+    let sidecar_ptr = b.gep(desc, vec![sidecar_off], IrType::Int(IntWidth::I8));
+    let sidecar_vtable = b.load_typed(sidecar_ptr, ptr_ty);
+    b.branch(done_bb, vec![sidecar_vtable]);
+
+    b.set_block(null_bb);
+    let zero64 = b.const_i64(0);
+    let null = b.int_to_ptr(zero64, IrType::Int(IntWidth::I8));
+    b.branch(done_bb, vec![null]);
+
+    b.set_block(done_bb);
+    result
 }
 
 pub(super) fn store_array_desc_type_tag(b: &mut FuncBuilder, desc: ValueId, tag: ValueId) {
@@ -29790,13 +29834,41 @@ pub(super) fn store_array_desc_type_tag(b: &mut FuncBuilder, desc: ValueId, tag:
 }
 
 pub(super) fn store_array_desc_vtable_ptr(b: &mut FuncBuilder, desc: ValueId, vtable_ptr: ValueId) {
+    let rank = load_array_desc_i32_field(b, desc, ARRAY_DESC_RANK_OFFSET);
+    let zero32 = b.const_i32(0);
+    let is_scalar = b.icmp(CmpOp::Eq, rank, zero32);
+    let scalar_bb = b.create_block("desc_vtable_store_scalar");
+    let array_check_bb = b.create_block("desc_vtable_store_array_check");
+    let array_store_bb = b.create_block("desc_vtable_store_array");
+    let done_bb = b.create_block("desc_vtable_store_done");
+    b.cond_branch(is_scalar, scalar_bb, vec![], array_check_bb, vec![]);
+
+    b.set_block(scalar_bb);
     store_byte_aggregate_field(
         b,
         desc,
-        32,
+        ARRAY_DESC_SCALAR_VTABLE_OFFSET,
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
         vtable_ptr,
     );
+    b.branch(done_bb, vec![]);
+
+    b.set_block(array_check_bb);
+    let max_rank = b.const_i32(ARRAY_DESC_MAX_RANK);
+    let has_sidecar_slot = b.icmp(CmpOp::Lt, rank, max_rank);
+    b.cond_branch(has_sidecar_slot, array_store_bb, vec![], done_bb, vec![]);
+
+    b.set_block(array_store_bb);
+    let rank64 = b.int_extend(rank, IntWidth::I64, false);
+    let dim_bytes = b.const_i64(ARRAY_DESC_DIM_BYTES);
+    let sidecar_delta = b.imul(rank64, dim_bytes);
+    let dims_base = b.const_i64(ARRAY_DESC_DIMS_OFFSET);
+    let sidecar_off = b.iadd(dims_base, sidecar_delta);
+    let sidecar_ptr = b.gep(desc, vec![sidecar_off], IrType::Int(IntWidth::I8));
+    b.store(vtable_ptr, sidecar_ptr);
+    b.branch(done_bb, vec![]);
+
+    b.set_block(done_bb);
 }
 
 pub(super) fn store_scalar_polymorphic_descriptor_view(
