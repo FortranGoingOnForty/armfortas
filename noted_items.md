@@ -428,4 +428,10 @@ Found during l04 (2026-06-12):
   call-safe (values live across the recursive call sit in slots for free).
   So arm64 -O0 keeps naive; the bug B fix is x86-only. Don't re-flip
   without re-measuring arm64 recursion depth. (fortsh runs on x86, so this
-  doesn't affect the fortsh rung.)
+  doesn't affect the fortsh rung.) The full run_programs gate under
+  arm64-linear@O0 ALSO surfaced 2 -O0 failures absent under naive
+  (do_loop_vectorize_fma, do_loop_vectorize_minmax_binary) — lib was
+  1291/0, so arm64-linear is mostly correct, but these 2 are either real
+  arm64-linear@O0 miscompiles or load flakes; not classified, since arm64
+  stays naive and the shipped (naive@O0) suite is green. If arm64 -O0 is
+  ever flipped, triage these two first.
