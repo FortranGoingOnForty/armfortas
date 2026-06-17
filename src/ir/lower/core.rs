@@ -12217,6 +12217,8 @@ fn resolve_generic_call_by_semantics_impl(
                 .as_ref()
                 .is_some_and(|declared_type| {
                     generic_declared_semantic_match(
+                        st,
+                        current_proc_scope(),
                         declared_type,
                         semantic_slots.get(idx).and_then(|slot| slot.as_ref()),
                         type_layouts,
@@ -12402,7 +12404,13 @@ fn resolve_generic_call_actuals_from_specifics(
                 return true;
             };
             let actual = semantic_slots.get(idx).and_then(|slot| slot.as_ref());
-            generic_declared_semantic_match(declared_type, actual, type_layouts)
+            generic_declared_semantic_match(
+                st,
+                callee_scope_id_for_lookup(st, b.func().name.as_str()).or_else(current_proc_scope),
+                declared_type,
+                actual,
+                type_layouts,
+            )
         });
         // F2018 §15.8.3: an elemental procedure with scalar formals
         // accepts conformable array actuals — the procedure is invoked
@@ -13080,7 +13088,13 @@ fn resolve_bound_proc_by_semantics<'a>(
                 };
                 let actual = semantic_slots.get(idx).and_then(|slot| slot.as_ref());
                 actual.is_some()
-                    && generic_declared_semantic_match(declared_type, actual, type_layouts)
+                    && generic_declared_semantic_match(
+                        st,
+                        current_proc_scope(),
+                        declared_type,
+                        actual,
+                        type_layouts,
+                    )
             });
         if !semantic_match {
             continue;
@@ -13197,7 +13211,14 @@ pub(super) fn resolve_bound_proc_actuals<'a>(
                         {
                             return false;
                         }
-                        generic_declared_semantic_match(declared_type, actual, type_layouts)
+                        generic_declared_semantic_match(
+                            st,
+                            callee_scope_id_for_lookup(st, b.func().name.as_str())
+                                .or_else(current_proc_scope),
+                            declared_type,
+                            actual,
+                            type_layouts,
+                        )
                     }
                     None => true,
                 },
@@ -13678,7 +13699,34 @@ pub(super) fn intrinsic_kind_matches(
     declared.unwrap_or(default_kind) == actual.unwrap_or(default_kind)
 }
 
+fn canonical_type_name_for_generic_match(
+    st: &SymbolTable,
+    scope_id: Option<crate::sema::symtab::ScopeId>,
+    name: &str,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> String {
+    type_layouts
+        .and_then(|tl| canonical_layout_type_name_for_scope(st, scope_id, name, tl))
+        .unwrap_or_else(|| name.to_string())
+}
+
+fn generic_type_names_match(
+    st: &SymbolTable,
+    scope_id: Option<crate::sema::symtab::ScopeId>,
+    declared_name: &str,
+    actual_name: &str,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> bool {
+    let declared_name =
+        canonical_type_name_for_generic_match(st, scope_id, declared_name, type_layouts);
+    let actual_name =
+        canonical_type_name_for_generic_match(st, scope_id, actual_name, type_layouts);
+    actual_name.eq_ignore_ascii_case(&declared_name)
+}
+
 pub(super) fn generic_declared_semantic_match(
+    st: &SymbolTable,
+    scope_id: Option<crate::sema::symtab::ScopeId>,
     declared: &crate::sema::symtab::TypeInfo,
     actual: Option<&crate::sema::symtab::TypeInfo>,
     type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
@@ -13732,12 +13780,21 @@ pub(super) fn generic_declared_semantic_match(
         TypeInfo::Derived(decl_name) => matches!(
             actual,
             TypeInfo::Derived(actual_name) | TypeInfo::Class(actual_name)
-                if actual_name.eq_ignore_ascii_case(decl_name)
+                if generic_type_names_match(st, scope_id, decl_name, actual_name, type_layouts)
         ),
         TypeInfo::Class(decl_name) => match actual {
             TypeInfo::Derived(actual_name) | TypeInfo::Class(actual_name) => {
-                actual_name.eq_ignore_ascii_case(decl_name)
-                    || type_layouts.is_some_and(|tl| is_type_or_extends(actual_name, decl_name, tl))
+                if generic_type_names_match(st, scope_id, decl_name, actual_name, type_layouts) {
+                    true
+                } else if let Some(tl) = type_layouts {
+                    let actual_name =
+                        canonical_type_name_for_generic_match(st, scope_id, actual_name, Some(tl));
+                    let decl_name =
+                        canonical_type_name_for_generic_match(st, scope_id, decl_name, Some(tl));
+                    is_type_or_extends(&actual_name, &decl_name, tl)
+                } else {
+                    false
+                }
             }
             _ => false,
         },
@@ -27140,7 +27197,13 @@ fn resolve_defined_io_item_specific(
         let Some(declared_type) = first_arg.type_info.as_ref() else {
             return false;
         };
-        generic_declared_semantic_match(declared_type, Some(&actual_type), Some(ctx.type_layouts))
+        generic_declared_semantic_match(
+            ctx.st,
+            ctx.proc_scope_id,
+            declared_type,
+            Some(&actual_type),
+            Some(ctx.type_layouts),
+        )
     })
 }
 
@@ -35371,7 +35434,13 @@ fn generic_interface_has_elemental_candidate_for_actuals(
             };
             match semantic_slots.get(idx).and_then(|slot| slot.as_ref()) {
                 Some(actual) => {
-                    generic_declared_semantic_match(declared_type, Some(actual), type_layouts)
+                    generic_declared_semantic_match(
+                        st,
+                        current_proc_scope(),
+                        declared_type,
+                        Some(actual),
+                        type_layouts,
+                    )
                 }
                 None => true,
             }
@@ -44005,7 +44074,11 @@ pub(super) fn resolve_component_field_access(
         return None;
     };
     let (base_addr, type_name) = resolve_component_base(b, locals, base, st, tl)?;
-    let layout = tl.get(&type_name)?;
+    let scope_id =
+        callee_scope_id_for_lookup(st, b.func().name.as_str()).or_else(current_proc_scope);
+    let layout_name =
+        canonical_layout_type_name_for_scope(st, scope_id, &type_name, tl).unwrap_or(type_name);
+    let layout = tl.get(&layout_name)?;
     let field = layout.field(component)?.clone();
     let offset = b.const_i64(field.offset as i64);
     let field_ptr = b.gep(base_addr, vec![offset], IrType::Int(IntWidth::I8));
