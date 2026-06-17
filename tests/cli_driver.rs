@@ -42679,6 +42679,33 @@ fn generic_character_substring_actual_uses_local_character_type() {
 }
 
 #[test]
+fn generic_module_allocatable_character_array_uses_declared_rank() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=generic_module_allocatable_character_array_uses_declared_rank count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  private\n  public :: update\n  interface insert\n    module procedure insert_c\n  end interface\n  character(len=:), allocatable, save :: keywords(:)\ncontains\n  subroutine update(key)\n    character(len=*), intent(in) :: key\n    character(len=:), allocatable :: long\n    integer :: place\n    long = trim(key)\n    place = 1\n    call insert(keywords, long, place)\n  end subroutine\n  subroutine insert_c(list, value, place)\n    character(len=*), intent(in) :: value\n    character(len=:), allocatable :: list(:)\n    integer, intent(in) :: place\n    if (.not. allocated(list)) then\n      allocate(character(len=len_trim(value)) :: list(1))\n    end if\n  end subroutine\nend module\nprogram p\n  use m, only: update\n  call update('abc')\nend program\n",
+        "f90",
+    );
+    let out = unique_path("generic_module_alloc_char_rank", "o");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("module allocatable character generic compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "module allocatable character generic compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn generic_actual_all_of_defined_operator_has_logical_type() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

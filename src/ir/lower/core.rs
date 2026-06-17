@@ -12520,13 +12520,7 @@ pub(super) fn actual_expr_rank(
             let key = name.to_lowercase();
             let symbol_rank = st
                 .lookup_local_then_any(current_proc_scope(), &key)
-                .and_then(|sym| {
-                    if sym.attrs.array_spec.is_empty() {
-                        None
-                    } else {
-                        Some(sym.attrs.array_spec.len())
-                    }
-                });
+                .and_then(value_symbol_declared_rank);
             if let Some(info) = locals.get(&key) {
                 if local_is_array_like(info) {
                     let local_rank = local_declared_rank(info);
@@ -12537,6 +12531,11 @@ pub(super) fn actual_expr_rank(
                         if symbol_rank > 0 {
                             return Some(symbol_rank);
                         }
+                    }
+                }
+                if let Some(symbol_rank) = symbol_rank {
+                    if symbol_rank > 0 {
+                        return Some(symbol_rank);
                     }
                 }
                 return Some(0);
