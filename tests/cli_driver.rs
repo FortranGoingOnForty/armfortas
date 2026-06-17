@@ -28002,6 +28002,48 @@ fn host_associated_large_explicit_array_sections_pass_descriptor() {
 }
 
 #[test]
+fn heap_promoted_explicit_array_preserves_declared_lower_bound() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=heap_promoted_explicit_array_preserves_declared_lower_bound count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  integer, parameter :: n = 70000\n  integer(1) :: values(0:n-1)\n  values = 0_1\n  values(n - 1) = 42_1\n  call check(values)\ncontains\n  subroutine check(arr)\n    integer(1), intent(in) :: arr(0:)\n    if (lbound(arr, 1) /= 0) error stop 1\n    if (ubound(arr, 1) /= n - 1) error stop 2\n    if (arr(n - 1) /= 42_1) error stop 3\n    print *, 'ok'\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("heap_promoted_explicit_lower_bound", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("heap-promoted explicit lower-bound compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "heap-promoted explicit lower-bound should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "heap-promoted explicit lower-bound should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected heap-promoted explicit lower-bound output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn use_only_generic_call_resolution_beats_private_reexport() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
