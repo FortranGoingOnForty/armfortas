@@ -2866,8 +2866,12 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 // or a local declaration made a callable with this
                 // name visible, resolve that call normally instead
                 // of eagerly lowering the intrinsic runtime hook.
-                if user_callable_shadows_intrinsic(ctx.st, &key)
-                    || !super::intrinsic_sub::lower_intrinsic_subroutine(b, ctx, &key, args)
+                if user_callable_shadows_intrinsic(
+                    ctx.st,
+                    ctx.proc_scope_id,
+                    b.func().name.as_str(),
+                    &key,
+                ) || !super::intrinsic_sub::lower_intrinsic_subroutine(b, ctx, &key, args)
                 {
                     let procptr_target =
                         procedure_pointer_call_target(b, &ctx.locals, ctx.st, &key);

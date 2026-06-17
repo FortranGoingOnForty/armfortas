@@ -43087,6 +43087,43 @@ fn imported_generic_subroutine_shadows_intrinsic_subroutine() {
 }
 
 #[test]
+fn module_subroutine_shadows_split_intrinsic_subroutine() {
+    let src = write_program(
+        "module m\n  implicit none\ncontains\n  subroutine update(key)\n    character(*), intent(in) :: key\n    character(:), allocatable :: parts(:)\n    call split(trim(key), parts, ':', nulls='return')\n  end subroutine\n\n  subroutine split(input_line, array, delimiters, order, nulls)\n    character(*), intent(in) :: input_line\n    character(:), allocatable, intent(out) :: array(:)\n    character(*), intent(in), optional :: delimiters\n    character(*), intent(in), optional :: order\n    character(*), intent(in), optional :: nulls\n    allocate(character(len=len_trim(input_line)) :: array(1))\n    array(1) = trim(input_line)\n  end subroutine\nend module\nprogram p\n  use m, only: update\n  call update('a:b')\nend program\n",
+        "f90",
+    );
+    let ir = unique_path("module_split_shadows_intrinsic", "ir");
+    let emit = Command::new(compiler("armfortas"))
+        .args([
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("module split shadow IR compile failed to spawn");
+    assert!(
+        emit.status.success(),
+        "module split shadow IR compile failed: {}",
+        String::from_utf8_lossy(&emit.stderr)
+    );
+    let ir_text = fs::read_to_string(&ir).expect("cannot read emitted IR");
+    assert!(
+        ir_text.contains("call @afs_modproc_m_split"),
+        "CALL split did not resolve to the module subroutine:\n{}",
+        ir_text
+    );
+    assert!(
+        !ir_text.contains("call @afs_split"),
+        "CALL split incorrectly lowered through the intrinsic runtime hook:\n{}",
+        ir_text
+    );
+
+    let _ = std::fs::remove_file(&ir);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn imported_generic_function_shadows_intrinsic_type_probe() {
     let src = write_program(
         "module special_like\n  implicit none\n  private\n  public :: log_gamma\n  interface log_gamma\n    module procedure l_gamma_iint32\n  end interface\ncontains\n  elemental real(8) function l_gamma_iint32(z) result(res)\n    integer, intent(in) :: z\n    res = real(z, 8) + 0.25_8\n  end function\nend module\nmodule check_like\n  implicit none\n  private\n  public :: error_type, check\n  type :: error_type\n    integer :: code = 0\n  end type\n  interface check\n    module procedure check_float_dp\n  end interface\ncontains\n  subroutine check_float_dp(error, actual, expected, message, more, thr, rel)\n    type(error_type), allocatable, intent(out) :: error\n    real(8), intent(in) :: actual\n    real(8), intent(in) :: expected\n    character(*), intent(in), optional :: message\n    character(*), intent(in), optional :: more\n    real(8), intent(in), optional :: thr\n    logical, intent(in), optional :: rel\n    if (abs(actual - expected) > 1.0e-12_8) allocate(error)\n  end subroutine\nend module\nprogram p\n  use special_like, only: log_gamma\n  use check_like, only: error_type, check\n  implicit none\n  type(error_type), allocatable :: error\n  integer :: i\n  integer, parameter :: xtest(*) = [1, 2, 10, 47]\n  integer, parameter :: x(*) = pack(xtest, xtest < huge(0_1))\n  real(8), parameter :: ans(*) = [1.25_8, 2.25_8, 10.25_8, 47.25_8]\n  real(8), parameter :: tol = sqrt(epsilon(1.0_8))\n  i = 1\n  call check(error, log_gamma(x(i)), ans(i), 'integer log_gamma', thr=tol, rel=.true.)\n  if (allocated(error)) error stop 1\n  print *, 'ok'\nend program\n",

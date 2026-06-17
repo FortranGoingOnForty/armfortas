@@ -11441,7 +11441,12 @@ fn scope_is_host_associated_or_self(
     }
 }
 
-pub(super) fn user_callable_shadows_intrinsic(st: &SymbolTable, name: &str) -> bool {
+pub(super) fn user_callable_shadows_intrinsic(
+    st: &SymbolTable,
+    caller_scope_id: Option<crate::sema::symtab::ScopeId>,
+    caller_link_name: &str,
+    name: &str,
+) -> bool {
     use crate::sema::symtab::SymbolKind;
 
     fn is_user_callable(sym: &crate::sema::symtab::Symbol) -> bool {
@@ -11458,6 +11463,15 @@ pub(super) fn user_callable_shadows_intrinsic(st: &SymbolTable, name: &str) -> b
     }
 
     let key = name.to_ascii_lowercase();
+    let caller_scope_id =
+        caller_scope_id.or_else(|| callee_scope_id_for_lookup(st, caller_link_name));
+    if let Some(scope_id) = caller_scope_id {
+        if let Some(sym) = st.lookup_in(scope_id, &key) {
+            if is_user_callable(sym) {
+                return true;
+            }
+        }
+    }
     if let Some(sym) = st.lookup(&key) {
         if is_user_callable(sym) {
             return true;
