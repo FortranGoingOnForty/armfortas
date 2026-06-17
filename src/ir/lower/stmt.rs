@@ -2213,9 +2213,10 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
 
             if let Some(ctrl) = controls.first() {
                 // Formatted internal WRITE to a deferred-length allocatable
-                // `character(:), allocatable` scalar: reallocate the target
-                // to the record length (F2008/F2018). List-directed to such
-                // a target stays on the fixed-buffer path below.
+                // `character(:), allocatable` scalar: unallocated targets are
+                // allocated to the record length, while allocated targets
+                // behave as fixed internal files. List-directed to such a
+                // target stays on the fixed-buffer path below.
                 if !is_list_directed {
                     if let Some(desc) = internal_io_alloc_target(b, ctx, ctrl) {
                         let (fmt_ptr, fmt_len) = lower_string_expr_with_layouts(

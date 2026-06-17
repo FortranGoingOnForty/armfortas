@@ -1,14 +1,12 @@
-! l05-3: F2008/F2018 auto-reallocation of a deferred-length allocatable
-! character on internal WRITE. write(s, fmt) reallocates s to the exact
-! record length; len(s) tracks it. Covers grow-from-unallocated, shrink,
-! re-grow, and a self-referential write (the target appears in the output
-! list) which exercises the allocate-new-before-free ordering. WRITE (not
-! PRINT) carries the format so the field contents are exact. Runtime-
-! threaded, so opt-level invariant (OPT_EQ).
+! l05-3: formatted internal WRITE to a deferred-length allocatable character.
+! An unallocated target is allocated to the first record length; an already
+! allocated target behaves like a fixed internal file, preserving length while
+! padding or truncating the formatted record. Assignment to the same variable
+! still uses normal allocatable character reallocation semantics.
 ! CHECK: a |val=42!| 7
-! CHECK: b |x| 1
-! CHECK: c |hello, world #100| 17
-! CHECK: d |abab| 4
+! CHECK: b |x      | 7
+! CHECK: c |hello, | 7
+! CHECK: d |ab| 2
 ! CHECK: ok
 ! OPT_EQ: O0,O1,O2,O3,Os,Ofast => stdout|stderr|exit
 program x_l05_internal_write_realloc
@@ -18,14 +16,14 @@ program x_l05_internal_write_realloc
   write(s, '(A,I0,A)') 'val=', 42, '!'        ! grow from unallocated -> 7
   write(*, '(A,A,A,I0)') 'a |', s, '| ', len(s)
 
-  write(s, '(A)') 'x'                          ! shrink -> 1
+  write(s, '(A)') 'x'                          ! fixed internal file -> 7
   write(*, '(A,A,A,I0)') 'b |', s, '| ', len(s)
 
-  write(s, '(A,I0)') 'hello, world #', 100     ! re-grow -> 17
+  write(s, '(A,I0)') 'hello, world #', 100     ! truncate to current len -> 7
   write(*, '(A,A,A,I0)') 'c |', s, '| ', len(s)
 
-  s = 'ab'
-  write(s, '(A,A)') s, s                       ! self-referential -> 'abab'
+  s = 'ab'                                     ! assignment reallocates -> 2
+  write(s, '(A,A)') s, s                       ! truncate to current len -> 'ab'
   write(*, '(A,A,A,I0)') 'd |', s, '| ', len(s)
 
   print '(A)', 'ok'
