@@ -43156,6 +43156,38 @@ fn generic_subroutine_matches_use_renamed_class_actual() {
 }
 
 #[test]
+fn use_only_generic_collects_all_bare_reexport_specifics() {
+    let src = write_program(
+        "module table_api\n  implicit none\n  type :: toml_table\n    integer :: n = 0\n  end type\n  type :: toml_array\n    integer :: n = 0\n  end type\n  interface get_value\n    module procedure get_child_array\n  end interface\ncontains\n  subroutine get_child_array(table, key, ptr, requested)\n    class(toml_table), intent(inout) :: table\n    character(*), intent(in) :: key\n    type(toml_array), pointer, intent(out) :: ptr\n    logical, intent(in), optional :: requested\n    nullify(ptr)\n  end subroutine\nend module\nmodule array_api\n  use table_api, only: toml_array\n  implicit none\n  interface get_value\n    module procedure get_elem_array\n  end interface\ncontains\n  subroutine get_elem_array(array, pos, ptr)\n    class(toml_array), intent(inout) :: array\n    integer, intent(in) :: pos\n    type(toml_array), pointer, intent(out) :: ptr\n    nullify(ptr)\n  end subroutine\nend module\nmodule build_api\n  use array_api\n  use table_api\n  implicit none\nend module\nmodule toml_api\n  use build_api\n  implicit none\nend module\nmodule user_m\n  use toml_api, only: toml_table, toml_array, get_value\n  implicit none\n  interface get_value\n    module procedure get_local_bool\n  end interface\ncontains\n  subroutine run(table, key)\n    type(toml_table), intent(inout) :: table\n    character(*), intent(in) :: key\n    type(toml_array), pointer :: children\n    call get_value(table, key, children, requested=.false.)\n  end subroutine\n  subroutine get_local_bool(table, key, value)\n    type(toml_table), intent(inout) :: table\n    character(*), intent(in) :: key\n    logical, intent(out) :: value\n    value = .false.\n  end subroutine\nend module\nprogram p\n  use user_m, only: run\n  use table_api, only: toml_table\n  type(toml_table) :: table\n  call run(table, 'items')\nend program\n",
+        "f90",
+    );
+    let ir = unique_path("generic_bare_reexports", "ir");
+    let emit = Command::new(compiler("armfortas"))
+        .args([
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("bare re-export generic IR compile failed to spawn");
+    assert!(
+        emit.status.success(),
+        "bare re-export generic IR compile failed: {}",
+        String::from_utf8_lossy(&emit.stderr)
+    );
+    let ir_text = fs::read_to_string(&ir).expect("cannot read emitted IR");
+    assert!(
+        ir_text.contains("call @afs_modproc_table_api_get_child_array"),
+        "get_value did not resolve to the table child-array specific:\n{}",
+        ir_text
+    );
+
+    let _ = std::fs::remove_file(&ir);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn imported_generic_function_shadows_intrinsic_type_probe() {
     let src = write_program(
         "module special_like\n  implicit none\n  private\n  public :: log_gamma\n  interface log_gamma\n    module procedure l_gamma_iint32\n  end interface\ncontains\n  elemental real(8) function l_gamma_iint32(z) result(res)\n    integer, intent(in) :: z\n    res = real(z, 8) + 0.25_8\n  end function\nend module\nmodule check_like\n  implicit none\n  private\n  public :: error_type, check\n  type :: error_type\n    integer :: code = 0\n  end type\n  interface check\n    module procedure check_float_dp\n  end interface\ncontains\n  subroutine check_float_dp(error, actual, expected, message, more, thr, rel)\n    type(error_type), allocatable, intent(out) :: error\n    real(8), intent(in) :: actual\n    real(8), intent(in) :: expected\n    character(*), intent(in), optional :: message\n    character(*), intent(in), optional :: more\n    real(8), intent(in), optional :: thr\n    logical, intent(in), optional :: rel\n    if (abs(actual - expected) > 1.0e-12_8) allocate(error)\n  end subroutine\nend module\nprogram p\n  use special_like, only: log_gamma\n  use check_like, only: error_type, check\n  implicit none\n  type(error_type), allocatable :: error\n  integer :: i\n  integer, parameter :: xtest(*) = [1, 2, 10, 47]\n  integer, parameter :: x(*) = pack(xtest, xtest < huge(0_1))\n  real(8), parameter :: ans(*) = [1.25_8, 2.25_8, 10.25_8, 47.25_8]\n  real(8), parameter :: tol = sqrt(epsilon(1.0_8))\n  i = 1\n  call check(error, log_gamma(x(i)), ans(i), 'integer log_gamma', thr=tol, rel=.true.)\n  if (allocated(error)) error stop 1\n  print *, 'ok'\nend program\n",

@@ -11332,18 +11332,81 @@ fn use_associated_named_interface_symbols<'a>(
             if assoc.local_name != key {
                 continue;
             }
-            if let Some(sym) = st
-                .lookup_in(assoc.source_scope, &assoc.original_name)
-                .filter(|sym| is_named_interface_like(sym))
-            {
-                let sym_key = (sym.name.to_ascii_lowercase(), sym.scope);
-                if seen.insert(sym_key) {
-                    symbols.push(sym);
-                }
-            }
+            let mut visited = Vec::new();
+            collect_named_interface_symbols_from_scope(
+                st,
+                assoc.source_scope,
+                &assoc.original_name,
+                &mut visited,
+                &mut symbols,
+                &mut seen,
+            );
         }
     }
     symbols
+}
+
+fn collect_named_interface_symbols_from_scope<'a>(
+    st: &'a SymbolTable,
+    scope_id: crate::sema::symtab::ScopeId,
+    key: &str,
+    visited: &mut Vec<crate::sema::symtab::ScopeId>,
+    symbols: &mut Vec<&'a crate::sema::symtab::Symbol>,
+    seen: &mut HashSet<(String, crate::sema::symtab::ScopeId)>,
+) {
+    if visited.contains(&scope_id) {
+        return;
+    }
+    visited.push(scope_id);
+    let scope = st.scope(scope_id);
+
+    if let Some(sym) = scope.symbols.get(key) {
+        if sym.attrs.access != crate::sema::symtab::Access::Private
+            && is_named_interface_like(sym)
+        {
+            let sym_key = (sym.name.to_ascii_lowercase(), sym.scope);
+            if seen.insert(sym_key) {
+                symbols.push(sym);
+            }
+        }
+    }
+
+    for assoc in &scope.use_associations {
+        if assoc.local_name == key {
+            collect_named_interface_symbols_from_scope(
+                st,
+                assoc.source_scope,
+                &assoc.original_name,
+                visited,
+                symbols,
+                seen,
+            );
+        }
+    }
+
+    let mut seen_use_scopes = Vec::new();
+    for assoc in &scope.use_associations {
+        if !assoc.from_bare_use {
+            continue;
+        }
+        if assoc.local_name != assoc.original_name {
+            continue;
+        }
+        if seen_use_scopes.contains(&assoc.source_scope) {
+            continue;
+        }
+        seen_use_scopes.push(assoc.source_scope);
+        collect_named_interface_symbols_from_scope(
+            st,
+            assoc.source_scope,
+            key,
+            visited,
+            symbols,
+            seen,
+        );
+    }
+
+    visited.pop();
 }
 
 fn active_block_use_named_interface_symbols<'a>(
