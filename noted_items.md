@@ -402,17 +402,25 @@ Found during l04 (2026-06-12):
   Stmt::Print vs Stmt::Write) — likely PRINT routes format-carrying
   output through the list-directed path.
 
-- **macOS arm64 run_programs gate is red on x12-campaign-x86** (found
-  x12 bug B work, 2026-06-16): a nomad run of `cargo test --test
-  run_programs --release` at the branch HEAD failed 113/7 — 7 programs
-  fail at EVERY opt level, including the named fixture
-  `defined_assignment_derived_operator_result` (which passes on x86 at
-  both -O0 and -O1+). These fail at O1+ too, where the bug B fix changes
-  nothing (the arm64 allocator path is byte-identical to before — the
-  arm64/mod.rs diff vs parent is comment-only), so they are PRE-EXISTING
-  macOS-arm64 regressions on this x86-campaign branch, not caused by bug
-  B. lib tests are green on macOS (1290/0); the failures are codegen/
-  runtime, surfaced only by the e2e run. Needs a dedicated macOS-arm64
-  triage: get the 7 program names (run_programs without the result-only
-  grep filter), bisect against trunk to find when the branch drifted from
-  macOS-green. Owner: x12 macOS-gate triage (separate from bug B).
+- **macOS arm64 run_programs "7 failures" were load flakiness, not real**
+  (found + resolved during x12 bug B triage, 2026-06-16/17): an initial
+  nomad run (43 min, host load ~7) of `cargo test --test run_programs
+  --release` reported 113/7. Triaged with lighter-load isolated-worktree
+  runs: the "7" were a SINGLE flaky program — `defined_assignment_
+  derived_operator_result` timing out under the crush, failing all 6
+  `test_programs_end_to_end_*` batch levels (6) + its `_passes_at_o0`
+  per-fixture test (1) = 7. In a lighter run it PASSES; trunk's -O0 batch
+  is fully clean; x12's -O0 batch is clean except the bug B fixture
+  (below). Conclusion: NO pre-existing macOS-arm64 codegen regressions on
+  this branch. Lesson: don't trust run_programs failure counts from a
+  heavily-loaded nomad run — re-run under light load before classifying.
+
+- **arm64 -O0 still uses the naive allocator (bug B is x86-only)** (x12,
+  2026-06-17): the bug B fix routes x86 -O0 through linear-scan but leaves
+  arm64 -O0 on naive, so macOS codegen is unchanged. arm64 -O0 therefore
+  retains the deep-recursion stack-overflow limitation (huge spill-
+  everything frames). Not a campaign requirement (fortsh runs on x86), and
+  flipping arm64 -O0 to linear needs a clean macOS run_programs validation
+  — which couldn't be done while nomad was loaded with codex's
+  `cargo test --workspace`. Owner: future arm64 -O0 linear-scan flip +
+  macOS validation (when nomad is quiet).
