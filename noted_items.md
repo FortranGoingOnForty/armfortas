@@ -415,12 +415,17 @@ Found during l04 (2026-06-12):
   this branch. Lesson: don't trust run_programs failure counts from a
   heavily-loaded nomad run — re-run under light load before classifying.
 
-- **arm64 -O0 still uses the naive allocator (bug B is x86-only)** (x12,
-  2026-06-17): the bug B fix routes x86 -O0 through linear-scan but leaves
-  arm64 -O0 on naive, so macOS codegen is unchanged. arm64 -O0 therefore
-  retains the deep-recursion stack-overflow limitation (huge spill-
-  everything frames). Not a campaign requirement (fortsh runs on x86), and
-  flipping arm64 -O0 to linear needs a clean macOS run_programs validation
-  — which couldn't be done while nomad was loaded with codex's
-  `cargo test --workspace`. Owner: future arm64 -O0 linear-scan flip +
-  macOS validation (when nomad is quiet).
+- **arm64 -O0 stays on naive: linear-scan is WORSE there (measured)** (x12,
+  2026-06-17): the bug B fix routes x86 -O0 through linear-scan. We then
+  flipped arm64 -O0 to linear and validated on macOS arm64 (nomad,
+  isolated worktree). Result: a regression. For a recursive function
+  (straight-line register pressure, depth from argv), -O0 overflows
+  EARLIER under linear (depth ~4000) than under naive (survives ~4-5000):
+  linear ~2KB/level vs naive ~1.6KB/level. The OPPOSITE of x86, where
+  linear cut fortsh's executor frame 6.7x. Cause: on small functions
+  arm64's callee-save + split-bridge frame overhead under linear exceeds
+  naive's spill-slot win, and naive's spill-everything is already
+  call-safe (values live across the recursive call sit in slots for free).
+  So arm64 -O0 keeps naive; the bug B fix is x86-only. Don't re-flip
+  without re-measuring arm64 recursion depth. (fortsh runs on x86, so this
+  doesn't affect the fortsh rung.)

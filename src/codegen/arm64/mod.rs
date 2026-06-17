@@ -41,11 +41,14 @@ pub fn emit_module(ir_module: &Module, opts: &Options) -> String {
     }
 
     // Naive allocator at -O0 (compile speed / debuggability), linear-scan
-    // at O1+. Bug B (deep-recursion stack overflow from spill-everything
-    // frames) is an x86/fortsh problem; the x86 backend routes -O0 through
-    // linear-scan (see codegen::mod), but arm64 stays on naive at -O0 so
-    // the macOS gate's codegen is unchanged. Flipping arm64 -O0 to
-    // linear-scan is a separate change needing its own macOS validation.
+    // at O1+. The x86 backend routes -O0 through linear-scan (bug B:
+    // spill-everything frames overflow deep recursion), but on arm64 that
+    // flip was measured to be a REGRESSION: for a recursive function it
+    // overflows EARLIER under linear (depth ~4000) than under naive
+    // (~5-6000) — arm64's callee-save/split-bridge frame overhead exceeds
+    // naive's win on small functions, the opposite of x86. So arm64 keeps
+    // naive at -O0 (also keeps the macOS gate's codegen unchanged). Don't
+    // re-flip without re-measuring recursion depth on arm64.
     let use_naive_regalloc = opts.opt_level == OptLevel::O0
         || std::env::var_os("ARMFORTAS_USE_NAIVE_REGALLOC").is_some();
 
