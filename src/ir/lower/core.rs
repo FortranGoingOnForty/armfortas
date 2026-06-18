@@ -25811,6 +25811,260 @@ pub(super) fn lower_runtime_array_constructor_descriptor(
     Some(desc)
 }
 
+fn array_constructor_has_implied_do(values: &[crate::ast::expr::AcValue]) -> bool {
+    values.iter().any(|value| match value {
+        crate::ast::expr::AcValue::Expr(expr) => {
+            if let Expr::ArrayConstructor { values: inner, .. } = &expr.node {
+                array_constructor_has_implied_do(inner)
+            } else {
+                false
+            }
+        }
+        crate::ast::expr::AcValue::ImpliedDo(_) => true,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_runtime_char_array_constructor_descriptor(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    values: &[crate::ast::expr::AcValue],
+    elem_len: ValueId,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) -> Option<ValueId> {
+    if array_constructor_has_implied_do(values) {
+        return None;
+    }
+    let total_n = lower_runtime_array_constructor_len(
+        b,
+        locals,
+        values,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    )?;
+
+    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let zero32 = b.const_i32(0);
+    let sz384 = b.const_i64(384);
+    b.call(
+        FuncRef::External("memset".into()),
+        vec![desc, zero32, sz384],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+
+    let bounds = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 24));
+    let lower = b.const_i64(1);
+    let zero64 = b.const_i64(0);
+    let has_elems = b.icmp(CmpOp::Gt, total_n, zero64);
+    let upper = b.select(has_elems, total_n, zero64);
+    let stride = b.const_i64(1);
+    let lower_ptr = b.gep(bounds, vec![zero64], IrType::Int(IntWidth::I8));
+    let eight = b.const_i64(8);
+    let upper_ptr = b.gep(bounds, vec![eight], IrType::Int(IntWidth::I8));
+    let sixteen = b.const_i64(16);
+    let stride_ptr = b.gep(bounds, vec![sixteen], IrType::Int(IntWidth::I8));
+    b.store(lower, lower_ptr);
+    b.store(upper, upper_ptr);
+    b.store(stride, stride_ptr);
+
+    let stat = b.alloca(IrType::Int(IntWidth::I32));
+    b.store(zero32, stat);
+    let rank = b.const_i32(1);
+    b.call(
+        FuncRef::External("afs_allocate_array".into()),
+        vec![desc, elem_len, rank, bounds, stat],
+        IrType::Void,
+    );
+
+    let dest_base = b.load_typed(desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    let index_slot = b.alloca(IrType::Int(IntWidth::I64));
+    b.store(zero64, index_slot);
+    store_runtime_char_ac_values_at_index(
+        b,
+        locals,
+        dest_base,
+        elem_len,
+        index_slot,
+        values,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    );
+    Some(desc)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn store_runtime_char_ac_values_at_index(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    dest_base: ValueId,
+    dest_elem_len: ValueId,
+    index_slot: ValueId,
+    values: &[crate::ast::expr::AcValue],
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) {
+    let zero32 = b.const_i32(0);
+    for value in values {
+        match value {
+            crate::ast::expr::AcValue::Expr(expr) => {
+                if let Expr::ArrayConstructor { values: inner, .. } = &expr.node {
+                    store_runtime_char_ac_values_at_index(
+                        b,
+                        locals,
+                        dest_base,
+                        dest_elem_len,
+                        index_slot,
+                        inner,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
+                    );
+                    continue;
+                }
+                if let Some(src_desc) = array_constructor_expr_descriptor(
+                    b,
+                    locals,
+                    expr,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                ) {
+                    copy_runtime_char_desc_into_constructor(
+                        b,
+                        dest_base,
+                        dest_elem_len,
+                        index_slot,
+                        src_desc,
+                        zero32,
+                    );
+                    continue;
+                }
+
+                let dest_index = b.load(index_slot);
+                let dest_off = b.imul(dest_index, dest_elem_len);
+                let dest_ptr = b.gep(dest_base, vec![dest_off], IrType::Int(IntWidth::I8));
+                let (src_ptr, src_len) = lower_string_expr_full(
+                    b,
+                    locals,
+                    expr,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                );
+                b.call(
+                    FuncRef::External("afs_assign_char_fixed".into()),
+                    vec![dest_ptr, dest_elem_len, src_ptr, src_len],
+                    IrType::Void,
+                );
+                let one = b.const_i64(1);
+                let next = b.iadd(dest_index, one);
+                b.store(next, index_slot);
+            }
+            crate::ast::expr::AcValue::ImpliedDo(_) => {
+                unreachable!("implied-do character constructors are filtered before lowering")
+            }
+        }
+    }
+}
+
+fn copy_runtime_char_desc_into_constructor(
+    b: &mut FuncBuilder,
+    dest_base: ValueId,
+    dest_elem_len: ValueId,
+    index_slot: ValueId,
+    src_desc: ValueId,
+    zero32: ValueId,
+) {
+    let src_n = b.call(
+        FuncRef::External("afs_array_size".into()),
+        vec![src_desc],
+        IrType::Int(IntWidth::I64),
+    );
+    let src_base = b.load_typed(src_desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    let src_stride = load_array_desc_i64_field(b, src_desc, 24 + 16);
+    let src_elem_len = descriptor_elem_size(b, src_desc);
+    let src_flags = descriptor_flags(b, src_desc);
+    let slot_flag = b.const_i32(DESC_CHAR_SLOT_TABLE);
+    let slot_bits = b.bit_and(src_flags, slot_flag);
+    let has_slot_table = b.icmp(CmpOp::Ne, slot_bits, zero32);
+
+    let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let zero64 = b.const_i64(0);
+    b.store(zero64, i_addr);
+
+    let bb_check = b.create_block("char_ac_desc_check");
+    let bb_body = b.create_block("char_ac_desc_body");
+    let bb_exit = b.create_block("char_ac_desc_exit");
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let i = b.load(i_addr);
+    let done = b.icmp(CmpOp::Ge, i, src_n);
+    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+    b.set_block(bb_body);
+    let i_val = b.load(i_addr);
+    let dest_index = b.load(index_slot);
+    let dest_off = b.imul(dest_index, dest_elem_len);
+    let dest_ptr = b.gep(dest_base, vec![dest_off], IrType::Int(IntWidth::I8));
+    let src_index = b.imul(i_val, src_stride);
+
+    let src_ptr_slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    let bb_slot = b.create_block("char_ac_desc_slot");
+    let bb_flat = b.create_block("char_ac_desc_flat");
+    let bb_join = b.create_block("char_ac_desc_join");
+    b.cond_branch(has_slot_table, bb_slot, vec![], bb_flat, vec![]);
+
+    b.set_block(bb_slot);
+    let ptr_bytes = b.const_i64(8);
+    let slot_off = b.imul(src_index, ptr_bytes);
+    let slot_ptr = b.gep(src_base, vec![slot_off], IrType::Int(IntWidth::I8));
+    let src_ptr = b.load_typed(slot_ptr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    b.store(src_ptr, src_ptr_slot);
+    b.branch(bb_join, vec![]);
+
+    b.set_block(bb_flat);
+    let src_off = b.imul(src_index, src_elem_len);
+    let src_ptr = b.gep(src_base, vec![src_off], IrType::Int(IntWidth::I8));
+    b.store(src_ptr, src_ptr_slot);
+    b.branch(bb_join, vec![]);
+
+    b.set_block(bb_join);
+    let src_ptr = b.load_typed(src_ptr_slot, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    b.call(
+        FuncRef::External("afs_assign_char_fixed".into()),
+        vec![dest_ptr, dest_elem_len, src_ptr, src_elem_len],
+        IrType::Void,
+    );
+    let one = b.const_i64(1);
+    let next_i = b.iadd(i_val, one);
+    b.store(next_i, i_addr);
+    let next_dest = b.iadd(dest_index, one);
+    b.store(next_dest, index_slot);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
+}
+
 /// Store the literal values of an array constructor into a
 /// destination buffer, one element at a time via byte-level GEP.
 ///
@@ -40496,6 +40750,51 @@ pub(super) fn lower_array_assign(
                 ctx.st,
                 Some(ctx.type_layouts),
             ) {
+                if descriptor_backed_runtime_char_array(dest_info) {
+                    if let Expr::ArrayConstructor { type_spec, .. } = &value.node {
+                        if let Some(parsed_spec) = type_spec
+                            .as_deref()
+                            .and_then(parse_array_constructor_type_spec)
+                        {
+                            if matches!(parsed_spec, TypeSpec::Character(_)) {
+                                if let Some(elem_len) = typed_allocate_char_len(
+                                    b,
+                                    &ctx.locals,
+                                    Some(&parsed_spec),
+                                    ctx.st,
+                                    Some(ctx.type_layouts),
+                                ) {
+                                    if let Some(src_desc) =
+                                        lower_runtime_char_array_constructor_descriptor(
+                                            b,
+                                            &ctx.locals,
+                                            values,
+                                            elem_len,
+                                            ctx.st,
+                                            Some(ctx.type_layouts),
+                                            Some(ctx.internal_funcs),
+                                            Some(ctx.contained_host_refs),
+                                            Some(ctx.descriptor_params),
+                                        )
+                                    {
+                                        lower_allocatable_char_array_assign_from_desc(
+                                            b, dest_desc, src_desc,
+                                        );
+                                        let tmp_stat = b.alloca(IrType::Int(IntWidth::I32));
+                                        let zero32 = b.const_i32(0);
+                                        b.store(zero32, tmp_stat);
+                                        b.call(
+                                            FuncRef::External("afs_deallocate_array".into()),
+                                            vec![src_desc, tmp_stat],
+                                            IrType::Void,
+                                        );
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 if let Some(src_desc) = lower_runtime_array_constructor_descriptor(
                     b,
                     &ctx.locals,
