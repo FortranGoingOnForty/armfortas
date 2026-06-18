@@ -435,3 +435,15 @@ Found during l04 (2026-06-12):
   arm64-linear@O0 miscompiles or load flakes; not classified, since arm64
   stays naive and the shipped (naive@O0) suite is green. If arm64 -O0 is
   ever flipped, triage these two first.
+
+- **fortsh PTY: 2 git-subcommand tests fail on gfortran too (not ours)**
+  (bug E classification, 2026-06-18): after fixing the fixed-len
+  allocatable char-scalar length bug (commit 975fe77) the armfortas fortsh
+  PTY suite is 116/2. The 2 residual —
+  test_command_richness::test_git_subcommand_menu and ::test_git_subcommand_prefix_filters
+  — also fail on the gfortran build (same fortsh source), so they are a
+  fortsh/environment issue (bundled git subcommand spec vs installed git, or
+  a stale test expectation), NOT an armfortas codegen bug. armfortas now
+  matches gfortran on the PTY suite. Out of scope for the armfortas
+  campaign; flag upstream to fortsh. (test_menu_descriptions::test_git_subcommand_menu_shows_help
+  WAS armfortas-specific and is fixed by 975fe77.)
