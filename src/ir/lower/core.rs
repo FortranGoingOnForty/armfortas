@@ -11324,6 +11324,7 @@ fn use_associated_named_interface_symbols<'a>(
 
     let mut symbols = Vec::new();
     let mut seen = HashSet::new();
+    let mut visited = HashSet::new();
     for scope in st.all_scopes() {
         if matches!(scope.kind, ScopeKind::Submodule(_)) {
             continue;
@@ -11332,7 +11333,6 @@ fn use_associated_named_interface_symbols<'a>(
             if assoc.local_name != key {
                 continue;
             }
-            let mut visited = Vec::new();
             collect_named_interface_symbols_from_scope(
                 st,
                 assoc.source_scope,
@@ -11350,14 +11350,14 @@ fn collect_named_interface_symbols_from_scope<'a>(
     st: &'a SymbolTable,
     scope_id: crate::sema::symtab::ScopeId,
     key: &str,
-    visited: &mut Vec<crate::sema::symtab::ScopeId>,
+    visited: &mut HashSet<(crate::sema::symtab::ScopeId, String)>,
     symbols: &mut Vec<&'a crate::sema::symtab::Symbol>,
     seen: &mut HashSet<(String, crate::sema::symtab::ScopeId)>,
 ) {
-    if visited.contains(&scope_id) {
+    let visit_key = (scope_id, key.to_ascii_lowercase());
+    if !visited.insert(visit_key) {
         return;
     }
-    visited.push(scope_id);
     let scope = st.scope(scope_id);
 
     if let Some(sym) = scope.symbols.get(key) {
@@ -11405,8 +11405,6 @@ fn collect_named_interface_symbols_from_scope<'a>(
             seen,
         );
     }
-
-    visited.pop();
 }
 
 fn active_block_use_named_interface_symbols<'a>(
