@@ -24,6 +24,12 @@ fn ensure_ascii_lowercase(s: &str) -> Cow<'_, str> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum LookupMode {
+    Normal,
+    Exported,
+}
+
 /// Scope identifier — an index into the SymbolTable's scope list.
 pub type ScopeId = usize;
 
@@ -212,19 +218,25 @@ impl SymbolTable {
         // fold, allocate only when uppercase bytes are present.
         let key = ensure_ascii_lowercase(name);
         let mut visited = Vec::new();
-        self.lookup_in_guarded(scope_id, key.as_ref(), &mut visited)
+        let mut cache = HashMap::new();
+        self.lookup_in_guarded(scope_id, key.as_ref(), &mut visited, &mut cache)
     }
 
-    fn lookup_in_guarded(
-        &self,
+    fn lookup_in_guarded<'a>(
+        &'a self,
         scope_id: ScopeId,
         key: &str,
-        visited: &mut Vec<ScopeId>,
-    ) -> Option<&Symbol> {
-        if visited.contains(&scope_id) {
+        visited: &mut Vec<(ScopeId, String, LookupMode)>,
+        cache: &mut HashMap<(ScopeId, String, LookupMode), Option<&'a Symbol>>,
+    ) -> Option<&'a Symbol> {
+        let visit_key = (scope_id, key.to_string(), LookupMode::Normal);
+        if let Some(cached) = cache.get(&visit_key) {
+            return *cached;
+        }
+        if visited.contains(&visit_key) {
             return None;
         }
-        visited.push(scope_id);
+        visited.push(visit_key.clone());
 
         let scope = &self.scopes[scope_id];
 
@@ -253,6 +265,7 @@ impl SymbolTable {
                             assoc.source_scope,
                             &assoc.original_name,
                             visited,
+                            cache,
                         ) {
                             return Some(sym);
                         }
@@ -260,6 +273,7 @@ impl SymbolTable {
                         assoc.source_scope,
                         &assoc.original_name,
                         visited,
+                        cache,
                     ) {
                         return Some(sym);
                     }
@@ -285,7 +299,8 @@ impl SymbolTable {
                     continue;
                 }
                 seen_use_scopes.push(assoc.source_scope);
-                if let Some(sym) = self.lookup_exported_in_guarded(assoc.source_scope, key, visited)
+                if let Some(sym) =
+                    self.lookup_exported_in_guarded(assoc.source_scope, key, visited, cache)
                 {
                     return Some(sym);
                 }
@@ -294,7 +309,7 @@ impl SymbolTable {
             // 3. Host association — look in parent scope.
             if let Some(parent) = scope.parent {
                 if self.scopes[parent].kind != ScopeKind::Global {
-                    return self.lookup_in_guarded(parent, key, visited);
+                    return self.lookup_in_guarded(parent, key, visited, cache);
                 }
             }
 
@@ -302,6 +317,7 @@ impl SymbolTable {
         })();
 
         visited.pop();
+        cache.insert(visit_key, result);
         result
     }
 
@@ -331,19 +347,25 @@ impl SymbolTable {
         }
     }
 
-    fn lookup_exported_in_guarded(
-        &self,
+    fn lookup_exported_in_guarded<'a>(
+        &'a self,
         scope_id: ScopeId,
         key: &str,
-        visited: &mut Vec<ScopeId>,
-    ) -> Option<&Symbol> {
-        if visited.contains(&scope_id) {
+        visited: &mut Vec<(ScopeId, String, LookupMode)>,
+        cache: &mut HashMap<(ScopeId, String, LookupMode), Option<&'a Symbol>>,
+    ) -> Option<&'a Symbol> {
+        let visit_key = (scope_id, key.to_string(), LookupMode::Exported);
+        if let Some(cached) = cache.get(&visit_key) {
+            return *cached;
+        }
+        if visited.contains(&visit_key) {
             return None;
         }
         if !self.scope_exports_key(scope_id, key) {
+            cache.insert(visit_key, None);
             return None;
         }
-        visited.push(scope_id);
+        visited.push(visit_key.clone());
 
         let scope = &self.scopes[scope_id];
         let result = (|| {
@@ -364,6 +386,7 @@ impl SymbolTable {
                             assoc.source_scope,
                             &assoc.original_name,
                             visited,
+                            cache,
                         ) {
                             return Some(sym);
                         }
@@ -371,6 +394,7 @@ impl SymbolTable {
                         assoc.source_scope,
                         &assoc.original_name,
                         visited,
+                        cache,
                     ) {
                         return Some(sym);
                     }
@@ -389,7 +413,8 @@ impl SymbolTable {
                     continue;
                 }
                 seen_use_scopes.push(assoc.source_scope);
-                if let Some(sym) = self.lookup_exported_in_guarded(assoc.source_scope, key, visited)
+                if let Some(sym) =
+                    self.lookup_exported_in_guarded(assoc.source_scope, key, visited, cache)
                 {
                     return Some(sym);
                 }
@@ -399,6 +424,7 @@ impl SymbolTable {
         })();
 
         visited.pop();
+        cache.insert(visit_key, result);
         result
     }
 
