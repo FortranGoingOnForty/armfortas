@@ -16386,6 +16386,72 @@ pub(super) fn value_is_string_descriptor_ptr(b: &FuncBuilder, value: ValueId) ->
     )
 }
 
+pub(super) fn emit_type_bound_binary_operator_dispatch(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+    op: &BinaryOp,
+    left_expr: &crate::ast::expr::SpannedExpr,
+    right_expr: &crate::ast::expr::SpannedExpr,
+    specific: &str,
+) -> Option<ValueId> {
+    let tl = type_layouts?;
+    let iface_name = binary_op_interface_name(op)?;
+    let left_ti = operator_expr_type_info(left_expr, Some(locals), st, Some(tl))?;
+    let proc_scope_id = callee_scope_id_for_lookup(st, b.func().name.as_str());
+    let raw_base_type = match &left_ti {
+        crate::sema::symtab::TypeInfo::Class(name) => name.clone(),
+        crate::sema::symtab::TypeInfo::Derived(name) => {
+            let layout_name =
+                canonical_layout_type_name_for_scope(st, proc_scope_id, name, tl)
+                    .unwrap_or_else(|| name.clone());
+            if !tl.get(&layout_name).is_some_and(|layout| layout.is_abstract) {
+                return None;
+            }
+            layout_name
+        }
+        _ => return None,
+    };
+    let base_type = canonical_layout_type_name_for_scope(st, proc_scope_id, &raw_base_type, tl)
+        .unwrap_or_else(|| raw_base_type.clone());
+    let base_layout = tl.get(&base_type)?;
+    if !base_layout.bound_proc_candidates(&iface_name).iter().any(|bp| {
+        bp.abi_name.eq_ignore_ascii_case(specific)
+            || bp.target_name.eq_ignore_ascii_case(specific)
+    }) {
+        return None;
+    }
+    let (desc_addr, obj_addr, dispatch_base_type) =
+        resolve_polymorphic_component_method_base_for_dispatch(b, locals, left_expr, st, tl)?;
+    let arg = crate::ast::expr::Argument {
+        keyword: None,
+        value: crate::ast::expr::SectionSubscript::Element(right_expr.clone()),
+    };
+    emit_dynamic_bound_proc_lookup_dispatch(
+        b,
+        locals,
+        st,
+        tl,
+        internal_funcs,
+        contained_host_refs,
+        None,
+        descriptor_params,
+        None,
+        left_expr.span,
+        desc_addr,
+        obj_addr,
+        &dispatch_base_type,
+        &iface_name,
+        &[arg],
+        None,
+    )
+    .flatten()
+}
+
 pub(super) fn emit_resolved_operator_call(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,

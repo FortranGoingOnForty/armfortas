@@ -751,6 +751,21 @@ pub(crate) fn lower_expr_full(
                 left,
                 right,
             ) {
+                if let Some(result) = emit_type_bound_binary_operator_dispatch(
+                    b,
+                    locals,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                    op,
+                    left,
+                    right,
+                    &specific,
+                ) {
+                    return result;
+                }
                 let lhs = lower_expr_full(
                     b,
                     locals,

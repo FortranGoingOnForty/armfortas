@@ -43373,6 +43373,41 @@ fn local_character_dummy_shadows_same_name_generic_for_substring() {
 }
 
 #[test]
+fn abstract_type_bound_operator_dispatch_avoids_direct_interface_call() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=abstract_type_bound_operator_dispatch_avoids_direct_interface_call count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type, abstract :: base_t\n  contains\n    procedure(is_equal), deferred :: same\n    generic :: operator(==) => same\n    procedure :: check_same\n  end type\n  abstract interface\n    logical function is_equal(this, that)\n      import base_t\n      class(base_t), intent(in) :: this, that\n    end function\n  end interface\n  type, extends(base_t) :: child_t\n    integer :: value = 0\n  contains\n    procedure :: same => child_same\n  end type\ncontains\n  subroutine check_same(self, other)\n    class(base_t), intent(in) :: self\n    class(base_t), intent(in) :: other\n    if (.not. (self == other)) error stop 1\n  end subroutine\n  logical function child_same(this, that)\n    class(child_t), intent(in) :: this\n    class(base_t), intent(in) :: that\n    child_same = .true.\n  end function\nend module\n",
+        "f90",
+    );
+    let out = unique_path("abstract_tbp_operator", "o");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("abstract type-bound operator compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "abstract type-bound operator compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let undefined = undefined_symbols(&out);
+    assert!(
+        !undefined
+            .iter()
+            .any(|sym| sym == "_afs_modproc_m_is_equal" || sym == "_is_equal"),
+        "abstract operator interface lowered as direct call: {:?}",
+        undefined
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn generic_optional_character_concat_probe_matches_character_dummy() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
