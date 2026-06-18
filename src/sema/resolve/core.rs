@@ -821,6 +821,7 @@ fn exported_const_int_params(
     if let Some(cached) = exported_cache.get(&scope_id) {
         return cached.clone();
     }
+    exported_cache.insert(scope_id, HashMap::new());
 
     let scope = st.scope(scope_id);
     let mut out = HashMap::new();
@@ -842,19 +843,34 @@ fn exported_const_int_params(
         // resolve to None and downstream layout falls back to default
         // kind, which silently shrinks `integer(block_kind) :: blk`
         // from 8 bytes to 4 inside derived types.
-        let sym = st
+        let direct_value = st
             .scope(assoc.source_scope)
             .symbols
             .get(&assoc.original_name)
-            .or_else(|| st.lookup_in(assoc.source_scope, &assoc.original_name));
-        if let Some(sym) = sym {
-            if sym.attrs.parameter
-                && (sym.attrs.access != Access::Private || assoc.is_submodule_access)
-            {
-                if let Some(value) = sym.const_value {
-                    out.entry(assoc.local_name.clone()).or_insert(value);
+            .and_then(|sym| {
+                (sym.attrs.parameter
+                    && (sym.attrs.access != Access::Private || assoc.is_submodule_access))
+                    .then_some(sym.const_value)
+                    .flatten()
+            });
+        if let Some(value) = direct_value {
+            out.entry(assoc.local_name.clone()).or_insert(value);
+            continue;
+        }
+        if assoc.is_submodule_access {
+            if let Some(sym) = st.lookup_in(assoc.source_scope, &assoc.original_name) {
+                if sym.attrs.parameter {
+                    if let Some(value) = sym.const_value {
+                        out.entry(assoc.local_name.clone()).or_insert(value);
+                    }
                 }
             }
+        } else if let Some(value) =
+            exported_const_int_params(st, assoc.source_scope, _visible_cache, exported_cache)
+                .get(&assoc.original_name)
+                .copied()
+        {
+            out.entry(assoc.local_name.clone()).or_insert(value);
         }
     }
 
@@ -886,6 +902,7 @@ fn exported_const_char_params(
     if let Some(cached) = exported_cache.get(&scope_id) {
         return cached.clone();
     }
+    exported_cache.insert(scope_id, HashMap::new());
 
     let scope = st.scope(scope_id);
     let mut out = HashMap::new();
@@ -899,20 +916,38 @@ fn exported_const_char_params(
     }
 
     for assoc in &scope.use_associations {
-        let sym = st
+        let direct_value = st
             .scope(assoc.source_scope)
             .symbols
             .get(&assoc.original_name)
-            .or_else(|| st.lookup_in(assoc.source_scope, &assoc.original_name));
-        if let Some(sym) = sym {
-            if sym.attrs.parameter
-                && (sym.attrs.access != Access::Private || assoc.is_submodule_access)
-            {
-                if let Some(value) = &sym.const_char_value {
-                    out.entry(assoc.local_name.clone())
-                        .or_insert_with(|| value.clone());
+            .and_then(|sym| {
+                if sym.attrs.parameter
+                    && (sym.attrs.access != Access::Private || assoc.is_submodule_access)
+                {
+                    sym.const_char_value.clone()
+                } else {
+                    None
+                }
+            });
+        if let Some(value) = direct_value {
+            out.entry(assoc.local_name.clone()).or_insert(value);
+            continue;
+        }
+        if assoc.is_submodule_access {
+            if let Some(sym) = st.lookup_in(assoc.source_scope, &assoc.original_name) {
+                if sym.attrs.parameter {
+                    if let Some(value) = &sym.const_char_value {
+                        out.entry(assoc.local_name.clone())
+                            .or_insert_with(|| value.clone());
+                    }
                 }
             }
+        } else if let Some(value) =
+            exported_const_char_params(st, assoc.source_scope, _visible_cache, exported_cache)
+                .get(&assoc.original_name)
+                .cloned()
+        {
+            out.entry(assoc.local_name.clone()).or_insert(value);
         }
     }
 
@@ -960,19 +995,34 @@ fn visible_const_int_params(
         if out.contains_key(&assoc.local_name) {
             continue;
         }
-        let sym = st
+        let direct_value = st
             .scope(assoc.source_scope)
             .symbols
             .get(&assoc.original_name)
-            .or_else(|| st.lookup_in(assoc.source_scope, &assoc.original_name));
-        if let Some(sym) = sym {
-            if sym.attrs.parameter
-                && (sym.attrs.access != Access::Private || assoc.is_submodule_access)
-            {
-                if let Some(value) = sym.const_value {
-                    out.insert(assoc.local_name.clone(), value);
+            .and_then(|sym| {
+                (sym.attrs.parameter
+                    && (sym.attrs.access != Access::Private || assoc.is_submodule_access))
+                    .then_some(sym.const_value)
+                    .flatten()
+            });
+        if let Some(value) = direct_value {
+            out.insert(assoc.local_name.clone(), value);
+            continue;
+        }
+        if assoc.is_submodule_access {
+            if let Some(sym) = st.lookup_in(assoc.source_scope, &assoc.original_name) {
+                if sym.attrs.parameter {
+                    if let Some(value) = sym.const_value {
+                        out.insert(assoc.local_name.clone(), value);
+                    }
                 }
             }
+        } else if let Some(value) =
+            exported_const_int_params(st, assoc.source_scope, visible_cache, exported_cache)
+                .get(&assoc.original_name)
+                .copied()
+        {
+            out.insert(assoc.local_name.clone(), value);
         }
     }
 
@@ -1029,19 +1079,37 @@ fn visible_const_char_params(
         if out.contains_key(&assoc.local_name) {
             continue;
         }
-        let sym = st
+        let direct_value = st
             .scope(assoc.source_scope)
             .symbols
             .get(&assoc.original_name)
-            .or_else(|| st.lookup_in(assoc.source_scope, &assoc.original_name));
-        if let Some(sym) = sym {
-            if sym.attrs.parameter
-                && (sym.attrs.access != Access::Private || assoc.is_submodule_access)
-            {
-                if let Some(value) = &sym.const_char_value {
-                    out.insert(assoc.local_name.clone(), value.clone());
+            .and_then(|sym| {
+                if sym.attrs.parameter
+                    && (sym.attrs.access != Access::Private || assoc.is_submodule_access)
+                {
+                    sym.const_char_value.clone()
+                } else {
+                    None
+                }
+            });
+        if let Some(value) = direct_value {
+            out.insert(assoc.local_name.clone(), value);
+            continue;
+        }
+        if assoc.is_submodule_access {
+            if let Some(sym) = st.lookup_in(assoc.source_scope, &assoc.original_name) {
+                if sym.attrs.parameter {
+                    if let Some(value) = &sym.const_char_value {
+                        out.insert(assoc.local_name.clone(), value.clone());
+                    }
                 }
             }
+        } else if let Some(value) =
+            exported_const_char_params(st, assoc.source_scope, visible_cache, exported_cache)
+                .get(&assoc.original_name)
+                .cloned()
+        {
+            out.insert(assoc.local_name.clone(), value);
         }
     }
 
