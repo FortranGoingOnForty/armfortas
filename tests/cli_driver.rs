@@ -32486,6 +32486,67 @@ fn logical_reduction_intrinsics_scalarize_component_and_constructor_exprs() {
 }
 
 #[test]
+fn all_reduction_accepts_sectioned_array_component_projection() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=all_reduction_accepts_sectioned_array_component_projection count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  type :: node_t\n    logical :: done = .false.\n    integer :: id = 0\n  end type\n  type(node_t), allocatable :: dep(:)\n  integer :: n\n  allocate(dep(3))\n  dep(1)%done = .true.\n  dep(2)%done = .true.\n  dep(3)%done = .false.\n  n = 2\n  if (.not. all(dep(:n)%done)) error stop 1\n  n = 3\n  if (all(dep(:n)%done)) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("all_section_component_projection", "bin");
+    let obj = unique_path("all_section_component_projection", "o");
+    let compile_obj = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", obj.to_str().unwrap()])
+        .output()
+        .expect("all section component object compile failed to spawn");
+    assert!(
+        compile_obj.status.success(),
+        "all section component object compile failed: {}",
+        String::from_utf8_lossy(&compile_obj.stderr)
+    );
+    let undef = undefined_symbols(&obj);
+    assert!(
+        !undef.iter().any(|sym| sym == "_all"),
+        "all section component projection lowered to external _all: {:?}",
+        undef
+    );
+
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("all section component compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "all section component compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("all section component run failed");
+    assert!(
+        run.status.success(),
+        "all section component run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected all section component output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&obj);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn logical_reduction_intrinsics_on_logical_sections_compile_and_run() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

@@ -41982,24 +41982,8 @@ fn projected_scalar_component_local_info(
     let Expr::ComponentAccess { base, component } = &expr.node else {
         return None;
     };
-    let Expr::Name { name } = &base.node else {
-        return None;
-    };
-    let key = name.to_lowercase();
-    let base_info = locals.get(&key)?;
-    let rank = local_declared_rank(base_info);
-    if rank == 0 || !local_is_array_like(base_info) {
-        return None;
-    }
-
-    let raw_type_name = base_info.derived_type.clone().or_else(|| {
-        let type_info = operator_expr_type_info(base, Some(locals), st, Some(tl))?;
-        match type_info {
-            crate::sema::symtab::TypeInfo::Derived(name)
-            | crate::sema::symtab::TypeInfo::Class(name) => Some(name),
-            _ => None,
-        }
-    })?;
+    let (base_desc, raw_type_name, rank, dims, runtime_dim_upper, last_dim_assumed_size) =
+        projected_component_base_descriptor(b, locals, base, st, tl)?;
     let scope_id =
         callee_scope_id_for_lookup(st, b.func().name.as_str()).or_else(current_proc_scope);
     let type_name = canonical_layout_type_name_for_scope(st, scope_id, &raw_type_name, tl)
@@ -42032,7 +42016,7 @@ fn projected_scalar_component_local_info(
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
     );
 
-    let base_addr = array_base_addr(b, base_info);
+    let base_addr = b.load_typed(base_desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
     let field_offset = b.const_i64(field.offset as i64);
     let field_base_raw = b.gep(base_addr, vec![field_offset], IrType::Int(IntWidth::I8));
     let field_base = {
@@ -42054,81 +42038,22 @@ fn projected_scalar_component_local_info(
     let flags_val = b.const_i32(flags);
     store_byte_aggregate_field(b, desc, 20, IrType::Int(IntWidth::I32), flags_val);
 
-    if local_uses_array_descriptor(base_info) {
-        let base_desc = array_descriptor_addr(b, base_info);
-        for dim_idx in 0..rank {
-            let dim_off = 24 + (dim_idx as i64) * 24;
-            let lo = load_array_desc_i64_field(b, base_desc, dim_off);
-            let hi = load_array_desc_i64_field(b, base_desc, dim_off + 8);
-            let base_stride = load_array_desc_i64_field(b, base_desc, dim_off + 16);
-            let stride = if record_stride_elems == 1 {
-                base_stride
-            } else {
-                let ratio = b.const_i64(record_stride_elems);
-                b.imul(base_stride, ratio)
-            };
-            store_byte_aggregate_field(b, desc, dim_off, IrType::Int(IntWidth::I64), lo);
-            store_byte_aggregate_field(b, desc, dim_off + 8, IrType::Int(IntWidth::I64), hi);
-            store_byte_aggregate_field(b, desc, dim_off + 16, IrType::Int(IntWidth::I64), stride);
-        }
-    } else {
-        let mut running_stride_static: i64 = record_stride_elems;
-        let mut running_stride_dynamic: Option<ValueId> = None;
-        for dim_idx in 0..rank {
-            let (lower, extent) = base_info.dims.get(dim_idx).copied().unwrap_or((1, 1));
-            let dim_off = 24 + (dim_idx as i64) * 24;
-            let lower_val = b.const_i64(lower);
-            store_byte_aggregate_field(b, desc, dim_off, IrType::Int(IntWidth::I64), lower_val);
-            let runtime_upper = base_info.runtime_dim_upper.get(dim_idx).and_then(|u| *u);
-            let upper_val = runtime_upper.unwrap_or_else(|| b.const_i64(lower + extent - 1));
-            store_byte_aggregate_field(b, desc, dim_off + 8, IrType::Int(IntWidth::I64), upper_val);
-            let stride_val =
-                running_stride_dynamic.unwrap_or_else(|| b.const_i64(running_stride_static));
-            store_byte_aggregate_field(
-                b,
-                desc,
-                dim_off + 16,
-                IrType::Int(IntWidth::I64),
-                stride_val,
-            );
-            match runtime_upper {
-                Some(up) => {
-                    let span = b.isub(up, lower_val);
-                    let one = b.const_i64(1);
-                    let runtime_extent = b.iadd(span, one);
-                    let next = match running_stride_dynamic {
-                        Some(prev) => b.imul(prev, runtime_extent),
-                        None if running_stride_static == 1 => runtime_extent,
-                        None => {
-                            let prev = b.const_i64(running_stride_static);
-                            b.imul(prev, runtime_extent)
-                        }
-                    };
-                    running_stride_dynamic = Some(next);
-                    running_stride_static = 1;
-                }
-                None => {
-                    if let Some(prev) = running_stride_dynamic {
-                        let ext = b.const_i64(extent.max(1));
-                        running_stride_dynamic = Some(b.imul(prev, ext));
-                    } else {
-                        running_stride_static = running_stride_static.saturating_mul(extent.max(1));
-                    }
-                }
-            }
-        }
+    for dim_idx in 0..rank {
+        let dim_off = 24 + (dim_idx as i64) * 24;
+        let lo = load_array_desc_i64_field(b, base_desc, dim_off);
+        let hi = load_array_desc_i64_field(b, base_desc, dim_off + 8);
+        let base_stride = load_array_desc_i64_field(b, base_desc, dim_off + 16);
+        let stride = if record_stride_elems == 1 {
+            base_stride
+        } else {
+            let ratio = b.const_i64(record_stride_elems);
+            b.imul(base_stride, ratio)
+        };
+        store_byte_aggregate_field(b, desc, dim_off, IrType::Int(IntWidth::I64), lo);
+        store_byte_aggregate_field(b, desc, dim_off + 8, IrType::Int(IntWidth::I64), hi);
+        store_byte_aggregate_field(b, desc, dim_off + 16, IrType::Int(IntWidth::I64), stride);
     }
 
-    let dims = if base_info.dims.is_empty() {
-        vec![(1, 1); rank]
-    } else {
-        base_info.dims.clone()
-    };
-    let runtime_dim_upper = if base_info.runtime_dim_upper.is_empty() {
-        vec![None; rank]
-    } else {
-        base_info.runtime_dim_upper.clone()
-    };
     Some(LocalInfo {
         addr: desc,
         ty: elem_ty,
@@ -42146,8 +42071,108 @@ fn projected_scalar_component_local_info(
             crate::sema::symtab::TypeInfo::Logical { kind } => *kind,
             _ => None,
         },
-        last_dim_assumed_size: base_info.last_dim_assumed_size,
+        last_dim_assumed_size,
     })
+}
+
+fn projected_component_base_descriptor(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    base: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    tl: &crate::sema::type_layout::TypeLayoutRegistry,
+) -> Option<(
+    ValueId,
+    String,
+    usize,
+    Vec<(i64, i64)>,
+    Vec<Option<ValueId>>,
+    bool,
+)> {
+    let type_name_from_expr = |base: &crate::ast::expr::SpannedExpr| {
+        operator_expr_type_info(base, Some(locals), st, Some(tl)).and_then(|type_info| {
+            match type_info {
+                crate::sema::symtab::TypeInfo::Derived(name)
+                | crate::sema::symtab::TypeInfo::Class(name) => Some(name),
+                _ => None,
+            }
+        })
+    };
+
+    match &base.node {
+        Expr::Name { name } => {
+            let key = name.to_lowercase();
+            let info = locals.get(&key)?;
+            let rank = local_declared_rank(info);
+            if rank == 0 || !local_is_array_like(info) {
+                return None;
+            }
+            let raw_type_name = info.derived_type.clone().or_else(|| type_name_from_expr(base))?;
+            let desc = if local_uses_array_descriptor(info) {
+                array_descriptor_addr(b, info)
+            } else {
+                materialize_array_descriptor_for_info(b, info)
+            };
+            let dims = if info.dims.is_empty() {
+                vec![(1, 1); rank]
+            } else {
+                info.dims.clone()
+            };
+            let runtime_dim_upper = if info.runtime_dim_upper.is_empty() {
+                vec![None; rank]
+            } else {
+                info.runtime_dim_upper.clone()
+            };
+            Some((
+                desc,
+                raw_type_name,
+                rank,
+                dims,
+                runtime_dim_upper,
+                info.last_dim_assumed_size,
+            ))
+        }
+        Expr::FunctionCall { callee, args } => {
+            let rank = args
+                .iter()
+                .filter(|arg| {
+                    matches!(arg.value, crate::ast::expr::SectionSubscript::Range { .. })
+                })
+                .count();
+            if rank == 0 {
+                return None;
+            }
+            let raw_type_name = type_name_from_expr(base).or_else(|| match &callee.node {
+                Expr::Name { name } => locals
+                    .get(&name.to_lowercase())
+                    .and_then(|info| info.derived_type.clone()),
+                Expr::ComponentAccess { .. } => component_intrinsic_local_info(
+                    b, locals, callee, st, tl,
+                )
+                .and_then(|info| info.derived_type),
+                _ => None,
+            })?;
+            let (desc, _) = lower_array_expr_descriptor(
+                b,
+                locals,
+                base,
+                st,
+                Some(tl),
+                None,
+                None,
+                None,
+            )?;
+            Some((
+                desc,
+                raw_type_name,
+                rank,
+                vec![(1, 1); rank],
+                vec![None; rank],
+                false,
+            ))
+        }
+        _ => None,
+    }
 }
 
 pub(super) fn associate_alias_local_info(
