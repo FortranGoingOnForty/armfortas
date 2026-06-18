@@ -19193,6 +19193,67 @@ fn all_over_int8_pack_compare_lowers_descriptor() {
 }
 
 #[test]
+fn pack_actual_selects_array_specific_in_generic_call() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=pack_actual_selects_array_specific_in_generic_call count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type :: item_t\n    integer :: id = 0\n  end type\n  interface add_item\n    module procedure add_one\n    module procedure add_many\n  end interface\ncontains\n  subroutine add_one(list, new)\n    type(item_t), allocatable, intent(inout) :: list(:)\n    type(item_t), intent(in) :: new\n    allocate(list(1))\n    list(1)%id = -new%id\n  end subroutine\n  subroutine add_many(list, new)\n    type(item_t), allocatable, intent(inout) :: list(:)\n    type(item_t), intent(in) :: new(:)\n    allocate(list(size(new)))\n    list = new\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(item_t), allocatable :: list(:), values(:)\n  logical :: mask(3)\n  allocate(values(3))\n  values(1)%id = 1\n  values(2)%id = 2\n  values(3)%id = 3\n  mask = [.true., .false., .true.]\n  call add_item(list, pack(values, mask))\n  if (size(list) /= 2) error stop 1\n  if (list(1)%id /= 1) error stop 2\n  if (list(2)%id /= 3) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let obj = unique_path("pack_generic_array_specific", "o");
+    let compile_obj = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", obj.to_str().unwrap()])
+        .output()
+        .expect("pack generic object compile failed to spawn");
+    assert!(
+        compile_obj.status.success(),
+        "pack generic object should compile: {}",
+        String::from_utf8_lossy(&compile_obj.stderr)
+    );
+    let undef = undefined_symbols(&obj);
+    assert!(
+        !undef.iter().any(|s| s == "_pack"),
+        "PACK actual should not lower to raw _pack: {:?}",
+        undef
+    );
+
+    let out = unique_path("pack_generic_array_specific", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("pack generic compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "pack generic should compile + link: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("pack generic run failed");
+    assert!(
+        run.status.success(),
+        "pack generic should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected ok marker, got: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&obj);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn generic_logical_actual_with_all_array_expr_uses_probe_type_only() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

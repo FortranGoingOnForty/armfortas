@@ -12707,6 +12707,9 @@ pub(super) fn actual_expr_rank(
                         );
                     }
                 }
+                if key == "pack" {
+                    return Some(1);
+                }
                 if matches!(
                     key.as_str(),
                     "all" | "any" | "count" | "sum" | "product" | "maxval" | "minval" | "norm2"
