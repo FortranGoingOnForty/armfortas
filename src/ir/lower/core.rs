@@ -44940,12 +44940,12 @@ pub(super) fn expr_is_callable_character_callee(
             // interface check below claimed it was callable and the
             // substring path was skipped (fpm/M_strings substitute). Only
             // a genuine procedure-pointer local stays callable.
-            if locals.contains_key(&key) && procedure_pointer_signature_key(st, &key).is_none() {
+            let local_data_symbol_shadows_callee =
+                locals.contains_key(&key) && procedure_pointer_signature_key(st, &key).is_none();
+            if local_data_symbol_shadows_callee {
                 return false;
             }
-            if !(locals.contains_key(&key) && procedure_pointer_signature_key(st, &key).is_none())
-                && callee_character_return_abi(st, &key).is_some()
-            {
+            if callee_character_return_abi(st, &key).is_some() {
                 return true;
             }
             if procedure_pointer_signature_key(st, &key).is_some() {
