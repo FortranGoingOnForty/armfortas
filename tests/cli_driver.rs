@@ -10787,6 +10787,50 @@ fn dash_capital_d_defines_preprocessor_macro() {
 }
 
 #[test]
+fn dash_capital_d_prescans_macro_argument_before_stringification() {
+    let src = write_program(
+        "#define STRINGIFY_(X) #X\n\
+         #define STRINGIFY_START(X) &\n\
+         #define STRINGIFY_END(X) STRINGIFY_(X)\n\
+         program p\n\
+           character(len=*), parameter :: ver = STRINGIFY_START(FPM_RELEASE_VERSION)\n\
+         STRINGIFY_END(FPM_RELEASE_VERSION)\n\
+           print *, ver\n\
+         end program\n",
+        "F90",
+    );
+    let out = unique_path("pp_define_stringify", "f90");
+    let result = Command::new(compiler("armfortas"))
+        .args([
+            "-DFPM_RELEASE_VERSION=0.13.0",
+            "-E",
+            src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        result.status.success(),
+        "-D stringification preprocess failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let pp = std::fs::read_to_string(&out).expect("missing preprocessed output");
+    assert!(
+        pp.contains("\"0.13.0\""),
+        "preprocessed text should stringify the expanded -D value: {}",
+        pp
+    );
+    assert!(
+        !pp.contains("\"FPM_RELEASE_VERSION\""),
+        "preprocessed text should not stringify the raw macro name: {}",
+        pp
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn dash_capital_d_rejects_invalid_macro_name() {
     let src = write_program("program p\n  print *, 1\nend program\n", "f90");
     let result = Command::new(compiler("armfortas"))
