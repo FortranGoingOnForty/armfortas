@@ -19254,6 +19254,65 @@ fn pack_actual_selects_array_specific_in_generic_call() {
 }
 
 #[test]
+fn findloc_logical_mask_dim1_lowers_scalar_index() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=findloc_logical_mask_dim1_lowers_scalar_index count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: stat(4)\n  integer :: firsterror\n  stat = [0, 0, 7, 8]\n  firsterror = findloc(stat /= 0, value=.true., dim=1)\n  if (firsterror /= 3) error stop 1\n  stat = 0\n  firsterror = findloc(stat /= 0, value=.true., dim=1)\n  if (firsterror /= 0) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let obj = unique_path("findloc_logical_mask_dim1", "o");
+    let compile_obj = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", obj.to_str().unwrap()])
+        .output()
+        .expect("findloc object compile failed to spawn");
+    assert!(
+        compile_obj.status.success(),
+        "findloc object should compile: {}",
+        String::from_utf8_lossy(&compile_obj.stderr)
+    );
+    let undef = undefined_symbols(&obj);
+    assert!(
+        !undef.iter().any(|s| s == "_findloc"),
+        "FINDLOC should not lower to raw _findloc: {:?}",
+        undef
+    );
+
+    let out = unique_path("findloc_logical_mask_dim1", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("findloc compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "findloc should compile + link: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("findloc run failed");
+    assert!(
+        run.status.success(),
+        "findloc should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected ok marker, got: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&obj);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn generic_logical_actual_with_all_array_expr_uses_probe_type_only() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

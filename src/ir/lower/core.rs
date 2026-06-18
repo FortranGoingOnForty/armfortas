@@ -16749,6 +16749,7 @@ pub(super) fn intrinsic_subroutine_arg_order(callee_key: &str) -> Option<&'stati
         "cmplx" => Some(&["x", "y", "kind"]),
         "reshape" => Some(&["source", "shape", "pad", "order"]),
         "pack" => Some(&["array", "mask", "vector"]),
+        "findloc" => Some(&["array", "value", "dim", "mask", "kind", "back"]),
         "spread" => Some(&["source", "dim", "ncopies"]),
         "unpack" => Some(&["vector", "mask", "field"]),
         _ => None,
@@ -42654,6 +42655,102 @@ pub(super) fn with_select_type_intrinsic_guard_binding<F>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn lower_findloc_rank1_scalar(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    first_expr: &crate::ast::expr::SpannedExpr,
+    desc: ValueId,
+    elem_ty: &IrType,
+    args: &[crate::ast::expr::Argument],
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) -> Option<ValueId> {
+    if actual_expr_rank(first_expr, locals, st, type_layouts).is_some_and(|rank| rank != 1) {
+        return None;
+    }
+    if !matches!(elem_ty, IrType::Bool | IrType::Int(_) | IrType::Float(_)) {
+        return None;
+    }
+
+    let arg_slots = reorder_args_by_keyword_slots(args, "findloc", st);
+    let value_expr = arg_slots.get(1).and_then(|slot| {
+        slot.as_ref().and_then(|arg| match &arg.value {
+            crate::ast::expr::SectionSubscript::Element(e) => Some(e),
+            _ => None,
+        })
+    })?;
+    let dim_expr = arg_slots.get(2).and_then(|slot| {
+        slot.as_ref().and_then(|arg| match &arg.value {
+            crate::ast::expr::SectionSubscript::Element(e) => Some(e),
+            _ => None,
+        })
+    })?;
+    if eval_const_int(dim_expr) != Some(1) {
+        return None;
+    }
+
+    let raw_value = super::expr::lower_expr_full(
+        b,
+        locals,
+        value_expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    );
+    let target = coerce_to_type(b, raw_value, elem_ty);
+
+    let result_addr = b.alloca(IrType::Int(IntWidth::I32));
+    let zero32 = b.const_i32(0);
+    b.store(zero32, result_addr);
+    let n = b.call(
+        FuncRef::External("afs_array_size".into()),
+        vec![desc],
+        IrType::Int(IntWidth::I64),
+    );
+    let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let zero64 = b.const_i64(0);
+    b.store(zero64, i_addr);
+
+    let bb_check = b.create_block("findloc_check");
+    let bb_body = b.create_block("findloc_body");
+    let bb_exit = b.create_block("findloc_exit");
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let idx = b.load(i_addr);
+    let past_end = b.icmp(CmpOp::Ge, idx, n);
+    let current_result = b.load(result_addr);
+    let found = b.icmp(CmpOp::Ne, current_result, zero32);
+    let done = b.or(past_end, found);
+    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+    b.set_block(bb_body);
+    let cur_idx = b.load(i_addr);
+    let elem = load_rank1_array_desc_elem(b, desc, elem_ty, cur_idx);
+    let is_match = match elem_ty {
+        IrType::Float(_) => b.fcmp(CmpOp::Eq, elem, target),
+        _ => b.icmp(CmpOp::Eq, elem, target),
+    };
+    let one64 = b.const_i64(1);
+    let one_based64 = b.iadd(cur_idx, one64);
+    let one_based32 = b.int_trunc(one_based64, IntWidth::I32);
+    let prev = b.load(result_addr);
+    let next_result = b.select(is_match, one_based32, prev);
+    b.store(next_result, result_addr);
+    let next_idx = b.iadd(cur_idx, one64);
+    b.store(next_idx, i_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
+    Some(b.load(result_addr))
+}
+
 pub(super) fn lower_array_intrinsic(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -42691,6 +42788,7 @@ pub(super) fn lower_array_intrinsic(
             | "minval"
             | "maxloc"
             | "minloc"
+            | "findloc"
             | "matmul"
             | "dot_product"
             | "transpose"
@@ -43336,6 +43434,19 @@ pub(super) fn lower_array_intrinsic(
                 IrType::Int(IntWidth::I32),
             ))
         }
+        "findloc" => lower_findloc_rank1_scalar(
+            b,
+            locals,
+            first_expr,
+            desc,
+            &elem_ty,
+            args,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        ),
         "dot_product" => {
             let second_desc = args.get(1).and_then(|a| {
                 if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
