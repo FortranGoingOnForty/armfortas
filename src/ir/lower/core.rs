@@ -41903,6 +41903,9 @@ pub(super) fn component_intrinsic_local_info(
     st: &SymbolTable,
     tl: &crate::sema::type_layout::TypeLayoutRegistry,
 ) -> Option<LocalInfo> {
+    if let Some(info) = projected_scalar_component_local_info(b, locals, expr, st, tl) {
+        return Some(info);
+    }
     let (field_ptr, field) = resolve_component_field_access(b, locals, expr, st, tl)?;
     if field_uses_array_descriptor(&field) {
         return Some(LocalInfo {
@@ -41969,6 +41972,184 @@ pub(super) fn component_field_local_info(
     })
 }
 
+fn projected_scalar_component_local_info(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    tl: &crate::sema::type_layout::TypeLayoutRegistry,
+) -> Option<LocalInfo> {
+    let Expr::ComponentAccess { base, component } = &expr.node else {
+        return None;
+    };
+    let Expr::Name { name } = &base.node else {
+        return None;
+    };
+    let key = name.to_lowercase();
+    let base_info = locals.get(&key)?;
+    let rank = local_declared_rank(base_info);
+    if rank == 0 || !local_is_array_like(base_info) {
+        return None;
+    }
+
+    let raw_type_name = base_info.derived_type.clone().or_else(|| {
+        let type_info = operator_expr_type_info(base, Some(locals), st, Some(tl))?;
+        match type_info {
+            crate::sema::symtab::TypeInfo::Derived(name)
+            | crate::sema::symtab::TypeInfo::Class(name) => Some(name),
+            _ => None,
+        }
+    })?;
+    let scope_id =
+        callee_scope_id_for_lookup(st, b.func().name.as_str()).or_else(current_proc_scope);
+    let type_name = canonical_layout_type_name_for_scope(st, scope_id, &raw_type_name, tl)
+        .unwrap_or(raw_type_name);
+    let layout = tl.get(&type_name)?;
+    let field = layout.field(component)?.clone();
+    if !field.dims.is_empty()
+        || field_uses_array_descriptor(&field)
+        || field.allocatable
+        || field.pointer
+        || field.procedure_pointer
+    {
+        return None;
+    }
+
+    let elem_ty = field_storage_ir_type(&field, tl);
+    let elem_bytes = field.size as i64;
+    let record_bytes = layout.size as i64;
+    if elem_bytes <= 0 || record_bytes <= 0 || record_bytes % elem_bytes != 0 {
+        return None;
+    }
+    let record_stride_elems = record_bytes / elem_bytes;
+
+    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let zero32 = b.const_i32(0);
+    let size384 = b.const_i64(384);
+    b.call(
+        FuncRef::External("memset".into()),
+        vec![desc, zero32, size384],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+
+    let base_addr = array_base_addr(b, base_info);
+    let field_offset = b.const_i64(field.offset as i64);
+    let field_base_raw = b.gep(base_addr, vec![field_offset], IrType::Int(IntWidth::I8));
+    let field_base = {
+        let raw = b.ptr_to_int(field_base_raw);
+        b.int_to_ptr(raw, elem_ty.clone())
+    };
+    store_byte_aggregate_field(
+        b,
+        desc,
+        0,
+        IrType::Ptr(Box::new(elem_ty.clone())),
+        field_base,
+    );
+    let elem_bytes_val = b.const_i64(elem_bytes);
+    store_byte_aggregate_field(b, desc, 8, IrType::Int(IntWidth::I64), elem_bytes_val);
+    let rank_val = b.const_i32(rank as i32);
+    store_byte_aggregate_field(b, desc, 16, IrType::Int(IntWidth::I32), rank_val);
+    let flags = if record_stride_elems == 1 { 2 } else { 0 };
+    let flags_val = b.const_i32(flags);
+    store_byte_aggregate_field(b, desc, 20, IrType::Int(IntWidth::I32), flags_val);
+
+    if local_uses_array_descriptor(base_info) {
+        let base_desc = array_descriptor_addr(b, base_info);
+        for dim_idx in 0..rank {
+            let dim_off = 24 + (dim_idx as i64) * 24;
+            let lo = load_array_desc_i64_field(b, base_desc, dim_off);
+            let hi = load_array_desc_i64_field(b, base_desc, dim_off + 8);
+            let base_stride = load_array_desc_i64_field(b, base_desc, dim_off + 16);
+            let stride = if record_stride_elems == 1 {
+                base_stride
+            } else {
+                let ratio = b.const_i64(record_stride_elems);
+                b.imul(base_stride, ratio)
+            };
+            store_byte_aggregate_field(b, desc, dim_off, IrType::Int(IntWidth::I64), lo);
+            store_byte_aggregate_field(b, desc, dim_off + 8, IrType::Int(IntWidth::I64), hi);
+            store_byte_aggregate_field(b, desc, dim_off + 16, IrType::Int(IntWidth::I64), stride);
+        }
+    } else {
+        let mut running_stride_static: i64 = record_stride_elems;
+        let mut running_stride_dynamic: Option<ValueId> = None;
+        for dim_idx in 0..rank {
+            let (lower, extent) = base_info.dims.get(dim_idx).copied().unwrap_or((1, 1));
+            let dim_off = 24 + (dim_idx as i64) * 24;
+            let lower_val = b.const_i64(lower);
+            store_byte_aggregate_field(b, desc, dim_off, IrType::Int(IntWidth::I64), lower_val);
+            let runtime_upper = base_info.runtime_dim_upper.get(dim_idx).and_then(|u| *u);
+            let upper_val = runtime_upper.unwrap_or_else(|| b.const_i64(lower + extent - 1));
+            store_byte_aggregate_field(b, desc, dim_off + 8, IrType::Int(IntWidth::I64), upper_val);
+            let stride_val =
+                running_stride_dynamic.unwrap_or_else(|| b.const_i64(running_stride_static));
+            store_byte_aggregate_field(
+                b,
+                desc,
+                dim_off + 16,
+                IrType::Int(IntWidth::I64),
+                stride_val,
+            );
+            match runtime_upper {
+                Some(up) => {
+                    let span = b.isub(up, lower_val);
+                    let one = b.const_i64(1);
+                    let runtime_extent = b.iadd(span, one);
+                    let next = match running_stride_dynamic {
+                        Some(prev) => b.imul(prev, runtime_extent),
+                        None if running_stride_static == 1 => runtime_extent,
+                        None => {
+                            let prev = b.const_i64(running_stride_static);
+                            b.imul(prev, runtime_extent)
+                        }
+                    };
+                    running_stride_dynamic = Some(next);
+                    running_stride_static = 1;
+                }
+                None => {
+                    if let Some(prev) = running_stride_dynamic {
+                        let ext = b.const_i64(extent.max(1));
+                        running_stride_dynamic = Some(b.imul(prev, ext));
+                    } else {
+                        running_stride_static = running_stride_static.saturating_mul(extent.max(1));
+                    }
+                }
+            }
+        }
+    }
+
+    let dims = if base_info.dims.is_empty() {
+        vec![(1, 1); rank]
+    } else {
+        base_info.dims.clone()
+    };
+    let runtime_dim_upper = if base_info.runtime_dim_upper.is_empty() {
+        vec![None; rank]
+    } else {
+        base_info.runtime_dim_upper.clone()
+    };
+    Some(LocalInfo {
+        addr: desc,
+        ty: elem_ty,
+        dims,
+        allocatable: false,
+        descriptor_arg: true,
+        by_ref: false,
+        char_kind: field_char_kind(&field),
+        derived_type: field_derived_type_name(&field),
+        inline_const: None,
+        is_pointer: false,
+        runtime_dim_upper,
+        is_class: false,
+        logical_kind: match &field.type_info {
+            crate::sema::symtab::TypeInfo::Logical { kind } => *kind,
+            _ => None,
+        },
+        last_dim_assumed_size: base_info.last_dim_assumed_size,
+    })
+}
+
 pub(super) fn associate_alias_local_info(
     b: &mut FuncBuilder,
     ctx: &LowerCtx,
@@ -41977,7 +42158,10 @@ pub(super) fn associate_alias_local_info(
     match &expr.node {
         Expr::Name { name } => ctx.locals.get(&name.to_lowercase()).cloned(),
         Expr::ComponentAccess { .. } => {
-            component_field_local_info(b, &ctx.locals, expr, ctx.st, ctx.type_layouts)
+            projected_scalar_component_local_info(b, &ctx.locals, expr, ctx.st, ctx.type_layouts)
+                .or_else(|| {
+                    component_field_local_info(b, &ctx.locals, expr, ctx.st, ctx.type_layouts)
+                })
         }
         Expr::FunctionCall { callee, args } => {
             let any_range = args

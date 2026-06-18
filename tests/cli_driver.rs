@@ -32339,6 +32339,67 @@ fn associate_alias_preserves_component_allocated_and_size_intrinsics() {
 }
 
 #[test]
+fn associate_alias_of_array_component_subscripts_as_array() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=associate_alias_of_array_component_subscripts_as_array count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type :: line_token\n    integer :: first = 0\n    integer :: last = 0\n  end type\ncontains\n  subroutine fill(token)\n    type(line_token), allocatable, intent(out) :: token(:)\n    allocate(token(3))\n    token(1)%first = 10\n    token(2)%first = 20\n    token(3)%first = 30\n    token(1)%last = 11\n    token(2)%last = 21\n    token(3)%last = 31\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(line_token), allocatable :: token(:)\n  integer :: line\n  integer :: shift\n  call fill(token)\n  line = 2\n  associate(first => token%first)\n    shift = first(line) - 1\n  end associate\n  if (shift /= 19) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("associate_alias_array_component_subscript", "bin");
+    let obj = unique_path("associate_alias_array_component_subscript", "o");
+    let compile_obj = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", obj.to_str().unwrap()])
+        .output()
+        .expect("associate array component object compile failed to spawn");
+    assert!(
+        compile_obj.status.success(),
+        "associate array component object compile failed: {}",
+        String::from_utf8_lossy(&compile_obj.stderr)
+    );
+    let undef = undefined_symbols(&obj);
+    assert!(
+        !undef.iter().any(|sym| sym == "_first"),
+        "associate array component alias lowered to external _first: {:?}",
+        undef
+    );
+
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("associate array component compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "associate array component compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("associate array component run failed");
+    assert!(
+        run.status.success(),
+        "associate array component run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected associate array component output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&obj);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn deferred_char_array_component_size_with_dimension_attr_runs() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
