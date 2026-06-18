@@ -12934,6 +12934,48 @@ pub(super) fn bound_proc_scope<'a>(
         .or_else(|| procedure_scope_by_name(st, &bp.abi_name))
 }
 
+fn procedure_symbol_is_elemental(sym: &crate::sema::symtab::Symbol) -> bool {
+    use crate::sema::symtab::SymbolKind;
+
+    sym.attrs.elemental
+        && matches!(
+            sym.kind,
+            SymbolKind::Function
+                | SymbolKind::Subroutine
+                | SymbolKind::ExternalProc
+                | SymbolKind::IntrinsicProc
+                | SymbolKind::ProcedurePointer
+        )
+}
+
+fn bound_proc_target_is_elemental(
+    st: &SymbolTable,
+    layout: &crate::sema::type_layout::TypeLayout,
+    bp: &crate::sema::type_layout::BoundProc,
+) -> bool {
+    let mut keys = vec![
+        bp.target_name.to_ascii_lowercase(),
+        bp.abi_name.to_ascii_lowercase(),
+    ];
+    if let Some(key) = abi_key_for_link_name(st, &bp.target_name) {
+        keys.push(key);
+    }
+    if let Some(key) = abi_key_for_link_name(st, &bp.abi_name) {
+        keys.push(key);
+    }
+    if let Some(scope) = bound_proc_scope(st, layout, bp) {
+        use crate::sema::symtab::ScopeKind;
+        if let ScopeKind::Function(name) | ScopeKind::Subroutine(name) = &scope.kind {
+            keys.push(name.to_ascii_lowercase());
+        }
+    }
+
+    keys.into_iter().any(|key| {
+        st.find_symbol_any_scope(&key)
+            .is_some_and(procedure_symbol_is_elemental)
+    })
+}
+
 fn function_symbol_result_type_info(
     sym: &crate::sema::symtab::Symbol,
 ) -> Option<crate::sema::symtab::TypeInfo> {
@@ -36212,29 +36254,116 @@ pub(super) fn lower_rank1_elemental_call_descriptor(
     contained_host_refs: Option<&HashMap<String, Vec<String>>>,
     descriptor_params: Option<&HashMap<String, Vec<bool>>>,
 ) -> Option<(ValueId, IrType)> {
-    let Expr::Name { name } = &callee.node else {
-        return None;
-    };
-    if !resolved_named_callee_is_elemental(
-        b,
-        locals,
-        name,
-        args,
-        st,
-        type_layouts,
-        internal_funcs,
-        contained_host_refs,
-        descriptor_params,
-    ) {
-        return None;
-    }
-
     let mut mapped_args = Vec::with_capacity(args.len());
     let mut loop_locals = locals.clone();
     let mut array_actuals: Vec<(String, ValueId, IrType, usize, Option<CharKind>, bool)> =
         Vec::new();
     let mut control_desc = None;
     let mut control_rank = None;
+    let mut mapped_callee = callee.clone();
+
+    match &callee.node {
+        Expr::Name { name } => {
+            if !resolved_named_callee_is_elemental(
+                b,
+                locals,
+                name,
+                args,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            ) {
+                return None;
+            }
+        }
+        Expr::ComponentAccess { base, component } => {
+            let tl = type_layouts?;
+            let type_name = match method_base_kind_for_call(base, locals, st, tl)? {
+                MethodBaseKind::Derived(name) | MethodBaseKind::PolymorphicClass(name) => name,
+            };
+            let layout = tl.get(&type_name)?;
+            let bp = resolved_bound_proc_for_call(
+                b,
+                locals,
+                st,
+                layout,
+                component,
+                args,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            )
+            .or_else(|| layout.bound_proc(component))?;
+            if !bound_proc_target_is_elemental(st, layout, bp) {
+                return None;
+            }
+
+            let (actual_desc, actual_elem_ty) = lower_array_expr_descriptor(
+                b,
+                locals,
+                base,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            )?;
+            let actual_rank = actual_expr_rank(base, locals, st, type_layouts)
+                .unwrap_or(1)
+                .max(1);
+            control_desc.get_or_insert(actual_desc);
+            control_rank.get_or_insert(actual_rank);
+
+            let actual_type = operator_expr_type_info(base, Some(locals), st, type_layouts);
+            let temp_name = fresh_elemental_temp_name(&loop_locals, "afs_elem_receiver", 0);
+            let temp_addr = b.alloca(actual_elem_ty.clone());
+            let temp_derived_type = match &actual_type {
+                Some(crate::sema::symtab::TypeInfo::Derived(name))
+                | Some(crate::sema::symtab::TypeInfo::Class(name)) => Some(name.clone()),
+                _ => None,
+            };
+            let is_class_actual =
+                matches!(actual_type, Some(crate::sema::symtab::TypeInfo::Class(_)));
+            loop_locals.insert(
+                temp_name.clone(),
+                LocalInfo {
+                    addr: temp_addr,
+                    ty: actual_elem_ty.clone(),
+                    dims: vec![],
+                    allocatable: false,
+                    descriptor_arg: false,
+                    by_ref: false,
+                    char_kind: CharKind::None,
+                    derived_type: temp_derived_type,
+                    inline_const: None,
+                    is_pointer: false,
+                    runtime_dim_upper: vec![],
+                    is_class: is_class_actual,
+                    logical_kind: None,
+                    last_dim_assumed_size: false,
+                },
+            );
+            array_actuals.push((
+                temp_name.clone(),
+                actual_desc,
+                actual_elem_ty,
+                actual_rank,
+                None,
+                false,
+            ));
+            mapped_callee = crate::ast::Spanned::new(
+                Expr::ComponentAccess {
+                    base: Box::new(synth_name_expr(&temp_name, base.span)),
+                    component: component.clone(),
+                },
+                callee.span,
+            );
+        }
+        _ => return None,
+    }
 
     for (idx, arg) in args.iter().enumerate() {
         let crate::ast::expr::SectionSubscript::Element(actual_expr) = &arg.value else {
@@ -36542,7 +36671,7 @@ pub(super) fn lower_rank1_elemental_call_descriptor(
 
     let mapped_call = crate::ast::Spanned::new(
         Expr::FunctionCall {
-            callee: Box::new(callee.clone()),
+            callee: Box::new(mapped_callee.clone()),
             args: mapped_args.clone(),
         },
         expr.span,
@@ -42107,11 +42236,49 @@ fn projected_component_base_descriptor(
             if rank == 0 || !local_is_array_like(info) {
                 return None;
             }
-            let raw_type_name = info.derived_type.clone().or_else(|| type_name_from_expr(base))?;
+            let raw_type_name = info
+                .derived_type
+                .clone()
+                .or_else(|| type_name_from_expr(base))?;
             let desc = if local_uses_array_descriptor(info) {
                 array_descriptor_addr(b, info)
             } else {
                 materialize_array_descriptor_for_info(b, info)
+            };
+            let dims = if info.dims.is_empty() {
+                vec![(1, 1); rank]
+            } else {
+                info.dims.clone()
+            };
+            let runtime_dim_upper = if info.runtime_dim_upper.is_empty() {
+                vec![None; rank]
+            } else {
+                info.runtime_dim_upper.clone()
+            };
+            Some((
+                desc,
+                raw_type_name,
+                rank,
+                dims,
+                runtime_dim_upper,
+                info.last_dim_assumed_size,
+            ))
+        }
+        Expr::ComponentAccess { .. } => {
+            let (_field_ptr, field) = resolve_component_field_access(b, locals, base, st, tl)?;
+            let info = component_intrinsic_local_info(b, locals, base, st, tl)?;
+            let rank = local_declared_rank(&info).max(if field.declared_array { 1 } else { 0 });
+            if rank == 0 || !local_is_array_like(&info) {
+                return None;
+            }
+            let raw_type_name = info
+                .derived_type
+                .clone()
+                .or_else(|| type_name_from_expr(base))?;
+            let desc = if local_uses_array_descriptor(&info) {
+                array_descriptor_addr(b, &info)
+            } else {
+                materialize_array_descriptor_for_info(b, &info)
             };
             let dims = if info.dims.is_empty() {
                 vec![(1, 1); rank]

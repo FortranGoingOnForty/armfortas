@@ -32547,6 +32547,128 @@ fn all_reduction_accepts_sectioned_array_component_projection() {
 }
 
 #[test]
+fn any_reduction_accepts_allocatable_component_array_projection() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=any_reduction_accepts_allocatable_component_array_projection count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  type :: source_t\n    integer :: unit_scope = 0\n    integer :: id = 0\n  end type\n  type :: package_t\n    type(source_t), allocatable :: sources(:)\n  end type\n  type(package_t) :: pkg\n  allocate(pkg%sources(3))\n  pkg%sources(1)%unit_scope = 2\n  pkg%sources(2)%unit_scope = 4\n  pkg%sources(3)%unit_scope = 6\n  if (.not. any(pkg%sources%unit_scope == 4)) error stop 1\n  if (any(pkg%sources%unit_scope == 5)) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("any_alloc_component_projection", "bin");
+    let obj = unique_path("any_alloc_component_projection", "o");
+    let compile_obj = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", obj.to_str().unwrap()])
+        .output()
+        .expect("any alloc component object compile failed to spawn");
+    assert!(
+        compile_obj.status.success(),
+        "any alloc component object compile failed: {}",
+        String::from_utf8_lossy(&compile_obj.stderr)
+    );
+    let undef = undefined_symbols(&obj);
+    assert!(
+        !undef.iter().any(|sym| sym == "_any"),
+        "any allocatable component projection lowered to external _any: {:?}",
+        undef
+    );
+
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("any alloc component compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "any alloc component compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("any alloc component run failed");
+    assert!(
+        run.status.success(),
+        "any alloc component run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected any alloc component output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&obj);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn any_reduction_accepts_elemental_type_bound_array_receiver() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=any_reduction_accepts_elemental_type_bound_array_receiver count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type :: source_t\n    integer :: unit_scope = 0\n  end type\n  type :: package_t\n    type(source_t), allocatable :: sources(:)\n  contains\n    procedure :: has_library => package_has_library\n  end type\n  type :: model_t\n    type(package_t), allocatable :: packages(:)\n  end type\ncontains\n  elemental logical function package_has_library(self) result(has_library)\n    class(package_t), intent(in) :: self\n    if (allocated(self%sources)) then\n      has_library = any(self%sources%unit_scope == 4)\n    else\n      has_library = .false.\n    end if\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  type(model_t) :: model\n  allocate(model%packages(3))\n  allocate(model%packages(1)%sources(1))\n  model%packages(1)%sources(1)%unit_scope = 4\n  allocate(model%packages(2)%sources(1))\n  model%packages(2)%sources(1)%unit_scope = 2\n  if (.not. any(model%packages%has_library())) error stop 1\n  if (model%packages(2)%has_library()) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("any_elemental_tbp_array_receiver", "bin");
+    let obj = unique_path("any_elemental_tbp_array_receiver", "o");
+    let compile_obj = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", obj.to_str().unwrap()])
+        .output()
+        .expect("any elemental tbp receiver object compile failed to spawn");
+    assert!(
+        compile_obj.status.success(),
+        "any elemental tbp receiver object compile failed: {}",
+        String::from_utf8_lossy(&compile_obj.stderr)
+    );
+    let undef = undefined_symbols(&obj);
+    assert!(
+        !undef.iter().any(|sym| sym == "_any"),
+        "elemental type-bound receiver lowered to external _any: {:?}",
+        undef
+    );
+
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("any elemental tbp receiver compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "any elemental tbp receiver compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("any elemental tbp receiver run failed");
+    assert!(
+        run.status.success(),
+        "any elemental tbp receiver run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected any elemental tbp receiver output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&obj);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn logical_reduction_intrinsics_on_logical_sections_compile_and_run() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
