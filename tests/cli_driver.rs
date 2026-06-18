@@ -43183,6 +43183,43 @@ fn empty_typed_character_constructor_allocates_zero_size_array() {
 }
 
 #[test]
+fn empty_typed_scalar_constructor_allocates_zero_size_array() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=empty_typed_scalar_constructor_allocates_zero_size_array count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  integer, allocatable :: xs(:)\n  logical, allocatable :: flags(:)\n  xs = [integer ::]\n  flags = [logical ::]\n  if (.not. allocated(xs)) error stop 1\n  if (.not. allocated(flags)) error stop 2\n  if (size(xs) /= 0) error stop 3\n  if (size(flags) /= 0) error stop 4\n  xs = [7]\n  flags = [.true.]\n  if (size(xs) /= 1 .or. xs(1) /= 7) error stop 5\n  if (size(flags) /= 1 .or. .not. flags(1)) error stop 6\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("empty_typed_scalar_constructor", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("empty typed scalar constructor compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "empty typed scalar constructor compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("empty typed scalar constructor run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "empty typed scalar constructor run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn generic_actual_all_of_defined_operator_has_logical_type() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

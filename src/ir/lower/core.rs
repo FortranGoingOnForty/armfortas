@@ -40603,6 +40603,65 @@ fn try_lower_empty_typed_char_allocatable_constructor_assign(
     true
 }
 
+fn try_lower_empty_typed_scalar_allocatable_constructor_assign(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    dest_info: &LocalInfo,
+    value: &crate::ast::expr::SpannedExpr,
+) -> bool {
+    let Expr::ArrayConstructor { values, type_spec } = &value.node else {
+        return false;
+    };
+    if !values.is_empty() {
+        return false;
+    }
+    let Some(type_spec) = type_spec.as_deref() else {
+        return false;
+    };
+    if matches!(
+        array_constructor_type_spec_info(Some(type_spec), ctx.st),
+        Some(crate::sema::symtab::TypeInfo::Character { .. })
+    ) {
+        return false;
+    }
+    let Some(type_info) = array_constructor_type_spec_info(Some(type_spec), ctx.st) else {
+        return false;
+    };
+    let elem_ty = type_info_to_ir_type(&type_info);
+    let elem_size = b.const_i64(ir_scalar_byte_size(&elem_ty, b.layout));
+
+    let dest_desc = array_descriptor_addr(b, dest_info);
+    let stat = b.alloca(IrType::Int(IntWidth::I32));
+    let zero32 = b.const_i32(0);
+    b.store(zero32, stat);
+    b.call(
+        FuncRef::External("afs_deallocate_array".into()),
+        vec![dest_desc, stat],
+        IrType::Void,
+    );
+
+    let bounds = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 24));
+    let zero64 = b.const_i64(0);
+    let eight = b.const_i64(8);
+    let sixteen = b.const_i64(16);
+    let one = b.const_i64(1);
+    let lower_ptr = b.gep(bounds, vec![zero64], IrType::Int(IntWidth::I8));
+    let upper_ptr = b.gep(bounds, vec![eight], IrType::Int(IntWidth::I8));
+    let stride_ptr = b.gep(bounds, vec![sixteen], IrType::Int(IntWidth::I8));
+    b.store(one, lower_ptr);
+    b.store(zero64, upper_ptr);
+    b.store(one, stride_ptr);
+
+    b.store(zero32, stat);
+    let rank = b.const_i32(1);
+    b.call(
+        FuncRef::External("afs_allocate_array".into()),
+        vec![dest_desc, elem_size, rank, bounds, stat],
+        IrType::Void,
+    );
+    true
+}
+
 fn lower_allocatable_char_array_assign_from_desc(
     b: &mut FuncBuilder,
     dest_desc: ValueId,
@@ -40970,6 +41029,9 @@ pub(super) fn lower_array_assign(
         }
 
         if try_lower_empty_typed_char_allocatable_constructor_assign(b, ctx, dest_info, value) {
+            return;
+        }
+        if try_lower_empty_typed_scalar_allocatable_constructor_assign(b, ctx, dest_info, value) {
             return;
         }
         if try_lower_fixed_char_allocatable_constructor_assign(b, ctx, dest_info, value) {
