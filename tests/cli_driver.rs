@@ -43146,6 +43146,43 @@ fn generic_module_allocatable_character_array_uses_declared_rank() {
 }
 
 #[test]
+fn empty_typed_character_constructor_allocates_zero_size_array() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=empty_typed_character_constructor_allocates_zero_size_array count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\ncontains\n  subroutine insert_c(list, value, place)\n    character(len=*), intent(in) :: value\n    character(len=:), allocatable :: list(:)\n    character(len=:), allocatable :: kludge(:)\n    integer, intent(in) :: place\n    integer :: ii\n    integer :: endpoint\n    if (.not. allocated(list)) then\n       list = [character(len=max(len_trim(value),2)) :: ]\n    endif\n    ii = max(len_trim(value), len(list), 2)\n    endpoint = size(list)\n    if (endpoint == 0) then\n       list = [character(len=ii) :: value]\n    elseif (place > endpoint) then\n       kludge = [character(len=ii) :: list, value]\n       list = kludge\n    else\n       error stop 10\n    endif\n  end subroutine\nend module\nprogram p\n  use m, only: insert_c\n  implicit none\n  character(len=:), allocatable :: list(:)\n  call insert_c(list, 'version', 1)\n  if (.not. allocated(list)) error stop 1\n  if (size(list) /= 1) error stop 2\n  if (len(list) /= 7) error stop 3\n  if (trim(list(1)) /= 'version') error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("empty_typed_char_constructor", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("empty typed character constructor compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "empty typed character constructor compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("empty typed character constructor run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "empty typed character constructor run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn generic_actual_all_of_defined_operator_has_logical_type() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

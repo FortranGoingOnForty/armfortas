@@ -9779,6 +9779,13 @@ pub(super) fn array_constructor_type_spec_info(
     }
 }
 
+fn parse_array_constructor_type_spec(type_spec: &str) -> Option<TypeSpec> {
+    let tokens = crate::lexer::tokenize(type_spec, 0, crate::lexer::SourceForm::FreeForm).ok()?;
+    let mut parser = crate::parser::Parser::new(&tokens);
+    let parsed = parser.try_parse_type_spec()?.ok()?;
+    (parser.peek() == &crate::lexer::TokenKind::Eof).then_some(parsed)
+}
+
 pub(super) fn first_array_constructor_type_info(
     values: &[crate::ast::expr::AcValue],
     locals: Option<&HashMap<String, LocalInfo>>,
@@ -40279,6 +40286,169 @@ fn try_lower_fixed_char_allocatable_constructor_assign(
     true
 }
 
+fn try_lower_empty_typed_char_allocatable_constructor_assign(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    dest_info: &LocalInfo,
+    value: &crate::ast::expr::SpannedExpr,
+) -> bool {
+    let Expr::ArrayConstructor { values, type_spec } = &value.node else {
+        return false;
+    };
+    if !values.is_empty() {
+        return false;
+    }
+    let Some(type_spec) = type_spec.as_deref() else {
+        return false;
+    };
+    let Some(parsed_spec) = parse_array_constructor_type_spec(type_spec) else {
+        return false;
+    };
+    if !matches!(parsed_spec, TypeSpec::Character(_)) {
+        return false;
+    }
+    let Some(elem_len) = typed_allocate_char_len(
+        b,
+        &ctx.locals,
+        Some(&parsed_spec),
+        ctx.st,
+        Some(ctx.type_layouts),
+    ) else {
+        return false;
+    };
+
+    let dest_desc = array_descriptor_addr(b, dest_info);
+    let stat = b.alloca(IrType::Int(IntWidth::I32));
+    let zero32 = b.const_i32(0);
+    b.store(zero32, stat);
+    b.call(
+        FuncRef::External("afs_deallocate_array".into()),
+        vec![dest_desc, stat],
+        IrType::Void,
+    );
+
+    let bounds = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 24));
+    let zero64 = b.const_i64(0);
+    let eight = b.const_i64(8);
+    let sixteen = b.const_i64(16);
+    let one = b.const_i64(1);
+    let lower_ptr = b.gep(bounds, vec![zero64], IrType::Int(IntWidth::I8));
+    let upper_ptr = b.gep(bounds, vec![eight], IrType::Int(IntWidth::I8));
+    let stride_ptr = b.gep(bounds, vec![sixteen], IrType::Int(IntWidth::I8));
+    b.store(one, lower_ptr);
+    b.store(zero64, upper_ptr);
+    b.store(one, stride_ptr);
+
+    b.store(zero32, stat);
+    let rank = b.const_i32(1);
+    b.call(
+        FuncRef::External("afs_allocate_array".into()),
+        vec![dest_desc, elem_len, rank, bounds, stat],
+        IrType::Void,
+    );
+    true
+}
+
+fn lower_allocatable_char_array_assign_from_desc(
+    b: &mut FuncBuilder,
+    dest_desc: ValueId,
+    src_desc: ValueId,
+) {
+    let stat = b.alloca(IrType::Int(IntWidth::I32));
+    let zero32 = b.const_i32(0);
+    b.store(zero32, stat);
+    b.call(
+        FuncRef::External("afs_deallocate_array".into()),
+        vec![dest_desc, stat],
+        IrType::Void,
+    );
+    b.store(zero32, stat);
+    b.call(
+        FuncRef::External("afs_allocate_like".into()),
+        vec![dest_desc, src_desc, stat],
+        IrType::Void,
+    );
+
+    let dest_base = b.load_typed(dest_desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    let src_base = b.load_typed(src_desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    let dest_n = b.call(
+        FuncRef::External("afs_array_size".into()),
+        vec![dest_desc],
+        IrType::Int(IntWidth::I64),
+    );
+    let src_n = b.call(
+        FuncRef::External("afs_array_size".into()),
+        vec![src_desc],
+        IrType::Int(IntWidth::I64),
+    );
+    let dest_stride = load_array_desc_i64_field(b, dest_desc, 24 + 16);
+    let src_stride = load_array_desc_i64_field(b, src_desc, 24 + 16);
+    let dest_elem_len = descriptor_elem_size(b, dest_desc);
+    let src_elem_len = descriptor_elem_size(b, src_desc);
+
+    let src_flags = descriptor_flags(b, src_desc);
+    let slot_flag = b.const_i32(DESC_CHAR_SLOT_TABLE);
+    let slot_bits = b.bit_and(src_flags, slot_flag);
+    let has_slot_table = b.icmp(CmpOp::Ne, slot_bits, zero32);
+
+    let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let zero64 = b.const_i64(0);
+    b.store(zero64, i_addr);
+
+    let bb_check = b.create_block("alloc_char_assign_check");
+    let bb_body = b.create_block("alloc_char_assign_body");
+    let bb_exit = b.create_block("alloc_char_assign_exit");
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let i = b.load(i_addr);
+    let dest_done = b.icmp(CmpOp::Ge, i, dest_n);
+    let src_done = b.icmp(CmpOp::Ge, i, src_n);
+    let done = b.or(dest_done, src_done);
+    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+    b.set_block(bb_body);
+    let i_val = b.load(i_addr);
+    let dest_index = b.imul(i_val, dest_stride);
+    let dest_off = b.imul(dest_index, dest_elem_len);
+    let dest_ptr = b.gep(dest_base, vec![dest_off], IrType::Int(IntWidth::I8));
+
+    let src_index = b.imul(i_val, src_stride);
+    let src_ptr_slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    let bb_slot = b.create_block("alloc_char_assign_src_slot");
+    let bb_flat = b.create_block("alloc_char_assign_src_flat");
+    let bb_join = b.create_block("alloc_char_assign_src_join");
+    b.cond_branch(has_slot_table, bb_slot, vec![], bb_flat, vec![]);
+
+    b.set_block(bb_slot);
+    let ptr_bytes = b.const_i64(8);
+    let slot_off = b.imul(src_index, ptr_bytes);
+    let slot_ptr = b.gep(src_base, vec![slot_off], IrType::Int(IntWidth::I8));
+    let src_ptr = b.load_typed(slot_ptr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    b.store(src_ptr, src_ptr_slot);
+    b.branch(bb_join, vec![]);
+
+    b.set_block(bb_flat);
+    let src_off = b.imul(src_index, src_elem_len);
+    let src_ptr = b.gep(src_base, vec![src_off], IrType::Int(IntWidth::I8));
+    b.store(src_ptr, src_ptr_slot);
+    b.branch(bb_join, vec![]);
+
+    b.set_block(bb_join);
+    let src_ptr = b.load_typed(src_ptr_slot, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    b.call(
+        FuncRef::External("afs_assign_char_fixed".into()),
+        vec![dest_ptr, dest_elem_len, src_ptr, src_elem_len],
+        IrType::Void,
+    );
+    let one = b.const_i64(1);
+    let next = b.iadd(i_val, one);
+    b.store(next, i_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
+}
+
 /// Lower whole-array assignment: a = b (element-wise copy) or a = scalar (broadcast).
 pub(super) fn lower_array_assign(
     b: &mut FuncBuilder,
@@ -40500,6 +40670,9 @@ pub(super) fn lower_array_assign(
             }
         }
 
+        if try_lower_empty_typed_char_allocatable_constructor_assign(b, ctx, dest_info, value) {
+            return;
+        }
         if try_lower_fixed_char_allocatable_constructor_assign(b, ctx, dest_info, value) {
             return;
         }
@@ -40536,6 +40709,20 @@ pub(super) fn lower_array_assign(
                 } else {
                     None
                 };
+                if descriptor_backed_runtime_char_array(dest_info) {
+                    lower_allocatable_char_array_assign_from_desc(b, dest_desc, assign_src_desc);
+                    if let Some(tmp_desc) = tmp_src_desc {
+                        let tmp_stat = b.alloca(IrType::Int(IntWidth::I32));
+                        let zero32 = b.const_i32(0);
+                        b.store(zero32, tmp_stat);
+                        b.call(
+                            FuncRef::External("afs_deallocate_array".into()),
+                            vec![tmp_desc, tmp_stat],
+                            IrType::Void,
+                        );
+                    }
+                    return;
+                }
                 // F2018 §10.2.1.3: numeric element type mismatch between
                 // RHS array result and LHS allocatable forces per-element
                 // conversion. The standard `afs_assign_allocatable` memcpys
