@@ -8809,7 +8809,16 @@ pub(super) fn local_char_runtime_len(b: &mut FuncBuilder, info: &LocalInfo) -> O
             let desc = array_descriptor_addr(b, info);
             Some(descriptor_elem_size(b, desc))
         }
-        CharKind::None => None,
+        CharKind::None => {
+            // Fixed-length allocatable char scalar (e.g.
+            // `character(len=64), allocatable`): char_kind is None and it is
+            // deliberately NOT descriptor-backed (descriptor_backed_runtime_char_array
+            // excludes the fixed-len case), but its length is the declared
+            // compile-time constant. Without this, passing such a scalar to a
+            // `character(len=*)` dummy passed length 0 — the callee saw an
+            // empty string (fortsh autosuggestion: current_input read empty).
+            local_fixed_char_allocatable_scalar_len(info).map(|n| b.const_i64(n))
+        }
     }
 }
 
