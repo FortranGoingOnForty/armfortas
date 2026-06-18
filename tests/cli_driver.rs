@@ -25408,6 +25408,103 @@ fn fixed_len_allocatable_char_array_dummy_round_trips_through_amod_import_and_ru
 }
 
 #[test]
+fn module_deferred_char_array_global_elements_round_trip_through_amod() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=module_deferred_char_array_global_elements_round_trip_through_amod count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("module_deferred_char_global_amod");
+    let mod_src = write_program_in(
+        &dir,
+        "m.f90",
+        "module m\n  implicit none\n  character(len=:), allocatable, public :: keywords(:)\ncontains\n  subroutine insert_c(list, value, place)\n    character(len=*), intent(in) :: value\n    character(len=:), allocatable :: list(:)\n    character(len=:), allocatable :: kludge(:)\n    integer, intent(in) :: place\n    integer :: ii\n    integer :: endpoint\n    if (.not. allocated(list)) then\n      list = [character(len=max(len_trim(value), 2)) :: ]\n    endif\n    ii = max(len_trim(value), len(list), 2)\n    endpoint = size(list)\n    if (endpoint == 0) then\n      list = [character(len=ii) :: value]\n    elseif (place == 1) then\n      kludge = [character(len=ii) :: value, list]\n      list = kludge\n    else\n      error stop 10\n    endif\n  end subroutine\n  subroutine add_front(value)\n    character(len=*), intent(in) :: value\n    call insert_c(keywords, value, 1)\n  end subroutine\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use m, only: add_front, keywords\n  implicit none\n  call add_front('version')\n  call add_front('usage')\n  call add_front('help')\n  if (size(keywords) /= 3) error stop 1\n  if (len(keywords) /= 7) error stop 2\n  if (trim(keywords(1)) /= 'help') error stop 3\n  if (trim(keywords(2)) /= 'usage') error stop 4\n  if (trim(keywords(3)) /= 'version') error stop 5\n  print *, 'ok'\nend program\n",
+    );
+
+    let mod_obj = dir.join("m.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            mod_src.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("module compile spawn failed");
+    assert!(
+        compile_mod.status.success(),
+        "deferred char array global module should compile: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let amod = std::fs::read_to_string(dir.join("m.amod")).expect("missing m.amod");
+    assert!(
+        amod.contains("@rank 1"),
+        "deferred char array global rank should survive into .amod: {}",
+        amod
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_main = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            main_src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("main compile spawn failed");
+    assert!(
+        compile_main.status.success(),
+        "deferred char array global consumer should compile through .amod: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let exe = dir.join("module_deferred_char_global_amod.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            mod_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link spawn failed");
+    assert!(
+        link.status.success(),
+        "deferred char array global link should succeed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe).output().expect("run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "deferred char array global should preserve elements through .amod: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn public_defined_assignment_in_private_module_round_trips_through_amod_and_runs() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

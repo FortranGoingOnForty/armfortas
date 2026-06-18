@@ -2595,6 +2595,7 @@ pub struct ModuleGlobalInfo {
     pub symbol: String,
     pub ty: IrType,
     pub dims: Vec<(i64, i64)>,
+    pub declared_rank: usize,
     pub allocatable: bool,
     pub is_pointer: bool,
     pub deferred_char: bool,
@@ -3796,6 +3797,7 @@ pub(super) fn collect_module_globals(
                     };
 
                 let array_spec = entity.array_spec.as_ref().or(attr_dims);
+                let declared_rank = array_spec.map(|specs| specs.len()).unwrap_or(0);
 
                 // Module-level allocatable and pointer arrays both
                 // live in a 384-byte descriptor slot. For pointers
@@ -3839,6 +3841,7 @@ pub(super) fn collect_module_globals(
                             symbol,
                             ty: storage_ty,
                             dims: vec![],
+                            declared_rank,
                             allocatable: true,
                             is_pointer,
                             deferred_char: false,
@@ -3869,6 +3872,7 @@ pub(super) fn collect_module_globals(
                             symbol,
                             ty: ir_ty.clone(),
                             dims: vec![],
+                            declared_rank: 0,
                             allocatable: false,
                             is_pointer,
                             deferred_char: true,
@@ -4027,6 +4031,7 @@ pub(super) fn collect_module_globals(
                         ModuleGlobalInfo {
                             symbol,
                             ty: elem_storage_ty,
+                            declared_rank: dims.len(),
                             dims,
                             allocatable: false,
                             is_pointer,
@@ -4053,6 +4058,7 @@ pub(super) fn collect_module_globals(
                                 symbol,
                                 ty: ir_ty.clone(),
                                 dims: vec![],
+                                declared_rank: 0,
                                 allocatable: false,
                                 is_pointer: true,
                                 deferred_char: false,
@@ -4087,6 +4093,7 @@ pub(super) fn collect_module_globals(
                                     symbol,
                                     ty: storage_ty,
                                     dims: vec![],
+                                    declared_rank: 0,
                                     allocatable: false,
                                     is_pointer: false,
                                     deferred_char: false,
@@ -4135,6 +4142,7 @@ pub(super) fn collect_module_globals(
                                     symbol,
                                     ty: scalar_ty,
                                     dims: vec![],
+                                    declared_rank: 0,
                                     allocatable: false,
                                     is_pointer,
                                     deferred_char: false,
@@ -4191,6 +4199,7 @@ pub(super) fn collect_module_globals(
                             symbol,
                             ty: ir_ty.clone(),
                             dims: vec![],
+                            declared_rank: 0,
                             allocatable: false,
                             is_pointer,
                             deferred_char: false,
