@@ -32207,10 +32207,38 @@ pub(super) fn materialize_scalar_element_descriptor_from_info(
     st: &SymbolTable,
     type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
 ) -> ValueId {
+    if matches!(
+        local_semantic_type_info(info),
+        Some(crate::sema::symtab::TypeInfo::Character { .. })
+    ) {
+        if let Some((elem_base, elem_len)) =
+            char_array_element_ptr_and_len(b, locals, info, args, st, type_layouts)
+        {
+            let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+            let tag = intrinsic_class_star_type_tag_for_type_info(
+                &crate::sema::symtab::TypeInfo::Character {
+                    len: None,
+                    kind: Some(1),
+                },
+            )
+            .map(|tag| b.const_i64(tag as i64));
+            store_scalar_polymorphic_descriptor_view(
+                b,
+                desc,
+                elem_base,
+                Some(elem_len),
+                tag,
+                None,
+            );
+            return desc;
+        }
+    }
+
     let elem_addr = lower_array_element_addr(b, locals, info, args, st, type_layouts);
     let elem_raw = b.ptr_to_int(elem_addr);
     let elem_base = b.int_to_ptr(elem_raw, IrType::Int(IntWidth::I8));
     let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let semantic_type = local_semantic_type_info(info);
     let elem_size = info
         .derived_type
         .as_ref()
@@ -32221,7 +32249,13 @@ pub(super) fn materialize_scalar_element_descriptor_from_info(
         .derived_type
         .as_ref()
         .and_then(|name| type_layouts.and_then(|layouts| layouts.get(name)))
-        .map(|layout| b.const_i64(layout.type_tag as i64));
+        .map(|layout| b.const_i64(layout.type_tag as i64))
+        .or_else(|| {
+            semantic_type
+                .as_ref()
+                .and_then(intrinsic_class_star_type_tag_for_type_info)
+                .map(|tag| b.const_i64(tag as i64))
+        });
     let vtable = info
         .derived_type
         .as_ref()
@@ -32340,9 +32374,14 @@ pub(super) fn lower_arg_descriptor_full(
     if let Expr::Name { name } = &expr.node {
         let key = name.to_lowercase();
         if let Some(info) = locals.get(&key) {
+            let static_scalar_character = local_declared_rank(info) == 0
+                && matches!(
+                    local_semantic_type_info(info),
+                    Some(crate::sema::symtab::TypeInfo::Character { .. })
+                );
             if force_static_scalar_polymorphic_view
                 && local_declared_rank(info) == 0
-                && !local_uses_array_descriptor(info)
+                && (!local_uses_array_descriptor(info) || static_scalar_character)
                 && info.derived_type.is_none()
             {
                 return box_actual_into_class_star_descriptor(b, locals, expr, st, type_layouts);

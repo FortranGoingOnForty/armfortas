@@ -44071,6 +44071,48 @@ fn optional_class_star_forwarding_preserves_absent_arguments() {
     let _ = std::fs::remove_file(&src);
 }
 
+#[test]
+fn class_star_character_elements_preserve_dynamic_type() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=class_star_character_elements_preserve_dynamic_type count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module class_star_char_elements_m\n  implicit none\ncontains\n  subroutine journal(where, g0)\n    character(len=*), intent(in) :: where\n    class(*), intent(in) :: g0\n    if (where /= 'sc') error stop 1\n    select type(g0)\n    type is (character(len=*))\n      write(*, '(a)') trim(g0)\n    class default\n      error stop 2\n    end select\n  end subroutine\n\n  subroutine check(help_text, version_text)\n    character(len=*), intent(in), optional :: help_text(:)\n    character(len=*), intent(in), optional :: version_text(:)\n    character(len=:), allocatable :: line\n    integer :: i\n    if (present(help_text)) then\n      do i = 1, size(help_text)\n        call journal('sc', help_text(i))\n      end do\n    end if\n    if (present(version_text)) then\n      do i = 1, size(version_text)\n        line = version_text(i)(1:len_trim(version_text(i)))\n        call journal('sc', line)\n      end do\n    end if\n  end subroutine\nend module\n\nprogram p\n  use class_star_char_elements_m\n  implicit none\n  character(len=:), allocatable :: help(:), version(:)\n  help = [character(len=16) :: 'Help one', 'Help two']\n  version = [character(len=32) :: 'Version one', 'Version two']\n  call check(help, version)\nend program\n",
+        "f90",
+    );
+    let out = unique_path("class_star_char_elements", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("class-star character element compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "class-star character element compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("class-star character element run failed");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        run.status.success()
+            && stdout.contains("Help one")
+            && stdout.contains("Help two")
+            && stdout.contains("Version one")
+            && stdout.contains("Version two"),
+        "class-star character element run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        stdout,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
 // ---- Sprint l00: --std=f2023 wiring ----
 
 #[test]
