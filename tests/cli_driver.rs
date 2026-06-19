@@ -30498,6 +30498,43 @@ fn pointer_array_component_element_actual_to_pointer_dummy_runs() {
 }
 
 #[test]
+fn module_deferred_char_array_typed_constructor_allocates_before_store() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=module_deferred_char_array_typed_constructor_allocates_before_store count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  character(len=:), allocatable :: version_text(:)\ncontains\n  subroutine init(version_s, os_type)\n    character(len=*), intent(in) :: version_s\n    character(len=*), intent(in) :: os_type\n    version_text = [character(len=80) :: &\n      'Version:     '//trim(version_s)//', alpha', &\n      os_type]\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  call init('0.13.0', 'OS Type:     macOS')\n  if (.not. allocated(version_text)) error stop 1\n  if (size(version_text) /= 2) error stop 2\n  if (len(version_text) /= 80) error stop 3\n  if (trim(version_text(1)) /= 'Version:     0.13.0, alpha') error stop 4\n  if (trim(version_text(2)) /= 'OS Type:     macOS') error stop 5\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("module_deferred_char_typed_ctor", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("module deferred char typed constructor compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "module deferred char typed constructor compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "module deferred char typed constructor should allocate before storing: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn single_char_array_constructor_actual_to_assumed_shape_dummy_runs() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

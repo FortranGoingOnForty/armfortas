@@ -40671,6 +40671,63 @@ fn try_lower_empty_typed_scalar_allocatable_constructor_assign(
     true
 }
 
+fn try_lower_typed_char_allocatable_constructor_assign(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    dest_info: &LocalInfo,
+    dest_desc: ValueId,
+    value: &crate::ast::expr::SpannedExpr,
+) -> bool {
+    if !descriptor_backed_runtime_char_array(dest_info) {
+        return false;
+    }
+    let Expr::ArrayConstructor { values, type_spec } = &value.node else {
+        return false;
+    };
+    let Some(parsed_spec) = type_spec
+        .as_deref()
+        .and_then(parse_array_constructor_type_spec)
+    else {
+        return false;
+    };
+    if !matches!(parsed_spec, TypeSpec::Character(_)) {
+        return false;
+    }
+    let Some(elem_len) = typed_allocate_char_len(
+        b,
+        &ctx.locals,
+        Some(&parsed_spec),
+        ctx.st,
+        Some(ctx.type_layouts),
+    ) else {
+        return false;
+    };
+    let Some(src_desc) = lower_runtime_char_array_constructor_descriptor(
+        b,
+        &ctx.locals,
+        values,
+        elem_len,
+        ctx.st,
+        Some(ctx.type_layouts),
+        Some(ctx.internal_funcs),
+        Some(ctx.contained_host_refs),
+        Some(ctx.descriptor_params),
+    ) else {
+        return false;
+    };
+
+    lower_allocatable_char_array_assign_from_desc(b, dest_desc, src_desc);
+    let tmp_stat = b.alloca(IrType::Int(IntWidth::I32));
+    let zero32 = b.const_i32(0);
+    b.store(zero32, tmp_stat);
+    b.call(
+        FuncRef::External("afs_deallocate_array".into()),
+        vec![src_desc, tmp_stat],
+        IrType::Void,
+    );
+    true
+}
+
 fn lower_allocatable_char_array_assign_from_desc(
     b: &mut FuncBuilder,
     dest_desc: ValueId,
@@ -40811,6 +40868,10 @@ pub(super) fn lower_array_assign(
     if local_uses_array_descriptor(dest_info) && (dest_info.allocatable || dest_symbol_allocatable)
     {
         let dest_desc = array_descriptor_addr(b, dest_info);
+        if try_lower_typed_char_allocatable_constructor_assign(b, ctx, dest_info, dest_desc, value)
+        {
+            return;
+        }
         if let Expr::ArrayConstructor { values, .. } = &value.node {
             if array_constructor_contains_array_expr(
                 &ctx.locals,
