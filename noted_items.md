@@ -463,12 +463,23 @@ Found during l04 (2026-06-12):
      (matches gfortran's FreeBSD default). CONSIDER: a non-PIE default on
      FreeBSD, or auto-detecting non-PIC objects, so real projects link
      without the manual flag.
-  2. test ICE (real armfortas x86 codegen bug, TO FIX): `fpm test` builds
-     test_test_sorting.F90 and panics — `x05 scope: no register class for
-     Array(Int(I8), 32)` (x86 isel type_to_class). A character(32) value
-     reaches the register-class path as a by-value scalar; type_to_class
-     handles 8-byte by-value arrays (complex copies) but not a 32-byte
-     char array (should be by-reference). Needs a minimal repro of the
-     trigger (char(32) passed/used by value in test_sorting), then the
-     upstream fix. Blocks the stdlib test suite -> the ≥95% test-pass
-     classification is pending this fix. Library/example build is clean.
+  2. test ICE — FIXED (PR #73, branch stdlib-string-section-write):
+     `fpm test` built test_sorting.F90 and panicked — `x05 scope: no
+     register class for Array(Int(I8), 32)` (x86 isel type_to_class). NOT
+     a char(32) — it's a `string_type` element (a 32-byte string
+     descriptor). The formatted/list-directed write of a string_type array
+     section (`write(...) string_dummy(i-1:i)`) loaded each element as a
+     value and pushed it as a scalar, so type_to_class got Array(i8,32).
+     Fix: a fmt_push_emit_string_type helper pushes the descriptor's
+     (data, len), applied to all four section emitters (whole-array, 1-D
+     slice, multi-D, allocatable). RESULT: stdlib builds 100% AND its test
+     suite passes under armfortas — `fpm test` 1288/0, exit 0. The ≥95%
+     deliverable is met (~100%). No portable test_programs fixture: a plain
+     string_type write needs defined I/O on gfortran (real stdlib type has
+     it; armfortas shortcuts string_type as character) — stdlib's own tests
+     cover it.
+
+  stdlib rung status: COMPLETE pending PR #73 merge. Build 100%, examples
+  100%, tests 1288/0. The only armfortas-only finding was this ICE (fixed);
+  the C-PIC/PIE issue is build-config (-no-pie, matches gfortran's FreeBSD
+  default).
