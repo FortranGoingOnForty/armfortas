@@ -23,6 +23,18 @@ pub use arm64::regalloc;
 pub use arm64::relax_branches;
 pub use arm64::tailcall;
 
+/// x86 allocator policy: linear-scan at EVERY opt level, naive only when
+/// forced. The naive spill-everything allocator gives every vreg its own
+/// stack slot, bloating frames ~6x and overflowing the stack on deep
+/// recursion (fortsh's executor SIGSEGV'd at depth ~62) — gfortran does
+/// real register allocation at -O0 too. `opt_level` is taken to make the
+/// "no opt-level gate" invariant explicit and testable: re-adding an
+/// `opt_level >= O1` condition here resurrects the bug, and
+/// `x86_linear_scan_at_every_opt_level` would catch it.
+fn x86_use_linear_scan(_opt_level: crate::driver::OptLevel, force_naive: bool) -> bool {
+    !force_naive
+}
+
 /// Run the target backend over a lowered module and return assembly
 /// text (x03). One closed `match` on arch: a missing arm is a compile
 /// error; a trait-object registry would add indirection with no second
@@ -45,15 +57,8 @@ pub fn emit_module(
                     x86::peephole::run_peephole(f);
                 }
                 x86::twoaddr::convert_to_two_address(f);
-                // x10a-1: linear-scan allocator at O1+, naive at O0
-                // (compile speed / debuggability), mirroring arm64.
-                // `ARMFORTAS_USE_NAIVE_REGALLOC` forces naive everywhere
-                // (the bisectable correctness reference);
-                // `ARMFORTAS_USE_LINEAR_REGALLOC` forces linear at O0 too.
                 let force_naive = std::env::var_os("ARMFORTAS_USE_NAIVE_REGALLOC").is_some();
-                let force_linear = std::env::var_os("ARMFORTAS_USE_LINEAR_REGALLOC").is_some();
-                let use_linear =
-                    !force_naive && (force_linear || opts.opt_level >= crate::driver::OptLevel::O1);
+                let use_linear = x86_use_linear_scan(opts.opt_level, force_naive);
                 if use_linear {
                     let result = x86::linearscan::linear_scan(f);
                     x86::linearscan::apply_allocation(f, &result);
@@ -113,6 +118,37 @@ main:
                 ));
             }
             Ok(text)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::x86_use_linear_scan;
+    use crate::driver::OptLevel;
+
+    /// The x86 backend must use linear-scan at EVERY opt level (the naive
+    /// spill-everything allocator overflows the stack on deep recursion).
+    /// Re-introducing an opt-level gate here is the exact way to regress
+    /// that; this test forbids it.
+    #[test]
+    fn x86_linear_scan_at_every_opt_level() {
+        for opt in [
+            OptLevel::O0,
+            OptLevel::O1,
+            OptLevel::O2,
+            OptLevel::O3,
+            OptLevel::Os,
+            OptLevel::Ofast,
+        ] {
+            assert!(
+                x86_use_linear_scan(opt, false),
+                "x86 must use linear-scan at {opt:?}"
+            );
+            assert!(
+                !x86_use_linear_scan(opt, true),
+                "ARMFORTAS_USE_NAIVE_REGALLOC must force naive at {opt:?}"
+            );
         }
     }
 }

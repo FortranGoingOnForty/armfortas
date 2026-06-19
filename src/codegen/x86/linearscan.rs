@@ -286,12 +286,25 @@ pub fn linear_scan(f: &mut X86Function) -> AllocResult {
     let mut free_gp: Vec<X86Reg> = GP_ALLOC_ORDER.to_vec();
     let mut free_fp: Vec<X86Reg> = FP_ALLOC_ORDER.to_vec();
 
-    // Per-vreg class for spill-slot sizing of victims.
-    let vreg_class: HashMap<VRegId, X86RegClass> = liveness
-        .intervals
-        .iter()
-        .map(|i| (i.vreg, i.class))
-        .collect();
+    // Per-vreg class for spill-slot sizing of victims. A spill slot is
+    // sized from the interval class (`spill_slot_size`), but the apply
+    // pass loads/stores it using the operand's class — so the two must
+    // agree or a 16-byte `movups` could write into an 8-byte slot and
+    // corrupt the adjacent one. Enforce one class per vreg here (the
+    // invariant that keeps slot sizing and access in lockstep) and
+    // re-check it at each spill emission below.
+    let mut vreg_class: HashMap<VRegId, X86RegClass> = HashMap::new();
+    for i in &liveness.intervals {
+        if let Some(&prev) = vreg_class.get(&i.vreg) {
+            assert_eq!(
+                prev, i.class,
+                "x86 linear scan: vreg {:?} carries divergent classes {:?} vs {:?} \
+                 across intervals — spill-slot sizing would disagree",
+                i.vreg, prev, i.class
+            );
+        }
+        vreg_class.insert(i.vreg, i.class);
+    }
 
     // Fixed-interval occupancy: positions where isel references each
     // physical register. A vreg may only take a register free of any
@@ -477,6 +490,16 @@ pub fn linear_scan(f: &mut X86Function) -> AllocResult {
         // Evict the active interval that ends furthest among those whose
         // register is fixed-free over our range; take it if it outlives
         // us, otherwise spill ourselves.
+        //
+        // No explicit crosses_call re-check on the incoming interval is
+        // needed: `phys_free_over` requires the victim register to be
+        // clear of every fixed reference over [start, end], and `occ`
+        // records each call as clobbering all caller-saved registers. So
+        // a call-crossing interval can only be handed a register that is
+        // free across the call — i.e. callee-saved. If the early
+        // split/pre-spill path above is ever relaxed so a call-crosser
+        // reaches here by another route, this invariant still holds only
+        // as long as `occ` keeps modelling calls as caller-saved clobbers.
         let (active, _) = if is_fp {
             (&mut active_fp, &mut free_fp)
         } else {
@@ -583,10 +606,16 @@ pub fn apply_allocation(f: &mut X86Function, result: &AllocResult) {
     // regalloc_naive Phase 2).
     let mut offset: i64 = 0;
     let mut slot_disp: HashMap<i32, i64> = HashMap::new();
+    // Slot id → byte size, so spill load/store emission can assert the
+    // access width (chosen from the operand class) never exceeds the slot
+    // the allocator sized from the interval class — a 16-byte `movups`
+    // into an 8-byte slot would corrupt the adjacent slot (fragility #1).
+    let mut slot_size: HashMap<i32, u64> = HashMap::new();
     for slot in &f.frame_slots {
         let align = slot.align.max(1) as i64;
         offset = -(((-offset) + slot.size as i64 + align - 1) & !(align - 1));
         slot_disp.insert(slot.id, offset);
+        slot_size.insert(slot.id, slot.size);
     }
     let locals = -offset;
     f.frame_bytes = (locals + f.outgoing_arg_bytes + 15) & !15;
@@ -742,6 +771,16 @@ pub fn apply_allocation(f: &mut X86Function, result: &AllocResult) {
                                 };
                             }
                             Resolved::Slot(slot) => {
+                                assert!(
+                                    spill_slot_size(v.class).0
+                                        <= *slot_size.get(&slot).unwrap_or(&u64::MAX),
+                                    "x86 linear scan: spilled vreg {:?} loaded as {:?} ({} bytes) \
+                                     exceeds its slot ({} bytes)",
+                                    v.id,
+                                    v.class,
+                                    spill_slot_size(v.class).0,
+                                    slot_size[&slot]
+                                );
                                 let scratch = next_scratch(v.class, &mut gp_used, &mut fp_used);
                                 let load_size = if is_addr {
                                     OpSize::Q
@@ -792,6 +831,16 @@ pub fn apply_allocation(f: &mut X86Function, result: &AllocResult) {
                             });
                         }
                         Resolved::Slot(slot) => {
+                            assert!(
+                                spill_slot_size(v.class).0
+                                    <= *slot_size.get(&slot).unwrap_or(&u64::MAX),
+                                "x86 linear scan: spilled vreg {:?} stored as {:?} ({} bytes) \
+                                 exceeds its slot ({} bytes)",
+                                v.id,
+                                v.class,
+                                spill_slot_size(v.class).0,
+                                slot_size[&slot]
+                            );
                             let scratch = next_scratch(v.class, &mut gp_used, &mut fp_used);
                             if is_fp_store_addr {
                                 out.push(load(scratch, v.class, mem_for_slot(slot), OpSize::Q));
