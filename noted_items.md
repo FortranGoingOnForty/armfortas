@@ -447,3 +447,28 @@ Found during l04 (2026-06-12):
   matches gfortran on the PTY suite. Out of scope for the armfortas
   campaign; flag upstream to fortsh. (test_menu_descriptions::test_git_subcommand_menu_shows_help
   WAS armfortas-specific and is fixed by 975fe77.)
+
+- **stdlib rung — Fortran library builds 100% under armfortas** (x12,
+  2026-06-19): fortran-stdlib (config/fypp_deployment.py → fpm, MAXRANK=4),
+  built with the trunk-based binary (trunk + bug B + bug E, the PR #72
+  branch). `fpm build` = `[100%] Project compiled successfully`: 442
+  Fortran modules (LAPACK, BLAS, sparse, linalg, hashmaps, sorting, ...) +
+  all examples + test executables compile and link, ZERO codegen failures.
+  Two build/codegen findings:
+  1. C-interop PIC/PIE (build-config, NOT codegen): the C file
+     stdlib_system_subprocess.c (compiled by cc, no -fPIC) fails a PIE
+     link — `R_X86_64_64 cannot be used against local symbol`. armfortas
+     defaults to PIE; gfortran on FreeBSD defaults to non-PIE, which
+     tolerates the non-PIC object. Unblocked with armfortas `-no-pie`
+     (matches gfortran's FreeBSD default). CONSIDER: a non-PIE default on
+     FreeBSD, or auto-detecting non-PIC objects, so real projects link
+     without the manual flag.
+  2. test ICE (real armfortas x86 codegen bug, TO FIX): `fpm test` builds
+     test_test_sorting.F90 and panics — `x05 scope: no register class for
+     Array(Int(I8), 32)` (x86 isel type_to_class). A character(32) value
+     reaches the register-class path as a by-value scalar; type_to_class
+     handles 8-byte by-value arrays (complex copies) but not a 32-byte
+     char array (should be by-reference). Needs a minimal repro of the
+     trigger (char(32) passed/used by value in test_sorting), then the
+     upstream fix. Blocks the stdlib test suite -> the ≥95% test-pass
+     classification is pending this fix. Library/example build is clean.
