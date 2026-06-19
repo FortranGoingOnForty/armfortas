@@ -2552,6 +2552,13 @@ pub(crate) fn lower_expr_full(
                                                 dummy_is_class,
                                             )
                                         };
+                                        let value = optional_arg_absent_if_forwarded_by_ref_dummy(
+                                            b,
+                                            locals,
+                                            e,
+                                            is_optional && !is_value,
+                                            value,
+                                        );
                                         optional_arg_absent_if_unallocated_allocatable_char(
                                             b,
                                             locals,
@@ -3121,6 +3128,14 @@ pub(crate) fn lower_expr_full(
                                                     descriptor_params,
                                                 )
                                             };
+                                            let value =
+                                                optional_arg_absent_if_forwarded_by_ref_dummy(
+                                                    b,
+                                                    locals,
+                                                    e,
+                                                    is_optional && !is_value,
+                                                    value,
+                                                );
                                             optional_arg_absent_if_unallocated_allocatable_char(
                                                 b,
                                                 locals,

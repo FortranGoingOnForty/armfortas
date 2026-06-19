@@ -2771,6 +2771,13 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                             dummy_is_class,
                                         )
                                     };
+                                    let value = optional_arg_absent_if_forwarded_by_ref_dummy(
+                                        b,
+                                        &ctx.locals,
+                                        e,
+                                        is_optional && !is_value,
+                                        value,
+                                    );
                                     optional_arg_absent_if_unallocated_allocatable_char(
                                         b,
                                         &ctx.locals,
@@ -3141,6 +3148,13 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                             dummy_is_class,
                                         )
                                     };
+                                    let value = optional_arg_absent_if_forwarded_by_ref_dummy(
+                                        b,
+                                        &ctx.locals,
+                                        e,
+                                        is_optional && !is_value,
+                                        value,
+                                    );
                                     optional_arg_absent_if_unallocated_allocatable_char(
                                         b,
                                         &ctx.locals,

@@ -44033,6 +44033,44 @@ fn shadowed_intrinsic_fallback_lowers_real_actual_not_generic_probe() {
     let _ = std::fs::remove_file(&src);
 }
 
+#[test]
+fn optional_class_star_forwarding_preserves_absent_arguments() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=optional_class_star_forwarding_preserves_absent_arguments count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module class_star_optional_forward_str_m\n  implicit none\ncontains\n  subroutine journal(g0, g1, g2)\n    class(*), intent(in) :: g0\n    class(*), intent(in), optional :: g1, g2\n    write(*, '(a)') msg_scalar(g0, g1, g2)\n  end subroutine\n\n  function msg_scalar(generic0, generic1, generic2) result(msg)\n    class(*), intent(in), optional :: generic0, generic1, generic2\n    character(len=:), allocatable :: msg\n    character(len=4096) :: line\n    integer :: istart\n    istart = 1\n    line = ''\n    if (present(generic0)) call print_generic(generic0)\n    if (present(generic1)) call print_generic(generic1)\n    if (present(generic2)) call print_generic(generic2)\n    msg = trim(line)\n  contains\n    subroutine print_generic(generic)\n      class(*), intent(in) :: generic\n      select type(generic)\n      type is (character(len=*))\n        write(line(istart:), '(a)') trim(generic)\n      class default\n        error stop 2\n      end select\n      istart = len_trim(line) + 2\n      line = trim(line)//' '\n    end subroutine\n  end function\nend module\n\nprogram p\n  use class_star_optional_forward_str_m\n  implicit none\n  call journal('Version: reduction')\nend program\n",
+        "f90",
+    );
+    let out = unique_path("optional_class_star_forwarding", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("optional class(*) forwarding compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "optional class(*) forwarding compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("optional class(*) forwarding run failed");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        run.status.success() && stdout.contains("Version: reduction"),
+        "optional class(*) forwarding run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        stdout,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
 // ---- Sprint l00: --std=f2023 wiring ----
 
 #[test]

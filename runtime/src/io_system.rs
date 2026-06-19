@@ -3502,7 +3502,7 @@ enum FmtSink {
     InternalAlloc { desc: *mut u8 },
 }
 
-/// Thread-local state for the current formatted I/O operation.
+/// Thread-local state for active formatted I/O operations.
 struct FmtContext {
     sink: FmtSink,
     format_str: String,
@@ -3522,7 +3522,7 @@ struct FmtContext {
 unsafe impl Send for FmtContext {}
 
 thread_local! {
-    static FMT_CTX: RefCell<Option<FmtContext>> = const { RefCell::new(None) };
+    static FMT_CTX: RefCell<Vec<FmtContext>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Begin a formatted write operation. Parses the format string and prepares
@@ -3552,7 +3552,7 @@ pub extern "C" fn afs_fmt_begin_ex(
 ) {
     let fmt = unsafe_str(fmt_str, fmt_len);
     FMT_CTX.with(|ctx| {
-        *ctx.borrow_mut() = Some(FmtContext {
+        ctx.borrow_mut().push(FmtContext {
             sink: FmtSink::Unit(unit),
             format_str: fmt,
             values: Vec::new(),
@@ -3596,7 +3596,7 @@ pub extern "C" fn afs_fmt_begin_internal_ex(
 ) {
     let fmt = unsafe_str(fmt_str, fmt_len);
     FMT_CTX.with(|ctx| {
-        *ctx.borrow_mut() = Some(FmtContext {
+        ctx.borrow_mut().push(FmtContext {
             sink: FmtSink::Internal {
                 buf,
                 buf_len: buf_len.max(0) as usize,
@@ -3689,7 +3689,7 @@ pub extern "C" fn afs_fmt_begin_internal_alloc(
 ) {
     let fmt = unsafe_str(fmt_str, fmt_len);
     FMT_CTX.with(|ctx| {
-        *ctx.borrow_mut() = Some(FmtContext {
+        ctx.borrow_mut().push(FmtContext {
             sink: FmtSink::InternalAlloc { desc },
             format_str: fmt,
             values: Vec::new(),
@@ -3711,7 +3711,7 @@ pub extern "C" fn afs_fmt_begin_internal_alloc(
 pub extern "C" fn afs_fmt_set_leading_zero(ptr: *const u8, len: i64) {
     let mode = LeadingZeroMode::from_specifier(&unsafe_str(ptr, len));
     FMT_CTX.with(|ctx| {
-        if let Some(ref mut c) = *ctx.borrow_mut() {
+        if let Some(c) = ctx.borrow_mut().last_mut() {
             c.stmt_leading_zero = Some(mode);
         }
     });
@@ -3721,7 +3721,7 @@ pub extern "C" fn afs_fmt_set_leading_zero(ptr: *const u8, len: i64) {
 #[no_mangle]
 pub extern "C" fn afs_fmt_push_int(val: i64) {
     FMT_CTX.with(|ctx| {
-        if let Some(ref mut c) = *ctx.borrow_mut() {
+        if let Some(c) = ctx.borrow_mut().last_mut() {
             c.values.push(IoValue::Integer(val as i128));
         }
     });
@@ -3731,7 +3731,7 @@ pub extern "C" fn afs_fmt_push_int(val: i64) {
 #[no_mangle]
 pub extern "C" fn afs_fmt_push_int128(val: *const i128) {
     FMT_CTX.with(|ctx| {
-        if let Some(ref mut c) = *ctx.borrow_mut() {
+        if let Some(c) = ctx.borrow_mut().last_mut() {
             if let Some(wide) = read_i128_ptr(val) {
                 c.values.push(IoValue::Integer(wide));
             }
@@ -3743,7 +3743,7 @@ pub extern "C" fn afs_fmt_push_int128(val: *const i128) {
 #[no_mangle]
 pub extern "C" fn afs_fmt_push_real(val: f64) {
     FMT_CTX.with(|ctx| {
-        if let Some(ref mut c) = *ctx.borrow_mut() {
+        if let Some(c) = ctx.borrow_mut().last_mut() {
             c.values.push(IoValue::Real(val));
         }
     });
@@ -3753,7 +3753,7 @@ pub extern "C" fn afs_fmt_push_real(val: f64) {
 #[no_mangle]
 pub extern "C" fn afs_fmt_push_logical(val: i32) {
     FMT_CTX.with(|ctx| {
-        if let Some(ref mut c) = *ctx.borrow_mut() {
+        if let Some(c) = ctx.borrow_mut().last_mut() {
             c.values.push(IoValue::Logical(val != 0));
         }
     });
@@ -3768,7 +3768,7 @@ pub extern "C" fn afs_fmt_push_string(ptr: *const u8, len: i64) {
         Vec::new()
     };
     FMT_CTX.with(|ctx| {
-        if let Some(ref mut c) = *ctx.borrow_mut() {
+        if let Some(c) = ctx.borrow_mut().last_mut() {
             c.values.push(IoValue::Character(bytes));
         }
     });
@@ -3779,7 +3779,7 @@ pub extern "C" fn afs_fmt_push_string(ptr: *const u8, len: i64) {
 #[no_mangle]
 pub extern "C" fn afs_fmt_end(advance: i32) {
     FMT_CTX.with(|ctx| {
-        let context = ctx.borrow_mut().take();
+        let context = ctx.borrow_mut().pop();
         if let Some(c) = context {
             let descriptors = parse_format(&c.format_str);
             let mut engine = FormatEngine::new(descriptors);
@@ -5200,6 +5200,46 @@ mod tests {
         assert_eq!(bytes, b"x      ");
 
         crate::string::afs_dealloc_string(dptr as *mut StringDescriptor);
+    }
+
+    #[test]
+    fn formatted_context_restores_outer_write_after_nested_internal_write() {
+        use crate::descriptor::StringDescriptor;
+        let path = "/tmp/afs_fmt_nested_context_test.dat";
+        let mut iostat = 0;
+        afs_open_simple(
+            822,
+            path.as_ptr(),
+            path.len() as i64,
+            "replace".as_ptr(),
+            7,
+            std::ptr::null(),
+            0,
+        );
+
+        let mut desc = StringDescriptor::zeroed();
+        let dptr = &mut desc as *mut StringDescriptor as *mut u8;
+        afs_fmt_begin(822, "(A)".as_ptr(), 3);
+        afs_fmt_begin_internal_alloc(
+            dptr,
+            "(A)".as_ptr(),
+            3,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        );
+        afs_fmt_push_string("inner".as_ptr(), 5);
+        afs_fmt_end(0);
+
+        afs_fmt_push_string(desc.data, desc.len);
+        afs_fmt_end(1);
+        afs_close(822, &mut iostat);
+
+        assert_eq!(iostat, 0, "expected close to succeed");
+        let content = std::fs::read_to_string(path).unwrap();
+        assert_eq!(content, "inner\n");
+        crate::string::afs_dealloc_string(dptr as *mut StringDescriptor);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

@@ -17820,6 +17820,13 @@ pub(super) fn emit_named_function_call(
                 } else {
                     lower_arg_by_ref(b, locals, e, st)
                 };
+                let value = optional_arg_absent_if_forwarded_by_ref_dummy(
+                    b,
+                    locals,
+                    e,
+                    is_optional && !is_value,
+                    value,
+                );
                 optional_arg_absent_if_unallocated_allocatable_char(
                     b,
                     locals,
@@ -18203,6 +18210,13 @@ pub(super) fn emit_resolved_bound_proc_call(
                             dummy_is_class,
                         )
                     };
+                    let value = optional_arg_absent_if_forwarded_by_ref_dummy(
+                        b,
+                        locals,
+                        e,
+                        is_optional && !is_value,
+                        value,
+                    );
                     optional_arg_absent_if_unallocated_allocatable_char(
                         b,
                         locals,
@@ -18833,6 +18847,13 @@ pub(super) fn lower_alloc_return_call_into_desc(
                 } else {
                     lower_arg_by_ref_ctx(b, ctx, e)
                 };
+                let value = optional_arg_absent_if_forwarded_by_ref_dummy(
+                    b,
+                    &ctx.locals,
+                    e,
+                    is_optional && !is_value,
+                    value,
+                );
                 optional_arg_absent_if_unallocated_allocatable_char(
                     b,
                     &ctx.locals,
@@ -45420,6 +45441,41 @@ fn typed_null_for_value(b: &mut FuncBuilder, value: ValueId) -> Option<ValueId> 
         }
         _ => None,
     }
+}
+
+pub(super) fn optional_arg_absent_if_forwarded_by_ref_dummy(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    enabled: bool,
+    value: ValueId,
+) -> ValueId {
+    if !enabled {
+        return value;
+    }
+    let Expr::Name { name } = &expr.node else {
+        return value;
+    };
+    let Some(info) = locals.get(&name.to_lowercase()) else {
+        return value;
+    };
+    if !info.by_ref {
+        return value;
+    }
+    let Some(null_value) = typed_null_for_value(b, value) else {
+        return value;
+    };
+
+    let incoming = b.load(info.addr);
+    let present_raw = match b.func().value_type(incoming) {
+        Some(IrType::Ptr(_)) => b.ptr_to_int(incoming),
+        Some(IrType::Int(IntWidth::I64)) => incoming,
+        Some(IrType::Int(_)) => coerce_to_type(b, incoming, &IrType::Int(IntWidth::I64)),
+        _ => return value,
+    };
+    let zero = b.const_i64(0);
+    let present = b.icmp(CmpOp::Ne, present_raw, zero);
+    b.select(present, value, null_value)
 }
 
 pub(super) fn optional_arg_absent_if_unallocated_allocatable_char(
