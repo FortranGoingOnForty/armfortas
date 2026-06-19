@@ -28701,6 +28701,21 @@ fn fmt_push_emit_char_fixed(b: &mut FuncBuilder, ptr: ValueId, len: i64) {
     );
 }
 
+/// Push a `string_type` element for formatted/list-directed output. The
+/// element at `ptr` is a 32-byte string descriptor; push its char data
+/// (ptr, len), NOT the raw struct. Loading the whole descriptor as a
+/// value asked x86 isel for a register class for `Array(i8, 32)` and
+/// panicked (surfaced by stdlib's test_sorting writing a string_type
+/// array section). Mirrors the scalar string_type write path.
+fn fmt_push_emit_string_type(b: &mut FuncBuilder, ptr: ValueId) {
+    let (sptr, slen) = load_string_descriptor_view(b, ptr);
+    b.call(
+        FuncRef::External("afs_fmt_push_string".into()),
+        vec![sptr, slen],
+        IrType::Void,
+    );
+}
+
 /// Push a complex element by emitting two real pushes for its lanes.
 /// The runtime has no afs_fmt_push_complex_* yet; this preserves
 /// observable behavior under formats like `(2(es...,1x))` while keeping
@@ -28781,6 +28796,8 @@ fn fmt_push_whole_array(b: &mut FuncBuilder, info: &LocalInfo) {
         fmt_push_emit_char_fixed(b, p, len);
     } else if is_complex_elem {
         fmt_push_emit_complex(b, complex_lane_f64, p);
+    } else if info.derived_type.as_deref() == Some("string_type") {
+        fmt_push_emit_string_type(b, p);
     } else {
         let elem = b.load_typed(p, info.ty.clone());
         fmt_push_emit_scalar(b, &info.ty, elem);
@@ -28887,6 +28904,8 @@ fn fmt_push_1d_slice(
         fmt_push_emit_char_fixed(b, p, len);
     } else if is_complex_elem {
         fmt_push_emit_complex(b, complex_lane_f64, p);
+    } else if info.derived_type.as_deref() == Some("string_type") {
+        fmt_push_emit_string_type(b, p);
     } else {
         let elem = b.load_typed(p, info.ty.clone());
         fmt_push_emit_scalar(b, &info.ty, elem);
@@ -29034,6 +29053,8 @@ fn fmt_push_section_nd(
                 fmt_push_emit_char_fixed(b, p, len);
             } else if is_complex_elem {
                 fmt_push_emit_complex(b, complex_lane_f64, p);
+            } else if info.derived_type.as_deref() == Some("string_type") {
+                fmt_push_emit_string_type(b, p);
             } else {
                 let elem = b.load_typed(p, info.ty.clone());
                 fmt_push_emit_scalar(b, &info.ty, elem);
@@ -29230,6 +29251,8 @@ fn fmt_push_alloc_section_nd(
                 fmt_push_emit_char_fixed(b, p, len);
             } else if is_complex_elem {
                 fmt_push_emit_complex(b, complex_lane_f64, p);
+            } else if info.derived_type.as_deref() == Some("string_type") {
+                fmt_push_emit_string_type(b, p);
             } else {
                 let elem = b.load_typed(p, info.ty.clone());
                 fmt_push_emit_scalar(b, &info.ty, elem);
