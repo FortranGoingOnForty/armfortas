@@ -387,17 +387,52 @@ Found during l04 (2026-06-12):
   link). Owners: intrinsic runtime-bounds pass / F2003 intrinsic
   backlog respectively.
 
-- **`print '(format)'` with multiple items ignores the format** (found
-  l05-2, 2026-06-13): a multi-item `print` with an explicit format
-  literal lowers as if list-directed. `print '(A,I0)', 'n=', 5`
-  emits ` n= 5` (leading blank + blank separator) instead of `n=5`;
-  `print '(A,A,A)', 'x|', 'ab', '|'` emits ` x| ab |` instead of
-  `x|ab|`. The equivalent `write(*,'(A,A,A)') ...` is correct, and a
-  single-item `print '(A)', 'ok'` is correct, so the bug is specific to
-  multi-item PRINT carrying a format. Existing fixtures dodge it
-  because their CHECKs are `contains`-based and tolerate the extra
-  blanks (e.g. x10c's `print '(A,16(1X,I0))'` already has explicit 1X
-  separators). The l05-2 fixture uses `write(*,...)` to assert exact
-  field contents. Owner: PRINT-statement lowering (src/ir/lower/stmt.rs
-  Stmt::Print vs Stmt::Write) — likely PRINT routes format-carrying
-  output through the list-directed path.
+- **`print '(format)'` ignores the format — FIXED (x12, 2026-06-20)**:
+  Stmt::Print dropped its `format` field and always lowered through the
+  list-directed path, so any `print '(...)' , items` emitted
+  list-directed output (and `print '("lit",i3)', 7` dropped the
+  embedded literal entirely). Fixed by routing a character format
+  through the same afs_fmt_begin_ex/push/end machinery WRITE uses; `*`
+  and (still-unsupported) numeric FORMAT labels stay list-directed. See
+  commit "Honor PRINT's character format string" and
+  test_programs/x12_print_format_string.f90. Supersedes the earlier
+  PRINT spurious-space / multi-item notes.
+
+- **fpm self-hosting stage0 bringup (x12, 2026-06-20)**: compiling the
+  amalgamated `fpm-0.13.0.F90` (53k lines, fpm + vendored M_CLI2,
+  toml-f, jonquil, fortran-regex/-shlex) surfaced a chain of
+  frontend/dispatch bugs, each fixed with a minimal repro + x12_*.f90
+  fixture on branch fpm-self-host (full regression green each time):
+    1. host/module-assoc deferred-shape array read as rank 0 (generic
+       `insert` mismatch) — give it the declared rank in install_one_global.
+    2. module deferred-len char ARRAY recorded char_kind=Deferred, so
+       ALLOCATE took the 32-byte scalar-string path (size 0, garbage
+       elements) — record char_kind=None like the local path.
+    3. LEN treated as elemental → `5 5 5` for a whole array; it is a
+       scalar inquiry function.
+    4. PRINT ignored its character format (above).
+    5. a local object named like a generic (`new(:n)` substring where
+       `new` is a char dummy) resolved to the generic — local shadows it.
+    6. a host-module's own declaration (`initial_size`) flagged as
+       USE-ONLY-filtered when an unrelated `use, only:` module also
+       exported the name — host association wins.
+    7. an in-module call to a generic the module extends saw only the
+       merged symbol's arg_names (its locals + first re-export), not the
+       full re-export chain (`get_value` through tomlf→tomlf_build→4
+       leaves) — gather the complete candidate set before erroring.
+    8. USE-renamed derived type (`json_value => toml_value`) not
+       canonicalized in generic dispatch (`json_load`).
+    9. same rename not canonicalized in component access
+       (`j_error%message` → "no field", then broken MOVE_ALLOC).
+  OPEN (resume): bug 10 — `global_settings%full_path()`, a plain
+  (non-generic) type-bound FUNCTION on `fpm_global_settings`, fails with
+  "no specific type-bound procedure ... candidates: []". A TBP
+  resolution facet, distinct from generic dispatch.
+  DEFERRED rename facets (not yet hit by fpm): component-WRITE
+  (`jv%x = 5`) and direct-call argument passing of a renamed-type actual
+  still mis-resolve; the robust fix is to canonicalize a local's
+  derived_type at decl time (alloc.rs) so every path sees the canonical
+  name — higher blast radius, deferred. Repros in ~/afs-scratch/buge/.
+  DEFERRED: numbered FORMAT labels (`write(*,100)` / `print 100,`)
+  produce no/list-directed output; unsupported everywhere, zero
+  test_programs use them.
