@@ -43847,19 +43847,30 @@ pub(super) fn resolve_component_base(
         Expr::Name { name } => {
             let key = name.to_lowercase();
             let info = locals.get(&key)?;
-            let type_name = info.derived_type.clone().or_else(|| {
-                let type_info = operator_expr_type_info(base, Some(locals), st, Some(tl))?;
-                let raw_name = match type_info {
-                    crate::sema::symtab::TypeInfo::Derived(name)
-                    | crate::sema::symtab::TypeInfo::Class(name) => name,
-                    _ => return None,
-                };
-                let scope_id = callee_scope_id_for_lookup(st, b.func().name.as_str());
-                Some(
-                    canonical_layout_type_name_for_scope(st, scope_id, &raw_name, tl)
-                        .unwrap_or(raw_name),
-                )
-            })?;
+            // Canonicalize a USE-renamed derived type to its underlying
+            // layout name. A `type(json_error)` local (jonquil renames
+            // `json_error => toml_error`) records the alias in
+            // info.derived_type, so without this the layout lookup misses
+            // every field (`j_error%message` -> "no field").
+            let scope_id = callee_scope_id_for_lookup(st, b.func().name.as_str());
+            let type_name = info
+                .derived_type
+                .clone()
+                .map(|raw| {
+                    canonical_layout_type_name_for_scope(st, scope_id, &raw, tl).unwrap_or(raw)
+                })
+                .or_else(|| {
+                    let type_info = operator_expr_type_info(base, Some(locals), st, Some(tl))?;
+                    let raw_name = match type_info {
+                        crate::sema::symtab::TypeInfo::Derived(name)
+                        | crate::sema::symtab::TypeInfo::Class(name) => name,
+                        _ => return None,
+                    };
+                    Some(
+                        canonical_layout_type_name_for_scope(st, scope_id, &raw_name, tl)
+                            .unwrap_or(raw_name),
+                    )
+                })?;
             // For a derived-type POINTER, info.addr is a pointer slot
             // whose contents are the associated struct's address.
             // Pointer dummies passed by reference add one more layer:
