@@ -16664,7 +16664,18 @@ pub(super) fn resolve_subroutine_call_name(
     if let Some(scope_id) = caller_scope_id {
         if let Some(sym) = st.lookup_in(scope_id, key) {
             if scope_is_host_associated_or_self(st, scope_id, sym.scope) {
-                if let Some(specifics) = named_interface_specific_candidates_from_symbol(sym) {
+                // Gather the FULL specific set, not just this symbol's own
+                // arg_names. When a module extends a generic it imports
+                // (`use m, only: g` plus a local `interface g`), the merged
+                // symbol records only its local specifics plus the first
+                // re-exported one; the rest live on the use-associated
+                // interfaces. named_interface_specific_candidates walks
+                // those too, so use it (falling back to the symbol-only set)
+                // — otherwise an in-module call could not reach a specific
+                // re-exported through a chain (fpm/tomlf get_value).
+                if let Some(specifics) = named_interface_specific_candidates(st, key)
+                    .or_else(|| named_interface_specific_candidates_from_symbol(sym))
+                {
                     match resolve_generic_call_actuals_from_specifics(
                         st,
                         b,
