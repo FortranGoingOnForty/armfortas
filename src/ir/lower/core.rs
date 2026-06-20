@@ -12143,11 +12143,17 @@ fn resolve_generic_call_by_semantics_impl(
         .iter()
         .map(|arg| match &arg.value {
             crate::ast::expr::SectionSubscript::Element(expr) => {
-                if let Some(locals) = locals {
+                let ti = if let Some(locals) = locals {
                     generic_actual_expr_type_info(expr, locals, st, type_layouts)
                 } else {
                     operator_expr_type_info(expr, None, st, type_layouts)
-                }
+                };
+                // Resolve a renamed derived type to its canonical name so
+                // it matches a specific's formal declared with the original
+                // name. jonquil does `use tomlf, only: json_value =>
+                // toml_value`, so a `class(json_value)` actual must match a
+                // `class(toml_value)` formal (json_load).
+                ti.map(|ti| canonicalize_type_info_type_name(ti, st, type_layouts))
             }
             _ => None,
         })
@@ -12257,11 +12263,17 @@ fn resolve_generic_call_actuals_from_specifics(
         .iter()
         .map(|arg| match &arg.value {
             crate::ast::expr::SectionSubscript::Element(expr) => {
-                if let Some(locals) = locals {
+                let ti = if let Some(locals) = locals {
                     generic_actual_expr_type_info(expr, locals, st, type_layouts)
                 } else {
                     operator_expr_type_info(expr, None, st, type_layouts)
-                }
+                };
+                // Resolve a renamed derived type to its canonical name so
+                // it matches a specific's formal declared with the original
+                // name. jonquil does `use tomlf, only: json_value =>
+                // toml_value`, so a `class(json_value)` actual must match a
+                // `class(toml_value)` formal (json_load).
+                ti.map(|ti| canonicalize_type_info_type_name(ti, st, type_layouts))
             }
             _ => None,
         })
@@ -18155,6 +18167,31 @@ pub(super) fn abstract_layout_base_type(
             Some(base_type.clone())
         }
         _ => None,
+    }
+}
+
+/// Rewrite a Derived/Class TypeInfo's name to its canonical layout name,
+/// resolving USE renames (`json_value => toml_value`) so generic dispatch
+/// compares the underlying type, not the local alias. Other type kinds
+/// pass through unchanged.
+pub(super) fn canonicalize_type_info_type_name(
+    ti: crate::sema::symtab::TypeInfo,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> crate::sema::symtab::TypeInfo {
+    use crate::sema::symtab::TypeInfo;
+    let Some(tl) = type_layouts else {
+        return ti;
+    };
+    let scope = current_proc_scope();
+    match ti {
+        TypeInfo::Derived(name) => TypeInfo::Derived(
+            canonical_layout_type_name_for_scope(st, scope, &name, tl).unwrap_or(name),
+        ),
+        TypeInfo::Class(name) => TypeInfo::Class(
+            canonical_layout_type_name_for_scope(st, scope, &name, tl).unwrap_or(name),
+        ),
+        other => other,
     }
 }
 
