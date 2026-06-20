@@ -375,6 +375,10 @@ impl<'a> Parser<'a> {
                     if self.peek_text().eq_ignore_ascii_case("then") {
                         self.advance();
                     }
+                    // Optional construct name after THEN (`else if (c) then blk`).
+                    if self.peek() == &TokenKind::Identifier && !self.at_stmt_end() {
+                        self.advance();
+                    }
                     let ei_body = self.parse_stmt_block(&["if"])?;
                     else_ifs.push((ei_cond, ei_body));
                     continue;
@@ -382,6 +386,10 @@ impl<'a> Parser<'a> {
 
                 // ELSE (no IF)
                 self.advance(); // else
+                // Optional construct name on the same line (`else blk`).
+                if self.peek() == &TokenKind::Identifier && !self.at_stmt_end() {
+                    self.advance();
+                }
                 let eb = self.parse_stmt_block(&["if"])?;
                 else_body = Some(eb);
                 continue;
