@@ -44214,6 +44214,17 @@ pub(super) fn expr_is_callable_character_callee(
     match &expr.node {
         Expr::Name { name } => {
             let key = name.to_lowercase();
+            // A local data object shadows any same-named procedure (a
+            // generic interface, module procedure, etc.) brought in by
+            // host/use association. `new(:n)` where `new` is a local
+            // `character(len=*)` dummy is a substring, not a call to an
+            // unrelated generic `new` — without this guard the named-
+            // interface check below claimed it was callable and the
+            // substring path was skipped (fpm/M_strings substitute). Only
+            // a genuine procedure-pointer local stays callable.
+            if locals.contains_key(&key) && procedure_pointer_signature_key(st, &key).is_none() {
+                return false;
+            }
             if !(locals.contains_key(&key) && procedure_pointer_signature_key(st, &key).is_none())
                 && callee_character_return_abi(st, &key).is_some()
             {
