@@ -3820,6 +3820,19 @@ pub(super) fn collect_module_globals(
                         ty: desc_ty,
                         initializer: Some(GlobalInit::Zero),
                     });
+                    // A deferred-length character ARRAY carries its element
+                    // length in the descriptor's elem_size at runtime, just
+                    // like a local `character(len=:), allocatable :: x(:)`
+                    // (which records CharKind::None, not Deferred). Deferred
+                    // here would route the ALLOCATE statement through the
+                    // 32-byte scalar-string path that only handles rank-0
+                    // deferred scalars, so a module array allocated only one
+                    // element's worth of bytes and read its descriptor as a
+                    // string (fpm/M_CLI2 keywords).
+                    let array_char_kind = match &global_char_kind {
+                        CharKind::Deferred => CharKind::None,
+                        other => other.clone(),
+                    };
                     globals.insert(
                         (mod_name.to_lowercase(), entity.name.to_lowercase()),
                         ModuleGlobalInfo {
@@ -3830,7 +3843,7 @@ pub(super) fn collect_module_globals(
                             is_pointer,
                             deferred_char: false,
                             derived_type: derived_type_name.clone(),
-                            char_kind: global_char_kind.clone(),
+                            char_kind: array_char_kind,
                             const_value: None,
                             external: false,
                             private: false,
@@ -35316,7 +35329,11 @@ pub(super) fn is_elemental_math_intrinsic(name: &str) -> bool {
         // wired in lower_intrinsic; flagging them here lets reductions
         // like `sum(len_trim(strs))` materialize the per-element
         // result array via `lower_rank1_elemental_call_descriptor`.
-        | "len" | "len_trim" | "index" | "scan" | "verify"
+        // LEN is excluded: it is an inquiry function (§16.9.108), not
+        // elemental — LEN(array) is the scalar element length, so it
+        // must not expand element-wise (printed `5 5 5` for a rank-1
+        // deferred-length char array instead of the scalar 5).
+        | "len_trim" | "index" | "scan" | "verify"
         | "adjustl" | "adjustr" | "lge" | "lgt" | "lle" | "llt"
         // F2018 §16.9 bit-manipulation elementals.
         | "popcnt" | "popcount" | "poppar" | "leadz" | "trailz"
