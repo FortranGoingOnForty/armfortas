@@ -2090,10 +2090,44 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             }
         }
 
-        Stmt::Print { items, .. } => {
-            // PRINT * → unit 6 (stdout).
+        Stmt::Print { format, items } => {
+            // PRINT writes to unit 6 (stdout). `PRINT *` is list-directed;
+            // `PRINT fmt` with a character format string routes through the
+            // same push-based formatted machinery WRITE uses. Numeric FORMAT
+            // labels aren't resolved yet (WRITE has the same gap), so any
+            // non-character format stays on the list-directed path rather
+            // than being lowered as a garbage string pointer.
             let unit = b.const_i32(6);
-            lower_write_items(b, ctx, items, unit);
+            let is_formatted = !matches!(&format.node, Expr::Name { name } if name == "*")
+                && crate::sema::types::expr_type(format, ctx.st).is_character();
+            if is_formatted {
+                let null_i64 = b.const_i64(0);
+                let null_i8_ptr = b.int_to_ptr(null_i64, IrType::Int(IntWidth::I8));
+                let zero_i64 = b.const_i64(0);
+                let (fmt_ptr, fmt_len) = lower_string_expr_with_layouts(
+                    b,
+                    &ctx.locals,
+                    format,
+                    ctx.st,
+                    Some(ctx.type_layouts),
+                );
+                b.call(
+                    FuncRef::External("afs_fmt_begin_ex".into()),
+                    vec![unit, fmt_ptr, fmt_len, null_i8_ptr, null_i8_ptr, zero_i64],
+                    IrType::Void,
+                );
+                for item in items {
+                    lower_fmt_push(b, ctx, item);
+                }
+                let adv = b.const_i32(1);
+                b.call(
+                    FuncRef::External("afs_fmt_end".into()),
+                    vec![adv],
+                    IrType::Void,
+                );
+            } else {
+                lower_write_items(b, ctx, items, unit);
+            }
         }
 
         Stmt::Write { controls, items } => {
