@@ -483,3 +483,22 @@ Found during l04 (2026-06-12):
   100%, tests 1288/0. The only armfortas-only finding was this ICE (fixed);
   the C-PIC/PIE issue is build-config (-no-pie, matches gfortran's FreeBSD
   default).
+
+- **fpm self-hosting rung — IN PROGRESS** (x12, 2026-06-19): stage0 =
+  compile the single-file fpm-0.13.0.F90 (53k lines: all of fpm + vendored
+  deps) with armfortas; stage1 = use that fpm to `fpm install` fpm. Found +
+  fixing armfortas bugs iteratively on branch fpm-self-host (off trunk):
+  1. FIXED (committed d27e0b1, branch fpm-self-host): parser rejected named
+     ELSE / ELSE IF clauses (`else name`, `else if (c) then name`) — the
+     trailing construct name was mis-parsed as a statement. (M_CLI2's
+     decodebase: `ALL: if ... else ALL`.) Clean general parser fix +
+     fixture x12_named_if_else_clauses.f90. Worth its own PR (helps any
+     project, not just fpm).
+  2. OPEN: generic-resolution failure — `call insert(...)` (M_CLI2,
+     ~line 3766-3771 of the single file) `no specific procedure of generic
+     'insert' matches; candidates insert_c/insert_i/insert_l`. The generic
+     `insert(list, value, place)` has char/int/logical specifics; armfortas
+     can't match one of the 6 call sites (keywords/values/counts/shorts/
+     present_in/mandatory). Generic-dispatch bug to reduce + fix next.
+  stage0 is an iterative multi-bug bringup (fpm is large); expect more
+  findings after bug 2. Single-file source at ~/afs-scratch/fpm-boot.
