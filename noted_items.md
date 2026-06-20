@@ -494,11 +494,26 @@ Found during l04 (2026-06-12):
      decodebase: `ALL: if ... else ALL`.) Clean general parser fix +
      fixture x12_named_if_else_clauses.f90. Worth its own PR (helps any
      project, not just fpm).
-  2. OPEN: generic-resolution failure — `call insert(...)` (M_CLI2,
-     ~line 3766-3771 of the single file) `no specific procedure of generic
-     'insert' matches; candidates insert_c/insert_i/insert_l`. The generic
-     `insert(list, value, place)` has char/int/logical specifics; armfortas
-     can't match one of the 6 call sites (keywords/values/counts/shorts/
-     present_in/mandatory). Generic-dispatch bug to reduce + fix next.
+  2. OPEN (diagnosed deeply): generic-resolution failure — `call
+     insert(keywords, long, ...)` (M_CLI2) `no specific procedure of
+     generic 'insert' matches`. ROOT: a host/module-associated
+     **deferred-length (`character(len=:)`) allocatable ARRAY** module var
+     gets a LocalInfo with **dims=0** (built as a scalar). So
+     local_is_array_like()=false and local_is_string_scalar()=true → the
+     generic-dispatch matcher mis-classifies it as a deferred-char SCALAR,
+     and the candidate's rank-1 `list(:)` dummy never matches. Minimal
+     repro (~/afs-scratch/buge/ins2b.f90): a module
+     `character(:),allocatable,save :: arr(:)` passed to a host-associated
+     generic with one `character(:),allocatable :: list(:)` specific.
+     MATRIX: fails ONLY for module + character + deferred-len + ARRAY;
+     module int array, module char scalar, and LOCAL char array all
+     resolve. NOTE: actual_expr_rank can be patched to fall back to the
+     symtab array_spec rank (symtab is authoritative), but that alone does
+     NOT fix it — the type/IR-value matching gates also see the scalar
+     mis-classification. The proper fix is the host/module-association
+     LocalInfo construction (give a module array its correct rank/dims),
+     which then satisfies all dispatch gates. Bug A family (host-assoc
+     array LocalInfo). Focused next task; not a one-liner.
   stage0 is an iterative multi-bug bringup (fpm is large); expect more
-  findings after bug 2. Single-file source at ~/afs-scratch/fpm-boot.
+  findings after bug 2. Single-file source at ~/afs-scratch/fpm-boot;
+  repros at ~/afs-scratch/buge/ins*.f90.
