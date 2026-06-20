@@ -437,10 +437,27 @@ Found during l04 (2026-06-12):
        canonicalized in generic dispatch (`json_load`).
     9. same rename not canonicalized in component access
        (`j_error%message` → "no field", then broken MOVE_ALLOC).
-  OPEN (resume): bug 10 — `global_settings%full_path()`, a plain
-  (non-generic) type-bound FUNCTION on `fpm_global_settings`, fails with
-  "no specific type-bound procedure ... candidates: []". A TBP
-  resolution facet, distinct from generic dispatch.
+   10. comma-separated type-bound binding (`procedure :: a, b, c`,
+       F2018 R448) bound only the first name — `global_settings%full_path()`
+       failed with "no specific type-bound procedure ... candidates: []".
+       parse_type_bound_proc now parses the full decl-list. FIXED on branch
+       fpm-bringup-2 (test_programs/x12_comma_list_type_bound_procs.f90 +
+       parser unit test); not yet PR'd.
+  OPEN (resume): bug 11 — generic `set_string` call
+  `set_string(table, "requested_version", self%requested_version%s(),
+  error, 'dependency_config_t')` (fpm_dependency dump_to_toml) matches no
+  candidate [set_character, set_string_type]. ROOT (via AFS_DBG_GEN debug
+  in resolve_generic_call_actuals_from_specifics):
+  generic_actual_expr_type_info infers the 3rd actual
+  `self%requested_version%s()` as Integer{None} instead of Character. It's
+  a TBP function call (FunctionCall with a ComponentAccess callee) that
+  falls through to operator_expr_type_info; that returns Character in every
+  isolated repro (~/afs-scratch/buge/tbpret*.f90) but Integer in the full
+  fpm type environment. version_t%s() returns character(len=:),allocatable;
+  requested_version is type(version_t),allocatable (other unrelated CHARACTER
+  `requested_version` vars exist — possible scope/layout mis-resolution).
+  Next: instrument operator_expr_type_info's component-access-callee
+  (TBP-call) return-type path.
   DEFERRED rename facets (not yet hit by fpm): component-WRITE
   (`jv%x = 5`) and direct-call argument passing of a renamed-type actual
   still mis-resolve; the robust fix is to canonicalize a local's
