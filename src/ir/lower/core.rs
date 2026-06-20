@@ -45659,7 +45659,8 @@ pub(super) fn expr_is_array_designator(
                     return false;
                 }
                 if matches!(info.char_kind, CharKind::Deferred) {
-                    false
+                    local_is_array_like(info)
+                        && (!info.dims.is_empty() || local_uses_array_descriptor(info))
                 } else {
                     !info.dims.is_empty() || local_uses_array_descriptor(info)
                 }
@@ -47985,7 +47986,7 @@ pub(super) fn lower_char_arg_by_ref(
     match &expr.node {
         Expr::Name { name } => {
             let info = locals.get(&name.to_lowercase())?;
-            if !info.dims.is_empty() {
+            if local_is_array_like(info) || descriptor_backed_runtime_char_array(info) {
                 return None;
             }
             if info.by_ref {

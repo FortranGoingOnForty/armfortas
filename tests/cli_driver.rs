@@ -3160,6 +3160,78 @@ fn bind_c_c_char_buffer_writes_scalar_character_storage() {
 }
 
 #[test]
+fn bind_c_c_char_buffer_writes_allocatable_array_storage() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=bind_c_c_char_buffer_writes_allocatable_array_storage count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("bind_c_c_char_alloc_array");
+    let c_src = write_program_in(
+        &dir,
+        "write_buf.c",
+        "char *write_buf(char *buf, int n) {\n    static const char msg[] = \"abc\";\n    int len = n < 3 ? n : 3;\n    for (int i = 0; i < len; ++i) buf[i] = msg[i];\n    if (n > len) buf[len] = '\\0';\n    return buf;\n}\n",
+    );
+    let c_obj = dir.join("write_buf.o");
+    compile_c_object(&c_src, &c_obj);
+
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use iso_c_binding, only: c_char, c_int, c_ptr, c_associated\n  implicit none\n  interface\n    function write_buf(buf, n) result(ptr) bind(C, name='write_buf')\n      import :: c_char, c_int, c_ptr\n      character(kind=c_char, len=1), intent(in) :: buf(*)\n      integer(c_int), value, intent(in) :: n\n      type(c_ptr) :: ptr\n    end function write_buf\n  end interface\n  character(kind=c_char, len=1), allocatable :: cpath(:)\n  type(c_ptr) :: tmp\n  allocate(cpath(4))\n  cpath = '?'\n  tmp = write_buf(cpath, 4_c_int)\n  if (.not. c_associated(tmp)) error stop 1\n  if (cpath(1) /= 'a') error stop 2\n  if (cpath(2) /= 'b') error stop 3\n  if (cpath(3) /= 'c') error stop 4\n  print *, 'ok'\nend program\n",
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_obj = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("bind(c) allocatable c_char array object compile failed to spawn");
+    assert!(
+        compile_obj.status.success(),
+        "bind(c) allocatable c_char array should compile to an object: {}",
+        String::from_utf8_lossy(&compile_obj.stderr)
+    );
+
+    let exe = dir.join("bind_c_c_char_alloc_array.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            main_obj.to_str().unwrap(),
+            c_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("bind(c) allocatable c_char array link failed to spawn");
+    assert!(
+        link.status.success(),
+        "bind(c) allocatable c_char array objects should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("bind(c) allocatable c_char array run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "bind(c) allocatable c_char array should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn bind_c_c_char_buffer_survives_amod_import_without_hidden_lengths() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
