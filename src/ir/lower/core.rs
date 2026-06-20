@@ -6910,10 +6910,24 @@ pub(super) fn install_one_global(
     locals: &mut HashMap<String, LocalInfo>,
     local_key: String,
     info: &ModuleGlobalInfo,
+    // Declared rank of the module symbol (from its array_spec). A
+    // deferred-shape allocatable/pointer array carries no fixed bounds in
+    // `info.dims`, so without this the installed LocalInfo reads as rank 0
+    // and a module array is mis-classified as a scalar — generic dispatch
+    // then can't match it to an array dummy (fpm/M_CLI2 `insert`).
+    rank: usize,
 ) {
     if locals.contains_key(&local_key) {
         return;
     }
+    // Rank known, bounds unknown until allocation: encode rank with None
+    // upper bounds (the same shape the decl/allocate paths use). Fixed
+    // arrays already carry their rank in `info.dims`.
+    let runtime_dim_upper = if info.dims.is_empty() && rank > 0 {
+        vec![None; rank]
+    } else {
+        vec![]
+    };
     let addr_ty = if info.allocatable {
         IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384)
     } else if info.deferred_char {
@@ -6937,7 +6951,7 @@ pub(super) fn install_one_global(
             derived_type: info.derived_type.clone(),
             inline_const: None,
             is_pointer: info.is_pointer,
-            runtime_dim_upper: vec![],
+            runtime_dim_upper,
             is_class: false,
             logical_kind: None,
             last_dim_assumed_size: false,
@@ -7314,7 +7328,16 @@ pub(super) fn install_globals_as_locals_in(
             }
             installed_from.insert(local_key.clone(), resolved_mod);
             if !install_global_inline_const(b, locals, local_key.clone(), info) {
-                install_one_global(b, locals, local_key, info);
+                // Recover the declared rank from the module symbol — a
+                // deferred-shape allocatable/pointer array has no bounds in
+                // `info.dims`, so the installed LocalInfo would otherwise be
+                // rank 0 (mis-read as a scalar by generic dispatch).
+                let rank = st
+                    .find_module_scope(&resolved_global_key.0)
+                    .and_then(|sid| st.lookup_in(sid, &resolved_global_key.1))
+                    .map(|sym| sym.attrs.array_spec.len())
+                    .unwrap_or(0);
+                install_one_global(b, locals, local_key, info, rank);
             }
         } else {
             // Not an IR global — check if it's an intrinsic module parameter constant
