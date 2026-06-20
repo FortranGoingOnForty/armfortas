@@ -976,8 +976,8 @@ impl<'a> Parser<'a> {
 
                     if proc_text == "procedure" {
                         self.advance();
-                        let tbp = self.parse_type_bound_proc()?;
-                        type_bound_procs.push(tbp);
+                        let tbps = self.parse_type_bound_proc()?;
+                        type_bound_procs.extend(tbps);
                     } else if proc_text == "generic" {
                         self.advance();
                         let tbp = self.parse_type_bound_proc_generic()?;
@@ -1157,8 +1157,11 @@ impl<'a> Parser<'a> {
         ))
     }
 
-    fn parse_type_bound_proc(&mut self) -> Result<TypeBoundProc, ParseError> {
-        // procedure [(iface)] [, attrs] :: name [=> binding]
+    fn parse_type_bound_proc(&mut self) -> Result<Vec<TypeBoundProc>, ParseError> {
+        // procedure [(iface)] [, attrs] :: tbp-decl-list, where each
+        // tbp-decl is `name [=> binding]` (F2018 R448/R449). The
+        // interface and attrs prefix is shared across the whole list, so
+        // `procedure :: a, b, c` binds all three.
         let interface = if self.eat(&TokenKind::LParen) {
             let iface = self.advance().clone().text;
             self.expect(&TokenKind::RParen)?;
@@ -1205,21 +1208,28 @@ impl<'a> Parser<'a> {
             }
         }
         self.eat(&TokenKind::ColonColon);
-        let name = self.advance().clone().text;
-        let binding = if self.eat(&TokenKind::Arrow) {
-            Some(self.advance().clone().text)
-        } else {
-            None
-        };
-        let bindings = binding.iter().cloned().collect();
-        Ok(TypeBoundProc {
-            name,
-            interface,
-            binding,
-            bindings,
-            attrs: proc_attrs,
-            is_generic: false,
-        })
+        let mut procs = Vec::new();
+        loop {
+            let name = self.advance().clone().text;
+            let binding = if self.eat(&TokenKind::Arrow) {
+                Some(self.advance().clone().text)
+            } else {
+                None
+            };
+            let bindings = binding.iter().cloned().collect();
+            procs.push(TypeBoundProc {
+                name,
+                interface: interface.clone(),
+                binding,
+                bindings,
+                attrs: proc_attrs.clone(),
+                is_generic: false,
+            });
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        Ok(procs)
     }
 
     fn parse_type_bound_proc_generic(&mut self) -> Result<TypeBoundProc, ParseError> {
@@ -1630,12 +1640,29 @@ mod tests {
         let tokens = Lexer::tokenize("procedure(push_iface), deferred :: push", 0).unwrap();
         let mut parser = Parser::new(&tokens);
         parser.advance();
-        let tbp = parser.parse_type_bound_proc().unwrap();
+        let tbps = parser.parse_type_bound_proc().unwrap();
+        assert_eq!(tbps.len(), 1);
+        let tbp = &tbps[0];
         assert_eq!(tbp.name, "push");
         assert_eq!(tbp.interface.as_deref(), Some("push_iface"));
         assert!(tbp.binding.is_none());
         assert!(tbp.bindings.is_empty());
         assert_eq!(tbp.attrs, vec!["deferred"]);
+    }
+
+    #[test]
+    fn type_bound_proc_comma_list_binds_every_name() {
+        // F2018 R448: `procedure :: a, b, c` binds all three. The shared
+        // attrs prefix applies to each. Surfaced building fpm
+        // (fpm_global_settings binds three procedures in one statement).
+        let tokens =
+            Lexer::tokenize("procedure :: has_custom_location, full_path, path_or_empty", 0)
+                .unwrap();
+        let mut parser = Parser::new(&tokens);
+        parser.advance();
+        let tbps = parser.parse_type_bound_proc().unwrap();
+        let names: Vec<&str> = tbps.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["has_custom_location", "full_path", "path_or_empty"]);
     }
 
     #[test]
