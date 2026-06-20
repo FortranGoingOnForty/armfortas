@@ -6811,6 +6811,8 @@ pub(super) fn compute_filtered_names(
     globals: &HashMap<(String, String), ModuleGlobalInfo>,
     uses: &[crate::ast::decl::SpannedDecl],
     local_decls: &[crate::ast::decl::SpannedDecl],
+    st: &SymbolTable,
+    proc_scope_id: Option<crate::sema::symtab::ScopeId>,
 ) -> HashSet<String> {
     use crate::ast::decl::OnlyItem;
     let mut filtered: HashSet<String> = HashSet::new();
@@ -6827,6 +6829,23 @@ pub(super) fn compute_filtered_names(
                 visible_local_names.insert(entity.name.to_lowercase());
             }
         }
+    }
+
+    // Host association: a name declared in the host (module/program)
+    // scope or any enclosing scope is visible here via host association
+    // and must never be flagged as use-only-filtered. A module that
+    // declares its own `initial_size` parameter and also does `use
+    // other, only: x` (where `other` happens to export `initial_size`
+    // too) must resolve the reference to its own declaration, not error.
+    // Each scope's `symbols` are its own declarations; use-associated
+    // names live in a separate list, so this collects host decls only.
+    let mut scope_cursor = proc_scope_id;
+    while let Some(sid) = scope_cursor {
+        let scope = st.scope(sid);
+        for name in scope.symbols.keys() {
+            visible_local_names.insert(name.clone());
+        }
+        scope_cursor = scope.parent;
     }
 
     for decl in uses {
