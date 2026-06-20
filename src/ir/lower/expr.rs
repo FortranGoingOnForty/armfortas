@@ -3362,12 +3362,14 @@ pub(crate) fn lower_expr_full(
                 });
                 if let Some((base_addr, type_name)) = resolved {
                     if let Some(layout) = tl.get(&type_name) {
-                        if let Some(field) = layout.field(component) {
+                        if let Some(field) =
+                            layout_component_field_or_parent_view(layout, component, tl)
+                        {
                             let offset = b.const_i64(field.offset as i64);
                             let field_ptr =
                                 b.gep(base_addr, vec![offset], IrType::Int(IntWidth::I8));
 
-                            if is_deferred_char_component_field(field) {
+                            if is_deferred_char_component_field(&field) {
                                 let (ptr, _len) = load_string_descriptor_view(b, field_ptr);
                                 return ptr;
                             }

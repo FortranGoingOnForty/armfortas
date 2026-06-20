@@ -9710,6 +9710,51 @@ fn class_allocatable_intent_out_constructor_preserves_descriptor_storage() {
 }
 
 #[test]
+fn parent_component_actual_on_allocatable_extension_passes_object_storage() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=parent_component_actual_on_allocatable_extension_passes_object_storage count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type :: feature_t\n    character(:), allocatable :: name\n    character(:), allocatable :: description\n  end type\n  type, extends(feature_t) :: package_t\n    character(:), allocatable :: license\n  end type\ncontains\n  subroutine init_feature(self)\n    type(feature_t), intent(inout) :: self\n    call set_value(self%description)\n  end subroutine\n  subroutine set_value(val)\n    character(:), allocatable, intent(out) :: val\n    val = 'abc'\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(package_t), allocatable :: package\n  allocate(package)\n  call init_feature(package%feature_t)\n  if (.not. allocated(package%description)) error stop 1\n  if (package%description /= 'abc') error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("parent_component_allocatable_extension_actual", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("parent component actual compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "parent component actual should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("parent component actual run failed to spawn");
+    assert!(
+        run.status.success(),
+        "parent component actual should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected parent component actual output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn scalar_derived_constructor_result_actual_preserves_object_storage() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

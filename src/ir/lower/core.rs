@@ -13139,8 +13139,8 @@ fn component_field_call_type_info(
         _ => return None,
     };
     tl.get(&type_name)
-        .and_then(|layout| layout.field(component))
-        .map(|field| field.type_info.clone())
+        .and_then(|layout| layout_component_field_or_parent_view(layout, component, tl))
+        .map(|field| field.type_info)
 }
 
 fn resolve_bound_proc_by_semantics<'a>(
@@ -14348,8 +14348,10 @@ pub(super) fn operator_expr_type_info(
                     if let Some(type_name) = type_name {
                         if let Some(field_ti) = tl
                             .get(&type_name)
-                            .and_then(|layout| layout.field(component))
-                            .map(|field| field.type_info.clone())
+                            .and_then(|layout| {
+                                layout_component_field_or_parent_view(layout, component, tl)
+                            })
+                            .map(|field| field.type_info)
                         {
                             return Some(field_ti);
                         }
@@ -14830,8 +14832,8 @@ pub(super) fn generic_actual_expr_type_info(
                 _ => return None,
             };
             tl.get(&type_name)
-                .and_then(|layout| layout.field(component))
-                .map(|field| field.type_info.clone())
+                .and_then(|layout| layout_component_field_or_parent_view(layout, component, tl))
+                .map(|field| field.type_info)
         }
         Expr::FunctionCall { callee, args } => {
             // Enumeration constructor (R771): color(n) is a value of
@@ -31693,7 +31695,7 @@ pub(super) fn actual_is_descriptor_backed(
     };
     let Some(field) = tl
         .get(&type_name)
-        .and_then(|layout| layout.field(component))
+        .and_then(|layout| layout_component_field_or_parent_view(layout, component, tl))
     else {
         return false;
     };
@@ -31703,7 +31705,7 @@ pub(super) fn actual_is_descriptor_backed(
     // runtime descriptor, but an ordinary scalar dummy expects the component's
     // payload address; descriptor association for scalar allocatable dummies is
     // driven by the callee mask instead.
-    field_uses_array_descriptor(field)
+    field_uses_array_descriptor(&field)
 }
 
 const DESC_CHAR_SLOT_TABLE: i32 = 1 << 3;
@@ -44457,6 +44459,42 @@ pub(super) fn is_type_or_extends(
     }
 }
 
+pub(super) fn layout_component_field_or_parent_view(
+    layout: &crate::sema::type_layout::TypeLayout,
+    component: &str,
+    tl: &crate::sema::type_layout::TypeLayoutRegistry,
+) -> Option<crate::sema::type_layout::FieldLayout> {
+    if let Some(field) = layout.field(component) {
+        return Some(field.clone());
+    }
+
+    let mut parent = layout.parent.as_deref();
+    while let Some(parent_name) = parent {
+        let parent_layout = tl.get(parent_name)?;
+        if parent_name.eq_ignore_ascii_case(component)
+            || parent_layout.name.eq_ignore_ascii_case(component)
+        {
+            return Some(crate::sema::type_layout::FieldLayout {
+                name: parent_layout.name.clone(),
+                offset: 0,
+                size: parent_layout.size,
+                dims: vec![],
+                declared_array: false,
+                type_info: crate::sema::symtab::TypeInfo::Derived(parent_layout.name.clone()),
+                allocatable: false,
+                pointer: false,
+                target: false,
+                procedure_pointer: false,
+                procedure_pointer_nopass: false,
+                default_init: None,
+            });
+        }
+        parent = parent_layout.parent.as_deref();
+    }
+
+    None
+}
+
 /// Convert TypeInfo to IR type for field loads.
 /// Resolve a numeric inquiry intrinsic argument (HUGE/TINY/EPSILON/...) to
 /// the IR element type of the actual. Walks Name and ComponentAccess only —
@@ -45292,12 +45330,12 @@ pub(super) fn resolve_component_base(
             // Recursive: resolve the inner base first.
             let (inner_addr, inner_type) = resolve_component_base(b, locals, inner_base, st, tl)?;
             let layout = tl.get(&inner_type)?;
-            let field = layout.field(component)?;
+            let field = layout_component_field_or_parent_view(layout, component, tl)?;
             let offset = b.const_i64(field.offset as i64);
             let field_ptr = b.gep(inner_addr, vec![offset], IrType::Int(IntWidth::I8));
             // The field must be a concrete typed derived/class component for
             // chaining to continue.
-            if let Some(nested_type) = field_derived_type_name(field) {
+            if let Some(nested_type) = field_derived_type_name(&field) {
                 let addr = if field.pointer {
                     // Scalar derived POINTER components store an address slot,
                     // while descriptor-backed POINTER components store the
@@ -45378,7 +45416,7 @@ pub(super) fn resolve_component_field_access(
     let layout_name =
         canonical_layout_type_name_for_scope(st, scope_id, &type_name, tl).unwrap_or(type_name);
     let layout = tl.get(&layout_name)?;
-    let field = layout.field(component)?.clone();
+    let field = layout_component_field_or_parent_view(layout, component, tl)?;
     let offset = b.const_i64(field.offset as i64);
     let field_ptr = b.gep(base_addr, vec![offset], IrType::Int(IntWidth::I8));
     Some((field_ptr, field))
@@ -47871,7 +47909,7 @@ pub(super) fn resolve_component_base_for_method(
             let (inner_addr, inner_type) =
                 resolve_component_base_for_method(b, locals, inner_base, st, tl)?;
             let layout = tl.get(&inner_type)?;
-            let field = layout.field(component)?;
+            let field = layout_component_field_or_parent_view(layout, component, tl)?;
             let offset = b.const_i64(field.offset as i64);
             let field_ptr = b.gep(inner_addr, vec![offset], IrType::Int(IntWidth::I8));
             if let crate::sema::symtab::TypeInfo::Derived(ref nested_type) = field.type_info {
