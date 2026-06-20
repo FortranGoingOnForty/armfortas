@@ -41182,11 +41182,15 @@ pub(super) fn lower_array_assign(
                 let mut assign_src_desc = src_desc;
                 let tmp_src_desc = if !dest_name.is_empty() && expr_mentions_name(value, dest_name)
                 {
-                    let tmp_desc = allocate_like_array_temp_descriptor_with_elem_type(
-                        b,
-                        src_desc,
-                        &src_elem_ty,
-                    );
+                    let tmp_desc = if descriptor_backed_runtime_char_array(dest_info) {
+                        allocate_like_array_temp_descriptor(b, src_desc)
+                    } else {
+                        allocate_like_array_temp_descriptor_with_elem_type(
+                            b,
+                            src_desc,
+                            &src_elem_ty,
+                        )
+                    };
                     let stat = b.alloca(IrType::Int(IntWidth::I32));
                     let zero32 = b.const_i32(0);
                     b.store(zero32, stat);

@@ -43808,6 +43808,43 @@ fn module_subroutine_shadows_split_intrinsic_subroutine() {
 }
 
 #[test]
+fn allocatable_character_array_self_section_assignment_preserves_values() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_character_array_self_section_assignment_preserves_values count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  call check_key('flag::')\n  call check_key('c-flag::')\n  call check_key('link-flag::')\n  print *, 'ok'\ncontains\n  subroutine check_key(key)\n    character(len=*), intent(in) :: key\n    character(len=:), allocatable :: parts(:)\n    integer :: n\n    call split_colon(key, parts)\n    n = size(parts)\n    if (parts(n) == '') parts = parts(:n - 1)\n    if (size(parts) /= 2) error stop 1\n    if (len(parts) /= len(key)) error stop 2\n    if (trim(parts(1)) /= key(:index(key, ':') - 1)) error stop 3\n    if (parts(2) /= '') error stop 4\n  end subroutine\n\n  subroutine split_colon(input, parts)\n    character(len=*), intent(in) :: input\n    character(len=:), allocatable, intent(out) :: parts(:)\n    integer :: i\n    integer :: count\n    integer :: start\n    integer :: width\n    count = 1\n    do i = 1, len(input)\n      if (input(i:i) == ':') count = count + 1\n    end do\n    width = len(input)\n    allocate(character(len=width) :: parts(count))\n    parts = ''\n    start = 1\n    count = 1\n    do i = 1, len(input)\n      if (input(i:i) == ':') then\n        if (i > start) parts(count) = input(start:i - 1)\n        count = count + 1\n        start = i + 1\n      end if\n    end do\n    if (start <= len(input)) parts(count) = input(start:)\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("alloc_char_array_self_section", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("allocatable char array self-section compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "allocatable char array self-section compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("allocatable char array self-section run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "allocatable char array self-section run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn generic_subroutine_matches_use_renamed_class_actual() {
     let src = write_program(
         "module value_m\n  implicit none\n  type :: toml_value\n    character(:), allocatable :: message\n  end type\nend module\nmodule parser_m\n  use value_m, only: toml_value\n  implicit none\n  interface json_load\n    module procedure json_load_file\n    module procedure json_load_unit\n  end interface\ncontains\n  subroutine json_load_file(object, filename, error)\n    class(toml_value), allocatable, intent(out) :: object\n    character(*), intent(in) :: filename\n    integer, intent(out), optional :: error\n    if (present(error)) error = len_trim(filename)\n  end subroutine\n  subroutine json_load_unit(object, io, error)\n    class(toml_value), allocatable, intent(out) :: object\n    integer, intent(in) :: io\n    integer, intent(out), optional :: error\n    if (present(error)) error = io\n  end subroutine\nend module\nmodule facade_m\n  use value_m, only: json_value => toml_value\n  use parser_m, only: json_load\n  implicit none\nend module\nmodule user_m\n  use facade_m, only: json_value, json_load\n  implicit none\ncontains\n  subroutine run(path)\n    character(*), intent(in) :: path\n    type(json_value), allocatable :: holder\n    class(json_value), allocatable :: value\n    integer :: err\n    allocate(holder)\n    holder%message = path\n    call json_load(value, holder%message, error=err)\n  end subroutine\nend module\nprogram p\n  use user_m, only: run\n  call run('pkg.json')\nend program\n",
