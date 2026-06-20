@@ -297,6 +297,66 @@ pub(super) fn lower_call_arg_maybe_conditional(
     }
 }
 
+/// True if an output-list expression contains a procedure call (a real
+/// function/subroutine or type-bound call), as opposed to array-element
+/// or substring access (a `name(...)` whose `name` is a local data
+/// object). Used to keep PRINT on the stateless list-directed path when
+/// an item's evaluation might perform nested I/O that would clobber the
+/// global formatter state.
+fn print_item_contains_proc_call(
+    expr: &crate::ast::expr::SpannedExpr,
+    locals: &HashMap<String, LocalInfo>,
+) -> bool {
+    use crate::ast::expr::SectionSubscript;
+    fn sub_has_call(s: &SectionSubscript, locals: &HashMap<String, LocalInfo>) -> bool {
+        match s {
+            SectionSubscript::Element(e) => print_item_contains_proc_call(e, locals),
+            SectionSubscript::Range { start, end, stride } => {
+                [start, end, stride]
+                    .iter()
+                    .filter_map(|o| o.as_ref())
+                    .any(|e| print_item_contains_proc_call(e, locals))
+            }
+        }
+    }
+    match &expr.node {
+        Expr::FunctionCall { callee, args } => {
+            // `name(...)` where name is a local data object is an
+            // array-element or substring reference, not a call. Anything
+            // else (a real procedure name, or a type-bound `x%f()`) is.
+            let is_data_ref = matches!(
+                &callee.node,
+                Expr::Name { name } if locals.contains_key(&name.to_lowercase())
+            );
+            if !is_data_ref {
+                return true;
+            }
+            args.iter().any(|a| sub_has_call(&a.value, locals))
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            print_item_contains_proc_call(left, locals)
+                || print_item_contains_proc_call(right, locals)
+        }
+        Expr::UnaryOp { operand, .. } => print_item_contains_proc_call(operand, locals),
+        Expr::ParenExpr { inner } => print_item_contains_proc_call(inner, locals),
+        Expr::ConditionalExpr {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            print_item_contains_proc_call(cond, locals)
+                || print_item_contains_proc_call(then_val, locals)
+                || print_item_contains_proc_call(else_val, locals)
+        }
+        Expr::ComponentAccess { base, .. } => print_item_contains_proc_call(base, locals),
+        Expr::ComplexLiteral { real, imag } => {
+            print_item_contains_proc_call(real, locals)
+                || print_item_contains_proc_call(imag, locals)
+        }
+        _ => false,
+    }
+}
+
 /// Lower `target = (cond ? then_val : else_val)` for an array-valued
 /// conditional by branching on the condition and reusing the ordinary
 /// assignment lowering on each arm. F2023 short-circuit holds: exactly one
@@ -2090,10 +2150,57 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             }
         }
 
-        Stmt::Print { items, .. } => {
-            // PRINT * → unit 6 (stdout).
+        Stmt::Print { format, items } => {
+            // PRINT writes to unit 6 (stdout). `PRINT *` is list-directed;
+            // `PRINT fmt` with a character format string routes through the
+            // same push-based formatted machinery WRITE uses. Numeric FORMAT
+            // labels aren't resolved yet (WRITE has the same gap), so any
+            // non-character format stays on the list-directed path rather
+            // than being lowered as a garbage string pointer.
             let unit = b.const_i32(6);
-            lower_write_items(b, ctx, items, unit);
+            // The push-based formatted runtime keeps the format-parse state
+            // in a single global formatter across begin→push→end. If an
+            // output item's evaluation performs nested I/O (e.g. a function
+            // that does an internal `write(str,...)`), that nested op
+            // clobbers the outer state and the record comes out empty. The
+            // list-directed path (afs_write_string, stateless per call) is
+            // immune, so fall back to it when any item contains a procedure
+            // call. (WRITE shares the underlying gap; the real fix is a
+            // re-entrant format engine — tracked in noted_items.)
+            let items_have_proc_call = items
+                .iter()
+                .any(|it| print_item_contains_proc_call(it, &ctx.locals));
+            let is_formatted = !matches!(&format.node, Expr::Name { name } if name == "*")
+                && crate::sema::types::expr_type(format, ctx.st).is_character()
+                && !items_have_proc_call;
+            if is_formatted {
+                let null_i64 = b.const_i64(0);
+                let null_i8_ptr = b.int_to_ptr(null_i64, IrType::Int(IntWidth::I8));
+                let zero_i64 = b.const_i64(0);
+                let (fmt_ptr, fmt_len) = lower_string_expr_with_layouts(
+                    b,
+                    &ctx.locals,
+                    format,
+                    ctx.st,
+                    Some(ctx.type_layouts),
+                );
+                b.call(
+                    FuncRef::External("afs_fmt_begin_ex".into()),
+                    vec![unit, fmt_ptr, fmt_len, null_i8_ptr, null_i8_ptr, zero_i64],
+                    IrType::Void,
+                );
+                for item in items {
+                    lower_fmt_push(b, ctx, item);
+                }
+                let adv = b.const_i32(1);
+                b.call(
+                    FuncRef::External("afs_fmt_end".into()),
+                    vec![adv],
+                    IrType::Void,
+                );
+            } else {
+                lower_write_items(b, ctx, items, unit);
+            }
         }
 
         Stmt::Write { controls, items } => {

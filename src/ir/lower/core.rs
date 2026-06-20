@@ -3820,6 +3820,19 @@ pub(super) fn collect_module_globals(
                         ty: desc_ty,
                         initializer: Some(GlobalInit::Zero),
                     });
+                    // A deferred-length character ARRAY carries its element
+                    // length in the descriptor's elem_size at runtime, just
+                    // like a local `character(len=:), allocatable :: x(:)`
+                    // (which records CharKind::None, not Deferred). Deferred
+                    // here would route the ALLOCATE statement through the
+                    // 32-byte scalar-string path that only handles rank-0
+                    // deferred scalars, so a module array allocated only one
+                    // element's worth of bytes and read its descriptor as a
+                    // string (fpm/M_CLI2 keywords).
+                    let array_char_kind = match &global_char_kind {
+                        CharKind::Deferred => CharKind::None,
+                        other => other.clone(),
+                    };
                     globals.insert(
                         (mod_name.to_lowercase(), entity.name.to_lowercase()),
                         ModuleGlobalInfo {
@@ -3830,7 +3843,7 @@ pub(super) fn collect_module_globals(
                             is_pointer,
                             deferred_char: false,
                             derived_type: derived_type_name.clone(),
-                            char_kind: global_char_kind.clone(),
+                            char_kind: array_char_kind,
                             const_value: None,
                             external: false,
                             private: false,
@@ -6798,6 +6811,8 @@ pub(super) fn compute_filtered_names(
     globals: &HashMap<(String, String), ModuleGlobalInfo>,
     uses: &[crate::ast::decl::SpannedDecl],
     local_decls: &[crate::ast::decl::SpannedDecl],
+    st: &SymbolTable,
+    proc_scope_id: Option<crate::sema::symtab::ScopeId>,
 ) -> HashSet<String> {
     use crate::ast::decl::OnlyItem;
     let mut filtered: HashSet<String> = HashSet::new();
@@ -6814,6 +6829,23 @@ pub(super) fn compute_filtered_names(
                 visible_local_names.insert(entity.name.to_lowercase());
             }
         }
+    }
+
+    // Host association: a name declared in the host (module/program)
+    // scope or any enclosing scope is visible here via host association
+    // and must never be flagged as use-only-filtered. A module that
+    // declares its own `initial_size` parameter and also does `use
+    // other, only: x` (where `other` happens to export `initial_size`
+    // too) must resolve the reference to its own declaration, not error.
+    // Each scope's `symbols` are its own declarations; use-associated
+    // names live in a separate list, so this collects host decls only.
+    let mut scope_cursor = proc_scope_id;
+    while let Some(sid) = scope_cursor {
+        let scope = st.scope(sid);
+        for name in scope.symbols.keys() {
+            visible_local_names.insert(name.clone());
+        }
+        scope_cursor = scope.parent;
     }
 
     for decl in uses {
@@ -6910,10 +6942,24 @@ pub(super) fn install_one_global(
     locals: &mut HashMap<String, LocalInfo>,
     local_key: String,
     info: &ModuleGlobalInfo,
+    // Declared rank of the module symbol (from its array_spec). A
+    // deferred-shape allocatable/pointer array carries no fixed bounds in
+    // `info.dims`, so without this the installed LocalInfo reads as rank 0
+    // and a module array is mis-classified as a scalar — generic dispatch
+    // then can't match it to an array dummy (fpm/M_CLI2 `insert`).
+    rank: usize,
 ) {
     if locals.contains_key(&local_key) {
         return;
     }
+    // Rank known, bounds unknown until allocation: encode rank with None
+    // upper bounds (the same shape the decl/allocate paths use). Fixed
+    // arrays already carry their rank in `info.dims`.
+    let runtime_dim_upper = if info.dims.is_empty() && rank > 0 {
+        vec![None; rank]
+    } else {
+        vec![]
+    };
     let addr_ty = if info.allocatable {
         IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384)
     } else if info.deferred_char {
@@ -6937,7 +6983,7 @@ pub(super) fn install_one_global(
             derived_type: info.derived_type.clone(),
             inline_const: None,
             is_pointer: info.is_pointer,
-            runtime_dim_upper: vec![],
+            runtime_dim_upper,
             is_class: false,
             logical_kind: None,
             last_dim_assumed_size: false,
@@ -7314,7 +7360,16 @@ pub(super) fn install_globals_as_locals_in(
             }
             installed_from.insert(local_key.clone(), resolved_mod);
             if !install_global_inline_const(b, locals, local_key.clone(), info) {
-                install_one_global(b, locals, local_key, info);
+                // Recover the declared rank from the module symbol — a
+                // deferred-shape allocatable/pointer array has no bounds in
+                // `info.dims`, so the installed LocalInfo would otherwise be
+                // rank 0 (mis-read as a scalar by generic dispatch).
+                let rank = st
+                    .find_module_scope(&resolved_global_key.0)
+                    .and_then(|sid| st.lookup_in(sid, &resolved_global_key.1))
+                    .map(|sym| sym.attrs.array_spec.len())
+                    .unwrap_or(0);
+                install_one_global(b, locals, local_key, info, rank);
             }
         } else {
             // Not an IR global — check if it's an intrinsic module parameter constant
@@ -12088,11 +12143,17 @@ fn resolve_generic_call_by_semantics_impl(
         .iter()
         .map(|arg| match &arg.value {
             crate::ast::expr::SectionSubscript::Element(expr) => {
-                if let Some(locals) = locals {
+                let ti = if let Some(locals) = locals {
                     generic_actual_expr_type_info(expr, locals, st, type_layouts)
                 } else {
                     operator_expr_type_info(expr, None, st, type_layouts)
-                }
+                };
+                // Resolve a renamed derived type to its canonical name so
+                // it matches a specific's formal declared with the original
+                // name. jonquil does `use tomlf, only: json_value =>
+                // toml_value`, so a `class(json_value)` actual must match a
+                // `class(toml_value)` formal (json_load).
+                ti.map(|ti| canonicalize_type_info_type_name(ti, st, type_layouts))
             }
             _ => None,
         })
@@ -12202,11 +12263,17 @@ fn resolve_generic_call_actuals_from_specifics(
         .iter()
         .map(|arg| match &arg.value {
             crate::ast::expr::SectionSubscript::Element(expr) => {
-                if let Some(locals) = locals {
+                let ti = if let Some(locals) = locals {
                     generic_actual_expr_type_info(expr, locals, st, type_layouts)
                 } else {
                     operator_expr_type_info(expr, None, st, type_layouts)
-                }
+                };
+                // Resolve a renamed derived type to its canonical name so
+                // it matches a specific's formal declared with the original
+                // name. jonquil does `use tomlf, only: json_value =>
+                // toml_value`, so a `class(json_value)` actual must match a
+                // `class(toml_value)` formal (json_load).
+                ti.map(|ti| canonicalize_type_info_type_name(ti, st, type_layouts))
             }
             _ => None,
         })
@@ -16609,7 +16676,18 @@ pub(super) fn resolve_subroutine_call_name(
     if let Some(scope_id) = caller_scope_id {
         if let Some(sym) = st.lookup_in(scope_id, key) {
             if scope_is_host_associated_or_self(st, scope_id, sym.scope) {
-                if let Some(specifics) = named_interface_specific_candidates_from_symbol(sym) {
+                // Gather the FULL specific set, not just this symbol's own
+                // arg_names. When a module extends a generic it imports
+                // (`use m, only: g` plus a local `interface g`), the merged
+                // symbol records only its local specifics plus the first
+                // re-exported one; the rest live on the use-associated
+                // interfaces. named_interface_specific_candidates walks
+                // those too, so use it (falling back to the symbol-only set)
+                // — otherwise an in-module call could not reach a specific
+                // re-exported through a chain (fpm/tomlf get_value).
+                if let Some(specifics) = named_interface_specific_candidates(st, key)
+                    .or_else(|| named_interface_specific_candidates_from_symbol(sym))
+                {
                     match resolve_generic_call_actuals_from_specifics(
                         st,
                         b,
@@ -18089,6 +18167,31 @@ pub(super) fn abstract_layout_base_type(
             Some(base_type.clone())
         }
         _ => None,
+    }
+}
+
+/// Rewrite a Derived/Class TypeInfo's name to its canonical layout name,
+/// resolving USE renames (`json_value => toml_value`) so generic dispatch
+/// compares the underlying type, not the local alias. Other type kinds
+/// pass through unchanged.
+pub(super) fn canonicalize_type_info_type_name(
+    ti: crate::sema::symtab::TypeInfo,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> crate::sema::symtab::TypeInfo {
+    use crate::sema::symtab::TypeInfo;
+    let Some(tl) = type_layouts else {
+        return ti;
+    };
+    let scope = current_proc_scope();
+    match ti {
+        TypeInfo::Derived(name) => TypeInfo::Derived(
+            canonical_layout_type_name_for_scope(st, scope, &name, tl).unwrap_or(name),
+        ),
+        TypeInfo::Class(name) => TypeInfo::Class(
+            canonical_layout_type_name_for_scope(st, scope, &name, tl).unwrap_or(name),
+        ),
+        other => other,
     }
 }
 
@@ -35293,7 +35396,11 @@ pub(super) fn is_elemental_math_intrinsic(name: &str) -> bool {
         // wired in lower_intrinsic; flagging them here lets reductions
         // like `sum(len_trim(strs))` materialize the per-element
         // result array via `lower_rank1_elemental_call_descriptor`.
-        | "len" | "len_trim" | "index" | "scan" | "verify"
+        // LEN is excluded: it is an inquiry function (§16.9.108), not
+        // elemental — LEN(array) is the scalar element length, so it
+        // must not expand element-wise (printed `5 5 5` for a rank-1
+        // deferred-length char array instead of the scalar 5).
+        | "len_trim" | "index" | "scan" | "verify"
         | "adjustl" | "adjustr" | "lge" | "lgt" | "lle" | "llt"
         // F2018 §16.9 bit-manipulation elementals.
         | "popcnt" | "popcount" | "poppar" | "leadz" | "trailz"
@@ -43740,19 +43847,30 @@ pub(super) fn resolve_component_base(
         Expr::Name { name } => {
             let key = name.to_lowercase();
             let info = locals.get(&key)?;
-            let type_name = info.derived_type.clone().or_else(|| {
-                let type_info = operator_expr_type_info(base, Some(locals), st, Some(tl))?;
-                let raw_name = match type_info {
-                    crate::sema::symtab::TypeInfo::Derived(name)
-                    | crate::sema::symtab::TypeInfo::Class(name) => name,
-                    _ => return None,
-                };
-                let scope_id = callee_scope_id_for_lookup(st, b.func().name.as_str());
-                Some(
-                    canonical_layout_type_name_for_scope(st, scope_id, &raw_name, tl)
-                        .unwrap_or(raw_name),
-                )
-            })?;
+            // Canonicalize a USE-renamed derived type to its underlying
+            // layout name. A `type(json_error)` local (jonquil renames
+            // `json_error => toml_error`) records the alias in
+            // info.derived_type, so without this the layout lookup misses
+            // every field (`j_error%message` -> "no field").
+            let scope_id = callee_scope_id_for_lookup(st, b.func().name.as_str());
+            let type_name = info
+                .derived_type
+                .clone()
+                .map(|raw| {
+                    canonical_layout_type_name_for_scope(st, scope_id, &raw, tl).unwrap_or(raw)
+                })
+                .or_else(|| {
+                    let type_info = operator_expr_type_info(base, Some(locals), st, Some(tl))?;
+                    let raw_name = match type_info {
+                        crate::sema::symtab::TypeInfo::Derived(name)
+                        | crate::sema::symtab::TypeInfo::Class(name) => name,
+                        _ => return None,
+                    };
+                    Some(
+                        canonical_layout_type_name_for_scope(st, scope_id, &raw_name, tl)
+                            .unwrap_or(raw_name),
+                    )
+                })?;
             // For a derived-type POINTER, info.addr is a pointer slot
             // whose contents are the associated struct's address.
             // Pointer dummies passed by reference add one more layer:
@@ -44174,6 +44292,17 @@ pub(super) fn expr_is_callable_character_callee(
     match &expr.node {
         Expr::Name { name } => {
             let key = name.to_lowercase();
+            // A local data object shadows any same-named procedure (a
+            // generic interface, module procedure, etc.) brought in by
+            // host/use association. `new(:n)` where `new` is a local
+            // `character(len=*)` dummy is a substring, not a call to an
+            // unrelated generic `new` — without this guard the named-
+            // interface check below claimed it was callable and the
+            // substring path was skipped (fpm/M_strings substitute). Only
+            // a genuine procedure-pointer local stays callable.
+            if locals.contains_key(&key) && procedure_pointer_signature_key(st, &key).is_none() {
+                return false;
+            }
             if !(locals.contains_key(&key) && procedure_pointer_signature_key(st, &key).is_none())
                 && callee_character_return_abi(st, &key).is_some()
             {
