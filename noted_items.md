@@ -437,10 +437,27 @@ Found during l04 (2026-06-12):
        canonicalized in generic dispatch (`json_load`).
     9. same rename not canonicalized in component access
        (`j_error%message` → "no field", then broken MOVE_ALLOC).
-  OPEN (resume): bug 10 — `global_settings%full_path()`, a plain
-  (non-generic) type-bound FUNCTION on `fpm_global_settings`, fails with
-  "no specific type-bound procedure ... candidates: []". A TBP
-  resolution facet, distinct from generic dispatch.
+   10. comma-separated type-bound binding (`procedure :: a, b, c`,
+       F2018 R448) bound only the first name — `global_settings%full_path()`
+       failed with "no specific type-bound procedure ... candidates: []".
+       parse_type_bound_proc now parses the full decl-list. FIXED on branch
+       fpm-bringup-2 (test_programs/x12_comma_list_type_bound_procs.f90 +
+       parser unit test); not yet PR'd.
+  OPEN (resume): bug 11 — generic `set_string` call
+  `set_string(table, "requested_version", self%requested_version%s(),
+  error, 'dependency_config_t')` (fpm_dependency dump_to_toml) matches no
+  candidate [set_character, set_string_type]. ROOT (via AFS_DBG_GEN debug
+  in resolve_generic_call_actuals_from_specifics):
+  generic_actual_expr_type_info infers the 3rd actual
+  `self%requested_version%s()` as Integer{None} instead of Character. It's
+  a TBP function call (FunctionCall with a ComponentAccess callee) that
+  falls through to operator_expr_type_info; that returns Character in every
+  isolated repro (~/afs-scratch/buge/tbpret*.f90) but Integer in the full
+  fpm type environment. version_t%s() returns character(len=:),allocatable;
+  requested_version is type(version_t),allocatable (other unrelated CHARACTER
+  `requested_version` vars exist — possible scope/layout mis-resolution).
+  Next: instrument operator_expr_type_info's component-access-callee
+  (TBP-call) return-type path.
   DEFERRED rename facets (not yet hit by fpm): component-WRITE
   (`jv%x = 5`) and direct-call argument passing of a renamed-type actual
   still mis-resolve; the robust fix is to canonicalize a local's
@@ -449,3 +466,18 @@ Found during l04 (2026-06-12):
   DEFERRED: numbered FORMAT labels (`write(*,100)` / `print 100,`)
   produce no/list-directed output; unsupported everywhere, zero
   test_programs use them.
+
+- **SUSPECTED arm64 -O2+ default-init component read returns 0 (x12,
+  2026-06-21)**: the first form of test_programs/x12_comma_list_type_bound_procs.f90
+  had `integer :: n = 3` default-init and `has_loc(self) = self%n > 0`,
+  called as `s%has_loc()` on a `type(settings), intent(inout) :: s` dummy
+  whose actual was a default-initialized local. On macOS arm64 at -O2,
+  -O3, -Ofast, -Os the read returned 0 (printed `hl=F`); -O0/-O1 and all
+  x86 opt levels returned 3 (`hl=T`). Pre-existing — the comma-list TBP
+  parser fix doesn't touch codegen/init; the fixture merely exposed it.
+  Reworked the fixture to not read the component (returns a constant) so
+  the macOS gate passes. Needs an arm64 reduction (nomad): minimal
+  `type(t){integer::n=3}` local passed intent(inout) to a sub that reads
+  `x%n` at -O2. Likely default-init of a derived local elided or the
+  intent(inout) copy losing the initializer at O2 on arm64. Owner:
+  arm64 opt / default-init.
