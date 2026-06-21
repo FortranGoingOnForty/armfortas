@@ -2589,6 +2589,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     let pointer_mask = first_procedure_lookup(&abi_lookup_keys, |k| {
                         callee_pointer_arg_mask(ctx.st, k)
                     });
+                    let allocatable_mask = first_procedure_lookup(&abi_lookup_keys, |k| {
+                        callee_allocatable_arg_mask(ctx.st, k)
+                    });
                     let class_mask = first_procedure_lookup(&abi_lookup_keys, |k| {
                         callee_class_arg_mask(ctx.st, k)
                     });
@@ -2646,6 +2649,10 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             .map(|mask| mask.get(i).copied().unwrap_or(false))
                             .unwrap_or(false);
                         let wants_pointer = pointer_mask
+                            .as_ref()
+                            .map(|mask| mask.get(i).copied().unwrap_or(false))
+                            .unwrap_or(false);
+                        let dummy_is_allocatable = allocatable_mask
                             .as_ref()
                             .map(|mask| mask.get(i).copied().unwrap_or(false))
                             .unwrap_or(false);
@@ -2778,7 +2785,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         is_optional && !is_value,
                                         value,
                                     );
-                                    optional_arg_absent_if_unallocated_allocatable_char(
+                                    optional_arg_absent_if_unallocated_allocatable(
                                         b,
                                         &ctx.locals,
                                         e,
@@ -2786,8 +2793,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         Some(ctx.type_layouts),
                                         is_optional
                                             && !is_value
-                                            && !wants_descriptor
-                                            && !wants_string_descriptor
+                                            && !dummy_is_allocatable
                                             && !wants_bind_c_char
                                             && !wants_pointer,
                                         value,
@@ -2963,6 +2969,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     let pointer_mask = first_procedure_lookup(&abi_lookup_keys, |k| {
                         callee_pointer_arg_mask(ctx.st, k)
                     });
+                    let allocatable_mask = first_procedure_lookup(&abi_lookup_keys, |k| {
+                        callee_allocatable_arg_mask(ctx.st, k)
+                    });
                     let class_mask = first_procedure_lookup(&abi_lookup_keys, |k| {
                         callee_class_arg_mask(ctx.st, k)
                     });
@@ -2993,6 +3002,10 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             .map(|mask| mask.get(i).copied().unwrap_or(false))
                             .unwrap_or(false);
                         let wants_pointer = pointer_mask
+                            .as_ref()
+                            .map(|mask| mask.get(i).copied().unwrap_or(false))
+                            .unwrap_or(false);
+                        let dummy_is_allocatable = allocatable_mask
                             .as_ref()
                             .map(|mask| mask.get(i).copied().unwrap_or(false))
                             .unwrap_or(false);
@@ -3155,7 +3168,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         is_optional && !is_value,
                                         value,
                                     );
-                                    optional_arg_absent_if_unallocated_allocatable_char(
+                                    optional_arg_absent_if_unallocated_allocatable(
                                         b,
                                         &ctx.locals,
                                         e,
@@ -3163,8 +3176,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         Some(ctx.type_layouts),
                                         is_optional
                                             && !is_value
-                                            && !wants_descriptor
-                                            && !wants_string_descriptor
+                                            && !dummy_is_allocatable
                                             && !wants_bind_c_char
                                             && !wants_pointer,
                                         value,

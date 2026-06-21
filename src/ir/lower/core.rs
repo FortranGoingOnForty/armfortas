@@ -17667,6 +17667,8 @@ pub(super) fn emit_named_function_call(
         first_procedure_lookup(&abi_lookup_keys, |k| callee_bind_c_char_arg_mask(st, k));
     let callee_pointer_args =
         first_procedure_lookup(&abi_lookup_keys, |k| callee_pointer_arg_mask(st, k));
+    let callee_allocatable_args =
+        first_procedure_lookup(&abi_lookup_keys, |k| callee_allocatable_arg_mask(st, k));
     let callee_class_args =
         first_procedure_lookup(&abi_lookup_keys, |k| callee_class_arg_mask(st, k));
     let opt_flags = first_procedure_lookup(&abi_lookup_keys, |k| callee_optional_arg_mask(st, k));
@@ -17701,6 +17703,10 @@ pub(super) fn emit_named_function_call(
                 .unwrap_or(false);
         let wants_string_descriptor = wants_string_descriptor && !wants_bind_c_char;
         let wants_pointer = callee_pointer_args
+            .as_ref()
+            .map(|mask| i < mask.len() && mask[i])
+            .unwrap_or(false);
+        let dummy_is_allocatable = callee_allocatable_args
             .as_ref()
             .map(|mask| i < mask.len() && mask[i])
             .unwrap_or(false);
@@ -17872,7 +17878,7 @@ pub(super) fn emit_named_function_call(
                     is_optional && !is_value,
                     value,
                 );
-                optional_arg_absent_if_unallocated_allocatable_char(
+                optional_arg_absent_if_unallocated_allocatable(
                     b,
                     locals,
                     e,
@@ -17880,8 +17886,7 @@ pub(super) fn emit_named_function_call(
                     type_layouts,
                     is_optional
                         && !is_value
-                        && !wants_descriptor
-                        && !wants_string_descriptor
+                        && !dummy_is_allocatable
                         && !wants_bind_c_char
                         && !wants_pointer,
                     value,
@@ -18078,6 +18083,8 @@ pub(super) fn emit_resolved_bound_proc_call(
         first_procedure_lookup(&abi_lookup_keys, |k| callee_pointer_arg_mask(st, k));
     let callee_class_args =
         first_procedure_lookup(&abi_lookup_keys, |k| callee_class_arg_mask(st, k));
+    let callee_allocatable_args =
+        first_procedure_lookup(&abi_lookup_keys, |k| callee_allocatable_arg_mask(st, k));
     let opt_flags = first_procedure_lookup(&abi_lookup_keys, |k| {
         optional_params
             .and_then(|m| cached_param_mask_for_lookup(st, m, k))
@@ -18140,6 +18147,10 @@ pub(super) fn emit_resolved_bound_proc_call(
                 .unwrap_or(false);
         let wants_string_descriptor = wants_string_descriptor && !wants_bind_c_char;
         let wants_pointer = callee_pointer_args
+            .as_ref()
+            .map(|mask| mask.get(i).copied().unwrap_or(false))
+            .unwrap_or(false);
+        let dummy_is_allocatable = callee_allocatable_args
             .as_ref()
             .map(|mask| mask.get(i).copied().unwrap_or(false))
             .unwrap_or(false);
@@ -18262,7 +18273,7 @@ pub(super) fn emit_resolved_bound_proc_call(
                         is_optional && !is_value,
                         value,
                     );
-                    optional_arg_absent_if_unallocated_allocatable_char(
+                    optional_arg_absent_if_unallocated_allocatable(
                         b,
                         locals,
                         e,
@@ -18270,8 +18281,7 @@ pub(super) fn emit_resolved_bound_proc_call(
                         type_layouts,
                         is_optional
                             && !is_value
-                            && !wants_descriptor
-                            && !wants_string_descriptor
+                            && !dummy_is_allocatable
                             && !wants_bind_c_char
                             && !wants_pointer,
                         value,
@@ -18771,6 +18781,8 @@ pub(super) fn lower_alloc_return_call_into_desc(
         first_procedure_lookup(&abi_lookup_keys, |k| callee_bind_c_char_arg_mask(ctx.st, k));
     let callee_pointer_args =
         first_procedure_lookup(&abi_lookup_keys, |k| callee_pointer_arg_mask(ctx.st, k));
+    let callee_allocatable_args =
+        first_procedure_lookup(&abi_lookup_keys, |k| callee_allocatable_arg_mask(ctx.st, k));
     let callee_class_args =
         first_procedure_lookup(&abi_lookup_keys, |k| callee_class_arg_mask(ctx.st, k));
     let opt_flags =
@@ -18802,6 +18814,10 @@ pub(super) fn lower_alloc_return_call_into_desc(
                 .unwrap_or(false);
         let wants_string_descriptor = wants_string_descriptor && !wants_bind_c_char;
         let wants_pointer = callee_pointer_args
+            .as_ref()
+            .map(|mask| i < mask.len() && mask[i])
+            .unwrap_or(false);
+        let dummy_is_allocatable = callee_allocatable_args
             .as_ref()
             .map(|mask| i < mask.len() && mask[i])
             .unwrap_or(false);
@@ -18899,7 +18915,7 @@ pub(super) fn lower_alloc_return_call_into_desc(
                     is_optional && !is_value,
                     value,
                 );
-                optional_arg_absent_if_unallocated_allocatable_char(
+                optional_arg_absent_if_unallocated_allocatable(
                     b,
                     &ctx.locals,
                     e,
@@ -18907,8 +18923,7 @@ pub(super) fn lower_alloc_return_call_into_desc(
                     Some(ctx.type_layouts),
                     is_optional
                         && !is_value
-                        && !wants_descriptor
-                        && !wants_string_descriptor
+                        && !dummy_is_allocatable
                         && !wants_bind_c_char
                         && !wants_pointer,
                     value,
@@ -21450,6 +21465,25 @@ pub(super) fn callee_pointer_arg_mask(st: &SymbolTable, callee_name: &str) -> Op
                 .symbols
                 .get(arg_name)
                 .map(|sym| sym.attrs.pointer)
+                .unwrap_or(false)
+        })
+        .collect();
+    Some(mask)
+}
+
+pub(super) fn callee_allocatable_arg_mask(
+    st: &SymbolTable,
+    callee_name: &str,
+) -> Option<Vec<bool>> {
+    let callee_scope = callee_scope_for_lookup(st, callee_name)?;
+    let mask: Vec<bool> = callee_scope
+        .arg_order
+        .iter()
+        .map(|arg_name| {
+            callee_scope
+                .symbols
+                .get(arg_name)
+                .map(|sym| sym.attrs.allocatable)
                 .unwrap_or(false)
         })
         .collect();
@@ -45650,6 +45684,41 @@ fn allocatable_deferred_char_actual_descriptor(
     }
 }
 
+fn allocatable_array_actual_descriptor(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> Option<ValueId> {
+    match &expr.node {
+        Expr::ParenExpr { inner } => {
+            allocatable_array_actual_descriptor(b, locals, inner, st, type_layouts)
+        }
+        Expr::Name { name } => {
+            let info = locals.get(&name.to_lowercase())?;
+            if info.allocatable
+                && local_uses_array_descriptor(info)
+                && !local_is_string_scalar(info)
+            {
+                Some(array_descriptor_addr(b, info))
+            } else {
+                None
+            }
+        }
+        Expr::ComponentAccess { .. } => {
+            let tl = type_layouts?;
+            let (field_ptr, field) = resolve_component_field_access(b, locals, expr, st, tl)?;
+            if field.allocatable && field_uses_array_descriptor(&field) {
+                Some(field_ptr)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 fn typed_null_for_value(b: &mut FuncBuilder, value: ValueId) -> Option<ValueId> {
     match b.func().value_type(value)? {
         IrType::Ptr(inner) => {
@@ -45695,7 +45764,7 @@ pub(super) fn optional_arg_absent_if_forwarded_by_ref_dummy(
     b.select(present, value, null_value)
 }
 
-pub(super) fn optional_arg_absent_if_unallocated_allocatable_char(
+pub(super) fn optional_arg_absent_if_unallocated_allocatable(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
     expr: &crate::ast::expr::SpannedExpr,
@@ -45707,19 +45776,29 @@ pub(super) fn optional_arg_absent_if_unallocated_allocatable_char(
     if !enabled {
         return value;
     }
-    let Some(desc) = allocatable_deferred_char_actual_descriptor(b, locals, expr, st, type_layouts)
-    else {
-        return value;
-    };
     let Some(null_value) = typed_null_for_value(b, value) else {
         return value;
     };
 
-    let allocated = b.call(
-        FuncRef::External("afs_string_allocated".into()),
-        vec![desc],
-        IrType::Int(IntWidth::I32),
-    );
+    let allocated = if let Some(desc) =
+        allocatable_deferred_char_actual_descriptor(b, locals, expr, st, type_layouts)
+    {
+        b.call(
+            FuncRef::External("afs_string_allocated".into()),
+            vec![desc],
+            IrType::Int(IntWidth::I32),
+        )
+    } else if let Some(desc) =
+        allocatable_array_actual_descriptor(b, locals, expr, st, type_layouts)
+    {
+        b.call(
+            FuncRef::External("afs_array_allocated".into()),
+            vec![desc],
+            IrType::Int(IntWidth::I32),
+        )
+    } else {
+        return value;
+    };
     let zero = b.const_i32(0);
     let is_allocated = b.icmp(CmpOp::Ne, allocated, zero);
     b.select(is_allocated, value, null_value)

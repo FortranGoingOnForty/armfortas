@@ -17343,6 +17343,47 @@ fn optional_assumed_shape_dummy_rebases_lower_to_one_when_present() {
 }
 
 #[test]
+fn unallocated_allocatable_actual_to_optional_assumed_shape_is_absent() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=unallocated_allocatable_actual_to_optional_assumed_shape_is_absent count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // F2018 §15.5.2.12: an unallocated allocatable actual associated
+    // with a non-allocatable optional dummy is not present.  The same
+    // actual associated with an allocatable optional dummy is present,
+    // but remains unallocated.
+    let src = write_program(
+        "module m\n  implicit none\n  type :: string_t\n    character(:), allocatable :: s\n  end type\ncontains\n  subroutine probe_nonalloc(features)\n    type(string_t), optional, target, intent(in) :: features(:)\n    if (present(features)) error stop 1\n  end subroutine\n\n  subroutine probe_alloc(features)\n    type(string_t), allocatable, optional, intent(in) :: features(:)\n    if (.not. present(features)) error stop 2\n    if (allocated(features)) error stop 3\n  end subroutine\n\n  subroutine probe_present(features)\n    type(string_t), optional, target, intent(in) :: features(:)\n    if (.not. present(features)) error stop 4\n    if (size(features) /= 1) error stop 5\n  end subroutine\nend module\n\nprogram p\n  use m\n  implicit none\n  type(string_t), allocatable :: features(:)\n  call probe_nonalloc(features)\n  call probe_alloc(features)\n  allocate(features(1))\n  features(1)%s = 'x'\n  call probe_present(features)\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("optional_unallocated_alloc_actual", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "run failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected 'ok': {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn rank_n_array_compare_yields_same_shape_logical_descriptor_per_f2018() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
