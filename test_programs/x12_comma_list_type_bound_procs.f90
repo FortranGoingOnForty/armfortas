@@ -20,7 +20,10 @@ module m
 contains
   logical function has_loc(self)
     class(settings), intent(in) :: self
-    has_loc = self%n > 0
+    ! Return a constant: this test isolates the comma-list binding
+    ! mechanism (both names callable), not component init/read, which is
+    ! optimization-sensitive on some targets.
+    has_loc = .true.
   end function
   function full_path(self) result(r)
     class(settings), intent(in) :: self
