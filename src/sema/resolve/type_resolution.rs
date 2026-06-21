@@ -51,9 +51,10 @@ pub(super) fn extract_kind(sel: &Option<decl::KindSelector>, st: &SymbolTable) -
 /// Compute the byte length of a string-valued PARAMETER initializer
 /// for `character(*)` length inference (F2008 §5.3.2). Handles string
 /// literals, references to other character parameters whose length is
-/// already known, and `lit // lit` / `lit // name` concat chains.
+/// already known, typed character array constructors, and `lit // lit` /
+/// `lit // name` concat chains.
 pub(super) fn derived_char_init_len(e: &crate::ast::expr::Expr, st: &SymbolTable) -> Option<usize> {
-    use crate::ast::expr::Expr;
+    use crate::ast::expr::{AcValue, Expr};
     match e {
         Expr::StringLiteral { value, .. } => Some(value.len()),
         Expr::Name { name } => {
@@ -91,6 +92,23 @@ pub(super) fn derived_char_init_len(e: &crate::ast::expr::Expr, st: &SymbolTable
                 _ => None,
             }
         }
+        Expr::ArrayConstructor { type_spec, values } => {
+            if let Some(type_spec) = type_spec {
+                if let Some(len) = typed_character_array_constructor_len(type_spec, st) {
+                    return Some(len);
+                }
+            }
+
+            let mut max_len = None;
+            for value in values {
+                let AcValue::Expr(expr) = value else {
+                    return None;
+                };
+                let len = derived_char_init_len(&expr.node, st)?;
+                max_len = Some(max_len.map_or(len, |prev: usize| prev.max(len)));
+            }
+            max_len
+        }
         Expr::BinaryOp {
             op: crate::ast::expr::BinaryOp::Concat,
             left,
@@ -98,6 +116,27 @@ pub(super) fn derived_char_init_len(e: &crate::ast::expr::Expr, st: &SymbolTable
         } => Some(derived_char_init_len(&left.node, st)? + derived_char_init_len(&right.node, st)?),
         _ => None,
     }
+}
+
+fn typed_character_array_constructor_len(type_spec: &str, st: &SymbolTable) -> Option<usize> {
+    let tokens = crate::lexer::tokenize(type_spec, 0, crate::lexer::SourceForm::FreeForm).ok()?;
+    let mut parser = crate::parser::Parser::new(&tokens);
+    let parsed = parser.try_parse_type_spec()?.ok()?;
+    if parser.peek() != &crate::lexer::TokenKind::Eof {
+        return None;
+    }
+
+    let TypeSpec::Character(Some(selector)) = parsed else {
+        return None;
+    };
+    let decl::LenSpec::Expr(expr) = selector.len? else {
+        return None;
+    };
+    let len = eval_const_int_expr(&expr, st)?;
+    if len < 0 {
+        return None;
+    }
+    usize::try_from(len).ok()
 }
 
 pub(super) fn extract_char_len(sel: &Option<decl::CharSelector>, st: &SymbolTable) -> Option<i64> {

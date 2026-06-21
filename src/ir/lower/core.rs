@@ -5384,6 +5384,22 @@ fn eval_const_char_expr_len(
                 .and_then(|bytes| i64::try_from(bytes.len()).ok())
         }
         Expr::ParenExpr { inner } => eval_const_char_expr_len(inner, param_consts, param_chars, st),
+        Expr::ArrayConstructor { type_spec, values } => typed_array_constructor_char_len(
+            type_spec.as_deref(),
+            param_consts,
+            st,
+        )
+        .or_else(|| {
+            let mut max_len = None;
+            for value in values {
+                let crate::ast::expr::AcValue::Expr(expr) = value else {
+                    return None;
+                };
+                let len = eval_const_char_expr_len(expr, param_consts, param_chars, st)?;
+                max_len = Some(max_len.map_or(len, |prev: i64| prev.max(len)));
+            }
+            max_len
+        }),
         Expr::BinaryOp {
             op: BinaryOp::Concat,
             left,
@@ -5669,6 +5685,13 @@ pub(super) fn declared_char_len(
         Some(crate::ast::decl::LenSpec::Star) => init_expr.and_then(|expr| {
             eval_const_char_bytes(expr, param_consts, param_char_consts)
                 .map(|bytes| bytes.len() as i64)
+                .or_else(|| {
+                    if let crate::ast::expr::Expr::ArrayConstructor { type_spec, .. } = &expr.node {
+                        typed_array_constructor_char_len(type_spec.as_deref(), param_consts, st)
+                    } else {
+                        None
+                    }
+                })
                 .or_else(|| {
                     collect_const_char_array_elems(expr, param_consts, param_char_consts).map(
                         |elems| {
@@ -9455,7 +9478,12 @@ pub(super) fn actual_char_arg_runtime_len(
             b.set_block(bb_merge);
             Some(merged_len)
         }
-        Expr::ArrayConstructor { values, .. } => {
+        Expr::ArrayConstructor { type_spec, values } => {
+            if let Some(len) =
+                typed_array_constructor_char_len(type_spec.as_deref(), &HashMap::new(), st)
+            {
+                return Some(b.const_i64(len));
+            }
             if let Some(len) = fixed_char_array_constructor_len(b, values, locals, st, type_layouts)
             {
                 return Some(b.const_i64(len));
@@ -9793,6 +9821,21 @@ fn parse_array_constructor_type_spec(type_spec: &str) -> Option<TypeSpec> {
     let mut parser = crate::parser::Parser::new(&tokens);
     let parsed = parser.try_parse_type_spec()?.ok()?;
     (parser.peek() == &crate::lexer::TokenKind::Eof).then_some(parsed)
+}
+
+fn typed_array_constructor_char_len(
+    type_spec: Option<&str>,
+    param_consts: &HashMap<String, ConstScalar>,
+    st: &SymbolTable,
+) -> Option<i64> {
+    let TypeSpec::Character(Some(selector)) = parse_array_constructor_type_spec(type_spec?)? else {
+        return None;
+    };
+    let crate::ast::decl::LenSpec::Expr(expr) = selector.len? else {
+        return None;
+    };
+    let len = eval_const_int_in_scope_or_any_scope(&expr, param_consts, st)?;
+    (len >= 0).then_some(len)
 }
 
 pub(super) fn first_array_constructor_type_info(
@@ -11067,7 +11110,7 @@ pub(super) fn lower_logical_reduction_intrinsic_ast(
             }
 
             let mut arrays = Vec::new();
-            collect_array_names(arg0, locals, &mut arrays);
+            collect_scalarized_control_array_names(arg0, locals, &mut arrays);
             let control_name = arrays.first()?;
             let control = locals.get(control_name)?;
             let loop_var = fresh_synth_loop_var(locals);
@@ -11171,7 +11214,7 @@ pub(super) fn lower_logical_reduction_intrinsic_ast(
             )?;
 
             let mut arrays = Vec::new();
-            collect_array_names(&normalized, &scratch_locals, &mut arrays);
+            collect_scalarized_control_array_names(&normalized, &scratch_locals, &mut arrays);
             let control_name = arrays.first()?;
             let control = scratch_locals.get(control_name)?.clone();
             let loop_var = fresh_synth_loop_var(&scratch_locals);
@@ -41914,6 +41957,99 @@ pub(super) fn collect_array_names(
                         for inner in &ido.values {
                             if let crate::ast::expr::AcValue::Expr(e) = inner {
                                 collect_array_names(e, locals, out);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_scalarized_control_array_names(
+    expr: &crate::ast::expr::SpannedExpr,
+    locals: &HashMap<String, LocalInfo>,
+    out: &mut Vec<String>,
+) {
+    fn push_if_array(
+        name: &str,
+        locals: &HashMap<String, LocalInfo>,
+        out: &mut Vec<String>,
+    ) {
+        let key = name.to_lowercase();
+        if let Some(info) = locals.get(&key) {
+            if local_is_array_like(info) && !out.contains(&key) {
+                out.push(key);
+            }
+        }
+    }
+
+    match &expr.node {
+        Expr::Name { name } => push_if_array(name, locals, out),
+        Expr::BinaryOp { left, right, .. } => {
+            collect_scalarized_control_array_names(left, locals, out);
+            collect_scalarized_control_array_names(right, locals, out);
+        }
+        Expr::UnaryOp { operand, .. } => {
+            collect_scalarized_control_array_names(operand, locals, out)
+        }
+        Expr::ParenExpr { inner } => collect_scalarized_control_array_names(inner, locals, out),
+        Expr::ComponentAccess { base, .. } => {
+            collect_scalarized_control_array_names(base, locals, out)
+        }
+        Expr::FunctionCall { callee, args } => {
+            let callee_is_local_array = if let Expr::Name { name } = &callee.node {
+                let key = name.to_lowercase();
+                if locals.get(&key).is_some_and(local_is_array_like) {
+                    if is_full_rank1_whole_slice(args) {
+                        push_if_array(name, locals, out);
+                    }
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if !callee_is_local_array {
+                collect_scalarized_control_array_names(callee, locals, out);
+            }
+            for arg in args {
+                match &arg.value {
+                    crate::ast::expr::SectionSubscript::Element(e) => {
+                        collect_scalarized_control_array_names(e, locals, out)
+                    }
+                    crate::ast::expr::SectionSubscript::Range { start, end, stride } => {
+                        if let Some(e) = start {
+                            collect_scalarized_control_array_names(e, locals, out);
+                        }
+                        if let Some(e) = end {
+                            collect_scalarized_control_array_names(e, locals, out);
+                        }
+                        if let Some(e) = stride {
+                            collect_scalarized_control_array_names(e, locals, out);
+                        }
+                    }
+                }
+            }
+        }
+        Expr::ArrayConstructor { values, .. } => {
+            for value in values {
+                match value {
+                    crate::ast::expr::AcValue::Expr(e) => {
+                        collect_scalarized_control_array_names(e, locals, out)
+                    }
+                    crate::ast::expr::AcValue::ImpliedDo(ido) => {
+                        collect_scalarized_control_array_names(&ido.start, locals, out);
+                        collect_scalarized_control_array_names(&ido.end, locals, out);
+                        if let Some(step) = &ido.step {
+                            collect_scalarized_control_array_names(step, locals, out);
+                        }
+                        for inner in &ido.values {
+                            if let crate::ast::expr::AcValue::Expr(e) = inner {
+                                collect_scalarized_control_array_names(e, locals, out);
                             }
                         }
                     }

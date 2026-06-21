@@ -44267,6 +44267,44 @@ fn class_star_character_elements_preserve_dynamic_type() {
     let _ = std::fs::remove_file(&src);
 }
 
+#[test]
+fn character_star_parameter_array_constructor_hidden_len_uses_element_len() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=character_star_parameter_array_constructor_hidden_len_uses_element_len count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  type :: key_t\n    character(:), allocatable :: key\n  end type\n  character(*), parameter :: valid_keys(*) = [character(24) :: &\n    'namespace', 'v', 'path', 'git', 'tag', 'branch', 'rev', &\n    'preprocess', 'features', 'profile']\n  type(key_t), allocatable :: keys(:)\n  allocate(keys(1))\n  keys(1)%key = 'git'\n  call check(keys, valid_keys)\n  print *, 'ok'\ncontains\n  subroutine check(keys, valid_keys)\n    type(key_t), intent(in) :: keys(:)\n    character(len=*), intent(in) :: valid_keys(:)\n    if (len(valid_keys(4)) /= 24) error stop 1\n    if (keys(1)%key /= valid_keys(4)) error stop 2\n    if (.not. any(keys(1)%key == valid_keys)) error stop 3\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("char_star_param_array_constructor_len", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("character parameter array compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "character parameter array compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("character parameter array run failed");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        run.status.success() && stdout.contains("ok"),
+        "character parameter array run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        stdout,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
 // ---- Sprint l00: --std=f2023 wiring ----
 
 #[test]
