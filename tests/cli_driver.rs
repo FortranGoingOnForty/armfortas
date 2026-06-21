@@ -17421,6 +17421,43 @@ fn class_derived_function_result_copies_inherited_allocatable_component() {
 }
 
 #[test]
+fn imported_type_allocatable_scalar_result_uses_derived_copy_path() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_type_allocatable_scalar_result_uses_derived_copy_path count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module types_m\n  implicit none\n  type :: base_t\n    integer, allocatable :: xs(:)\n  end type\n  type, extends(base_t) :: child_t\n    integer :: tag\n  contains\n    procedure :: count_xs\n  end type\ncontains\n  function export(self) result(r)\n    class(child_t), intent(in), target :: self\n    type(child_t) :: r\n    r = self\n  end function\n\n  function count_xs(self) result(n)\n    class(child_t), intent(in) :: self\n    integer :: n\n    n = 0\n    if (allocated(self%xs)) n = size(self%xs)\n  end function\nend module\n\nmodule user_m\n  use types_m, only: child_t, export\n  implicit none\ncontains\n  subroutine new_flags(package)\n    type(child_t), intent(in) :: package\n    if (package%count_xs() /= 2) error stop 1\n    if (package%tag /= 7) error stop 2\n  end subroutine\n\n  subroutine run()\n    type(child_t), target :: cfg\n    type(child_t), allocatable, target :: package\n    allocate(cfg%xs(2))\n    cfg%xs = [11, 22]\n    cfg%tag = 7\n    allocate(package)\n    package = export(cfg)\n    call new_flags(package)\n  end subroutine\nend module\n\nprogram p\n  use user_m, only: run\n  implicit none\n  call run()\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("imported_type_alloc_scalar_result", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "run failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected 'ok': {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn rank_n_array_compare_yields_same_shape_logical_descriptor_per_f2018() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

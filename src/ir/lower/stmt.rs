@@ -621,13 +621,6 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 } else if local_uses_array_descriptor(&info)
                                     && local_declared_rank(&info) == 0
                                     && info.derived_type.is_some()
-                                    && ctx
-                                        .st
-                                        .find_symbol_any_scope(&key)
-                                        .and_then(|sym| sym.type_info.as_ref())
-                                        .is_some_and(|ti| {
-                                            matches!(ti, crate::sema::symtab::TypeInfo::Derived(_))
-                                        })
                                 {
                                     let desc = array_descriptor_addr(b, &info);
                                     let allocated = b.call(
