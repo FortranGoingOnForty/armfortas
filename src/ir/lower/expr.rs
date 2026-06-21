@@ -568,6 +568,9 @@ pub(crate) fn lower_expr_full(
                         b.load_typed(info.addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
                     }
                 } else if info.derived_type.is_some() {
+                    if info.is_class && local_uses_array_descriptor(info) && info.dims.is_empty() {
+                        return array_base_addr(b, info);
+                    }
                     if info
                         .derived_type
                         .as_ref()
