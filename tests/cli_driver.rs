@@ -9755,6 +9755,51 @@ fn parent_component_actual_on_allocatable_extension_passes_object_storage() {
 }
 
 #[test]
+fn parent_component_assignment_deep_copies_allocatable_char_fields() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=parent_component_assignment_deep_copies_allocatable_char_fields count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type :: base_t\n    character(len=:), allocatable :: name\n    character(len=:), allocatable :: path\n  end type\n  type, extends(base_t) :: node_t\n    logical :: done = .false.\n  end type\ncontains\n  subroutine init_node(node, base)\n    type(node_t), intent(out) :: node\n    type(base_t), intent(in) :: base\n    node%base_t = base\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(base_t) :: base\n  type(node_t) :: node\n  base%name = 'fpm'\n  base%path = '.'\n  call init_node(node, base)\n  if (.not. allocated(node%name)) error stop 1\n  if (.not. allocated(node%path)) error stop 2\n  if (node%name /= 'fpm') error stop 3\n  if (node%path /= '.') error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("parent_component_assignment_alloc_char", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("parent component assignment compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "parent component assignment should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("parent component assignment run failed to spawn");
+    assert!(
+        run.status.success(),
+        "parent component assignment should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected parent component assignment output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn scalar_derived_constructor_result_actual_preserves_object_storage() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

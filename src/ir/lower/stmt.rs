@@ -1797,13 +1797,17 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         resolve_component_base(b, &ctx.locals, base, ctx.st, ctx.type_layouts)
                     {
                         if let Some(layout) = ctx.type_layouts.get(&type_name) {
-                            if let Some(field) = layout.field(component) {
+                            if let Some(field) = layout_component_field_or_parent_view(
+                                layout,
+                                component,
+                                ctx.type_layouts,
+                            ) {
                                 let offset = b.const_i64(field.offset as i64);
                                 let field_ptr =
                                     b.gep(base_addr, vec![offset], IrType::Int(IntWidth::I8));
 
                                 // Character field: copy string data with space padding.
-                                if let CharKind::Fixed(flen) = field_char_kind(field) {
+                                if let CharKind::Fixed(flen) = field_char_kind(&field) {
                                     let (src_ptr, src_len) = lower_string_expr_ctx(b, ctx, value);
                                     let dest_ptr = if field.pointer {
                                         b.load_typed(
@@ -1827,7 +1831,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         Some(ctx.type_layouts),
                                         src_ptr,
                                     );
-                                } else if is_deferred_char_component_field(field) {
+                                } else if is_deferred_char_component_field(&field) {
                                     let (src_ptr, src_len) = lower_string_expr_ctx(b, ctx, value);
                                     if field.pointer {
                                         let (dest_ptr, dest_len) =
@@ -1859,7 +1863,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     && field.size == 384
                                     && field.dims.is_empty()
                                 {
-                                    let Some(type_name) = field_derived_type_name(field) else {
+                                    let Some(type_name) = field_derived_type_name(&field) else {
                                         return;
                                     };
                                     let desc = field_ptr;
@@ -1944,7 +1948,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     && field.dims.is_empty()
                                 {
                                     let src_ptr = super::expr::lower_expr_ctx_tl(b, ctx, value);
-                                    if let Some(nested_name) = field_derived_type_name(field) {
+                                    if let Some(nested_name) = field_derived_type_name(&field) {
                                         emit_derived_value_copy(
                                             b,
                                             ctx.type_layouts,
@@ -1991,7 +1995,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     ) && !is_opaque_c_handle_type(&field.type_info)
                                     {
                                         let src_ptr = super::expr::lower_expr_ctx_tl(b, ctx, value);
-                                        if let Some(nested_name) = field_derived_type_name(field) {
+                                        if let Some(nested_name) = field_derived_type_name(&field) {
                                             let dest_ptr = b.load_typed(
                                                 field_ptr,
                                                 IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
@@ -2019,7 +2023,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         let dest_ptr = b.load_typed(
                                             field_ptr,
                                             IrType::Ptr(Box::new(field_storage_ir_type(
-                                                field,
+                                                &field,
                                                 ctx.type_layouts,
                                             ))),
                                         );
