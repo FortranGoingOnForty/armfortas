@@ -280,7 +280,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --workspace
       - run: cargo test -p armfortas --lib
-      - run: cargo test -p armfortas --tests -- --nocapture --test-threads=1 2>&1 | tee /tmp/tests.log
+      - shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p armfortas --tests -- --nocapture --test-threads=1 2>&1 | tee /tmp/tests.log
       - run: ci/check_skips.sh /tmp/tests.log posix-elf
       # x09: SSE-only FP — fail on any x87 mnemonic at -O2/-Ofast.
       - run: ci/check_x87.sh
@@ -302,13 +305,16 @@ jobs:
       # to a REST tarball download that cannot fetch submodules. Install
       # deps BEFORE checkout (binutils: rustc needs a linker for test
       # binaries; the image ships none).
-      - run: apk add --no-cache git binutils musl-dev grep
+      - run: apk add --no-cache git binutils musl-dev grep bash
       - uses: actions/checkout@v4
         with:
           submodules: recursive
       - run: cargo build --workspace
       - run: cargo test -p armfortas --lib
-      - run: cargo test -p armfortas --tests -- --nocapture --test-threads=1 2>&1 | tee /tmp/tests.log
+      - shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p armfortas --tests -- --nocapture --test-threads=1 2>&1 | tee /tmp/tests.log
       - run: ci/check_skips.sh /tmp/tests.log posix-elf-musl
 
   build-freebsd:
