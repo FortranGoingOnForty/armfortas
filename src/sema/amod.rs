@@ -2281,15 +2281,12 @@ pub fn extract_module_globals(
                 }
                 _ => None,
             };
-            let ir_ty = if var.proc_pointer {
-                crate::ir::types::IrType::Ptr(Box::new(crate::ir::types::IrType::Int(
-                    crate::ir::types::IntWidth::I8,
-                )))
-            } else if matches!(
-                var.type_info.as_ref(),
-                Some(TypeInfo::Character { len: None, .. })
-            ) && (var.allocatable || var.pointer)
-                && declared_rank > 0
+            let ir_ty = if var.proc_pointer
+                || (matches!(
+                    var.type_info.as_ref(),
+                    Some(TypeInfo::Character { len: None, .. })
+                ) && (var.allocatable || var.pointer)
+                    && declared_rank > 0)
             {
                 crate::ir::types::IrType::Ptr(Box::new(crate::ir::types::IrType::Int(
                     crate::ir::types::IntWidth::I8,

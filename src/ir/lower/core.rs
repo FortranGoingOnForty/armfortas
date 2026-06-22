@@ -11660,9 +11660,7 @@ fn named_interface_symbol_in_scope_chain<'a>(
             return Some(sym);
         }
         let scope = st.scope(scope_id);
-        let Some(parent) = scope.parent else {
-            return None;
-        };
+        let parent = scope.parent?;
         if matches!(st.scope(parent).kind, crate::sema::symtab::ScopeKind::Global) {
             return None;
         }
@@ -43642,20 +43640,22 @@ fn projected_scalar_component_local_info(
     })
 }
 
-fn projected_component_base_descriptor(
-    b: &mut FuncBuilder,
-    locals: &HashMap<String, LocalInfo>,
-    base: &crate::ast::expr::SpannedExpr,
-    st: &SymbolTable,
-    tl: &crate::sema::type_layout::TypeLayoutRegistry,
-) -> Option<(
+type ProjectedComponentArrayBase = (
     ValueId,
     String,
     usize,
     Vec<(i64, i64)>,
     Vec<Option<ValueId>>,
     bool,
-)> {
+);
+
+fn projected_component_base_descriptor(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    base: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    tl: &crate::sema::type_layout::TypeLayoutRegistry,
+) -> Option<ProjectedComponentArrayBase> {
     let type_name_from_expr = |base: &crate::ast::expr::SpannedExpr| {
         operator_expr_type_info(base, Some(locals), st, Some(tl)).and_then(|type_info| {
             match type_info {
