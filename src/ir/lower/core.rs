@@ -512,6 +512,20 @@ fn derived_memory_helper_symbol(
     )
 }
 
+fn derived_memory_helper_available_from_current_func(
+    b: &FuncBuilder,
+    layout: &crate::sema::type_layout::TypeLayout,
+) -> bool {
+    let Some(owner) = layout.owner_module.as_ref() else {
+        return true;
+    };
+    let owner = sanitize_internal_host_symbol(owner);
+    let func = b.func().name.to_lowercase();
+    func.starts_with(&format!("afs_modproc_{}_", owner))
+        || func.contains(&format!("_afs_modproc_{}_", owner))
+        || func.starts_with(&format!("afs_derived_{}_", owner))
+}
+
 fn ptr_i8_ty() -> IrType {
     IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)))
 }
@@ -11588,6 +11602,11 @@ pub(super) fn find_named_interface_symbol<'a>(
         if let Some(sym) = named_interface_symbol_in_scope_chain(st, scope_id, &key) {
             return Some(sym);
         }
+        if let Some(sym) = st.lookup_in(scope_id, &key) {
+            if is_named_interface_like(sym) {
+                return Some(sym);
+            }
+        }
     }
 
     if let Some(sym) = active_block_use_named_interface_symbols(st, &key)
@@ -11942,6 +11961,13 @@ pub(super) fn named_interface_specific_candidates(
     if let Some(scope_id) = current_proc_scope() {
         if let Some(sym) = named_interface_symbol_in_scope_chain(st, scope_id, &key) {
             append_named_interface_specific_candidates(sym, &mut specifics, &mut seen);
+        }
+        if specifics.is_empty() {
+            if let Some(sym) = st.lookup_in(scope_id, &key) {
+                if is_named_interface_like(sym) {
+                    append_named_interface_specific_candidates(sym, &mut specifics, &mut seen);
+                }
+            }
         }
     }
 
@@ -45403,6 +45429,10 @@ pub(super) fn initialize_derived_storage(
     if !derived_layout_needs_runtime_initialization(layout, registry) {
         return;
     }
+    if !derived_memory_helper_available_from_current_func(b, layout) {
+        emit_initialize_derived_storage_inline(b, base_addr, layout, registry);
+        return;
+    }
     let base = ptr_i8_value(b, base_addr);
     b.call(
         FuncRef::External(derived_memory_helper_symbol(
@@ -45613,6 +45643,10 @@ pub(super) fn deallocate_derived_descriptor_components(
     if !derived_layout_needs_component_deallocation(layout, registry) {
         return;
     }
+    if !derived_memory_helper_available_from_current_func(b, layout) {
+        emit_deallocate_derived_descriptor_components_inline(b, desc, layout, registry, stat_addr);
+        return;
+    }
     let desc_ptr = ptr_i8_value(b, desc);
     b.call(
         FuncRef::External(derived_memory_helper_symbol(
@@ -45679,6 +45713,12 @@ pub(super) fn deallocate_derived_storage_components(
     stat_addr: ValueId,
 ) {
     if !derived_layout_needs_component_deallocation(layout, registry) {
+        return;
+    }
+    if !derived_memory_helper_available_from_current_func(b, layout) {
+        emit_deallocate_derived_storage_components_inline(
+            b, base_addr, layout, registry, stat_addr,
+        );
         return;
     }
     let base = ptr_i8_value(b, base_addr);
@@ -46879,6 +46919,10 @@ pub(super) fn emit_derived_value_copy(
         emit_memcpy_bytes(b, dest_ptr, src_ptr, layout.size as i64);
         return;
     }
+    if !derived_memory_helper_available_from_current_func(b, layout) {
+        emit_derived_value_copy_inline(b, type_layouts, layout, dest_ptr, src_ptr);
+        return;
+    }
     let dest = ptr_i8_value(b, dest_ptr);
     let src = ptr_i8_value(b, src_ptr);
     b.call(
@@ -48053,6 +48097,10 @@ pub(super) fn emit_derived_array_desc_copy(
     if derived_layout_needs_deep_copy(layout, type_layouts)
         || derived_layout_needs_runtime_initialization(layout, type_layouts)
     {
+        if !derived_memory_helper_available_from_current_func(b, layout) {
+            emit_derived_array_desc_copy_inline(b, type_layouts, layout, dest_desc, source_desc);
+            return;
+        }
         let dest = ptr_i8_value(b, dest_desc);
         let source = ptr_i8_value(b, source_desc);
         b.call(
