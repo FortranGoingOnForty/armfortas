@@ -13737,24 +13737,13 @@ fn function_scope_result_type_info(
     let ScopeKind::Function(function_name) = &scope.kind else {
         return None;
     };
-    let arg_set: HashSet<String> = scope
-        .arg_order
-        .iter()
-        .map(|arg| arg.to_lowercase())
-        .collect();
-    for (key, sym) in &scope.symbols {
-        if arg_set.contains(key) {
-            continue;
-        }
-        if matches!(sym.kind, SymbolKind::Variable | SymbolKind::Parameter) {
-            if let Some(ti) = sym.type_info.clone() {
-                return Some(ti);
-            }
-        }
-    }
-
     let key = function_name.to_ascii_lowercase();
-    scope
+
+    // The function symbol carries the result type sema computed; it
+    // handles `result(X)` clauses and implicit typing uniformly. Prefer
+    // it — the symbol lives in this scope (a recursion self-reference) or
+    // in the parent module.
+    if let Some(ti) = scope
         .symbols
         .get(&key)
         .and_then(function_symbol_result_type_info)
@@ -13766,6 +13755,42 @@ fn function_scope_result_type_info(
                     .and_then(function_symbol_result_type_info)
             })
         })
+    {
+        return Some(ti);
+    }
+
+    // Fallback: scan the body for the result variable. With a `result(X)`
+    // clause the result variable is named X (not the function name), and a
+    // function can have other locals/parameters too — `scope.symbols` is a
+    // HashMap, so returning the first non-argument variable picked a
+    // nondeterministic one (fpm version_t%s(): result var `string` vs
+    // locals `buffer`, `ii` — generic dispatch on the call then matched
+    // the wrong specific, or none). Pick deterministically by declaration
+    // position, which puts the header-declared result variable first.
+    let arg_set: HashSet<String> = scope
+        .arg_order
+        .iter()
+        .map(|arg| arg.to_lowercase())
+        .collect();
+    let mut candidates: Vec<_> = scope
+        .symbols
+        .iter()
+        .filter(|(k, sym)| {
+            !arg_set.contains(*k)
+                && matches!(sym.kind, SymbolKind::Variable | SymbolKind::Parameter)
+                && sym.type_info.is_some()
+        })
+        .collect();
+    candidates.sort_by(|(ak, a), (bk, b)| {
+        (a.defined_at.start.line, a.defined_at.start.col, ak.as_str()).cmp(&(
+            b.defined_at.start.line,
+            b.defined_at.start.col,
+            bk.as_str(),
+        ))
+    });
+    candidates
+        .first()
+        .and_then(|(_, sym)| sym.type_info.clone())
 }
 
 fn bound_proc_result_type_info(
