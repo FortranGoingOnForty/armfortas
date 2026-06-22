@@ -372,9 +372,62 @@ pub fn predecessors(func: &Function) -> HashMap<BlockId, Vec<BlockId>> {
     preds
 }
 
-/// Compute the dominator set for each block via iterative dataflow.
-/// Result: `dom[B]` is the set of blocks that dominate `B` (including
-/// `B` itself).
+#[derive(Debug, Clone)]
+pub struct DominatorInfo {
+    blocks: Vec<BlockId>,
+    index: HashMap<BlockId, usize>,
+    doms: Vec<Vec<u64>>,
+    reachable: Vec<bool>,
+}
+
+impl DominatorInfo {
+    pub fn dominates(&self, dominator: BlockId, block: BlockId) -> bool {
+        let Some(&dom_idx) = self.index.get(&dominator) else {
+            return false;
+        };
+        let Some(&block_idx) = self.index.get(&block) else {
+            return false;
+        };
+        self.reachable.get(block_idx).copied().unwrap_or(false)
+            && bit_is_set(&self.doms[block_idx], dom_idx)
+    }
+
+    fn dominator_set(&self, block: BlockId) -> HashSet<BlockId> {
+        let Some(&block_idx) = self.index.get(&block) else {
+            return HashSet::new();
+        };
+        if !self.reachable.get(block_idx).copied().unwrap_or(false) {
+            return HashSet::new();
+        }
+        self.blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, bid)| bit_is_set(&self.doms[block_idx], idx).then_some(*bid))
+            .collect()
+    }
+}
+
+fn bit_word_count(bits: usize) -> usize {
+    bits.div_ceil(64)
+}
+
+fn set_bit(bits: &mut [u64], idx: usize) {
+    bits[idx / 64] |= 1u64 << (idx % 64);
+}
+
+fn bit_is_set(bits: &[u64], idx: usize) -> bool {
+    bits.get(idx / 64)
+        .is_some_and(|word| (word & (1u64 << (idx % 64))) != 0)
+}
+
+fn and_bits_into(dst: &mut [u64], src: &[u64]) {
+    for (d, s) in dst.iter_mut().zip(src) {
+        *d &= *s;
+    }
+}
+
+/// Compute compact dominator sets for each block via iterative dataflow.
+/// `dom[B]` is the set of blocks that dominate `B` (including `B` itself).
 ///
 /// Audit M4-3: blocks that are **not reachable from the entry** are
 /// assigned the empty set (they dominate nothing and nothing dominates
@@ -385,20 +438,32 @@ pub fn predecessors(func: &Function) -> HashMap<BlockId, Vec<BlockId>> {
 /// fabricate phantom loops in unreachable code. LICM was shielded by
 /// the N-6 pre-prune, but any future consumer of `compute_dominators`
 /// would trip over the latent bug.
-pub fn compute_dominators(func: &Function) -> HashMap<BlockId, HashSet<BlockId>> {
-    let all_blocks: HashSet<BlockId> = func.blocks.iter().map(|b| b.id).collect();
+pub fn compute_dominator_info(func: &Function) -> DominatorInfo {
+    let blocks: Vec<BlockId> = func.blocks.iter().map(|b| b.id).collect();
+    let index: HashMap<BlockId, usize> = blocks
+        .iter()
+        .enumerate()
+        .map(|(idx, bid)| (*bid, idx))
+        .collect();
+    let word_count = bit_word_count(blocks.len());
 
     // First, compute the set of blocks reachable from the entry via
     // a forward BFS over terminator targets.
-    let mut reachable: HashSet<BlockId> = HashSet::new();
+    let mut reachable = vec![false; blocks.len()];
     let mut queue: VecDeque<BlockId> = VecDeque::new();
-    queue.push_back(func.entry);
-    reachable.insert(func.entry);
+    if let Some(&entry_idx) = index.get(&func.entry) {
+        queue.push_back(func.entry);
+        reachable[entry_idx] = true;
+    }
     while let Some(bid) = queue.pop_front() {
-        if let Some(block) = func.blocks.iter().find(|b| b.id == bid) {
-            if let Some(term) = &block.terminator {
+        if let Some(&block_idx) = index.get(&bid) {
+            if let Some(term) = &func.blocks[block_idx].terminator {
                 for tgt in terminator_targets(term) {
-                    if reachable.insert(tgt) {
+                    let Some(&tgt_idx) = index.get(&tgt) else {
+                        continue;
+                    };
+                    if !reachable[tgt_idx] {
+                        reachable[tgt_idx] = true;
                         queue.push_back(tgt);
                     }
                 }
@@ -406,68 +471,80 @@ pub fn compute_dominators(func: &Function) -> HashMap<BlockId, HashSet<BlockId>>
         }
     }
 
-    let mut doms: HashMap<BlockId, HashSet<BlockId>> = HashMap::new();
-
-    // Entry is dominated only by itself.
-    let mut entry_set = HashSet::new();
-    entry_set.insert(func.entry);
-    doms.insert(func.entry, entry_set);
-
-    // Reachable non-entry blocks: initialize to the universe of
-    // reachable blocks (so the intersection converges).
-    // Unreachable blocks: initialize to the empty set and never
-    // update them — they participate in no meaningful dominance
-    // relationship.
-    for block in &func.blocks {
-        if block.id == func.entry {
-            continue;
-        }
-        if reachable.contains(&block.id) {
-            doms.insert(block.id, reachable.clone());
-        } else {
-            doms.insert(block.id, HashSet::new());
+    let mut reachable_bits = vec![0u64; word_count];
+    for (idx, is_reachable) in reachable.iter().copied().enumerate() {
+        if is_reachable {
+            set_bit(&mut reachable_bits, idx);
         }
     }
 
-    let preds = predecessors(func);
+    let mut pred_indices: Vec<Vec<usize>> = vec![Vec::new(); blocks.len()];
+    for (idx, block) in func.blocks.iter().enumerate() {
+        if let Some(term) = &block.terminator {
+            for tgt in terminator_targets(term) {
+                if let Some(&tgt_idx) = index.get(&tgt) {
+                    pred_indices[tgt_idx].push(idx);
+                }
+            }
+        }
+    }
+
+    let mut doms = vec![vec![0u64; word_count]; blocks.len()];
+    if let Some(&entry_idx) = index.get(&func.entry) {
+        if reachable[entry_idx] {
+            set_bit(&mut doms[entry_idx], entry_idx);
+        }
+    }
+    for (idx, block) in func.blocks.iter().enumerate() {
+        if block.id != func.entry && reachable[idx] {
+            doms[idx] = reachable_bits.clone();
+        }
+    }
+
     let mut changed = true;
     while changed {
         changed = false;
-        for block in &func.blocks {
+        for (idx, block) in func.blocks.iter().enumerate() {
             if block.id == func.entry {
                 continue;
             }
-            if !reachable.contains(&block.id) {
+            if !reachable[idx] {
                 continue;
             }
-            let plist = preds.get(&block.id).cloned().unwrap_or_default();
-            // Reachable-only predecessors — an edge from an
-            // unreachable block doesn't contribute to dominance.
-            let reachable_preds: Vec<BlockId> = plist
-                .into_iter()
-                .filter(|p| reachable.contains(p))
-                .collect();
-            if reachable_preds.is_empty() {
+
+            let mut reachable_preds = pred_indices[idx].iter().copied().filter(|p| reachable[*p]);
+            let Some(first_pred) = reachable_preds.next() else {
                 continue;
+            };
+            let mut new_dom = doms[first_pred].clone();
+            for pred_idx in reachable_preds {
+                and_bits_into(&mut new_dom, &doms[pred_idx]);
             }
-            let mut new_dom = reachable.clone();
-            for p in &reachable_preds {
-                if let Some(pd) = doms.get(p) {
-                    new_dom = new_dom.intersection(pd).copied().collect();
-                }
-            }
-            new_dom.insert(block.id);
-            if doms.get(&block.id) != Some(&new_dom) {
-                doms.insert(block.id, new_dom);
+            set_bit(&mut new_dom, idx);
+            if doms[idx] != new_dom {
+                doms[idx] = new_dom;
                 changed = true;
             }
         }
     }
-    // Silence unused-var lint for `all_blocks` — kept for potential
-    // future needs (and because removing it would break callers that
-    // expect every block to have an entry in the map).
-    let _ = all_blocks;
-    doms
+
+    DominatorInfo {
+        blocks,
+        index,
+        doms,
+        reachable,
+    }
+}
+
+/// Compute the dominator set for each block via iterative dataflow.
+/// Result: `dom[B]` is the set of blocks that dominate `B` (including
+/// `B` itself).
+pub fn compute_dominators(func: &Function) -> HashMap<BlockId, HashSet<BlockId>> {
+    let info = compute_dominator_info(func);
+    info.blocks
+        .iter()
+        .map(|bid| (*bid, info.dominator_set(*bid)))
+        .collect()
 }
 
 /// A natural loop: header + the set of blocks in the loop body.
@@ -492,7 +569,7 @@ pub struct NaturalLoop {
 /// passes can merge them if needed. (LICM only cares about the body
 /// set, so identical-header loops are still safe.)
 pub fn find_natural_loops(func: &Function) -> Vec<NaturalLoop> {
-    let doms = compute_dominators(func);
+    let doms = compute_dominator_info(func);
     let preds = predecessors(func);
 
     // Collect back edges: (latch → header) where header dominates latch.
@@ -500,10 +577,8 @@ pub fn find_natural_loops(func: &Function) -> Vec<NaturalLoop> {
     for block in &func.blocks {
         if let Some(term) = &block.terminator {
             for tgt in terminator_targets(term) {
-                if let Some(d) = doms.get(&block.id) {
-                    if d.contains(&tgt) {
-                        back_edges.push((block.id, tgt));
-                    }
+                if doms.dominates(tgt, block.id) {
+                    back_edges.push((block.id, tgt));
                 }
             }
         }
@@ -608,51 +683,47 @@ pub fn prune_unreachable(func: &mut Function) -> bool {
 /// Unreachable blocks have an empty dominator set (per
 /// [`compute_dominators`]) and therefore no idom.
 ///
-/// **Performance**: this is the naïve O(N³) construction — for each
-/// block we filter its dominator set, then for each candidate scan
-/// every other candidate's dominator set looking for the unique
-/// "smallest". `compute_dominators` itself is O(N²·E) iterative
-/// data-flow on top, so the asymptotic ceiling for the dominator
-/// pipeline is roughly O(N³ + N²·E). That is fine for the
-/// kilo-block functions today's frontend produces, but if we ever
-/// start lowering huge SSA graphs (autovec spillovers, inlining
-/// across modules) the right replacement is Lengauer–Tarjan, which
-/// is O((N+E)·α(N)) in practice. Track separately as an
-/// optimization-tier replacement, not a correctness fix.
+/// **Performance**: this still uses the simple iterative data-flow
+/// algorithm, but `compute_dominator_info` stores each dominator set
+/// as a compact bitset. That keeps verifier/optimizer memory bounded
+/// for large lowered functions while preserving the old API surface.
+/// A future Lengauer–Tarjan implementation would improve asymptotic
+/// time, but the bitset representation fixes the current practical
+/// memory cliff.
 pub fn compute_immediate_dominators(func: &Function) -> HashMap<BlockId, BlockId> {
-    let doms = compute_dominators(func);
+    let doms = compute_dominator_info(func);
     let mut idoms: HashMap<BlockId, BlockId> = HashMap::new();
 
-    for block in &func.blocks {
-        if block.id == func.entry {
+    for (block_idx, block) in func.blocks.iter().enumerate() {
+        if block.id == func.entry || !doms.reachable[block_idx] {
             continue;
         }
-        let Some(my_doms) = doms.get(&block.id) else {
-            continue;
-        };
-        if my_doms.is_empty() {
-            continue;
-        } // unreachable
 
         // The immediate dominator is the dominator (other than
         // self) that is dominated by every other dominator (other
         // than self). Equivalently: the dominator that has the
         // largest dominator set — all other dominators of `block`
         // also dominate the idom.
-        let candidates: Vec<BlockId> = my_doms.iter().copied().filter(|&d| d != block.id).collect();
+        let candidates: Vec<usize> = doms
+            .blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, _)| {
+                (idx != block_idx && bit_is_set(&doms.doms[block_idx], idx)).then_some(idx)
+            })
+            .collect();
 
-        let idom = candidates.iter().copied().find(|&cand| {
+        let idom = candidates.iter().copied().find(|&cand_idx| {
             // cand is idom iff no other candidate strictly
             // dominates it (only cand itself and cand's own
             // dominators do).
-            let cand_doms = doms.get(&cand).cloned().unwrap_or_default();
-            candidates
-                .iter()
-                .all(|&other| other == cand || cand_doms.contains(&other))
+            candidates.iter().all(|&other_idx| {
+                other_idx == cand_idx || bit_is_set(&doms.doms[cand_idx], other_idx)
+            })
         });
 
-        if let Some(idom) = idom {
-            idoms.insert(block.id, idom);
+        if let Some(idom_idx) = idom {
+            idoms.insert(block.id, doms.blocks[idom_idx]);
         }
     }
 

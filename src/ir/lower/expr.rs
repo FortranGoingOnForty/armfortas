@@ -568,6 +568,9 @@ pub(crate) fn lower_expr_full(
                         b.load_typed(info.addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
                     }
                 } else if info.derived_type.is_some() {
+                    if info.is_class && local_uses_array_descriptor(info) && info.dims.is_empty() {
+                        return array_base_addr(b, info);
+                    }
                     if info
                         .derived_type
                         .as_ref()
@@ -751,6 +754,21 @@ pub(crate) fn lower_expr_full(
                 left,
                 right,
             ) {
+                if let Some(result) = emit_type_bound_binary_operator_dispatch(
+                    b,
+                    locals,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                    op,
+                    left,
+                    right,
+                    &specific,
+                ) {
+                    return result;
+                }
                 let lhs = lower_expr_full(
                     b,
                     locals,
@@ -2402,6 +2420,9 @@ pub(crate) fn lower_expr_full(
                 });
                 let callee_pointer_args =
                     first_procedure_lookup(&abi_lookup_keys, |k| callee_pointer_arg_mask(st, k));
+                let callee_allocatable_args = first_procedure_lookup(&abi_lookup_keys, |k| {
+                    callee_allocatable_arg_mask(st, k)
+                });
                 let callee_class_args =
                     first_procedure_lookup(&abi_lookup_keys, |k| callee_class_arg_mask(st, k));
                 let opt_flags =
@@ -2436,6 +2457,10 @@ pub(crate) fn lower_expr_full(
                         .as_ref()
                         .map(|mask| mask.get(i).copied().unwrap_or(false))
                         .unwrap_or(false);
+                    let dummy_is_allocatable = callee_allocatable_args
+                        .as_ref()
+                        .map(|mask| mask.get(i).copied().unwrap_or(false))
+                        .unwrap_or(false);
                     let is_optional = opt_flags
                         .as_ref()
                         .map(|mask| mask.get(i).copied().unwrap_or(false))
@@ -2448,70 +2473,70 @@ pub(crate) fn lower_expr_full(
                                 // INTENT(OUT)/INOUT writes land in the chosen
                                 // actual. `materialize` is the ordinary ABI
                                 // decision tree for one arm/non-conditional arg.
-                                let mut materialize =
-                                    |b: &mut FuncBuilder,
-                                     e: &crate::ast::expr::SpannedExpr|
-                                     -> ValueId {
-                                        let value = if is_value && wants_bind_c_char {
-                                            lower_bind_c_char_value_arg(
-                                                b,
-                                                locals,
-                                                e,
-                                                st,
-                                                type_layouts,
-                                                internal_funcs,
-                                                contained_host_refs,
-                                                descriptor_params,
-                                            )
-                                        } else if is_value {
-                                            let raw = lower_expr_full(
-                                                b,
-                                                locals,
-                                                e,
-                                                st,
-                                                type_layouts,
-                                                internal_funcs,
-                                                contained_host_refs,
-                                                descriptor_params,
-                                            );
-                                            coerce_value_call_arg(b, st, abi_primary_key, i, raw)
-                                        } else if wants_descriptor {
-                                            lower_arg_descriptor_full(
-                                                b,
-                                                locals,
-                                                e,
-                                                st,
-                                                type_layouts,
-                                                internal_funcs,
-                                                contained_host_refs,
-                                                descriptor_params,
-                                                wants_polymorphic_descriptor,
-                                            )
-                                        } else if wants_string_descriptor {
-                                            lower_arg_string_descriptor(b, locals, e, st, type_layouts)
-                                        } else if wants_bind_c_char {
-                                            lower_bind_c_char_arg_raw(
-                                                b,
-                                                locals,
-                                                e,
-                                                st,
-                                                type_layouts,
-                                                internal_funcs,
-                                                contained_host_refs,
-                                                descriptor_params,
-                                            )
-                                        } else if wants_pointer {
-                                            lower_pointer_dummy_actual(
-                                                b,
-                                                locals,
-                                                e,
-                                                st,
-                                                type_layouts,
-                                                internal_funcs,
-                                                contained_host_refs,
-                                                descriptor_params,
-                                            )
-                                            .unwrap_or_else(|| {
+                                let mut materialize = |b: &mut FuncBuilder,
+                                                       e: &crate::ast::expr::SpannedExpr|
+                                 -> ValueId {
+                                    let value = if is_value && wants_bind_c_char {
+                                        lower_bind_c_char_value_arg(
+                                            b,
+                                            locals,
+                                            e,
+                                            st,
+                                            type_layouts,
+                                            internal_funcs,
+                                            contained_host_refs,
+                                            descriptor_params,
+                                        )
+                                    } else if is_value {
+                                        let raw = lower_expr_full(
+                                            b,
+                                            locals,
+                                            e,
+                                            st,
+                                            type_layouts,
+                                            internal_funcs,
+                                            contained_host_refs,
+                                            descriptor_params,
+                                        );
+                                        coerce_value_call_arg(b, st, abi_primary_key, i, raw)
+                                    } else if wants_descriptor {
+                                        lower_arg_descriptor_full(
+                                            b,
+                                            locals,
+                                            e,
+                                            st,
+                                            type_layouts,
+                                            internal_funcs,
+                                            contained_host_refs,
+                                            descriptor_params,
+                                            wants_polymorphic_descriptor,
+                                        )
+                                    } else if wants_string_descriptor {
+                                        lower_arg_string_descriptor(b, locals, e, st, type_layouts)
+                                    } else if wants_bind_c_char {
+                                        lower_bind_c_char_arg_raw(
+                                            b,
+                                            locals,
+                                            e,
+                                            st,
+                                            type_layouts,
+                                            internal_funcs,
+                                            contained_host_refs,
+                                            descriptor_params,
+                                        )
+                                    } else if wants_pointer {
+                                        lower_pointer_dummy_actual(
+                                            b,
+                                            locals,
+                                            e,
+                                            st,
+                                            type_layouts,
+                                            internal_funcs,
+                                            contained_host_refs,
+                                            descriptor_params,
+                                        )
+                                        .unwrap_or_else(
+                                            || {
                                                 lower_arg_by_ref_for_dummy_full(
                                                     b,
                                                     locals,
@@ -2523,35 +2548,42 @@ pub(crate) fn lower_expr_full(
                                                     descriptor_params,
                                                     dummy_is_class,
                                                 )
-                                            })
-                                        } else {
-                                            lower_arg_by_ref_for_dummy_full(
-                                                b,
-                                                locals,
-                                                e,
-                                                st,
-                                                type_layouts,
-                                                internal_funcs,
-                                                contained_host_refs,
-                                                descriptor_params,
-                                                dummy_is_class,
-                                            )
-                                        };
-                                        optional_arg_absent_if_unallocated_allocatable_char(
+                                            },
+                                        )
+                                    } else {
+                                        lower_arg_by_ref_for_dummy_full(
                                             b,
                                             locals,
                                             e,
                                             st,
                                             type_layouts,
-                                            is_optional
-                                                && !is_value
-                                                && !wants_descriptor
-                                                && !wants_string_descriptor
-                                                && !wants_bind_c_char
-                                                && !wants_pointer,
-                                            value,
+                                            internal_funcs,
+                                            contained_host_refs,
+                                            descriptor_params,
+                                            dummy_is_class,
                                         )
                                     };
+                                    let value = optional_arg_absent_if_forwarded_by_ref_dummy(
+                                        b,
+                                        locals,
+                                        e,
+                                        is_optional && !is_value,
+                                        value,
+                                    );
+                                    optional_arg_absent_if_unallocated_allocatable(
+                                        b,
+                                        locals,
+                                        e,
+                                        st,
+                                        type_layouts,
+                                        is_optional
+                                            && !is_value
+                                            && !dummy_is_allocatable
+                                            && !wants_bind_c_char
+                                            && !wants_pointer,
+                                        value,
+                                    )
+                                };
                                 super::stmt::lower_call_arg_maybe_conditional(
                                     b,
                                     locals,
@@ -2944,6 +2976,10 @@ pub(crate) fn lower_expr_full(
                                 first_procedure_lookup(&abi_lookup_keys, |k| {
                                     callee_pointer_arg_mask(st, k)
                                 });
+                            let callee_allocatable_args =
+                                first_procedure_lookup(&abi_lookup_keys, |k| {
+                                    callee_allocatable_arg_mask(st, k)
+                                });
                             let opt_flags = first_procedure_lookup(&abi_lookup_keys, |k| {
                                 callee_optional_arg_mask(st, k)
                             });
@@ -3001,6 +3037,10 @@ pub(crate) fn lower_expr_full(
                                 let wants_string_descriptor =
                                     wants_string_descriptor && !wants_bind_c_char;
                                 let wants_pointer = callee_pointer_args
+                                    .as_ref()
+                                    .map(|mask| mask.get(i).copied().unwrap_or(false))
+                                    .unwrap_or(false);
+                                let dummy_is_allocatable = callee_allocatable_args
                                     .as_ref()
                                     .map(|mask| mask.get(i).copied().unwrap_or(false))
                                     .unwrap_or(false);
@@ -3106,7 +3146,15 @@ pub(crate) fn lower_expr_full(
                                                     descriptor_params,
                                                 )
                                             };
-                                            optional_arg_absent_if_unallocated_allocatable_char(
+                                            let value =
+                                                optional_arg_absent_if_forwarded_by_ref_dummy(
+                                                    b,
+                                                    locals,
+                                                    e,
+                                                    is_optional && !is_value,
+                                                    value,
+                                                );
+                                            optional_arg_absent_if_unallocated_allocatable(
                                                 b,
                                                 locals,
                                                 e,
@@ -3114,8 +3162,7 @@ pub(crate) fn lower_expr_full(
                                                 type_layouts,
                                                 is_optional
                                                     && !is_value
-                                                    && !wants_descriptor
-                                                    && !wants_string_descriptor
+                                                    && !dummy_is_allocatable
                                                     && !wants_bind_c_char
                                                     && !wants_pointer,
                                                 value,
@@ -3332,12 +3379,14 @@ pub(crate) fn lower_expr_full(
                 });
                 if let Some((base_addr, type_name)) = resolved {
                     if let Some(layout) = tl.get(&type_name) {
-                        if let Some(field) = layout.field(component) {
+                        if let Some(field) =
+                            layout_component_field_or_parent_view(layout, component, tl)
+                        {
                             let offset = b.const_i64(field.offset as i64);
                             let field_ptr =
                                 b.gep(base_addr, vec![offset], IrType::Int(IntWidth::I8));
 
-                            if is_deferred_char_component_field(field) {
+                            if is_deferred_char_component_field(&field) {
                                 let (ptr, _len) = load_string_descriptor_view(b, field_ptr);
                                 return ptr;
                             }

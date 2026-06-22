@@ -221,21 +221,18 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
     // ways that surface latent bugs in arg-setup emission — but we
     // do consult this tighter map before committing to a split.
     let mut vreg_actual_range: HashMap<VRegId, (u32, u32)> = HashMap::new();
-    // Vregs defined in more than one MIR block — these are
-    // phi-like (block params receiving values via the parallel-copy
-    // sequence emit_branch_arg_copies inserts at the end of every
-    // predecessor). Linear-position liveness can't represent the
-    // true CFG-aware live set for these, so the splitter must not
-    // act on them: a call block lexically wedged between the def
-    // edge and the use block fakes a crossing point that no actual
-    // control-flow path traverses, and the resulting split assigns
-    // the post-half a different physreg than the pre-half — every
-    // predecessor's parallel-copy lands in pre_phys but every use
-    // inside the loop reads post_phys. (`realworld_affine_shift.f90`
-    // at -O2+ exhibits this: V_iv defined in `if_end_1`, used in
-    // `do_check_3`/`do_body_4`, but `if_then_2` carrying the
-    // recursive call is lexically between if_end_1 and do_check_3.)
-    let mut vreg_def_blocks: HashMap<VRegId, std::collections::HashSet<usize>> = HashMap::new();
+    // Vregs defined in more than one MIR block, or referenced from
+    // more than one MIR block, are not safe to split at a linear call
+    // position. Multi-def vregs are phi-like block params receiving
+    // values via predecessor parallel-copies. Cross-block references
+    // have the same hazard even with a single edge-copy def: a shim
+    // block can be emitted after its target block, so a call block
+    // lexically wedged between the target use and the shim def fakes a
+    // crossing point no real control-flow path traverses. Splitting
+    // then assigns the post-half a different physreg than the branch
+    // copy writes, so target-block uses read stale garbage.
+    let mut vreg_def_blocks: HashMap<VRegId, HashSet<usize>> = HashMap::new();
+    let mut vreg_ref_blocks: HashMap<VRegId, HashSet<usize>> = HashMap::new();
     {
         let mut p: u32 = 0;
         for (block_idx, block) in mf.blocks.iter().enumerate() {
@@ -244,10 +241,12 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
                 if let Some(d) = inst.def {
                     touched.push(d);
                     vreg_def_blocks.entry(d).or_default().insert(block_idx);
+                    vreg_ref_blocks.entry(d).or_default().insert(block_idx);
                 }
                 for op in &inst.operands {
                     if let MachineOperand::VReg(v) = op {
                         touched.push(*v);
+                        vreg_ref_blocks.entry(*v).or_default().insert(block_idx);
                     }
                 }
                 for v in touched {
@@ -263,7 +262,7 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
             }
         }
     }
-    let multi_def_vregs: std::collections::HashSet<VRegId> = vreg_def_blocks
+    let multi_def_vregs: HashSet<VRegId> = vreg_def_blocks
         .iter()
         .filter(|(_, blocks)| blocks.len() > 1)
         .map(|(v, _)| *v)
@@ -340,12 +339,15 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
         // range from the MIR walk: a vreg whose real range doesn't
         // straddle the supposed crossing point is a false positive
         // from inflated liveness, and must NOT be split.
-        let real_crosses = if multi_def_vregs.contains(&interval.vreg) {
-            // Phi-like vreg: positions can't represent the true
-            // live set (see comment above where multi_def_vregs is
-            // built). Refuse to split — the parallel-copy at every
-            // predecessor must land in the same physreg as every
-            // use, and splitting fundamentally breaks that.
+        let single_ref_block = vreg_ref_blocks
+            .get(&interval.vreg)
+            .is_some_and(|blocks| blocks.len() == 1);
+        let real_crosses = if multi_def_vregs.contains(&interval.vreg) || !single_ref_block {
+            // CFG-carried vreg: positions can't represent the true
+            // live set (see comment above where the def/ref block
+            // sets are built). Refuse to split — predecessor
+            // parallel-copies and target-block uses must agree on
+            // one physreg or one spill slot.
             false
         } else if let Some(&(real_start, real_end)) = vreg_actual_range.get(&interval.vreg) {
             interval.call_crossings.len() == 1
@@ -2154,6 +2156,101 @@ mod tests {
         let blr = mf.blocks[0].insts.last().unwrap();
         assert_eq!(blr.opcode, ArmOpcode::Blr);
         assert_eq!(blr.operands, vec![MachineOperand::PhysReg(PhysReg::Gp(10))]);
+    }
+
+    #[test]
+    fn linear_scan_does_not_split_cross_block_branch_param() {
+        // Branch-argument shims are appended after the original IR
+        // blocks. A target block can therefore use a block-param vreg
+        // earlier in linear order than the shim that defines it. If an
+        // unrelated call block sits between those two positions, plain
+        // linear liveness reports a false call crossing. With the
+        // callee-saved pool exhausted, the splitter used to split that
+        // vreg and make target uses read a different physreg than the
+        // shim wrote.
+        let mut mf = MachineFunction::new("test".into());
+        let target = mf.new_block("target");
+        let cold_call = mf.new_block("cold_call");
+        let shim = mf.new_block("shim");
+        let exit = mf.new_block("exit");
+
+        let pressure: Vec<VRegId> = (0..10).map(|_| mf.new_vreg(RegClass::Gp64)).collect();
+        let carried = mf.new_vreg(RegClass::Gp64);
+
+        for (i, &v) in pressure.iter().enumerate() {
+            mf.blocks[0].insts.push(MachineInst {
+                opcode: ArmOpcode::Movz,
+                operands: vec![MachineOperand::VReg(v), MachineOperand::Imm(i as i64 + 1)],
+                def: Some(v),
+            });
+        }
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::B,
+            operands: vec![MachineOperand::BlockRef(shim)],
+            def: None,
+        });
+
+        mf.block_mut(target).insts.push(MachineInst {
+            opcode: ArmOpcode::MovReg,
+            operands: vec![
+                MachineOperand::PhysReg(PhysReg::Gp(0)),
+                MachineOperand::VReg(carried),
+            ],
+            def: None,
+        });
+        mf.block_mut(target).insts.push(MachineInst {
+            opcode: ArmOpcode::B,
+            operands: vec![MachineOperand::BlockRef(exit)],
+            def: None,
+        });
+
+        mf.block_mut(cold_call).insts.push(MachineInst {
+            opcode: ArmOpcode::Bl,
+            operands: vec![MachineOperand::Extern("_cold".into())],
+            def: None,
+        });
+        mf.block_mut(cold_call).insts.push(MachineInst {
+            opcode: ArmOpcode::B,
+            operands: vec![MachineOperand::BlockRef(exit)],
+            def: None,
+        });
+
+        mf.block_mut(shim).insts.push(MachineInst {
+            opcode: ArmOpcode::MovReg,
+            operands: vec![
+                MachineOperand::VReg(carried),
+                MachineOperand::VReg(pressure[0]),
+            ],
+            def: Some(carried),
+        });
+        for &v in &pressure {
+            mf.block_mut(shim).insts.push(MachineInst {
+                opcode: ArmOpcode::MovReg,
+                operands: vec![
+                    MachineOperand::PhysReg(PhysReg::Gp(1)),
+                    MachineOperand::VReg(v),
+                ],
+                def: None,
+            });
+        }
+        mf.block_mut(shim).insts.push(MachineInst {
+            opcode: ArmOpcode::B,
+            operands: vec![MachineOperand::BlockRef(target)],
+            def: None,
+        });
+
+        mf.block_mut(exit).insts.push(MachineInst {
+            opcode: ArmOpcode::Ret,
+            operands: vec![],
+            def: None,
+        });
+
+        let result = linear_scan(&mut mf);
+        assert!(
+            result.split_records.iter().all(|r| r.vreg != carried),
+            "branch-carried cross-block vreg must not be split: {:#?}",
+            result.split_records
+        );
     }
 
     #[test]

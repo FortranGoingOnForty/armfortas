@@ -838,15 +838,15 @@ impl FormatEngine {
                 Ok(fit_field(&s, *width))
             }
             (FormatDesc::IntegerB { width, min_digits }, IoValue::Integer(v)) => {
-                let s = format_radix_integer(*v, *min_digits, 2);
+                let s = format_radix_integer(*v, *min_digits, 2, *width);
                 Ok(fit_field(&s, *width))
             }
             (FormatDesc::IntegerO { width, min_digits }, IoValue::Integer(v)) => {
-                let s = format_radix_integer(*v, *min_digits, 8);
+                let s = format_radix_integer(*v, *min_digits, 8, *width);
                 Ok(fit_field(&s, *width))
             }
             (FormatDesc::IntegerZ { width, min_digits }, IoValue::Integer(v)) => {
-                let s = format_radix_integer(*v, *min_digits, 16);
+                let s = format_radix_integer(*v, *min_digits, 16, *width);
                 Ok(fit_field(&s, *width))
             }
 
@@ -872,7 +872,8 @@ impl FormatEngine {
                 if let Some(s) = self.format_nonfinite(*v) {
                     return Ok(self.apply_decimal_sep(&fit_field(&s, *width)));
                 }
-                let s = self.apply_leading_zero(&self.format_e_style(*v, *decimals, *exp_width, 'E'));
+                let s =
+                    self.apply_leading_zero(&self.format_e_style(*v, *decimals, *exp_width, 'E'));
                 Ok(self.apply_decimal_sep(&fit_exponential_field(&s, *width)))
             }
             (
@@ -1262,7 +1263,23 @@ impl FormatEngine {
     }
 }
 
-fn format_radix_integer(value: i128, min_digits: Option<usize>, radix: u32) -> String {
+fn format_radix_integer(
+    value: i128,
+    min_digits: Option<usize>,
+    radix: u32,
+    width: usize,
+) -> String {
+    if value < 0 && radix == 16 {
+        let digits = min_digits.unwrap_or(width).max(1);
+        let bit_width = digits.saturating_mul(4).min(128);
+        let mask = if bit_width == 128 {
+            u128::MAX
+        } else {
+            (1u128 << bit_width) - 1
+        };
+        return format!("{:0>width$X}", (value as u128) & mask, width = digits);
+    }
+
     let digits = match radix {
         2 => format!("{:b}", value.unsigned_abs()),
         8 => format!("{:o}", value.unsigned_abs()),
@@ -1604,6 +1621,14 @@ mod tests {
     }
 
     #[test]
+    fn format_hex_negative_uses_requested_twos_complement_width() {
+        let descs = parse_format("(Z16.16)");
+        let mut engine = FormatEngine::new(descs);
+        let out = engine.format_values(&[IoValue::Integer(-1)]);
+        assert_eq!(out, "FFFFFFFFFFFFFFFF");
+    }
+
+    #[test]
     fn format_octal_integer() {
         let descs = parse_format("(O6)");
         let mut engine = FormatEngine::new(descs);
@@ -1735,7 +1760,10 @@ mod tests {
             LeadingZeroMode::from_specifier("Processor_Defined"),
             LeadingZeroMode::Default
         );
-        assert_eq!(LeadingZeroMode::from_specifier(""), LeadingZeroMode::Default);
+        assert_eq!(
+            LeadingZeroMode::from_specifier(""),
+            LeadingZeroMode::Default
+        );
         assert_eq!(
             LeadingZeroMode::from_specifier("garbage"),
             LeadingZeroMode::Default
@@ -1793,7 +1821,8 @@ mod tests {
     #[test]
     fn format_leading_zero_suppress() {
         // LZS drops the leading zero; default/LZP keep it.
-        let s = FormatEngine::new(parse_format("(LZS, F6.3)")).format_values(&[IoValue::Real(0.25)]);
+        let s =
+            FormatEngine::new(parse_format("(LZS, F6.3)")).format_values(&[IoValue::Real(0.25)]);
         assert_eq!(s.trim(), ".250");
         let neg =
             FormatEngine::new(parse_format("(LZS, F7.3)")).format_values(&[IoValue::Real(-0.25)]);
@@ -1808,7 +1837,8 @@ mod tests {
     #[test]
     fn format_leading_zero_suppress_only_below_one() {
         // No leading zero to drop when |value| >= 1.
-        let s = FormatEngine::new(parse_format("(LZS, F7.3)")).format_values(&[IoValue::Real(10.25)]);
+        let s =
+            FormatEngine::new(parse_format("(LZS, F7.3)")).format_values(&[IoValue::Real(10.25)]);
         assert_eq!(s.trim(), "10.250");
     }
 
@@ -1818,7 +1848,10 @@ mod tests {
         let s =
             FormatEngine::new(parse_format("(LZS, E10.3)")).format_values(&[IoValue::Real(0.25)]);
         assert!(s.contains(".250"), "got {s}");
-        assert!(!s.trim().starts_with('0'), "leading zero not suppressed: {s}");
+        assert!(
+            !s.trim().starts_with('0'),
+            "leading zero not suppressed: {s}"
+        );
     }
 
     #[test]

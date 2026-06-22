@@ -3160,6 +3160,78 @@ fn bind_c_c_char_buffer_writes_scalar_character_storage() {
 }
 
 #[test]
+fn bind_c_c_char_buffer_writes_allocatable_array_storage() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=bind_c_c_char_buffer_writes_allocatable_array_storage count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("bind_c_c_char_alloc_array");
+    let c_src = write_program_in(
+        &dir,
+        "write_buf.c",
+        "char *write_buf(char *buf, int n) {\n    static const char msg[] = \"abc\";\n    int len = n < 3 ? n : 3;\n    for (int i = 0; i < len; ++i) buf[i] = msg[i];\n    if (n > len) buf[len] = '\\0';\n    return buf;\n}\n",
+    );
+    let c_obj = dir.join("write_buf.o");
+    compile_c_object(&c_src, &c_obj);
+
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use iso_c_binding, only: c_char, c_int, c_ptr, c_associated\n  implicit none\n  interface\n    function write_buf(buf, n) result(ptr) bind(C, name='write_buf')\n      import :: c_char, c_int, c_ptr\n      character(kind=c_char, len=1), intent(in) :: buf(*)\n      integer(c_int), value, intent(in) :: n\n      type(c_ptr) :: ptr\n    end function write_buf\n  end interface\n  character(kind=c_char, len=1), allocatable :: cpath(:)\n  type(c_ptr) :: tmp\n  allocate(cpath(4))\n  cpath = '?'\n  tmp = write_buf(cpath, 4_c_int)\n  if (.not. c_associated(tmp)) error stop 1\n  if (cpath(1) /= 'a') error stop 2\n  if (cpath(2) /= 'b') error stop 3\n  if (cpath(3) /= 'c') error stop 4\n  print *, 'ok'\nend program\n",
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_obj = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("bind(c) allocatable c_char array object compile failed to spawn");
+    assert!(
+        compile_obj.status.success(),
+        "bind(c) allocatable c_char array should compile to an object: {}",
+        String::from_utf8_lossy(&compile_obj.stderr)
+    );
+
+    let exe = dir.join("bind_c_c_char_alloc_array.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            main_obj.to_str().unwrap(),
+            c_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("bind(c) allocatable c_char array link failed to spawn");
+    assert!(
+        link.status.success(),
+        "bind(c) allocatable c_char array objects should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("bind(c) allocatable c_char array run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "bind(c) allocatable c_char array should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn bind_c_c_char_buffer_survives_amod_import_without_hidden_lengths() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -7199,6 +7271,94 @@ fn type_bound_deferred_char_result_preserves_pass_object_and_length() {
 }
 
 #[test]
+fn dynamic_type_bound_derived_result_uses_hidden_result_storage() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=dynamic_type_bound_derived_result_uses_hidden_result_storage count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type feature_config_t\n    character(len=:), allocatable :: name\n  end type\n  type collection_t\n    type(feature_config_t) :: base\n  contains\n    procedure :: extract_for_target\n    procedure :: merge_into_package\n  end type\ncontains\n  type(feature_config_t) function extract_for_target(self) result(feature)\n    class(collection_t), intent(in) :: self\n    feature = self%base\n  end function\n  subroutine print_feature_collection(collection)\n    type(collection_t), intent(in) :: collection\n    type(feature_config_t) :: extracted\n    extracted = collection%extract_for_target()\n    if (extracted%name /= 'release') error stop 1\n  end subroutine\n  subroutine merge_into_package(self)\n    class(collection_t), intent(in) :: self\n    type(feature_config_t) :: feature\n    feature = self%extract_for_target()\n    if (feature%name /= 'release') error stop 2\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(collection_t) :: c\n  c%base%name = 'release'\n  call print_feature_collection(c)\n  call c%merge_into_package()\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("dynamic_tbp_derived_result", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("dynamic type-bound derived result compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "dynamic type-bound derived result compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("dynamic type-bound derived result run failed");
+    assert!(
+        run.status.success(),
+        "dynamic type-bound derived result should use hidden result storage: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected dynamic type-bound derived result output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn comma_separated_type_bound_procs_all_resolve_as_methods() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=comma_separated_type_bound_procs_all_resolve_as_methods count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type :: settings_t\n    character(len=:), allocatable :: path\n    character(len=:), allocatable :: name\n  contains\n    procedure :: has_custom_location, full_path, path_or_empty\n  end type\ncontains\n  logical function has_custom_location(self)\n    class(settings_t), intent(in) :: self\n    has_custom_location = allocated(self%path) .and. allocated(self%name)\n  end function\n  function full_path(self) result(result)\n    class(settings_t), intent(in) :: self\n    character(len=:), allocatable :: result\n    result = self%path // '/' // self%name\n  end function\n  function path_or_empty(self) result(result)\n    class(settings_t), intent(in) :: self\n    character(len=:), allocatable :: result\n    if (allocated(self%path)) then\n      result = self%path\n    else\n      result = ''\n    end if\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  type(settings_t) :: settings\n  character(len=:), allocatable :: value\n  settings%path = 'abc'\n  settings%name = 'def'\n  if (.not. settings%has_custom_location()) error stop 1\n  value = settings%full_path()\n  if (value /= 'abc/def') error stop 2\n  value = settings%path_or_empty()\n  if (value /= 'abc') error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("comma_separated_tbp", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("comma-separated type-bound procedure compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "comma-separated type-bound procedure compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("comma-separated type-bound procedure run failed");
+    assert!(
+        run.status.success(),
+        "comma-separated type-bound procedure run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected comma-separated type-bound procedure output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn scalar_char_substring_argument_avoids_raw_local_symbol() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -7576,6 +7736,43 @@ fn c_f_pointer_scalar_fixed_c_char_pointer_reads_back_bytes() {
     assert!(
         run.status.success(),
         "c_f_pointer scalar fixed c_char run failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn c_f_pointer_runtime_len_c_char_pointer_copies_back_bytes() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=c_f_pointer_runtime_len_c_char_pointer_copies_back_bytes count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  use iso_c_binding\n  implicit none\ncontains\n  function f_string_cptr_n(cptr, n) result(s)\n    type(c_ptr), intent(in), value :: cptr\n    integer(kind=c_size_t), intent(in) :: n\n    character(len=n, kind=c_char) :: s\n    character(len=n, kind=c_char), pointer :: sptr\n    call c_f_pointer(cptr, sptr)\n    s = sptr\n  end function\nend module\nprogram p\n  use iso_c_binding\n  use m\n  implicit none\n  character(kind=c_char), target :: buf(4)\n  character(len=:, kind=c_char), allocatable :: out\n  buf = [achar(97, kind=c_char), achar(98, kind=c_char), achar(99, kind=c_char), c_null_char]\n  out = f_string_cptr_n(c_loc(buf(1)), 3_c_size_t)\n  if (len(out) /= 3) error stop 1\n  if (out /= 'abc') error stop 2\n  print *, out\nend program\n",
+        "f90",
+    );
+    let out = unique_path("c_f_pointer_runtime_len_scalar_char", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("c_f_pointer runtime-len c_char compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "c_f_pointer runtime-len c_char compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("c_f_pointer runtime-len c_char run failed");
+    assert!(
+        run.status.success(),
+        "c_f_pointer runtime-len c_char run failed: {}",
         String::from_utf8_lossy(&run.stderr)
     );
 
@@ -9638,6 +9835,96 @@ fn class_allocatable_intent_out_constructor_preserves_descriptor_storage() {
 }
 
 #[test]
+fn parent_component_actual_on_allocatable_extension_passes_object_storage() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=parent_component_actual_on_allocatable_extension_passes_object_storage count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type :: feature_t\n    character(:), allocatable :: name\n    character(:), allocatable :: description\n  end type\n  type, extends(feature_t) :: package_t\n    character(:), allocatable :: license\n  end type\ncontains\n  subroutine init_feature(self)\n    type(feature_t), intent(inout) :: self\n    call set_value(self%description)\n  end subroutine\n  subroutine set_value(val)\n    character(:), allocatable, intent(out) :: val\n    val = 'abc'\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(package_t), allocatable :: package\n  allocate(package)\n  call init_feature(package%feature_t)\n  if (.not. allocated(package%description)) error stop 1\n  if (package%description /= 'abc') error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("parent_component_allocatable_extension_actual", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("parent component actual compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "parent component actual should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("parent component actual run failed to spawn");
+    assert!(
+        run.status.success(),
+        "parent component actual should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected parent component actual output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn parent_component_assignment_deep_copies_allocatable_char_fields() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=parent_component_assignment_deep_copies_allocatable_char_fields count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type :: base_t\n    character(len=:), allocatable :: name\n    character(len=:), allocatable :: path\n  end type\n  type, extends(base_t) :: node_t\n    logical :: done = .false.\n  end type\ncontains\n  subroutine init_node(node, base)\n    type(node_t), intent(out) :: node\n    type(base_t), intent(in) :: base\n    node%base_t = base\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(base_t) :: base\n  type(node_t) :: node\n  base%name = 'fpm'\n  base%path = '.'\n  call init_node(node, base)\n  if (.not. allocated(node%name)) error stop 1\n  if (.not. allocated(node%path)) error stop 2\n  if (node%name /= 'fpm') error stop 3\n  if (node%path /= '.') error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("parent_component_assignment_alloc_char", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("parent component assignment compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "parent component assignment should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("parent component assignment run failed to spawn");
+    assert!(
+        run.status.success(),
+        "parent component assignment should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected parent component assignment output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn scalar_derived_constructor_result_actual_preserves_object_storage() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -10780,6 +11067,50 @@ fn dash_capital_d_defines_preprocessor_macro() {
     assert!(
         pp.contains(", 1"),
         "preprocessed text should take the defined branch: {}",
+        pp
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn dash_capital_d_prescans_macro_argument_before_stringification() {
+    let src = write_program(
+        "#define STRINGIFY_(X) #X\n\
+         #define STRINGIFY_START(X) &\n\
+         #define STRINGIFY_END(X) STRINGIFY_(X)\n\
+         program p\n\
+           character(len=*), parameter :: ver = STRINGIFY_START(FPM_RELEASE_VERSION)\n\
+         STRINGIFY_END(FPM_RELEASE_VERSION)\n\
+           print *, ver\n\
+         end program\n",
+        "F90",
+    );
+    let out = unique_path("pp_define_stringify", "f90");
+    let result = Command::new(compiler("armfortas"))
+        .args([
+            "-DFPM_RELEASE_VERSION=0.13.0",
+            "-E",
+            src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        result.status.success(),
+        "-D stringification preprocess failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let pp = std::fs::read_to_string(&out).expect("missing preprocessed output");
+    assert!(
+        pp.contains("\"0.13.0\""),
+        "preprocessed text should stringify the expanded -D value: {}",
+        pp
+    );
+    assert!(
+        !pp.contains("\"FPM_RELEASE_VERSION\""),
+        "preprocessed text should not stringify the raw macro name: {}",
         pp
     );
     let _ = std::fs::remove_file(&out);
@@ -17182,6 +17513,121 @@ fn optional_assumed_shape_dummy_rebases_lower_to_one_when_present() {
 }
 
 #[test]
+fn unallocated_allocatable_actual_to_optional_assumed_shape_is_absent() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=unallocated_allocatable_actual_to_optional_assumed_shape_is_absent count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // F2018 §15.5.2.12: an unallocated allocatable actual associated
+    // with a non-allocatable optional dummy is not present.  The same
+    // actual associated with an allocatable optional dummy is present,
+    // but remains unallocated.
+    let src = write_program(
+        "module m\n  implicit none\n  type :: string_t\n    character(:), allocatable :: s\n  end type\ncontains\n  subroutine probe_nonalloc(features)\n    type(string_t), optional, target, intent(in) :: features(:)\n    if (present(features)) error stop 1\n  end subroutine\n\n  subroutine probe_alloc(features)\n    type(string_t), allocatable, optional, intent(in) :: features(:)\n    if (.not. present(features)) error stop 2\n    if (allocated(features)) error stop 3\n  end subroutine\n\n  subroutine probe_present(features)\n    type(string_t), optional, target, intent(in) :: features(:)\n    if (.not. present(features)) error stop 4\n    if (size(features) /= 1) error stop 5\n  end subroutine\nend module\n\nprogram p\n  use m\n  implicit none\n  type(string_t), allocatable :: features(:)\n  call probe_nonalloc(features)\n  call probe_alloc(features)\n  allocate(features(1))\n  features(1)%s = 'x'\n  call probe_present(features)\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("optional_unallocated_alloc_actual", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "run failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected 'ok': {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn class_derived_function_result_copies_inherited_allocatable_component() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=class_derived_function_result_copies_inherited_allocatable_component count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type :: base_t\n    integer, allocatable :: xs(:)\n  end type\n  type, extends(base_t) :: child_t\n    integer :: tag\n  end type\ncontains\n  function export(self) result(r)\n    class(child_t), intent(in), target :: self\n    type(child_t) :: r\n    r = self\n  end function\nend module\n\nprogram p\n  use m\n  implicit none\n  type(child_t), target :: cfg\n  type(child_t), allocatable :: a\n  allocate(cfg%xs(2))\n  cfg%xs = [11, 22]\n  cfg%tag = 7\n  allocate(a)\n  a = export(cfg)\n  if (.not. allocated(a%xs)) error stop 1\n  if (size(a%xs) /= 2) error stop 2\n  if (a%xs(1) /= 11 .or. a%xs(2) /= 22) error stop 3\n  if (a%tag /= 7) error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("class_derived_alloc_component_copy", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "run failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected 'ok': {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn imported_type_allocatable_scalar_result_uses_derived_copy_path() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_type_allocatable_scalar_result_uses_derived_copy_path count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module types_m\n  implicit none\n  type :: base_t\n    integer, allocatable :: xs(:)\n  end type\n  type, extends(base_t) :: child_t\n    integer :: tag\n  contains\n    procedure :: count_xs\n  end type\ncontains\n  function export(self) result(r)\n    class(child_t), intent(in), target :: self\n    type(child_t) :: r\n    r = self\n  end function\n\n  function count_xs(self) result(n)\n    class(child_t), intent(in) :: self\n    integer :: n\n    n = 0\n    if (allocated(self%xs)) n = size(self%xs)\n  end function\nend module\n\nmodule user_m\n  use types_m, only: child_t, export\n  implicit none\ncontains\n  subroutine new_flags(package)\n    type(child_t), intent(in) :: package\n    if (package%count_xs() /= 2) error stop 1\n    if (package%tag /= 7) error stop 2\n  end subroutine\n\n  subroutine run()\n    type(child_t), target :: cfg\n    type(child_t), allocatable, target :: package\n    allocate(cfg%xs(2))\n    cfg%xs = [11, 22]\n    cfg%tag = 7\n    allocate(package)\n    package = export(cfg)\n    call new_flags(package)\n  end subroutine\nend module\n\nprogram p\n  use user_m, only: run\n  implicit none\n  call run()\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("imported_type_alloc_scalar_result", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "run failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected 'ok': {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn rank_n_array_compare_yields_same_shape_logical_descriptor_per_f2018() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -19177,6 +19623,126 @@ fn all_over_int8_pack_compare_lowers_descriptor() {
     assert!(
         run.status.success(),
         "all int8 pack should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected ok marker, got: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&obj);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn pack_actual_selects_array_specific_in_generic_call() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=pack_actual_selects_array_specific_in_generic_call count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type :: item_t\n    integer :: id = 0\n  end type\n  interface add_item\n    module procedure add_one\n    module procedure add_many\n  end interface\ncontains\n  subroutine add_one(list, new)\n    type(item_t), allocatable, intent(inout) :: list(:)\n    type(item_t), intent(in) :: new\n    allocate(list(1))\n    list(1)%id = -new%id\n  end subroutine\n  subroutine add_many(list, new)\n    type(item_t), allocatable, intent(inout) :: list(:)\n    type(item_t), intent(in) :: new(:)\n    allocate(list(size(new)))\n    list = new\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(item_t), allocatable :: list(:), values(:)\n  logical :: mask(3)\n  allocate(values(3))\n  values(1)%id = 1\n  values(2)%id = 2\n  values(3)%id = 3\n  mask = [.true., .false., .true.]\n  call add_item(list, pack(values, mask))\n  if (size(list) /= 2) error stop 1\n  if (list(1)%id /= 1) error stop 2\n  if (list(2)%id /= 3) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let obj = unique_path("pack_generic_array_specific", "o");
+    let compile_obj = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", obj.to_str().unwrap()])
+        .output()
+        .expect("pack generic object compile failed to spawn");
+    assert!(
+        compile_obj.status.success(),
+        "pack generic object should compile: {}",
+        String::from_utf8_lossy(&compile_obj.stderr)
+    );
+    let undef = undefined_symbols(&obj);
+    assert!(
+        !undef.iter().any(|s| s == "_pack"),
+        "PACK actual should not lower to raw _pack: {:?}",
+        undef
+    );
+
+    let out = unique_path("pack_generic_array_specific", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("pack generic compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "pack generic should compile + link: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("pack generic run failed");
+    assert!(
+        run.status.success(),
+        "pack generic should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected ok marker, got: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&obj);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn findloc_logical_mask_dim1_lowers_scalar_index() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=findloc_logical_mask_dim1_lowers_scalar_index count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: stat(4)\n  integer :: firsterror\n  stat = [0, 0, 7, 8]\n  firsterror = findloc(stat /= 0, value=.true., dim=1)\n  if (firsterror /= 3) error stop 1\n  stat = 0\n  firsterror = findloc(stat /= 0, value=.true., dim=1)\n  if (firsterror /= 0) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let obj = unique_path("findloc_logical_mask_dim1", "o");
+    let compile_obj = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", obj.to_str().unwrap()])
+        .output()
+        .expect("findloc object compile failed to spawn");
+    assert!(
+        compile_obj.status.success(),
+        "findloc object should compile: {}",
+        String::from_utf8_lossy(&compile_obj.stderr)
+    );
+    let undef = undefined_symbols(&obj);
+    assert!(
+        !undef.iter().any(|s| s == "_findloc"),
+        "FINDLOC should not lower to raw _findloc: {:?}",
+        undef
+    );
+
+    let out = unique_path("findloc_logical_mask_dim1", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("findloc compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "findloc should compile + link: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("findloc run failed");
+    assert!(
+        run.status.success(),
+        "findloc should pass: status={:?} stdout={} stderr={}",
         run.status,
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr)
@@ -25244,6 +25810,103 @@ fn fixed_len_allocatable_char_array_dummy_round_trips_through_amod_import_and_ru
 }
 
 #[test]
+fn module_deferred_char_array_global_elements_round_trip_through_amod() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=module_deferred_char_array_global_elements_round_trip_through_amod count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("module_deferred_char_global_amod");
+    let mod_src = write_program_in(
+        &dir,
+        "m.f90",
+        "module m\n  implicit none\n  character(len=:), allocatable, public :: keywords(:)\ncontains\n  subroutine insert_c(list, value, place)\n    character(len=*), intent(in) :: value\n    character(len=:), allocatable :: list(:)\n    character(len=:), allocatable :: kludge(:)\n    integer, intent(in) :: place\n    integer :: ii\n    integer :: endpoint\n    if (.not. allocated(list)) then\n      list = [character(len=max(len_trim(value), 2)) :: ]\n    endif\n    ii = max(len_trim(value), len(list), 2)\n    endpoint = size(list)\n    if (endpoint == 0) then\n      list = [character(len=ii) :: value]\n    elseif (place == 1) then\n      kludge = [character(len=ii) :: value, list]\n      list = kludge\n    else\n      error stop 10\n    endif\n  end subroutine\n  subroutine add_front(value)\n    character(len=*), intent(in) :: value\n    call insert_c(keywords, value, 1)\n  end subroutine\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use m, only: add_front, keywords\n  implicit none\n  call add_front('version')\n  call add_front('usage')\n  call add_front('help')\n  if (size(keywords) /= 3) error stop 1\n  if (len(keywords) /= 7) error stop 2\n  if (trim(keywords(1)) /= 'help') error stop 3\n  if (trim(keywords(2)) /= 'usage') error stop 4\n  if (trim(keywords(3)) /= 'version') error stop 5\n  print *, 'ok'\nend program\n",
+    );
+
+    let mod_obj = dir.join("m.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            mod_src.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("module compile spawn failed");
+    assert!(
+        compile_mod.status.success(),
+        "deferred char array global module should compile: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let amod = std::fs::read_to_string(dir.join("m.amod")).expect("missing m.amod");
+    assert!(
+        amod.contains("@rank 1"),
+        "deferred char array global rank should survive into .amod: {}",
+        amod
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_main = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            main_src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("main compile spawn failed");
+    assert!(
+        compile_main.status.success(),
+        "deferred char array global consumer should compile through .amod: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let exe = dir.join("module_deferred_char_global_amod.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            mod_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link spawn failed");
+    assert!(
+        link.status.success(),
+        "deferred char array global link should succeed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe).output().expect("run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "deferred char array global should preserve elements through .amod: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn public_defined_assignment_in_private_module_round_trips_through_amod_and_runs() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -30237,6 +30900,43 @@ fn pointer_array_component_element_actual_to_pointer_dummy_runs() {
 }
 
 #[test]
+fn module_deferred_char_array_typed_constructor_allocates_before_store() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=module_deferred_char_array_typed_constructor_allocates_before_store count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  character(len=:), allocatable :: version_text(:)\ncontains\n  subroutine init(version_s, os_type)\n    character(len=*), intent(in) :: version_s\n    character(len=*), intent(in) :: os_type\n    version_text = [character(len=80) :: &\n      'Version:     '//trim(version_s)//', alpha', &\n      os_type]\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  call init('0.13.0', 'OS Type:     macOS')\n  if (.not. allocated(version_text)) error stop 1\n  if (size(version_text) /= 2) error stop 2\n  if (len(version_text) /= 80) error stop 3\n  if (trim(version_text(1)) /= 'Version:     0.13.0, alpha') error stop 4\n  if (trim(version_text(2)) /= 'OS Type:     macOS') error stop 5\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("module_deferred_char_typed_ctor", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("module deferred char typed constructor compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "module deferred char typed constructor compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "module deferred char typed constructor should allocate before storing: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn single_char_array_constructor_actual_to_assumed_shape_dummy_runs() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -32339,6 +33039,67 @@ fn associate_alias_preserves_component_allocated_and_size_intrinsics() {
 }
 
 #[test]
+fn associate_alias_of_array_component_subscripts_as_array() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=associate_alias_of_array_component_subscripts_as_array count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type :: line_token\n    integer :: first = 0\n    integer :: last = 0\n  end type\ncontains\n  subroutine fill(token)\n    type(line_token), allocatable, intent(out) :: token(:)\n    allocate(token(3))\n    token(1)%first = 10\n    token(2)%first = 20\n    token(3)%first = 30\n    token(1)%last = 11\n    token(2)%last = 21\n    token(3)%last = 31\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(line_token), allocatable :: token(:)\n  integer :: line\n  integer :: shift\n  call fill(token)\n  line = 2\n  associate(first => token%first)\n    shift = first(line) - 1\n  end associate\n  if (shift /= 19) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("associate_alias_array_component_subscript", "bin");
+    let obj = unique_path("associate_alias_array_component_subscript", "o");
+    let compile_obj = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", obj.to_str().unwrap()])
+        .output()
+        .expect("associate array component object compile failed to spawn");
+    assert!(
+        compile_obj.status.success(),
+        "associate array component object compile failed: {}",
+        String::from_utf8_lossy(&compile_obj.stderr)
+    );
+    let undef = undefined_symbols(&obj);
+    assert!(
+        !undef.iter().any(|sym| sym == "_first"),
+        "associate array component alias lowered to external _first: {:?}",
+        undef
+    );
+
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("associate array component compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "associate array component compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("associate array component run failed");
+    assert!(
+        run.status.success(),
+        "associate array component run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected associate array component output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&obj);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn deferred_char_array_component_size_with_dimension_attr_runs() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -32421,6 +33182,189 @@ fn logical_reduction_intrinsics_scalarize_component_and_constructor_exprs() {
     );
 
     let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn all_reduction_accepts_sectioned_array_component_projection() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=all_reduction_accepts_sectioned_array_component_projection count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  type :: node_t\n    logical :: done = .false.\n    integer :: id = 0\n  end type\n  type(node_t), allocatable :: dep(:)\n  integer :: n\n  allocate(dep(3))\n  dep(1)%done = .true.\n  dep(2)%done = .true.\n  dep(3)%done = .false.\n  n = 2\n  if (.not. all(dep(:n)%done)) error stop 1\n  n = 3\n  if (all(dep(:n)%done)) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("all_section_component_projection", "bin");
+    let obj = unique_path("all_section_component_projection", "o");
+    let compile_obj = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", obj.to_str().unwrap()])
+        .output()
+        .expect("all section component object compile failed to spawn");
+    assert!(
+        compile_obj.status.success(),
+        "all section component object compile failed: {}",
+        String::from_utf8_lossy(&compile_obj.stderr)
+    );
+    let undef = undefined_symbols(&obj);
+    assert!(
+        !undef.iter().any(|sym| sym == "_all"),
+        "all section component projection lowered to external _all: {:?}",
+        undef
+    );
+
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("all section component compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "all section component compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("all section component run failed");
+    assert!(
+        run.status.success(),
+        "all section component run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected all section component output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&obj);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn any_reduction_accepts_allocatable_component_array_projection() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=any_reduction_accepts_allocatable_component_array_projection count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  type :: source_t\n    integer :: unit_scope = 0\n    integer :: id = 0\n  end type\n  type :: package_t\n    type(source_t), allocatable :: sources(:)\n  end type\n  type(package_t) :: pkg\n  allocate(pkg%sources(3))\n  pkg%sources(1)%unit_scope = 2\n  pkg%sources(2)%unit_scope = 4\n  pkg%sources(3)%unit_scope = 6\n  if (.not. any(pkg%sources%unit_scope == 4)) error stop 1\n  if (any(pkg%sources%unit_scope == 5)) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("any_alloc_component_projection", "bin");
+    let obj = unique_path("any_alloc_component_projection", "o");
+    let compile_obj = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", obj.to_str().unwrap()])
+        .output()
+        .expect("any alloc component object compile failed to spawn");
+    assert!(
+        compile_obj.status.success(),
+        "any alloc component object compile failed: {}",
+        String::from_utf8_lossy(&compile_obj.stderr)
+    );
+    let undef = undefined_symbols(&obj);
+    assert!(
+        !undef.iter().any(|sym| sym == "_any"),
+        "any allocatable component projection lowered to external _any: {:?}",
+        undef
+    );
+
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("any alloc component compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "any alloc component compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("any alloc component run failed");
+    assert!(
+        run.status.success(),
+        "any alloc component run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected any alloc component output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&obj);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn any_reduction_accepts_elemental_type_bound_array_receiver() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=any_reduction_accepts_elemental_type_bound_array_receiver count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type :: source_t\n    integer :: unit_scope = 0\n  end type\n  type :: package_t\n    type(source_t), allocatable :: sources(:)\n  contains\n    procedure :: has_library => package_has_library\n  end type\n  type :: model_t\n    type(package_t), allocatable :: packages(:)\n  end type\ncontains\n  elemental logical function package_has_library(self) result(has_library)\n    class(package_t), intent(in) :: self\n    if (allocated(self%sources)) then\n      has_library = any(self%sources%unit_scope == 4)\n    else\n      has_library = .false.\n    end if\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  type(model_t) :: model\n  allocate(model%packages(3))\n  allocate(model%packages(1)%sources(1))\n  model%packages(1)%sources(1)%unit_scope = 4\n  allocate(model%packages(2)%sources(1))\n  model%packages(2)%sources(1)%unit_scope = 2\n  if (.not. any(model%packages%has_library())) error stop 1\n  if (model%packages(2)%has_library()) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("any_elemental_tbp_array_receiver", "bin");
+    let obj = unique_path("any_elemental_tbp_array_receiver", "o");
+    let compile_obj = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", obj.to_str().unwrap()])
+        .output()
+        .expect("any elemental tbp receiver object compile failed to spawn");
+    assert!(
+        compile_obj.status.success(),
+        "any elemental tbp receiver object compile failed: {}",
+        String::from_utf8_lossy(&compile_obj.stderr)
+    );
+    let undef = undefined_symbols(&obj);
+    assert!(
+        !undef.iter().any(|sym| sym == "_any"),
+        "elemental type-bound receiver lowered to external _any: {:?}",
+        undef
+    );
+
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("any elemental tbp receiver compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "any elemental tbp receiver compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("any elemental tbp receiver run failed");
+    assert!(
+        run.status.success(),
+        "any elemental tbp receiver run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected any elemental tbp receiver output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&obj);
     let _ = std::fs::remove_file(&src);
 }
 
@@ -39880,6 +40824,38 @@ fn array_constructor_whole_array_expressions_flatten_full_size() {
 }
 
 #[test]
+fn array_constructor_array_sections_lower_through_descriptor_path() {
+    let src = write_program(
+        "program p\n  implicit none\n  logical, allocatable :: list(:)\n  integer :: place\n  allocate(list(3))\n  list = [.true., .false., .true.]\n  place = 2\n  list = [list(:place-1), .false., list(place:)]\nend program\n",
+        "f90",
+    );
+    let ir = unique_path("array_ctor_sections", "ir");
+    let emit = Command::new(compiler("armfortas"))
+        .args([
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("array constructor section IR compile failed to spawn");
+    assert!(
+        emit.status.success(),
+        "array constructor section IR compile failed: {}",
+        String::from_utf8_lossy(&emit.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&emit.stderr);
+    assert!(
+        !stderr.contains("coerce_to_type: unhandled coercion"),
+        "array constructor section lowered through scalar coercion path: {}",
+        stderr
+    );
+
+    let _ = std::fs::remove_file(&ir);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn mixed_numeric_array_binary_exprs_coerce_array_lanes() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -41133,6 +42109,87 @@ fn nested_call_chain_with_array_section_args_keeps_frame_bounded() {
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr)
     );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&asm);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn nested_derived_allocatable_assignment_uses_owned_helpers() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=nested_derived_allocatable_assignment_uses_owned_helpers count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module helper_feature_m\n  implicit none\n  type :: leaf_t\n    character(:), allocatable :: name\n  end type\n  type :: feature_t\n    type(leaf_t), allocatable :: leaves(:)\n    character(:), allocatable :: flags\n  end type\ncontains\n  function make_feature(label) result(f)\n    character(*), intent(in) :: label\n    type(feature_t) :: f\n    allocate(f%leaves(2))\n    f%leaves(1)%name = label // '1'\n    f%leaves(2)%name = label // '2'\n    f%flags = label\n  end function\nend module\n\nmodule helper_collection_m\n  use helper_feature_m\n  implicit none\n  type :: collection_t\n    type(feature_t) :: base\n    type(feature_t), allocatable :: variants(:)\n  end type\ncontains\n  subroutine add_defaults(features)\n    type(collection_t), allocatable, intent(inout) :: features(:)\n    type(collection_t), allocatable :: tmp(:), defaults(:)\n    integer :: n\n    allocate(defaults(2))\n    defaults(1)%base = make_feature('debug')\n    allocate(defaults(1)%variants(1))\n    defaults(1)%variants(1) = make_feature('dbg-v')\n    defaults(2)%base = make_feature('release')\n    n = 0\n    if (allocated(features)) n = size(features)\n    allocate(tmp(n + 2))\n    if (n > 0) tmp(1:n) = features\n    tmp(n + 1) = defaults(1)\n    tmp(n + 2) = defaults(2)\n    call move_alloc(tmp, features)\n  end subroutine\nend module\n\nprogram p\n  use helper_collection_m\n  implicit none\n  type(collection_t), allocatable :: items(:)\n  call add_defaults(items)\n  if (.not. allocated(items)) error stop 1\n  if (items(1)%base%flags /= 'debug') error stop 2\n  if (items(1)%variants(1)%leaves(1)%name /= 'dbg-v1') error stop 3\n  items(1)%variants(1)%leaves(1)%name = 'changed'\n  if (items(1)%base%leaves(1)%name /= 'debug1') error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("derived_helpers", "bin");
+    let asm = unique_path("derived_helpers", "s");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("derived helper compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "derived helper compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("derived helper run failed");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        run.status.success() && stdout.contains("ok"),
+        "derived helper run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        stdout,
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let asm_compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-S", "-o", asm.to_str().unwrap()])
+        .output()
+        .expect("derived helper -S failed to spawn");
+    assert!(
+        asm_compile.status.success(),
+        "derived helper -S failed: {}",
+        String::from_utf8_lossy(&asm_compile.stderr)
+    );
+    let asm_text = std::fs::read_to_string(&asm).expect("read derived helper asm");
+    let collection_copy_helper = if cfg!(target_arch = "x86_64") {
+        "afs_derived_helper_collection_m_collection_t_copy_value"
+    } else {
+        "_afs_derived_helper_collection_m_collection_t_copy_value"
+    };
+    let feature_copy_helper = if cfg!(target_arch = "x86_64") {
+        "afs_derived_helper_feature_m_feature_t_copy_value"
+    } else {
+        "_afs_derived_helper_feature_m_feature_t_copy_value"
+    };
+    assert!(
+        asm_text.contains(collection_copy_helper) && asm_text.contains(feature_copy_helper),
+        "expected module-owned derived copy helper symbols in asm"
+    );
+    let add_defaults_marker = if cfg!(target_arch = "x86_64") {
+        "afs_modproc_helper_collection_m_add_defaults:"
+    } else {
+        "_afs_modproc_helper_collection_m_add_defaults:"
+    };
+    let start = asm_text
+        .find(add_defaults_marker)
+        .expect("add_defaults symbol present in asm");
+    let prologue = asm_text[start..].lines().take(80).collect::<Vec<_>>().join("\n");
+    let probe_count = prologue.matches("movz x16, #16384").count();
+    assert!(
+        probe_count == 0,
+        "add_defaults should call derived helpers instead of reserving a probed giant frame:\n{}",
+        prologue
+    );
+
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&asm);
     let _ = std::fs::remove_file(&src);
@@ -42679,6 +43736,255 @@ fn generic_character_substring_actual_uses_local_character_type() {
 }
 
 #[test]
+fn generic_module_allocatable_character_array_uses_declared_rank() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=generic_module_allocatable_character_array_uses_declared_rank count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  private\n  public :: update\n  interface insert\n    module procedure insert_c\n  end interface\n  character(len=:), allocatable, save :: keywords(:)\ncontains\n  subroutine update(key)\n    character(len=*), intent(in) :: key\n    character(len=:), allocatable :: long\n    integer :: place\n    long = trim(key)\n    place = 1\n    call insert(keywords, long, place)\n  end subroutine\n  subroutine insert_c(list, value, place)\n    character(len=*), intent(in) :: value\n    character(len=:), allocatable :: list(:)\n    integer, intent(in) :: place\n    if (.not. allocated(list)) then\n      allocate(character(len=len_trim(value)) :: list(1))\n    end if\n  end subroutine\nend module\nprogram p\n  use m, only: update\n  call update('abc')\nend program\n",
+        "f90",
+    );
+    let out = unique_path("generic_module_alloc_char_rank", "o");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("module allocatable character generic compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "module allocatable character generic compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn empty_typed_character_constructor_allocates_zero_size_array() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=empty_typed_character_constructor_allocates_zero_size_array count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\ncontains\n  subroutine insert_c(list, value, place)\n    character(len=*), intent(in) :: value\n    character(len=:), allocatable :: list(:)\n    character(len=:), allocatable :: kludge(:)\n    integer, intent(in) :: place\n    integer :: ii\n    integer :: endpoint\n    if (.not. allocated(list)) then\n       list = [character(len=max(len_trim(value),2)) :: ]\n    endif\n    ii = max(len_trim(value), len(list), 2)\n    endpoint = size(list)\n    if (endpoint == 0) then\n       list = [character(len=ii) :: value]\n    elseif (place > endpoint) then\n       kludge = [character(len=ii) :: list, value]\n       list = kludge\n    else\n       error stop 10\n    endif\n  end subroutine\nend module\nprogram p\n  use m, only: insert_c\n  implicit none\n  character(len=:), allocatable :: list(:)\n  call insert_c(list, 'version', 1)\n  call insert_c(list, '--help', 2)\n  if (.not. allocated(list)) error stop 1\n  if (size(list) /= 2) error stop 2\n  if (len(list) /= 7) error stop 3\n  if (trim(list(1)) /= 'version') error stop 4\n  if (trim(list(2)) /= '--help') error stop 5\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("empty_typed_char_constructor", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("empty typed character constructor compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "empty typed character constructor compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("empty typed character constructor run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "empty typed character constructor run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn empty_typed_scalar_constructor_allocates_zero_size_array() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=empty_typed_scalar_constructor_allocates_zero_size_array count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  integer, allocatable :: xs(:)\n  logical, allocatable :: flags(:)\n  xs = [integer ::]\n  flags = [logical ::]\n  if (.not. allocated(xs)) error stop 1\n  if (.not. allocated(flags)) error stop 2\n  if (size(xs) /= 0) error stop 3\n  if (size(flags) /= 0) error stop 4\n  xs = [7]\n  flags = [.true.]\n  if (size(xs) /= 1 .or. xs(1) /= 7) error stop 5\n  if (size(flags) /= 1 .or. .not. flags(1)) error stop 6\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("empty_typed_scalar_constructor", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("empty typed scalar constructor compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "empty typed scalar constructor compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("empty typed scalar constructor run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "empty typed scalar constructor run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn implied_do_constructor_allocates_logical_allocatable_array() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=implied_do_constructor_allocates_logical_allocatable_array count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  logical, allocatable :: flags(:)\n  integer :: i, n\n  n = 4\n  flags = [(i > 2, i = 1, n)]\n  if (.not. allocated(flags)) error stop 1\n  if (size(flags) /= 4) error stop 2\n  if (flags(1) .or. flags(2) .or. .not. flags(3) .or. .not. flags(4)) error stop 3\n  flags = [(mod(i, 2) == 0, i = 1, 2*n)]\n  if (size(flags) /= 8) error stop 4\n  if (flags(1) .or. .not. flags(2) .or. flags(3) .or. .not. flags(8)) error stop 5\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("implied_do_logical_alloc_constructor", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("implied-do logical allocatable constructor compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "implied-do logical allocatable constructor compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("implied-do logical allocatable constructor run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "implied-do logical allocatable constructor run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn defined_scalar_operator_array_actual_does_not_size_constructor() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=defined_scalar_operator_array_actual_does_not_size_constructor count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type :: string_t\n    character(:), allocatable :: s\n  end type\n  interface operator(.in.)\n    module procedure string_array_contains\n  end interface\ncontains\n  logical function string_array_contains(search, array) result(found)\n    character(*), intent(in) :: search\n    type(string_t), intent(in) :: array(:)\n    integer :: j\n    found = .false.\n    do j = 1, size(array)\n      if (array(j)%s == search) found = .true.\n    end do\n  end function\n  subroutine run\n    type(string_t), allocatable :: names(:), existing(:)\n    logical, allocatable :: flags(:)\n    integer :: i\n    allocate(names(3))\n    names(1)%s = 'alpha'\n    names(2)%s = 'beta'\n    names(3)%s = 'gamma'\n    allocate(existing(0))\n    flags = [(.not. (names(i)%s .in. existing), i = 1, size(names))]\n    if (.not. allocated(flags)) error stop 1\n    if (size(flags) /= 3) error stop 2\n    if (.not. all(flags)) error stop 3\n  end subroutine\nend module\nprogram p\n  use m, only: run\n  implicit none\n  call run\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("defined_op_constructor_rank", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("defined operator constructor rank compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "defined operator constructor rank compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("defined operator constructor rank run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "defined operator constructor rank run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn allocatable_component_constructor_append_uses_source_extent() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_component_constructor_append_uses_source_extent count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type string_t\n    character(len=:), allocatable :: s\n  end type\n  type model_t\n    type(string_t), allocatable :: include_dirs(:)\n  end type\nend module\nprogram p\n  use m\n  implicit none\n  type(model_t) :: model\n  type(string_t) :: include_dir\n  allocate(model%include_dirs(0))\n  include_dir%s = 'one'\n  model%include_dirs = [model%include_dirs, include_dir]\n  if (.not. allocated(model%include_dirs)) error stop 1\n  if (size(model%include_dirs) /= 1) error stop 2\n  if (model%include_dirs(1)%s /= 'one') error stop 3\n  include_dir%s = 'two'\n  model%include_dirs = [model%include_dirs, include_dir]\n  if (size(model%include_dirs) /= 2) error stop 4\n  if (model%include_dirs(1)%s /= 'one') error stop 5\n  if (model%include_dirs(2)%s /= 'two') error stop 6\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("component_constructor_append", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("component constructor append compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "component constructor append compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("component constructor append run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "component constructor append run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn type_bound_array_element_class_receiver_uses_scalar_descriptor() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=type_bound_array_element_class_receiver_uses_scalar_descriptor count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module shlex_repro\n  implicit none\n  type :: shlex_token\n    character(len=:), allocatable :: string\n  contains\n    procedure :: print => print_token\n  end type\ncontains\n  pure type(shlex_token) function new_token(string) result(token)\n    character(len=*), intent(in) :: string\n    token%string = string\n  end function\n  pure function print_token(token) result(msg)\n    class(shlex_token), intent(in) :: token\n    character(len=:), allocatable :: msg\n    msg = trim(token%string)\n  end function\n  subroutine tokens_to_strings(tokens, list)\n    type(shlex_token), optional, intent(in) :: tokens(:)\n    character(len=:), allocatable, intent(out) :: list(:)\n    integer :: n, maxlen, i\n    if (.not. present(tokens)) error stop 10\n    n = size(tokens)\n    maxlen = 0\n    do i = 1, n\n      maxlen = max(maxlen, len(tokens(i)%string))\n    end do\n    allocate(character(len=maxlen) :: list(n))\n    do i = 1, n\n      list(i) = tokens(i)%print()\n    end do\n  end subroutine\nend module\nprogram p\n  use shlex_repro\n  implicit none\n  type(shlex_token), allocatable :: tokens(:)\n  character(len=:), allocatable :: list(:)\n  tokens = [new_token('clang'), new_token('-c')]\n  call tokens_to_strings(tokens, list)\n  if (size(list) /= 2) error stop 1\n  if (trim(list(1)) /= 'clang') error stop 2\n  if (trim(list(2)) /= '-c') error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("tbp_array_element_class_receiver", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("TBP array element class receiver compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "TBP array element class receiver compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("TBP array element class receiver run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "TBP array element class receiver run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn generic_actual_all_of_defined_operator_has_logical_type() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -42812,6 +44118,96 @@ fn imported_generic_keyword_actual_does_not_skip_required_formal() {
 }
 
 #[test]
+fn same_name_imported_generic_preserves_private_c_ptr_specifics() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=same_name_imported_generic_preserves_private_c_ptr_specifics count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("same_name_generic_cptr_amod");
+    let provider = write_program_in(
+        &dir,
+        "provider.f90",
+        "module generic_cptr_provider\n  use iso_c_binding, only: c_ptr, c_char\n  implicit none\n  private\n  public :: pick\n  interface pick\n    module procedure pick, pick_ptr\n  end interface\ncontains\n  function pick(buf) result(s)\n    character(kind=c_char, len=1), intent(in) :: buf(:)\n    character(len=:), allocatable :: s\n    s = 'array'\n  end function\n  function pick_ptr(raw) result(s)\n    type(c_ptr), intent(in), value :: raw\n    character(len=:), allocatable :: s\n    s = 'ptr'\n  end function\nend module\n",
+    );
+    let consumer = write_program_in(
+        &dir,
+        "consumer.f90",
+        "module generic_cptr_consumer\n  use iso_c_binding, only: c_ptr\n  use generic_cptr_provider, only: pick\n  implicit none\n  interface\n    function get_ptr() result(r) bind(C, name='get_ptr')\n      import :: c_ptr\n      type(c_ptr) :: r\n    end function\n  end interface\ncontains\n  subroutine run(out)\n    character(len=:), allocatable, intent(out) :: out\n    out = pick(get_ptr())\n  end subroutine\nend module\n",
+    );
+    let provider_o = dir.join("provider.o");
+    let compile_provider = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            provider.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-o",
+            provider_o.to_str().unwrap(),
+        ])
+        .output()
+        .expect("same-name c_ptr provider compile failed to spawn");
+    assert!(
+        compile_provider.status.success(),
+        "same-name c_ptr provider compile failed: {}",
+        String::from_utf8_lossy(&compile_provider.stderr)
+    );
+    let amod = fs::read_to_string(dir.join("generic_cptr_provider.amod"))
+        .expect("cannot read same-name c_ptr provider amod");
+    assert!(
+        amod.contains("@interface pick")
+            && amod.contains("@specific pick_ptr")
+            && amod.contains("@arg raw : type(c_ptr), intent(in), value"),
+        "same-name generic .amod lost c_ptr specific:\n{}",
+        amod
+    );
+
+    let asm = dir.join("consumer.s");
+    let compile_consumer = Command::new(compiler("armfortas"))
+        .args([
+            "-S",
+            "-I",
+            dir.to_str().unwrap(),
+            consumer.to_str().unwrap(),
+            "-o",
+            asm.to_str().unwrap(),
+        ])
+        .output()
+        .expect("same-name c_ptr consumer compile failed to spawn");
+    assert!(
+        compile_consumer.status.success(),
+        "same-name c_ptr consumer compile failed: {}",
+        String::from_utf8_lossy(&compile_consumer.stderr)
+    );
+    let asm_text = fs::read_to_string(&asm).expect("cannot read same-name c_ptr consumer asm");
+    let get_ptr_symbol = if cfg!(target_arch = "x86_64") {
+        "get_ptr"
+    } else {
+        "_get_ptr"
+    };
+    let pick_ptr_symbol = if cfg!(target_arch = "x86_64") {
+        "afs_modproc_generic_cptr_provider_pick_ptr"
+    } else {
+        "_afs_modproc_generic_cptr_provider_pick_ptr"
+    };
+    let wrong_pick_call = if cfg!(target_arch = "x86_64") {
+        "call afs_modproc_generic_cptr_provider_pick\n"
+    } else {
+        "bl _afs_modproc_generic_cptr_provider_pick\n"
+    };
+    assert!(
+        asm_text.contains(get_ptr_symbol)
+            && asm_text.contains(pick_ptr_symbol)
+            && !asm_text.contains(wrong_pick_call),
+        "same-name imported generic resolved to wrong specific:\n{}",
+        asm_text
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn local_generic_gamma_falls_back_to_intrinsic_for_real_actual() {
     let src = write_program(
         "module gamma_like\n  implicit none\n  private\n  public :: gamma\n  interface gamma\n    module procedure gamma_iint32\n    module procedure gamma_csp\n  end interface\ncontains\n  elemental real function gamma_iint32(z) result(res)\n    integer, intent(in) :: z\n    res = real(z)\n  end function\n  impure elemental complex function gamma_csp(z) result(res)\n    complex, intent(in) :: z\n    res = cmplx(gamma(z%re), kind=4)\n  end function\nend module\nprogram p\n  use gamma_like, only: gamma\n  implicit none\n  complex :: got\n  got = gamma((2.0, 0.0))\n  print *, 'ok'\nend program\n",
@@ -42911,6 +44307,74 @@ fn callable_generic_not_treated_as_character_substring_by_unrelated_data_symbol(
         run.status,
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn local_character_dummy_shadows_same_name_generic_for_substring() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=local_character_dummy_shadows_same_name_generic_for_substring count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  private\n  public :: lower\n  interface str\n    module procedure str_int\n  end interface\ncontains\n  character(8) function str_int(i) result(s)\n    integer, intent(in) :: i\n    write(s, '(i0)') i\n  end function\n  elemental function lower(str) result(string)\n    character(*), intent(in) :: str\n    character(len(str)) :: string\n    integer :: i\n    string = str\n    do i = 1, len_trim(str)\n      select case (str(i:i))\n      case ('A':'Z')\n        string(i:i) = char(iachar(str(i:i)) + 32)\n      case default\n      end select\n    end do\n  end function\nend module\n",
+        "f90",
+    );
+    let out = unique_path("same_name_generic_substring", "o");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("same-name generic substring compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "same-name generic substring compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let undefined = undefined_symbols(&out);
+    assert!(
+        !undefined.iter().any(|sym| sym == "_str"),
+        "local character dummy substring lowered as raw generic call: {:?}",
+        undefined
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn abstract_type_bound_operator_dispatch_avoids_direct_interface_call() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=abstract_type_bound_operator_dispatch_avoids_direct_interface_call count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type, abstract :: base_t\n  contains\n    procedure(is_equal), deferred :: same\n    generic :: operator(==) => same\n    procedure :: check_same\n  end type\n  abstract interface\n    logical function is_equal(this, that)\n      import base_t\n      class(base_t), intent(in) :: this, that\n    end function\n  end interface\n  type, extends(base_t) :: child_t\n    integer :: value = 0\n  contains\n    procedure :: same => child_same\n  end type\ncontains\n  subroutine check_same(self, other)\n    class(base_t), intent(in) :: self\n    class(base_t), intent(in) :: other\n    if (.not. (self == other)) error stop 1\n  end subroutine\n  logical function child_same(this, that)\n    class(child_t), intent(in) :: this\n    class(base_t), intent(in) :: that\n    child_same = .true.\n  end function\nend module\n",
+        "f90",
+    );
+    let out = unique_path("abstract_tbp_operator", "o");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("abstract type-bound operator compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "abstract type-bound operator compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let undefined = undefined_symbols(&out);
+    assert!(
+        !undefined
+            .iter()
+            .any(|sym| sym == "_afs_modproc_m_is_equal" || sym == "_is_equal"),
+        "abstract operator interface lowered as direct call: {:?}",
+        undefined
     );
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
@@ -43024,6 +44488,144 @@ fn imported_generic_subroutine_shadows_intrinsic_subroutine() {
         String::from_utf8_lossy(&run.stderr)
     );
     let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn module_subroutine_shadows_split_intrinsic_subroutine() {
+    let src = write_program(
+        "module m\n  implicit none\ncontains\n  subroutine update(key)\n    character(*), intent(in) :: key\n    character(:), allocatable :: parts(:)\n    call split(trim(key), parts, ':', nulls='return')\n  end subroutine\n\n  subroutine split(input_line, array, delimiters, order, nulls)\n    character(*), intent(in) :: input_line\n    character(:), allocatable, intent(out) :: array(:)\n    character(*), intent(in), optional :: delimiters\n    character(*), intent(in), optional :: order\n    character(*), intent(in), optional :: nulls\n    allocate(character(len=len_trim(input_line)) :: array(1))\n    array(1) = trim(input_line)\n  end subroutine\nend module\nprogram p\n  use m, only: update\n  call update('a:b')\nend program\n",
+        "f90",
+    );
+    let ir = unique_path("module_split_shadows_intrinsic", "ir");
+    let emit = Command::new(compiler("armfortas"))
+        .args([
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("module split shadow IR compile failed to spawn");
+    assert!(
+        emit.status.success(),
+        "module split shadow IR compile failed: {}",
+        String::from_utf8_lossy(&emit.stderr)
+    );
+    let ir_text = fs::read_to_string(&ir).expect("cannot read emitted IR");
+    assert!(
+        ir_text.contains("call @afs_modproc_m_split"),
+        "CALL split did not resolve to the module subroutine:\n{}",
+        ir_text
+    );
+    assert!(
+        !ir_text.contains("call @afs_split"),
+        "CALL split incorrectly lowered through the intrinsic runtime hook:\n{}",
+        ir_text
+    );
+
+    let _ = std::fs::remove_file(&ir);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn allocatable_character_array_self_section_assignment_preserves_values() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_character_array_self_section_assignment_preserves_values count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  call check_key('flag::')\n  call check_key('c-flag::')\n  call check_key('link-flag::')\n  print *, 'ok'\ncontains\n  subroutine check_key(key)\n    character(len=*), intent(in) :: key\n    character(len=:), allocatable :: parts(:)\n    integer :: n\n    call split_colon(key, parts)\n    n = size(parts)\n    if (parts(n) == '') parts = parts(:n - 1)\n    if (size(parts) /= 2) error stop 1\n    if (len(parts) /= len(key)) error stop 2\n    if (trim(parts(1)) /= key(:index(key, ':') - 1)) error stop 3\n    if (parts(2) /= '') error stop 4\n  end subroutine\n\n  subroutine split_colon(input, parts)\n    character(len=*), intent(in) :: input\n    character(len=:), allocatable, intent(out) :: parts(:)\n    integer :: i\n    integer :: count\n    integer :: start\n    integer :: width\n    count = 1\n    do i = 1, len(input)\n      if (input(i:i) == ':') count = count + 1\n    end do\n    width = len(input)\n    allocate(character(len=width) :: parts(count))\n    parts = ''\n    start = 1\n    count = 1\n    do i = 1, len(input)\n      if (input(i:i) == ':') then\n        if (i > start) parts(count) = input(start:i - 1)\n        count = count + 1\n        start = i + 1\n      end if\n    end do\n    if (start <= len(input)) parts(count) = input(start:)\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("alloc_char_array_self_section", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("allocatable char array self-section compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "allocatable char array self-section compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("allocatable char array self-section run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "allocatable char array self-section run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn generic_subroutine_matches_use_renamed_class_actual() {
+    let src = write_program(
+        "module value_m\n  implicit none\n  type :: toml_value\n    character(:), allocatable :: message\n  end type\nend module\nmodule parser_m\n  use value_m, only: toml_value\n  implicit none\n  interface json_load\n    module procedure json_load_file\n    module procedure json_load_unit\n  end interface\ncontains\n  subroutine json_load_file(object, filename, error)\n    class(toml_value), allocatable, intent(out) :: object\n    character(*), intent(in) :: filename\n    integer, intent(out), optional :: error\n    if (present(error)) error = len_trim(filename)\n  end subroutine\n  subroutine json_load_unit(object, io, error)\n    class(toml_value), allocatable, intent(out) :: object\n    integer, intent(in) :: io\n    integer, intent(out), optional :: error\n    if (present(error)) error = io\n  end subroutine\nend module\nmodule facade_m\n  use value_m, only: json_value => toml_value\n  use parser_m, only: json_load\n  implicit none\nend module\nmodule user_m\n  use facade_m, only: json_value, json_load\n  implicit none\ncontains\n  subroutine run(path)\n    character(*), intent(in) :: path\n    type(json_value), allocatable :: holder\n    class(json_value), allocatable :: value\n    integer :: err\n    allocate(holder)\n    holder%message = path\n    call json_load(value, holder%message, error=err)\n  end subroutine\nend module\nprogram p\n  use user_m, only: run\n  call run('pkg.json')\nend program\n",
+        "f90",
+    );
+    let ir = unique_path("generic_use_renamed_class", "ir");
+    let emit = Command::new(compiler("armfortas"))
+        .args([
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("use-renamed class generic IR compile failed to spawn");
+    assert!(
+        emit.status.success(),
+        "use-renamed class generic IR compile failed: {}",
+        String::from_utf8_lossy(&emit.stderr)
+    );
+    let ir_text = fs::read_to_string(&ir).expect("cannot read emitted IR");
+    assert!(
+        ir_text.contains("call @afs_modproc_parser_m_json_load_file"),
+        "json_load did not resolve to the filename specific:\n{}",
+        ir_text
+    );
+
+    let _ = std::fs::remove_file(&ir);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn use_only_generic_collects_all_bare_reexport_specifics() {
+    let src = write_program(
+        "module table_api\n  implicit none\n  type :: toml_table\n    integer :: n = 0\n  end type\n  type :: toml_array\n    integer :: n = 0\n  end type\n  interface get_value\n    module procedure get_child_array\n  end interface\ncontains\n  subroutine get_child_array(table, key, ptr, requested)\n    class(toml_table), intent(inout) :: table\n    character(*), intent(in) :: key\n    type(toml_array), pointer, intent(out) :: ptr\n    logical, intent(in), optional :: requested\n    nullify(ptr)\n  end subroutine\nend module\nmodule array_api\n  use table_api, only: toml_array\n  implicit none\n  interface get_value\n    module procedure get_elem_array\n  end interface\ncontains\n  subroutine get_elem_array(array, pos, ptr)\n    class(toml_array), intent(inout) :: array\n    integer, intent(in) :: pos\n    type(toml_array), pointer, intent(out) :: ptr\n    nullify(ptr)\n  end subroutine\nend module\nmodule build_api\n  use array_api\n  use table_api\n  implicit none\nend module\nmodule toml_api\n  use build_api\n  implicit none\nend module\nmodule user_m\n  use toml_api, only: toml_table, toml_array, get_value\n  implicit none\n  interface get_value\n    module procedure get_local_bool\n  end interface\ncontains\n  subroutine run(table, key)\n    type(toml_table), intent(inout) :: table\n    character(*), intent(in) :: key\n    type(toml_array), pointer :: children\n    call get_value(table, key, children, requested=.false.)\n  end subroutine\n  subroutine get_local_bool(table, key, value)\n    type(toml_table), intent(inout) :: table\n    character(*), intent(in) :: key\n    logical, intent(out) :: value\n    value = .false.\n  end subroutine\nend module\nprogram p\n  use user_m, only: run\n  use table_api, only: toml_table\n  type(toml_table) :: table\n  call run(table, 'items')\nend program\n",
+        "f90",
+    );
+    let ir = unique_path("generic_bare_reexports", "ir");
+    let emit = Command::new(compiler("armfortas"))
+        .args([
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("bare re-export generic IR compile failed to spawn");
+    assert!(
+        emit.status.success(),
+        "bare re-export generic IR compile failed: {}",
+        String::from_utf8_lossy(&emit.stderr)
+    );
+    let ir_text = fs::read_to_string(&ir).expect("cannot read emitted IR");
+    assert!(
+        ir_text.contains("call @afs_modproc_table_api_get_child_array"),
+        "get_value did not resolve to the table child-array specific:\n{}",
+        ir_text
+    );
+
+    let _ = std::fs::remove_file(&ir);
     let _ = std::fs::remove_file(&src);
 }
 
@@ -43183,6 +44785,124 @@ fn shadowed_intrinsic_fallback_lowers_real_actual_not_generic_probe() {
         "shadowed intrinsic fallback run failed: status={:?} stdout={} stderr={}",
         run.status,
         String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn optional_class_star_forwarding_preserves_absent_arguments() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=optional_class_star_forwarding_preserves_absent_arguments count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module class_star_optional_forward_str_m\n  implicit none\ncontains\n  subroutine journal(g0, g1, g2)\n    class(*), intent(in) :: g0\n    class(*), intent(in), optional :: g1, g2\n    write(*, '(a)') msg_scalar(g0, g1, g2)\n  end subroutine\n\n  function msg_scalar(generic0, generic1, generic2) result(msg)\n    class(*), intent(in), optional :: generic0, generic1, generic2\n    character(len=:), allocatable :: msg\n    character(len=4096) :: line\n    integer :: istart\n    istart = 1\n    line = ''\n    if (present(generic0)) call print_generic(generic0)\n    if (present(generic1)) call print_generic(generic1)\n    if (present(generic2)) call print_generic(generic2)\n    msg = trim(line)\n  contains\n    subroutine print_generic(generic)\n      class(*), intent(in) :: generic\n      select type(generic)\n      type is (character(len=*))\n        write(line(istart:), '(a)') trim(generic)\n      class default\n        error stop 2\n      end select\n      istart = len_trim(line) + 2\n      line = trim(line)//' '\n    end subroutine\n  end function\nend module\n\nprogram p\n  use class_star_optional_forward_str_m\n  implicit none\n  call journal('Version: reduction')\nend program\n",
+        "f90",
+    );
+    let out = unique_path("optional_class_star_forwarding", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("optional class(*) forwarding compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "optional class(*) forwarding compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("optional class(*) forwarding run failed");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        run.status.success() && stdout.contains("Version: reduction"),
+        "optional class(*) forwarding run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        stdout,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn class_star_character_elements_preserve_dynamic_type() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=class_star_character_elements_preserve_dynamic_type count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module class_star_char_elements_m\n  implicit none\ncontains\n  subroutine journal(where, g0)\n    character(len=*), intent(in) :: where\n    class(*), intent(in) :: g0\n    if (where /= 'sc') error stop 1\n    select type(g0)\n    type is (character(len=*))\n      write(*, '(a)') trim(g0)\n    class default\n      error stop 2\n    end select\n  end subroutine\n\n  subroutine check(help_text, version_text)\n    character(len=*), intent(in), optional :: help_text(:)\n    character(len=*), intent(in), optional :: version_text(:)\n    character(len=:), allocatable :: line\n    integer :: i\n    if (present(help_text)) then\n      do i = 1, size(help_text)\n        call journal('sc', help_text(i))\n      end do\n    end if\n    if (present(version_text)) then\n      do i = 1, size(version_text)\n        line = version_text(i)(1:len_trim(version_text(i)))\n        call journal('sc', line)\n      end do\n    end if\n  end subroutine\nend module\n\nprogram p\n  use class_star_char_elements_m\n  implicit none\n  character(len=:), allocatable :: help(:), version(:)\n  help = [character(len=16) :: 'Help one', 'Help two']\n  version = [character(len=32) :: 'Version one', 'Version two']\n  call check(help, version)\nend program\n",
+        "f90",
+    );
+    let out = unique_path("class_star_char_elements", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("class-star character element compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "class-star character element compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("class-star character element run failed");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        run.status.success()
+            && stdout.contains("Help one")
+            && stdout.contains("Help two")
+            && stdout.contains("Version one")
+            && stdout.contains("Version two"),
+        "class-star character element run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        stdout,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn character_star_parameter_array_constructor_hidden_len_uses_element_len() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=character_star_parameter_array_constructor_hidden_len_uses_element_len count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  type :: key_t\n    character(:), allocatable :: key\n  end type\n  character(*), parameter :: valid_keys(*) = [character(24) :: &\n    'namespace', 'v', 'path', 'git', 'tag', 'branch', 'rev', &\n    'preprocess', 'features', 'profile']\n  type(key_t), allocatable :: keys(:)\n  allocate(keys(1))\n  keys(1)%key = 'git'\n  call check(keys, valid_keys)\n  print *, 'ok'\ncontains\n  subroutine check(keys, valid_keys)\n    type(key_t), intent(in) :: keys(:)\n    character(len=*), intent(in) :: valid_keys(:)\n    if (len(valid_keys(4)) /= 24) error stop 1\n    if (keys(1)%key /= valid_keys(4)) error stop 2\n    if (.not. any(keys(1)%key == valid_keys)) error stop 3\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("char_star_param_array_constructor_len", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("character parameter array compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "character parameter array compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("character parameter array run failed");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        run.status.success() && stdout.contains("ok"),
+        "character parameter array run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        stdout,
         String::from_utf8_lossy(&run.stderr)
     );
     let _ = std::fs::remove_file(&out);

@@ -6,7 +6,7 @@
 
 use super::inst::*;
 use super::types::{IntWidth, IrType};
-use super::walk::{compute_dominators, inst_uses, terminator_targets, terminator_uses};
+use super::walk::{compute_dominator_info, inst_uses, terminator_targets, terminator_uses};
 use std::collections::{HashMap, HashSet};
 
 /// Verification error.
@@ -208,12 +208,10 @@ fn value_def_block(func: &Function) -> HashMap<ValueId, BlockId> {
 /// by the block where the value is defined. For same-block uses, the
 /// definition must precede the use in instruction order.
 fn check_dominance(func: &Function, errors: &mut Vec<VerifyError>) {
-    let doms = compute_dominators(func);
+    let doms = compute_dominator_info(func);
     let def_blocks = value_def_block(func);
 
     for block in &func.blocks {
-        let block_doms = doms.get(&block.id).cloned().unwrap_or_default();
-
         // Build intra-block ordering: map ValueId → instruction index.
         // Block params have index -1 (always dominate all instructions).
         let mut inst_order: HashMap<ValueId, i32> = HashMap::new();
@@ -238,7 +236,7 @@ fn check_dominance(func: &Function, errors: &mut Vec<VerifyError>) {
                             });
                         }
                     }
-                } else if !block_doms.contains(def_block) {
+                } else if !doms.dominates(*def_block, block.id) {
                     // Cross-block: def block must dominate use block.
                     errors.push(VerifyError {
                         msg: format!(

@@ -244,22 +244,64 @@ fn conversion_spill_traffic_uses_fp_width() {
     let asm = emit_asm("x86_64-freebsd", "x05_conversions");
     let lines: Vec<&str> = asm.lines().map(str::trim).collect();
     for (i, line) in lines.iter().enumerate() {
-        // Naive-allocator shape: the def store-back immediately
-        // follows, the use load immediately precedes.
+        let operands: Vec<&str> = line
+            .split_once(' ')
+            .map(|(_, ops)| ops.split(',').map(str::trim).collect())
+            .unwrap_or_default();
         if line.starts_with("cvtsi2sd") {
+            let def = operands
+                .get(1)
+                .expect("cvtsi2sd destination operand")
+                .trim_end_matches(',');
+            let narrow_store = lines
+                .iter()
+                .skip(i + 1)
+                .take(4)
+                .any(|next| next.starts_with("movss") && next.split(',').next() == Some(def));
             assert!(
-                lines[i + 1].starts_with("movsd"),
-                "cvtsi2sd double def stored narrow: {} | {}",
+                !narrow_store,
+                "cvtsi2sd double def stored narrow near: {} | {}",
                 line,
-                lines[i + 1]
+                lines
+                    .iter()
+                    .skip(i + 1)
+                    .take(4)
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(" | ")
             );
         }
         if line.starts_with("cvttsd2si") {
+            let src = operands
+                .first()
+                .expect("cvttsd2si source operand")
+                .trim_end_matches(',');
+            let narrow_load = lines
+                .iter()
+                .take(i)
+                .rev()
+                .take(4)
+                .any(|prev| {
+                    prev.starts_with("movss")
+                        && prev
+                            .split(',')
+                            .nth(1)
+                            .map(str::trim)
+                            .map(|dst| dst.trim_end_matches(','))
+                            == Some(src)
+                });
             assert!(
-                lines[i - 1].starts_with("movsd"),
-                "cvttsd2si double source loaded narrow: {} | {}",
-                lines[i - 1],
-                line
+                !narrow_load,
+                "cvttsd2si double source loaded narrow near: {} | {}",
+                lines
+                    .iter()
+                    .take(i)
+                    .rev()
+                    .take(4)
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(" | "),
+                line,
             );
         }
     }

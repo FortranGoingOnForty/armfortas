@@ -565,6 +565,9 @@ fn emit_variable(
         if info.deferred_char {
             write!(out, " @deferred_char").unwrap();
         }
+        if info.declared_rank > 0 {
+            write!(out, " @rank {}", info.declared_rank).unwrap();
+        }
         if !info.dims.is_empty() {
             write!(out, " @dims").unwrap();
             for (lo, ext) in &info.dims {
@@ -1257,7 +1260,12 @@ fn emit_interface(out: &mut String, name: &str, sym: &Symbol, scope: &Scope) {
         Access::Default => matches!(scope.default_access, Access::Private),
     };
     let suf = if effective_private { ", private" } else { "" };
-    writeln!(out, "@interface {}{}", name, suf).unwrap();
+    let interface_name = if matches!(sym.kind, SymbolKind::NamedInterface) {
+        sym.name.as_str()
+    } else {
+        name
+    };
+    writeln!(out, "@interface {}{}", interface_name, suf).unwrap();
     let mut specifics = sym.arg_names.clone(); // arg_names repurposed for specific list
     specifics.sort();
     for s in &specifics {
@@ -1404,6 +1412,7 @@ pub struct AmodVar {
     pub target: bool,
     pub ir_symbol: Option<String>,
     pub deferred_char: bool,
+    pub rank: usize,
     pub dims: Vec<(i64, i64)>,
     pub const_value: Option<i64>,
     pub const_char_value: Option<String>,
@@ -1689,6 +1698,7 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
 
     let mut ir_symbol = None;
     let mut deferred_char = false;
+    let mut rank = 0usize;
     let mut dims = Vec::new();
 
     if let Some(meta) = meta_part {
@@ -1709,6 +1719,11 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
             } else if parts[i] == "@deferred_char" {
                 deferred_char = true;
                 i += 1;
+            } else if parts[i] == "@rank" {
+                if let Some(value) = parts.get(i + 1) {
+                    rank = value.parse().unwrap_or(0);
+                }
+                i += 2;
             } else if parts[i] == "@dims" {
                 // Parse dimension pairs: @dims 1:5 1:10 ...
                 i += 1;
@@ -1738,6 +1753,7 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
         target,
         ir_symbol,
         deferred_char,
+        rank: rank.max(dims.len()),
         dims,
         const_value,
         const_char_value,
@@ -2256,6 +2272,7 @@ pub fn extract_module_globals(
             continue;
         } // PARAMETERs with folded values inline; others still need storage
         if let Some(ref ir_sym) = var.ir_symbol {
+            let declared_rank = var.rank.max(var.dims.len());
             let derived_type = match var.type_info.as_ref() {
                 Some(TypeInfo::Derived(name))
                     if !matches!(name.to_lowercase().as_str(), "c_ptr" | "c_funptr") =>
@@ -2264,7 +2281,13 @@ pub fn extract_module_globals(
                 }
                 _ => None,
             };
-            let ir_ty = if var.proc_pointer {
+            let ir_ty = if var.proc_pointer
+                || (matches!(
+                    var.type_info.as_ref(),
+                    Some(TypeInfo::Character { len: None, .. })
+                ) && (var.allocatable || var.pointer)
+                    && declared_rank > 0)
+            {
                 crate::ir::types::IrType::Ptr(Box::new(crate::ir::types::IrType::Int(
                     crate::ir::types::IntWidth::I8,
                 )))
@@ -2313,6 +2336,7 @@ pub fn extract_module_globals(
                     symbol: ir_sym.clone(),
                     ty: ir_ty,
                     dims: var.dims.clone(),
+                    declared_rank,
                     allocatable: var.allocatable,
                     is_pointer: var.pointer,
                     deferred_char: var.deferred_char,
@@ -2321,7 +2345,9 @@ pub fn extract_module_globals(
                         Some(crate::sema::symtab::TypeInfo::Character { len: Some(n), .. }) => {
                             crate::ir::lower::CharKind::Fixed(*n)
                         }
-                        _ if var.deferred_char => crate::ir::lower::CharKind::Deferred,
+                        _ if var.deferred_char && var.rank == 0 => {
+                            crate::ir::lower::CharKind::Deferred
+                        }
                         _ => crate::ir::lower::CharKind::None,
                     },
                     const_value: var.const_value.map(i128::from),

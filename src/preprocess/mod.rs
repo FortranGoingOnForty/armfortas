@@ -788,7 +788,7 @@ impl Preprocessor {
                     if def.is_function {
                         if i < bytes.len() && bytes[i] == b'(' {
                             if let Some((expanded, new_i)) =
-                                self.expand_function_macro(def, line, i)
+                                self.expand_function_macro(def, line, i, expanding, mode)
                             {
                                 // Re-expand the result with this macro marked as expanding.
                                 let mut next_expanding = expanding.clone();
@@ -830,6 +830,8 @@ impl Preprocessor {
         def: &MacroDef,
         line: &str,
         paren_start: usize,
+        expanding: &std::collections::HashSet<String>,
+        mode: MacroExpandMode,
     ) -> Option<(String, usize)> {
         let bytes = line.as_bytes();
         let mut i = paren_start + 1; // skip '('
@@ -862,6 +864,10 @@ impl Preprocessor {
             return None;
         }
         args.push(current_arg.trim().to_string());
+        let expanded_args: Vec<String> = args
+            .iter()
+            .map(|arg| self.expand_macros_inner(arg, expanding, mode))
+            .collect();
 
         // Build parameter lookup table.
         let mut param_map: HashMap<&str, usize> = HashMap::new();
@@ -869,9 +875,15 @@ impl Preprocessor {
             param_map.insert(param.as_str(), pi);
         }
 
-        let va_args_str = if def.is_variadic {
+        let va_args_raw = if def.is_variadic {
             let va_start = def.params.len();
             args.get(va_start..).unwrap_or(&[]).join(", ")
+        } else {
+            String::new()
+        };
+        let va_args_expanded = if def.is_variadic {
+            let va_start = def.params.len();
+            expanded_args.get(va_start..).unwrap_or(&[]).join(", ")
         } else {
             String::new()
         };
@@ -930,10 +942,23 @@ impl Preprocessor {
                 }
                 let id = std::str::from_utf8(&body_bytes[id_start..bi]).unwrap_or("");
 
+                let is_pasted =
+                    macro_param_is_pasted_left(body_bytes, id_start)
+                        || macro_param_is_pasted_right(body_bytes, bi);
+
                 if id == "__VA_ARGS__" && def.is_variadic {
-                    body.push_str(&va_args_str);
+                    body.push_str(if is_pasted {
+                        &va_args_raw
+                    } else {
+                        &va_args_expanded
+                    });
                 } else if let Some(&pi) = param_map.get(id) {
-                    body.push_str(args.get(pi).map(|s| s.as_str()).unwrap_or(""));
+                    let replacement = if is_pasted {
+                        args.get(pi)
+                    } else {
+                        expanded_args.get(pi)
+                    };
+                    body.push_str(replacement.map(|s| s.as_str()).unwrap_or(""));
                 } else {
                     body.push_str(id);
                 }
@@ -946,6 +971,22 @@ impl Preprocessor {
 
         Some((body, i))
     }
+}
+
+fn macro_param_is_pasted_left(body: &[u8], start: usize) -> bool {
+    let mut i = start;
+    while i > 0 && body[i - 1].is_ascii_whitespace() {
+        i -= 1;
+    }
+    i >= 2 && body[i - 2] == b'#' && body[i - 1] == b'#'
+}
+
+fn macro_param_is_pasted_right(body: &[u8], end: usize) -> bool {
+    let mut i = end;
+    while i < body.len() && body[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i + 1 < body.len() && body[i] == b'#' && body[i + 1] == b'#'
 }
 
 fn parse_defined_operand(expr: &str, start: usize) -> (&str, usize) {
@@ -2000,6 +2041,23 @@ end program
     fn stringification_with_spaces() {
         let out = pp("#define STR(x) #x\ny = STR(a + b)\n");
         assert!(out.contains("y = \"a + b\""));
+    }
+
+    #[test]
+    fn direct_stringification_uses_raw_argument() {
+        let out = pp("#define VERSION 0.13.0\n#define STR(x) #x\ny = STR(VERSION)\n");
+        assert!(out.contains("y = \"VERSION\""));
+    }
+
+    #[test]
+    fn two_step_stringification_prescans_argument() {
+        let out = pp(
+            "#define VERSION 0.13.0\n\
+             #define STR_(x) #x\n\
+             #define STR(x) STR_(x)\n\
+             y = STR(VERSION)\n",
+        );
+        assert!(out.contains("y = \"0.13.0\""), "got: {out}");
     }
 
     // ---- Token pasting ----
