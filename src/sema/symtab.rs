@@ -33,6 +33,34 @@ enum LookupMode {
 /// Scope identifier — an index into the SymbolTable's scope list.
 pub type ScopeId = usize;
 
+pub fn same_name_generic_interface_key(name: &str) -> String {
+    format!(
+        "__armfortas_same_name_generic${}",
+        ensure_ascii_lowercase(name)
+    )
+}
+
+fn is_named_interface_like_symbol(sym: &Symbol) -> bool {
+    sym.kind == SymbolKind::NamedInterface
+        || (sym.kind == SymbolKind::DerivedType && !sym.arg_names.is_empty())
+}
+
+fn symbol_exports(sym: &Symbol, scope: &Scope) -> bool {
+    match sym.attrs.access {
+        Access::Public => true,
+        Access::Private => false,
+        Access::Default => !matches!(scope.default_access, Access::Private),
+    }
+}
+
+fn merge_symbol_names(into: &mut Vec<String>, additional: &[String]) {
+    for name in additional {
+        if !into.iter().any(|existing| existing.eq_ignore_ascii_case(name)) {
+            into.push(name.clone());
+        }
+    }
+}
+
 /// F77 §15.4 statement function: a single-line function defined inside
 /// the host procedure's declaration prologue, scoped to that procedure
 /// only. Stored on the SymbolTable as a side table so lowering can skip
@@ -185,6 +213,42 @@ impl SymbolTable {
         Ok(())
     }
 
+    pub fn define_same_name_generic_interface(&mut self, mut symbol: Symbol) {
+        let scope_id = self.current_scope();
+        let public_key = symbol.name.to_lowercase();
+        let side_key = same_name_generic_interface_key(&public_key);
+        let scope = &mut self.scopes[scope_id];
+        if let Some(access) = scope.pending_access.get(&public_key).copied() {
+            symbol.attrs.access = access;
+        }
+        symbol.scope = scope_id;
+        if let Some(existing) = scope.symbols.get_mut(&side_key) {
+            merge_symbol_names(&mut existing.arg_names, &symbol.arg_names);
+            return;
+        }
+        scope.symbols.insert(side_key, symbol);
+    }
+
+    pub fn named_interface_symbol_in_scope(
+        &self,
+        scope_id: ScopeId,
+        name: &str,
+    ) -> Option<&Symbol> {
+        let key = ensure_ascii_lowercase(name);
+        let scope = &self.scopes[scope_id];
+        if let Some(sym) = scope.symbols.get(key.as_ref()) {
+            if is_named_interface_like_symbol(sym) {
+                return Some(sym);
+            }
+        }
+        let side_key = same_name_generic_interface_key(key.as_ref());
+        scope
+            .symbols
+            .get(&side_key)
+            .filter(|sym| is_named_interface_like_symbol(sym))
+            .filter(|sym| sym.name.eq_ignore_ascii_case(key.as_ref()))
+    }
+
     /// Define a symbol in a specific scope.
     pub fn define_in(&mut self, scope_id: ScopeId, symbol: Symbol) -> Result<(), SemaError> {
         let key = symbol.name.to_lowercase();
@@ -328,12 +392,18 @@ impl SymbolTable {
 
     fn scope_exports_key(&self, scope_id: ScopeId, key: &str) -> bool {
         let scope = &self.scopes[scope_id];
+        let mut saw_symbol = false;
+        let mut exports = false;
         if let Some(sym) = scope.symbols.get(key) {
-            return match sym.attrs.access {
-                Access::Public => true,
-                Access::Private => false,
-                Access::Default => !matches!(scope.default_access, Access::Private),
-            };
+            saw_symbol = true;
+            exports |= symbol_exports(sym, scope);
+        }
+        if let Some(sym) = self.named_interface_symbol_in_scope(scope_id, key) {
+            saw_symbol = true;
+            exports |= symbol_exports(sym, scope);
+        }
+        if saw_symbol {
+            return exports;
         }
         match scope
             .pending_access
@@ -614,6 +684,10 @@ impl SymbolTable {
             .pending_access
             .insert(key.clone(), access);
         if let Some(sym) = self.scopes[self.current].symbols.get_mut(&key) {
+            sym.attrs.access = access;
+        }
+        let side_key = same_name_generic_interface_key(&key);
+        if let Some(sym) = self.scopes[self.current].symbols.get_mut(&side_key) {
             sym.attrs.access = access;
         }
     }

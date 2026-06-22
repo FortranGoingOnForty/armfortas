@@ -590,7 +590,7 @@ pub(super) fn load_external_module(
             name: iface_def.name.clone(),
             kind: SymbolKind::NamedInterface,
             type_info: None,
-            attrs,
+            attrs: attrs.clone(),
             defined_at: dummy_span,
             scope: scope_id,
             arg_names: iface_def.specifics.clone(),
@@ -604,6 +604,24 @@ pub(super) fn load_external_module(
                     || existing.kind == SymbolKind::DerivedType
                 {
                     merge_specific_names(&mut existing.arg_names, &iface_def.specifics);
+                } else if matches!(
+                    existing.kind,
+                    SymbolKind::Function
+                        | SymbolKind::Subroutine
+                        | SymbolKind::ExternalProc
+                        | SymbolKind::ProcedurePointer
+                ) {
+                    st.define_same_name_generic_interface(Symbol {
+                        name: iface_def.name.clone(),
+                        kind: SymbolKind::NamedInterface,
+                        type_info: None,
+                        attrs: attrs.clone(),
+                        defined_at: dummy_span,
+                        scope: scope_id,
+                        arg_names: iface_def.specifics.clone(),
+                        const_value: None,
+                        const_char_value: None,
+                    });
                 }
             }
         }

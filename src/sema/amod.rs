@@ -1260,7 +1260,12 @@ fn emit_interface(out: &mut String, name: &str, sym: &Symbol, scope: &Scope) {
         Access::Default => matches!(scope.default_access, Access::Private),
     };
     let suf = if effective_private { ", private" } else { "" };
-    writeln!(out, "@interface {}{}", name, suf).unwrap();
+    let interface_name = if matches!(sym.kind, SymbolKind::NamedInterface) {
+        sym.name.as_str()
+    } else {
+        name
+    };
+    writeln!(out, "@interface {}{}", interface_name, suf).unwrap();
     let mut specifics = sym.arg_names.clone(); // arg_names repurposed for specific list
     specifics.sort();
     for s in &specifics {

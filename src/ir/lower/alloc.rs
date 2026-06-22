@@ -659,9 +659,11 @@ pub(crate) fn alloc_decls(
                 } else if let Some(len_expr) = runtime_char_len_expr {
                     if !is_allocatable && array_spec.is_none() {
                         // Automatic fixed-length character whose size depends on a
-                        // runtime expression such as LEN(input). Materialize a
-                        // heap buffer now and remember the runtime length for
-                        // substring and assignment lowering.
+                        // runtime expression such as LEN(input). Pointer
+                        // declarations keep only a pointer slot plus the
+                        // runtime length; intrinsics such as c_f_pointer bind
+                        // the slot to external storage that this local does
+                        // not own.
                         let raw_len = super::expr::lower_expr_with_optional_layouts(
                             b,
                             locals,
@@ -673,28 +675,37 @@ pub(crate) fn alloc_decls(
                         let len_addr = b.alloca(IrType::Int(IntWidth::I64));
                         b.store(len_val, len_addr);
 
-                        let one = b.const_i64(1);
-                        let total = b.iadd(len_val, one);
-                        let ptr = b.runtime_call(
-                            RuntimeFunc::Allocate,
-                            vec![total],
-                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                        );
                         let ptr_slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
-                        b.store(ptr, ptr_slot);
-
                         let zero = b.const_i32(0);
-                        b.call(
-                            FuncRef::External("memset".into()),
-                            vec![ptr, zero, total],
-                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                        );
-                        let space = b.const_i32(b' ' as i32);
-                        b.call(
-                            FuncRef::External("memset".into()),
-                            vec![ptr, space, len_val],
-                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                        );
+                        let eight = b.const_i64(8);
+                        if is_pointer_attr {
+                            b.call(
+                                FuncRef::External("memset".into()),
+                                vec![ptr_slot, zero, eight],
+                                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                            );
+                        } else {
+                            let one = b.const_i64(1);
+                            let total = b.iadd(len_val, one);
+                            let ptr = b.runtime_call(
+                                RuntimeFunc::Allocate,
+                                vec![total],
+                                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                            );
+                            b.store(ptr, ptr_slot);
+
+                            b.call(
+                                FuncRef::External("memset".into()),
+                                vec![ptr, zero, total],
+                                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                            );
+                            let space = b.const_i32(b' ' as i32);
+                            b.call(
+                                FuncRef::External("memset".into()),
+                                vec![ptr, space, len_val],
+                                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                            );
+                        }
 
                         locals.insert(
                             key,
@@ -708,7 +719,7 @@ pub(crate) fn alloc_decls(
                                 char_kind: CharKind::FixedRuntime { len_addr },
                                 derived_type: None,
                                 inline_const: None,
-                                is_pointer: false,
+                                is_pointer: is_pointer_attr,
                                 runtime_dim_upper: vec![],
                                 is_class: false,
                                 logical_kind: None,

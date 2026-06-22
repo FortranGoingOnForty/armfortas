@@ -622,6 +622,26 @@ pub(super) fn resolve_unit(
                                 || existing.kind == SymbolKind::DerivedType
                             {
                                 merge_specific_names(&mut existing.arg_names, &merged_specifics);
+                            } else if matches!(
+                                existing.kind,
+                                SymbolKind::Function
+                                    | SymbolKind::Subroutine
+                                    | SymbolKind::ExternalProc
+                                    | SymbolKind::ProcedurePointer
+                            ) {
+                                st.define_same_name_generic_interface(Symbol {
+                                    name: generic_name.clone(),
+                                    kind: SymbolKind::NamedInterface,
+                                    type_info: None,
+                                    attrs: SymbolAttrs {
+                                        ..Default::default()
+                                    },
+                                    defined_at: span,
+                                    scope: st.current_scope(),
+                                    arg_names: merged_specifics.clone(),
+                                    const_value: None,
+                                    const_char_value: None,
+                                });
                             }
                         }
                     }
