@@ -54,15 +54,15 @@ fn o3_vectorizes_int_max_and_min_reductions() {
         },
         Stage::Asm,
     );
+    assert!(
+        o3_ir.contains("vmax")
+            && o3_ir.contains("vmin")
+            && o3_ir.contains("vreduce_max")
+            && o3_ir.contains("vreduce_min"),
+        "expected vector min/max reductions to emit vmax + vmin and vreduce_max + vreduce_min:\n{}",
+        o3_ir
+    );
     if cfg!(target_arch = "aarch64") {
-        assert!(
-            o3_ir.contains("vmax")
-                && o3_ir.contains("vmin")
-                && o3_ir.contains("vreduce_max")
-                && o3_ir.contains("vreduce_min"),
-            "expected NeonVectorize to emit vmax + vmin and vreduce_max + vreduce_min:\n{}",
-            o3_ir
-        );
         assert!(
             o3_asm.contains("smaxv.4s") && o3_asm.contains("sminv.4s"),
             "VReduceMax/VReduceMin on i32 should lower via smaxv.4s / sminv.4s:\n{}",
@@ -72,16 +72,6 @@ fn o3_vectorizes_int_max_and_min_reductions() {
             o3_asm.contains("smax.4s") && o3_asm.contains("smin.4s"),
             "VMax/VMin in the body should lower via smax.4s / smin.4s:\n{}",
             o3_asm
-        );
-    } else {
-        // x86: SSE2 has neither an i32 lane min/max nor an i32 min/max
-        // reduce (vec_isa.rs int_min_max / reduce_min_max_i32 = false);
-        // both loops must stay scalar. Correctness is the runtime
-        // check below.
-        assert!(
-            !o3_ir.contains("vreduce_max") && !o3_ir.contains("vreduce_min"),
-            "SSE2 refuses i32 min/max reductions; the loops must stay scalar:\n{}",
-            o3_ir
         );
     }
 

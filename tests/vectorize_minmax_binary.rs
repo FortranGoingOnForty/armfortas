@@ -92,37 +92,20 @@ fn o3_vectorizes_elementwise_minmax_binary() {
         },
         Stage::OptIr,
     );
-    if cfg!(target_arch = "aarch64") {
-        // Three vmax (i32, f32, f64) and three vmin (i32, f32, f64).
-        assert_eq!(
-            o3_ir.matches("vmax").count(),
-            3,
-            "expected three vmax:\n{}",
-            o3_ir
-        );
-        assert_eq!(
-            o3_ir.matches("vmin").count(),
-            3,
-            "expected three vmin:\n{}",
-            o3_ir
-        );
-    } else {
-        // x86: the f32 and f64 lanes vectorize (minps/maxps,
-        // minpd/maxpd); SSE2 has no i32 lane min/max (vec_isa.rs
-        // int_min_max = false), so the i32 loop stays scalar.
-        assert_eq!(
-            o3_ir.matches("vmax").count(),
-            2,
-            "expected two vmax (f32 + f64; i32 stays scalar on SSE2):\n{}",
-            o3_ir
-        );
-        assert_eq!(
-            o3_ir.matches("vmin").count(),
-            2,
-            "expected two vmin (f32 + f64; i32 stays scalar on SSE2):\n{}",
-            o3_ir
-        );
-    }
+    // Three vmax (i32, f32, f64) and three vmin (i32, f32, f64).
+    // x86 lowers i32 min/max through the SSE2 pcmpgtd blend synthesis.
+    assert_eq!(
+        o3_ir.matches("vmax").count(),
+        3,
+        "expected three vmax:\n{}",
+        o3_ir
+    );
+    assert_eq!(
+        o3_ir.matches("vmin").count(),
+        3,
+        "expected three vmin:\n{}",
+        o3_ir
+    );
 
     let stdout = capture_run_stdout(CaptureRequest {
         input: source,
