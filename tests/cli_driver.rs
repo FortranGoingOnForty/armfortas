@@ -42160,9 +42160,18 @@ fn nested_derived_allocatable_assignment_uses_owned_helpers() {
         String::from_utf8_lossy(&asm_compile.stderr)
     );
     let asm_text = std::fs::read_to_string(&asm).expect("read derived helper asm");
+    let collection_copy_helper = if cfg!(target_arch = "x86_64") {
+        "afs_derived_helper_collection_m_collection_t_copy_value"
+    } else {
+        "_afs_derived_helper_collection_m_collection_t_copy_value"
+    };
+    let feature_copy_helper = if cfg!(target_arch = "x86_64") {
+        "afs_derived_helper_feature_m_feature_t_copy_value"
+    } else {
+        "_afs_derived_helper_feature_m_feature_t_copy_value"
+    };
     assert!(
-        asm_text.contains("_afs_derived_helper_collection_m_collection_t_copy_value")
-            && asm_text.contains("_afs_derived_helper_feature_m_feature_t_copy_value"),
+        asm_text.contains(collection_copy_helper) && asm_text.contains(feature_copy_helper),
         "expected module-owned derived copy helper symbols in asm"
     );
     let add_defaults_marker = if cfg!(target_arch = "x86_64") {
@@ -44173,10 +44182,25 @@ fn same_name_imported_generic_preserves_private_c_ptr_specifics() {
         String::from_utf8_lossy(&compile_consumer.stderr)
     );
     let asm_text = fs::read_to_string(&asm).expect("cannot read same-name c_ptr consumer asm");
+    let get_ptr_symbol = if cfg!(target_arch = "x86_64") {
+        "get_ptr"
+    } else {
+        "_get_ptr"
+    };
+    let pick_ptr_symbol = if cfg!(target_arch = "x86_64") {
+        "afs_modproc_generic_cptr_provider_pick_ptr"
+    } else {
+        "_afs_modproc_generic_cptr_provider_pick_ptr"
+    };
+    let wrong_pick_call = if cfg!(target_arch = "x86_64") {
+        "call afs_modproc_generic_cptr_provider_pick\n"
+    } else {
+        "bl _afs_modproc_generic_cptr_provider_pick\n"
+    };
     assert!(
-        asm_text.contains("_get_ptr")
-            && asm_text.contains("_afs_modproc_generic_cptr_provider_pick_ptr")
-            && !asm_text.contains("bl _afs_modproc_generic_cptr_provider_pick\n"),
+        asm_text.contains(get_ptr_symbol)
+            && asm_text.contains(pick_ptr_symbol)
+            && !asm_text.contains(wrong_pick_call),
         "same-name imported generic resolved to wrong specific:\n{}",
         asm_text
     );
