@@ -731,13 +731,23 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         let callee_is_elemental_array_intrinsic =
                                             if let Expr::Name { name: cname } = &callee.node {
                                                 let lname = cname.to_lowercase();
-                                                let direct_elemental =
-                                                    is_elemental_math_intrinsic(cname)
+                                                let whole_array_scalar_intrinsic =
+                                                    crate::sema::validate::is_intrinsic_name(
+                                                        &lname,
+                                                    ) && is_array_reducing_intrinsic(&lname)
+                                                        && !user_callable_shadows_intrinsic(
+                                                            ctx.st,
+                                                            ctx.proc_scope_id,
+                                                            b.func().name.as_str(),
+                                                            &lname,
+                                                        );
+                                                let direct_elemental = !whole_array_scalar_intrinsic
+                                                    && (is_elemental_math_intrinsic(cname)
                                                         || ctx.elemental_funcs.contains(&lname)
                                                         || ctx
                                                             .st
                                                             .find_symbol_any_scope(&lname)
-                                                            .is_some_and(|s| s.attrs.elemental);
+                                                            .is_some_and(|s| s.attrs.elemental));
                                                 let generic_specifics_elemental = !direct_elemental
                                                     && resolved_named_callee_is_elemental(
                                                         b,
@@ -899,6 +909,16 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                                 | "minexponent"
                                                                 | "maxexponent"
                                                         )
+                                                            || (lk == "len"
+                                                                && crate::sema::validate::is_intrinsic_name(
+                                                                    &lk,
+                                                                )
+                                                                && !user_callable_shadows_intrinsic(
+                                                                    ctx.st,
+                                                                    ctx.proc_scope_id,
+                                                                    b.func().name.as_str(),
+                                                                    &lk,
+                                                                ))
                                                     } else {
                                                         false
                                                     }
@@ -4228,11 +4248,11 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             let typed_vtable =
                 typed_allocate_vtable_value(b, type_spec.as_ref(), ctx.type_layouts);
             let typed_layout = typed_allocate_layout(type_spec.as_ref(), ctx.type_layouts);
-            let source_desc = allocate_descriptor_keyword_expr(b, ctx, opts, "source");
-            let mold_desc = allocate_descriptor_keyword_expr(b, ctx, opts, "mold");
-            let shape_desc = source_desc.or(mold_desc);
             let source_expr = allocate_keyword_expr(opts, "source");
             let source_scalar_desc = allocate_scalar_source_descriptor(b, ctx, opts);
+            let source_desc = allocate_descriptor_keyword_expr(b, ctx, opts, "source");
+            let mold_desc = allocate_descriptor_keyword_expr(b, ctx, opts, "mold");
+            let shape_desc = source_desc.or(mold_desc).or(source_scalar_desc);
 
             for item in items {
                 let source_char = allocate_char_source_value(b, ctx, opts);

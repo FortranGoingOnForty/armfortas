@@ -44566,6 +44566,43 @@ fn allocatable_character_array_self_section_assignment_preserves_values() {
 }
 
 #[test]
+fn allocatable_integer_array_broadcasts_len_of_optional_char_array() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_integer_array_broadcasts_len_of_optional_char_array count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\ncontains\n  subroutine fill_lengths(default, ilen)\n    character(len=*), intent(in), optional :: default(:)\n    integer, allocatable, intent(out) :: ilen(:)\n    if (present(default)) then\n      allocate(ilen(size(default)))\n      ilen = len(default)\n    end if\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  character(len=3), parameter :: defaults(2) = [character(len=3) :: 'abc', 'de']\n  integer, allocatable :: ilen(:)\n  call fill_lengths(defaults, ilen)\n  if (.not. allocated(ilen)) error stop 1\n  if (size(ilen) /= 2) error stop 2\n  if (any(ilen /= 3)) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("alloc_int_len_optional_char_array", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("optional char-array LEN broadcast compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "optional char-array LEN broadcast compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("optional char-array LEN broadcast run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "optional char-array LEN broadcast run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn generic_subroutine_matches_use_renamed_class_actual() {
     let src = write_program(
         "module value_m\n  implicit none\n  type :: toml_value\n    character(:), allocatable :: message\n  end type\nend module\nmodule parser_m\n  use value_m, only: toml_value\n  implicit none\n  interface json_load\n    module procedure json_load_file\n    module procedure json_load_unit\n  end interface\ncontains\n  subroutine json_load_file(object, filename, error)\n    class(toml_value), allocatable, intent(out) :: object\n    character(*), intent(in) :: filename\n    integer, intent(out), optional :: error\n    if (present(error)) error = len_trim(filename)\n  end subroutine\n  subroutine json_load_unit(object, io, error)\n    class(toml_value), allocatable, intent(out) :: object\n    integer, intent(in) :: io\n    integer, intent(out), optional :: error\n    if (present(error)) error = io\n  end subroutine\nend module\nmodule facade_m\n  use value_m, only: json_value => toml_value\n  use parser_m, only: json_load\n  implicit none\nend module\nmodule user_m\n  use facade_m, only: json_value, json_load\n  implicit none\ncontains\n  subroutine run(path)\n    character(*), intent(in) :: path\n    type(json_value), allocatable :: holder\n    class(json_value), allocatable :: value\n    integer :: err\n    allocate(holder)\n    holder%message = path\n    call json_load(value, holder%message, error=err)\n  end subroutine\nend module\nprogram p\n  use user_m, only: run\n  call run('pkg.json')\nend program\n",
@@ -44594,6 +44631,136 @@ fn generic_subroutine_matches_use_renamed_class_actual() {
     );
 
     let _ = std::fs::remove_file(&ir);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn use_renamed_derived_local_copies_pointer_function_result() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=use_renamed_derived_local_copies_pointer_function_result count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("renamed_derived_pointer_copy");
+    let table_api = write_program_in(
+        &dir,
+        "table_api.f90",
+        "module table_api\n  implicit none\n  type :: toml_table\n    integer :: n = 0\n  end type\ncontains\n  function cast_to_table(value) result(table)\n    type(toml_table), target, intent(in) :: value\n    type(toml_table), pointer :: table\n    table => value\n  end function\nend module\n",
+    );
+    let facade = write_program_in(
+        &dir,
+        "facade_m.f90",
+        "module facade_m\n  use table_api, only: json_object => toml_table, cast_to_object => cast_to_table\n  implicit none\nend module\n",
+    );
+    let user = write_program_in(
+        &dir,
+        "user_m.f90",
+        "module user_m\n  use facade_m, only: json_object, cast_to_object\n  implicit none\ncontains\n  subroutine run()\n    type(json_object), target :: source\n    type(json_object) :: json\n    source%n = 42\n    json = cast_to_object(source)\n    if (json%n /= 42) error stop 1\n  end subroutine\nend module\nprogram p\n  use user_m, only: run\n  call run()\n  print *, 'ok'\nend program\n",
+    );
+
+    let table_obj = dir.join("table_api.o");
+    let facade_obj = dir.join("facade_m.o");
+    let user_obj = dir.join("user_m.o");
+    for (src, obj) in [
+        (&table_api, &table_obj),
+        (&facade, &facade_obj),
+        (&user, &user_obj),
+    ] {
+        let compiled = Command::new(compiler("armfortas"))
+            .args([
+                "-c",
+                src.to_str().unwrap(),
+                "-I",
+                dir.to_str().unwrap(),
+                "-J",
+                dir.to_str().unwrap(),
+                "-o",
+                obj.to_str().unwrap(),
+            ])
+            .output()
+            .expect("renamed derived pointer-copy compile failed to spawn");
+        assert!(
+            compiled.status.success(),
+            "compile {} failed: {}",
+            src.display(),
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+    }
+
+    let amod = fs::read_to_string(dir.join("facade_m.amod")).expect("missing facade_m.amod");
+    assert!(
+        amod.contains("@use_rename json_object = toml_table from table_api"),
+        "facade .amod should preserve the derived type rename:\n{}",
+        amod
+    );
+
+    let bin = dir.join("p");
+    let link = Command::new(compiler("armfortas"))
+        .args([
+            table_obj.to_str().unwrap(),
+            facade_obj.to_str().unwrap(),
+            user_obj.to_str().unwrap(),
+            "-o",
+            bin.to_str().unwrap(),
+        ])
+        .output()
+        .expect("renamed derived pointer-copy link failed to spawn");
+    assert!(
+        link.status.success(),
+        "renamed derived pointer-copy link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&bin)
+        .output()
+        .expect("renamed derived pointer-copy run failed to spawn");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "renamed derived pointer-copy run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+#[test]
+fn defined_concat_probe_skips_rank_until_semantic_match() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=defined_concat_probe_skips_rank_until_semantic_match count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let src = write_program(
+        "module string_ops\n  implicit none\n  type :: string_t\n    character(:), allocatable :: raw\n  end type\n  interface operator(//)\n    module procedure concat_string_char\n  end interface\ncontains\n  function concat_string_char(lhs, rhs) result(out)\n    type(string_t), intent(in) :: lhs\n    character(*), intent(in) :: rhs\n    type(string_t) :: out\n    out%raw = lhs%raw // rhs\n  end function\nend module\nmodule m\n  use string_ops, only: string_t, operator(//)\n  implicit none\n  character(*), parameter :: nl = new_line('a')\n  character(*), parameter :: toml = 'a'//nl//'b'//nl//'c'//nl//'d'//nl// &\n    'e'//nl//'f'//nl//'g'//nl//'h'//nl//'i'//nl//'j'//nl// &\n    'k'//nl//'l'//nl//'m'//nl//'n'//nl//'o'//nl//'p'\ncontains\n  subroutine run()\n    if (len(toml) <= 16) error stop 1\n  end subroutine\nend module\nprogram p\n  use m, only: run\n  call run()\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("defined_concat_rank_probe", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("defined concat rank-probe compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "defined concat rank-probe compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("defined concat rank-probe run failed to spawn");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "defined concat rank-probe run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
 }
 

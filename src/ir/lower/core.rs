@@ -14960,10 +14960,6 @@ pub(super) fn defined_binary_operator_result_type_info(
     let iface_name = binary_op_interface_name(op)?;
     let specifics =
         operator_specific_candidates(st, type_layouts, &iface_name, &[left_ti, right_ti])?;
-    let left_actual_rank =
-        locals.and_then(|locals| actual_expr_rank(left_expr, locals, st, type_layouts));
-    let right_actual_rank =
-        locals.and_then(|locals| actual_expr_rank(right_expr, locals, st, type_layouts));
 
     for candidate in &specifics {
         let Some(scope) = procedure_scope_for_candidate(st, candidate) else {
@@ -14987,6 +14983,10 @@ pub(super) fn defined_binary_operator_result_type_info(
             continue;
         }
         if !candidate_is_elemental {
+            let left_actual_rank =
+                locals.and_then(|locals| actual_expr_rank(left_expr, locals, st, type_layouts));
+            let right_actual_rank =
+                locals.and_then(|locals| actual_expr_rank(right_expr, locals, st, type_layouts));
             let left_formal_rank = formal_declared_rank(declared_args[0]);
             let right_formal_rank = formal_declared_rank(declared_args[1]);
             if !formal_rank_matches_actual(left_formal_rank, left_actual_rank)
@@ -15016,10 +15016,6 @@ pub(super) fn defined_binary_operator_result_rank(
     let iface_name = binary_op_interface_name(op)?;
     let specifics =
         operator_specific_candidates(st, type_layouts, &iface_name, &[left_ti, right_ti])?;
-    let left_actual_rank =
-        locals.and_then(|locals| actual_expr_rank(left_expr, locals, st, type_layouts));
-    let right_actual_rank =
-        locals.and_then(|locals| actual_expr_rank(right_expr, locals, st, type_layouts));
 
     for candidate in &specifics {
         let Some(scope) = procedure_scope_for_candidate(st, candidate) else {
@@ -15043,6 +15039,10 @@ pub(super) fn defined_binary_operator_result_rank(
             continue;
         }
         if !candidate_is_elemental {
+            let left_actual_rank =
+                locals.and_then(|locals| actual_expr_rank(left_expr, locals, st, type_layouts));
+            let right_actual_rank =
+                locals.and_then(|locals| actual_expr_rank(right_expr, locals, st, type_layouts));
             let left_formal_rank = formal_declared_rank(declared_args[0]);
             let right_formal_rank = formal_declared_rank(declared_args[1]);
             if !formal_rank_matches_actual(left_formal_rank, left_actual_rank)
@@ -15058,6 +15058,10 @@ pub(super) fn defined_binary_operator_result_rank(
         if declared_result_rank > 0 {
             return Some(declared_result_rank);
         }
+        let left_actual_rank =
+            locals.and_then(|locals| actual_expr_rank(left_expr, locals, st, type_layouts));
+        let right_actual_rank =
+            locals.and_then(|locals| actual_expr_rank(right_expr, locals, st, type_layouts));
         return Some(
             left_actual_rank
                 .unwrap_or(0)
@@ -15078,8 +15082,6 @@ pub(super) fn defined_unary_operator_result_type_info(
 ) -> Option<crate::sema::symtab::TypeInfo> {
     let iface_name = unary_op_interface_name(op)?;
     let specifics = operator_interface_specific_candidates(st, &iface_name)?;
-    let operand_actual_rank =
-        locals.and_then(|locals| actual_expr_rank(operand_expr, locals, st, type_layouts));
 
     for candidate in &specifics {
         let Some(scope) = procedure_scope_for_candidate(st, candidate) else {
@@ -15097,6 +15099,8 @@ pub(super) fn defined_unary_operator_result_type_info(
             continue;
         }
         if !candidate_is_elemental {
+            let operand_actual_rank =
+                locals.and_then(|locals| actual_expr_rank(operand_expr, locals, st, type_layouts));
             let formal_rank = formal_declared_rank(declared_args[0]);
             if !formal_rank_matches_actual(formal_rank, operand_actual_rank) {
                 continue;
@@ -15124,8 +15128,6 @@ pub(super) fn resolve_defined_unary_operator_specific_by_semantics(
     {
         return None;
     }
-    let operand_actual_rank =
-        locals.and_then(|locals| actual_expr_rank(operand_expr, locals, st, type_layouts));
 
     for candidate in &specifics {
         let Some(scope) = procedure_scope_for_candidate(st, candidate) else {
@@ -15142,6 +15144,8 @@ pub(super) fn resolve_defined_unary_operator_specific_by_semantics(
             continue;
         }
         if !specific_candidate_is_elemental(st, candidate) {
+            let operand_actual_rank =
+                locals.and_then(|locals| actual_expr_rank(operand_expr, locals, st, type_layouts));
             let formal_rank = formal_declared_rank(declared_args[0]);
             if !formal_rank_matches_actual(formal_rank, operand_actual_rank) {
                 continue;
@@ -15175,10 +15179,6 @@ pub(super) fn resolve_defined_binary_operator_specific_by_semantics(
     {
         return None;
     }
-    let left_actual_rank =
-        locals.and_then(|locals| actual_expr_rank(left_expr, locals, st, type_layouts));
-    let right_actual_rank =
-        locals.and_then(|locals| actual_expr_rank(right_expr, locals, st, type_layouts));
 
     for candidate in &specifics {
         let Some(scope) = procedure_scope_for_candidate(st, candidate) else {
@@ -15201,6 +15201,10 @@ pub(super) fn resolve_defined_binary_operator_specific_by_semantics(
             continue;
         }
         if !specific_candidate_is_elemental(st, candidate) {
+            let left_actual_rank =
+                locals.and_then(|locals| actual_expr_rank(left_expr, locals, st, type_layouts));
+            let right_actual_rank =
+                locals.and_then(|locals| actual_expr_rank(right_expr, locals, st, type_layouts));
             let left_formal_rank = formal_declared_rank(declared_args[0]);
             let right_formal_rank = formal_declared_rank(declared_args[1]);
             if !formal_rank_matches_actual(left_formal_rank, left_actual_rank)
@@ -33681,6 +33685,7 @@ pub(super) fn is_array_reducing_intrinsic(name: &str) -> bool {
             | "iparity"
             | "parity"
             | "findloc"
+            | "len"
             // Whole-array inquiry intrinsics: their first arg is the
             // array itself, not an elementwise operand. Scalarizing
             // them rewrites `size(x, dim)` to `size(x(i,j), dim)`,
@@ -35952,6 +35957,17 @@ pub(super) fn array_function_result_elem_type(
     match &callee.node {
         Expr::Name { name } => {
             let key = name.to_lowercase();
+            if crate::sema::validate::is_intrinsic_name(&key)
+                && is_array_reducing_intrinsic(&key)
+                && !user_callable_shadows_intrinsic(
+                    st,
+                    current_proc_scope(),
+                    b.func().name.as_str(),
+                    &key,
+                )
+            {
+                return None;
+            }
             if procedure_pointer_call_target(b, locals, st, &key).is_some() {
                 return None;
             }
@@ -36431,6 +36447,18 @@ pub(super) fn resolved_named_callee_is_elemental(
     contained_host_refs: Option<&HashMap<String, Vec<String>>>,
     descriptor_params: Option<&HashMap<String, Vec<bool>>>,
 ) -> bool {
+    let callee_key = callee_name.to_lowercase();
+    if crate::sema::validate::is_intrinsic_name(&callee_key)
+        && is_array_reducing_intrinsic(&callee_key)
+        && !user_callable_shadows_intrinsic(
+            st,
+            current_proc_scope(),
+            b.func().name.as_str(),
+            &callee_key,
+        )
+    {
+        return false;
+    }
     let actual_vals: Vec<ValueId> = args
         .iter()
         .map(|arg| match &arg.value {
