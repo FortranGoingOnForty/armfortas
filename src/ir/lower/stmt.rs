@@ -4248,11 +4248,11 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             let typed_vtable =
                 typed_allocate_vtable_value(b, type_spec.as_ref(), ctx.type_layouts);
             let typed_layout = typed_allocate_layout(type_spec.as_ref(), ctx.type_layouts);
-            let source_desc = allocate_descriptor_keyword_expr(b, ctx, opts, "source");
-            let mold_desc = allocate_descriptor_keyword_expr(b, ctx, opts, "mold");
-            let shape_desc = source_desc.or(mold_desc);
             let source_expr = allocate_keyword_expr(opts, "source");
             let source_scalar_desc = allocate_scalar_source_descriptor(b, ctx, opts);
+            let source_desc = allocate_descriptor_keyword_expr(b, ctx, opts, "source");
+            let mold_desc = allocate_descriptor_keyword_expr(b, ctx, opts, "mold");
+            let shape_desc = source_desc.or(mold_desc).or(source_scalar_desc);
 
             for item in items {
                 let source_char = allocate_char_source_value(b, ctx, opts);
