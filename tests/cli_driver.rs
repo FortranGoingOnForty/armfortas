@@ -44727,6 +44727,44 @@ fn use_renamed_derived_local_copies_pointer_function_result() {
 }
 
 #[test]
+fn defined_concat_probe_skips_rank_until_semantic_match() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=defined_concat_probe_skips_rank_until_semantic_match count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let src = write_program(
+        "module string_ops\n  implicit none\n  type :: string_t\n    character(:), allocatable :: raw\n  end type\n  interface operator(//)\n    module procedure concat_string_char\n  end interface\ncontains\n  function concat_string_char(lhs, rhs) result(out)\n    type(string_t), intent(in) :: lhs\n    character(*), intent(in) :: rhs\n    type(string_t) :: out\n    out%raw = lhs%raw // rhs\n  end function\nend module\nmodule m\n  use string_ops, only: string_t, operator(//)\n  implicit none\n  character(*), parameter :: nl = new_line('a')\n  character(*), parameter :: toml = 'a'//nl//'b'//nl//'c'//nl//'d'//nl// &\n    'e'//nl//'f'//nl//'g'//nl//'h'//nl//'i'//nl//'j'//nl// &\n    'k'//nl//'l'//nl//'m'//nl//'n'//nl//'o'//nl//'p'\ncontains\n  subroutine run()\n    if (len(toml) <= 16) error stop 1\n  end subroutine\nend module\nprogram p\n  use m, only: run\n  call run()\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("defined_concat_rank_probe", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("defined concat rank-probe compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "defined concat rank-probe compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("defined concat rank-probe run failed to spawn");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "defined concat rank-probe run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn use_only_generic_collects_all_bare_reexport_specifics() {
     let src = write_program(
         "module table_api\n  implicit none\n  type :: toml_table\n    integer :: n = 0\n  end type\n  type :: toml_array\n    integer :: n = 0\n  end type\n  interface get_value\n    module procedure get_child_array\n  end interface\ncontains\n  subroutine get_child_array(table, key, ptr, requested)\n    class(toml_table), intent(inout) :: table\n    character(*), intent(in) :: key\n    type(toml_array), pointer, intent(out) :: ptr\n    logical, intent(in), optional :: requested\n    nullify(ptr)\n  end subroutine\nend module\nmodule array_api\n  use table_api, only: toml_array\n  implicit none\n  interface get_value\n    module procedure get_elem_array\n  end interface\ncontains\n  subroutine get_elem_array(array, pos, ptr)\n    class(toml_array), intent(inout) :: array\n    integer, intent(in) :: pos\n    type(toml_array), pointer, intent(out) :: ptr\n    nullify(ptr)\n  end subroutine\nend module\nmodule build_api\n  use array_api\n  use table_api\n  implicit none\nend module\nmodule toml_api\n  use build_api\n  implicit none\nend module\nmodule user_m\n  use toml_api, only: toml_table, toml_array, get_value\n  implicit none\n  interface get_value\n    module procedure get_local_bool\n  end interface\ncontains\n  subroutine run(table, key)\n    type(toml_table), intent(inout) :: table\n    character(*), intent(in) :: key\n    type(toml_array), pointer :: children\n    call get_value(table, key, children, requested=.false.)\n  end subroutine\n  subroutine get_local_bool(table, key, value)\n    type(toml_table), intent(inout) :: table\n    character(*), intent(in) :: key\n    logical, intent(out) :: value\n    value = .false.\n  end subroutine\nend module\nprogram p\n  use user_m, only: run\n  use table_api, only: toml_table\n  type(toml_table) :: table\n  call run(table, 'items')\nend program\n",
