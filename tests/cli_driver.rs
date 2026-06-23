@@ -568,6 +568,101 @@ fn stream_unformatted_scalar_char_read_preserves_each_byte() {
 }
 
 #[test]
+fn stream_unformatted_char_allocatable_dummy_read_uses_descriptor_elem_size() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=stream_unformatted_char_allocatable_dummy_read_uses_descriptor_elem_size count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let input = unique_path("stream_unformatted_char_alloc_dummy_read", "bin");
+    std::fs::write(&input, b"NAME\n").expect("cannot write stream char alloc dummy input");
+
+    let src = write_program(
+        &format!(
+            "module m\ncontains\n  subroutine slurp(path, text)\n    character(len=*), intent(in) :: path\n    character(len=1), allocatable, intent(out) :: text(:)\n    integer :: unit_num, ios, nchars\n    open(newunit=unit_num, file=path, status='old', action='read', access='stream', form='unformatted', iostat=ios)\n    if (ios /= 0) error stop 1\n    inquire(unit=unit_num, size=nchars)\n    allocate(text(nchars))\n    read(unit_num, iostat=ios) text\n    if (ios /= 0) error stop 2\n    close(unit_num)\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  character(len=1), allocatable :: text(:)\n  call slurp('{}', text)\n  if (size(text) /= 5) error stop 3\n  if (text(1) /= 'N') error stop 4\n  if (text(2) /= 'A') error stop 5\n  if (text(3) /= 'M') error stop 6\n  if (text(4) /= 'E') error stop 7\n  if (iachar(text(5)) /= 10) error stop 8\n  print *, 'ok'\nend program\n",
+            input.display()
+        ),
+        "stream_unformatted_char_alloc_dummy_read.f90",
+    );
+    let out = unique_path("stream_unformatted_char_alloc_dummy_read", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("stream unformatted char alloc dummy read compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "stream unformatted char alloc dummy read compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("stream unformatted char alloc dummy read run failed");
+    assert!(
+        run.status.success(),
+        "stream unformatted char alloc dummy read failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected ok output, got: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&input);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn allocatable_fixed_char_array_function_result_assignment_preserves_bytes() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_fixed_char_array_function_result_assignment_preserves_bytes count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  integer, parameter :: k1 = 16\n  character(len=1), allocatable :: text(:)\n  character(len=k1), allocatable :: pageout(:)\n\n  allocate(text(6))\n  text = [character(len=1) :: 'N', 'A', 'M', 'E', char(10), 'Z']\n  pageout = page(text)\n\n  if (size(pageout) /= 2) error stop 1\n  if (pageout(1)(1:4) /= 'NAME') error stop 2\n  if (pageout(2)(1:1) /= 'Z') error stop 3\n  print *, 'ok'\ncontains\n  function page(array) result(table)\n    character(len=1), intent(in) :: array(:)\n    character(len=k1), allocatable :: table(:)\n    integer :: i\n    integer :: lines\n    integer :: linecount\n    integer :: position\n\n    lines = 1\n    do i = 1, size(array)\n      if (array(i) == char(10)) lines = lines + 1\n    end do\n\n    allocate(character(len=k1) :: table(lines))\n    table = ' '\n    linecount = 1\n    position = 1\n    do i = 1, size(array)\n      if (array(i) == char(10)) then\n        linecount = linecount + 1\n        position = 1\n      else\n        table(linecount)(position:position) = array(i)\n        position = position + 1\n      end if\n    end do\n  end function\nend program\n",
+        "alloc_char_array_func_result.f90",
+    );
+    let out = unique_path("alloc_char_array_func_result", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("allocatable char array function result compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "allocatable char array function result compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("allocatable char array function result run failed");
+    assert!(
+        run.status.success(),
+        "allocatable char array function result failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected ok output, got: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn stream_unformatted_char_write_preserves_exact_bytes() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

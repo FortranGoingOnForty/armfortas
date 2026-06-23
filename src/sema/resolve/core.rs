@@ -5,6 +5,7 @@
 
 use crate::ast::decl;
 use crate::ast::decl::{Attribute, Decl, SpannedDecl, TypeSpec};
+use crate::ast::stmt::{SpannedStmt, Stmt};
 use crate::ast::unit::*;
 use crate::sema::symtab::*;
 use std::cell::RefCell;
@@ -208,6 +209,7 @@ pub(super) fn resolve_unit(
             process_uses(st, uses, module_search_paths, layouts)?;
             process_implicit(st, implicit)?;
             process_decls(st, decls)?;
+            process_namelists(st, body)?;
             detect_statement_functions(st, scope_id, body);
             preload_stmt_uses(st, body, module_search_paths, layouts);
             process_contains(st, contains, module_search_paths, layouts)?;
@@ -295,6 +297,7 @@ pub(super) fn resolve_unit(
             process_uses(st, uses, module_search_paths, layouts)?;
             process_implicit(st, implicit)?;
             process_decls(st, decls)?;
+            process_namelists(st, body)?;
             detect_statement_functions(st, scope_id, body);
             preload_stmt_uses(st, body, module_search_paths, layouts);
             process_contains(st, contains, module_search_paths, layouts)?;
@@ -365,6 +368,7 @@ pub(super) fn resolve_unit(
                 name,
                 result.as_deref().unwrap_or(name.as_str()),
             );
+            process_namelists(st, body)?;
             detect_statement_functions(st, scope_id, body);
             preload_stmt_uses(st, body, module_search_paths, layouts);
             process_contains(st, contains, module_search_paths, layouts)?;
@@ -2203,6 +2207,35 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
     for (access, names) in &pending_access {
         for name in names {
             st.set_symbol_access(name, *access);
+        }
+    }
+    Ok(())
+}
+
+fn process_namelists(st: &mut SymbolTable, body: &[SpannedStmt]) -> Result<(), SemaError> {
+    for stmt in body {
+        let Stmt::Namelist { groups } = &stmt.node else {
+            continue;
+        };
+        for (name, vars) in groups {
+            let key = name.to_lowercase();
+            if let Some(existing) = st.scope_mut(st.current_scope()).symbols.get_mut(&key) {
+                if existing.kind == SymbolKind::Namelist {
+                    merge_specific_names(&mut existing.arg_names, vars);
+                    continue;
+                }
+            }
+            st.define(Symbol {
+                name: name.clone(),
+                kind: SymbolKind::Namelist,
+                type_info: None,
+                attrs: SymbolAttrs::default(),
+                defined_at: stmt.span,
+                scope: st.current_scope(),
+                arg_names: vars.clone(),
+                const_value: None,
+                const_char_value: None,
+            })?;
         }
     }
     Ok(())

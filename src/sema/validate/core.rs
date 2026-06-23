@@ -3351,6 +3351,7 @@ fn check_implicit_none(
     // Collect declared names in this scope (from declarations).
     let mut declared: std::collections::HashSet<String> = std::collections::HashSet::new();
     extend_declared_names_from_decls(&mut declared, decls);
+    extend_declared_names_from_namelist_stmts(&mut declared, stmts);
     // Also scan for INTERFACE blocks — function/subroutine names
     // declared in interfaces are valid in the current scope.
     // The interface bodies are stored as program units in the
@@ -3447,6 +3448,19 @@ fn extend_declared_names_from_ifaces(
                         declared.insert(name.to_lowercase());
                     }
                 }
+            }
+        }
+    }
+}
+
+fn extend_declared_names_from_namelist_stmts(
+    declared: &mut std::collections::HashSet<String>,
+    stmts: &[SpannedStmt],
+) {
+    for stmt in stmts {
+        if let Stmt::Namelist { groups } = &stmt.node {
+            for (name, _) in groups {
+                declared.insert(name.to_lowercase());
             }
         }
     }
@@ -3572,6 +3586,7 @@ fn walk_stmt_for_undeclared(
             block_declared.extend(block_use_imported_names(st, uses));
             extend_declared_names_from_decls(&mut block_declared, decls);
             extend_declared_names_from_ifaces(&mut block_declared, ifaces);
+            extend_declared_names_from_namelist_stmts(&mut block_declared, body);
             let mut block_implicit = implicit_letters.clone();
             let mut block_implicit_none = false;
             for d in implicit {
@@ -3936,6 +3951,54 @@ mod tests {
             .filter(|d| d.kind == DiagKind::Error)
             .map(|d| d.msg.clone())
             .collect()
+    }
+
+    #[test]
+    fn implicit_none_accepts_namelist_group_in_nml_control() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  integer :: x
+  namelist /expected/ x
+  read(*, nml=expected)
+end program
+",
+        );
+        assert!(!errs.iter().any(|e| e.contains("expected")), "{:?}", errs);
+    }
+
+    #[test]
+    fn implicit_none_rejects_unknown_namelist_group_in_nml_control() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  integer :: x
+  namelist /expected/ x
+  read(*, nml=missing)
+end program
+",
+        );
+        assert!(errs.iter().any(|e| e.contains("missing")), "{:?}", errs);
+    }
+
+    #[test]
+    fn implicit_none_accepts_host_namelist_group_in_contained_proc() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  integer :: x
+  namelist /act_cli/ x
+contains
+  subroutine parse()
+    write(*, nml=act_cli)
+  end subroutine
+end program
+",
+        );
+        assert!(!errs.iter().any(|e| e.contains("act_cli")), "{:?}", errs);
     }
 
     // ---- F2023 enumeration types ----

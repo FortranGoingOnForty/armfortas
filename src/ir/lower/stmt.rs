@@ -1020,6 +1020,94 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                 );
                                                 if local_uses_array_descriptor(&info) {
                                                     let dest_desc = array_descriptor_addr(b, &info);
+                                                    if descriptor_backed_char_array(&info) {
+                                                        lower_allocatable_char_array_assign_from_desc(
+                                                            b, dest_desc, src_desc,
+                                                        );
+                                                    } else {
+                                                        let src_kind_tag = src_elem_ty
+                                                            .as_ref()
+                                                            .and_then(numeric_kind_tag_for_ir_type);
+                                                        let dest_kind_tag =
+                                                            numeric_kind_tag_for_ir_type(&info.ty);
+                                                        if let (Some(sk), Some(dk)) =
+                                                            (src_kind_tag, dest_kind_tag)
+                                                        {
+                                                            if sk != dk {
+                                                                let dk_v = b.const_i32(dk);
+                                                                let sk_v = b.const_i32(sk);
+                                                                b.call(
+                                                                    FuncRef::External(
+                                                                        "afs_assign_allocatable_convert"
+                                                                            .into(),
+                                                                    ),
+                                                                    vec![
+                                                                        dest_desc, src_desc, dk_v,
+                                                                        sk_v,
+                                                                    ],
+                                                                    IrType::Void,
+                                                                );
+                                                            } else {
+                                                                b.call(
+                                                                    FuncRef::External(
+                                                                        "afs_assign_allocatable"
+                                                                            .into(),
+                                                                    ),
+                                                                    vec![dest_desc, src_desc],
+                                                                    IrType::Void,
+                                                                );
+                                                            }
+                                                        } else {
+                                                            b.call(
+                                                                FuncRef::External(
+                                                                    "afs_assign_allocatable".into(),
+                                                                ),
+                                                                vec![dest_desc, src_desc],
+                                                                IrType::Void,
+                                                            );
+                                                        }
+                                                    }
+                                                } else {
+                                                    copy_array_result_to_fixed_dest(
+                                                        b,
+                                                        &info,
+                                                        src_desc,
+                                                        src_elem_ty.as_ref(),
+                                                    );
+                                                }
+                                                let stat = b.alloca(IrType::Int(IntWidth::I32));
+                                                let zero32 = b.const_i32(0);
+                                                b.store(zero32, stat);
+                                                b.call(
+                                                    FuncRef::External(
+                                                        "afs_deallocate_array".into(),
+                                                    ),
+                                                    vec![src_desc, stat],
+                                                    IrType::Void,
+                                                );
+                                            }
+                                        } else {
+                                            // Indirect callee: same dest split as above.
+                                            let src_elem_ty = array_function_result_elem_type(
+                                                b,
+                                                &ctx.locals,
+                                                callee,
+                                                call_args,
+                                                ctx.st,
+                                                Some(ctx.type_layouts),
+                                                Some(ctx.internal_funcs),
+                                                Some(ctx.contained_host_refs),
+                                                Some(ctx.descriptor_params),
+                                            );
+                                            let src_desc =
+                                                super::expr::lower_expr_ctx_tl(b, ctx, array_rhs);
+                                            if local_uses_array_descriptor(&info) {
+                                                let dest_desc = array_descriptor_addr(b, &info);
+                                                if descriptor_backed_char_array(&info) {
+                                                    lower_allocatable_char_array_assign_from_desc(
+                                                        b, dest_desc, src_desc,
+                                                    );
+                                                } else {
                                                     let src_kind_tag = src_elem_ty
                                                         .as_ref()
                                                         .and_then(numeric_kind_tag_for_ir_type);
@@ -1059,78 +1147,6 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                             IrType::Void,
                                                         );
                                                     }
-                                                } else {
-                                                    copy_array_result_to_fixed_dest(
-                                                        b,
-                                                        &info,
-                                                        src_desc,
-                                                        src_elem_ty.as_ref(),
-                                                    );
-                                                }
-                                                let stat = b.alloca(IrType::Int(IntWidth::I32));
-                                                let zero32 = b.const_i32(0);
-                                                b.store(zero32, stat);
-                                                b.call(
-                                                    FuncRef::External(
-                                                        "afs_deallocate_array".into(),
-                                                    ),
-                                                    vec![src_desc, stat],
-                                                    IrType::Void,
-                                                );
-                                            }
-                                        } else {
-                                            // Indirect callee: same dest split as above.
-                                            let src_elem_ty = array_function_result_elem_type(
-                                                b,
-                                                &ctx.locals,
-                                                callee,
-                                                call_args,
-                                                ctx.st,
-                                                Some(ctx.type_layouts),
-                                                Some(ctx.internal_funcs),
-                                                Some(ctx.contained_host_refs),
-                                                Some(ctx.descriptor_params),
-                                            );
-                                            let src_desc =
-                                                super::expr::lower_expr_ctx_tl(b, ctx, array_rhs);
-                                            if local_uses_array_descriptor(&info) {
-                                                let dest_desc = array_descriptor_addr(b, &info);
-                                                let src_kind_tag = src_elem_ty
-                                                    .as_ref()
-                                                    .and_then(numeric_kind_tag_for_ir_type);
-                                                let dest_kind_tag =
-                                                    numeric_kind_tag_for_ir_type(&info.ty);
-                                                if let (Some(sk), Some(dk)) =
-                                                    (src_kind_tag, dest_kind_tag)
-                                                {
-                                                    if sk != dk {
-                                                        let dk_v = b.const_i32(dk);
-                                                        let sk_v = b.const_i32(sk);
-                                                        b.call(
-                                                            FuncRef::External(
-                                                                "afs_assign_allocatable_convert"
-                                                                    .into(),
-                                                            ),
-                                                            vec![dest_desc, src_desc, dk_v, sk_v],
-                                                            IrType::Void,
-                                                        );
-                                                    } else {
-                                                        b.call(
-                                                            FuncRef::External(
-                                                                "afs_assign_allocatable".into(),
-                                                            ),
-                                                            vec![dest_desc, src_desc],
-                                                            IrType::Void,
-                                                        );
-                                                    }
-                                                } else {
-                                                    b.call(
-                                                        FuncRef::External(
-                                                            "afs_assign_allocatable".into(),
-                                                        ),
-                                                        vec![dest_desc, src_desc],
-                                                        IrType::Void,
-                                                    );
                                                 }
                                             } else {
                                                 copy_array_result_to_fixed_dest(

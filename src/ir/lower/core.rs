@@ -9146,6 +9146,11 @@ pub(super) fn descriptor_backed_runtime_char_array(info: &LocalInfo) -> bool {
                 && local_fixed_char_allocatable_scalar_len(info).is_none()))
 }
 
+pub(super) fn descriptor_backed_char_array(info: &LocalInfo) -> bool {
+    local_uses_array_descriptor(info)
+        && (info.char_kind != CharKind::None || descriptor_backed_runtime_char_array(info))
+}
+
 pub(super) fn inline_char_array_storage(info: &LocalInfo) -> bool {
     matches!(info.ty, IrType::Int(IntWidth::I8))
         || matches!(
@@ -30017,7 +30022,6 @@ fn fmt_push_emit_complex(b: &mut FuncBuilder, lane_f64: bool, ptr: ValueId) {
 /// afs_fmt_push_*. Mirrors `lower_whole_array_write` minus the unit arg.
 fn fmt_push_whole_array(b: &mut FuncBuilder, info: &LocalInfo) {
     let base = array_base_addr(b, info);
-    let elem_bytes = ir_scalar_byte_size(&info.ty, b.layout);
 
     let char_fixed_len: Option<i64> = match info.char_kind {
         CharKind::Fixed(n) => Some(n),
@@ -30049,7 +30053,7 @@ fn fmt_push_whole_array(b: &mut FuncBuilder, info: &LocalInfo) {
 
     b.set_block(bb_body);
     let i_val = b.load(i_addr);
-    let elem_bytes_v = b.const_i64(elem_bytes);
+    let elem_bytes_v = array_elem_size_value(b, info);
     let byte_off = b.imul(i_val, elem_bytes_v);
     let p = b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
     if let Some(len) = char_fixed_len {
@@ -32132,7 +32136,6 @@ pub(super) fn lower_whole_array_write(
     unit: ValueId,
 ) {
     let base = array_base_addr(b, info);
-    let elem_bytes = ir_scalar_byte_size(&info.ty, b.layout);
     // Fixed-length CHARACTER arrays must dispatch to afs_write_string
     // with (ptr, len). Without this, the element load was treated as a
     // packed-integer chunk and fed to afs_write_int — `print *, c` for
@@ -32187,7 +32190,7 @@ pub(super) fn lower_whole_array_write(
 
     b.set_block(bb_body);
     let i_val = b.load(i_addr);
-    let elem_bytes_v = b.const_i64(elem_bytes);
+    let elem_bytes_v = array_elem_size_value(b, info);
     let byte_off = b.imul(i_val, elem_bytes_v);
     let ptr = b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
     if let Some(len) = char_fixed_len {
@@ -32223,7 +32226,6 @@ pub(super) fn lower_whole_array_write(
 
 pub(super) fn lower_whole_array_read(b: &mut FuncBuilder, info: &LocalInfo, mode: ReadMode) {
     let base = array_base_addr(b, info);
-    let elem_bytes = ir_scalar_byte_size(&info.ty, b.layout);
     let char_fixed_len = match info.char_kind {
         CharKind::Fixed(n) => Some(n),
         _ => None,
@@ -32246,7 +32248,7 @@ pub(super) fn lower_whole_array_read(b: &mut FuncBuilder, info: &LocalInfo, mode
 
     b.set_block(bb_body);
     let i_val = b.load(i_addr);
-    let elem_bytes_v = b.const_i64(elem_bytes);
+    let elem_bytes_v = array_elem_size_value(b, info);
     let byte_off = b.imul(i_val, elem_bytes_v);
     let ptr = b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
     if char_fixed_len.map(|len| lower_read_fixed_char_into_addr(b, mode, ptr, len)) != Some(true) {
@@ -33242,6 +33244,15 @@ pub(super) fn array_base_addr(b: &mut FuncBuilder, info: &LocalInfo) -> ValueId 
         b.load(info.addr)
     } else {
         info.addr
+    }
+}
+
+pub(super) fn array_elem_size_value(b: &mut FuncBuilder, info: &LocalInfo) -> ValueId {
+    if local_uses_array_descriptor(info) {
+        let desc = array_descriptor_addr(b, info);
+        descriptor_elem_size(b, desc)
+    } else {
+        b.const_i64(ir_scalar_byte_size(&info.ty, b.layout))
     }
 }
 
@@ -41408,7 +41419,7 @@ fn try_lower_typed_char_allocatable_constructor_assign(
     true
 }
 
-fn lower_allocatable_char_array_assign_from_desc(
+pub(super) fn lower_allocatable_char_array_assign_from_desc(
     b: &mut FuncBuilder,
     dest_desc: ValueId,
     src_desc: ValueId,
@@ -41725,6 +41736,16 @@ pub(super) fn lower_array_assign(
                 if ctx.alloc_return_funcs.contains(&callee_key)
                     || ctx.alloc_return_funcs.contains(&resolved_key)
                 {
+                    if descriptor_backed_char_array(dest_info) {
+                        lower_alloc_return_call_into_desc(
+                            b,
+                            ctx,
+                            dest_desc,
+                            callee_name,
+                            call_args,
+                        );
+                        return;
+                    }
                     let result_elem_ty = array_function_result_elem_type(
                         b,
                         &ctx.locals,
@@ -41805,7 +41826,7 @@ pub(super) fn lower_array_assign(
                 let mut assign_src_desc = src_desc;
                 let tmp_src_desc = if !dest_name.is_empty() && expr_mentions_name(value, dest_name)
                 {
-                    let tmp_desc = if descriptor_backed_runtime_char_array(dest_info) {
+                    let tmp_desc = if descriptor_backed_char_array(dest_info) {
                         allocate_like_array_temp_descriptor(b, src_desc)
                     } else {
                         allocate_like_array_temp_descriptor_with_elem_type(
@@ -41827,7 +41848,7 @@ pub(super) fn lower_array_assign(
                 } else {
                     None
                 };
-                if descriptor_backed_runtime_char_array(dest_info) {
+                if descriptor_backed_char_array(dest_info) {
                     lower_allocatable_char_array_assign_from_desc(b, dest_desc, assign_src_desc);
                     if let Some(tmp_desc) = tmp_src_desc {
                         let tmp_stat = b.alloca(IrType::Int(IntWidth::I32));
