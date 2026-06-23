@@ -713,6 +713,16 @@ impl<'a> Parser<'a> {
             }
             self.pos = save_pos;
         }
+        if self.peek() == &TokenKind::Identifier
+            && self
+                .tokens
+                .get(self.pos + 1)
+                .is_some_and(|tok| tok.kind == TokenKind::ColonColon)
+        {
+            let spec = self.advance().text.clone();
+            self.advance(); // skip ::
+            return Some(spec);
+        }
         None
     }
 
@@ -1100,6 +1110,11 @@ mod tests {
             sexpr("[character(len=26) :: '%s', 'left']"),
             "[character(len=26) :: '%s', 'left']"
         );
+    }
+
+    #[test]
+    fn array_constructor_typed_empty_derived() {
+        assert_eq!(sexpr("[string_t::]"), "[string_t :: ]");
     }
 
     #[test]
