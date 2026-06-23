@@ -40363,6 +40363,50 @@ fn allocatable_scalar_structure_constructor_assignment_preserves_class_dispatch(
 }
 
 #[test]
+fn class_allocatable_constructor_assignment_preserves_dynamic_type() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=class_allocatable_constructor_assignment_preserves_dynamic_type count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module repro\n  implicit none\n  type, abstract :: base_t\n    logical :: verbose = .true.\n  end type base_t\n  type, extends(base_t) :: child_t\n    character(:), allocatable :: name\n    logical :: enabled = .false.\n  end type child_t\ncontains\n  subroutine make_settings(cmd)\n    class(base_t), allocatable, intent(out) :: cmd\n    allocate(child_t :: cmd)\n    cmd = child_t(verbose=.false., name='manual_sample', enabled=.true.)\n  end subroutine make_settings\n\n  subroutine check_settings(cmd)\n    class(base_t), allocatable, intent(in) :: cmd\n    select type (settings => cmd)\n    type is (child_t)\n      if (settings%verbose) error stop 1\n      if (.not. settings%enabled) error stop 2\n      if (settings%name /= 'manual_sample') error stop 3\n    class default\n      error stop 4\n    end select\n  end subroutine check_settings\nend module repro\nprogram p\n  use repro\n  implicit none\n  class(base_t), allocatable :: cmd\n  call make_settings(cmd)\n  call check_settings(cmd)\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("class_alloc_ctor_assign_dynamic_type", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("class allocatable constructor assignment compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "class allocatable constructor assignment compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("class allocatable constructor assignment run failed");
+    assert!(
+        run.status.success(),
+        "class allocatable constructor assignment run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected class allocatable constructor assignment output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn allocate_source_implied_do_constructor_initializes_runtime_elements() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

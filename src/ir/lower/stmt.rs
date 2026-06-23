@@ -623,6 +623,19 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     && info.derived_type.is_some()
                                 {
                                     let desc = array_descriptor_addr(b, &info);
+                                    let assign_type_name = if info.is_class {
+                                        expr_type_layout(
+                                            value,
+                                            Some(&ctx.locals),
+                                            ctx.st,
+                                            ctx.type_layouts,
+                                        )
+                                        .filter(|layout| !layout.is_abstract)
+                                        .map(|layout| layout.name.clone())
+                                    } else {
+                                        None
+                                    }
+                                    .or_else(|| info.derived_type.clone());
                                     let allocated = b.call(
                                         FuncRef::External("afs_allocated".into()),
                                         vec![desc],
@@ -630,13 +643,78 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     );
                                     let zero32 = b.const_i32(0);
                                     let needs_alloc = b.icmp(CmpOp::Eq, allocated, zero32);
+                                    let needs_storage_alloc =
+                                        if info.is_class {
+                                            if let Some(ref tn) = assign_type_name {
+                                                if let Some(layout) = ctx.type_layouts.get(tn) {
+                                                    let current_elem_size =
+                                                        load_array_desc_i64_field(b, desc, 8);
+                                                    let target_elem_size =
+                                                        b.const_i64(layout.size as i64);
+                                                    let size_mismatch = b.icmp(
+                                                        CmpOp::Ne,
+                                                        current_elem_size,
+                                                        target_elem_size,
+                                                    );
+                                                    let current_tag =
+                                                        load_array_desc_type_tag(b, desc);
+                                                    let target_tag =
+                                                        b.const_i64(layout.type_tag as i64);
+                                                    let tag_mismatch = b.icmp(
+                                                        CmpOp::Ne,
+                                                        current_tag,
+                                                        target_tag,
+                                                    );
+                                                    let storage_mismatch =
+                                                        b.or(size_mismatch, tag_mismatch);
+                                                    b.or(needs_alloc, storage_mismatch)
+                                                } else {
+                                                    needs_alloc
+                                                }
+                                            } else {
+                                                needs_alloc
+                                            }
+                                        } else {
+                                            needs_alloc
+                                        };
                                     let alloc_bb = b.create_block("scalar_derived_assign_alloc");
                                     let copy_bb = b.create_block("scalar_derived_assign_copy");
                                     let done_bb = b.create_block("scalar_derived_assign_done");
-                                    b.cond_branch(needs_alloc, alloc_bb, vec![], copy_bb, vec![]);
+                                    b.cond_branch(
+                                        needs_storage_alloc,
+                                        alloc_bb,
+                                        vec![],
+                                        copy_bb,
+                                        vec![],
+                                    );
 
                                     b.set_block(alloc_bb);
-                                    if let Some(ref tn) = info.derived_type {
+                                    let already_allocated =
+                                        b.icmp(CmpOp::Ne, allocated, zero32);
+                                    let dealloc_bb =
+                                        b.create_block("scalar_derived_assign_realloc_dealloc");
+                                    let do_alloc_bb =
+                                        b.create_block("scalar_derived_assign_do_alloc");
+                                    b.cond_branch(
+                                        already_allocated,
+                                        dealloc_bb,
+                                        vec![],
+                                        do_alloc_bb,
+                                        vec![],
+                                    );
+
+                                    b.set_block(dealloc_bb);
+                                    let stat = b.alloca(IrType::Int(IntWidth::I32));
+                                    b.store(zero32, stat);
+                                    b.call(
+                                        FuncRef::External("afs_deallocate_array".into()),
+                                        vec![desc, stat],
+                                        IrType::Void,
+                                    );
+                                    b.branch(do_alloc_bb, vec![]);
+
+                                    b.set_block(do_alloc_bb);
+                                    if let Some(ref tn) = assign_type_name {
                                         if let Some(layout) = ctx.type_layouts.get(tn) {
                                             let elem_size = b.const_i64(layout.size as i64);
                                             let rank_val = b.const_i32(0);
@@ -670,7 +748,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     b.set_block(copy_bb);
                                     let val = super::expr::lower_expr_ctx_tl(b, ctx, value);
                                     let dest = derived_storage_addr(b, &info);
-                                    if let Some(ref tn) = info.derived_type {
+                                    if let Some(ref tn) = assign_type_name {
                                         emit_derived_value_copy(b, ctx.type_layouts, tn, dest, val);
                                     }
                                     // Scalar descriptor-backed TYPE allocatables keep their
@@ -679,14 +757,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     // concrete metadata after copying the value bytes.
                                     if let Some(tag) = derived_type_tag_value(
                                         b,
-                                        info.derived_type.as_deref(),
+                                        assign_type_name.as_deref(),
                                         ctx.type_layouts,
                                     ) {
                                         store_array_desc_type_tag(b, desc, tag);
                                     }
                                     if let Some(lookup) = derived_type_vtable_value(
                                         b,
-                                        info.derived_type.as_deref(),
+                                        assign_type_name.as_deref(),
                                         ctx.type_layouts,
                                     ) {
                                         store_array_desc_vtable_ptr(b, desc, lookup);
