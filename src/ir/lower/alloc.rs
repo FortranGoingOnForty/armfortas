@@ -13,8 +13,47 @@ use crate::sema::symtab::SymbolTable;
 
 use super::const_scalar::{clamp_const_to_type, ConstScalar};
 use super::core::*;
-use super::ctx::{CharKind, LocalInfo};
+use super::ctx::{current_proc_scope, CharKind, LocalInfo};
 use super::helpers::{clamp_nonnegative_i64, widen_to_i64};
+
+fn canonical_declared_derived_layout_name(
+    type_spec: &TypeSpec,
+    st: &SymbolTable,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+) -> Option<String> {
+    match type_spec {
+        TypeSpec::Type(type_name) | TypeSpec::Class(type_name) => {
+            canonical_layout_type_name_for_scope(st, current_proc_scope(), type_name, type_layouts)
+        }
+        _ => None,
+    }
+}
+
+fn declared_derived_info_name(
+    type_spec: &TypeSpec,
+    st: &SymbolTable,
+    canonical_layout_name: Option<&str>,
+) -> Option<String> {
+    match type_spec {
+        TypeSpec::Type(type_name) | TypeSpec::Class(type_name) => {
+            if st
+                .find_symbol_any_scope(&type_name.to_lowercase())
+                .is_some_and(|sym| {
+                    matches!(sym.kind, crate::sema::symtab::SymbolKind::EnumerationType)
+                })
+            {
+                None
+            } else {
+                Some(
+                    canonical_layout_name
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| type_name.clone()),
+                )
+            }
+        }
+        _ => None,
+    }
+}
 
 /// Allocate local variables from declarations. Handles both scalars and arrays.
 pub(crate) fn alloc_decls(
@@ -64,6 +103,10 @@ pub(crate) fn alloc_decls(
         {
             let elem_ty =
                 lower_type_spec_with_param_consts(type_spec, Some(&param_consts), Some(st));
+            let declared_derived_layout_name =
+                canonical_declared_derived_layout_name(type_spec, st, type_layouts);
+            let declared_derived_info_name =
+                declared_derived_info_name(type_spec, st, declared_derived_layout_name.as_deref());
 
             let attr_dims: Option<&Vec<ArraySpec>> = attrs.iter().find_map(|a| {
                 if let Attribute::Dimension(specs) = a {
@@ -148,7 +191,7 @@ pub(crate) fn alloc_decls(
                             Some(len) => fixed_char_storage_ir_type(len),
                             None => elem_ty.clone(),
                         }
-                    } else if let TypeSpec::Type(ref type_name) = type_spec {
+                    } else if let Some(type_name) = declared_derived_layout_name.as_deref() {
                         derived_storage_ir_type(type_name, type_layouts)
                             .unwrap_or_else(|| elem_ty.clone())
                     } else {
@@ -172,10 +215,7 @@ pub(crate) fn alloc_decls(
                             descriptor_arg: false,
                             by_ref: false,
                             char_kind: pointer_char_kind,
-                            derived_type: match type_spec {
-                                TypeSpec::Type(type_name) => Some(type_name.clone()),
-                                _ => None,
-                            },
+                            derived_type: declared_derived_info_name.clone(),
                             inline_const: None,
                             is_pointer: true,
                             runtime_dim_upper: array_spec
@@ -196,7 +236,7 @@ pub(crate) fn alloc_decls(
                     // loads the slot and uses that address as the
                     // struct base.  derived_type is stored so that
                     // component lookup can find the type layout.
-                    if let TypeSpec::Type(ref type_name) = type_spec {
+                    if let TypeSpec::Type(_) = type_spec {
                         let addr = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
                         let zero_byte = b.const_i32(0);
                         let eight = b.const_i64(8);
@@ -215,7 +255,7 @@ pub(crate) fn alloc_decls(
                                 descriptor_arg: false,
                                 by_ref: false,
                                 char_kind: CharKind::None,
-                                derived_type: Some(type_name.clone()),
+                                derived_type: declared_derived_info_name.clone(),
                                 inline_const: None,
                                 is_pointer: true,
                                 runtime_dim_upper: vec![],
@@ -231,7 +271,7 @@ pub(crate) fn alloc_decls(
                     && matches!(type_spec, TypeSpec::Class(_))
                     && array_spec.is_none()
                 {
-                    if let TypeSpec::Class(ref type_name) = type_spec {
+                    if let TypeSpec::Class(_) = type_spec {
                         let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384);
                         let addr = b.alloca(desc_ty);
                         let zero = b.const_i32(0);
@@ -251,7 +291,7 @@ pub(crate) fn alloc_decls(
                                 descriptor_arg: true,
                                 by_ref: false,
                                 char_kind: CharKind::None,
-                                derived_type: Some(type_name.clone()),
+                                derived_type: declared_derived_info_name.clone(),
                                 inline_const: None,
                                 is_pointer: true,
                                 runtime_dim_upper: vec![],
@@ -310,9 +350,9 @@ pub(crate) fn alloc_decls(
                         ) {
                             let len = char_len.expect(
                                     "runtime-bound explicit-shape character array should have a fixed element length",
-                                );
+                            );
                             (fixed_char_storage_ir_type(len), None, CharKind::Fixed(len))
-                        } else if let TypeSpec::Type(ref type_name) = type_spec {
+                        } else if let Some(type_name) = declared_derived_layout_name.as_ref() {
                             if let Some(layout) = type_layouts.get(type_name) {
                                 (
                                     IrType::Array(
@@ -747,7 +787,7 @@ pub(crate) fn alloc_decls(
                             Some(len) => fixed_char_storage_ir_type(len),
                             None => elem_ty.clone(),
                         }
-                    } else if let TypeSpec::Type(ref type_name) = type_spec {
+                    } else if let Some(type_name) = declared_derived_layout_name.as_deref() {
                         derived_storage_ir_type(type_name, type_layouts)
                             .unwrap_or_else(|| elem_ty.clone())
                     } else {
@@ -767,12 +807,7 @@ pub(crate) fn alloc_decls(
                             descriptor_arg: false,
                             by_ref: false,
                             char_kind,
-                            derived_type: match type_spec {
-                                TypeSpec::Type(type_name) | TypeSpec::Class(type_name) => {
-                                    Some(type_name.clone())
-                                }
-                                _ => None,
-                            },
+                            derived_type: declared_derived_info_name.clone(),
                             inline_const: None,
                             is_pointer: false,
                             runtime_dim_upper: array_spec
@@ -805,7 +840,7 @@ pub(crate) fn alloc_decls(
                             } else {
                                 (elem_ty.clone(), None, CharKind::None)
                             }
-                        } else if let TypeSpec::Type(ref type_name) = type_spec {
+                        } else if let Some(type_name) = declared_derived_layout_name.as_ref() {
                             if let Some(layout) = type_layouts.get(type_name) {
                                 (
                                     IrType::Array(
@@ -999,7 +1034,10 @@ pub(crate) fn alloc_decls(
                         continue;
                     }
                     // Derived type variable: allocate struct-sized byte array.
-                    if let Some(layout) = type_layouts.get(type_name) {
+                    if let Some(type_name) = declared_derived_layout_name.as_ref() {
+                        let layout = type_layouts
+                            .get(type_name)
+                            .expect("canonical derived layout should be registered");
                         let struct_ty =
                             IrType::Array(Box::new(IrType::Int(IntWidth::I8)), layout.size as u64);
                         let addr = b.alloca(struct_ty);

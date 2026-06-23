@@ -44635,6 +44635,98 @@ fn generic_subroutine_matches_use_renamed_class_actual() {
 }
 
 #[test]
+fn use_renamed_derived_local_copies_pointer_function_result() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=use_renamed_derived_local_copies_pointer_function_result count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("renamed_derived_pointer_copy");
+    let table_api = write_program_in(
+        &dir,
+        "table_api.f90",
+        "module table_api\n  implicit none\n  type :: toml_table\n    integer :: n = 0\n  end type\ncontains\n  function cast_to_table(value) result(table)\n    type(toml_table), target, intent(in) :: value\n    type(toml_table), pointer :: table\n    table => value\n  end function\nend module\n",
+    );
+    let facade = write_program_in(
+        &dir,
+        "facade_m.f90",
+        "module facade_m\n  use table_api, only: json_object => toml_table, cast_to_object => cast_to_table\n  implicit none\nend module\n",
+    );
+    let user = write_program_in(
+        &dir,
+        "user_m.f90",
+        "module user_m\n  use facade_m, only: json_object, cast_to_object\n  implicit none\ncontains\n  subroutine run()\n    type(json_object), target :: source\n    type(json_object) :: json\n    source%n = 42\n    json = cast_to_object(source)\n    if (json%n /= 42) error stop 1\n  end subroutine\nend module\nprogram p\n  use user_m, only: run\n  call run()\n  print *, 'ok'\nend program\n",
+    );
+
+    let table_obj = dir.join("table_api.o");
+    let facade_obj = dir.join("facade_m.o");
+    let user_obj = dir.join("user_m.o");
+    for (src, obj) in [
+        (&table_api, &table_obj),
+        (&facade, &facade_obj),
+        (&user, &user_obj),
+    ] {
+        let compiled = Command::new(compiler("armfortas"))
+            .args([
+                "-c",
+                src.to_str().unwrap(),
+                "-I",
+                dir.to_str().unwrap(),
+                "-J",
+                dir.to_str().unwrap(),
+                "-o",
+                obj.to_str().unwrap(),
+            ])
+            .output()
+            .expect("renamed derived pointer-copy compile failed to spawn");
+        assert!(
+            compiled.status.success(),
+            "compile {} failed: {}",
+            src.display(),
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+    }
+
+    let amod = fs::read_to_string(dir.join("facade_m.amod")).expect("missing facade_m.amod");
+    assert!(
+        amod.contains("@use_rename json_object = toml_table from table_api"),
+        "facade .amod should preserve the derived type rename:\n{}",
+        amod
+    );
+
+    let bin = dir.join("p");
+    let link = Command::new(compiler("armfortas"))
+        .args([
+            table_obj.to_str().unwrap(),
+            facade_obj.to_str().unwrap(),
+            user_obj.to_str().unwrap(),
+            "-o",
+            bin.to_str().unwrap(),
+        ])
+        .output()
+        .expect("renamed derived pointer-copy link failed to spawn");
+    assert!(
+        link.status.success(),
+        "renamed derived pointer-copy link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&bin)
+        .output()
+        .expect("renamed derived pointer-copy run failed to spawn");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "renamed derived pointer-copy run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+#[test]
 fn use_only_generic_collects_all_bare_reexport_specifics() {
     let src = write_program(
         "module table_api\n  implicit none\n  type :: toml_table\n    integer :: n = 0\n  end type\n  type :: toml_array\n    integer :: n = 0\n  end type\n  interface get_value\n    module procedure get_child_array\n  end interface\ncontains\n  subroutine get_child_array(table, key, ptr, requested)\n    class(toml_table), intent(inout) :: table\n    character(*), intent(in) :: key\n    type(toml_array), pointer, intent(out) :: ptr\n    logical, intent(in), optional :: requested\n    nullify(ptr)\n  end subroutine\nend module\nmodule array_api\n  use table_api, only: toml_array\n  implicit none\n  interface get_value\n    module procedure get_elem_array\n  end interface\ncontains\n  subroutine get_elem_array(array, pos, ptr)\n    class(toml_array), intent(inout) :: array\n    integer, intent(in) :: pos\n    type(toml_array), pointer, intent(out) :: ptr\n    nullify(ptr)\n  end subroutine\nend module\nmodule build_api\n  use array_api\n  use table_api\n  implicit none\nend module\nmodule toml_api\n  use build_api\n  implicit none\nend module\nmodule user_m\n  use toml_api, only: toml_table, toml_array, get_value\n  implicit none\n  interface get_value\n    module procedure get_local_bool\n  end interface\ncontains\n  subroutine run(table, key)\n    type(toml_table), intent(inout) :: table\n    character(*), intent(in) :: key\n    type(toml_array), pointer :: children\n    call get_value(table, key, children, requested=.false.)\n  end subroutine\n  subroutine get_local_bool(table, key, value)\n    type(toml_table), intent(inout) :: table\n    character(*), intent(in) :: key\n    logical, intent(out) :: value\n    value = .false.\n  end subroutine\nend module\nprogram p\n  use user_m, only: run\n  use table_api, only: toml_table\n  type(toml_table) :: table\n  call run(table, 'items')\nend program\n",
