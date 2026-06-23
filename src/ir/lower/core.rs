@@ -33681,6 +33681,7 @@ pub(super) fn is_array_reducing_intrinsic(name: &str) -> bool {
             | "iparity"
             | "parity"
             | "findloc"
+            | "len"
             // Whole-array inquiry intrinsics: their first arg is the
             // array itself, not an elementwise operand. Scalarizing
             // them rewrites `size(x, dim)` to `size(x(i,j), dim)`,
@@ -35952,6 +35953,17 @@ pub(super) fn array_function_result_elem_type(
     match &callee.node {
         Expr::Name { name } => {
             let key = name.to_lowercase();
+            if crate::sema::validate::is_intrinsic_name(&key)
+                && is_array_reducing_intrinsic(&key)
+                && !user_callable_shadows_intrinsic(
+                    st,
+                    current_proc_scope(),
+                    b.func().name.as_str(),
+                    &key,
+                )
+            {
+                return None;
+            }
             if procedure_pointer_call_target(b, locals, st, &key).is_some() {
                 return None;
             }
@@ -36431,6 +36443,18 @@ pub(super) fn resolved_named_callee_is_elemental(
     contained_host_refs: Option<&HashMap<String, Vec<String>>>,
     descriptor_params: Option<&HashMap<String, Vec<bool>>>,
 ) -> bool {
+    let callee_key = callee_name.to_lowercase();
+    if crate::sema::validate::is_intrinsic_name(&callee_key)
+        && is_array_reducing_intrinsic(&callee_key)
+        && !user_callable_shadows_intrinsic(
+            st,
+            current_proc_scope(),
+            b.func().name.as_str(),
+            &callee_key,
+        )
+    {
+        return false;
+    }
     let actual_vals: Vec<ValueId> = args
         .iter()
         .map(|arg| match &arg.value {
