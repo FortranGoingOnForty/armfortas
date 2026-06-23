@@ -48101,7 +48101,7 @@ pub(super) fn allocate_descriptor_keyword_expr(
     keyword: &str,
 ) -> Option<ValueId> {
     let expr = allocate_keyword_expr(opts, keyword)?;
-    lower_array_expr_descriptor(
+    if let Some((desc, _)) = lower_array_expr_descriptor(
         b,
         &ctx.locals,
         expr,
@@ -48110,8 +48110,30 @@ pub(super) fn allocate_descriptor_keyword_expr(
         Some(ctx.internal_funcs),
         Some(ctx.contained_host_refs),
         Some(ctx.descriptor_params),
-    )
-    .map(|(desc, _)| desc)
+    ) {
+        return Some(desc);
+    }
+
+    match &expr.node {
+        Expr::Name { name } => {
+            let info = ctx.locals.get(&name.to_lowercase())?;
+            (local_uses_array_descriptor(info) && local_declared_rank(info) == 0)
+                .then(|| array_descriptor_addr(b, info))
+        }
+        Expr::ComponentAccess { .. } => {
+            if let Some(info) =
+                component_intrinsic_local_info(b, &ctx.locals, expr, ctx.st, ctx.type_layouts)
+            {
+                if local_uses_array_descriptor(&info) && local_declared_rank(&info) == 0 {
+                    return Some(array_descriptor_addr(b, &info));
+                }
+            }
+            let info = component_field_local_info(b, &ctx.locals, expr, ctx.st, ctx.type_layouts)?;
+            (local_uses_array_descriptor(&info) && local_declared_rank(&info) == 0)
+                .then(|| array_descriptor_addr(b, &info))
+        }
+        _ => None,
+    }
 }
 
 pub(super) fn allocate_scalar_source_descriptor(

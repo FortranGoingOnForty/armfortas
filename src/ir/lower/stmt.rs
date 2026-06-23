@@ -4592,8 +4592,19 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             // component's elements share one dynamic type.
                             // Derived default-init below stays scalar-only.
                             {
+                                let mold_metadata_desc = if source_desc.is_none()
+                                    && source_scalar_desc.is_none()
+                                    && source_expr.is_none()
+                                    && typed_type_tag.is_none()
+                                {
+                                    mold_desc
+                                } else {
+                                    None
+                                };
                                 let field_type_name = field_derived_type_name(&field);
-                                let type_tag = if source_desc.is_some() {
+                                let type_tag = if source_desc.is_some()
+                                    || mold_metadata_desc.is_some()
+                                {
                                     None
                                 } else if let Some(source_expr) = source_expr {
                                     expr_type_tag_value(
@@ -4628,7 +4639,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         )
                                     })
                                 };
-                                let vtable = if source_desc.is_some() {
+                                let vtable = if source_desc.is_some()
+                                    || mold_metadata_desc.is_some()
+                                {
                                     None
                                 } else if let Some(source_expr) = source_expr {
                                     expr_vtable_value(
@@ -4680,10 +4693,15 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         field_ptr,
                                         source_desc,
                                     );
+                                } else if let Some(mold_desc) = mold_metadata_desc {
+                                    emit_scalar_alloc_source_descriptor_metadata_on_success(
+                                        b, stat_addr, field_ptr, mold_desc,
+                                    );
                                 }
                                 let copied_from_source = source_desc.is_some()
                                     || source_scalar_desc.is_some()
-                                    || source_expr.is_some();
+                                    || source_expr.is_some()
+                                    || mold_metadata_desc.is_some();
                                 if !copied_from_source && rank == 0 {
                                     if let Some(layout) = dynamic_layout {
                                         let base_ptr = b.load_typed(
@@ -4979,7 +4997,18 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             // stays scalar-only; whole-array element init is
                             // a separate concern.)
                             {
-                                let type_tag = if source_desc.is_some() {
+                                let mold_metadata_desc = if source_desc.is_none()
+                                    && source_scalar_desc.is_none()
+                                    && source_expr.is_none()
+                                    && typed_type_tag.is_none()
+                                {
+                                    mold_desc
+                                } else {
+                                    None
+                                };
+                                let type_tag = if source_desc.is_some()
+                                    || mold_metadata_desc.is_some()
+                                {
                                     None
                                 } else if let Some(source_expr) = source_expr {
                                     expr_type_tag_value(
@@ -5014,7 +5043,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         )
                                     })
                                 };
-                                let vtable = if source_desc.is_some() {
+                                let vtable = if source_desc.is_some()
+                                    || mold_metadata_desc.is_some()
+                                {
                                     None
                                 } else if let Some(source_expr) = source_expr {
                                     expr_vtable_value(
@@ -5066,10 +5097,15 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         desc,
                                         source_desc,
                                     );
+                                } else if let Some(mold_desc) = mold_metadata_desc {
+                                    emit_scalar_alloc_source_descriptor_metadata_on_success(
+                                        b, stat_addr, desc, mold_desc,
+                                    );
                                 }
                                 let copied_from_source = source_desc.is_some()
                                     || source_scalar_desc.is_some()
-                                    || source_expr.is_some();
+                                    || source_expr.is_some()
+                                    || mold_metadata_desc.is_some();
                                 if !copied_from_source && rank == 0 {
                                     if let Some(layout) = dynamic_layout {
                                         let base_ptr = b.load_typed(

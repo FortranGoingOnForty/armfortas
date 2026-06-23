@@ -40407,6 +40407,50 @@ fn class_allocatable_constructor_assignment_preserves_dynamic_type() {
 }
 
 #[test]
+fn allocate_mold_scalar_class_preserves_dynamic_vtable() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocate_mold_scalar_class_preserves_dynamic_vtable count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module repro\n  implicit none\n  type, abstract :: base_t\n  contains\n    procedure(load_i), deferred :: load\n    procedure :: roundtrip\n  end type base_t\n  abstract interface\n    subroutine load_i(self)\n      import :: base_t\n      class(base_t), intent(inout) :: self\n    end subroutine load_i\n  end interface\n  type, extends(base_t) :: child_t\n    integer :: value = 0\n  contains\n    procedure :: load => child_load\n  end type child_t\ncontains\n  subroutine child_load(self)\n    class(child_t), intent(inout) :: self\n    self%value = 42\n  end subroutine child_load\n  subroutine roundtrip(self)\n    class(base_t), intent(inout) :: self\n    class(base_t), allocatable :: copy\n    allocate(copy, mold=self)\n    call copy%load()\n    select type (copy)\n    type is (child_t)\n      if (copy%value /= 42) error stop 1\n    class default\n      error stop 2\n    end select\n  end subroutine roundtrip\nend module repro\nprogram p\n  use repro\n  implicit none\n  type(child_t) :: obj\n  call obj%roundtrip()\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("alloc_mold_scalar_class_vtable", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("allocate mold scalar class compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "allocate mold scalar class compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("allocate mold scalar class run failed");
+    assert!(
+        run.status.success(),
+        "allocate mold scalar class run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected allocate mold scalar class output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn allocate_source_implied_do_constructor_initializes_runtime_elements() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
