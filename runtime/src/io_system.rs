@@ -4008,6 +4008,86 @@ fn extract_nth_formatted_field(
     None
 }
 
+fn read_nonadvancing_formatted_field(
+    desc: &FormatDesc,
+    input: &[u8],
+    cursor: &mut usize,
+    dest_len: i64,
+) -> Option<String> {
+    match desc {
+        FormatDesc::Character { width: None } => {
+            let start = (*cursor).min(input.len());
+            let n = dest_len.max(0) as usize;
+            let end = start.saturating_add(n).min(input.len());
+            *cursor = end;
+            Some(String::from_utf8_lossy(&input[start..end]).into_owned())
+        }
+        _ => read_formatted_field(desc, input, cursor),
+    }
+}
+
+fn extract_nth_nonadvancing_formatted_field(
+    descs: &[FormatDesc],
+    input: &[u8],
+    cursor: &mut usize,
+    remaining_data_index: &mut usize,
+    dest_len: i64,
+) -> Option<(FormatDesc, String)> {
+    for desc in descs {
+        match desc {
+            FormatDesc::Group {
+                repeat,
+                descriptors,
+            } => {
+                for _ in 0..*repeat {
+                    if let Some(found) = extract_nth_nonadvancing_formatted_field(
+                        descriptors,
+                        input,
+                        cursor,
+                        remaining_data_index,
+                        dest_len,
+                    ) {
+                        return Some(found);
+                    }
+                }
+            }
+            FormatDesc::UnlimitedRepeat { descriptors } => {
+                let mut loop_guard = 0usize;
+                while *cursor < input.len() && loop_guard < input.len().saturating_add(1) {
+                    let before = *cursor;
+                    if let Some(found) = extract_nth_nonadvancing_formatted_field(
+                        descriptors,
+                        input,
+                        cursor,
+                        remaining_data_index,
+                        dest_len,
+                    ) {
+                        return Some(found);
+                    }
+                    if *cursor == before {
+                        break;
+                    }
+                    loop_guard += 1;
+                }
+            }
+            _ => {
+                if let Some(field) =
+                    read_nonadvancing_formatted_field(desc, input, cursor, dest_len)
+                {
+                    if *remaining_data_index == 0 {
+                        return Some((desc.clone(), field));
+                    }
+                    *remaining_data_index -= 1;
+                } else {
+                    advance_formatted_cursor(desc, input, cursor);
+                }
+            }
+        }
+    }
+
+    None
+}
+
 fn parse_nth_formatted_record(
     input: &[u8],
     fmt_str: *const u8,
@@ -4285,7 +4365,13 @@ pub extern "C" fn afs_fmt_read_string_noadvance(
     let mut cursor = u.formatted_read_cursor;
     let mut remaining = 0usize;
 
-    match extract_nth_formatted_field(&descs, &input, &mut cursor, &mut remaining) {
+    match extract_nth_nonadvancing_formatted_field(
+        &descs,
+        &input,
+        &mut cursor,
+        &mut remaining,
+        dest_len,
+    ) {
         Some((desc @ FormatDesc::Character { .. }, field)) => {
             store_formatted_char_result(&field, dest, dest_len, size_out, iostat);
             if cursor >= input.len() {
@@ -5728,6 +5814,56 @@ mod tests {
         assert_eq!(iostat, IOSTAT_EOR);
         assert_eq!(second_size, 4);
         assert_eq!(&second[..4], b"wxyz");
+    }
+
+    #[test]
+    fn formatted_noadvance_unbounded_a_chunks_long_record() {
+        let path = "/tmp/afs_fmt_noadvance_unbounded_a_long_record_test.dat";
+        std::fs::write(path, format!("{}\n", "x".repeat(5000))).unwrap();
+
+        afs_open_simple(
+            89,
+            path.as_ptr(),
+            path.len() as i64,
+            "old".as_ptr(),
+            3,
+            "read".as_ptr(),
+            4,
+        );
+
+        let mut first = vec![b' '; 4096];
+        let mut second = vec![b' '; 4096];
+        let mut first_size = -99i32;
+        let mut second_size = -99i32;
+        let mut iostat = -99i32;
+
+        afs_fmt_read_string_noadvance(
+            89,
+            "(a)".as_ptr(),
+            3,
+            first.as_mut_ptr(),
+            first.len() as i64,
+            &mut first_size,
+            &mut iostat,
+        );
+        assert_eq!(iostat, 0);
+        assert_eq!(first_size, 4096);
+        assert!(first.iter().all(|&b| b == b'x'));
+
+        afs_fmt_read_string_noadvance(
+            89,
+            "(a)".as_ptr(),
+            3,
+            second.as_mut_ptr(),
+            second.len() as i64,
+            &mut second_size,
+            &mut iostat,
+        );
+        afs_close(89, std::ptr::null_mut());
+
+        assert_eq!(iostat, IOSTAT_EOR);
+        assert_eq!(second_size, 904);
+        assert!(second[..904].iter().all(|&b| b == b'x'));
     }
 
     #[test]

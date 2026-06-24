@@ -449,6 +449,51 @@ fn formatted_char_read_with_size_from_redirected_stdin_compiles_and_runs() {
 }
 
 #[test]
+fn nonadvancing_unbounded_a_read_chunks_long_record() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=nonadvancing_unbounded_a_read_chunks_long_record count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  integer, parameter :: bufsize = 4096\n  integer :: unit, stat, chunk\n  character(bufsize) :: buffer\n  character(:), allocatable :: whole\n\n  open(newunit=unit, status='scratch', form='formatted', action='readwrite')\n  write(unit, '(a)') repeat('x', 5000)\n  rewind(unit)\n\n  stat = 0\n  whole = ''\n  do while (stat == 0)\n    read(unit, '(a)', advance='no', iostat=stat, size=chunk) buffer\n    if (stat > 0) error stop 1\n    if (chunk < 0 .or. chunk > bufsize) error stop 2\n    whole = whole // buffer(:chunk)\n  end do\n  close(unit)\n\n  if (len(whole) /= 5000) error stop 3\n  if (whole(4096:4100) /= 'xxxxx') error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("nonadvancing_unbounded_a_long_record", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("nonadvancing long record compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "nonadvancing long record compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("nonadvancing long record run failed");
+    assert!(
+        run.status.success(),
+        "nonadvancing long record run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected nonadvancing long record output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn formatted_char_pointer_read_preserves_blank_record_before_following_input() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
