@@ -40495,6 +40495,50 @@ fn derived_parameter_array_constructor_initializes_elements() {
 }
 
 #[test]
+fn imported_derived_parameter_component_folds_in_char_concat() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_derived_parameter_component_folds_in_char_concat count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module constants\n  implicit none\n  type :: enum_escape\n    character(len=1) :: tabulator = achar(9)\n    character(len=1) :: newline = achar(10)\n    character(len=1) :: carriage_return = achar(13)\n  end type enum_escape\n  type(enum_escape), parameter :: toml_escape = enum_escape()\nend module constants\nmodule lexer_mod\n  use constants, only: toml_escape\n  implicit none\n  type :: token_t\n    integer :: kind = 1\n    integer :: first = 0\n    integer :: last = 0\n  end type token_t\n  type :: lexer_t\n    integer :: pos = 13\n    character(:), allocatable :: chunk\n  contains\n    procedure :: next_boolean\n  end type lexer_t\n  character(*), parameter :: terminated = \" {}[],:\" // &\n    toml_escape%tabulator // toml_escape%newline // toml_escape%carriage_return\ncontains\n  subroutine next_boolean(lexer, token)\n    class(lexer_t), intent(inout) :: lexer\n    type(token_t), intent(inout) :: token\n    integer :: pos, prev\n    prev = lexer%pos\n    pos = lexer%pos\n    do pos = lexer%pos, len(lexer%chunk) - 1\n      if (verify(lexer%chunk(pos+1:pos+1), terminated) <= 0) exit\n    end do\n    select case (lexer%chunk(prev:pos))\n    case default\n      token = token_t(-1, prev, pos)\n    case (\"true\", \"false\")\n      token = token_t(17, prev, pos)\n    end select\n  end subroutine next_boolean\nend module lexer_mod\nprogram p\n  use lexer_mod\n  implicit none\n  type(lexer_t) :: lexer\n  type(token_t) :: token\n  lexer%chunk = '{\"library\": false}'\n  call lexer%next_boolean(token)\n  if (token%kind /= 17) error stop 1\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("imported_derived_param_char_concat", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("imported derived parameter char concat compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "imported derived parameter char concat compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("imported derived parameter char concat run failed");
+    assert!(
+        run.status.success(),
+        "imported derived parameter char concat run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected imported derived parameter char concat output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn allocate_source_implied_do_constructor_initializes_runtime_elements() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
