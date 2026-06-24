@@ -4431,7 +4431,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         .as_deref()
                                         .and_then(|type_name| ctx.type_layouts.get(type_name))
                                 });
-                            let scalar_source_copy_plan = if rank == 0 {
+                            let target_rank =
+                                local_declared_rank(&field_info).max(if field.declared_array {
+                                    field.dims.len().max(1)
+                                } else {
+                                    0
+                                });
+                            let source_copy_rank = rank.max(target_rank);
+                            let scalar_source_copy_plan = if source_copy_rank == 0 {
                                 source_expr.and_then(|expr| {
                                     expr_scalar_alloc_source_copy_plan(
                                         expr,
@@ -4444,7 +4451,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 None
                             };
                             let array_source_copy_layout = if source_desc.is_some() {
-                                if rank == 0 && scalar_source_copy_plan.is_some() {
+                                if source_copy_rank == 0 && scalar_source_copy_plan.is_some() {
                                     None
                                 } else {
                                     dynamic_layout.filter(|layout| {
@@ -4526,7 +4533,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     stat_addr,
                                     field_ptr,
                                     source_desc,
-                                    rank > 0,
+                                    source_copy_rank > 0,
                                     array_source_copy_layout,
                                     scalar_source_copy_plan.as_ref(),
                                     ctx.type_layouts,
@@ -4831,7 +4838,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         .as_deref()
                                         .and_then(|type_name| ctx.type_layouts.get(type_name))
                                 });
-                            let scalar_source_copy_plan = if rank == 0 {
+                            let target_rank = local_declared_rank(&info);
+                            let source_copy_rank = rank.max(target_rank);
+                            let scalar_source_copy_plan = if source_copy_rank == 0 {
                                 source_expr.and_then(|expr| {
                                     expr_scalar_alloc_source_copy_plan(
                                         expr,
@@ -4844,7 +4853,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 None
                             };
                             let array_source_copy_layout = if source_desc.is_some() {
-                                if rank == 0 && scalar_source_copy_plan.is_some() {
+                                if source_copy_rank == 0 && scalar_source_copy_plan.is_some() {
                                     None
                                 } else {
                                     dynamic_layout.filter(|layout| {
@@ -4931,7 +4940,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     stat_addr,
                                     desc,
                                     source_desc,
-                                    rank > 0,
+                                    source_copy_rank > 0,
                                     array_source_copy_layout,
                                     scalar_source_copy_plan.as_ref(),
                                     ctx.type_layouts,
