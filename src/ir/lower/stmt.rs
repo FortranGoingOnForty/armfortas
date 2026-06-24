@@ -4431,7 +4431,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         .as_deref()
                                         .and_then(|type_name| ctx.type_layouts.get(type_name))
                                 });
-                            let scalar_source_copy_plan = if source_desc.is_none() {
+                            let scalar_source_copy_plan = if rank == 0 {
                                 source_expr.and_then(|expr| {
                                     expr_scalar_alloc_source_copy_plan(
                                         expr,
@@ -4444,9 +4444,13 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 None
                             };
                             let array_source_copy_layout = if source_desc.is_some() {
-                                dynamic_layout.filter(|layout| {
-                                    derived_layout_needs_deep_copy(layout, ctx.type_layouts)
-                                })
+                                if rank == 0 && scalar_source_copy_plan.is_some() {
+                                    None
+                                } else {
+                                    dynamic_layout.filter(|layout| {
+                                        derived_layout_needs_deep_copy(layout, ctx.type_layouts)
+                                    })
+                                }
                             } else {
                                 None
                             };
@@ -4827,7 +4831,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         .as_deref()
                                         .and_then(|type_name| ctx.type_layouts.get(type_name))
                                 });
-                            let scalar_source_copy_plan = if source_desc.is_none() {
+                            let scalar_source_copy_plan = if rank == 0 {
                                 source_expr.and_then(|expr| {
                                     expr_scalar_alloc_source_copy_plan(
                                         expr,
@@ -4840,9 +4844,13 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 None
                             };
                             let array_source_copy_layout = if source_desc.is_some() {
-                                dynamic_layout.filter(|layout| {
-                                    derived_layout_needs_deep_copy(layout, ctx.type_layouts)
-                                })
+                                if rank == 0 && scalar_source_copy_plan.is_some() {
+                                    None
+                                } else {
+                                    dynamic_layout.filter(|layout| {
+                                        derived_layout_needs_deep_copy(layout, ctx.type_layouts)
+                                    })
+                                }
                             } else {
                                 None
                             };
