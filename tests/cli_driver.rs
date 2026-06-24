@@ -31819,6 +31819,51 @@ fn derived_section_assignment_deep_copies_allocatable_char_component() {
 }
 
 #[test]
+fn derived_allocatable_self_section_assignment_preserves_allocatable_char_components() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=derived_allocatable_self_section_assignment_preserves_allocatable_char_components count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  type :: string_t\n    character(len=:), allocatable :: s\n  end type string_t\n  type(string_t), allocatable :: list(:)\n  character(len=16) :: word\n  integer :: i\n  allocate(list(5))\n  do i = 1, size(list)\n    write(word, '(\"word\", i0)') i\n    list(i)%s = trim(word)\n  end do\n  list = list(1:5)\n  do i = 1, size(list)\n    if (.not. allocated(list(i)%s)) error stop 10 + i\n    write(word, '(\"word\", i0)') i\n    if (trim(list(i)%s) /= trim(word)) error stop 20 + i\n  end do\n  list = list(1:3)\n  if (size(list) /= 3) error stop 30\n  do i = 1, size(list)\n    if (.not. allocated(list(i)%s)) error stop 40 + i\n    write(word, '(\"word\", i0)') i\n    if (trim(list(i)%s) /= trim(word)) error stop 50 + i\n  end do\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("derived_alloc_self_section_char_copy", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("derived allocatable self-section compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "derived allocatable self-section compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("derived allocatable self-section run failed");
+    assert!(
+        run.status.success(),
+        "derived allocatable self-section run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected derived allocatable self-section output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn empty_allocatable_char_component_copy_stays_allocated() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

@@ -42031,7 +42031,38 @@ pub(super) fn lower_array_assign(
             }
 
             if let Some(type_name) = dest_info.derived_type.as_deref() {
-                if let Some(layout) = ctx.type_layouts.get(type_name) {
+                if let Some(layout) = ctx.type_layouts.get(type_name).cloned() {
+                    let mut assign_src_desc = src_desc;
+                    let tmp_src_desc = if !dest_name.is_empty() && expr_mentions_name(value, dest_name)
+                    {
+                        let tmp_desc = allocate_like_array_temp_descriptor(b, src_desc);
+                        let tmp_base = b.load_typed(
+                            tmp_desc,
+                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                        );
+                        let tmp_n = b.call(
+                            FuncRef::External("afs_array_size".into()),
+                            vec![tmp_desc],
+                            IrType::Int(IntWidth::I64),
+                        );
+                        if derived_layout_needs_runtime_initialization(&layout, ctx.type_layouts) {
+                            initialize_derived_array_storage_dynamic(
+                                b,
+                                tmp_base,
+                                &layout,
+                                tmp_n,
+                                ctx.type_layouts,
+                            );
+                        }
+                        let tmp_stride = load_array_desc_i64_field(b, tmp_desc, 24 + 16);
+                        lower_derived_array_copy_from_desc(
+                            b, ctx, type_name, tmp_base, tmp_n, tmp_stride, src_desc,
+                        );
+                        assign_src_desc = tmp_desc;
+                        Some(tmp_desc)
+                    } else {
+                        None
+                    };
                     let stat = b.alloca(IrType::Int(IntWidth::I32));
                     let zero32 = b.const_i32(0);
                     b.store(zero32, stat);
@@ -42043,7 +42074,7 @@ pub(super) fn lower_array_assign(
                     let null_stat = b.const_i64(0);
                     b.call(
                         FuncRef::External("afs_allocate_like".into()),
-                        vec![dest_desc, src_desc, null_stat],
+                        vec![dest_desc, assign_src_desc, null_stat],
                         IrType::Void,
                     );
                     let dest_base =
@@ -42053,11 +42084,11 @@ pub(super) fn lower_array_assign(
                         vec![dest_desc],
                         IrType::Int(IntWidth::I64),
                     );
-                    if derived_layout_needs_runtime_initialization(layout, ctx.type_layouts) {
+                    if derived_layout_needs_runtime_initialization(&layout, ctx.type_layouts) {
                         initialize_derived_array_storage_dynamic(
                             b,
                             dest_base,
-                            layout,
+                            &layout,
                             dest_n,
                             ctx.type_layouts,
                         );
@@ -42070,8 +42101,25 @@ pub(super) fn lower_array_assign(
                         dest_base,
                         dest_n,
                         dest_stride,
-                        src_desc,
+                        assign_src_desc,
                     );
+                    if let Some(tmp_desc) = tmp_src_desc {
+                        let tmp_stat = b.alloca(IrType::Int(IntWidth::I32));
+                        b.store(zero32, tmp_stat);
+                        deallocate_derived_descriptor_components(
+                            b,
+                            tmp_desc,
+                            &layout,
+                            ctx.type_layouts,
+                            tmp_stat,
+                        );
+                        b.store(zero32, tmp_stat);
+                        b.call(
+                            FuncRef::External("afs_deallocate_array".into()),
+                            vec![tmp_desc, tmp_stat],
+                            IrType::Void,
+                        );
+                    }
                     return;
                 }
             }
