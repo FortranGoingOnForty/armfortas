@@ -220,6 +220,9 @@ pub enum Stmt {
     Continue {
         label: Option<u64>,
     },
+    Format {
+        spec: String,
+    },
     Call {
         callee: SpannedExpr,
         args: Vec<crate::ast::expr::Argument>,

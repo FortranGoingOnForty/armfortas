@@ -1876,6 +1876,7 @@ fn validate_stmt_const_int_exprs(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
         | Stmt::Cycle { .. }
         | Stmt::Goto { .. }
         | Stmt::Continue { .. }
+        | Stmt::Format { .. }
         | Stmt::Labeled { .. }
         | Stmt::Namelist { .. } => {}
     }

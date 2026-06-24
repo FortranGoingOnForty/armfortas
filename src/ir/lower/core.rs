@@ -3770,6 +3770,7 @@ pub(super) fn collect_name_refs_stmt(stmt: &crate::ast::stmt::SpannedStmt, out: 
         | Stmt::Cycle { .. }
         | Stmt::Goto { .. }
         | Stmt::Continue { .. }
+        | Stmt::Format { .. }
         | Stmt::Namelist { .. } => {}
     }
 }
@@ -7055,7 +7056,11 @@ pub(super) fn check_filtered_in_stmt(
         Stmt::ArithmeticIf { expr, .. } => {
             check_filtered_in_expr(expr, filtered);
         }
-        Stmt::Exit { .. } | Stmt::Cycle { .. } | Stmt::Goto { .. } | Stmt::Continue { .. } => {}
+        Stmt::Exit { .. }
+        | Stmt::Cycle { .. }
+        | Stmt::Goto { .. }
+        | Stmt::Continue { .. }
+        | Stmt::Format { .. } => {}
         Stmt::Labeled { stmt: inner, .. } => {
             check_no_filtered_refs(std::slice::from_ref(inner.as_ref()), filtered);
         }
@@ -24697,6 +24702,83 @@ pub(super) fn collect_label_blocks(
             | Stmt::DoWhile { body, .. }
             | Stmt::DoConcurrent { body, .. } => {
                 collect_label_blocks(b, body, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+pub(super) fn collect_format_labels(stmts: &[SpannedStmt], out: &mut HashMap<u64, String>) {
+    for stmt in stmts {
+        match &stmt.node {
+            Stmt::Labeled { label, stmt: inner } => {
+                if let Stmt::Format { spec } = &inner.node {
+                    out.entry(*label).or_insert_with(|| spec.clone());
+                }
+                collect_format_labels(std::slice::from_ref(inner.as_ref()), out);
+            }
+            Stmt::IfConstruct {
+                then_body,
+                else_ifs,
+                else_body,
+                ..
+            } => {
+                collect_format_labels(then_body, out);
+                for (_, body) in else_ifs {
+                    collect_format_labels(body, out);
+                }
+                if let Some(body) = else_body {
+                    collect_format_labels(body, out);
+                }
+            }
+            Stmt::IfStmt { action, .. } => {
+                collect_format_labels(std::slice::from_ref(action.as_ref()), out);
+            }
+            Stmt::SelectCase { cases, .. } => {
+                for case in cases {
+                    collect_format_labels(&case.body, out);
+                }
+            }
+            Stmt::SelectType { guards, .. } => {
+                for guard in guards {
+                    match guard {
+                        crate::ast::stmt::TypeGuard::TypeIs { body, .. }
+                        | crate::ast::stmt::TypeGuard::ClassIs { body, .. }
+                        | crate::ast::stmt::TypeGuard::ClassDefault { body } => {
+                            collect_format_labels(body, out);
+                        }
+                    }
+                }
+            }
+            Stmt::SelectRank { guards, .. } => {
+                for guard in guards {
+                    match guard {
+                        crate::ast::stmt::RankGuard::Rank { body, .. }
+                        | crate::ast::stmt::RankGuard::RankStar { body }
+                        | crate::ast::stmt::RankGuard::RankDefault { body } => {
+                            collect_format_labels(body, out);
+                        }
+                    }
+                }
+            }
+            Stmt::WhereConstruct {
+                body, elsewhere, ..
+            } => {
+                collect_format_labels(body, out);
+                for (_, else_body) in elsewhere {
+                    collect_format_labels(else_body, out);
+                }
+            }
+            Stmt::WhereStmt { stmt, .. } | Stmt::ForallStmt { stmt, .. } => {
+                collect_format_labels(std::slice::from_ref(stmt.as_ref()), out);
+            }
+            Stmt::ForallConstruct { body, .. }
+            | Stmt::Block { body, .. }
+            | Stmt::Associate { body, .. }
+            | Stmt::DoLoop { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::DoConcurrent { body, .. } => {
+                collect_format_labels(body, out);
             }
             _ => {}
         }

@@ -58,36 +58,8 @@ impl<'a> Parser<'a> {
 
         let text = self.peek_text().to_lowercase();
 
-        // FORMAT statement: skip over the (...) format spec. Format
-        // strings as labeled FORMAT are largely informational — modern
-        // Fortran uses character format strings inline. We swallow the
-        // whole statement and emit a Continue placeholder so labels
-        // can still target it.
         if text == "format" {
-            self.advance(); // consume 'format'
-            if self.peek() == &TokenKind::LParen {
-                let mut depth = 0;
-                while self.peek() != &TokenKind::Eof {
-                    match self.peek() {
-                        TokenKind::LParen => {
-                            self.advance();
-                            depth += 1;
-                        }
-                        TokenKind::RParen => {
-                            self.advance();
-                            depth -= 1;
-                            if depth == 0 {
-                                break;
-                            }
-                        }
-                        _ => {
-                            self.advance();
-                        }
-                    }
-                }
-            }
-            let span = span_from_to(start, self.prev_span());
-            return Ok(Spanned::new(Stmt::Continue { label: None }, span));
+            return self.parse_format(start);
         }
 
         match text.as_str() {
@@ -912,6 +884,30 @@ impl<'a> Parser<'a> {
         }
         let span = span_from_to(start, self.prev_span());
         Ok(Spanned::new(Stmt::Print { format, items }, span))
+    }
+
+    fn parse_format(&mut self, start: crate::lexer::Span) -> Result<SpannedStmt, ParseError> {
+        self.advance(); // consume FORMAT
+        let mut spec = String::new();
+        if self.peek() == &TokenKind::LParen {
+            let mut depth = 0i32;
+            while self.peek() != &TokenKind::Eof && !self.at_stmt_end() {
+                let tok = self.advance().clone();
+                spec.push_str(&tok.text);
+                match tok.kind {
+                    TokenKind::LParen => depth += 1,
+                    TokenKind::RParen => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let span = span_from_to(start, self.prev_span());
+        Ok(Spanned::new(Stmt::Format { spec }, span))
     }
 
     fn parse_assignment_or_call(
@@ -2605,6 +2601,21 @@ end if
     fn print_label_format() {
         let s = parse_one("print 100, x\n");
         assert!(matches!(s.node, Stmt::Print { .. }));
+    }
+
+    #[test]
+    fn labeled_format_preserves_spec() {
+        let s = parse_one("100 format('src_', i0)\n");
+        if let Stmt::Labeled { label, stmt } = &s.node {
+            assert_eq!(*label, 100);
+            if let Stmt::Format { spec } = &stmt.node {
+                assert_eq!(spec, "('src_',i0)");
+            } else {
+                panic!("labeled inner statement should be Format, got {:?}", stmt.node);
+            }
+        } else {
+            panic!("not Labeled, got {:?}", s.node);
+        }
     }
 
     #[test]
