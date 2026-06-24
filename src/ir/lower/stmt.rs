@@ -6723,7 +6723,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                 Some(ctx.contained_host_refs),
                                                 Some(ctx.descriptor_params),
                                             );
-                                            store_string_descriptor_view(
+                                            store_string_pointer_descriptor_view(
                                                 b,
                                                 *tgt_field_ptr,
                                                 ptr,
@@ -6745,12 +6745,12 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     ) {
                         if is_deferred_char_component_field(&src_field) {
                             let (ptr, len) = load_string_descriptor_view(b, src_field_ptr);
-                            store_string_descriptor_view(b, *tgt_field_ptr, ptr, len);
+                            store_string_pointer_descriptor_view(b, *tgt_field_ptr, ptr, len);
                             return;
                         }
                     }
                     let (ptr, len) = lower_string_expr_ctx(b, ctx, value);
-                    store_string_descriptor_view(b, *tgt_field_ptr, ptr, len);
+                    store_string_pointer_descriptor_view(b, *tgt_field_ptr, ptr, len);
                     return;
                 }
                 if field_is_class_star_pointer_descriptor(tgt_field) {
@@ -6918,7 +6918,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 {
                     if is_deferred_char_component_field(&src_field) {
                         let (ptr, len) = load_string_descriptor_view(b, src_field_ptr);
-                        store_string_descriptor_view(b, tgt_desc, ptr, len);
+                        store_string_pointer_descriptor_view(b, tgt_desc, ptr, len);
                         return;
                     }
                 }
@@ -6927,13 +6927,13 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         if matches!(src_info.char_kind, CharKind::Deferred) {
                             let src_desc = string_descriptor_addr(b, src_info);
                             let (ptr, len) = load_string_descriptor_view(b, src_desc);
-                            store_string_descriptor_view(b, tgt_desc, ptr, len);
+                            store_string_pointer_descriptor_view(b, tgt_desc, ptr, len);
                             return;
                         }
                     }
                 }
                 let (ptr, len) = lower_string_expr_ctx(b, ctx, value);
-                store_string_descriptor_view(b, tgt_desc, ptr, len);
+                store_string_pointer_descriptor_view(b, tgt_desc, ptr, len);
                 return;
             }
 

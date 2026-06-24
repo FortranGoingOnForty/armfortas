@@ -43626,6 +43626,13 @@ pub(super) fn lower_pointer_intrinsic(
     let crate::ast::expr::SectionSubscript::Element(expr) = &first.value else {
         return None;
     };
+    if args.len() == 1 {
+        if let Some(associated) =
+            deferred_char_pointer_associated_value(b, locals, expr, st, type_layouts)
+        {
+            return Some(associated);
+        }
+    }
     let raw = associated_target_address_for_expr(b, locals, expr, st, type_layouts, false)?;
     let zero = b.const_i64(0);
 
@@ -43649,6 +43656,36 @@ pub(super) fn lower_pointer_intrinsic(
     }
 
     Some(b.icmp(CmpOp::Ne, raw, zero))
+}
+
+fn deferred_char_pointer_associated_value(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> Option<ValueId> {
+    match &expr.node {
+        Expr::Name { name } => {
+            let info = locals.get(&name.to_lowercase())?;
+            if info.is_pointer && matches!(info.char_kind, CharKind::Deferred) {
+                let desc = string_descriptor_addr(b, info);
+                Some(string_descriptor_associated_value(b, desc))
+            } else {
+                None
+            }
+        }
+        Expr::ComponentAccess { .. } => {
+            let tl = type_layouts?;
+            let (field_ptr, field) = resolve_component_field_access(b, locals, expr, st, tl)?;
+            if field.pointer && is_deferred_char_component_field(&field) {
+                Some(string_descriptor_associated_value(b, field_ptr))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 fn associated_target_address_for_expr(
@@ -46491,6 +46528,23 @@ pub(super) fn load_string_descriptor_view(
     (ptr, len)
 }
 
+fn string_descriptor_associated_value(b: &mut FuncBuilder, desc: ValueId) -> ValueId {
+    let (ptr, _len) = load_string_descriptor_view(b, desc);
+    let zero_i64 = b.const_i64(0);
+    let ptr_bits = coerce_to_type(b, ptr, &IrType::Int(IntWidth::I64));
+    let ptr_nonnull = b.icmp(CmpOp::Ne, ptr_bits, zero_i64);
+
+    let flags_off = b.const_i64(24);
+    let flags_ptr = b.gep(desc, vec![flags_off], IrType::Int(IntWidth::I8));
+    let flags = b.load_typed(flags_ptr, IrType::Int(IntWidth::I32));
+    let association_mask = b.const_i32(1 | 4); // STR_ALLOCATED | STR_POINTER
+    let association_bits = b.bit_and(flags, association_mask);
+    let zero_i32 = b.const_i32(0);
+    let flagged_associated = b.icmp(CmpOp::Ne, association_bits, zero_i32);
+
+    b.or(ptr_nonnull, flagged_associated)
+}
+
 pub(super) fn field_char_kind(field: &crate::sema::type_layout::FieldLayout) -> CharKind {
     match &field.type_info {
         crate::sema::symtab::TypeInfo::Character { len: Some(n), .. } => CharKind::Fixed(*n),
@@ -47105,6 +47159,25 @@ pub(super) fn store_string_descriptor_view(
     len: ValueId,
 ) {
     let flags = b.const_i32(2); // STR_DEFERRED without STR_ALLOCATED
+    store_byte_aggregate_field(
+        b,
+        desc,
+        0,
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        ptr,
+    );
+    store_byte_aggregate_field(b, desc, 8, IrType::Int(IntWidth::I64), len);
+    store_byte_aggregate_field(b, desc, 16, IrType::Int(IntWidth::I64), len);
+    store_byte_aggregate_field(b, desc, 24, IrType::Int(IntWidth::I32), flags);
+}
+
+pub(super) fn store_string_pointer_descriptor_view(
+    b: &mut FuncBuilder,
+    desc: ValueId,
+    ptr: ValueId,
+    len: ValueId,
+) {
+    let flags = b.const_i32(2 | 4); // STR_DEFERRED | STR_POINTER
     store_byte_aggregate_field(
         b,
         desc,
