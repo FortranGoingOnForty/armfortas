@@ -40451,6 +40451,50 @@ fn allocate_mold_scalar_class_preserves_dynamic_vtable() {
 }
 
 #[test]
+fn derived_parameter_array_constructor_initializes_elements() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=derived_parameter_array_constructor_initializes_elements count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module repro\n  implicit none\n  type :: token_t\n    integer :: kind = 1\n    integer :: first = 0\n    integer :: last = 0\n  end type token_t\n  type :: lexer_t\n    integer :: prelude = 2\n  contains\n    procedure :: next\n  end type lexer_t\ncontains\n  subroutine next(lexer, token)\n    class(lexer_t), intent(inout) :: lexer\n    type(token_t), intent(inout) :: token\n    type(token_t), parameter :: prelude(2) = [token_t(5, 0, 0), token_t(14, 1, 0)]\n    if (lexer%prelude > 0) then\n      token = prelude(lexer%prelude)\n      lexer%prelude = lexer%prelude - 1\n      return\n    end if\n    token = token_t(6, 1, 1)\n  end subroutine next\nend module repro\nprogram p\n  use repro\n  implicit none\n  type(lexer_t) :: lexer\n  type(token_t) :: token\n  call lexer%next(token)\n  if (token%kind /= 14) error stop 1\n  call lexer%next(token)\n  if (token%kind /= 5) error stop 2\n  call lexer%next(token)\n  if (token%kind /= 6) error stop 3\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("derived_parameter_array_constructor", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("derived parameter array constructor compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "derived parameter array constructor compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("derived parameter array constructor run failed");
+    assert!(
+        run.status.success(),
+        "derived parameter array constructor run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected derived parameter array constructor output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn allocate_source_implied_do_constructor_initializes_runtime_elements() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
