@@ -163,6 +163,30 @@ pub(crate) fn init_decls(
                         continue;
                     }
 
+                    if !info.dims.is_empty()
+                        && !info.allocatable
+                        && matches!(info.char_kind, CharKind::None)
+                    {
+                        if let Some(type_name) = info.derived_type.as_deref() {
+                            if let Expr::ArrayConstructor { values, .. } = &init_expr.node {
+                                store_ac_values_into(
+                                    b,
+                                    locals,
+                                    info.addr,
+                                    &info.ty,
+                                    Some(type_name),
+                                    values,
+                                    st,
+                                    type_layouts,
+                                    None,
+                                    None,
+                                    None,
+                                );
+                                continue;
+                            }
+                        }
+                    }
+
                     // Array entity with an array constructor init:
                     // store each literal element into the slot.
                     // Only stack/non-allocatable arrays are handled

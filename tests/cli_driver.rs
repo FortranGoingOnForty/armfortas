@@ -31819,6 +31819,51 @@ fn derived_section_assignment_deep_copies_allocatable_char_component() {
 }
 
 #[test]
+fn derived_allocatable_self_section_assignment_preserves_allocatable_char_components() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=derived_allocatable_self_section_assignment_preserves_allocatable_char_components count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  type :: string_t\n    character(len=:), allocatable :: s\n  end type string_t\n  type(string_t), allocatable :: list(:)\n  character(len=16) :: word\n  integer :: i\n  allocate(list(5))\n  do i = 1, size(list)\n    write(word, '(\"word\", i0)') i\n    list(i)%s = trim(word)\n  end do\n  list = list(1:5)\n  do i = 1, size(list)\n    if (.not. allocated(list(i)%s)) error stop 10 + i\n    write(word, '(\"word\", i0)') i\n    if (trim(list(i)%s) /= trim(word)) error stop 20 + i\n  end do\n  list = list(1:3)\n  if (size(list) /= 3) error stop 30\n  do i = 1, size(list)\n    if (.not. allocated(list(i)%s)) error stop 40 + i\n    write(word, '(\"word\", i0)') i\n    if (trim(list(i)%s) /= trim(word)) error stop 50 + i\n  end do\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("derived_alloc_self_section_char_copy", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("derived allocatable self-section compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "derived allocatable self-section compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("derived allocatable self-section run failed");
+    assert!(
+        run.status.success(),
+        "derived allocatable self-section run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected derived allocatable self-section output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn empty_allocatable_char_component_copy_stays_allocated() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -40355,6 +40400,182 @@ fn allocatable_scalar_structure_constructor_assignment_preserves_class_dispatch(
     assert!(
         String::from_utf8_lossy(&run.stdout).contains("ok"),
         "unexpected alloc scalar structure-constructor dispatch output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn class_allocatable_constructor_assignment_preserves_dynamic_type() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=class_allocatable_constructor_assignment_preserves_dynamic_type count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module repro\n  implicit none\n  type, abstract :: base_t\n    logical :: verbose = .true.\n  end type base_t\n  type, extends(base_t) :: child_t\n    character(:), allocatable :: name\n    logical :: enabled = .false.\n  end type child_t\ncontains\n  subroutine make_settings(cmd)\n    class(base_t), allocatable, intent(out) :: cmd\n    allocate(child_t :: cmd)\n    cmd = child_t(verbose=.false., name='manual_sample', enabled=.true.)\n  end subroutine make_settings\n\n  subroutine check_settings(cmd)\n    class(base_t), allocatable, intent(in) :: cmd\n    select type (settings => cmd)\n    type is (child_t)\n      if (settings%verbose) error stop 1\n      if (.not. settings%enabled) error stop 2\n      if (settings%name /= 'manual_sample') error stop 3\n    class default\n      error stop 4\n    end select\n  end subroutine check_settings\nend module repro\nprogram p\n  use repro\n  implicit none\n  class(base_t), allocatable :: cmd\n  call make_settings(cmd)\n  call check_settings(cmd)\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("class_alloc_ctor_assign_dynamic_type", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("class allocatable constructor assignment compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "class allocatable constructor assignment compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("class allocatable constructor assignment run failed");
+    assert!(
+        run.status.success(),
+        "class allocatable constructor assignment run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected class allocatable constructor assignment output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn allocate_mold_scalar_class_preserves_dynamic_vtable() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocate_mold_scalar_class_preserves_dynamic_vtable count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module repro\n  implicit none\n  type, abstract :: base_t\n  contains\n    procedure(load_i), deferred :: load\n    procedure :: roundtrip\n  end type base_t\n  abstract interface\n    subroutine load_i(self)\n      import :: base_t\n      class(base_t), intent(inout) :: self\n    end subroutine load_i\n  end interface\n  type, extends(base_t) :: child_t\n    integer :: value = 0\n  contains\n    procedure :: load => child_load\n  end type child_t\ncontains\n  subroutine child_load(self)\n    class(child_t), intent(inout) :: self\n    self%value = 42\n  end subroutine child_load\n  subroutine roundtrip(self)\n    class(base_t), intent(inout) :: self\n    class(base_t), allocatable :: copy\n    allocate(copy, mold=self)\n    call copy%load()\n    select type (copy)\n    type is (child_t)\n      if (copy%value /= 42) error stop 1\n    class default\n      error stop 2\n    end select\n  end subroutine roundtrip\nend module repro\nprogram p\n  use repro\n  implicit none\n  type(child_t) :: obj\n  call obj%roundtrip()\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("alloc_mold_scalar_class_vtable", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("allocate mold scalar class compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "allocate mold scalar class compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("allocate mold scalar class run failed");
+    assert!(
+        run.status.success(),
+        "allocate mold scalar class run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected allocate mold scalar class output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn derived_parameter_array_constructor_initializes_elements() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=derived_parameter_array_constructor_initializes_elements count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module repro\n  implicit none\n  type :: token_t\n    integer :: kind = 1\n    integer :: first = 0\n    integer :: last = 0\n  end type token_t\n  type :: lexer_t\n    integer :: prelude = 2\n  contains\n    procedure :: next\n  end type lexer_t\ncontains\n  subroutine next(lexer, token)\n    class(lexer_t), intent(inout) :: lexer\n    type(token_t), intent(inout) :: token\n    type(token_t), parameter :: prelude(2) = [token_t(5, 0, 0), token_t(14, 1, 0)]\n    if (lexer%prelude > 0) then\n      token = prelude(lexer%prelude)\n      lexer%prelude = lexer%prelude - 1\n      return\n    end if\n    token = token_t(6, 1, 1)\n  end subroutine next\nend module repro\nprogram p\n  use repro\n  implicit none\n  type(lexer_t) :: lexer\n  type(token_t) :: token\n  call lexer%next(token)\n  if (token%kind /= 14) error stop 1\n  call lexer%next(token)\n  if (token%kind /= 5) error stop 2\n  call lexer%next(token)\n  if (token%kind /= 6) error stop 3\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("derived_parameter_array_constructor", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("derived parameter array constructor compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "derived parameter array constructor compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("derived parameter array constructor run failed");
+    assert!(
+        run.status.success(),
+        "derived parameter array constructor run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected derived parameter array constructor output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn imported_derived_parameter_component_folds_in_char_concat() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_derived_parameter_component_folds_in_char_concat count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module constants\n  implicit none\n  type :: enum_escape\n    character(len=1) :: tabulator = achar(9)\n    character(len=1) :: newline = achar(10)\n    character(len=1) :: carriage_return = achar(13)\n  end type enum_escape\n  type(enum_escape), parameter :: toml_escape = enum_escape()\nend module constants\nmodule lexer_mod\n  use constants, only: toml_escape\n  implicit none\n  type :: token_t\n    integer :: kind = 1\n    integer :: first = 0\n    integer :: last = 0\n  end type token_t\n  type :: lexer_t\n    integer :: pos = 13\n    character(:), allocatable :: chunk\n  contains\n    procedure :: next_boolean\n  end type lexer_t\n  character(*), parameter :: terminated = \" {}[],:\" // &\n    toml_escape%tabulator // toml_escape%newline // toml_escape%carriage_return\ncontains\n  subroutine next_boolean(lexer, token)\n    class(lexer_t), intent(inout) :: lexer\n    type(token_t), intent(inout) :: token\n    integer :: pos, prev\n    prev = lexer%pos\n    pos = lexer%pos\n    do pos = lexer%pos, len(lexer%chunk) - 1\n      if (verify(lexer%chunk(pos+1:pos+1), terminated) <= 0) exit\n    end do\n    select case (lexer%chunk(prev:pos))\n    case default\n      token = token_t(-1, prev, pos)\n    case (\"true\", \"false\")\n      token = token_t(17, prev, pos)\n    end select\n  end subroutine next_boolean\nend module lexer_mod\nprogram p\n  use lexer_mod\n  implicit none\n  type(lexer_t) :: lexer\n  type(token_t) :: token\n  lexer%chunk = '{\"library\": false}'\n  call lexer%next_boolean(token)\n  if (token%kind /= 17) error stop 1\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("imported_derived_param_char_concat", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("imported derived parameter char concat compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "imported derived parameter char concat compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("imported derived parameter char concat run failed");
+    assert!(
+        run.status.success(),
+        "imported derived parameter char concat run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected imported derived parameter char concat output: {}",
         String::from_utf8_lossy(&run.stdout)
     );
 

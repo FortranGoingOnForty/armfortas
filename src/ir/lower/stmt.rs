@@ -623,6 +623,19 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     && info.derived_type.is_some()
                                 {
                                     let desc = array_descriptor_addr(b, &info);
+                                    let assign_type_name = if info.is_class {
+                                        expr_type_layout(
+                                            value,
+                                            Some(&ctx.locals),
+                                            ctx.st,
+                                            ctx.type_layouts,
+                                        )
+                                        .filter(|layout| !layout.is_abstract)
+                                        .map(|layout| layout.name.clone())
+                                    } else {
+                                        None
+                                    }
+                                    .or_else(|| info.derived_type.clone());
                                     let allocated = b.call(
                                         FuncRef::External("afs_allocated".into()),
                                         vec![desc],
@@ -630,13 +643,78 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     );
                                     let zero32 = b.const_i32(0);
                                     let needs_alloc = b.icmp(CmpOp::Eq, allocated, zero32);
+                                    let needs_storage_alloc =
+                                        if info.is_class {
+                                            if let Some(ref tn) = assign_type_name {
+                                                if let Some(layout) = ctx.type_layouts.get(tn) {
+                                                    let current_elem_size =
+                                                        load_array_desc_i64_field(b, desc, 8);
+                                                    let target_elem_size =
+                                                        b.const_i64(layout.size as i64);
+                                                    let size_mismatch = b.icmp(
+                                                        CmpOp::Ne,
+                                                        current_elem_size,
+                                                        target_elem_size,
+                                                    );
+                                                    let current_tag =
+                                                        load_array_desc_type_tag(b, desc);
+                                                    let target_tag =
+                                                        b.const_i64(layout.type_tag as i64);
+                                                    let tag_mismatch = b.icmp(
+                                                        CmpOp::Ne,
+                                                        current_tag,
+                                                        target_tag,
+                                                    );
+                                                    let storage_mismatch =
+                                                        b.or(size_mismatch, tag_mismatch);
+                                                    b.or(needs_alloc, storage_mismatch)
+                                                } else {
+                                                    needs_alloc
+                                                }
+                                            } else {
+                                                needs_alloc
+                                            }
+                                        } else {
+                                            needs_alloc
+                                        };
                                     let alloc_bb = b.create_block("scalar_derived_assign_alloc");
                                     let copy_bb = b.create_block("scalar_derived_assign_copy");
                                     let done_bb = b.create_block("scalar_derived_assign_done");
-                                    b.cond_branch(needs_alloc, alloc_bb, vec![], copy_bb, vec![]);
+                                    b.cond_branch(
+                                        needs_storage_alloc,
+                                        alloc_bb,
+                                        vec![],
+                                        copy_bb,
+                                        vec![],
+                                    );
 
                                     b.set_block(alloc_bb);
-                                    if let Some(ref tn) = info.derived_type {
+                                    let already_allocated =
+                                        b.icmp(CmpOp::Ne, allocated, zero32);
+                                    let dealloc_bb =
+                                        b.create_block("scalar_derived_assign_realloc_dealloc");
+                                    let do_alloc_bb =
+                                        b.create_block("scalar_derived_assign_do_alloc");
+                                    b.cond_branch(
+                                        already_allocated,
+                                        dealloc_bb,
+                                        vec![],
+                                        do_alloc_bb,
+                                        vec![],
+                                    );
+
+                                    b.set_block(dealloc_bb);
+                                    let stat = b.alloca(IrType::Int(IntWidth::I32));
+                                    b.store(zero32, stat);
+                                    b.call(
+                                        FuncRef::External("afs_deallocate_array".into()),
+                                        vec![desc, stat],
+                                        IrType::Void,
+                                    );
+                                    b.branch(do_alloc_bb, vec![]);
+
+                                    b.set_block(do_alloc_bb);
+                                    if let Some(ref tn) = assign_type_name {
                                         if let Some(layout) = ctx.type_layouts.get(tn) {
                                             let elem_size = b.const_i64(layout.size as i64);
                                             let rank_val = b.const_i32(0);
@@ -670,7 +748,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     b.set_block(copy_bb);
                                     let val = super::expr::lower_expr_ctx_tl(b, ctx, value);
                                     let dest = derived_storage_addr(b, &info);
-                                    if let Some(ref tn) = info.derived_type {
+                                    if let Some(ref tn) = assign_type_name {
                                         emit_derived_value_copy(b, ctx.type_layouts, tn, dest, val);
                                     }
                                     // Scalar descriptor-backed TYPE allocatables keep their
@@ -679,14 +757,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     // concrete metadata after copying the value bytes.
                                     if let Some(tag) = derived_type_tag_value(
                                         b,
-                                        info.derived_type.as_deref(),
+                                        assign_type_name.as_deref(),
                                         ctx.type_layouts,
                                     ) {
                                         store_array_desc_type_tag(b, desc, tag);
                                     }
                                     if let Some(lookup) = derived_type_vtable_value(
                                         b,
-                                        info.derived_type.as_deref(),
+                                        assign_type_name.as_deref(),
                                         ctx.type_layouts,
                                     ) {
                                         store_array_desc_vtable_ptr(b, desc, lookup);
@@ -4353,7 +4431,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         .as_deref()
                                         .and_then(|type_name| ctx.type_layouts.get(type_name))
                                 });
-                            let scalar_source_copy_plan = if source_desc.is_none() {
+                            let target_rank =
+                                local_declared_rank(&field_info).max(if field.declared_array {
+                                    field.dims.len().max(1)
+                                } else {
+                                    0
+                                });
+                            let source_copy_rank = rank.max(target_rank);
+                            let scalar_source_copy_plan = if source_copy_rank == 0 {
                                 source_expr.and_then(|expr| {
                                     expr_scalar_alloc_source_copy_plan(
                                         expr,
@@ -4366,9 +4451,13 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 None
                             };
                             let array_source_copy_layout = if source_desc.is_some() {
-                                dynamic_layout.filter(|layout| {
-                                    derived_layout_needs_deep_copy(layout, ctx.type_layouts)
-                                })
+                                if source_copy_rank == 0 && scalar_source_copy_plan.is_some() {
+                                    None
+                                } else {
+                                    dynamic_layout.filter(|layout| {
+                                        derived_layout_needs_deep_copy(layout, ctx.type_layouts)
+                                    })
+                                }
                             } else {
                                 None
                             };
@@ -4444,7 +4533,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     stat_addr,
                                     field_ptr,
                                     source_desc,
-                                    rank > 0,
+                                    source_copy_rank > 0,
                                     array_source_copy_layout,
                                     scalar_source_copy_plan.as_ref(),
                                     ctx.type_layouts,
@@ -4514,8 +4603,19 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             // component's elements share one dynamic type.
                             // Derived default-init below stays scalar-only.
                             {
+                                let mold_metadata_desc = if source_desc.is_none()
+                                    && source_scalar_desc.is_none()
+                                    && source_expr.is_none()
+                                    && typed_type_tag.is_none()
+                                {
+                                    mold_desc
+                                } else {
+                                    None
+                                };
                                 let field_type_name = field_derived_type_name(&field);
-                                let type_tag = if source_desc.is_some() {
+                                let type_tag = if source_desc.is_some()
+                                    || mold_metadata_desc.is_some()
+                                {
                                     None
                                 } else if let Some(source_expr) = source_expr {
                                     expr_type_tag_value(
@@ -4550,7 +4650,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         )
                                     })
                                 };
-                                let vtable = if source_desc.is_some() {
+                                let vtable = if source_desc.is_some()
+                                    || mold_metadata_desc.is_some()
+                                {
                                     None
                                 } else if let Some(source_expr) = source_expr {
                                     expr_vtable_value(
@@ -4602,10 +4704,15 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         field_ptr,
                                         source_desc,
                                     );
+                                } else if let Some(mold_desc) = mold_metadata_desc {
+                                    emit_scalar_alloc_source_descriptor_metadata_on_success(
+                                        b, stat_addr, field_ptr, mold_desc,
+                                    );
                                 }
                                 let copied_from_source = source_desc.is_some()
                                     || source_scalar_desc.is_some()
-                                    || source_expr.is_some();
+                                    || source_expr.is_some()
+                                    || mold_metadata_desc.is_some();
                                 if !copied_from_source && rank == 0 {
                                     if let Some(layout) = dynamic_layout {
                                         let base_ptr = b.load_typed(
@@ -4731,7 +4838,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         .as_deref()
                                         .and_then(|type_name| ctx.type_layouts.get(type_name))
                                 });
-                            let scalar_source_copy_plan = if source_desc.is_none() {
+                            let target_rank = local_declared_rank(&info);
+                            let source_copy_rank = rank.max(target_rank);
+                            let scalar_source_copy_plan = if source_copy_rank == 0 {
                                 source_expr.and_then(|expr| {
                                     expr_scalar_alloc_source_copy_plan(
                                         expr,
@@ -4744,9 +4853,13 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 None
                             };
                             let array_source_copy_layout = if source_desc.is_some() {
-                                dynamic_layout.filter(|layout| {
-                                    derived_layout_needs_deep_copy(layout, ctx.type_layouts)
-                                })
+                                if source_copy_rank == 0 && scalar_source_copy_plan.is_some() {
+                                    None
+                                } else {
+                                    dynamic_layout.filter(|layout| {
+                                        derived_layout_needs_deep_copy(layout, ctx.type_layouts)
+                                    })
+                                }
                             } else {
                                 None
                             };
@@ -4827,7 +4940,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     stat_addr,
                                     desc,
                                     source_desc,
-                                    rank > 0,
+                                    source_copy_rank > 0,
                                     array_source_copy_layout,
                                     scalar_source_copy_plan.as_ref(),
                                     ctx.type_layouts,
@@ -4901,7 +5014,18 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             // stays scalar-only; whole-array element init is
                             // a separate concern.)
                             {
-                                let type_tag = if source_desc.is_some() {
+                                let mold_metadata_desc = if source_desc.is_none()
+                                    && source_scalar_desc.is_none()
+                                    && source_expr.is_none()
+                                    && typed_type_tag.is_none()
+                                {
+                                    mold_desc
+                                } else {
+                                    None
+                                };
+                                let type_tag = if source_desc.is_some()
+                                    || mold_metadata_desc.is_some()
+                                {
                                     None
                                 } else if let Some(source_expr) = source_expr {
                                     expr_type_tag_value(
@@ -4936,7 +5060,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         )
                                     })
                                 };
-                                let vtable = if source_desc.is_some() {
+                                let vtable = if source_desc.is_some()
+                                    || mold_metadata_desc.is_some()
+                                {
                                     None
                                 } else if let Some(source_expr) = source_expr {
                                     expr_vtable_value(
@@ -4988,10 +5114,15 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         desc,
                                         source_desc,
                                     );
+                                } else if let Some(mold_desc) = mold_metadata_desc {
+                                    emit_scalar_alloc_source_descriptor_metadata_on_success(
+                                        b, stat_addr, desc, mold_desc,
+                                    );
                                 }
                                 let copied_from_source = source_desc.is_some()
                                     || source_scalar_desc.is_some()
-                                    || source_expr.is_some();
+                                    || source_expr.is_some()
+                                    || mold_metadata_desc.is_some();
                                 if !copied_from_source && rank == 0 {
                                     if let Some(layout) = dynamic_layout {
                                         let base_ptr = b.load_typed(

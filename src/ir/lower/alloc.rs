@@ -92,7 +92,13 @@ pub(crate) fn alloc_decls(
     // Parameters can reference earlier parameters (`tau = 2 * pi`),
     // so we walk decls in order and build the map incrementally.
     let param_consts = collect_decl_param_consts_with_scope(decls, visible_param_consts, st);
-    let param_char_consts = collect_decl_param_char_consts(decls, &param_consts, type_layouts);
+    let param_char_consts = collect_decl_param_char_consts(
+        decls,
+        &param_consts,
+        type_layouts,
+        st,
+        current_proc_scope(),
+    );
 
     for decl in decls {
         if let Decl::TypeDecl {
@@ -139,6 +145,8 @@ pub(crate) fn alloc_decls(
                     &param_consts,
                     &param_char_consts,
                     st,
+                    Some(type_layouts),
+                    current_proc_scope(),
                 );
                 let effective_char_len =
                     super::core::effective_decl_char_len_spec(type_spec, entity.char_len.as_ref());

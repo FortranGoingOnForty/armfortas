@@ -4014,7 +4014,9 @@ pub(super) fn collect_module_globals(
     // Module-level parameter table built incrementally so a later
     // parameter declaration can reference earlier ones.
     let param_consts = collect_decl_param_consts_with_scope(decls, &HashMap::new(), st);
-    let param_char_consts = collect_decl_param_char_consts(decls, &param_consts, type_layouts);
+    let module_scope_id = st.find_module_scope(&mod_name.to_lowercase());
+    let param_char_consts =
+        collect_decl_param_char_consts(decls, &param_consts, type_layouts, st, module_scope_id);
     let mut param_array_consts: HashMap<String, Vec<ConstScalar>> = HashMap::new();
     let mut param_array_elem_tys: HashMap<String, IrType> = HashMap::new();
     let mut parameter_inits: HashMap<String, &crate::ast::expr::SpannedExpr> = HashMap::new();
@@ -4062,6 +4064,8 @@ pub(super) fn collect_module_globals(
                     &param_consts,
                     &param_char_consts,
                     st,
+                    Some(type_layouts),
+                    module_scope_id,
                 );
                 let effective_char_len =
                     effective_decl_char_len_spec(type_spec, entity.char_len.as_ref());
@@ -4351,11 +4355,14 @@ pub(super) fn collect_module_globals(
                         if let Some(len) = char_len {
                             let storage_ty = fixed_char_storage_ir_type(len);
                             let init = init_expr.and_then(|e| {
-                                eval_const_char_global_init(
+                                eval_const_char_global_init_with_context(
                                     e,
                                     &param_consts,
                                     &param_char_consts,
                                     len,
+                                    Some(st),
+                                    module_scope_id,
+                                    Some(type_layouts),
                                 )
                             });
                             module.add_global(Global {
@@ -5559,6 +5566,17 @@ pub(super) fn eval_const_char_bytes(
     param_consts: &HashMap<String, ConstScalar>,
     param_chars: &HashMap<String, Vec<u8>>,
 ) -> Option<Vec<u8>> {
+    eval_const_char_bytes_with_context(e, param_consts, param_chars, None, None, None)
+}
+
+fn eval_const_char_bytes_with_context(
+    e: &crate::ast::expr::SpannedExpr,
+    param_consts: &HashMap<String, ConstScalar>,
+    param_chars: &HashMap<String, Vec<u8>>,
+    st: Option<&SymbolTable>,
+    scope_id: Option<crate::sema::symtab::ScopeId>,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> Option<Vec<u8>> {
     match &e.node {
         Expr::StringLiteral { value, .. } => Some(value.as_bytes().to_vec()),
         Expr::Name { name } => param_chars.get(&name.to_lowercase()).cloned(),
@@ -5567,12 +5585,51 @@ pub(super) fn eval_const_char_bytes(
                 return None;
             };
             let key = crate::sema::type_layout::derived_param_field_lookup_key(name, component);
-            param_chars.get(&key).cloned()
+            param_chars.get(&key).cloned().or_else(|| {
+                let st = st?;
+                let key = name.to_lowercase();
+                let sym = scope_id
+                    .and_then(|scope_id| st.lookup_in(scope_id, &key))
+                    .or_else(|| st.find_symbol_any_scope(&key))?;
+                if !sym.attrs.parameter {
+                    return None;
+                }
+                let type_name = match sym.type_info.as_ref()? {
+                    crate::sema::symtab::TypeInfo::Derived(name)
+                    | crate::sema::symtab::TypeInfo::Class(name) => name,
+                    _ => return None,
+                };
+                let layout = type_layouts?.get(type_name)?;
+                let field = layout.field(component)?;
+                let crate::sema::type_layout::FieldDefaultInit::Character(value) =
+                    field.default_init.as_ref()?
+                else {
+                    return None;
+                };
+                Some(value.as_bytes().to_vec())
+            })
         }
-        Expr::ParenExpr { inner } => eval_const_char_bytes(inner, param_consts, param_chars),
+        Expr::ParenExpr { inner } => {
+            eval_const_char_bytes_with_context(
+                inner,
+                param_consts,
+                param_chars,
+                st,
+                scope_id,
+                type_layouts,
+            )
+        }
         Expr::FunctionCall { callee, args } => {
             if args.len() == 1 && args[0].keyword.is_none() {
-                if let Some(base) = eval_const_char_bytes(callee, param_consts, param_chars) {
+                if let Some(base) = eval_const_char_bytes_with_context(
+                    callee,
+                    param_consts,
+                    param_chars,
+                    st,
+                    scope_id,
+                    type_layouts,
+                )
+                {
                     return eval_const_char_substring(&base, &args[0].value, param_consts);
                 }
             }
@@ -5622,8 +5679,23 @@ pub(super) fn eval_const_char_bytes(
             left,
             right,
         } => {
-            let mut out = eval_const_char_bytes(left, param_consts, param_chars)?;
-            out.extend(eval_const_char_bytes(right, param_consts, param_chars)?);
+            let mut out =
+                eval_const_char_bytes_with_context(
+                    left,
+                    param_consts,
+                    param_chars,
+                    st,
+                    scope_id,
+                    type_layouts,
+                )?;
+            out.extend(eval_const_char_bytes_with_context(
+                right,
+                param_consts,
+                param_chars,
+                st,
+                scope_id,
+                type_layouts,
+            )?);
             Some(out)
         }
         _ => None,
@@ -5859,6 +5931,8 @@ pub(super) fn collect_decl_param_char_consts(
     decls: &[crate::ast::decl::SpannedDecl],
     param_consts: &HashMap<String, ConstScalar>,
     type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+    st: &SymbolTable,
+    scope_id: Option<crate::sema::symtab::ScopeId>,
 ) -> HashMap<String, Vec<u8>> {
     let mut out = HashMap::new();
     for decl in decls {
@@ -5880,7 +5954,14 @@ pub(super) fn collect_decl_param_char_consts(
                         &mut out,
                     );
                     if let Some(init) = entity.init.as_ref() {
-                        if let Some(bytes) = eval_const_char_bytes(init, param_consts, &out) {
+                        if let Some(bytes) = eval_const_char_bytes_with_context(
+                            init,
+                            param_consts,
+                            &out,
+                            Some(st),
+                            scope_id,
+                            Some(type_layouts),
+                        ) {
                             out.insert(entity.name.to_lowercase(), bytes);
                         }
                     }
@@ -5888,7 +5969,14 @@ pub(super) fn collect_decl_param_char_consts(
             }
             Decl::ParameterStmt { pairs } => {
                 for (name, expr) in pairs {
-                    if let Some(bytes) = eval_const_char_bytes(expr, param_consts, &out) {
+                    if let Some(bytes) = eval_const_char_bytes_with_context(
+                        expr,
+                        param_consts,
+                        &out,
+                        Some(st),
+                        scope_id,
+                        Some(type_layouts),
+                    ) {
                         out.insert(name.to_lowercase(), bytes);
                     }
                 }
@@ -5947,6 +6035,8 @@ pub(super) fn declared_char_len(
     param_consts: &HashMap<String, ConstScalar>,
     param_char_consts: &HashMap<String, Vec<u8>>,
     st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    scope_id: Option<crate::sema::symtab::ScopeId>,
 ) -> Option<i64> {
     if !matches!(type_spec, TypeSpec::Character(_)) {
         return None;
@@ -5956,7 +6046,14 @@ pub(super) fn declared_char_len(
             eval_const_int_in_scope_or_any_scope(e, param_consts, st)
         }
         Some(crate::ast::decl::LenSpec::Star) => init_expr.and_then(|expr| {
-            eval_const_char_bytes(expr, param_consts, param_char_consts)
+            eval_const_char_bytes_with_context(
+                expr,
+                param_consts,
+                param_char_consts,
+                Some(st),
+                scope_id,
+                type_layouts,
+            )
                 .map(|bytes| bytes.len() as i64)
                 .or_else(|| {
                     if let crate::ast::expr::Expr::ArrayConstructor { type_spec, .. } = &expr.node {
@@ -6020,7 +6117,28 @@ pub(super) fn eval_const_char_global_init(
     param_char_consts: &HashMap<String, Vec<u8>>,
     len: i64,
 ) -> Option<GlobalInit> {
-    let mut bytes = eval_const_char_bytes(e, param_consts, param_char_consts)?;
+    eval_const_char_global_init_with_context(
+        e,
+        param_consts,
+        param_char_consts,
+        len,
+        None,
+        None,
+        None,
+    )
+}
+
+fn eval_const_char_global_init_with_context(
+    e: &crate::ast::expr::SpannedExpr,
+    param_consts: &HashMap<String, ConstScalar>,
+    param_char_consts: &HashMap<String, Vec<u8>>,
+    len: i64,
+    st: Option<&SymbolTable>,
+    scope_id: Option<crate::sema::symtab::ScopeId>,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> Option<GlobalInit> {
+    let mut bytes =
+        eval_const_char_bytes_with_context(e, param_consts, param_char_consts, st, scope_id, type_layouts)?;
     let target_len = usize::try_from(len).ok()?;
     if bytes.len() > target_len {
         bytes.truncate(target_len);
@@ -41913,7 +42031,38 @@ pub(super) fn lower_array_assign(
             }
 
             if let Some(type_name) = dest_info.derived_type.as_deref() {
-                if let Some(layout) = ctx.type_layouts.get(type_name) {
+                if let Some(layout) = ctx.type_layouts.get(type_name).cloned() {
+                    let mut assign_src_desc = src_desc;
+                    let tmp_src_desc = if !dest_name.is_empty() && expr_mentions_name(value, dest_name)
+                    {
+                        let tmp_desc = allocate_like_array_temp_descriptor(b, src_desc);
+                        let tmp_base = b.load_typed(
+                            tmp_desc,
+                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                        );
+                        let tmp_n = b.call(
+                            FuncRef::External("afs_array_size".into()),
+                            vec![tmp_desc],
+                            IrType::Int(IntWidth::I64),
+                        );
+                        if derived_layout_needs_runtime_initialization(&layout, ctx.type_layouts) {
+                            initialize_derived_array_storage_dynamic(
+                                b,
+                                tmp_base,
+                                &layout,
+                                tmp_n,
+                                ctx.type_layouts,
+                            );
+                        }
+                        let tmp_stride = load_array_desc_i64_field(b, tmp_desc, 24 + 16);
+                        lower_derived_array_copy_from_desc(
+                            b, ctx, type_name, tmp_base, tmp_n, tmp_stride, src_desc,
+                        );
+                        assign_src_desc = tmp_desc;
+                        Some(tmp_desc)
+                    } else {
+                        None
+                    };
                     let stat = b.alloca(IrType::Int(IntWidth::I32));
                     let zero32 = b.const_i32(0);
                     b.store(zero32, stat);
@@ -41925,7 +42074,7 @@ pub(super) fn lower_array_assign(
                     let null_stat = b.const_i64(0);
                     b.call(
                         FuncRef::External("afs_allocate_like".into()),
-                        vec![dest_desc, src_desc, null_stat],
+                        vec![dest_desc, assign_src_desc, null_stat],
                         IrType::Void,
                     );
                     let dest_base =
@@ -41935,11 +42084,11 @@ pub(super) fn lower_array_assign(
                         vec![dest_desc],
                         IrType::Int(IntWidth::I64),
                     );
-                    if derived_layout_needs_runtime_initialization(layout, ctx.type_layouts) {
+                    if derived_layout_needs_runtime_initialization(&layout, ctx.type_layouts) {
                         initialize_derived_array_storage_dynamic(
                             b,
                             dest_base,
-                            layout,
+                            &layout,
                             dest_n,
                             ctx.type_layouts,
                         );
@@ -41952,8 +42101,25 @@ pub(super) fn lower_array_assign(
                         dest_base,
                         dest_n,
                         dest_stride,
-                        src_desc,
+                        assign_src_desc,
                     );
+                    if let Some(tmp_desc) = tmp_src_desc {
+                        let tmp_stat = b.alloca(IrType::Int(IntWidth::I32));
+                        b.store(zero32, tmp_stat);
+                        deallocate_derived_descriptor_components(
+                            b,
+                            tmp_desc,
+                            &layout,
+                            ctx.type_layouts,
+                            tmp_stat,
+                        );
+                        b.store(zero32, tmp_stat);
+                        b.call(
+                            FuncRef::External("afs_deallocate_array".into()),
+                            vec![tmp_desc, tmp_stat],
+                            IrType::Void,
+                        );
+                    }
                     return;
                 }
             }
@@ -48101,7 +48267,7 @@ pub(super) fn allocate_descriptor_keyword_expr(
     keyword: &str,
 ) -> Option<ValueId> {
     let expr = allocate_keyword_expr(opts, keyword)?;
-    lower_array_expr_descriptor(
+    if let Some((desc, _)) = lower_array_expr_descriptor(
         b,
         &ctx.locals,
         expr,
@@ -48110,8 +48276,30 @@ pub(super) fn allocate_descriptor_keyword_expr(
         Some(ctx.internal_funcs),
         Some(ctx.contained_host_refs),
         Some(ctx.descriptor_params),
-    )
-    .map(|(desc, _)| desc)
+    ) {
+        return Some(desc);
+    }
+
+    match &expr.node {
+        Expr::Name { name } => {
+            let info = ctx.locals.get(&name.to_lowercase())?;
+            (local_uses_array_descriptor(info) && local_declared_rank(info) == 0)
+                .then(|| array_descriptor_addr(b, info))
+        }
+        Expr::ComponentAccess { .. } => {
+            if let Some(info) =
+                component_intrinsic_local_info(b, &ctx.locals, expr, ctx.st, ctx.type_layouts)
+            {
+                if local_uses_array_descriptor(&info) && local_declared_rank(&info) == 0 {
+                    return Some(array_descriptor_addr(b, &info));
+                }
+            }
+            let info = component_field_local_info(b, &ctx.locals, expr, ctx.st, ctx.type_layouts)?;
+            (local_uses_array_descriptor(&info) && local_declared_rank(&info) == 0)
+                .then(|| array_descriptor_addr(b, &info))
+        }
+        _ => None,
+    }
 }
 
 pub(super) fn allocate_scalar_source_descriptor(
