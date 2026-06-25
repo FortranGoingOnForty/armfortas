@@ -115,6 +115,18 @@ fn io_control_by_keyword<'a>(controls: &'a [IoControl], needle: &str) -> Option<
     })
 }
 
+fn static_concrete_expr_type_layout<'a>(
+    ctx: &'a LowerCtx<'_>,
+    expr: Option<&SpannedExpr>,
+) -> Option<&'a crate::sema::type_layout::TypeLayout> {
+    let expr = expr?;
+    let layout = expr_type_layout(expr, Some(&ctx.locals), ctx.st, ctx.type_layouts)?;
+    if layout.is_abstract {
+        return None;
+    }
+    Some(layout)
+}
+
 fn format_label_literal(expr: &SpannedExpr) -> Option<u64> {
     match &expr.node {
         Expr::IntegerLiteral { text, .. } => text.parse::<u64>().ok(),
@@ -153,13 +165,7 @@ fn lower_format_expr(
             &format!("FORMAT label {} not defined in this scoping unit", label),
         );
     }
-    lower_string_expr_with_layouts(
-        b,
-        &ctx.locals,
-        expr,
-        ctx.st,
-        Some(ctx.type_layouts),
-    )
+    lower_string_expr_with_layouts(b, &ctx.locals, expr, ctx.st, Some(ctx.type_layouts))
 }
 
 fn inquire_size_storeback_type(
@@ -358,12 +364,10 @@ fn print_item_contains_proc_call(
     fn sub_has_call(s: &SectionSubscript, locals: &HashMap<String, LocalInfo>) -> bool {
         match s {
             SectionSubscript::Element(e) => print_item_contains_proc_call(e, locals),
-            SectionSubscript::Range { start, end, stride } => {
-                [start, end, stride]
-                    .iter()
-                    .filter_map(|o| o.as_ref())
-                    .any(|e| print_item_contains_proc_call(e, locals))
-            }
+            SectionSubscript::Range { start, end, stride } => [start, end, stride]
+                .iter()
+                .filter_map(|o| o.as_ref())
+                .any(|e| print_item_contains_proc_call(e, locals)),
         }
     }
     match &expr.node {
@@ -690,40 +694,35 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     );
                                     let zero32 = b.const_i32(0);
                                     let needs_alloc = b.icmp(CmpOp::Eq, allocated, zero32);
-                                    let needs_storage_alloc =
-                                        if info.is_class {
-                                            if let Some(ref tn) = assign_type_name {
-                                                if let Some(layout) = ctx.type_layouts.get(tn) {
-                                                    let current_elem_size =
-                                                        load_array_desc_i64_field(b, desc, 8);
-                                                    let target_elem_size =
-                                                        b.const_i64(layout.size as i64);
-                                                    let size_mismatch = b.icmp(
-                                                        CmpOp::Ne,
-                                                        current_elem_size,
-                                                        target_elem_size,
-                                                    );
-                                                    let current_tag =
-                                                        load_array_desc_type_tag(b, desc);
-                                                    let target_tag =
-                                                        b.const_i64(layout.type_tag as i64);
-                                                    let tag_mismatch = b.icmp(
-                                                        CmpOp::Ne,
-                                                        current_tag,
-                                                        target_tag,
-                                                    );
-                                                    let storage_mismatch =
-                                                        b.or(size_mismatch, tag_mismatch);
-                                                    b.or(needs_alloc, storage_mismatch)
-                                                } else {
-                                                    needs_alloc
-                                                }
+                                    let needs_storage_alloc = if info.is_class {
+                                        if let Some(ref tn) = assign_type_name {
+                                            if let Some(layout) = ctx.type_layouts.get(tn) {
+                                                let current_elem_size =
+                                                    load_array_desc_i64_field(b, desc, 8);
+                                                let target_elem_size =
+                                                    b.const_i64(layout.size as i64);
+                                                let size_mismatch = b.icmp(
+                                                    CmpOp::Ne,
+                                                    current_elem_size,
+                                                    target_elem_size,
+                                                );
+                                                let current_tag = load_array_desc_type_tag(b, desc);
+                                                let target_tag =
+                                                    b.const_i64(layout.type_tag as i64);
+                                                let tag_mismatch =
+                                                    b.icmp(CmpOp::Ne, current_tag, target_tag);
+                                                let storage_mismatch =
+                                                    b.or(size_mismatch, tag_mismatch);
+                                                b.or(needs_alloc, storage_mismatch)
                                             } else {
                                                 needs_alloc
                                             }
                                         } else {
                                             needs_alloc
-                                        };
+                                        }
+                                    } else {
+                                        needs_alloc
+                                    };
                                     let alloc_bb = b.create_block("scalar_derived_assign_alloc");
                                     let copy_bb = b.create_block("scalar_derived_assign_copy");
                                     let done_bb = b.create_block("scalar_derived_assign_done");
@@ -736,8 +735,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     );
 
                                     b.set_block(alloc_bb);
-                                    let already_allocated =
-                                        b.icmp(CmpOp::Ne, allocated, zero32);
+                                    let already_allocated = b.icmp(CmpOp::Ne, allocated, zero32);
                                     let dealloc_bb =
                                         b.create_block("scalar_derived_assign_realloc_dealloc");
                                     let do_alloc_bb =
@@ -2072,16 +2070,17 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     b.branch(copy_bb, vec![]);
 
                                     b.set_block(copy_bb);
-                                    let src_ptr = scalar_allocatable_derived_component_payload_addr(
-                                        b,
-                                        &ctx.locals,
-                                        value,
-                                        ctx.st,
-                                        ctx.type_layouts,
-                                    )
-                                    .unwrap_or_else(|| {
-                                        super::expr::lower_expr_ctx_tl(b, ctx, value)
-                                    });
+                                    let src_ptr =
+                                        scalar_allocatable_derived_component_payload_addr(
+                                            b,
+                                            &ctx.locals,
+                                            value,
+                                            ctx.st,
+                                            ctx.type_layouts,
+                                        )
+                                        .unwrap_or_else(
+                                            || super::expr::lower_expr_ctx_tl(b, ctx, value),
+                                        );
                                     let dest_ptr = b.load_typed(
                                         desc,
                                         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
@@ -4369,14 +4368,29 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             );
             let typed_type_tag =
                 typed_allocate_type_tag_value(b, type_spec.as_ref(), ctx.type_layouts);
-            let typed_vtable =
-                typed_allocate_vtable_value(b, type_spec.as_ref(), ctx.type_layouts);
+            let typed_vtable = typed_allocate_vtable_value(b, type_spec.as_ref(), ctx.type_layouts);
             let typed_layout = typed_allocate_layout(type_spec.as_ref(), ctx.type_layouts);
             let source_expr = allocate_keyword_expr(opts, "source");
             let source_scalar_desc = allocate_scalar_source_descriptor(b, ctx, opts);
             let source_desc = allocate_descriptor_keyword_expr(b, ctx, opts, "source");
             let mold_desc = allocate_descriptor_keyword_expr(b, ctx, opts, "mold");
-            let shape_desc = source_desc.or(mold_desc).or(source_scalar_desc);
+            let mold_expr = allocate_keyword_expr(opts, "mold");
+            let mold_static_layout = static_concrete_expr_type_layout(ctx, mold_expr);
+            let mold_static_type_tag =
+                mold_static_layout.map(|layout| b.const_i64(layout.type_tag as i64));
+            let mold_static_vtable =
+                mold_static_layout.and_then(|layout| type_layout_vtable_value(b, layout));
+            let mold_rank = mold_expr
+                .and_then(|expr| {
+                    actual_expr_rank(expr, &ctx.locals, ctx.st, Some(ctx.type_layouts))
+                })
+                .unwrap_or(0);
+            let mold_shape_desc = if mold_static_layout.is_some() && mold_rank == 0 {
+                None
+            } else {
+                mold_desc
+            };
+            let shape_desc = source_desc.or(mold_shape_desc).or(source_scalar_desc);
 
             for item in items {
                 let source_char = allocate_char_source_value(b, ctx, opts);
@@ -4454,8 +4468,10 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             } else {
                                 None
                             };
-                            let dynamic_layout =
-                                source_scalar_layout.or(typed_layout).or_else(|| {
+                            let dynamic_layout = source_scalar_layout
+                                .or(mold_static_layout)
+                                .or(typed_layout)
+                                .or_else(|| {
                                     field_info
                                         .derived_type
                                         .as_deref()
@@ -4637,86 +4653,90 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     && source_scalar_desc.is_none()
                                     && source_expr.is_none()
                                     && typed_type_tag.is_none()
+                                    && mold_static_type_tag.is_none()
+                                    && mold_static_vtable.is_none()
                                 {
-                                    mold_desc
+                                    mold_shape_desc
                                 } else {
                                     None
                                 };
                                 let field_type_name = field_derived_type_name(&field);
-                                let type_tag = if source_desc.is_some()
-                                    || mold_metadata_desc.is_some()
-                                {
-                                    None
-                                } else if let Some(source_expr) = source_expr {
-                                    expr_type_tag_value(
-                                        b,
-                                        source_expr,
-                                        None,
-                                        ctx.st,
-                                        ctx.type_layouts,
-                                    )
-                                    .or_else(|| {
-                                        static_alloc_target_type_tag_value(
+                                let type_tag =
+                                    if source_desc.is_some() || mold_metadata_desc.is_some() {
+                                        None
+                                    } else if let Some(source_expr) = source_expr {
+                                        expr_type_tag_value(
                                             b,
-                                            item,
+                                            source_expr,
+                                            Some(&ctx.locals),
                                             ctx.st,
                                             ctx.type_layouts,
                                         )
-                                    })
-                                } else if let Some(tag) = typed_type_tag {
-                                    Some(tag)
-                                } else {
-                                    derived_type_tag_value(
-                                        b,
-                                        field_type_name.as_deref(),
-                                        ctx.type_layouts,
-                                    )
-                                    .or_else(|| {
-                                        static_alloc_target_type_tag_value(
+                                        .or_else(|| {
+                                            static_alloc_target_type_tag_value(
+                                                b,
+                                                item,
+                                                ctx.st,
+                                                ctx.type_layouts,
+                                            )
+                                        })
+                                    } else if let Some(tag) = mold_static_type_tag {
+                                        Some(tag)
+                                    } else if let Some(tag) = typed_type_tag {
+                                        Some(tag)
+                                    } else {
+                                        derived_type_tag_value(
                                             b,
-                                            item,
+                                            field_type_name.as_deref(),
+                                            ctx.type_layouts,
+                                        )
+                                        .or_else(|| {
+                                            static_alloc_target_type_tag_value(
+                                                b,
+                                                item,
+                                                ctx.st,
+                                                ctx.type_layouts,
+                                            )
+                                        })
+                                    };
+                                let vtable =
+                                    if source_desc.is_some() || mold_metadata_desc.is_some() {
+                                        None
+                                    } else if let Some(source_expr) = source_expr {
+                                        expr_vtable_value(
+                                            b,
+                                            source_expr,
+                                            Some(&ctx.locals),
                                             ctx.st,
                                             ctx.type_layouts,
                                         )
-                                    })
-                                };
-                                let vtable = if source_desc.is_some()
-                                    || mold_metadata_desc.is_some()
-                                {
-                                    None
-                                } else if let Some(source_expr) = source_expr {
-                                    expr_vtable_value(
-                                        b,
-                                        source_expr,
-                                        None,
-                                        ctx.st,
-                                        ctx.type_layouts,
-                                    )
-                                    .or_else(|| {
-                                        static_alloc_target_vtable_value(
+                                        .or_else(|| {
+                                            static_alloc_target_vtable_value(
+                                                b,
+                                                item,
+                                                ctx.st,
+                                                ctx.type_layouts,
+                                            )
+                                        })
+                                    } else if let Some(ptr) = mold_static_vtable {
+                                        Some(ptr)
+                                    } else if let Some(ptr) = typed_vtable {
+                                        Some(ptr)
+                                    } else {
+                                        derived_type_vtable_value(
                                             b,
-                                            item,
-                                            ctx.st,
+                                            field_type_name.as_deref(),
                                             ctx.type_layouts,
                                         )
-                                    })
-                                } else if let Some(ptr) = typed_vtable {
-                                    Some(ptr)
-                                } else {
-                                    derived_type_vtable_value(
-                                        b,
-                                        field_type_name.as_deref(),
-                                        ctx.type_layouts,
-                                    )
-                                    .or_else(|| {
-                                        static_alloc_target_vtable_value(
-                                            b,
-                                            item,
-                                            ctx.st,
-                                            ctx.type_layouts,
-                                        )
-                                    })
-                                };
+                                        .or_else(|| {
+                                            static_alloc_target_vtable_value(
+                                                b,
+                                                item,
+                                                ctx.st,
+                                                ctx.type_layouts,
+                                            )
+                                        })
+                                    };
                                 emit_scalar_alloc_polymorphic_metadata_on_success(
                                     b, stat_addr, field_ptr, type_tag, vtable,
                                 );
@@ -4862,8 +4882,10 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             } else {
                                 None
                             };
-                            let dynamic_layout =
-                                source_scalar_layout.or(typed_layout).or_else(|| {
+                            let dynamic_layout = source_scalar_layout
+                                .or(mold_static_layout)
+                                .or(typed_layout)
+                                .or_else(|| {
                                     info.derived_type
                                         .as_deref()
                                         .and_then(|type_name| ctx.type_layouts.get(type_name))
@@ -5048,85 +5070,89 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     && source_scalar_desc.is_none()
                                     && source_expr.is_none()
                                     && typed_type_tag.is_none()
+                                    && mold_static_type_tag.is_none()
+                                    && mold_static_vtable.is_none()
                                 {
-                                    mold_desc
+                                    mold_shape_desc
                                 } else {
                                     None
                                 };
-                                let type_tag = if source_desc.is_some()
-                                    || mold_metadata_desc.is_some()
-                                {
-                                    None
-                                } else if let Some(source_expr) = source_expr {
-                                    expr_type_tag_value(
-                                        b,
-                                        source_expr,
-                                        None,
-                                        ctx.st,
-                                        ctx.type_layouts,
-                                    )
-                                    .or_else(|| {
-                                        static_alloc_target_type_tag_value(
+                                let type_tag =
+                                    if source_desc.is_some() || mold_metadata_desc.is_some() {
+                                        None
+                                    } else if let Some(source_expr) = source_expr {
+                                        expr_type_tag_value(
                                             b,
-                                            item,
+                                            source_expr,
+                                            Some(&ctx.locals),
                                             ctx.st,
                                             ctx.type_layouts,
                                         )
-                                    })
-                                } else if let Some(tag) = typed_type_tag {
-                                    Some(tag)
-                                } else {
-                                    derived_type_tag_value(
-                                        b,
-                                        info.derived_type.as_deref(),
-                                        ctx.type_layouts,
-                                    )
-                                    .or_else(|| {
-                                        static_alloc_target_type_tag_value(
+                                        .or_else(|| {
+                                            static_alloc_target_type_tag_value(
+                                                b,
+                                                item,
+                                                ctx.st,
+                                                ctx.type_layouts,
+                                            )
+                                        })
+                                    } else if let Some(tag) = mold_static_type_tag {
+                                        Some(tag)
+                                    } else if let Some(tag) = typed_type_tag {
+                                        Some(tag)
+                                    } else {
+                                        derived_type_tag_value(
                                             b,
-                                            item,
+                                            info.derived_type.as_deref(),
+                                            ctx.type_layouts,
+                                        )
+                                        .or_else(|| {
+                                            static_alloc_target_type_tag_value(
+                                                b,
+                                                item,
+                                                ctx.st,
+                                                ctx.type_layouts,
+                                            )
+                                        })
+                                    };
+                                let vtable =
+                                    if source_desc.is_some() || mold_metadata_desc.is_some() {
+                                        None
+                                    } else if let Some(source_expr) = source_expr {
+                                        expr_vtable_value(
+                                            b,
+                                            source_expr,
+                                            Some(&ctx.locals),
                                             ctx.st,
                                             ctx.type_layouts,
                                         )
-                                    })
-                                };
-                                let vtable = if source_desc.is_some()
-                                    || mold_metadata_desc.is_some()
-                                {
-                                    None
-                                } else if let Some(source_expr) = source_expr {
-                                    expr_vtable_value(
-                                        b,
-                                        source_expr,
-                                        None,
-                                        ctx.st,
-                                        ctx.type_layouts,
-                                    )
-                                    .or_else(|| {
-                                        static_alloc_target_vtable_value(
+                                        .or_else(|| {
+                                            static_alloc_target_vtable_value(
+                                                b,
+                                                item,
+                                                ctx.st,
+                                                ctx.type_layouts,
+                                            )
+                                        })
+                                    } else if let Some(ptr) = mold_static_vtable {
+                                        Some(ptr)
+                                    } else if let Some(ptr) = typed_vtable {
+                                        Some(ptr)
+                                    } else {
+                                        derived_type_vtable_value(
                                             b,
-                                            item,
-                                            ctx.st,
+                                            info.derived_type.as_deref(),
                                             ctx.type_layouts,
                                         )
-                                    })
-                                } else if let Some(ptr) = typed_vtable {
-                                    Some(ptr)
-                                } else {
-                                    derived_type_vtable_value(
-                                        b,
-                                        info.derived_type.as_deref(),
-                                        ctx.type_layouts,
-                                    )
-                                    .or_else(|| {
-                                        static_alloc_target_vtable_value(
-                                            b,
-                                            item,
-                                            ctx.st,
-                                            ctx.type_layouts,
-                                        )
-                                    })
-                                };
+                                        .or_else(|| {
+                                            static_alloc_target_vtable_value(
+                                                b,
+                                                item,
+                                                ctx.st,
+                                                ctx.type_layouts,
+                                            )
+                                        })
+                                    };
                                 emit_scalar_alloc_polymorphic_metadata_on_success(
                                     b, stat_addr, desc, type_tag, vtable,
                                 );
@@ -6941,7 +6967,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         }
                     }
                 }
-                if let Some(src_desc) = lower_hidden_character_result_descriptor_ctx(b, ctx, value) {
+                if let Some(src_desc) = lower_hidden_character_result_descriptor_ctx(b, ctx, value)
+                {
                     let size = b.const_i64(32);
                     b.call(
                         FuncRef::External("memcpy".into()),
@@ -7174,8 +7201,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     let type_tag = static_expr_type_tag_value(b, value, ctx.st, ctx.type_layouts);
                     let elem_size = expr_type_layout(value, None, ctx.st, ctx.type_layouts)
                         .map(|layout| b.const_i64(layout.size as i64));
-                    let vtable =
-                        static_expr_vtable_value(b, value, ctx.st, ctx.type_layouts);
+                    let vtable = static_expr_vtable_value(b, value, ctx.st, ctx.type_layouts);
                     let tgt_desc = array_descriptor_addr(b, &tgt_info);
                     store_scalar_polymorphic_descriptor_view(
                         b, tgt_desc, addr, elem_size, type_tag, vtable,
