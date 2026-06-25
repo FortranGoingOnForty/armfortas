@@ -133,6 +133,8 @@ pub(crate) fn alloc_decls(
                     .init
                     .as_ref()
                     .or_else(|| parameter_inits.get(&key).copied());
+                let is_parameter = attrs.iter().any(|a| matches!(a, Attribute::Parameter))
+                    || parameter_inits.contains_key(&key);
 
                 // Use entity-level array spec, or fall back to attribute-level DIMENSION.
                 let array_spec = entity.array_spec.as_ref().or(attr_dims);
@@ -667,6 +669,58 @@ pub(crate) fn alloc_decls(
                         // value still occupies the first N bytes.
                         let buf_ty =
                             IrType::Array(Box::new(IrType::Int(IntWidth::I8)), (len + 1) as u64);
+                        let is_save_attr = attrs.iter().any(|a| matches!(a, Attribute::Save));
+                        if !is_parameter
+                            && array_spec.is_none()
+                            && (is_save_attr || init_expr.is_some())
+                        {
+                            let mut bytes = vec![b' '; len.max(0) as usize + 1];
+                            let mut const_init = init_expr.is_none();
+                            if let Some(expr) = init_expr {
+                                if let Some(raw) =
+                                    eval_const_char_bytes(expr, &param_consts, &param_char_consts)
+                                {
+                                    const_init = true;
+                                    let limit = len.max(0) as usize;
+                                    for (dst, src) in
+                                        bytes.iter_mut().take(limit).zip(raw.iter().copied())
+                                    {
+                                        *dst = src;
+                                    }
+                                }
+                            }
+                            if const_init {
+                                let global_name = save_global_name(func_name, &key);
+                                pending_globals.push(PendingGlobal {
+                                    global: Global {
+                                        name: global_name.clone(),
+                                        ty: buf_ty.clone(),
+                                        initializer: Some(GlobalInit::String(bytes)),
+                                    },
+                                });
+                                let addr = b.global_addr(&global_name, buf_ty);
+                                locals.insert(
+                                    key,
+                                    LocalInfo {
+                                        addr,
+                                        ty: IrType::Int(IntWidth::I8),
+                                        dims: vec![],
+                                        allocatable: false,
+                                        descriptor_arg: false,
+                                        by_ref: false,
+                                        char_kind: CharKind::Fixed(len),
+                                        derived_type: None,
+                                        inline_const: None,
+                                        is_pointer: false,
+                                        runtime_dim_upper: vec![],
+                                        is_class: false,
+                                        logical_kind: None,
+                                        last_dim_assumed_size: false,
+                                    },
+                                );
+                                continue;
+                            }
+                        }
                         let addr = b.alloca(buf_ty);
                         let zero = b.const_i32(0);
                         let total = b.const_i64(len + 1);

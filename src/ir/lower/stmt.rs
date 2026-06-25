@@ -6932,6 +6932,15 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         }
                     }
                 }
+                if let Some(src_desc) = lower_hidden_character_result_descriptor_ctx(b, ctx, value) {
+                    let size = b.const_i64(32);
+                    b.call(
+                        FuncRef::External("memcpy".into()),
+                        vec![tgt_desc, src_desc, size],
+                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                    );
+                    return;
+                }
                 let (ptr, len) = lower_string_expr_ctx(b, ctx, value);
                 store_string_pointer_descriptor_view(b, tgt_desc, ptr, len);
                 return;

@@ -22629,6 +22629,60 @@ pub(super) fn resolved_character_return_abi_for_call(
     )
 }
 
+pub(super) fn lower_hidden_character_result_descriptor_ctx(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    expr: &SpannedExpr,
+) -> Option<ValueId> {
+    let Expr::FunctionCall { callee, args } = &expr.node else {
+        return None;
+    };
+    let Expr::Name { name } = &callee.node else {
+        return None;
+    };
+    let key = name.to_lowercase();
+    let ret_abi = resolved_character_return_abi_for_call(
+        b,
+        &ctx.locals,
+        ctx.st,
+        Some(ctx.type_layouts),
+        Some(ctx.internal_funcs),
+        Some(ctx.contained_host_refs),
+        Some(ctx.descriptor_params),
+        &key,
+        args,
+    );
+    let uses_hidden_descriptor = matches!(ret_abi, Some(CharacterReturnAbi::HiddenDescriptor))
+        || (ret_abi.is_none() && ctx.internal_funcs.contains_key(&key));
+    if !uses_hidden_descriptor {
+        return None;
+    }
+
+    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 32));
+    let zero_i32 = b.const_i32(0);
+    let size32 = b.const_i64(32);
+    b.call(
+        FuncRef::External("memset".into()),
+        vec![desc, zero_i32, size32],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+    emit_named_function_call(
+        b,
+        &ctx.locals,
+        ctx.st,
+        Some(ctx.type_layouts),
+        Some(ctx.internal_funcs),
+        Some(ctx.contained_host_refs),
+        Some(ctx.descriptor_params),
+        name,
+        args,
+        Some(desc),
+        true,
+        IrType::Void,
+    );
+    Some(desc)
+}
+
 /// Check if a dummy argument has the VALUE attribute in its declaration.
 pub(super) fn arg_has_value_attr(arg_name: &str, decls: &[crate::ast::decl::SpannedDecl]) -> bool {
     let key = arg_name.to_lowercase();
@@ -47919,6 +47973,7 @@ pub(super) fn ensure_hidden_string_result_local(
     b: &mut FuncBuilder,
     locals: &mut HashMap<String, LocalInfo>,
     result_name: &str,
+    result_is_pointer: bool,
     return_type: Option<&TypeSpec>,
     visible_param_consts: &HashMap<String, ConstScalar>,
     st: &SymbolTable,
@@ -47956,13 +48011,13 @@ pub(super) fn ensure_hidden_string_result_local(
                 addr,
                 ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
                 dims: vec![],
-                allocatable: true,
+                allocatable: !result_is_pointer,
                 descriptor_arg: false,
                 by_ref: false,
                 char_kind: CharKind::Deferred,
                 derived_type: None,
                 inline_const: None,
-                is_pointer: false,
+                is_pointer: result_is_pointer,
                 runtime_dim_upper: vec![],
                 is_class: false,
                 logical_kind: None,
@@ -48077,6 +48132,16 @@ pub(super) fn lower_hidden_string_result_copy(b: &mut FuncBuilder, ctx: &LowerCt
         .locals
         .get(result_name)
         .unwrap_or_else(|| panic!("missing hidden string result local '{}'", result_name));
+    if info.is_pointer && matches!(info.char_kind, CharKind::Deferred) {
+        let src_desc = string_descriptor_addr(b, info);
+        let size = b.const_i64(32);
+        b.call(
+            FuncRef::External("memcpy".into()),
+            vec![ValueId(0), src_desc, size],
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        );
+        return;
+    }
     let (src_ptr, src_len) = local_char_ptr_and_len(b, info).unwrap_or_else(|| {
         panic!(
             "hidden string result '{}' is not lowered as a string local",

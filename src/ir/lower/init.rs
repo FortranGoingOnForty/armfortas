@@ -162,6 +162,9 @@ pub(crate) fn init_decls(
                     if info.by_ref {
                         continue;
                     }
+                    if global_addr_ids.contains(&info.addr) {
+                        continue;
+                    }
 
                     if !info.dims.is_empty()
                         && !info.allocatable
@@ -417,13 +420,6 @@ pub(crate) fn init_decls(
                         || !matches!(info.char_kind, CharKind::None)
                         || info.derived_type.is_some()
                     {
-                        continue;
-                    }
-                    // SAVE-promoted locals are backed by a module
-                    // global already initialized at link time. Don't
-                    // re-store on every call — that would defeat
-                    // the SAVE semantics (audit MAJOR-1).
-                    if global_addr_ids.contains(&info.addr) {
                         continue;
                     }
                     // Audit5 MAJOR-3: PARAMETER scalars folded by

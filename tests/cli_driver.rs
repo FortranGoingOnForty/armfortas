@@ -30417,6 +30417,49 @@ fn deferred_character_pointer_to_empty_class_component_stays_associated() {
 }
 
 #[test]
+fn deferred_character_pointer_result_select_type_mismatch_stays_null() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=deferred_character_pointer_result_select_type_mismatch_stays_null count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  type, abstract :: generic_value\n  end type\n  type, extends(generic_value) :: integer_value\n    integer :: raw\n  end type\n  type, extends(generic_value) :: string_value\n    character(:), allocatable :: raw\n  end type\n\n  class(generic_value), allocatable, target :: val\n  character(:), pointer :: ptr\n\n  allocate(integer_value :: val)\n  select type (val)\n  type is (integer_value)\n    val%raw = 123\n  end select\n\n  ptr => cast_string(val)\n  if (associated(ptr)) error stop 1\n  print *, 'ok'\n\ncontains\n  function cast_string(value) result(ptr)\n    class(generic_value), intent(in), target :: value\n    character(:), pointer :: ptr\n\n    nullify(ptr)\n    select type (value)\n    type is (string_value)\n      ptr => value%raw\n    end select\n  end function cast_string\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("deferred_char_ptr_select_type_mismatch", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("deferred char pointer mismatch compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "deferred char pointer mismatch should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "deferred char pointer mismatch should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected deferred char pointer mismatch output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn allocatable_result_helper_assignment_uses_resolved_symbol() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

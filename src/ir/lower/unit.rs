@@ -1385,6 +1385,7 @@ pub(crate) fn lower_unit(
                         &mut b,
                         &mut ctx.locals,
                         &result_name,
+                        result_is_pointer,
                         return_type.as_ref(),
                         &visible_param_consts,
                         st,
