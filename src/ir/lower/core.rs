@@ -10890,8 +10890,21 @@ fn lower_logical_reduction_defined_array_ctor_compare(
         let Some(right_decl) = declared_args.get(1).and_then(|sym| sym.type_info.as_ref()) else {
             return false;
         };
-        operator_arg_semantic_match(left_decl, Some(&left_ti))
-            && operator_arg_semantic_match(right_decl, Some(&right_ti))
+        let match_scope_id =
+            callee_scope_id_for_lookup(st, b.func().name.as_str()).or_else(current_proc_scope);
+        operator_arg_semantic_match_with_context(
+            st,
+            match_scope_id,
+            left_decl,
+            Some(&left_ti),
+            type_layouts,
+        ) && operator_arg_semantic_match_with_context(
+            st,
+            match_scope_id,
+            right_decl,
+            Some(&right_ti),
+            type_layouts,
+        )
     })?;
 
     let (array_desc, elem_ty) = lower_array_expr_descriptor(
@@ -12202,12 +12215,8 @@ fn operator_specific_candidates(
     iface_name: &str,
     operand_types: &[Option<&crate::sema::symtab::TypeInfo>],
 ) -> Option<Vec<SpecificProcCandidate>> {
-    let mut all_candidates =
-        operator_interface_specific_candidates(st, iface_name).unwrap_or_default();
-    let mut seen_candidates: HashSet<(String, crate::sema::symtab::ScopeId)> = all_candidates
-        .iter()
-        .map(|candidate| (candidate.name.to_ascii_lowercase(), candidate.owner_scope))
-        .collect();
+    let mut all_candidates = Vec::new();
+    let mut seen_candidates: HashSet<(String, crate::sema::symtab::ScopeId)> = HashSet::new();
     append_type_bound_operator_specific_candidates(
         st,
         type_layouts,
@@ -12216,6 +12225,11 @@ fn operator_specific_candidates(
         &mut all_candidates,
         &mut seen_candidates,
     );
+    for candidate in operator_interface_specific_candidates(st, iface_name).unwrap_or_default() {
+        if seen_candidates.insert((candidate.name.to_ascii_lowercase(), candidate.owner_scope)) {
+            all_candidates.push(candidate);
+        }
+    }
     (!all_candidates.is_empty()).then_some(all_candidates)
 }
 
@@ -12244,7 +12258,8 @@ fn append_type_bound_operator_specific_candidates(
             continue;
         };
         for proc in layout.bound_proc_candidates(iface_name) {
-            let specific_name = proc.abi_name.to_ascii_lowercase();
+            let specific_name = abi_key_for_link_name(st, &proc.target_name)
+                .unwrap_or_else(|| proc.target_name.to_ascii_lowercase());
             let owner_scope = procedure_scope_by_name(st, &specific_name)
                 .and_then(|scope| scope.parent)
                 .or(proc_scope_id)
@@ -14309,9 +14324,58 @@ pub(super) fn defined_assignment_arg_semantic_match(
     }
 }
 
-pub(super) fn operator_arg_semantic_match(
+pub(super) fn operator_arg_semantic_match_with_context(
+    st: &SymbolTable,
+    scope_id: Option<crate::sema::symtab::ScopeId>,
     declared: &crate::sema::symtab::TypeInfo,
     actual: Option<&crate::sema::symtab::TypeInfo>,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> bool {
+    operator_arg_semantic_match_impl(Some(st), scope_id, declared, actual, type_layouts)
+}
+
+fn operator_type_names_exact_match(
+    st: Option<&SymbolTable>,
+    scope_id: Option<crate::sema::symtab::ScopeId>,
+    declared_name: &str,
+    actual_name: &str,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> bool {
+    if let Some(st) = st {
+        generic_type_names_match(st, scope_id, declared_name, actual_name, type_layouts)
+    } else {
+        actual_name.eq_ignore_ascii_case(declared_name)
+    }
+}
+
+fn operator_actual_extends_declared(
+    st: Option<&SymbolTable>,
+    scope_id: Option<crate::sema::symtab::ScopeId>,
+    declared_name: &str,
+    actual_name: &str,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> bool {
+    let Some(st) = st else {
+        return actual_name.eq_ignore_ascii_case(declared_name);
+    };
+    if generic_type_names_match(st, scope_id, declared_name, actual_name, type_layouts) {
+        return true;
+    }
+    let Some(tl) = type_layouts else {
+        return false;
+    };
+    let actual_name = canonical_type_name_for_generic_match(st, scope_id, actual_name, Some(tl));
+    let declared_name =
+        canonical_type_name_for_generic_match(st, scope_id, declared_name, Some(tl));
+    is_type_or_extends(&actual_name, &declared_name, tl)
+}
+
+fn operator_arg_semantic_match_impl(
+    st: Option<&SymbolTable>,
+    scope_id: Option<crate::sema::symtab::ScopeId>,
+    declared: &crate::sema::symtab::TypeInfo,
+    actual: Option<&crate::sema::symtab::TypeInfo>,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
 ) -> bool {
     use crate::sema::symtab::TypeInfo;
 
@@ -14322,15 +14386,18 @@ pub(super) fn operator_arg_semantic_match(
                 if actual_name.eq_ignore_ascii_case(decl_name)
         ),
         TypeInfo::Character { .. } => matches!(actual, Some(TypeInfo::Character { .. })),
-        TypeInfo::Derived(decl_name) => matches!(
-            actual,
-            Some(TypeInfo::Derived(actual_name)) if actual_name.eq_ignore_ascii_case(decl_name)
-        ),
-        TypeInfo::Class(decl_name) => matches!(
-            actual,
-            Some(TypeInfo::Class(actual_name)) | Some(TypeInfo::Derived(actual_name))
-                if actual_name.eq_ignore_ascii_case(decl_name)
-        ),
+        TypeInfo::Derived(decl_name) => match actual {
+            Some(TypeInfo::Derived(actual_name)) => {
+                operator_type_names_exact_match(st, scope_id, decl_name, actual_name, type_layouts)
+            }
+            _ => false,
+        },
+        TypeInfo::Class(decl_name) => match actual {
+            Some(TypeInfo::Class(actual_name)) | Some(TypeInfo::Derived(actual_name)) => {
+                operator_actual_extends_declared(st, scope_id, decl_name, actual_name, type_layouts)
+            }
+            _ => false,
+        },
         TypeInfo::ClassStar => matches!(actual, Some(TypeInfo::ClassStar)),
         TypeInfo::TypeStar => matches!(actual, Some(TypeInfo::TypeStar)),
         // Numeric / logical: when the actual type is known, require both
@@ -15104,10 +15171,22 @@ pub(super) fn defined_binary_operator_result_type_info(
         let Some(right_decl) = declared_args.get(1).and_then(|arg| arg.type_info.as_ref()) else {
             continue;
         };
-        if !operator_arg_semantic_match(left_decl, left_ti) {
+        if !operator_arg_semantic_match_with_context(
+            st,
+            current_proc_scope(),
+            left_decl,
+            left_ti,
+            type_layouts,
+        ) {
             continue;
         }
-        if !operator_arg_semantic_match(right_decl, right_ti) {
+        if !operator_arg_semantic_match_with_context(
+            st,
+            current_proc_scope(),
+            right_decl,
+            right_ti,
+            type_layouts,
+        ) {
             continue;
         }
         if !candidate_is_elemental {
@@ -15160,10 +15239,22 @@ pub(super) fn defined_binary_operator_result_rank(
         let Some(right_decl) = declared_args.get(1).and_then(|arg| arg.type_info.as_ref()) else {
             continue;
         };
-        if !operator_arg_semantic_match(left_decl, left_ti) {
+        if !operator_arg_semantic_match_with_context(
+            st,
+            current_proc_scope(),
+            left_decl,
+            left_ti,
+            type_layouts,
+        ) {
             continue;
         }
-        if !operator_arg_semantic_match(right_decl, right_ti) {
+        if !operator_arg_semantic_match_with_context(
+            st,
+            current_proc_scope(),
+            right_decl,
+            right_ti,
+            type_layouts,
+        ) {
             continue;
         }
         if !candidate_is_elemental {
@@ -15223,7 +15314,13 @@ pub(super) fn defined_unary_operator_result_type_info(
         let Some(decl) = declared_args.first().and_then(|arg| arg.type_info.as_ref()) else {
             continue;
         };
-        if !operator_arg_semantic_match(decl, operand_ti) {
+        if !operator_arg_semantic_match_with_context(
+            st,
+            current_proc_scope(),
+            decl,
+            operand_ti,
+            type_layouts,
+        ) {
             continue;
         }
         if !candidate_is_elemental {
@@ -15268,7 +15365,13 @@ pub(super) fn resolve_defined_unary_operator_specific_by_semantics(
         let Some(decl) = declared_args.first().and_then(|arg| arg.type_info.as_ref()) else {
             continue;
         };
-        if !operator_arg_semantic_match(decl, operand_ti.as_ref()) {
+        if !operator_arg_semantic_match_with_context(
+            st,
+            current_proc_scope(),
+            decl,
+            operand_ti.as_ref(),
+            type_layouts,
+        ) {
             continue;
         }
         if !specific_candidate_is_elemental(st, candidate) {
@@ -15322,10 +15425,22 @@ pub(super) fn resolve_defined_binary_operator_specific_by_semantics(
         let Some(right_decl) = declared_args.get(1).and_then(|arg| arg.type_info.as_ref()) else {
             continue;
         };
-        if !operator_arg_semantic_match(left_decl, left_ti.as_ref()) {
+        if !operator_arg_semantic_match_with_context(
+            st,
+            current_proc_scope(),
+            left_decl,
+            left_ti.as_ref(),
+            type_layouts,
+        ) {
             continue;
         }
-        if !operator_arg_semantic_match(right_decl, right_ti.as_ref()) {
+        if !operator_arg_semantic_match_with_context(
+            st,
+            current_proc_scope(),
+            right_decl,
+            right_ti.as_ref(),
+            type_layouts,
+        ) {
             continue;
         }
         if !specific_candidate_is_elemental(st, candidate) {
@@ -16828,6 +16943,8 @@ pub(super) fn resolve_operator_overload(
         &iface_name,
         &[left_semantic_ti.as_ref(), right_semantic_ti.as_ref()],
     )?;
+    let match_scope_id =
+        callee_scope_id_for_lookup(st, b.func().name.as_str()).or_else(current_proc_scope);
     let semantic_candidates: Vec<SpecificProcCandidate> = all_candidates
         .iter()
         .filter_map(|candidate| {
@@ -16838,10 +16955,22 @@ pub(super) fn resolve_operator_overload(
             }
             let left_decl = declared_args.first()?.type_info.as_ref()?;
             let right_decl = declared_args.get(1)?.type_info.as_ref()?;
-            if !operator_arg_semantic_match(left_decl, left_semantic_ti.as_ref()) {
+            if !operator_arg_semantic_match_with_context(
+                st,
+                match_scope_id,
+                left_decl,
+                left_semantic_ti.as_ref(),
+                type_layouts,
+            ) {
                 return None;
             }
-            if !operator_arg_semantic_match(right_decl, right_semantic_ti.as_ref()) {
+            if !operator_arg_semantic_match_with_context(
+                st,
+                match_scope_id,
+                right_decl,
+                right_semantic_ti.as_ref(),
+                type_layouts,
+            ) {
                 return None;
             }
             Some(candidate.clone())

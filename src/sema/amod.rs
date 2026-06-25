@@ -369,6 +369,7 @@ pub fn write_amod(
         if let Some(layout) = type_layouts.get(name) {
             for bp in &layout.bound_procs {
                 proc_export_names.insert(bp.abi_name.to_lowercase());
+                proc_export_names.insert(bound_proc_target_export_key(&mod_key, &bp.target_name));
             }
         }
     }
@@ -506,6 +507,14 @@ fn is_public(sym: &Symbol, scope: &Scope) -> bool {
         Access::Public => true,
         Access::Default => !matches!(scope.default_access, Access::Private),
     }
+}
+
+fn bound_proc_target_export_key(module_key: &str, target_name: &str) -> String {
+    let prefix = format!("afs_modproc_{}_", module_key.to_lowercase());
+    target_name
+        .strip_prefix(&prefix)
+        .unwrap_or(target_name)
+        .to_lowercase()
 }
 
 fn emit_variable(
