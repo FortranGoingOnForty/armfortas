@@ -531,7 +531,10 @@ fn ptr_i8_ty() -> IrType {
 }
 
 fn ptr_i8_value(b: &mut FuncBuilder, value: ValueId) -> ValueId {
-    if b.func().value_type(value).is_some_and(|ty| ty == ptr_i8_ty()) {
+    if b.func()
+        .value_type(value)
+        .is_some_and(|ty| ty == ptr_i8_ty())
+    {
         return value;
     }
     let raw = b.ptr_to_int(value);
@@ -5668,16 +5671,14 @@ fn eval_const_char_bytes_with_context(
                 Some(value.as_bytes().to_vec())
             })
         }
-        Expr::ParenExpr { inner } => {
-            eval_const_char_bytes_with_context(
-                inner,
-                param_consts,
-                param_chars,
-                st,
-                scope_id,
-                type_layouts,
-            )
-        }
+        Expr::ParenExpr { inner } => eval_const_char_bytes_with_context(
+            inner,
+            param_consts,
+            param_chars,
+            st,
+            scope_id,
+            type_layouts,
+        ),
         Expr::FunctionCall { callee, args } => {
             if args.len() == 1 && args[0].keyword.is_none() {
                 if let Some(base) = eval_const_char_bytes_with_context(
@@ -5687,8 +5688,7 @@ fn eval_const_char_bytes_with_context(
                     st,
                     scope_id,
                     type_layouts,
-                )
-                {
+                ) {
                     return eval_const_char_substring(&base, &args[0].value, param_consts);
                 }
             }
@@ -5738,15 +5738,14 @@ fn eval_const_char_bytes_with_context(
             left,
             right,
         } => {
-            let mut out =
-                eval_const_char_bytes_with_context(
-                    left,
-                    param_consts,
-                    param_chars,
-                    st,
-                    scope_id,
-                    type_layouts,
-                )?;
+            let mut out = eval_const_char_bytes_with_context(
+                left,
+                param_consts,
+                param_chars,
+                st,
+                scope_id,
+                type_layouts,
+            )?;
             out.extend(eval_const_char_bytes_with_context(
                 right,
                 param_consts,
@@ -6113,47 +6112,44 @@ pub(super) fn declared_char_len(
                 scope_id,
                 type_layouts,
             )
-                .map(|bytes| bytes.len() as i64)
-                .or_else(|| {
-                    if let crate::ast::expr::Expr::ArrayConstructor { type_spec, .. } = &expr.node {
-                        typed_array_constructor_char_len(type_spec.as_deref(), param_consts, st)
-                    } else {
-                        None
-                    }
+            .map(|bytes| bytes.len() as i64)
+            .or_else(|| {
+                if let crate::ast::expr::Expr::ArrayConstructor { type_spec, .. } = &expr.node {
+                    typed_array_constructor_char_len(type_spec.as_deref(), param_consts, st)
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                collect_const_char_array_elems(expr, param_consts, param_char_consts).map(|elems| {
+                    elems
+                        .iter()
+                        .map(|elem| elem.len() as i64)
+                        .max()
+                        .unwrap_or(0)
                 })
-                .or_else(|| {
-                    collect_const_char_array_elems(expr, param_consts, param_char_consts).map(
-                        |elems| {
-                            elems
-                                .iter()
-                                .map(|elem| elem.len() as i64)
-                                .max()
-                                .unwrap_or(0)
-                        },
-                    )
-                })
-                .or_else(|| eval_const_char_expr_len(expr, param_consts, param_char_consts, st))
-                .or_else(|| {
-                    // Fallback: when the init is a Name that
-                    // refers to another character parameter
-                    // visible via host/use association (e.g.
-                    // `character(*), parameter :: vtype = type_rsp`
-                    // where type_rsp lives in the parent module),
-                    // extract the length from the symbol table.
-                    if let crate::ast::expr::Expr::Name { name } = &expr.node {
-                        let key = name.to_lowercase();
-                        if let Some(sym) = st.find_symbol_any_scope(&key) {
-                            if let Some(crate::sema::symtab::TypeInfo::Character {
-                                len: Some(n),
-                                ..
-                            }) = &sym.type_info
-                            {
-                                return Some(*n);
-                            }
+            })
+            .or_else(|| eval_const_char_expr_len(expr, param_consts, param_char_consts, st))
+            .or_else(|| {
+                // Fallback: when the init is a Name that
+                // refers to another character parameter
+                // visible via host/use association (e.g.
+                // `character(*), parameter :: vtype = type_rsp`
+                // where type_rsp lives in the parent module),
+                // extract the length from the symbol table.
+                if let crate::ast::expr::Expr::Name { name } = &expr.node {
+                    let key = name.to_lowercase();
+                    if let Some(sym) = st.find_symbol_any_scope(&key) {
+                        if let Some(crate::sema::symtab::TypeInfo::Character {
+                            len: Some(n), ..
+                        }) = &sym.type_info
+                        {
+                            return Some(*n);
                         }
                     }
-                    None
-                })
+                }
+                None
+            })
         }),
         Some(crate::ast::decl::LenSpec::Colon) => None,
         None => Some(1),
@@ -6196,8 +6192,14 @@ fn eval_const_char_global_init_with_context(
     scope_id: Option<crate::sema::symtab::ScopeId>,
     type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
 ) -> Option<GlobalInit> {
-    let mut bytes =
-        eval_const_char_bytes_with_context(e, param_consts, param_char_consts, st, scope_id, type_layouts)?;
+    let mut bytes = eval_const_char_bytes_with_context(
+        e,
+        param_consts,
+        param_char_consts,
+        st,
+        scope_id,
+        type_layouts,
+    )?;
     let target_len = usize::try_from(len).ok()?;
     if bytes.len() > target_len {
         bytes.truncate(target_len);
@@ -11883,7 +11885,10 @@ fn named_interface_symbol_in_scope_chain<'a>(
         }
         let scope = st.scope(scope_id);
         let parent = scope.parent?;
-        if matches!(st.scope(parent).kind, crate::sema::symtab::ScopeKind::Global) {
+        if matches!(
+            st.scope(parent).kind,
+            crate::sema::symtab::ScopeKind::Global
+        ) {
             return None;
         }
         scope_id = parent;
@@ -12339,17 +12344,23 @@ fn append_type_bound_operator_specific_candidates(
             continue;
         };
         for proc in layout.bound_proc_candidates(iface_name) {
-            let specific_name = abi_key_for_link_name(st, &proc.target_name)
+            let mut push_candidate = |specific_name: String| {
+                let owner_scope = procedure_scope_by_name(st, &specific_name)
+                    .and_then(|scope| scope.parent)
+                    .or(proc_scope_id)
+                    .unwrap_or(0);
+                if seen.insert((specific_name.clone(), owner_scope)) {
+                    specifics.push(SpecificProcCandidate {
+                        name: specific_name,
+                        owner_scope,
+                    });
+                }
+            };
+            let target_specific = abi_key_for_link_name(st, &proc.target_name)
                 .unwrap_or_else(|| proc.target_name.to_ascii_lowercase());
-            let owner_scope = procedure_scope_by_name(st, &specific_name)
-                .and_then(|scope| scope.parent)
-                .or(proc_scope_id)
-                .unwrap_or(0);
-            if seen.insert((specific_name.clone(), owner_scope)) {
-                specifics.push(SpecificProcCandidate {
-                    name: specific_name,
-                    owner_scope,
-                });
+            push_candidate(target_specific.clone());
+            if !proc.abi_name.eq_ignore_ascii_case(&target_specific) {
+                push_candidate(proc.abi_name.to_ascii_lowercase());
             }
         }
     }
@@ -14960,12 +14971,8 @@ pub(super) fn operator_expr_type_info(
         Expr::Name { name } => {
             let key = name.to_lowercase();
             let symbol_ti = st
-                .lookup(&key)
-                .and_then(|sym| sym.type_info.clone())
-                .or_else(|| {
-                    st.find_symbol_any_scope(&key)
-                        .and_then(|sym| sym.type_info.clone())
-                });
+                .lookup_local_then_any(current_proc_scope(), &key)
+                .and_then(|sym| sym.type_info.clone());
             let local_info = locals.and_then(|locals| locals.get(&key));
             name_expr_type_info(local_info, symbol_ti.as_ref())
         }
@@ -15623,12 +15630,8 @@ pub(super) fn generic_actual_expr_type_info(
         Expr::Name { name } => {
             let key = name.to_lowercase();
             let symbol_ti = st
-                .lookup(&key)
-                .and_then(|sym| sym.type_info.clone())
-                .or_else(|| {
-                    st.find_symbol_any_scope(&key)
-                        .and_then(|sym| sym.type_info.clone())
-                });
+                .lookup_local_then_any(current_proc_scope(), &key)
+                .and_then(|sym| sym.type_info.clone());
             // F2023 7.6.2: enumeration values lower to plain i32
             // scalars, so the LocalInfo types them Integer and generic
             // dispatch would route the actual to an INTEGER specific.
@@ -18928,8 +18931,7 @@ pub(super) fn emit_resolved_bound_proc_call(
             .as_ref()
             .map(|mask| mask.first().copied().unwrap_or(false))
             .unwrap_or(false);
-        let wants_descriptor = (mask_wants_descriptor || pass_dummy_is_class)
-            && !wants_bind_c_char;
+        let wants_descriptor = (mask_wants_descriptor || pass_dummy_is_class) && !wants_bind_c_char;
         call_args.push(if wants_descriptor {
             pass_desc_addr.unwrap_or(obj_addr)
         } else {
@@ -19232,7 +19234,9 @@ pub(super) fn emit_dynamic_bound_proc_lookup_dispatch(
         target_key.clone(),
         declared_bp.abi_name.clone(),
     ];
-    abi_seed_keys.extend(module_procedure_link_name_candidates(&declared_bp.target_name));
+    abi_seed_keys.extend(module_procedure_link_name_candidates(
+        &declared_bp.target_name,
+    ));
     let abi_seed_refs: Vec<&str> = abi_seed_keys.iter().map(String::as_str).collect();
     let abi_lookup_keys = procedure_abi_lookup_keys(st, &abi_seed_refs);
     let hidden_abi = first_procedure_lookup(&abi_lookup_keys, |k| callee_hidden_result_abi(st, k));
@@ -19411,16 +19415,20 @@ pub(super) fn resolve_polymorphic_component_method_base_for_dispatch(
             if !local_uses_array_descriptor(info) || !info.dims.is_empty() {
                 return None;
             }
-            let proc_scope_id = callee_scope_id_for_lookup(st, b.func().name.as_str());
-            let type_info = proc_scope_id
-                .and_then(|scope_id| st.lookup_in(scope_id, &key))
-                .and_then(|sym| sym.type_info.as_ref())
-                .or_else(|| st.lookup(&key).and_then(|sym| sym.type_info.as_ref()))
-                .or_else(|| {
-                    st.find_symbol_any_scope(&key)
-                        .and_then(|sym| sym.type_info.as_ref())
-                })?;
-            let base_type = match type_info {
+            let proc_scope_id =
+                callee_scope_id_for_lookup(st, b.func().name.as_str()).or_else(current_proc_scope);
+            let local_type_info = info.derived_type.as_ref().map(|type_name| {
+                if info.is_class {
+                    crate::sema::symtab::TypeInfo::Class(type_name.clone())
+                } else {
+                    crate::sema::symtab::TypeInfo::Derived(type_name.clone())
+                }
+            });
+            let symbol_type_info = st
+                .lookup_local_then_any(proc_scope_id, &key)
+                .and_then(|sym| sym.type_info.clone());
+            let type_info = local_type_info.or(symbol_type_info)?;
+            let base_type = match &type_info {
                 crate::sema::symtab::TypeInfo::Class(base_type) => {
                     canonical_layout_type_name_for_scope(st, proc_scope_id, base_type, tl)
                         .or_else(|| Some(base_type.clone()))?
@@ -22262,7 +22270,10 @@ pub(super) fn descriptor_param_mask_for_lookup(
     };
     let proc_mask = cache.get(&proc_name).cloned();
     let cached = direct_mask.clone().or_else(|| proc_mask.clone());
-    if cached.as_ref().is_some_and(|mask| mask.iter().any(|flag| *flag)) {
+    if cached
+        .as_ref()
+        .is_some_and(|mask| mask.iter().any(|flag| *flag))
+    {
         return cached;
     }
 
@@ -22674,8 +22685,8 @@ pub(super) fn callee_character_return_abi(
     use crate::sema::symtab::TypeInfo;
 
     let key = canonical_procedure_abi_key(st, callee_name);
-    let sym = find_linkable_symbol_any_scope(st, &key)
-        .filter(|sym| is_linkable_callable_symbol(sym))?;
+    let sym =
+        find_linkable_symbol_any_scope(st, &key).filter(|sym| is_linkable_callable_symbol(sym))?;
     let TypeInfo::Character { .. } = sym.type_info.as_ref()? else {
         return None;
     };
@@ -22693,8 +22704,8 @@ pub(super) fn callee_hidden_result_abi(
     use crate::sema::symtab::TypeInfo;
 
     let key = canonical_procedure_abi_key(st, callee_name);
-    let sym = find_linkable_symbol_any_scope(st, &key)
-        .filter(|sym| is_linkable_callable_symbol(sym))?;
+    let sym =
+        find_linkable_symbol_any_scope(st, &key).filter(|sym| is_linkable_callable_symbol(sym))?;
     // Rank check must come BEFORE the Character match arm: a function
     // returning `character :: cstr(N)` is rank-1, and the caller has to
     // allocate a 384-byte ArrayDescriptor (NOT a 32-byte StringDescriptor)
@@ -41289,14 +41300,7 @@ pub(super) fn lower_1d_section_assign(
     );
     let dest_stride = load_array_desc_i64_field(b, dest_desc, 24 + 16);
     if (dest_info.char_kind != CharKind::None || descriptor_backed_runtime_char_array(dest_info))
-        && try_lower_transfer_char_expr_into_section(
-            b,
-            ctx,
-            dest_desc,
-            dest_n,
-            dest_stride,
-            value,
-        )
+        && try_lower_transfer_char_expr_into_section(b, ctx, dest_desc, dest_n, dest_stride, value)
     {
         return true;
     }
@@ -42579,13 +42583,12 @@ pub(super) fn lower_array_assign(
             if let Some(type_name) = dest_info.derived_type.as_deref() {
                 if let Some(layout) = ctx.type_layouts.get(type_name).cloned() {
                     let mut assign_src_desc = src_desc;
-                    let tmp_src_desc = if !dest_name.is_empty() && expr_mentions_name(value, dest_name)
+                    let tmp_src_desc = if !dest_name.is_empty()
+                        && expr_mentions_name(value, dest_name)
                     {
                         let tmp_desc = allocate_like_array_temp_descriptor(b, src_desc);
-                        let tmp_base = b.load_typed(
-                            tmp_desc,
-                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                        );
+                        let tmp_base = b
+                            .load_typed(tmp_desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
                         let tmp_n = b.call(
                             FuncRef::External("afs_array_size".into()),
                             vec![tmp_desc],
@@ -47244,10 +47247,7 @@ pub(super) fn scalar_allocatable_derived_component_payload_addr(
         && (field.allocatable || field.pointer)
         && !field.procedure_pointer
     {
-        Some(b.load_typed(
-            field_ptr,
-            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-        ))
+        Some(b.load_typed(field_ptr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)))))
     } else {
         None
     }

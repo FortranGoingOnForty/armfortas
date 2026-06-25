@@ -41058,6 +41058,103 @@ fn derived_array_allocation_with_bound_proc_preserves_bounds() {
 }
 
 #[test]
+fn allocate_mold_imported_concrete_preserves_vtable() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocate_mold_imported_concrete_preserves_vtable count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("alloc_mold_imported_concrete_vtable");
+    let module_src = write_program_in(
+        &dir,
+        "m.f90",
+        "module m\n  implicit none\n  type, abstract :: base_t\n  contains\n    procedure(load_i), deferred :: load\n  end type base_t\n  abstract interface\n    subroutine load_i(self)\n      import :: base_t\n      class(base_t), intent(inout) :: self\n    end subroutine load_i\n  end interface\n  type, extends(base_t) :: child_t\n    integer :: value = 0\n  contains\n    procedure :: load => child_load\n  end type child_t\ncontains\n  subroutine child_load(self)\n    class(child_t), intent(inout) :: self\n    self%value = 42\n  end subroutine child_load\nend module m\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use m\n  implicit none\n  type(child_t) :: src\n  class(base_t), allocatable :: copy\n  src%value = 7\n  allocate(copy, mold=src)\n  call copy%load()\n  select type (copy)\n  type is (child_t)\n    if (copy%value /= 42) error stop 1\n  class default\n    error stop 2\n  end select\n  print *, 'ok'\nend program p\n",
+    );
+
+    let mod_obj = dir.join("m.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            module_src.to_str().unwrap(),
+            "-module",
+            dir.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("allocate mold imported concrete module compile failed to spawn");
+    assert!(
+        compile_mod.status.success(),
+        "allocate mold imported concrete module compile failed: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_main = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            main_src.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            "-module",
+            dir.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("allocate mold imported concrete main compile failed to spawn");
+    assert!(
+        compile_main.status.success(),
+        "allocate mold imported concrete main compile failed: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let exe = dir.join("alloc_mold_imported_concrete_vtable.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            mod_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("allocate mold imported concrete link failed to spawn");
+    assert!(
+        link.status.success(),
+        "allocate mold imported concrete link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("allocate mold imported concrete run failed");
+    assert!(
+        run.status.success(),
+        "allocate mold imported concrete run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected allocate mold imported concrete output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn polymorphic_array_element_dispatch_uses_array_vtable_sidecar() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -42884,7 +42981,11 @@ fn nested_derived_allocatable_assignment_uses_owned_helpers() {
     let start = asm_text
         .find(add_defaults_marker)
         .expect("add_defaults symbol present in asm");
-    let prologue = asm_text[start..].lines().take(80).collect::<Vec<_>>().join("\n");
+    let prologue = asm_text[start..]
+        .lines()
+        .take(80)
+        .collect::<Vec<_>>()
+        .join("\n");
     let probe_count = prologue.matches("movz x16, #16384").count();
     assert!(
         probe_count == 0,
@@ -45197,6 +45298,169 @@ fn concrete_type_bound_operator_uses_overriding_target() {
     );
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn polymorphic_allocatable_rhs_uses_type_bound_operator() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=polymorphic_allocatable_rhs_uses_type_bound_operator count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type, abstract :: base_t\n  contains\n    procedure(is_equal_i), deferred :: is_equal\n    generic :: operator(==) => is_equal\n  end type base_t\n  abstract interface\n    logical function is_equal_i(this, that)\n      import :: base_t\n      class(base_t), intent(in) :: this, that\n    end function is_equal_i\n  end interface\n  type, extends(base_t) :: child_t\n    integer :: value = 0\n  contains\n    procedure :: is_equal => child_is_equal\n  end type child_t\ncontains\n  logical function child_is_equal(this, that)\n    class(child_t), intent(in) :: this\n    class(base_t), intent(in) :: that\n    child_is_equal = .false.\n    select type (other => that)\n    type is (child_t)\n      if (this%value == other%value) child_is_equal = .true.\n    class default\n      return\n    end select\n  end function child_is_equal\n\n  subroutine roundtrip(self)\n    class(base_t), intent(inout) :: self\n    class(base_t), allocatable :: copy\n    logical :: same\n    allocate(copy, mold=self)\n    select type (copy)\n    type is (child_t)\n      copy%value = 7\n    class default\n      error stop 10\n    end select\n    same = self == copy\n    if (.not. same) error stop 1\n  end subroutine roundtrip\nend module m\nprogram p\n  use m\n  implicit none\n  type(child_t) :: src\n  src%value = 7\n  call roundtrip(src)\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("polymorphic_allocatable_tbp_operator", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("polymorphic allocatable type-bound operator compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "polymorphic allocatable type-bound operator compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("polymorphic allocatable type-bound operator run failed");
+    assert!(
+        run.status.success(),
+        "polymorphic allocatable type-bound operator should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected polymorphic allocatable type-bound operator output: {}",
+        stdout
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn imported_polymorphic_operator_receiver_uses_local_scope_type() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_polymorphic_operator_receiver_uses_local_scope_type count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("imported_poly_operator_receiver_scope");
+    let foreign_src = write_program_in(
+        &dir,
+        "foreign.f90",
+        "module foreign_m\n  implicit none\n  type, abstract :: toml_value\n  end type toml_value\ncontains\n  subroutine touch(self)\n    class(toml_value), intent(inout) :: self\n  end subroutine touch\nend module foreign_m\n",
+    );
+    let module_src = write_program_in(
+        &dir,
+        "m.f90",
+        "module m\n  implicit none\n  type, abstract :: base_t\n  contains\n    procedure(is_equal_i), deferred :: is_equal\n    generic :: operator(==) => is_equal\n  end type base_t\n  abstract interface\n    logical function is_equal_i(this, that)\n      import :: base_t\n      class(base_t), intent(in) :: this, that\n    end function is_equal_i\n  end interface\n  type, extends(base_t) :: child_t\n    integer :: value = 0\n  contains\n    procedure :: is_equal => child_is_equal\n  end type child_t\ncontains\n  logical function child_is_equal(this, that)\n    class(child_t), intent(in) :: this\n    class(base_t), intent(in) :: that\n    child_is_equal = .false.\n    select type (other => that)\n    type is (child_t)\n      child_is_equal = this%value == other%value\n    class default\n      return\n    end select\n  end function child_is_equal\nend module m\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use foreign_m, only: toml_value\n  use m\n  implicit none\n  type(child_t) :: src\n  src%value = 7\n  call roundtrip(src)\n  print *, 'ok'\ncontains\n  subroutine roundtrip(self)\n    class(base_t), intent(inout) :: self\n    class(base_t), allocatable :: copy\n    allocate(copy, mold=self)\n    select type (copy)\n    type is (child_t)\n      copy%value = 7\n    class default\n      error stop 10\n    end select\n    if (.not. (self == copy)) error stop 1\n  end subroutine roundtrip\nend program p\n",
+    );
+
+    let foreign_obj = dir.join("foreign.o");
+    let compile_foreign = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            foreign_src.to_str().unwrap(),
+            "-module",
+            dir.to_str().unwrap(),
+            "-o",
+            foreign_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("foreign module compile failed to spawn");
+    assert!(
+        compile_foreign.status.success(),
+        "foreign module compile failed: {}",
+        String::from_utf8_lossy(&compile_foreign.stderr)
+    );
+
+    let module_obj = dir.join("m.o");
+    let compile_module = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            module_src.to_str().unwrap(),
+            "-module",
+            dir.to_str().unwrap(),
+            "-o",
+            module_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("operator module compile failed to spawn");
+    assert!(
+        compile_module.status.success(),
+        "operator module compile failed: {}",
+        String::from_utf8_lossy(&compile_module.stderr)
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_main = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            main_src.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            "-module",
+            dir.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("operator main compile failed to spawn");
+    assert!(
+        compile_main.status.success(),
+        "operator main compile failed: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let exe = dir.join("imported_poly_operator_receiver_scope.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            foreign_obj.to_str().unwrap(),
+            module_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("operator scope link failed to spawn");
+    assert!(
+        link.status.success(),
+        "operator scope link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+    let run = Command::new(&exe)
+        .output()
+        .expect("operator scope run failed");
+    assert!(
+        run.status.success(),
+        "operator scope run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected operator scope output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
