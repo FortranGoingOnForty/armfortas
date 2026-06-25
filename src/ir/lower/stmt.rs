@@ -2072,7 +2072,16 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     b.branch(copy_bb, vec![]);
 
                                     b.set_block(copy_bb);
-                                    let src_ptr = super::expr::lower_expr_ctx_tl(b, ctx, value);
+                                    let src_ptr = scalar_allocatable_derived_component_payload_addr(
+                                        b,
+                                        &ctx.locals,
+                                        value,
+                                        ctx.st,
+                                        ctx.type_layouts,
+                                    )
+                                    .unwrap_or_else(|| {
+                                        super::expr::lower_expr_ctx_tl(b, ctx, value)
+                                    });
                                     let dest_ptr = b.load_typed(
                                         desc,
                                         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
@@ -2713,7 +2722,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         callee_value_arg_mask(ctx.st, k)
                     });
                     let desc_mask = first_procedure_lookup(&abi_lookup_keys, |k| {
-                        cached_param_mask_for_lookup(ctx.st, ctx.descriptor_params, k)
+                        descriptor_param_mask_for_lookup(ctx.st, ctx.descriptor_params, k)
                     });
                     let bind_c_char_mask = first_procedure_lookup(&abi_lookup_keys, |k| {
                         callee_bind_c_char_arg_mask(ctx.st, k)
@@ -3093,7 +3102,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         callee_value_arg_mask(ctx.st, k)
                     });
                     let desc_mask = first_procedure_lookup(&abi_lookup_keys, |k| {
-                        cached_param_mask_for_lookup(ctx.st, ctx.descriptor_params, k)
+                        descriptor_param_mask_for_lookup(ctx.st, ctx.descriptor_params, k)
                     });
                     let bind_c_char_mask = first_procedure_lookup(&abi_lookup_keys, |k| {
                         callee_bind_c_char_arg_mask(ctx.st, k)

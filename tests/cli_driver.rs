@@ -14291,6 +14291,50 @@ fn module_character_parameter_array_constructor_initializes_runtime_bytes() {
 }
 
 #[test]
+fn module_enum_kind_parameter_array_constructor_initializes_runtime_values() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=module_enum_kind_parameter_array_constructor_initializes_runtime_values count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module compiler_ids\n  implicit none\n  enum, bind(C)\n    enumerator :: id_all = -1\n    enumerator :: id_unknown = 0\n    enumerator :: id_gcc\n    enumerator :: id_intel_classic_nix\n    enumerator :: id_intel_classic_mac\n    enumerator :: id_intel_classic_windows\n  end enum\n  integer, parameter :: compiler_enum = kind(id_unknown)\nend module compiler_ids\nmodule platform_like\n  use compiler_ids, only: compiler_enum, id_all, id_intel_classic_nix, &\n      id_intel_classic_mac, id_intel_classic_windows\n  implicit none\n  integer(compiler_enum), parameter :: id_intel_classic(*) = &\n      [id_intel_classic_mac, id_intel_classic_nix, id_intel_classic_windows]\n  type :: platform_config_t\n    integer(compiler_enum) :: compiler = id_all\n  end type platform_config_t\ncontains\n  logical function compiler_is_suitable(compiler_id, target) result(suitable)\n    integer(compiler_enum), intent(in) :: compiler_id\n    type(platform_config_t), intent(in) :: target\n    suitable = (compiler_id == id_all .or. compiler_id == target%compiler)\n    if (suitable) return\n    if (any(compiler_id == id_intel_classic) .and. &\n        any(target%compiler == id_intel_classic)) then\n      suitable = .true.\n      return\n    end if\n  end function compiler_is_suitable\nend module platform_like\nprogram p\n  use platform_like\n  use compiler_ids, only: id_intel_classic_nix, id_intel_classic_windows\n  implicit none\n  type(platform_config_t) :: target\n  target%compiler = id_intel_classic_windows\n  if (.not. compiler_is_suitable(id_intel_classic_nix, target)) error stop 1\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("module_enum_kind_param_array_init", "bin");
+
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("module enum-kind parameter array init compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "module enum-kind parameter array init compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("module enum-kind parameter array init run failed");
+    assert!(
+        run.status.success(),
+        "module enum-kind parameter array init run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected module enum-kind parameter array init output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn elemental_character_compare_uses_hidden_result_bytes() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -41076,6 +41120,50 @@ fn allocatable_derived_component_actual_passes_base_storage_to_value_dummy() {
 }
 
 #[test]
+fn scalar_allocatable_derived_component_assignment_copies_payload() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=scalar_allocatable_derived_component_assignment_copies_payload count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  type :: build_t\n    logical :: auto_executables = .true.\n    logical :: auto_tests = .true.\n  end type build_t\n  type :: feature_t\n    type(build_t), allocatable :: build\n  end type feature_t\n  type(feature_t) :: source\n  type(feature_t) :: target\n\n  allocate(source%build)\n  source%build%auto_executables = .false.\n  source%build%auto_tests = .false.\n  allocate(target%build)\n  target%build%auto_executables = .true.\n  target%build%auto_tests = .true.\n\n  call copy_feature(target, source)\n\n  if (.not. allocated(target%build)) error stop 1\n  if (target%build%auto_executables) error stop 2\n  if (target%build%auto_tests) error stop 3\n  source%build%auto_executables = .true.\n  if (target%build%auto_executables) error stop 4\n  print *, 'ok'\ncontains\n  subroutine copy_feature(target, source)\n    type(feature_t), intent(inout) :: target\n    type(feature_t), intent(in) :: source\n    if (.not. allocated(target%build)) allocate(target%build)\n    target%build = source%build\n  end subroutine copy_feature\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("scalar_alloc_component_copy_payload", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("scalar allocatable derived component assignment compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "scalar allocatable derived component assignment compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("scalar allocatable derived component assignment run failed");
+    assert!(
+        run.status.success(),
+        "scalar allocatable derived component assignment run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected scalar allocatable derived component assignment output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn allocatable_array_result_append_preserves_declared_rank() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -44327,6 +44415,43 @@ fn empty_typed_scalar_constructor_allocates_zero_size_array() {
 }
 
 #[test]
+fn empty_typed_derived_constructor_actual_to_assumed_shape_dummy_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=empty_typed_derived_constructor_actual_to_assumed_shape_dummy_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type :: string_t\n    character(len=:), allocatable :: s\n  end type string_t\ncontains\n  subroutine take(xs)\n    type(string_t), intent(in) :: xs(:)\n    if (size(xs) /= 0) error stop 1\n  end subroutine take\nend module m\nprogram p\n  use m\n  implicit none\n  call take([string_t::])\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("empty_typed_derived_constructor_actual", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("empty typed derived constructor actual compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "empty typed derived constructor actual compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("empty typed derived constructor actual run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "empty typed derived constructor actual run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn implied_do_constructor_allocates_logical_allocatable_array() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -44836,6 +44961,43 @@ fn local_character_dummy_shadows_same_name_generic_for_substring() {
 }
 
 #[test]
+fn character_result_call_ignores_unrelated_parameter_symbol() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=character_result_call_ignores_unrelated_parameter_symbol count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  private\n  public :: starts_casefold\ncontains\n  pure logical function starts_casefold(s, e, case_sensitive) result(ok)\n    character(*), intent(in) :: s, e\n    logical, optional, intent(in) :: case_sensitive\n    logical :: lower_case\n    if (present(case_sensitive)) then\n      lower_case = .not. case_sensitive\n    else\n      lower_case = .false.\n    end if\n    if (lower_case) then\n      ok = lower(s(1:len(e))) == lower(e)\n    else\n      ok = s(1:len(e)) == e\n    end if\n  end function\n\n  elemental pure function lower(str, begin, end) result(string)\n    character(*), intent(in) :: str\n    character(len(str)) :: string\n    integer, intent(in), optional :: begin, end\n    integer :: i\n    integer :: ibegin, iend\n    string = str\n    ibegin = 1\n    if (present(begin)) ibegin = max(ibegin, begin)\n    iend = len_trim(str)\n    if (present(end)) iend = min(iend, end)\n    do i = ibegin, iend\n      select case (str(i:i))\n      case ('A':'Z')\n        string(i:i) = char(iachar(str(i:i)) + 32)\n      case default\n      end select\n    end do\n  end function\n\n  logical function pollute()\n    character(len=*), parameter :: lower = 'abcdefghijklmnopqrstuvwxyz'\n    pollute = len(lower) > 0\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  if (.not. starts_casefold('My_Pkg__Mod', 'my_pkg', case_sensitive=.false.)) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("char_result_ignores_parameter", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("character result parameter-pollution compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "character result parameter-pollution compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("character result parameter-pollution run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "character result parameter-pollution run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn abstract_type_bound_operator_dispatch_avoids_direct_interface_call() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -44868,6 +45030,166 @@ fn abstract_type_bound_operator_dispatch_avoids_direct_interface_call() {
     );
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn concrete_type_bound_operator_uses_overriding_target() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=concrete_type_bound_operator_uses_overriding_target count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type, abstract :: serializable_t\n  contains\n    procedure(is_equal), deferred :: serializable_is_same\n    generic :: operator(==) => serializable_is_same\n  end type\n  abstract interface\n    logical function is_equal(this, that)\n      import serializable_t\n      class(serializable_t), intent(in) :: this, that\n    end function\n  end interface\n  type, extends(serializable_t) :: platform_t\n    integer :: compiler = 0\n    integer :: os_type = 0\n  contains\n    procedure :: serializable_is_same => platform_is_same\n  end type\ncontains\n  logical function platform_is_same(this, that)\n    class(platform_t), intent(in) :: this\n    class(serializable_t), intent(in) :: that\n    platform_is_same = .false.\n    select type (other => that)\n    type is (platform_t)\n      if (this%compiler /= other%compiler) return\n      if (this%os_type /= other%os_type) return\n    class default\n      return\n    end select\n    platform_is_same = .true.\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  type(platform_t) :: a, b\n  a%compiler = 1\n  a%os_type = 10\n  b%compiler = 2\n  b%os_type = 10\n  if (a == b) error stop 1\n  b%compiler = 1\n  if (.not. (a == b)) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("concrete_tbp_operator_target", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("concrete type-bound operator compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "concrete type-bound operator compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("concrete type-bound operator run failed");
+    assert!(
+        run.status.success(),
+        "concrete type-bound operator should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected concrete type-bound operator output: {}",
+        stdout
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn imported_type_bound_operator_private_target_beats_unrelated_operator() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_type_bound_operator_private_target_beats_unrelated_operator count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("imported_tbp_operator_private_target");
+    let strings_src = write_program_in(
+        &dir,
+        "strings.f90",
+        "module string_m\n  implicit none\n  private\n  public :: string_t, operator(==)\n  type :: string_t\n    integer :: marker = 0\n  end type\n  interface operator(==)\n    module procedure string_arrays_same\n  end interface\ncontains\n  logical function string_arrays_same(this, that)\n    type(string_t), intent(in) :: this(:), that(:)\n    string_arrays_same = .true.\n  end function\nend module\n",
+    );
+    let platform_src = write_program_in(
+        &dir,
+        "platform.f90",
+        "module platform_m\n  implicit none\n  private\n  public :: platform_t\n  type, abstract :: serializable_t\n  contains\n    procedure(is_equal), deferred :: serializable_is_same\n    generic :: operator(==) => serializable_is_same\n  end type\n  abstract interface\n    logical function is_equal(this, that)\n      import serializable_t\n      class(serializable_t), intent(in) :: this, that\n    end function\n  end interface\n  type, extends(serializable_t) :: platform_t\n    integer :: compiler = 0\n    integer :: os_type = 0\n  contains\n    procedure :: serializable_is_same => platform_is_same\n  end type\ncontains\n  logical function platform_is_same(this, that)\n    class(platform_t), intent(in) :: this\n    class(serializable_t), intent(in) :: that\n    platform_is_same = .false.\n    select type (other => that)\n    type is (platform_t)\n      if (this%compiler /= other%compiler) return\n      if (this%os_type /= other%os_type) return\n    class default\n      return\n    end select\n    platform_is_same = .true.\n  end function\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use platform_m, only: platform_t\n  use string_m, only: operator(==)\n  implicit none\n  type(platform_t) :: a, b\n  a%compiler = 1\n  a%os_type = 10\n  b%compiler = 2\n  b%os_type = 10\n  if (a == b) error stop 1\n  b%compiler = 1\n  if (.not. (a == b)) error stop 2\n  print *, 'ok'\nend program\n",
+    );
+
+    let strings_obj = dir.join("strings.o");
+    let strings_compile = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            strings_src.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-o",
+            strings_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("strings module compile failed to spawn");
+    assert!(
+        strings_compile.status.success(),
+        "strings module compile failed: {}",
+        String::from_utf8_lossy(&strings_compile.stderr)
+    );
+
+    let platform_obj = dir.join("platform.o");
+    let platform_compile = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            platform_src.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-o",
+            platform_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("platform module compile failed to spawn");
+    assert!(
+        platform_compile.status.success(),
+        "platform module compile failed: {}",
+        String::from_utf8_lossy(&platform_compile.stderr)
+    );
+
+    let main_obj = dir.join("main.o");
+    let main_compile = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            main_src.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("main compile failed to spawn");
+    assert!(
+        main_compile.status.success(),
+        "main compile failed: {}",
+        String::from_utf8_lossy(&main_compile.stderr)
+    );
+
+    let out = dir.join("main.bin");
+    let link = Command::new(compiler("armfortas"))
+        .args([
+            main_obj.to_str().unwrap(),
+            platform_obj.to_str().unwrap(),
+            strings_obj.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link failed to spawn");
+    assert!(
+        link.status.success(),
+        "link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("imported type-bound operator run failed");
+    assert!(
+        run.status.success(),
+        "imported type-bound operator should use platform equality: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected imported type-bound operator output: {}",
+        stdout
+    );
 }
 
 #[test]
