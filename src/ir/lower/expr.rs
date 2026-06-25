@@ -2410,7 +2410,7 @@ pub(crate) fn lower_expr_full(
                 let callee_value_args =
                     first_procedure_lookup(&abi_lookup_keys, |k| callee_value_arg_mask(st, k));
                 let callee_descriptor_args = first_procedure_lookup(&abi_lookup_keys, |k| {
-                    descriptor_params.and_then(|m| cached_param_mask_for_lookup(st, m, k))
+                    descriptor_params.and_then(|m| descriptor_param_mask_for_lookup(st, m, k))
                 });
                 let callee_string_descriptor_args = first_procedure_lookup(&abi_lookup_keys, |k| {
                     callee_string_descriptor_arg_mask(st, k)

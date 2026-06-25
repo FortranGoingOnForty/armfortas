@@ -44415,6 +44415,43 @@ fn empty_typed_scalar_constructor_allocates_zero_size_array() {
 }
 
 #[test]
+fn empty_typed_derived_constructor_actual_to_assumed_shape_dummy_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=empty_typed_derived_constructor_actual_to_assumed_shape_dummy_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type :: string_t\n    character(len=:), allocatable :: s\n  end type string_t\ncontains\n  subroutine take(xs)\n    type(string_t), intent(in) :: xs(:)\n    if (size(xs) /= 0) error stop 1\n  end subroutine take\nend module m\nprogram p\n  use m\n  implicit none\n  call take([string_t::])\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("empty_typed_derived_constructor_actual", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("empty typed derived constructor actual compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "empty typed derived constructor actual compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("empty typed derived constructor actual run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "empty typed derived constructor actual run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn implied_do_constructor_allocates_logical_allocatable_array() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

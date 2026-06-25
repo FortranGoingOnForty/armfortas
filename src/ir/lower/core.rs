@@ -2342,6 +2342,31 @@ pub(super) fn arg_uses_descriptor_for_lowering(
         })
 }
 
+fn symbol_uses_descriptor_for_lowering(sym: &crate::sema::symtab::Symbol) -> bool {
+    use crate::sema::symtab::TypeInfo;
+
+    if matches!(
+        sym.type_info,
+        Some(TypeInfo::Class(_)) | Some(TypeInfo::ClassStar)
+    ) {
+        return true;
+    }
+    if !sym.attrs.array_spec.is_empty() {
+        return sym.attrs.array_spec.iter().any(|spec| {
+            matches!(
+                spec,
+                ArraySpec::AssumedShape { .. } | ArraySpec::Deferred | ArraySpec::AssumedRank
+            )
+        });
+    }
+    if sym.attrs.allocatable {
+        let is_deferred_char_scalar =
+            matches!(sym.type_info, Some(TypeInfo::Character { len: None, .. }));
+        return !is_deferred_char_scalar;
+    }
+    false
+}
+
 pub(super) fn arg_uses_string_descriptor_from_decls(
     arg_name: &str,
     decls: &[crate::ast::decl::SpannedDecl],
@@ -10247,7 +10272,30 @@ pub(super) fn array_constructor_type_spec_info(
             kind: Some(1),
             len: None,
         }),
-        _ => None,
+        _ => {
+            if let Some(sym) = st
+                .find_symbol_any_scope(&raw)
+                .filter(|sym| matches!(sym.kind, crate::sema::symtab::SymbolKind::DerivedType))
+            {
+                return Some(TypeInfo::Derived(sym.name.clone()));
+            }
+            let parsed = parse_array_constructor_type_spec(&raw)?;
+            match parsed {
+                TypeSpec::Type(name) => {
+                    let key = name.to_ascii_lowercase();
+                    let resolved = st
+                        .find_symbol_any_scope(&key)
+                        .filter(|sym| {
+                            matches!(sym.kind, crate::sema::symtab::SymbolKind::DerivedType)
+                        })
+                        .map(|sym| sym.name.clone())
+                        .unwrap_or(key);
+                    Some(TypeInfo::Derived(resolved))
+                }
+                TypeSpec::Class(name) => Some(TypeInfo::Class(name.to_ascii_lowercase())),
+                _ => None,
+            }
+        }
     }
 }
 
@@ -17305,7 +17353,7 @@ pub(super) fn emit_resolved_operator_call(
     let callee_value_args =
         first_procedure_lookup(&abi_lookup_keys, |k| callee_value_arg_mask(st, k));
     let callee_descriptor_args = first_procedure_lookup(&abi_lookup_keys, |k| {
-        descriptor_params.and_then(|m| cached_param_mask_for_lookup(st, m, k))
+        descriptor_params.and_then(|m| descriptor_param_mask_for_lookup(st, m, k))
     });
     let callee_string_descriptor_args = first_procedure_lookup(&abi_lookup_keys, |k| {
         callee_string_descriptor_arg_mask(st, k)
@@ -18424,7 +18472,7 @@ pub(super) fn emit_named_function_call(
     let callee_value_args =
         first_procedure_lookup(&abi_lookup_keys, |k| callee_value_arg_mask(st, k));
     let callee_descriptor_args = first_procedure_lookup(&abi_lookup_keys, |k| {
-        descriptor_params.and_then(|m| cached_param_mask_for_lookup(st, m, k))
+        descriptor_params.and_then(|m| descriptor_param_mask_for_lookup(st, m, k))
     });
     let callee_string_descriptor_args = first_procedure_lookup(&abi_lookup_keys, |k| {
         callee_string_descriptor_arg_mask(st, k)
@@ -18838,7 +18886,7 @@ pub(super) fn emit_resolved_bound_proc_call(
     let callee_value_args =
         first_procedure_lookup(&abi_lookup_keys, |k| callee_value_arg_mask(st, k));
     let callee_descriptor_args = first_procedure_lookup(&abi_lookup_keys, |k| {
-        descriptor_params.and_then(|m| cached_param_mask_for_lookup(st, m, k))
+        descriptor_params.and_then(|m| descriptor_param_mask_for_lookup(st, m, k))
     });
     let callee_string_descriptor_args = first_procedure_lookup(&abi_lookup_keys, |k| {
         callee_string_descriptor_arg_mask(st, k)
@@ -19579,7 +19627,7 @@ pub(super) fn lower_alloc_return_call_into_desc(
     let callee_value_args =
         first_procedure_lookup(&abi_lookup_keys, |k| callee_value_arg_mask(ctx.st, k));
     let callee_descriptor_args = first_procedure_lookup(&abi_lookup_keys, |k| {
-        cached_param_mask_for_lookup(ctx.st, ctx.descriptor_params, k)
+        descriptor_param_mask_for_lookup(ctx.st, ctx.descriptor_params, k)
     });
     let callee_string_descriptor_args = first_procedure_lookup(&abi_lookup_keys, |k| {
         callee_string_descriptor_arg_mask(ctx.st, k)
@@ -22198,6 +22246,40 @@ pub(super) fn cached_param_mask_for_lookup(
         _ => return None,
     };
     cache.get(&proc_name).cloned()
+}
+
+pub(super) fn descriptor_param_mask_for_lookup(
+    st: &SymbolTable,
+    cache: &HashMap<String, Vec<bool>>,
+    callee_name: &str,
+) -> Option<Vec<bool>> {
+    let direct_mask = cache.get(callee_name).cloned();
+    let scope = callee_scope_for_lookup(st, callee_name)?;
+    let proc_name = match &scope.kind {
+        crate::sema::symtab::ScopeKind::Function(name)
+        | crate::sema::symtab::ScopeKind::Subroutine(name) => name.to_lowercase(),
+        _ => return direct_mask,
+    };
+    let proc_mask = cache.get(&proc_name).cloned();
+    let cached = direct_mask.clone().or_else(|| proc_mask.clone());
+    if cached.as_ref().is_some_and(|mask| mask.iter().any(|flag| *flag)) {
+        return cached;
+    }
+
+    let scope_mask: Vec<bool> = scope
+        .arg_order
+        .iter()
+        .map(|arg_name| {
+            scope
+                .symbols
+                .get(arg_name)
+                .is_some_and(symbol_uses_descriptor_for_lowering)
+        })
+        .collect();
+    if scope_mask.iter().any(|flag| *flag) {
+        return Some(scope_mask);
+    }
+    cached
 }
 
 pub(super) fn callee_value_arg_mask(st: &SymbolTable, callee_name: &str) -> Option<Vec<bool>> {
@@ -26855,6 +26937,15 @@ pub(super) fn lower_runtime_array_constructor_descriptor(
         vec![desc, elem_size, rank, bounds, stat],
         IrType::Void,
     );
+    if let Some(layout) =
+        derived_type.and_then(|name| type_layouts.and_then(|layouts| layouts.get(name)))
+    {
+        let tag = b.const_i64(layout.type_tag as i64);
+        store_array_desc_type_tag(b, desc, tag);
+        if let Some(vtable) = type_layout_vtable_value(b, layout) {
+            store_array_desc_vtable_ptr(b, desc, vtable);
+        }
+    }
 
     let dest_base = b.load_typed(desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
     store_ac_values_into(
@@ -28799,7 +28890,7 @@ fn emit_defined_io_call(
     let abi_lookup_keys =
         procedure_abi_lookup_keys_for_call_target(ctx.st, call_name.as_str(), &[&specific_key]);
     let descriptor_mask = first_procedure_lookup(&abi_lookup_keys, |key| {
-        cached_param_mask_for_lookup(ctx.st, ctx.descriptor_params, key)
+        descriptor_param_mask_for_lookup(ctx.st, ctx.descriptor_params, key)
     })
     .or_else(|| dtio_descriptor_mask_fallback(ctx, candidate));
     let class_mask =
@@ -40127,8 +40218,62 @@ pub(super) fn lower_array_expr_descriptor(
             )
         }
         Expr::ArrayConstructor { values, type_spec } => {
-            let first = first_array_constructor_expr(values)?;
             let spec_ti = array_constructor_type_spec_info(type_spec.as_deref(), st);
+            let first = match first_array_constructor_expr(values) {
+                Some(first) => first,
+                None => {
+                    let first_ti = spec_ti?;
+                    if matches!(first_ti, crate::sema::symtab::TypeInfo::Character { .. }) {
+                        let empty_params: HashMap<String, ConstScalar> = HashMap::new();
+                        let elem_len = typed_array_constructor_char_len(
+                            type_spec.as_deref(),
+                            &empty_params,
+                            st,
+                        )
+                        .unwrap_or(1)
+                        .max(0);
+                        let elem_len = b.const_i64(elem_len);
+                        let desc = lower_runtime_char_array_constructor_descriptor(
+                            b,
+                            locals,
+                            values,
+                            elem_len,
+                            st,
+                            type_layouts,
+                            internal_funcs,
+                            contained_host_refs,
+                            descriptor_params,
+                        )?;
+                        return Some((desc, IrType::Int(IntWidth::I8)));
+                    }
+
+                    let elem_ty = match &first_ti {
+                        crate::sema::symtab::TypeInfo::Derived(name)
+                        | crate::sema::symtab::TypeInfo::Class(name) => type_layouts
+                            .and_then(|tl| derived_storage_ir_type(name, tl))
+                            .unwrap_or(IrType::Int(IntWidth::I32)),
+                        ti => type_info_to_ir_type(ti),
+                    };
+                    let derived_type = match &first_ti {
+                        crate::sema::symtab::TypeInfo::Derived(name)
+                        | crate::sema::symtab::TypeInfo::Class(name) => Some(name.as_str()),
+                        _ => None,
+                    };
+                    let desc = lower_runtime_array_constructor_descriptor(
+                        b,
+                        locals,
+                        &elem_ty,
+                        derived_type,
+                        values,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
+                    )?;
+                    return Some((desc, elem_ty));
+                }
+            };
             let first_ti = spec_ti.clone().or_else(|| {
                 first_array_constructor_type_info(values, Some(locals), st, type_layouts)
             });

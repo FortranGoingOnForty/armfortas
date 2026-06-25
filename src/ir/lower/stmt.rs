@@ -2722,7 +2722,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         callee_value_arg_mask(ctx.st, k)
                     });
                     let desc_mask = first_procedure_lookup(&abi_lookup_keys, |k| {
-                        cached_param_mask_for_lookup(ctx.st, ctx.descriptor_params, k)
+                        descriptor_param_mask_for_lookup(ctx.st, ctx.descriptor_params, k)
                     });
                     let bind_c_char_mask = first_procedure_lookup(&abi_lookup_keys, |k| {
                         callee_bind_c_char_arg_mask(ctx.st, k)
@@ -3102,7 +3102,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         callee_value_arg_mask(ctx.st, k)
                     });
                     let desc_mask = first_procedure_lookup(&abi_lookup_keys, |k| {
-                        cached_param_mask_for_lookup(ctx.st, ctx.descriptor_params, k)
+                        descriptor_param_mask_for_lookup(ctx.st, ctx.descriptor_params, k)
                     });
                     let bind_c_char_mask = first_procedure_lookup(&abi_lookup_keys, |k| {
                         callee_bind_c_char_arg_mask(ctx.st, k)
