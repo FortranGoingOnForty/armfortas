@@ -295,6 +295,8 @@ pub(super) struct LowerCtx<'a> {
     /// begins at that label. Pre-populated by `collect_label_blocks` before
     /// lowering so that GOTO can branch forward as well as backward.
     pub(super) label_blocks: HashMap<u64, BlockId>,
+    /// Labeled FORMAT statements visible in the current scoping unit.
+    pub(super) format_labels: HashMap<u64, String>,
     /// Cross-function dedupe for ambiguous USE-import warnings emitted by
     /// install_globals_as_locals. Large fortsh units can otherwise print the
     /// exact same ambiguity hundreds or thousands of times while lowering each
@@ -346,6 +348,7 @@ impl<'a> LowerCtx<'a> {
             char_len_star_params,
             contained_host_refs,
             label_blocks: HashMap::new(),
+            format_labels: HashMap::new(),
             ambiguous_use_warnings,
             proc_scope_id: None,
         }

@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 
-use crate::ast::expr::Expr;
+use crate::ast::expr::{Expr, SpannedExpr};
 use crate::ast::stmt::*;
 use crate::ir::builder::FuncBuilder;
 use crate::ir::inst::*;
@@ -113,6 +113,53 @@ fn io_control_by_keyword<'a>(controls: &'a [IoControl], needle: &str) -> Option<
             .map(|k| k.eq_ignore_ascii_case(needle))
             .unwrap_or(false)
     })
+}
+
+fn format_label_literal(expr: &SpannedExpr) -> Option<u64> {
+    match &expr.node {
+        Expr::IntegerLiteral { text, .. } => text.parse::<u64>().ok(),
+        Expr::ParenExpr { inner } => format_label_literal(inner),
+        _ => None,
+    }
+}
+
+fn labeled_format_spec<'a>(ctx: &'a LowerCtx<'_>, expr: &SpannedExpr) -> Option<&'a str> {
+    format_label_literal(expr)
+        .and_then(|label| ctx.format_labels.get(&label))
+        .map(String::as_str)
+}
+
+fn is_formatted_format_expr(ctx: &LowerCtx<'_>, expr: &SpannedExpr) -> bool {
+    if matches!(&expr.node, Expr::Name { name } if name == "*") {
+        return false;
+    }
+    format_label_literal(expr).is_some()
+        || crate::sema::types::expr_type(expr, ctx.st).is_character()
+}
+
+fn lower_format_expr(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx<'_>,
+    expr: &SpannedExpr,
+) -> (ValueId, ValueId) {
+    if let Some(spec) = labeled_format_spec(ctx, expr) {
+        let ptr = b.const_string(spec.as_bytes());
+        let len = b.const_i64(spec.len() as i64);
+        return (ptr, len);
+    }
+    if let Some(label) = format_label_literal(expr) {
+        lower_stmt_error(
+            expr.span,
+            &format!("FORMAT label {} not defined in this scoping unit", label),
+        );
+    }
+    lower_string_expr_with_layouts(
+        b,
+        &ctx.locals,
+        expr,
+        ctx.st,
+        Some(ctx.type_layouts),
+    )
 }
 
 fn inquire_size_storeback_type(
@@ -2263,11 +2310,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
 
         Stmt::Print { format, items } => {
             // PRINT writes to unit 6 (stdout). `PRINT *` is list-directed;
-            // `PRINT fmt` with a character format string routes through the
-            // same push-based formatted machinery WRITE uses. Numeric FORMAT
-            // labels aren't resolved yet (WRITE has the same gap), so any
-            // non-character format stays on the list-directed path rather
-            // than being lowered as a garbage string pointer.
+            // `PRINT fmt` with a character format string or labeled FORMAT
+            // statement routes through the same push-based formatted machinery
+            // WRITE uses.
             let unit = b.const_i32(6);
             // The push-based formatted runtime keeps the format-parse state
             // in a single global formatter across begin→push→end. If an
@@ -2281,20 +2326,12 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             let items_have_proc_call = items
                 .iter()
                 .any(|it| print_item_contains_proc_call(it, &ctx.locals));
-            let is_formatted = !matches!(&format.node, Expr::Name { name } if name == "*")
-                && crate::sema::types::expr_type(format, ctx.st).is_character()
-                && !items_have_proc_call;
+            let is_formatted = is_formatted_format_expr(ctx, format) && !items_have_proc_call;
             if is_formatted {
                 let null_i64 = b.const_i64(0);
                 let null_i8_ptr = b.int_to_ptr(null_i64, IrType::Int(IntWidth::I8));
                 let zero_i64 = b.const_i64(0);
-                let (fmt_ptr, fmt_len) = lower_string_expr_with_layouts(
-                    b,
-                    &ctx.locals,
-                    format,
-                    ctx.st,
-                    Some(ctx.type_layouts),
-                );
+                let (fmt_ptr, fmt_len) = lower_format_expr(b, ctx, format);
                 b.call(
                     FuncRef::External("afs_fmt_begin_ex".into()),
                     vec![unit, fmt_ptr, fmt_len, null_i8_ptr, null_i8_ptr, zero_i64],
@@ -2437,13 +2474,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 // target stays on the fixed-buffer path below.
                 if !is_list_directed {
                     if let Some(desc) = internal_io_alloc_target(b, ctx, ctrl) {
-                        let (fmt_ptr, fmt_len) = lower_string_expr_with_layouts(
-                            b,
-                            &ctx.locals,
-                            &fmt_control.unwrap().value,
-                            ctx.st,
-                            Some(ctx.type_layouts),
-                        );
+                        let (fmt_ptr, fmt_len) =
+                            lower_format_expr(b, ctx, &fmt_control.unwrap().value);
                         b.call(
                             FuncRef::External("afs_fmt_begin_internal_alloc".into()),
                             vec![desc, fmt_ptr, fmt_len, iostat_ptr, iomsg_ptr, iomsg_len],
@@ -2467,13 +2499,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     if is_list_directed {
                         lower_internal_write_items(b, ctx, items, buf_ptr, buf_len);
                     } else {
-                        let (fmt_ptr, fmt_len) = lower_string_expr_with_layouts(
-                            b,
-                            &ctx.locals,
-                            &fmt_control.unwrap().value,
-                            ctx.st,
-                            Some(ctx.type_layouts),
-                        );
+                        let (fmt_ptr, fmt_len) =
+                            lower_format_expr(b, ctx, &fmt_control.unwrap().value);
                         b.call(
                             FuncRef::External("afs_fmt_begin_internal_ex".into()),
                             vec![
@@ -2560,13 +2587,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 );
             } else {
                 // Formatted I/O: use push-based API.
-                let (fmt_ptr, fmt_len) = lower_string_expr_with_layouts(
-                    b,
-                    &ctx.locals,
-                    &fmt_control.unwrap().value,
-                    ctx.st,
-                    Some(ctx.type_layouts),
-                );
+                let (fmt_ptr, fmt_len) = lower_format_expr(b, ctx, &fmt_control.unwrap().value);
                 b.call(
                     FuncRef::External("afs_fmt_begin_ex".into()),
                     vec![unit, fmt_ptr, fmt_len, iostat_ptr, iomsg_ptr, iomsg_len],
@@ -5562,6 +5583,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             }
         }
         Stmt::Continue { label: None } => {} // no-op
+        Stmt::Format { .. } => {}            // non-executable metadata
 
         Stmt::Goto { label } => {
             if let Some(&target_bb) = ctx.label_blocks.get(label) {
@@ -6180,13 +6202,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     if is_list_directed {
                         lower_internal_read_items(b, ctx, items, buf_ptr, buf_len, iostat_addr);
                     } else {
-                        let (fmt_ptr, fmt_len) = lower_string_expr_with_layouts(
-                            b,
-                            &ctx.locals,
-                            &fmt_control.unwrap().value,
-                            ctx.st,
-                            Some(ctx.type_layouts),
-                        );
+                        let (fmt_ptr, fmt_len) =
+                            lower_format_expr(b, ctx, &fmt_control.unwrap().value);
                         lower_formatted_internal_read_items(
                             b,
                             ctx,
@@ -6253,13 +6270,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     IrType::Void,
                 );
             } else {
-                let (fmt_ptr, fmt_len) = lower_string_expr_with_layouts(
-                    b,
-                    &ctx.locals,
-                    &fmt_control.unwrap().value,
-                    ctx.st,
-                    Some(ctx.type_layouts),
-                );
+                let (fmt_ptr, fmt_len) = lower_format_expr(b, ctx, &fmt_control.unwrap().value);
                 lower_formatted_read_items_with_runtime_advance(
                     b,
                     ctx,
@@ -6712,7 +6723,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                 Some(ctx.contained_host_refs),
                                                 Some(ctx.descriptor_params),
                                             );
-                                            store_string_descriptor_view(
+                                            store_string_pointer_descriptor_view(
                                                 b,
                                                 *tgt_field_ptr,
                                                 ptr,
@@ -6734,12 +6745,12 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     ) {
                         if is_deferred_char_component_field(&src_field) {
                             let (ptr, len) = load_string_descriptor_view(b, src_field_ptr);
-                            store_string_descriptor_view(b, *tgt_field_ptr, ptr, len);
+                            store_string_pointer_descriptor_view(b, *tgt_field_ptr, ptr, len);
                             return;
                         }
                     }
                     let (ptr, len) = lower_string_expr_ctx(b, ctx, value);
-                    store_string_descriptor_view(b, *tgt_field_ptr, ptr, len);
+                    store_string_pointer_descriptor_view(b, *tgt_field_ptr, ptr, len);
                     return;
                 }
                 if field_is_class_star_pointer_descriptor(tgt_field) {
@@ -6907,7 +6918,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 {
                     if is_deferred_char_component_field(&src_field) {
                         let (ptr, len) = load_string_descriptor_view(b, src_field_ptr);
-                        store_string_descriptor_view(b, tgt_desc, ptr, len);
+                        store_string_pointer_descriptor_view(b, tgt_desc, ptr, len);
                         return;
                     }
                 }
@@ -6916,13 +6927,22 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         if matches!(src_info.char_kind, CharKind::Deferred) {
                             let src_desc = string_descriptor_addr(b, src_info);
                             let (ptr, len) = load_string_descriptor_view(b, src_desc);
-                            store_string_descriptor_view(b, tgt_desc, ptr, len);
+                            store_string_pointer_descriptor_view(b, tgt_desc, ptr, len);
                             return;
                         }
                     }
                 }
+                if let Some(src_desc) = lower_hidden_character_result_descriptor_ctx(b, ctx, value) {
+                    let size = b.const_i64(32);
+                    b.call(
+                        FuncRef::External("memcpy".into()),
+                        vec![tgt_desc, src_desc, size],
+                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                    );
+                    return;
+                }
                 let (ptr, len) = lower_string_expr_ctx(b, ctx, value);
-                store_string_descriptor_view(b, tgt_desc, ptr, len);
+                store_string_pointer_descriptor_view(b, tgt_desc, ptr, len);
                 return;
             }
 

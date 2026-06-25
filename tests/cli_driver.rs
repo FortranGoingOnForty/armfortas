@@ -449,6 +449,51 @@ fn formatted_char_read_with_size_from_redirected_stdin_compiles_and_runs() {
 }
 
 #[test]
+fn nonadvancing_unbounded_a_read_chunks_long_record() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=nonadvancing_unbounded_a_read_chunks_long_record count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  integer, parameter :: bufsize = 4096\n  integer :: unit, stat, chunk\n  character(bufsize) :: buffer\n  character(:), allocatable :: whole\n\n  open(newunit=unit, status='scratch', form='formatted', action='readwrite')\n  write(unit, '(a)') repeat('x', 5000)\n  rewind(unit)\n\n  stat = 0\n  whole = ''\n  do while (stat == 0)\n    read(unit, '(a)', advance='no', iostat=stat, size=chunk) buffer\n    if (stat > 0) error stop 1\n    if (chunk < 0 .or. chunk > bufsize) error stop 2\n    whole = whole // buffer(:chunk)\n  end do\n  close(unit)\n\n  if (len(whole) /= 5000) error stop 3\n  if (whole(4096:4100) /= 'xxxxx') error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("nonadvancing_unbounded_a_long_record", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("nonadvancing long record compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "nonadvancing long record compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("nonadvancing long record run failed");
+    assert!(
+        run.status.success(),
+        "nonadvancing long record run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected nonadvancing long record output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn formatted_char_pointer_read_preserves_blank_record_before_following_input() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -28095,6 +28140,49 @@ fn formatted_internal_write_preserves_allocated_deferred_char_length() {
 }
 
 #[test]
+fn labeled_format_internal_write_print_and_read_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=labeled_format_internal_write_print_and_read_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=16) :: src_name\n  character(len=4) :: input\n  integer :: got\n  src_name = repeat('?', len(src_name))\n  write(src_name, 1) 7\n  if (trim(src_name) /= 'src_7') error stop 1\n  print 2, 8\n  input = '42'\n  read(input, 3) got\n  if (got /= 42) error stop 2\n  print *, 'ok'\n1 format('src_', i0)\n2 format('PRINT_', i0)\n3 format(i2)\nend program\n",
+        "f90",
+    );
+    let out = unique_path("labeled_format_io", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("labeled FORMAT compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "labeled FORMAT should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "labeled FORMAT should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("PRINT_8") && stdout.contains("ok"),
+        "expected labeled FORMAT output, got: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn contained_subroutine_forwards_derived_dummy_by_ref() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -30278,6 +30366,92 @@ fn deferred_character_pointer_result_from_class_component_preserves_descriptor()
     assert!(
         stdout.contains("value"),
         "unexpected deferred char pointer class component output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn deferred_character_pointer_to_empty_class_component_stays_associated() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=deferred_character_pointer_to_empty_class_component_stays_associated count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type, abstract :: generic_value\n  end type\n  type, extends(generic_value) :: string_value\n    character(:), allocatable :: raw\n  end type\n  type :: keyval_t\n    class(generic_value), allocatable :: val\n  contains\n    procedure :: set_string\n    procedure :: get_string\n  end type\ncontains\n  subroutine set_string(self, text)\n    class(keyval_t), intent(inout) :: self\n    character(*), intent(in) :: text\n    type(string_value), allocatable :: tmp\n    allocate(tmp)\n    tmp%raw = text\n    call move_alloc(tmp, self%val)\n  end subroutine\n  subroutine get_string(self, text)\n    class(keyval_t), intent(in) :: self\n    character(:), allocatable, intent(out) :: text\n    character(:), pointer :: ptr\n    ptr => cast_string(self%val)\n    if (.not. associated(ptr)) error stop 1\n    if (len(ptr) /= 0) error stop 2\n    text = ptr\n  end subroutine\n  function cast_string(val) result(ptr)\n    class(generic_value), intent(in), target :: val\n    character(:), pointer :: ptr\n    nullify(ptr)\n    select type (val)\n    type is (string_value)\n      ptr => val%raw\n    end select\n  end function\nend module\n\nprogram p\n  use m\n  implicit none\n  type(keyval_t) :: kv\n  character(:), allocatable :: text\n  call kv%set_string('')\n  call kv%get_string(text)\n  if (.not. allocated(text)) error stop 3\n  if (len(text) /= 0) error stop 4\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("deferred_char_empty_class_component", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("deferred empty char pointer class component compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "deferred empty char pointer class component should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "deferred empty char pointer class component should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected deferred empty char pointer class component output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn deferred_character_pointer_result_select_type_mismatch_stays_null() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=deferred_character_pointer_result_select_type_mismatch_stays_null count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  type, abstract :: generic_value\n  end type\n  type, extends(generic_value) :: integer_value\n    integer :: raw\n  end type\n  type, extends(generic_value) :: string_value\n    character(:), allocatable :: raw\n  end type\n\n  class(generic_value), allocatable, target :: val\n  character(:), pointer :: ptr\n\n  allocate(integer_value :: val)\n  select type (val)\n  type is (integer_value)\n    val%raw = 123\n  end select\n\n  ptr => cast_string(val)\n  if (associated(ptr)) error stop 1\n  print *, 'ok'\n\ncontains\n  function cast_string(value) result(ptr)\n    class(generic_value), intent(in), target :: value\n    character(:), pointer :: ptr\n\n    nullify(ptr)\n    select type (value)\n    type is (string_value)\n      ptr => value%raw\n    end select\n  end function cast_string\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("deferred_char_ptr_select_type_mismatch", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("deferred char pointer mismatch compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "deferred char pointer mismatch should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "deferred char pointer mismatch should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected deferred char pointer mismatch output: {}",
         stdout
     );
 

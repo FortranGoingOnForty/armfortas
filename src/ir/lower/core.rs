@@ -3770,6 +3770,7 @@ pub(super) fn collect_name_refs_stmt(stmt: &crate::ast::stmt::SpannedStmt, out: 
         | Stmt::Cycle { .. }
         | Stmt::Goto { .. }
         | Stmt::Continue { .. }
+        | Stmt::Format { .. }
         | Stmt::Namelist { .. } => {}
     }
 }
@@ -7055,7 +7056,11 @@ pub(super) fn check_filtered_in_stmt(
         Stmt::ArithmeticIf { expr, .. } => {
             check_filtered_in_expr(expr, filtered);
         }
-        Stmt::Exit { .. } | Stmt::Cycle { .. } | Stmt::Goto { .. } | Stmt::Continue { .. } => {}
+        Stmt::Exit { .. }
+        | Stmt::Cycle { .. }
+        | Stmt::Goto { .. }
+        | Stmt::Continue { .. }
+        | Stmt::Format { .. } => {}
         Stmt::Labeled { stmt: inner, .. } => {
             check_no_filtered_refs(std::slice::from_ref(inner.as_ref()), filtered);
         }
@@ -22624,6 +22629,60 @@ pub(super) fn resolved_character_return_abi_for_call(
     )
 }
 
+pub(super) fn lower_hidden_character_result_descriptor_ctx(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    expr: &SpannedExpr,
+) -> Option<ValueId> {
+    let Expr::FunctionCall { callee, args } = &expr.node else {
+        return None;
+    };
+    let Expr::Name { name } = &callee.node else {
+        return None;
+    };
+    let key = name.to_lowercase();
+    let ret_abi = resolved_character_return_abi_for_call(
+        b,
+        &ctx.locals,
+        ctx.st,
+        Some(ctx.type_layouts),
+        Some(ctx.internal_funcs),
+        Some(ctx.contained_host_refs),
+        Some(ctx.descriptor_params),
+        &key,
+        args,
+    );
+    let uses_hidden_descriptor = matches!(ret_abi, Some(CharacterReturnAbi::HiddenDescriptor))
+        || (ret_abi.is_none() && ctx.internal_funcs.contains_key(&key));
+    if !uses_hidden_descriptor {
+        return None;
+    }
+
+    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 32));
+    let zero_i32 = b.const_i32(0);
+    let size32 = b.const_i64(32);
+    b.call(
+        FuncRef::External("memset".into()),
+        vec![desc, zero_i32, size32],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+    emit_named_function_call(
+        b,
+        &ctx.locals,
+        ctx.st,
+        Some(ctx.type_layouts),
+        Some(ctx.internal_funcs),
+        Some(ctx.contained_host_refs),
+        Some(ctx.descriptor_params),
+        name,
+        args,
+        Some(desc),
+        true,
+        IrType::Void,
+    );
+    Some(desc)
+}
+
 /// Check if a dummy argument has the VALUE attribute in its declaration.
 pub(super) fn arg_has_value_attr(arg_name: &str, decls: &[crate::ast::decl::SpannedDecl]) -> bool {
     let key = arg_name.to_lowercase();
@@ -24697,6 +24756,83 @@ pub(super) fn collect_label_blocks(
             | Stmt::DoWhile { body, .. }
             | Stmt::DoConcurrent { body, .. } => {
                 collect_label_blocks(b, body, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+pub(super) fn collect_format_labels(stmts: &[SpannedStmt], out: &mut HashMap<u64, String>) {
+    for stmt in stmts {
+        match &stmt.node {
+            Stmt::Labeled { label, stmt: inner } => {
+                if let Stmt::Format { spec } = &inner.node {
+                    out.entry(*label).or_insert_with(|| spec.clone());
+                }
+                collect_format_labels(std::slice::from_ref(inner.as_ref()), out);
+            }
+            Stmt::IfConstruct {
+                then_body,
+                else_ifs,
+                else_body,
+                ..
+            } => {
+                collect_format_labels(then_body, out);
+                for (_, body) in else_ifs {
+                    collect_format_labels(body, out);
+                }
+                if let Some(body) = else_body {
+                    collect_format_labels(body, out);
+                }
+            }
+            Stmt::IfStmt { action, .. } => {
+                collect_format_labels(std::slice::from_ref(action.as_ref()), out);
+            }
+            Stmt::SelectCase { cases, .. } => {
+                for case in cases {
+                    collect_format_labels(&case.body, out);
+                }
+            }
+            Stmt::SelectType { guards, .. } => {
+                for guard in guards {
+                    match guard {
+                        crate::ast::stmt::TypeGuard::TypeIs { body, .. }
+                        | crate::ast::stmt::TypeGuard::ClassIs { body, .. }
+                        | crate::ast::stmt::TypeGuard::ClassDefault { body } => {
+                            collect_format_labels(body, out);
+                        }
+                    }
+                }
+            }
+            Stmt::SelectRank { guards, .. } => {
+                for guard in guards {
+                    match guard {
+                        crate::ast::stmt::RankGuard::Rank { body, .. }
+                        | crate::ast::stmt::RankGuard::RankStar { body }
+                        | crate::ast::stmt::RankGuard::RankDefault { body } => {
+                            collect_format_labels(body, out);
+                        }
+                    }
+                }
+            }
+            Stmt::WhereConstruct {
+                body, elsewhere, ..
+            } => {
+                collect_format_labels(body, out);
+                for (_, else_body) in elsewhere {
+                    collect_format_labels(else_body, out);
+                }
+            }
+            Stmt::WhereStmt { stmt, .. } | Stmt::ForallStmt { stmt, .. } => {
+                collect_format_labels(std::slice::from_ref(stmt.as_ref()), out);
+            }
+            Stmt::ForallConstruct { body, .. }
+            | Stmt::Block { body, .. }
+            | Stmt::Associate { body, .. }
+            | Stmt::DoLoop { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::DoConcurrent { body, .. } => {
+                collect_format_labels(body, out);
             }
             _ => {}
         }
@@ -43544,6 +43680,13 @@ pub(super) fn lower_pointer_intrinsic(
     let crate::ast::expr::SectionSubscript::Element(expr) = &first.value else {
         return None;
     };
+    if args.len() == 1 {
+        if let Some(associated) =
+            deferred_char_pointer_associated_value(b, locals, expr, st, type_layouts)
+        {
+            return Some(associated);
+        }
+    }
     let raw = associated_target_address_for_expr(b, locals, expr, st, type_layouts, false)?;
     let zero = b.const_i64(0);
 
@@ -43567,6 +43710,36 @@ pub(super) fn lower_pointer_intrinsic(
     }
 
     Some(b.icmp(CmpOp::Ne, raw, zero))
+}
+
+fn deferred_char_pointer_associated_value(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> Option<ValueId> {
+    match &expr.node {
+        Expr::Name { name } => {
+            let info = locals.get(&name.to_lowercase())?;
+            if info.is_pointer && matches!(info.char_kind, CharKind::Deferred) {
+                let desc = string_descriptor_addr(b, info);
+                Some(string_descriptor_associated_value(b, desc))
+            } else {
+                None
+            }
+        }
+        Expr::ComponentAccess { .. } => {
+            let tl = type_layouts?;
+            let (field_ptr, field) = resolve_component_field_access(b, locals, expr, st, tl)?;
+            if field.pointer && is_deferred_char_component_field(&field) {
+                Some(string_descriptor_associated_value(b, field_ptr))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 fn associated_target_address_for_expr(
@@ -46409,6 +46582,23 @@ pub(super) fn load_string_descriptor_view(
     (ptr, len)
 }
 
+fn string_descriptor_associated_value(b: &mut FuncBuilder, desc: ValueId) -> ValueId {
+    let (ptr, _len) = load_string_descriptor_view(b, desc);
+    let zero_i64 = b.const_i64(0);
+    let ptr_bits = coerce_to_type(b, ptr, &IrType::Int(IntWidth::I64));
+    let ptr_nonnull = b.icmp(CmpOp::Ne, ptr_bits, zero_i64);
+
+    let flags_off = b.const_i64(24);
+    let flags_ptr = b.gep(desc, vec![flags_off], IrType::Int(IntWidth::I8));
+    let flags = b.load_typed(flags_ptr, IrType::Int(IntWidth::I32));
+    let association_mask = b.const_i32(1 | 4); // STR_ALLOCATED | STR_POINTER
+    let association_bits = b.bit_and(flags, association_mask);
+    let zero_i32 = b.const_i32(0);
+    let flagged_associated = b.icmp(CmpOp::Ne, association_bits, zero_i32);
+
+    b.or(ptr_nonnull, flagged_associated)
+}
+
 pub(super) fn field_char_kind(field: &crate::sema::type_layout::FieldLayout) -> CharKind {
     match &field.type_info {
         crate::sema::symtab::TypeInfo::Character { len: Some(n), .. } => CharKind::Fixed(*n),
@@ -47023,6 +47213,25 @@ pub(super) fn store_string_descriptor_view(
     len: ValueId,
 ) {
     let flags = b.const_i32(2); // STR_DEFERRED without STR_ALLOCATED
+    store_byte_aggregate_field(
+        b,
+        desc,
+        0,
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        ptr,
+    );
+    store_byte_aggregate_field(b, desc, 8, IrType::Int(IntWidth::I64), len);
+    store_byte_aggregate_field(b, desc, 16, IrType::Int(IntWidth::I64), len);
+    store_byte_aggregate_field(b, desc, 24, IrType::Int(IntWidth::I32), flags);
+}
+
+pub(super) fn store_string_pointer_descriptor_view(
+    b: &mut FuncBuilder,
+    desc: ValueId,
+    ptr: ValueId,
+    len: ValueId,
+) {
+    let flags = b.const_i32(2 | 4); // STR_DEFERRED | STR_POINTER
     store_byte_aggregate_field(
         b,
         desc,
@@ -47764,6 +47973,7 @@ pub(super) fn ensure_hidden_string_result_local(
     b: &mut FuncBuilder,
     locals: &mut HashMap<String, LocalInfo>,
     result_name: &str,
+    result_is_pointer: bool,
     return_type: Option<&TypeSpec>,
     visible_param_consts: &HashMap<String, ConstScalar>,
     st: &SymbolTable,
@@ -47801,13 +48011,13 @@ pub(super) fn ensure_hidden_string_result_local(
                 addr,
                 ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
                 dims: vec![],
-                allocatable: true,
+                allocatable: !result_is_pointer,
                 descriptor_arg: false,
                 by_ref: false,
                 char_kind: CharKind::Deferred,
                 derived_type: None,
                 inline_const: None,
-                is_pointer: false,
+                is_pointer: result_is_pointer,
                 runtime_dim_upper: vec![],
                 is_class: false,
                 logical_kind: None,
@@ -47922,6 +48132,16 @@ pub(super) fn lower_hidden_string_result_copy(b: &mut FuncBuilder, ctx: &LowerCt
         .locals
         .get(result_name)
         .unwrap_or_else(|| panic!("missing hidden string result local '{}'", result_name));
+    if info.is_pointer && matches!(info.char_kind, CharKind::Deferred) {
+        let src_desc = string_descriptor_addr(b, info);
+        let size = b.const_i64(32);
+        b.call(
+            FuncRef::External("memcpy".into()),
+            vec![ValueId(0), src_desc, size],
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        );
+        return;
+    }
     let (src_ptr, src_len) = local_char_ptr_and_len(b, info).unwrap_or_else(|| {
         panic!(
             "hidden string result '{}' is not lowered as a string local",
