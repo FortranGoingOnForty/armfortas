@@ -46948,6 +46948,30 @@ pub(super) fn field_uses_array_descriptor(field: &crate::sema::type_layout::Fiel
         && (field.declared_array || !field.dims.is_empty())
 }
 
+pub(super) fn scalar_allocatable_derived_component_payload_addr(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    tl: &crate::sema::type_layout::TypeLayoutRegistry,
+) -> Option<ValueId> {
+    let (field_ptr, field) = resolve_component_field_access(b, locals, expr, st, tl)?;
+    if field_derived_type_name(&field).is_some()
+        && field.dims.is_empty()
+        && !field.declared_array
+        && field.size == 384
+        && (field.allocatable || field.pointer)
+        && !field.procedure_pointer
+    {
+        Some(b.load_typed(
+            field_ptr,
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        ))
+    } else {
+        None
+    }
+}
+
 pub(super) fn field_is_class_star_pointer_descriptor(
     field: &crate::sema::type_layout::FieldLayout,
 ) -> bool {

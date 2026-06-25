@@ -41076,6 +41076,50 @@ fn allocatable_derived_component_actual_passes_base_storage_to_value_dummy() {
 }
 
 #[test]
+fn scalar_allocatable_derived_component_assignment_copies_payload() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=scalar_allocatable_derived_component_assignment_copies_payload count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  type :: build_t\n    logical :: auto_executables = .true.\n    logical :: auto_tests = .true.\n  end type build_t\n  type :: feature_t\n    type(build_t), allocatable :: build\n  end type feature_t\n  type(feature_t) :: source\n  type(feature_t) :: target\n\n  allocate(source%build)\n  source%build%auto_executables = .false.\n  source%build%auto_tests = .false.\n  allocate(target%build)\n  target%build%auto_executables = .true.\n  target%build%auto_tests = .true.\n\n  call copy_feature(target, source)\n\n  if (.not. allocated(target%build)) error stop 1\n  if (target%build%auto_executables) error stop 2\n  if (target%build%auto_tests) error stop 3\n  source%build%auto_executables = .true.\n  if (target%build%auto_executables) error stop 4\n  print *, 'ok'\ncontains\n  subroutine copy_feature(target, source)\n    type(feature_t), intent(inout) :: target\n    type(feature_t), intent(in) :: source\n    if (.not. allocated(target%build)) allocate(target%build)\n    target%build = source%build\n  end subroutine copy_feature\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("scalar_alloc_component_copy_payload", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("scalar allocatable derived component assignment compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "scalar allocatable derived component assignment compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("scalar allocatable derived component assignment run failed");
+    assert!(
+        run.status.success(),
+        "scalar allocatable derived component assignment run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected scalar allocatable derived component assignment output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn allocatable_array_result_append_preserves_declared_rank() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

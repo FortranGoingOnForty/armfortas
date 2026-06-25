@@ -2072,7 +2072,16 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     b.branch(copy_bb, vec![]);
 
                                     b.set_block(copy_bb);
-                                    let src_ptr = super::expr::lower_expr_ctx_tl(b, ctx, value);
+                                    let src_ptr = scalar_allocatable_derived_component_payload_addr(
+                                        b,
+                                        &ctx.locals,
+                                        value,
+                                        ctx.st,
+                                        ctx.type_layouts,
+                                    )
+                                    .unwrap_or_else(|| {
+                                        super::expr::lower_expr_ctx_tl(b, ctx, value)
+                                    });
                                     let dest_ptr = b.load_typed(
                                         desc,
                                         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
