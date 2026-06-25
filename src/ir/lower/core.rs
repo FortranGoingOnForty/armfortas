@@ -33160,7 +33160,8 @@ pub(super) fn materialize_array_descriptor_for_info(
 
     let base_ptr = array_data_ptr_for_call(b, info);
     store_byte_aggregate_field(b, desc, 0, IrType::Ptr(Box::new(info.ty.clone())), base_ptr);
-    let elem_size = b.const_i64(ir_scalar_byte_size(&info.ty, b.layout));
+    let fallback_elem_size = ir_scalar_byte_size(&info.ty, b.layout);
+    let elem_size = allocated_array_elem_size(b, info, fallback_elem_size, None);
     store_byte_aggregate_field(b, desc, 8, IrType::Int(IntWidth::I64), elem_size);
     let rank = b.const_i32(info.dims.len() as i32);
     store_byte_aggregate_field(b, desc, 16, IrType::Int(IntWidth::I32), rank);
@@ -33747,7 +33748,8 @@ pub(super) fn array_elem_size_value(b: &mut FuncBuilder, info: &LocalInfo) -> Va
         let desc = array_descriptor_addr(b, info);
         descriptor_elem_size(b, desc)
     } else {
-        b.const_i64(ir_scalar_byte_size(&info.ty, b.layout))
+        let fallback_elem_size = ir_scalar_byte_size(&info.ty, b.layout);
+        allocated_array_elem_size(b, info, fallback_elem_size, None)
     }
 }
 
@@ -41150,6 +41152,107 @@ pub(super) fn lower_multi_d_section_assign(
     true
 }
 
+fn try_lower_transfer_char_expr_into_section(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    dest_desc: ValueId,
+    dest_n: ValueId,
+    dest_stride: ValueId,
+    value: &crate::ast::expr::SpannedExpr,
+) -> bool {
+    use crate::ast::expr::SectionSubscript;
+
+    let Expr::FunctionCall { callee, args } = &value.node else {
+        return false;
+    };
+    let Expr::Name { name } = &callee.node else {
+        return false;
+    };
+    if !name.eq_ignore_ascii_case("transfer") || args.len() != 2 {
+        return false;
+    }
+    let SectionSubscript::Element(src_expr) = &args[0].value else {
+        return false;
+    };
+    if !expr_is_character_expr(b, &ctx.locals, src_expr, ctx.st, Some(ctx.type_layouts))
+        || expr_returns_array(src_expr, &ctx.locals, ctx.st)
+    {
+        return false;
+    }
+
+    let (src_base, src_len) = lower_string_expr_full(
+        b,
+        &ctx.locals,
+        src_expr,
+        ctx.st,
+        Some(ctx.type_layouts),
+        Some(ctx.internal_funcs),
+        Some(ctx.contained_host_refs),
+        Some(ctx.descriptor_params),
+    );
+    let dest_base = b.load_typed(dest_desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    let dest_elem_len = descriptor_elem_size(b, dest_desc);
+    let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let zero64 = b.const_i64(0);
+    b.store(zero64, i_addr);
+
+    let bb_check = b.create_block("transfer_char_section_check");
+    let bb_body = b.create_block("transfer_char_section_body");
+    let bb_copy = b.create_block("transfer_char_section_copy");
+    let bb_next = b.create_block("transfer_char_section_next");
+    let bb_exit = b.create_block("transfer_char_section_exit");
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let i = b.load(i_addr);
+    let done = b.icmp(CmpOp::Ge, i, dest_n);
+    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+    b.set_block(bb_body);
+    let i_val = b.load(i_addr);
+    let dest_index = b.imul(i_val, dest_stride);
+    let dest_off = b.imul(dest_index, dest_elem_len);
+    let dest_ptr = b.gep(dest_base, vec![dest_off], IrType::Int(IntWidth::I8));
+    let zero32 = b.const_i32(0);
+    b.call(
+        FuncRef::External("memset".into()),
+        vec![dest_ptr, zero32, dest_elem_len],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+    let src_off = b.imul(i_val, dest_elem_len);
+    let remaining = b.isub(src_len, src_off);
+    let has_src = b.icmp(CmpOp::Gt, remaining, zero64);
+    b.cond_branch(has_src, bb_copy, vec![], bb_next, vec![]);
+
+    b.set_block(bb_copy);
+    let src_ptr = b.gep(src_base, vec![src_off], IrType::Int(IntWidth::I8));
+    let copy_is_short = b.icmp(CmpOp::Lt, remaining, dest_elem_len);
+    let copy_len = b.select(copy_is_short, remaining, dest_elem_len);
+    b.call(
+        FuncRef::External("memcpy".into()),
+        vec![dest_ptr, src_ptr, copy_len],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+    b.branch(bb_next, vec![]);
+
+    b.set_block(bb_next);
+    let one = b.const_i64(1);
+    let next_i = b.iadd(i_val, one);
+    b.store(next_i, i_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
+    deallocate_owned_string_expr_temp(
+        b,
+        &ctx.locals,
+        src_expr,
+        ctx.st,
+        Some(ctx.type_layouts),
+        src_base,
+    );
+    true
+}
+
 pub(super) fn lower_1d_section_assign(
     b: &mut FuncBuilder,
     ctx: &mut LowerCtx,
@@ -41185,6 +41288,18 @@ pub(super) fn lower_1d_section_assign(
         IrType::Int(IntWidth::I64),
     );
     let dest_stride = load_array_desc_i64_field(b, dest_desc, 24 + 16);
+    if (dest_info.char_kind != CharKind::None || descriptor_backed_runtime_char_array(dest_info))
+        && try_lower_transfer_char_expr_into_section(
+            b,
+            ctx,
+            dest_desc,
+            dest_n,
+            dest_stride,
+            value,
+        )
+    {
+        return true;
+    }
     let scalarized_value = if expr_contains_array_refs_in_subscripts(value, &ctx.locals) {
         let loop_var = fresh_synth_loop_var(&ctx.locals);
         rewrite_scalarized_rank1_array_refs(value, &ctx.locals, dest_info, &loop_var).and_then(
@@ -50794,6 +50909,20 @@ pub(super) fn try_lower_transfer_into_array(
     };
     let src_addr: ValueId = if let Some(addr) = char_name_src_addr {
         addr
+    } else if expr_is_character_expr(b, &ctx.locals, src_expr, ctx.st, Some(ctx.type_layouts))
+        && !expr_returns_array(src_expr, &ctx.locals, ctx.st)
+    {
+        let (ptr, _len) = lower_string_expr_full(
+            b,
+            &ctx.locals,
+            src_expr,
+            ctx.st,
+            Some(ctx.type_layouts),
+            Some(ctx.internal_funcs),
+            Some(ctx.contained_host_refs),
+            Some(ctx.descriptor_params),
+        );
+        ptr
     } else if let Some((src_desc, _src_elem_ty)) = lower_array_expr_descriptor(
         b,
         &ctx.locals,
