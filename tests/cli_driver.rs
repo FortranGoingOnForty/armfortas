@@ -4134,6 +4134,53 @@ fn assumed_size_c_char_section_transfer_keeps_byte_stride() {
 }
 
 #[test]
+fn character_substring_transfer_to_c_char_section_copies_bytes() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=character_substring_transfer_to_c_char_section_copies_bytes count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("c_char_transfer_substring_bytes");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "module m\n  use iso_c_binding, only: c_char, c_null_char\n  implicit none\ncontains\n  subroutine f_c_character(rhs, lhs, n)\n    character(kind=c_char), intent(out) :: lhs(*)\n    character(len=*), intent(in) :: rhs\n    integer, intent(in) :: n\n    integer :: length\n    length = min(n - 1, len_trim(rhs))\n    lhs(1:length) = transfer(rhs(1:length), lhs(1:length))\n    lhs(length + 1:length + 1) = c_null_char\n  end subroutine f_c_character\nend module m\n\nprogram p\n  use iso_c_binding, only: c_char, c_null_char\n  use m\n  implicit none\n  character(kind=c_char), allocatable :: buf(:)\n  allocate(buf(16))\n  call f_c_character('/Users/mfwolffe', buf, 16)\n  if (buf(1) /= '/') error stop 1\n  if (buf(2) /= 'U') error stop 2\n  if (buf(3) /= 's') error stop 3\n  if (buf(15) /= 'e') error stop 4\n  if (buf(16) /= c_null_char) error stop 5\n  print *, 'ok'\nend program p\n",
+    );
+
+    let exe = dir.join("c_char_transfer_substring_bytes.bin");
+    let compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([src.to_str().unwrap(), "-o", exe.to_str().unwrap()])
+        .output()
+        .expect("character substring transfer compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "character substring transfer should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("character substring transfer run failed");
+    assert!(
+        run.status.success(),
+        "character substring transfer should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected character substring transfer output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn optional_deferred_char_intent_out_deallocates_actual_on_entry() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
