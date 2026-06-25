@@ -4014,8 +4014,41 @@ pub(super) fn collect_module_globals(
     use crate::ast::decl::Attribute;
     // Module-level parameter table built incrementally so a later
     // parameter declaration can reference earlier ones.
-    let param_consts = collect_decl_param_consts_with_scope(decls, &HashMap::new(), st);
     let module_scope_id = st.find_module_scope(&mod_name.to_lowercase());
+    let mut param_consts = collect_decl_param_consts_with_scope(decls, &HashMap::new(), st);
+    if let Some(scope_id) = module_scope_id {
+        for (name, sym) in &st.scope(scope_id).symbols {
+            if matches!(
+                sym.kind,
+                crate::sema::symtab::SymbolKind::Parameter
+                    | crate::sema::symtab::SymbolKind::Enumerator
+            ) {
+                if let Some(value) = sym.const_value {
+                    param_consts
+                        .entry(name.clone())
+                        .or_insert(ConstScalar::Int(value as i128));
+                }
+            }
+        }
+        for assoc in st.scope(scope_id).use_associations.clone() {
+            if assoc.local_name.is_empty() {
+                continue;
+            }
+            if let Some(sym) = st.lookup_in(assoc.source_scope, &assoc.original_name) {
+                if matches!(
+                    sym.kind,
+                    crate::sema::symtab::SymbolKind::Parameter
+                        | crate::sema::symtab::SymbolKind::Enumerator
+                ) {
+                    if let Some(value) = sym.const_value {
+                        param_consts
+                            .entry(assoc.local_name)
+                            .or_insert(ConstScalar::Int(value as i128));
+                    }
+                }
+            }
+        }
+    }
     let param_char_consts =
         collect_decl_param_char_consts(decls, &param_consts, type_layouts, st, module_scope_id);
     let mut param_array_consts: HashMap<String, Vec<ConstScalar>> = HashMap::new();

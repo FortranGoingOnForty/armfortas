@@ -14291,6 +14291,50 @@ fn module_character_parameter_array_constructor_initializes_runtime_bytes() {
 }
 
 #[test]
+fn module_enum_kind_parameter_array_constructor_initializes_runtime_values() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=module_enum_kind_parameter_array_constructor_initializes_runtime_values count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module compiler_ids\n  implicit none\n  enum, bind(C)\n    enumerator :: id_all = -1\n    enumerator :: id_unknown = 0\n    enumerator :: id_gcc\n    enumerator :: id_intel_classic_nix\n    enumerator :: id_intel_classic_mac\n    enumerator :: id_intel_classic_windows\n  end enum\n  integer, parameter :: compiler_enum = kind(id_unknown)\nend module compiler_ids\nmodule platform_like\n  use compiler_ids, only: compiler_enum, id_all, id_intel_classic_nix, &\n      id_intel_classic_mac, id_intel_classic_windows\n  implicit none\n  integer(compiler_enum), parameter :: id_intel_classic(*) = &\n      [id_intel_classic_mac, id_intel_classic_nix, id_intel_classic_windows]\n  type :: platform_config_t\n    integer(compiler_enum) :: compiler = id_all\n  end type platform_config_t\ncontains\n  logical function compiler_is_suitable(compiler_id, target) result(suitable)\n    integer(compiler_enum), intent(in) :: compiler_id\n    type(platform_config_t), intent(in) :: target\n    suitable = (compiler_id == id_all .or. compiler_id == target%compiler)\n    if (suitable) return\n    if (any(compiler_id == id_intel_classic) .and. &\n        any(target%compiler == id_intel_classic)) then\n      suitable = .true.\n      return\n    end if\n  end function compiler_is_suitable\nend module platform_like\nprogram p\n  use platform_like\n  use compiler_ids, only: id_intel_classic_nix, id_intel_classic_windows\n  implicit none\n  type(platform_config_t) :: target\n  target%compiler = id_intel_classic_windows\n  if (.not. compiler_is_suitable(id_intel_classic_nix, target)) error stop 1\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("module_enum_kind_param_array_init", "bin");
+
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("module enum-kind parameter array init compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "module enum-kind parameter array init compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("module enum-kind parameter array init run failed");
+    assert!(
+        run.status.success(),
+        "module enum-kind parameter array init run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected module enum-kind parameter array init output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn elemental_character_compare_uses_hidden_result_bytes() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
