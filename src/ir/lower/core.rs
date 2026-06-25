@@ -33160,7 +33160,8 @@ pub(super) fn materialize_array_descriptor_for_info(
 
     let base_ptr = array_data_ptr_for_call(b, info);
     store_byte_aggregate_field(b, desc, 0, IrType::Ptr(Box::new(info.ty.clone())), base_ptr);
-    let elem_size = b.const_i64(ir_scalar_byte_size(&info.ty, b.layout));
+    let fallback_elem_size = ir_scalar_byte_size(&info.ty, b.layout);
+    let elem_size = allocated_array_elem_size(b, info, fallback_elem_size, None);
     store_byte_aggregate_field(b, desc, 8, IrType::Int(IntWidth::I64), elem_size);
     let rank = b.const_i32(info.dims.len() as i32);
     store_byte_aggregate_field(b, desc, 16, IrType::Int(IntWidth::I32), rank);
@@ -33747,7 +33748,8 @@ pub(super) fn array_elem_size_value(b: &mut FuncBuilder, info: &LocalInfo) -> Va
         let desc = array_descriptor_addr(b, info);
         descriptor_elem_size(b, desc)
     } else {
-        b.const_i64(ir_scalar_byte_size(&info.ty, b.layout))
+        let fallback_elem_size = ir_scalar_byte_size(&info.ty, b.layout);
+        allocated_array_elem_size(b, info, fallback_elem_size, None)
     }
 }
 

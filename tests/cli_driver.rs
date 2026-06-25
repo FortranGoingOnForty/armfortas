@@ -4057,6 +4057,83 @@ fn allocatable_c_char_array_result_assigns_into_intent_out_dummy() {
 }
 
 #[test]
+fn assumed_size_c_char_section_transfer_keeps_byte_stride() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=assumed_size_c_char_section_transfer_keeps_byte_stride count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("assumed_size_c_char_transfer");
+    let c_src = write_program_in(
+        &dir,
+        "check.c",
+        "#include <string.h>\n\nvoid ccheck(const char *s, int *ok) {\n    *ok = strcmp(s, \"/\") == 0 ? 1 : 0;\n}\n",
+    );
+    let c_obj = dir.join("check.o");
+    compile_c_object(&c_src, &c_obj);
+
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "module m\n  use iso_c_binding, only: c_char, c_int, c_null_char\n  implicit none\n  interface\n    subroutine ccheck(s, ok) bind(C, name='ccheck')\n      import :: c_char, c_int\n      character(kind=c_char), intent(in) :: s(*)\n      integer(c_int), intent(out) :: ok\n    end subroutine ccheck\n  end interface\ncontains\n  subroutine f_c_character(rhs, lhs, n)\n    character(kind=c_char), intent(out) :: lhs(*)\n    character(len=*), intent(in) :: rhs\n    integer, intent(in) :: n\n    integer :: length\n    length = min(n - 1, len_trim(rhs))\n    lhs(1:length) = transfer(rhs(1:length), lhs(1:length))\n    lhs(length + 1:length + 1) = c_null_char\n  end subroutine f_c_character\n\n  subroutine run()\n    character(kind=c_char), allocatable :: buf(:)\n    integer(c_int) :: ok\n    allocate(buf(2))\n    call f_c_character('/', buf, 2)\n    if (buf(2) /= c_null_char) error stop 2\n    call ccheck(buf, ok)\n    if (ok /= 1_c_int) error stop 3\n  end subroutine run\nend module m\n\nprogram p\n  use m\n  implicit none\n  call run()\n  print *, 'ok'\nend program p\n",
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_obj = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("assumed-size c_char transfer object compile failed to spawn");
+    assert!(
+        compile_obj.status.success(),
+        "assumed-size c_char transfer should compile to an object: {}",
+        String::from_utf8_lossy(&compile_obj.stderr)
+    );
+
+    let exe = dir.join("assumed_size_c_char_transfer.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            main_obj.to_str().unwrap(),
+            c_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("assumed-size c_char transfer link failed to spawn");
+    assert!(
+        link.status.success(),
+        "assumed-size c_char transfer objects should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("assumed-size c_char transfer run failed");
+    assert!(
+        run.status.success(),
+        "assumed-size c_char transfer should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected assumed-size c_char transfer output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn optional_deferred_char_intent_out_deallocates_actual_on_entry() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
