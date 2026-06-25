@@ -119,12 +119,8 @@ fn static_concrete_expr_type_layout<'a>(
     ctx: &'a LowerCtx<'_>,
     expr: Option<&SpannedExpr>,
 ) -> Option<&'a crate::sema::type_layout::TypeLayout> {
-    let Some(expr) = expr else {
-        return None;
-    };
-    let Some(layout) = expr_type_layout(expr, Some(&ctx.locals), ctx.st, ctx.type_layouts) else {
-        return None;
-    };
+    let expr = expr?;
+    let layout = expr_type_layout(expr, Some(&ctx.locals), ctx.st, ctx.type_layouts)?;
     if layout.is_abstract {
         return None;
     }
