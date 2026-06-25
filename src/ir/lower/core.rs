@@ -22671,17 +22671,11 @@ pub(super) fn callee_character_return_abi(
     st: &SymbolTable,
     callee_name: &str,
 ) -> Option<CharacterReturnAbi> {
-    use crate::sema::symtab::{SymbolKind, TypeInfo};
+    use crate::sema::symtab::TypeInfo;
 
-    let key = callee_name.to_ascii_lowercase();
-    let sym = st.find_symbol_any_scope(&key)?;
-    match sym.kind {
-        SymbolKind::Function
-        | SymbolKind::ExternalProc
-        | SymbolKind::IntrinsicProc
-        | SymbolKind::ProcedurePointer => {}
-        _ => return None,
-    }
+    let key = canonical_procedure_abi_key(st, callee_name);
+    let sym = find_linkable_symbol_any_scope(st, &key)
+        .filter(|sym| is_linkable_callable_symbol(sym))?;
     let TypeInfo::Character { .. } = sym.type_info.as_ref()? else {
         return None;
     };
@@ -22696,17 +22690,11 @@ pub(super) fn callee_hidden_result_abi(
     st: &SymbolTable,
     callee_name: &str,
 ) -> Option<HiddenResultAbi> {
-    use crate::sema::symtab::{SymbolKind, TypeInfo};
+    use crate::sema::symtab::TypeInfo;
 
-    let key = callee_name.to_ascii_lowercase();
-    let sym = st.find_symbol_any_scope(&key)?;
-    match sym.kind {
-        SymbolKind::Function
-        | SymbolKind::ExternalProc
-        | SymbolKind::IntrinsicProc
-        | SymbolKind::ProcedurePointer => {}
-        _ => return None,
-    }
+    let key = canonical_procedure_abi_key(st, callee_name);
+    let sym = find_linkable_symbol_any_scope(st, &key)
+        .filter(|sym| is_linkable_callable_symbol(sym))?;
     // Rank check must come BEFORE the Character match arm: a function
     // returning `character :: cstr(N)` is rank-1, and the caller has to
     // allocate a 384-byte ArrayDescriptor (NOT a 32-byte StringDescriptor)

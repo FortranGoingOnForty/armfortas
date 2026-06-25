@@ -44961,6 +44961,43 @@ fn local_character_dummy_shadows_same_name_generic_for_substring() {
 }
 
 #[test]
+fn character_result_call_ignores_unrelated_parameter_symbol() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=character_result_call_ignores_unrelated_parameter_symbol count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  private\n  public :: starts_casefold\ncontains\n  pure logical function starts_casefold(s, e, case_sensitive) result(ok)\n    character(*), intent(in) :: s, e\n    logical, optional, intent(in) :: case_sensitive\n    logical :: lower_case\n    if (present(case_sensitive)) then\n      lower_case = .not. case_sensitive\n    else\n      lower_case = .false.\n    end if\n    if (lower_case) then\n      ok = lower(s(1:len(e))) == lower(e)\n    else\n      ok = s(1:len(e)) == e\n    end if\n  end function\n\n  elemental pure function lower(str, begin, end) result(string)\n    character(*), intent(in) :: str\n    character(len(str)) :: string\n    integer, intent(in), optional :: begin, end\n    integer :: i\n    integer :: ibegin, iend\n    string = str\n    ibegin = 1\n    if (present(begin)) ibegin = max(ibegin, begin)\n    iend = len_trim(str)\n    if (present(end)) iend = min(iend, end)\n    do i = ibegin, iend\n      select case (str(i:i))\n      case ('A':'Z')\n        string(i:i) = char(iachar(str(i:i)) + 32)\n      case default\n      end select\n    end do\n  end function\n\n  logical function pollute()\n    character(len=*), parameter :: lower = 'abcdefghijklmnopqrstuvwxyz'\n    pollute = len(lower) > 0\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  if (.not. starts_casefold('My_Pkg__Mod', 'my_pkg', case_sensitive=.false.)) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("char_result_ignores_parameter", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("character result parameter-pollution compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "character result parameter-pollution compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("character result parameter-pollution run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "character result parameter-pollution run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn abstract_type_bound_operator_dispatch_avoids_direct_interface_call() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
