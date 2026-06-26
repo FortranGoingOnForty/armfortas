@@ -1592,10 +1592,37 @@ impl<'a> Parser<'a> {
 
     fn try_parse_io_implied_do(&mut self) -> Result<SpannedExpr, ParseError> {
         let start = self.current_span();
+        let ido = self.try_parse_io_implied_do_loop()?;
+        let span = span_from_to(start, self.prev_span());
+        use crate::ast::expr::{AcValue, Expr};
+        Ok(Spanned::new(
+            Expr::ArrayConstructor {
+                type_spec: None,
+                values: vec![AcValue::ImpliedDo(Box::new(ido))],
+            },
+            span,
+        ))
+    }
+
+    fn parse_io_implied_do_value(&mut self) -> Result<crate::ast::expr::AcValue, ParseError> {
+        if self.peek() == &TokenKind::LParen {
+            let save = self.pos;
+            if let Ok(ido) = self.try_parse_io_implied_do_loop() {
+                return Ok(crate::ast::expr::AcValue::ImpliedDo(Box::new(ido)));
+            }
+            self.pos = save;
+        }
+
+        Ok(crate::ast::expr::AcValue::Expr(self.parse_expr()?))
+    }
+
+    fn try_parse_io_implied_do_loop(
+        &mut self,
+    ) -> Result<crate::ast::expr::ImpliedDoLoop, ParseError> {
         self.expect(&TokenKind::LParen)?;
 
         // Parse items until we find var=start,end pattern.
-        let mut inner_items = vec![self.parse_expr()?];
+        let mut values = vec![self.parse_io_implied_do_value()?];
         while self.eat(&TokenKind::Comma) {
             // Check for var=start pattern (identifier followed by =).
             if self.peek() == &TokenKind::Identifier {
@@ -1613,27 +1640,16 @@ impl<'a> Parser<'a> {
                     };
                     self.expect(&TokenKind::RParen)?;
 
-                    // Build as a synthetic expression — a FunctionCall-like node
-                    // that sema can recognize as an I/O implied-do.
-                    let span = span_from_to(start, self.prev_span());
-                    use crate::ast::expr::{AcValue, Expr, ImpliedDoLoop};
-                    let values: Vec<AcValue> = inner_items.into_iter().map(AcValue::Expr).collect();
-                    return Ok(Spanned::new(
-                        Expr::ArrayConstructor {
-                            type_spec: None,
-                            values: vec![AcValue::ImpliedDo(Box::new(ImpliedDoLoop {
-                                values,
-                                var,
-                                start: loop_start,
-                                end,
-                                step: step.map(|s| *s),
-                            }))],
-                        },
-                        span,
-                    ));
+                    return Ok(crate::ast::expr::ImpliedDoLoop {
+                        values,
+                        var,
+                        start: loop_start,
+                        end,
+                        step: step.map(|s| *s),
+                    });
                 }
             }
-            inner_items.push(self.parse_expr()?);
+            values.push(self.parse_io_implied_do_value()?);
         }
         // If we got here without finding var=, it's not an implied-do.
         Err(self.error("expected implied-do variable assignment".into()))
@@ -2548,6 +2564,16 @@ end if
         let s = parse_one("write(*, *) (a(i), i=1,10)\n");
         if let Stmt::Write { items, .. } = &s.node {
             assert_eq!(items.len(), 1, "implied-do should produce 1 item");
+        } else {
+            panic!("not Write");
+        }
+    }
+
+    #[test]
+    fn write_nested_implied_do() {
+        let s = parse_one("write(unit, fmt) ((adjustl(test_param(i,j)), i=1,4), j=1,n-1)\n");
+        if let Stmt::Write { items, .. } = &s.node {
+            assert_eq!(items.len(), 1, "nested implied-do should produce 1 item");
         } else {
             panic!("not Write");
         }
