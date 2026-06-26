@@ -839,9 +839,13 @@ pub fn compute_layout_with_attrs(
             let is_target = attrs
                 .iter()
                 .any(|a| matches!(a, crate::ast::decl::Attribute::Target));
-            let has_dimension_attr = attrs
-                .iter()
-                .any(|a| matches!(a, crate::ast::decl::Attribute::Dimension(_)));
+            let dimension_attr_specs = attrs.iter().find_map(|a| {
+                if let crate::ast::decl::Attribute::Dimension(specs) = a {
+                    Some(specs)
+                } else {
+                    None
+                }
+            });
 
             let base_ti = type_spec_to_type_info(type_spec, const_params);
             for entity in entities {
@@ -850,11 +854,15 @@ pub fn compute_layout_with_attrs(
                     entity.char_len.as_ref(),
                     const_params,
                 );
-                let declared_array = entity.array_spec.is_some() || has_dimension_attr;
+                let explicit_array_specs = entity
+                    .array_spec
+                    .as_ref()
+                    .or(dimension_attr_specs);
+                let declared_array = explicit_array_specs.is_some();
                 let dims = if is_allocatable || is_pointer {
                     Vec::new()
                 } else {
-                    eval_explicit_array_dims(entity.array_spec.as_ref(), const_params)
+                    eval_explicit_array_dims(explicit_array_specs, const_params)
                 };
                 let is_proc_pointer_component = is_pointer
                     && attrs
@@ -1613,6 +1621,66 @@ mod tests {
                 kind: None
             }
         ));
+    }
+
+    #[test]
+    fn compute_layout_fixed_component_dimension_attr_preserves_extents() {
+        use crate::ast::decl::{ArraySpec, Attribute, TypeSpec};
+        use crate::ast::expr::Expr;
+        use crate::ast::Spanned;
+
+        let pos = crate::lexer::Position { line: 0, col: 0 };
+        let span = crate::lexer::Span {
+            start: pos,
+            end: pos,
+            file_id: 0,
+        };
+        let upper = Spanned::new(
+            Expr::IntegerLiteral {
+                text: "512".into(),
+                kind: None,
+            },
+            span,
+        );
+
+        let mut reg = TypeLayoutRegistry::new();
+        let token_layout = compute_layout(
+            "token",
+            None,
+            &[],
+            &[],
+            &[make_component("tag", TypeSpec::Integer(None))],
+            None,
+            &reg,
+            &empty_params(),
+            crate::target::TargetLayout::LP64,
+        );
+        reg.insert(token_layout);
+
+        let components = vec![make_component_with_attrs(
+            "pattern",
+            TypeSpec::Type("token".into()),
+            vec![Attribute::Dimension(vec![ArraySpec::Explicit {
+                lower: None,
+                upper,
+            }])],
+        )];
+        let layout = compute_layout(
+            "holder",
+            None,
+            &[],
+            &[],
+            &components,
+            None,
+            &reg,
+            &empty_params(),
+            crate::target::TargetLayout::LP64,
+        );
+        let field = layout.field("pattern").expect("missing pattern field");
+
+        assert_eq!(field.dims, vec![(1, 512)]);
+        assert_eq!(field.size, 4 * 512);
+        assert!(field.declared_array);
     }
 
     #[test]
