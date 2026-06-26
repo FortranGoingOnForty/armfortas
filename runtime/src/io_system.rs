@@ -2303,6 +2303,11 @@ pub struct NamelistEntry {
     pub data: *mut u8,
     pub data_type: i32, // 0=int, 1=real, 2=fixed string, 3=i32 logical, 4=StringDescriptor, 5=bool logical
     pub data_len: i64,  // fixed string length for type 2
+    pub elem_count: i64,
+}
+
+fn quote_namelist_char(s: &str) -> String {
+    format!("'{}'", s.trim_end().replace('\'', "''"))
 }
 
 /// Write a NAMELIST group to a unit.
@@ -2338,8 +2343,15 @@ pub extern "C" fn afs_write_namelist(
                     }
                     2 => {
                         // string
-                        let s = unsafe_str(entry.data, entry.data_len);
-                        format!("'{}'", s.trim_end())
+                        let elem_len = entry.data_len.max(0) as usize;
+                        let elem_count = entry.elem_count.max(1) as usize;
+                        let mut values = Vec::with_capacity(elem_count);
+                        for elem in 0..elem_count {
+                            let ptr = unsafe { entry.data.add(elem * elem_len) };
+                            let s = unsafe_str(ptr, entry.data_len);
+                            values.push(quote_namelist_char(&s));
+                        }
+                        values.join(",")
                     }
                     3 => {
                         // logical
@@ -2351,7 +2363,7 @@ pub extern "C" fn afs_write_namelist(
                         let desc =
                             unsafe { &*(entry.data as *const crate::descriptor::StringDescriptor) };
                         let s = unsafe_str(desc.data, desc.len);
-                        format!("'{}'", s.trim_end())
+                        quote_namelist_char(&s)
                     }
                     5 => {
                         // bool-backed logical
@@ -2472,7 +2484,8 @@ fn namelist_assign_from_text(
     //   var=val            — simple scalar assignment
     //   var(index)=val     — array element assignment (1-based)
     //   var=n*val          — repeat notation (set n consecutive elements)
-    for pair in content.split(',') {
+    let mut continuation: Option<(usize, usize)> = None;
+    for pair in split_namelist_fields(content) {
         let pair = pair.trim();
         if let Some(eq_pos) = pair.find('=') {
             let lhs = pair[..eq_pos].trim().to_lowercase();
@@ -2489,32 +2502,98 @@ fn namelist_assign_from_text(
             };
 
             // Parse repeat notation "n*val".
-            let (repeat_count, actual_val) = if let Some(star) = val_str.find('*') {
-                // Make sure * is preceded by digits (not part of a number like 1.5E*).
-                let before = val_str[..star].trim();
-                if let Ok(n) = before.parse::<usize>() {
-                    (n, val_str[star + 1..].trim())
-                } else {
-                    (1, val_str)
-                }
-            } else {
-                (1, val_str)
-            };
+            let (repeat_count, actual_val) = parse_namelist_repeat(val_str);
 
             // Find the matching entry.
-            for entry in entries_slice {
+            continuation = None;
+            for (entry_index, entry) in entries_slice.iter().enumerate() {
                 if entry.data.is_null() {
                     continue;
                 }
                 let ename = unsafe_str(entry.name, entry.name_len).to_lowercase();
                 if ename == var_name {
                     namelist_assign_value(entry, actual_val, array_index, repeat_count);
+                    let next_index = array_index.unwrap_or(1).saturating_add(repeat_count);
+                    if entry.data_type == 2 && next_index <= entry.elem_count.max(1) as usize {
+                        continuation = Some((entry_index, next_index));
+                    }
                     break;
                 }
+            }
+        } else if let Some((entry_index, next_index)) = continuation {
+            let (repeat_count, actual_val) = parse_namelist_repeat(pair);
+            if let Some(entry) = entries_slice.get(entry_index) {
+                namelist_assign_value(entry, actual_val, Some(next_index), repeat_count);
+                let next_index = next_index.saturating_add(repeat_count);
+                continuation = if next_index <= entry.elem_count.max(1) as usize {
+                    Some((entry_index, next_index))
+                } else {
+                    None
+                };
             }
         }
     }
     true
+}
+
+fn split_namelist_fields(content: &str) -> Vec<&str> {
+    let mut fields = Vec::new();
+    let mut start = 0;
+    let mut quote = None;
+    let mut chars = content.char_indices().peekable();
+    while let Some((idx, ch)) = chars.next() {
+        if let Some(q) = quote {
+            if ch == q {
+                if chars.peek().is_some_and(|(_, next)| *next == q) {
+                    let _ = chars.next();
+                } else {
+                    quote = None;
+                }
+            }
+        } else if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+        } else if ch == ',' {
+            fields.push(&content[start..idx]);
+            start = idx + ch.len_utf8();
+        }
+    }
+    fields.push(&content[start..]);
+    fields
+}
+
+fn parse_namelist_repeat(val_str: &str) -> (usize, &str) {
+    if let Some(star) = val_str.find('*') {
+        // Make sure * is preceded by digits (not part of a number like 1.5E*).
+        let before = val_str[..star].trim();
+        if let Ok(n) = before.parse::<usize>() {
+            return (n, val_str[star + 1..].trim());
+        }
+    }
+    (1, val_str)
+}
+
+fn parse_namelist_char_value(raw: &str) -> String {
+    let s = raw.trim();
+    let Some(first) = s.as_bytes().first().copied() else {
+        return String::new();
+    };
+    if first != b'\'' && first != b'"' {
+        return s.to_string();
+    }
+    if s.as_bytes().last().copied() != Some(first) || s.len() < 2 {
+        return s.to_string();
+    }
+
+    let quote = first as char;
+    let mut out = String::with_capacity(s.len().saturating_sub(2));
+    let mut chars = s[1..s.len() - 1].chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == quote && chars.peek().copied() == Some(quote) {
+            let _ = chars.next();
+        }
+        out.push(ch);
+    }
+    out
 }
 
 /// Assign a parsed NAMELIST value to an entry, handling array indexing and repeat.
@@ -2528,16 +2607,20 @@ fn namelist_assign_value(
     let elem_size = match entry.data_type {
         0 => 4, // integer (i32)
         1 => 8, // real (f64)
+        2 => entry.data_len.max(1) as usize, // fixed string element
         3 => 4, // logical (i32)
         5 => 1, // logical (bool/i8)
         _ => 1, // string
     };
-    let base_offset = index
-        .map(|i| (i.saturating_sub(1)) * elem_size)
-        .unwrap_or(0);
+    let start_index = index.unwrap_or(1).max(1);
+    let max_elems = entry.elem_count.max(1) as usize;
 
     for r in 0..repeat {
-        let offset = base_offset + r * elem_size;
+        let elem_index = start_index.saturating_add(r);
+        if elem_index > max_elems {
+            break;
+        }
+        let offset = (elem_index - 1) * elem_size;
         let ptr = unsafe { entry.data.add(offset) };
         match entry.data_type {
             0 => {
@@ -2558,23 +2641,25 @@ fn namelist_assign_value(
                 }
             }
             2 => {
-                // string (only first element for repeat, no array stride for strings)
-                let s = val_str.trim_matches('\'').trim_matches('"');
+                // fixed-length string scalar or element
+                let s = parse_namelist_char_value(val_str);
                 let bytes = s.as_bytes();
-                let copy_len = bytes.len().min(entry.data_len as usize);
-                if copy_len > 0 {
+                let slot_len = entry.data_len.max(0) as usize;
+                let copy_len = bytes.len().min(slot_len);
+                if slot_len > 0 {
                     unsafe {
-                        std::ptr::copy_nonoverlapping(bytes.as_ptr(), entry.data, copy_len);
-                        if copy_len < entry.data_len as usize {
+                        if copy_len > 0 {
+                            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, copy_len);
+                        }
+                        if copy_len < slot_len {
                             std::ptr::write_bytes(
-                                entry.data.add(copy_len),
+                                ptr.add(copy_len),
                                 b' ',
-                                entry.data_len as usize - copy_len,
+                                slot_len - copy_len,
                             );
                         }
                     }
                 }
-                return; // string repeat doesn't make sense
             }
             3 => {
                 // logical
@@ -2586,7 +2671,7 @@ fn namelist_assign_value(
             }
             4 => {
                 // deferred-length string descriptor
-                let s = val_str.trim_matches('\'').trim_matches('"');
+                let s = parse_namelist_char_value(val_str);
                 crate::string::afs_assign_char_deferred(
                     entry.data as *mut crate::descriptor::StringDescriptor,
                     s.as_ptr(),
