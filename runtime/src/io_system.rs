@@ -3134,6 +3134,19 @@ fn write_inquire_string(buf: *mut u8, buf_len: i64, value: &str) {
     }
 }
 
+fn unit_current_fortran_pos(u: &mut Unit) -> i64 {
+    let pos = match &mut u.stream {
+        UnitStream::FileRaw(f) => f.stream_position(),
+        UnitStream::FileRead(r) => r.stream_position(),
+        UnitStream::FileWrite(w) => {
+            let _ = w.flush();
+            w.stream_position()
+        }
+        _ => return -1,
+    };
+    pos.map(|p| p as i64 + 1).unwrap_or(-1)
+}
+
 /// INQUIRE LEADING_ZERO= readback (F2023 12.10.2.15). A formatted
 /// connection reports its current mode (`PRINT`/`SUPPRESS`/
 /// `PROCESSOR_DEFINED`); no connection or an unformatted connection is
@@ -3165,6 +3178,7 @@ pub extern "C" fn afs_inquire_file(
     action_buf_len: i64,
     recl_out: *mut i64,
     size_out: *mut i64,
+    pos_out: *mut i64,
     read_buf: *mut u8,
     read_buf_len: i64,
     write_buf: *mut u8,
@@ -3283,6 +3297,11 @@ pub extern "C" fn afs_inquire_file(
             *size_out = sz;
         }
     }
+    if !pos_out.is_null() {
+        unsafe {
+            *pos_out = -1;
+        }
+    }
 
     if !iostat.is_null() {
         unsafe {
@@ -3309,6 +3328,7 @@ pub extern "C" fn afs_inquire_unit(
     action_buf_len: i64,
     recl_out: *mut i64,
     size_out: *mut i64,
+    pos_out: *mut i64,
     read_buf: *mut u8,
     read_buf_len: i64,
     write_buf: *mut u8,
@@ -3329,8 +3349,8 @@ pub extern "C" fn afs_inquire_unit(
     leading_zero_buf_len: i64,
     pos_out: *mut i64,
 ) {
-    let state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    let unit_entry = state.units.get(&unit);
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+    let unit_entry = state.units.get_mut(&unit);
 
     if !exist.is_null() {
         unsafe {
@@ -3395,18 +3415,8 @@ pub extern "C" fn afs_inquire_unit(
             }
         }
         if !pos_out.is_null() {
-            // F2018 §12.10.2.22: POS= is the file storage unit the next
-            // read/write would address, 1-based; stream access only.
-            // `impl Seek for &File` lets us query without a mutable unit.
-            let p = match &u.stream {
-                UnitStream::FileRaw(f) => (&*f)
-                    .stream_position()
-                    .map(|off| off as i64 + 1)
-                    .unwrap_or(-1),
-                _ => -1,
-            };
             unsafe {
-                *pos_out = p;
+                *pos_out = unit_current_fortran_pos(u);
             }
         }
     } else {
@@ -5373,6 +5383,7 @@ mod tests {
             0,
             std::ptr::null_mut(),
             0,
+            std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
