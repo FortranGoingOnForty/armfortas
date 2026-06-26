@@ -3164,9 +3164,22 @@ pub(super) fn collect_host_refs_stmt(
                 collect_host_refs_expr(e, host_names, sub_locals, refs);
             }
         }
-        Stmt::Write { items, .. } | Stmt::Read { items, .. } => {
+        Stmt::Write { controls, items } | Stmt::Read { controls, items } => {
+            for c in controls {
+                collect_host_refs_expr(&c.value, host_names, sub_locals, refs);
+            }
             for e in items {
                 collect_host_refs_expr(e, host_names, sub_locals, refs);
+            }
+        }
+        Stmt::Namelist { groups } => {
+            for (_, vars) in groups {
+                for name in vars {
+                    let key = name.to_lowercase();
+                    if host_names.contains(&key) && !sub_locals.contains(&key) {
+                        refs.insert(key);
+                    }
+                }
             }
         }
         Stmt::IfConstruct {
@@ -22382,7 +22395,9 @@ pub(super) fn append_host_closure_args_raw(
             }
             b.load(info.addr)
         } else if info.dims.is_empty()
+            && !info.allocatable
             && !info.descriptor_arg
+            && !local_is_array_like(&info)
             && !matches!(info.char_kind, CharKind::Deferred)
             && matches!(
                 info.char_kind,

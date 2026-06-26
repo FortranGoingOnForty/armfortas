@@ -45803,6 +45803,191 @@ fn allocatable_fixed_character_array_implied_do_constructor_reallocates() {
 }
 
 #[test]
+fn internal_namelist_read_reallocates_deferred_character() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=internal_namelist_read_reallocates_deferred_character count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=128) :: readme(3)\n  character(len=:), allocatable :: cmd, profile\n  integer :: estat\n  logical :: w_e\n  namelist /expected/ cmd, estat, w_e, profile\n  cmd = repeat(' ', 132)\n  profile = ''\n  estat = 0\n  w_e = .false.\n  readme(1) = '&EXPECTED'\n  readme(2) = ' CMD=\"new\", ESTAT=7, W_E=T, PROFILE=\"debug\",'\n  readme(3) = ' /'\n  read(readme, nml=expected)\n  if (cmd /= 'new') error stop 1\n  if (estat /= 7) error stop 2\n  if (.not. w_e) error stop 3\n  if (profile /= 'debug') error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("internal_nml_deferred_char", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("internal namelist deferred char compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "internal namelist deferred char compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("internal namelist deferred char run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "internal namelist deferred char run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn external_namelist_write_read_roundtrip_reallocates_deferred_character() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=external_namelist_write_read_roundtrip_reallocates_deferred_character count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=:), allocatable :: cmd\n  integer :: estat, unit, ios\n  logical :: flag\n  character(len=128) :: message\n  namelist /round/ cmd, estat, flag\n  cmd = 'abc'\n  estat = 42\n  flag = .true.\n  open(newunit=unit, status='scratch', action='readwrite')\n  write(unit, nml=round)\n  rewind(unit)\n  cmd = ''\n  estat = 0\n  flag = .false.\n  ios = -99\n  message = ''\n  read(unit, nml=round, iostat=ios, iomsg=message)\n  if (ios /= 0) error stop 1\n  if (cmd /= 'abc') error stop 2\n  if (estat /= 42) error stop 3\n  if (.not. flag) error stop 4\n  close(unit)\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("external_nml_roundtrip", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("external namelist roundtrip compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "external namelist roundtrip compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("external namelist roundtrip run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "external namelist roundtrip run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn internal_namelist_read_populates_allocatable_fixed_char_array() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=internal_namelist_read_populates_allocatable_fixed_char_array count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=15), allocatable :: name(:)\n  character(len=80) :: readme(3)\n  integer :: i\n  namelist /expected/ name\n  name = [(repeat(' ', len(name)), i = 1, 3)]\n  readme(1) = '&EXPECTED'\n  readme(2) = ' NAME=\"my_project\",'\n  readme(3) = ' /'\n  read(readme, nml=expected)\n  if (.not. allocated(name)) error stop 1\n  if (size(name) /= 3) error stop 2\n  if (len(name) /= 15) error stop 3\n  if (trim(name(1)) /= 'my_project') error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("internal_nml_alloc_fixed_char_array", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("internal namelist fixed char-array compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "internal namelist fixed char-array compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("internal namelist fixed char-array run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "internal namelist fixed char-array run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn contained_noarg_call_does_not_prepend_unrelated_optional_nulls() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=contained_noarg_call_does_not_prepend_unrelated_optional_nulls count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module other_parse_owner\ncontains\n  subroutine parse(a, b, c)\n    integer, optional :: a, b, c\n  end subroutine\nend module\nprogram p\n  implicit none\n  logical :: touched\n  touched = .false.\n  call parse()\n  if (.not. touched) error stop 1\n  print *, 'ok'\ncontains\n  subroutine parse()\n    touched = .true.\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("contained_noarg_optional_mask", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("contained noarg optional-mask compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "contained noarg optional-mask compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("contained noarg optional-mask run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "contained noarg optional-mask run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn contained_namelist_write_forwards_allocatable_fixed_char_array_descriptor() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=contained_namelist_write_forwards_allocatable_fixed_char_array_descriptor count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=15), allocatable :: names(:)\n  integer :: unit, ios\n  character(len=128) :: line\n  logical :: seen\n  allocate(character(len=15) :: names(1))\n  names(1) = 'abc'\n  call inner()\n  print *, 'ok'\ncontains\n  subroutine inner()\n    namelist /g/ names\n    open(newunit=unit, status='scratch', action='readwrite')\n    write(unit, nml=g)\n    rewind(unit)\n    seen = .false.\n    do\n      read(unit, '(a)', iostat=ios) line\n      if (ios /= 0) exit\n      if (index(line, 'abc') > 0) seen = .true.\n    end do\n    if (.not. seen) error stop 1\n    close(unit)\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("contained_nml_alloc_fixed_char_array", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("contained namelist fixed char-array compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "contained namelist fixed char-array compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("contained namelist fixed char-array run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "contained namelist fixed char-array run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn allocatable_integer_array_broadcasts_len_of_optional_char_array() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
