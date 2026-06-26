@@ -2301,8 +2301,8 @@ pub struct NamelistEntry {
     pub name: *const u8,
     pub name_len: i64,
     pub data: *mut u8,
-    pub data_type: i32, // 0=int, 1=real, 2=string, 3=logical
-    pub data_len: i64,  // string length for type 2
+    pub data_type: i32, // 0=int, 1=real, 2=fixed string, 3=i32 logical, 4=StringDescriptor, 5=bool logical
+    pub data_len: i64,  // fixed string length for type 2
 }
 
 /// Write a NAMELIST group to a unit.
@@ -2345,6 +2345,18 @@ pub extern "C" fn afs_write_namelist(
                         // logical
                         let v = unsafe { *(entry.data as *const i32) };
                         (if v != 0 { ".TRUE." } else { ".FALSE." }).to_string()
+                    }
+                    4 => {
+                        // deferred-length string descriptor
+                        let desc =
+                            unsafe { &*(entry.data as *const crate::descriptor::StringDescriptor) };
+                        let s = unsafe_str(desc.data, desc.len);
+                        format!("'{}'", s.trim_end())
+                    }
+                    5 => {
+                        // bool-backed logical
+                        let v = unsafe { *(entry.data as *const u8) } != 0;
+                        (if v { ".TRUE." } else { ".FALSE." }).to_string()
                     }
                     _ => "???".to_string(),
                 };
@@ -2399,74 +2411,110 @@ pub extern "C" fn afs_read_namelist(
             }
         }
 
-        // Parse assignments from the namelist text.
-        if !entries.is_null() && n_entries > 0 {
-            let entries_slice = unsafe { std::slice::from_raw_parts(entries, n_entries as usize) };
-            // Extract the content between & and /.
-            let content = if let Some(start) = all_lines.find(&gname) {
-                let after_name = &all_lines[start + gname.len()..];
-                if let Some(end) = after_name.find('/') {
-                    &after_name[..end]
-                } else {
-                    after_name
-                }
-            } else {
-                ""
-            };
-
-            // Parse var=val pairs. Supports:
-            //   var=val            — simple scalar assignment
-            //   var(index)=val     — array element assignment (1-based)
-            //   var=n*val          — repeat notation (set n consecutive elements)
-            for pair in content.split(',') {
-                let pair = pair.trim();
-                if let Some(eq_pos) = pair.find('=') {
-                    let lhs = pair[..eq_pos].trim().to_lowercase();
-                    let val_str = pair[eq_pos + 1..].trim();
-
-                    // Parse array index from "var(idx)" syntax.
-                    let (var_name, array_index) = if let Some(paren) = lhs.find('(') {
-                        let name = lhs[..paren].trim();
-                        let idx_str = lhs[paren + 1..].trim_end_matches(')').trim();
-                        let idx = idx_str.parse::<usize>().unwrap_or(1);
-                        (name.to_string(), Some(idx))
-                    } else {
-                        (lhs, None)
-                    };
-
-                    // Parse repeat notation "n*val".
-                    let (repeat_count, actual_val) = if let Some(star) = val_str.find('*') {
-                        // Make sure * is preceded by digits (not part of a number like 1.5E*).
-                        let before = val_str[..star].trim();
-                        if let Ok(n) = before.parse::<usize>() {
-                            (n, val_str[star + 1..].trim())
-                        } else {
-                            (1, val_str)
-                        }
-                    } else {
-                        (1, val_str)
-                    };
-
-                    // Find the matching entry.
-                    for entry in entries_slice {
-                        if entry.data.is_null() {
-                            continue;
-                        }
-                        let ename = unsafe_str(entry.name, entry.name_len).to_lowercase();
-                        if ename == var_name {
-                            namelist_assign_value(entry, actual_val, array_index, repeat_count);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
+        let _ = namelist_assign_from_text(&all_lines, &gname, entries, n_entries);
         if !iostat.is_null() {
             unsafe {
                 *iostat = 0;
             }
         }
     }
+}
+
+/// Read a NAMELIST group from an internal character buffer.
+#[no_mangle]
+pub extern "C" fn afs_read_namelist_internal(
+    buf: *const u8,
+    buf_len: i64,
+    group_name: *const u8,
+    group_name_len: i64,
+    entries: *const NamelistEntry,
+    n_entries: i32,
+    iostat: *mut i32,
+) {
+    let gname = unsafe_str(group_name, group_name_len).to_lowercase();
+    let text = unsafe_str(buf, buf_len);
+    let found = namelist_assign_from_text(&text, &gname, entries, n_entries);
+    if !iostat.is_null() {
+        unsafe {
+            *iostat = if found { 0 } else { IOSTAT_END };
+        }
+    }
+}
+
+fn namelist_content<'a>(text: &'a str, group_name: &str) -> Option<&'a str> {
+    let lower = text.to_lowercase();
+    let marker = format!("&{}", group_name.to_lowercase());
+    let start = lower.find(&marker)?;
+    let after_start = start + marker.len();
+    let after_name = &text[after_start..];
+    if let Some(end) = after_name.find('/') {
+        Some(&after_name[..end])
+    } else {
+        Some(after_name)
+    }
+}
+
+fn namelist_assign_from_text(
+    text: &str,
+    group_name: &str,
+    entries: *const NamelistEntry,
+    n_entries: i32,
+) -> bool {
+    let Some(content) = namelist_content(text, group_name) else {
+        return false;
+    };
+    if entries.is_null() || n_entries <= 0 {
+        return true;
+    }
+    let entries_slice = unsafe { std::slice::from_raw_parts(entries, n_entries as usize) };
+
+    // Parse var=val pairs. Supports:
+    //   var=val            — simple scalar assignment
+    //   var(index)=val     — array element assignment (1-based)
+    //   var=n*val          — repeat notation (set n consecutive elements)
+    for pair in content.split(',') {
+        let pair = pair.trim();
+        if let Some(eq_pos) = pair.find('=') {
+            let lhs = pair[..eq_pos].trim().to_lowercase();
+            let val_str = pair[eq_pos + 1..].trim();
+
+            // Parse array index from "var(idx)" syntax.
+            let (var_name, array_index) = if let Some(paren) = lhs.find('(') {
+                let name = lhs[..paren].trim();
+                let idx_str = lhs[paren + 1..].trim_end_matches(')').trim();
+                let idx = idx_str.parse::<usize>().unwrap_or(1);
+                (name.to_string(), Some(idx))
+            } else {
+                (lhs, None)
+            };
+
+            // Parse repeat notation "n*val".
+            let (repeat_count, actual_val) = if let Some(star) = val_str.find('*') {
+                // Make sure * is preceded by digits (not part of a number like 1.5E*).
+                let before = val_str[..star].trim();
+                if let Ok(n) = before.parse::<usize>() {
+                    (n, val_str[star + 1..].trim())
+                } else {
+                    (1, val_str)
+                }
+            } else {
+                (1, val_str)
+            };
+
+            // Find the matching entry.
+            for entry in entries_slice {
+                if entry.data.is_null() {
+                    continue;
+                }
+                let ename = unsafe_str(entry.name, entry.name_len).to_lowercase();
+                if ename == var_name {
+                    namelist_assign_value(entry, actual_val, array_index, repeat_count);
+                    break;
+                }
+            }
+        }
+    }
+    true
 }
 
 /// Assign a parsed NAMELIST value to an entry, handling array indexing and repeat.
@@ -2481,6 +2529,7 @@ fn namelist_assign_value(
         0 => 4, // integer (i32)
         1 => 8, // real (f64)
         3 => 4, // logical (i32)
+        5 => 1, // logical (bool/i8)
         _ => 1, // string
     };
     let base_offset = index
@@ -2533,6 +2582,24 @@ fn namelist_assign_value(
                 let v = lower.starts_with(".t") || lower.starts_with("t");
                 unsafe {
                     *(ptr as *mut i32) = v as i32;
+                }
+            }
+            4 => {
+                // deferred-length string descriptor
+                let s = val_str.trim_matches('\'').trim_matches('"');
+                crate::string::afs_assign_char_deferred(
+                    entry.data as *mut crate::descriptor::StringDescriptor,
+                    s.as_ptr(),
+                    s.len() as i64,
+                );
+                return;
+            }
+            5 => {
+                // bool-backed logical
+                let lower = val_str.to_lowercase();
+                let v = lower.starts_with(".t") || lower.starts_with("t");
+                unsafe {
+                    *ptr = v as u8;
                 }
             }
             _ => {}
