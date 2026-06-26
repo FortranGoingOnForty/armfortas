@@ -42294,56 +42294,17 @@ fn try_lower_fixed_char_allocatable_constructor_assign(
     );
 
     let dest_base = b.load_typed(dest_desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
-    let src_base = b.load_typed(src_desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
-    let dest_n = b.call(
-        FuncRef::External("afs_array_size".into()),
-        vec![dest_desc],
-        IrType::Int(IntWidth::I64),
-    );
-    let src_n = b.call(
-        FuncRef::External("afs_array_size".into()),
-        vec![src_desc],
-        IrType::Int(IntWidth::I64),
-    );
-    let dest_stride = load_array_desc_i64_field(b, dest_desc, 24 + 16);
-    let src_stride = load_array_desc_i64_field(b, src_desc, 24 + 16);
-    let src_elem_len = descriptor_elem_size(b, src_desc);
-
-    let i_addr = b.alloca(IrType::Int(IntWidth::I64));
     let zero64 = b.const_i64(0);
-    b.store(zero64, i_addr);
-
-    let bb_check = b.create_block("fixed_char_alloc_ctor_check");
-    let bb_body = b.create_block("fixed_char_alloc_ctor_body");
-    let bb_exit = b.create_block("fixed_char_alloc_ctor_exit");
-    b.branch(bb_check, vec![]);
-
-    b.set_block(bb_check);
-    let i = b.load(i_addr);
-    let dest_done = b.icmp(CmpOp::Ge, i, dest_n);
-    let src_done = b.icmp(CmpOp::Ge, i, src_n);
-    let done = b.or(dest_done, src_done);
-    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
-
-    b.set_block(bb_body);
-    let i_val = b.load(i_addr);
-    let dest_index = b.imul(i_val, dest_stride);
-    let dest_off = b.imul(dest_index, dest_elem_len);
-    let dest_ptr = b.gep(dest_base, vec![dest_off], IrType::Int(IntWidth::I8));
-    let src_index = b.imul(i_val, src_stride);
-    let src_off = b.imul(src_index, src_elem_len);
-    let src_ptr = b.gep(src_base, vec![src_off], IrType::Int(IntWidth::I8));
-    b.call(
-        FuncRef::External("afs_assign_char_fixed".into()),
-        vec![dest_ptr, dest_elem_len, src_ptr, src_elem_len],
-        IrType::Void,
+    let index_slot = b.alloca(IrType::Int(IntWidth::I64));
+    b.store(zero64, index_slot);
+    copy_runtime_char_desc_into_constructor(
+        b,
+        dest_base,
+        dest_elem_len,
+        index_slot,
+        src_desc,
+        zero32,
     );
-    let one64 = b.const_i64(1);
-    let next_i = b.iadd(i_val, one64);
-    b.store(next_i, i_addr);
-    b.branch(bb_check, vec![]);
-
-    b.set_block(bb_exit);
     true
 }
 
