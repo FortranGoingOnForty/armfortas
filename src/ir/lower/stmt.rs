@@ -6712,6 +6712,15 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             } else {
                 (null, None)
             };
+            let pos_spec = spec_by_keyword("pos");
+            let (pos_addr, pos_storeback) = if let Some(spec) = pos_spec {
+                let dest_addr = lower_arg_by_ref_ctx(b, ctx, &spec.value);
+                let temp = b.alloca(IrType::Int(IntWidth::I64));
+                let dest_ty = inquire_size_storeback_type(b, ctx, &spec.value, dest_addr);
+                (temp, Some((dest_addr, dest_ty)))
+            } else {
+                (null, None)
+            };
 
             if let Some(fs) = file_spec {
                 let (fptr, flen) = lower_string_expr_with_layouts(
@@ -6739,6 +6748,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         action_len,
                         recl_addr,
                         size_addr,
+                        pos_addr,
                         read_ptr,
                         read_len,
                         write_ptr,
@@ -6780,6 +6790,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         action_len,
                         recl_addr,
                         size_addr,
+                        pos_addr,
                         read_ptr,
                         read_len,
                         write_ptr,
@@ -6805,6 +6816,11 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             if let Some((dest_addr, dest_ty)) = size_storeback {
                 let size_val = b.load(size_addr);
                 let coerced = coerce_to_type(b, size_val, &dest_ty);
+                b.store(coerced, dest_addr);
+            }
+            if let Some((dest_addr, dest_ty)) = pos_storeback {
+                let pos_val = b.load(pos_addr);
+                let coerced = coerce_to_type(b, pos_val, &dest_ty);
                 b.store(coerced, dest_addr);
             }
         }
