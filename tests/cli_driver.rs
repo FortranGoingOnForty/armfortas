@@ -1135,6 +1135,50 @@ fn character_len_of_star_parameter_array_sizes_local_buffer() {
 }
 
 #[test]
+fn derived_component_array_dimension_attribute_keeps_element_assignment() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=derived_component_array_dimension_attribute_keeps_element_assignment count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type :: token\n    integer :: tag = 0\n    character(len=:), allocatable :: text\n  end type token\n  type :: holder\n    integer :: n = 0\n    type(token), dimension(4) :: pattern\n  contains\n    procedure :: init\n  end type holder\n  interface token\n    module procedure make_token\n  end interface token\ncontains\n  type(token) function make_token(tag, text) result(out)\n    integer, intent(in) :: tag\n    character(*), intent(in) :: text\n    out%tag = tag\n    allocate(character(len=len(text)) :: out%text)\n    out%text = text\n  end function make_token\n  subroutine init(this, c)\n    class(holder), intent(inout) :: this\n    character, intent(in) :: c\n    integer :: j\n    j = 1\n    select case (c)\n    case ('\\'); this%pattern(j) = token(10, 'd')\n    case default; this%pattern(j) = token(7, c)\n    end select\n    this%n = j\n  end subroutine init\nend module m\nprogram p\n  use m\n  implicit none\n  type(holder) :: h\n  call h%init('\\')\n  if (h%n /= 1) error stop 1\n  if (h%pattern(1)%tag /= 10) error stop 2\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("derived_component_array_dimension_attr", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("derived component dimension attr compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "derived component dimension attr compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("derived component dimension attr run failed");
+    assert!(
+        run.status.success(),
+        "derived component dimension attr run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected derived component dimension attr output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn stream_unformatted_narrow_integer_io_preserves_raw_widths() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
