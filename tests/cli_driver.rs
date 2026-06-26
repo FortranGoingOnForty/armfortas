@@ -45803,6 +45803,43 @@ fn allocatable_fixed_character_array_implied_do_constructor_reallocates() {
 }
 
 #[test]
+fn allocatable_fixed_character_array_constructor_copies_trimmed_deferred_char() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_fixed_character_array_constructor_copies_trimmed_deferred_char count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=15), allocatable :: name(:)\n  character(len=:), allocatable :: source\n  source = 'my_project   '\n  name = [trim(source)]\n  if (.not. allocated(name)) error stop 1\n  if (size(name) /= 1) error stop 2\n  if (len(name) /= 15) error stop 3\n  if (trim(name(1)) /= 'my_project') error stop 4\n  if (name(1)(11:15) /= '     ') error stop 5\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("alloc_fixed_char_trim_ctor", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("allocatable fixed char trim constructor compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "allocatable fixed char trim constructor compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("allocatable fixed char trim constructor run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "allocatable fixed char trim constructor run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn internal_namelist_read_reallocates_deferred_character() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
