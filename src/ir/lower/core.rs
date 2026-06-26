@@ -4424,6 +4424,9 @@ pub(super) fn collect_module_globals(
                                         len,
                                         &param_consts,
                                         &param_char_consts,
+                                        Some(st),
+                                        module_scope_id,
+                                        Some(type_layouts),
                                     )
                                 })
                             } else {
@@ -5755,7 +5758,19 @@ fn eval_const_char_bytes_with_context(
 ) -> Option<Vec<u8>> {
     match &e.node {
         Expr::StringLiteral { value, .. } => Some(value.as_bytes().to_vec()),
-        Expr::Name { name } => param_chars.get(&name.to_lowercase()).cloned(),
+        Expr::Name { name } => param_chars.get(&name.to_lowercase()).cloned().or_else(|| {
+            let st = st?;
+            let key = name.to_lowercase();
+            let sym = scope_id
+                .and_then(|scope_id| st.lookup_in(scope_id, &key))
+                .or_else(|| st.find_symbol_any_scope(&key))?;
+            if !sym.attrs.parameter {
+                return None;
+            }
+            sym.const_char_value
+                .as_ref()
+                .map(|value| value.as_bytes().to_vec())
+        }),
         Expr::ComponentAccess { base, component } => {
             let Expr::Name { name } = &base.node else {
                 return None;
@@ -6330,8 +6345,18 @@ pub(super) fn eval_const_char_array_init(
     elem_len: i64,
     param_consts: &HashMap<String, ConstScalar>,
     param_char_consts: &HashMap<String, Vec<u8>>,
+    st: Option<&SymbolTable>,
+    scope_id: Option<crate::sema::symtab::ScopeId>,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
 ) -> Option<GlobalInit> {
-    let elems = collect_const_char_array_elems(expr, param_consts, param_char_consts)?;
+    let elems = collect_const_char_array_elems_with_context(
+        expr,
+        param_consts,
+        param_char_consts,
+        st,
+        scope_id,
+        type_layouts,
+    )?;
     if (elems.len() as i64) > total {
         return None;
     }
@@ -6354,22 +6379,79 @@ pub(super) fn collect_const_char_array_elems(
     param_consts: &HashMap<String, ConstScalar>,
     param_char_consts: &HashMap<String, Vec<u8>>,
 ) -> Option<Vec<Vec<u8>>> {
+    collect_const_char_array_elems_with_context(
+        expr,
+        param_consts,
+        param_char_consts,
+        None,
+        None,
+        None,
+    )
+}
+
+fn collect_const_char_array_elems_with_context(
+    expr: &crate::ast::expr::SpannedExpr,
+    param_consts: &HashMap<String, ConstScalar>,
+    param_char_consts: &HashMap<String, Vec<u8>>,
+    st: Option<&SymbolTable>,
+    scope_id: Option<crate::sema::symtab::ScopeId>,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> Option<Vec<Vec<u8>>> {
     match &expr.node {
         Expr::ArrayConstructor { values, .. } => {
             let mut out = Vec::new();
             for value in values {
-                collect_ac_char_value(value, param_consts, param_char_consts, &mut out)?;
+                collect_ac_char_value_with_context(
+                    value,
+                    param_consts,
+                    param_char_consts,
+                    st,
+                    scope_id,
+                    type_layouts,
+                    &mut out,
+                )?;
             }
             Some(out)
         }
+        Expr::ParenExpr { inner } => collect_const_char_array_elems_with_context(
+            inner,
+            param_consts,
+            param_char_consts,
+            st,
+            scope_id,
+            type_layouts,
+        ),
         Expr::FunctionCall { callee, args } => {
             if let Expr::Name { name } = &callee.node {
                 if name.eq_ignore_ascii_case("reshape") && !args.is_empty() {
-                    if let crate::ast::expr::SectionSubscript::Element(src) = &args[0].value {
-                        return collect_const_char_array_elems(
+                    if let Some(st) = st {
+                        let arg_slots = reorder_args_by_keyword_slots(args, "reshape", st);
+                        if let Some(src) = arg_slots
+                            .first()
+                            .and_then(|slot| slot.as_ref())
+                            .and_then(|arg| match &arg.value {
+                                crate::ast::expr::SectionSubscript::Element(src) => Some(src),
+                                _ => None,
+                            })
+                        {
+                            return collect_const_char_array_elems_with_context(
+                                src,
+                                param_consts,
+                                param_char_consts,
+                                Some(st),
+                                scope_id,
+                                type_layouts,
+                            );
+                        }
+                    } else if let crate::ast::expr::SectionSubscript::Element(src) = &args[0].value
+                    {
+                        return collect_const_char_array_elems_with_context(
                             src,
                             param_consts,
                             param_char_consts,
+                            None,
+                            scope_id,
+                            type_layouts,
                         );
                     }
                 }
@@ -6386,14 +6468,29 @@ pub(super) fn collect_ac_char_value(
     param_char_consts: &HashMap<String, Vec<u8>>,
     out: &mut Vec<Vec<u8>>,
 ) -> Option<()> {
+    collect_ac_char_value_with_context(value, param_consts, param_char_consts, None, None, None, out)
+}
+
+fn collect_ac_char_value_with_context(
+    value: &crate::ast::expr::AcValue,
+    param_consts: &HashMap<String, ConstScalar>,
+    param_char_consts: &HashMap<String, Vec<u8>>,
+    st: Option<&SymbolTable>,
+    scope_id: Option<crate::sema::symtab::ScopeId>,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    out: &mut Vec<Vec<u8>>,
+) -> Option<()> {
     use crate::ast::expr::AcValue;
 
     match value {
         AcValue::Expr(expr) => {
-            out.push(eval_const_char_bytes(
+            out.push(eval_const_char_bytes_with_context(
                 expr,
                 param_consts,
                 param_char_consts,
+                st,
+                scope_id,
+                type_layouts,
             )?);
             Some(())
         }
@@ -6430,7 +6527,15 @@ pub(super) fn collect_ac_char_value(
                 }
                 local_consts.insert(var_key.clone(), ConstScalar::Int(i));
                 for inner in values {
-                    collect_ac_char_value(inner, &local_consts, param_char_consts, out)?;
+                    collect_ac_char_value_with_context(
+                        inner,
+                        &local_consts,
+                        param_char_consts,
+                        st,
+                        scope_id,
+                        type_layouts,
+                        out,
+                    )?;
                 }
                 i = i.wrapping_add(step_i);
             }
