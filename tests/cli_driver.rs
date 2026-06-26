@@ -25124,6 +25124,61 @@ fn inquire_unit_size_stores_full_value_to_derived_component() {
 }
 
 #[test]
+fn inquire_unit_pos_after_stream_append_reports_one_based_eof() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=inquire_unit_pos_after_stream_append_reports_one_based_eof count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("inquire_unit_pos_append");
+    let empty = dir.join("empty.toml");
+    let payload = dir.join("registry.toml");
+    let payload_text = "[registry]\npath=\"abc\"\n";
+    fs::write(&empty, "\n").expect("write empty TOML");
+    fs::write(&payload, payload_text).expect("write registry TOML");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        &format!(
+            "program p\n  implicit none\n  integer :: unit, ios, length\n  character(len=:), allocatable :: text\n  open(newunit=unit, file='{}', status='old', access='stream', position='append', iostat=ios)\n  if (ios /= 0) error stop 1\n  inquire(unit=unit, pos=length, iostat=ios)\n  if (ios /= 0) error stop 2\n  if (length /= 2) then\n    print *, length\n    error stop 3\n  end if\n  close(unit)\n  open(newunit=unit, file='{}', status='old', access='stream', position='append', iostat=ios)\n  if (ios /= 0) error stop 4\n  inquire(unit=unit, pos=length, iostat=ios)\n  if (ios /= 0) error stop 5\n  if (length /= {}) then\n    print *, length\n    error stop 6\n  end if\n  allocate(character(length - 1) :: text, stat=ios)\n  if (ios /= 0) error stop 7\n  read(unit, pos=1, iostat=ios) text(:length - 1)\n  if (ios /= 0) error stop 8\n  if (index(text, '[registry]') /= 1) error stop 9\n  if (index(text, 'path=\"abc\"') == 0) error stop 10\n  close(unit)\n  print *, 'ok'\nend program\n",
+            empty.display(),
+            payload.display(),
+            payload_text.len() + 1
+        ),
+    );
+    let out = dir.join("main.out");
+    let compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        compile.status.success(),
+        "INQUIRE(unit=, pos=) compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "INQUIRE(unit=, pos=) runtime failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected INQUIRE(unit=, pos=) output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn open_with_newunit_and_iostat_uses_keyword_specs() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
