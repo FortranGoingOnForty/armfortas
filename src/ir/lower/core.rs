@@ -6227,6 +6227,7 @@ pub(super) fn declared_char_len(
                 type_layouts,
             )
             .map(|bytes| bytes.len() as i64)
+            .or_else(|| character_array_init_element_len(expr, param_consts, param_char_consts, st))
             .or_else(|| {
                 if let crate::ast::expr::Expr::ArrayConstructor { type_spec, .. } = &expr.node {
                     typed_array_constructor_char_len(type_spec.as_deref(), param_consts, st)
@@ -10517,6 +10518,50 @@ fn typed_array_constructor_char_len(
     };
     let len = eval_const_int_in_scope_or_any_scope(&expr, param_consts, st)?;
     (len >= 0).then_some(len)
+}
+
+fn character_array_init_element_len(
+    expr: &crate::ast::expr::SpannedExpr,
+    param_consts: &HashMap<String, ConstScalar>,
+    param_char_consts: &HashMap<String, Vec<u8>>,
+    st: &SymbolTable,
+) -> Option<i64> {
+    match &expr.node {
+        Expr::ParenExpr { inner } => {
+            character_array_init_element_len(inner, param_consts, param_char_consts, st)
+        }
+        Expr::ArrayConstructor { type_spec, values } => {
+            typed_array_constructor_char_len(type_spec.as_deref(), param_consts, st).or_else(|| {
+                let mut max_len = None;
+                for value in values {
+                    let crate::ast::expr::AcValue::Expr(expr) = value else {
+                        return None;
+                    };
+                    let len = eval_const_char_expr_len(expr, param_consts, param_char_consts, st)?;
+                    max_len = Some(max_len.map_or(len, |prev: i64| prev.max(len)));
+                }
+                max_len
+            })
+        }
+        Expr::FunctionCall { callee, args } => {
+            let Expr::Name { name } = &callee.node else {
+                return None;
+            };
+            if !name.eq_ignore_ascii_case("reshape") {
+                return None;
+            }
+            let arg_slots = reorder_args_by_keyword_slots(args, "reshape", st);
+            let source_expr = arg_slots
+                .first()
+                .and_then(|slot| slot.as_ref())
+                .and_then(|arg| match &arg.value {
+                    crate::ast::expr::SectionSubscript::Element(e) => Some(e),
+                    _ => None,
+                })?;
+            character_array_init_element_len(source_expr, param_consts, param_char_consts, st)
+        }
+        _ => None,
+    }
 }
 
 pub(super) fn first_array_constructor_type_info(
