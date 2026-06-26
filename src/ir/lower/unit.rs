@@ -139,6 +139,7 @@ pub(crate) fn lower_unit(
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
                 host_uses.iter().chain(uses.iter()).cloned().collect();
             let required_import_names = collect_required_import_names(decls, body);
+            let decl_spec_import_names = collect_decl_spec_import_names(decls);
 
             {
                 let mut b = FuncBuilder::new(&mut func, ctx.layout);
@@ -151,6 +152,16 @@ pub(crate) fn lower_unit(
                     decls,
                     &visible_param_consts,
                     st,
+                );
+                install_globals_as_locals(
+                    &mut b,
+                    &mut ctx.locals,
+                    globals,
+                    &combined_uses,
+                    Some(&decl_spec_import_names),
+                    host_module,
+                    ctx.st,
+                    &ctx.ambiguous_use_warnings,
                 );
                 super::alloc::alloc_decls(
                     &mut b,
@@ -458,6 +469,7 @@ pub(crate) fn lower_unit(
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
                 host_uses.iter().chain(uses.iter()).cloned().collect();
             let required_import_names = collect_required_import_names(decls, body);
+            let decl_spec_import_names = collect_decl_spec_import_names(decls);
 
             // Collect param info: (name, param_id, elem_type, is_value).
             // Skip hidden params: __len_* (character-length) and __host_*
@@ -638,6 +650,16 @@ pub(crate) fn lower_unit(
                 // them available for initialization expressions that
                 // reference host vars.
                 install_host_ref_locals(&mut b, &mut ctx.locals, &host_ref_infos);
+                install_globals_as_locals(
+                    &mut b,
+                    &mut ctx.locals,
+                    globals,
+                    &combined_uses,
+                    Some(&decl_spec_import_names),
+                    host_module,
+                    ctx.st,
+                    &ctx.ambiguous_use_warnings,
+                );
                 super::alloc::alloc_decls(
                     &mut b,
                     &mut ctx.locals,
@@ -991,6 +1013,7 @@ pub(crate) fn lower_unit(
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
                 host_uses.iter().chain(uses.iter()).cloned().collect();
             let required_import_names = collect_required_import_names(decls, body);
+            let decl_spec_import_names = collect_decl_spec_import_names(decls);
 
             // Build param_info skipping the sret param (not a Fortran
             // variable) and __host_* closure-passing pointers (installed
@@ -1372,6 +1395,16 @@ pub(crate) fn lower_unit(
                     st,
                 );
                 install_host_ref_locals(&mut b, &mut ctx.locals, &host_ref_infos);
+                install_globals_as_locals(
+                    &mut b,
+                    &mut ctx.locals,
+                    globals,
+                    &combined_uses,
+                    Some(&decl_spec_import_names),
+                    host_module,
+                    ctx.st,
+                    &ctx.ambiguous_use_warnings,
+                );
                 super::alloc::alloc_decls(
                     &mut b,
                     &mut ctx.locals,
