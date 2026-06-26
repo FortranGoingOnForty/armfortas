@@ -4145,6 +4145,35 @@ pub(super) fn collect_required_import_names(
     refs.into_iter().map(|name| name.to_lowercase()).collect()
 }
 
+pub(super) fn collect_decl_spec_import_names(
+    decls: &[crate::ast::decl::SpannedDecl],
+) -> HashSet<String> {
+    let mut refs = Vec::new();
+    collect_name_refs_decls(decls, &mut refs);
+
+    let mut declared = HashSet::new();
+    for decl in decls {
+        match &decl.node {
+            Decl::TypeDecl { entities, .. } => {
+                for entity in entities {
+                    declared.insert(entity.name.to_lowercase());
+                }
+            }
+            Decl::ParameterStmt { pairs } => {
+                for (name, _) in pairs {
+                    declared.insert(name.to_lowercase());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    refs.into_iter()
+        .map(|name| name.to_lowercase())
+        .filter(|name| !declared.contains(name))
+        .collect()
+}
+
 pub(super) fn collect_module_globals(
     module: &mut Module,
     globals: &mut HashMap<(String, String), ModuleGlobalInfo>,

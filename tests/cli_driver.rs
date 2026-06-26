@@ -1091,6 +1091,50 @@ fn character_parameter_array_reshape_uses_imported_char_constants() {
 }
 
 #[test]
+fn character_len_of_star_parameter_array_sizes_local_buffer() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=character_len_of_star_parameter_array_sizes_local_buffer count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  character(len=*), parameter :: table(4,1) = reshape([character(len=5) :: 'YES', '\\d', '5', '1'], [4,1])\ncontains\n  subroutine get(n)\n    integer, intent(out) :: n\n    character(len(table)) :: buffer\n    buffer = table(4,1)\n    read(buffer,*) n\n  end subroutine get\nend module m\nprogram p\n  use m\n  implicit none\n  integer :: n\n  call get(n)\n  if (n /= 1) error stop 1\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("char_star_param_array_len_buffer", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("char star parameter array len buffer compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "char star parameter array len buffer compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("char star parameter array len buffer run failed");
+    assert!(
+        run.status.success(),
+        "char star parameter array len buffer run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected char star parameter array len buffer output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn stream_unformatted_narrow_integer_io_preserves_raw_widths() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
