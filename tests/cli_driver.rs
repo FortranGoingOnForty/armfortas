@@ -9168,6 +9168,47 @@ fn allocatable_two_dimensional_element_actuals_update_storage() {
 }
 
 #[test]
+fn formatted_write_nested_implied_do_preserves_loop_order() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=formatted_write_nested_implied_do_preserves_loop_order count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: grid(2,2)\n  integer :: i, j\n  grid = reshape([1, 2, 3, 4], [2, 2])\n  write(*,'(4I4)') ((grid(i,j), i=1,2), j=1,2)\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("formatted_nested_implied_do", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("formatted nested implied-do compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "formatted nested implied-do compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("formatted nested implied-do run failed");
+    assert!(
+        run.status.success(),
+        "formatted nested implied-do run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let fields: Vec<&str> = stdout.split_whitespace().collect();
+    assert_eq!(fields, ["1", "2", "3", "4"], "unexpected stdout: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn imported_derived_array_global_component_access_compiles() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
