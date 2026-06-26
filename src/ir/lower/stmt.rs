@@ -166,16 +166,18 @@ fn lower_namelist_entry_value(
     b: &mut FuncBuilder,
     info: &LocalInfo,
     is_logical: bool,
-) -> Option<(ValueId, i32, ValueId)> {
+) -> Option<(ValueId, i32, ValueId, ValueId)> {
+    let one = b.const_i64(1);
     if matches!(info.char_kind, CharKind::Deferred) && info.dims.is_empty() && !info.is_pointer {
         let desc = string_descriptor_addr(b, info);
-        return Some((namelist_i8_ptr(b, desc), 4, b.const_i64(0)));
+        return Some((namelist_i8_ptr(b, desc), 4, b.const_i64(0), one));
     }
     if local_is_array_like(info)
         && (info.char_kind != CharKind::None || descriptor_backed_runtime_char_array(info))
     {
         let raw_base = array_base_addr(b, info);
         let base = namelist_i8_ptr(b, raw_base);
+        let elem_count = array_total_elems_value(b, info);
         let elem_len = match info.char_kind {
             CharKind::Fixed(len) => b.const_i64(len),
             CharKind::FixedRuntime { len_addr } | CharKind::AssumedLen { len_addr } => {
@@ -183,10 +185,10 @@ fn lower_namelist_entry_value(
             }
             _ => array_elem_size_value(b, info),
         };
-        return Some((base, 2, elem_len));
+        return Some((base, 2, elem_len, elem_count));
     }
     if let Some((ptr, len)) = local_char_ptr_and_len(b, info) {
-        return Some((namelist_i8_ptr(b, ptr), 2, len));
+        return Some((namelist_i8_ptr(b, ptr), 2, len, one));
     }
 
     let data_addr = if local_is_array_like(info) && local_uses_array_descriptor(info) {
@@ -198,19 +200,24 @@ fn lower_namelist_entry_value(
     };
     let data_ptr = namelist_i8_ptr(b, data_addr);
     let zero_len = b.const_i64(0);
+    let elem_count = if local_is_array_like(info) {
+        array_total_elems_value(b, info)
+    } else {
+        one
+    };
 
     if is_logical || info.logical_kind.is_some() {
         match info.ty {
-            IrType::Int(IntWidth::I32) => return Some((data_ptr, 3, zero_len)),
-            IrType::Bool => return Some((data_ptr, 5, zero_len)),
+            IrType::Int(IntWidth::I32) => return Some((data_ptr, 3, zero_len, elem_count)),
+            IrType::Bool => return Some((data_ptr, 5, zero_len, elem_count)),
             _ => {}
         }
         return None;
     }
 
     match info.ty {
-        IrType::Int(IntWidth::I32) => Some((data_ptr, 0, zero_len)),
-        IrType::Float(FloatWidth::F64) => Some((data_ptr, 1, zero_len)),
+        IrType::Int(IntWidth::I32) => Some((data_ptr, 0, zero_len, elem_count)),
+        IrType::Float(FloatWidth::F64) => Some((data_ptr, 1, zero_len, elem_count)),
         _ => None,
     }
 }
@@ -233,7 +240,7 @@ fn lower_namelist_entries(
         lower_stmt_error(span, &format!("'{}' is not a NAMELIST group", group_name));
     }
     let vars = sym.arg_names.clone();
-    let entry_size = 40_i64;
+    let entry_size = 48_i64;
     let entries = b.alloca(IrType::Array(
         Box::new(IrType::Int(IntWidth::I8)),
         entry_size as u64 * vars.len() as u64,
@@ -252,7 +259,7 @@ fn lower_namelist_entries(
             .lookup_local_then_any(ctx.proc_scope_id, &var_key)
             .and_then(|sym| sym.type_info.as_ref())
             .is_some_and(|ty| matches!(ty, crate::sema::symtab::TypeInfo::Logical { .. }));
-        let Some((data_ptr, data_type, data_len)) =
+        let Some((data_ptr, data_type, data_len, elem_count)) =
             lower_namelist_entry_value(b, &info, is_logical)
         else {
             lower_stmt_error(
@@ -281,6 +288,13 @@ fn lower_namelist_entries(
             data_type_value,
         );
         store_byte_aggregate_field(b, entries, base + 32, IrType::Int(IntWidth::I64), data_len);
+        store_byte_aggregate_field(
+            b,
+            entries,
+            base + 40,
+            IrType::Int(IntWidth::I64),
+            elem_count,
+        );
     }
     (entries, b.const_i32(vars.len() as i32))
 }
