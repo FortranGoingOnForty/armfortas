@@ -1420,8 +1420,15 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                 if local_uses_array_descriptor(&info) {
                                                     let dest_desc = array_descriptor_addr(b, &info);
                                                     if descriptor_backed_char_array(&info) {
+                                                        let dest_elem_len =
+                                                            fixed_char_allocatable_array_elem_len(
+                                                                b, &info,
+                                                            );
                                                         lower_allocatable_char_array_assign_from_desc(
-                                                            b, dest_desc, src_desc,
+                                                            b,
+                                                            dest_desc,
+                                                            src_desc,
+                                                            dest_elem_len,
                                                         );
                                                     } else {
                                                         let src_kind_tag = src_elem_ty
@@ -1503,8 +1510,15 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                             if local_uses_array_descriptor(&info) {
                                                 let dest_desc = array_descriptor_addr(b, &info);
                                                 if descriptor_backed_char_array(&info) {
+                                                    let dest_elem_len =
+                                                        fixed_char_allocatable_array_elem_len(
+                                                            b, &info,
+                                                        );
                                                     lower_allocatable_char_array_assign_from_desc(
-                                                        b, dest_desc, src_desc,
+                                                        b,
+                                                        dest_desc,
+                                                        src_desc,
+                                                        dest_elem_len,
                                                     );
                                                 } else {
                                                     let src_kind_tag = src_elem_ty
