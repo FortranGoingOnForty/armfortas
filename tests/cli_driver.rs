@@ -45914,6 +45914,117 @@ fn internal_namelist_read_reallocates_deferred_character() {
 }
 
 #[test]
+fn internal_namelist_read_unescapes_doubled_character_quotes() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=internal_namelist_read_unescapes_doubled_character_quotes count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=160) :: readme(3)\n  character(len=:), allocatable :: cmd\n  namelist /expected/ cmd\n  cmd = ''\n  readme(1) = '&EXPECTED'\n  readme(2) = ' CMD=\"run -- arg1 -x \"\"and a long one\"\"\",'\n  readme(3) = ' /'\n  read(readme, nml=expected)\n  if (cmd /= 'run -- arg1 -x \"and a long one\"') error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("internal_nml_doubled_quotes", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("internal namelist doubled quotes compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "internal namelist doubled quotes compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("internal namelist doubled quotes run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "internal namelist doubled quotes run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn internal_namelist_read_keeps_quoted_commas_and_array_continuations() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=internal_namelist_read_keeps_quoted_commas_and_array_continuations count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=160) :: readme(3)\n  character(len=:), allocatable :: cmd\n  character(len=15), allocatable :: features(:)\n  integer :: i\n  namelist /expected/ cmd, features\n  cmd = ''\n  features = [(repeat(' ', len(features)), i = 1, 3)]\n  readme(1) = '&EXPECTED'\n  readme(2) = ' CMD=\"build --features debug,mpi\", FEATURES=\"debug\",\"mpi\",'\n  readme(3) = ' /'\n  read(readme, nml=expected)\n  if (cmd /= 'build --features debug,mpi') error stop 1\n  if (.not. allocated(features)) error stop 2\n  if (size(features) /= 3) error stop 3\n  if (trim(features(1)) /= 'debug') error stop 4\n  if (trim(features(2)) /= 'mpi') error stop 5\n  if (features(3) /= repeat(' ', len(features))) error stop 6\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("internal_nml_quoted_commas_arrays", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("internal namelist quoted comma compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "internal namelist quoted comma compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("internal namelist quoted comma run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "internal namelist quoted comma run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn namelist_write_emits_all_fixed_character_array_elements() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=namelist_write_emits_all_fixed_character_array_elements count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=15), allocatable :: features(:)\n  character(len=256) :: line\n  integer :: unit, ios\n  namelist /actual/ features\n  features = [character(len=15) :: 'debug', 'mpi']\n  open(newunit=unit, status='scratch', action='readwrite')\n  write(unit, nml=actual)\n  rewind(unit)\n  read(unit, '(a)', iostat=ios) line\n  if (ios /= 0) error stop 1\n  if (index(line, 'debug') == 0) error stop 2\n  if (index(line, 'mpi') == 0) error stop 3\n  close(unit)\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("namelist_write_fixed_char_array", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("namelist write fixed char-array compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "namelist write fixed char-array compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("namelist write fixed char-array run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "namelist write fixed char-array run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn external_namelist_write_read_roundtrip_reallocates_deferred_character() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
