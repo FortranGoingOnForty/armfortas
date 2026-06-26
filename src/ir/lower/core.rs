@@ -10254,8 +10254,26 @@ pub(super) fn fixed_char_expr_len(
             let right_len = fixed_char_expr_len(b, right, locals, st, type_layouts)?;
             left_len.checked_add(right_len)
         }
-        Expr::FunctionCall { callee, .. } => {
+        Expr::FunctionCall { callee, args } => {
             if let Expr::Name { name } = &callee.node {
+                if name.eq_ignore_ascii_case("repeat")
+                    && args.len() >= 2
+                    && args[0].keyword.is_none()
+                    && args[1].keyword.is_none()
+                {
+                    if let (
+                        crate::ast::expr::SectionSubscript::Element(source),
+                        crate::ast::expr::SectionSubscript::Element(copies),
+                    ) = (&args[0].value, &args[1].value)
+                    {
+                        let source_len = fixed_char_expr_len(b, source, locals, st, type_layouts)?;
+                        let copies =
+                            fixed_char_int_expr_len_context(b, copies, locals, st, type_layouts)?;
+                        if copies >= 0 {
+                            return source_len.checked_mul(copies);
+                        }
+                    }
+                }
                 if let Some(info) = locals.get(&name.to_lowercase()) {
                     if let CharKind::Fixed(len) = info.char_kind {
                         return Some(len);
@@ -10279,6 +10297,62 @@ pub(super) fn fixed_char_expr_len(
     }
 }
 
+fn fixed_char_int_expr_len_context(
+    b: &mut FuncBuilder,
+    expr: &crate::ast::expr::SpannedExpr,
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> Option<i64> {
+    if let Some(value) = eval_const_int_in_scope_or_any_scope(expr, &HashMap::new(), st) {
+        return Some(value);
+    }
+    match &expr.node {
+        Expr::ParenExpr { inner } => {
+            fixed_char_int_expr_len_context(b, inner, locals, st, type_layouts)
+        }
+        Expr::UnaryOp { op, operand } => {
+            let value = fixed_char_int_expr_len_context(b, operand, locals, st, type_layouts)?;
+            match op {
+                UnaryOp::Plus => Some(value),
+                UnaryOp::Minus => Some(-value),
+                _ => None,
+            }
+        }
+        Expr::BinaryOp { op, left, right } => {
+            let left = fixed_char_int_expr_len_context(b, left, locals, st, type_layouts)?;
+            let right = fixed_char_int_expr_len_context(b, right, locals, st, type_layouts)?;
+            match op {
+                BinaryOp::Add => left.checked_add(right),
+                BinaryOp::Sub => left.checked_sub(right),
+                BinaryOp::Mul => left.checked_mul(right),
+                BinaryOp::Div if right != 0 => Some(left / right),
+                BinaryOp::Pow if right >= 0 && right <= i32::MAX as i64 => {
+                    let mut acc = 1_i64;
+                    for _ in 0..(right as usize) {
+                        acc = acc.checked_mul(left)?;
+                    }
+                    Some(acc)
+                }
+                _ => None,
+            }
+        }
+        Expr::FunctionCall { callee, args } => {
+            let Expr::Name { name } = &callee.node else {
+                return None;
+            };
+            if !name.eq_ignore_ascii_case("len") || args.len() != 1 || args[0].keyword.is_some() {
+                return None;
+            }
+            let crate::ast::expr::SectionSubscript::Element(arg_expr) = &args[0].value else {
+                return None;
+            };
+            fixed_char_expr_len(b, arg_expr, locals, st, type_layouts)
+        }
+        _ => None,
+    }
+}
+
 pub(super) fn fixed_char_array_constructor_len(
     b: &mut FuncBuilder,
     values: &[crate::ast::expr::AcValue],
@@ -10289,10 +10363,18 @@ pub(super) fn fixed_char_array_constructor_len(
     let mut max_len = 0_i64;
     let mut saw_expr = false;
     for value in values {
-        let crate::ast::expr::AcValue::Expr(expr) = value else {
-            return None;
+        let len = match value {
+            crate::ast::expr::AcValue::Expr(expr) => {
+                if let Expr::ArrayConstructor { values: inner, .. } = &expr.node {
+                    fixed_char_array_constructor_len(b, inner, locals, st, type_layouts)?
+                } else {
+                    fixed_char_expr_len(b, expr, locals, st, type_layouts)?
+                }
+            }
+            crate::ast::expr::AcValue::ImpliedDo(ido) => {
+                fixed_char_array_constructor_len(b, &ido.values, locals, st, type_layouts)?
+            }
         };
-        let len = fixed_char_expr_len(b, expr, locals, st, type_layouts)?;
         max_len = max_len.max(len);
         saw_expr = true;
     }
@@ -40615,7 +40697,8 @@ pub(super) fn lower_array_expr_descriptor(
                 if let Some(elem_len_const) =
                     fixed_char_array_constructor_len(b, values, locals, st, type_layouts)
                 {
-                    let n = const_array_constructor_len(values)?;
+                    let n =
+                        const_array_constructor_len_in_scope(values, &HashMap::new(), Some(st))?;
                     let total_bytes = (elem_len_const * n).max(1) as u64;
                     let storage = b.alloca(IrType::Array(
                         Box::new(IrType::Int(IntWidth::I8)),

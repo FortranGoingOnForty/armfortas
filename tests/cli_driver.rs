@@ -45766,6 +45766,43 @@ fn allocatable_character_array_self_section_assignment_preserves_values() {
 }
 
 #[test]
+fn allocatable_fixed_character_array_implied_do_constructor_reallocates() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_fixed_character_array_implied_do_constructor_reallocates count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=15), allocatable :: name(:)\n  integer, parameter :: max_names = 10\n  integer :: i\n  name = [(repeat(' ', len(name)), i = 1, max_names)]\n  if (.not. allocated(name)) error stop 1\n  if (size(name) /= max_names) error stop 2\n  if (len(name) /= 15) error stop 3\n  name(3) = 'abc'\n  if (trim(name(3)) /= 'abc') error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("alloc_fixed_char_impdo_ctor", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("allocatable fixed char implied-do constructor compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "allocatable fixed char implied-do constructor compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("allocatable fixed char implied-do constructor run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "allocatable fixed char implied-do constructor run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn allocatable_integer_array_broadcasts_len_of_optional_char_array() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
