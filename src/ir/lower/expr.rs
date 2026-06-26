@@ -2607,7 +2607,12 @@ pub(crate) fn lower_expr_full(
                     ref_arg_vals.push(value);
                 }
                 if let Some(opt_flags) = opt_flags {
-                    for flag in opt_flags.iter().skip(ref_arg_vals.len()) {
+                    let missing_slots = arg_slots.len().saturating_sub(ref_arg_vals.len());
+                    for flag in opt_flags
+                        .iter()
+                        .skip(ref_arg_vals.len())
+                        .take(missing_slots)
+                    {
                         if *flag {
                             ref_arg_vals.push(b.const_i64(0));
                         }
