@@ -42239,7 +42239,10 @@ pub(super) fn lower_forall_nested(
     }
 }
 
-fn fixed_char_allocatable_array_elem_len(b: &mut FuncBuilder, info: &LocalInfo) -> Option<ValueId> {
+pub(super) fn fixed_char_allocatable_array_elem_len(
+    b: &mut FuncBuilder,
+    info: &LocalInfo,
+) -> Option<ValueId> {
     match info.char_kind {
         CharKind::Fixed(len) => Some(b.const_i64(len)),
         CharKind::FixedRuntime { len_addr } | CharKind::AssumedLen { len_addr } => {
@@ -42475,7 +42478,7 @@ fn try_lower_typed_char_allocatable_constructor_assign(
         return false;
     };
 
-    lower_allocatable_char_array_assign_from_desc(b, dest_desc, src_desc);
+    lower_allocatable_char_array_assign_from_desc(b, dest_desc, src_desc, None);
     let tmp_stat = b.alloca(IrType::Int(IntWidth::I32));
     let zero32 = b.const_i32(0);
     b.store(zero32, tmp_stat);
@@ -42491,6 +42494,7 @@ pub(super) fn lower_allocatable_char_array_assign_from_desc(
     b: &mut FuncBuilder,
     dest_desc: ValueId,
     src_desc: ValueId,
+    dest_elem_len_override: Option<ValueId>,
 ) {
     let stat = b.alloca(IrType::Int(IntWidth::I32));
     let zero32 = b.const_i32(0);
@@ -42501,11 +42505,19 @@ pub(super) fn lower_allocatable_char_array_assign_from_desc(
         IrType::Void,
     );
     b.store(zero32, stat);
-    b.call(
-        FuncRef::External("afs_allocate_like".into()),
-        vec![dest_desc, src_desc, stat],
-        IrType::Void,
-    );
+    if let Some(dest_elem_len) = dest_elem_len_override {
+        b.call(
+            FuncRef::External("afs_allocate_like_with_elem_size".into()),
+            vec![dest_desc, src_desc, dest_elem_len, stat],
+            IrType::Void,
+        );
+    } else {
+        b.call(
+            FuncRef::External("afs_allocate_like".into()),
+            vec![dest_desc, src_desc, stat],
+            IrType::Void,
+        );
+    }
 
     let dest_base = b.load_typed(dest_desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
     let src_base = b.load_typed(src_desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
@@ -42669,7 +42681,7 @@ pub(super) fn lower_array_assign(
                                         )
                                     {
                                         lower_allocatable_char_array_assign_from_desc(
-                                            b, dest_desc, src_desc,
+                                            b, dest_desc, src_desc, None,
                                         );
                                         let tmp_stat = b.alloca(IrType::Int(IntWidth::I32));
                                         let zero32 = b.const_i32(0);
@@ -42917,7 +42929,13 @@ pub(super) fn lower_array_assign(
                     None
                 };
                 if descriptor_backed_char_array(dest_info) {
-                    lower_allocatable_char_array_assign_from_desc(b, dest_desc, assign_src_desc);
+                    let dest_elem_len = fixed_char_allocatable_array_elem_len(b, dest_info);
+                    lower_allocatable_char_array_assign_from_desc(
+                        b,
+                        dest_desc,
+                        assign_src_desc,
+                        dest_elem_len,
+                    );
                     if let Some(tmp_desc) = tmp_src_desc {
                         let tmp_stat = b.alloca(IrType::Int(IntWidth::I32));
                         let zero32 = b.const_i32(0);
