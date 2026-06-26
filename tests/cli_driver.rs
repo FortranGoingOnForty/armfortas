@@ -975,6 +975,122 @@ fn imported_character_star_parameter_array_preserves_shape_and_length() {
 }
 
 #[test]
+fn character_parameter_array_reshape_uses_imported_char_constants() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=character_parameter_array_reshape_uses_imported_char_constants count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("char_param_array_imported_const");
+    let chars = write_program_in(
+        &dir,
+        "chars.f90",
+        "module chars\n  implicit none\n  character(len=1), parameter :: nl = achar(10)\nend module chars\n",
+    );
+    let provider = write_program_in(
+        &dir,
+        "provider.f90",
+        "module provider\n  use chars, only: nl\n  implicit none\n  character(len=*), parameter :: table(2,2) = reshape([character(len=5) :: 'yes', 'a'//nl//'b', 'no', 'zz'], [2, 2])\nend module provider\n",
+    );
+    let consumer = write_program_in(
+        &dir,
+        "consumer.f90",
+        "program p\n  use provider, only: table\n  implicit none\n  if (len(table) /= 5) error stop 1\n  if (table(1,1) /= 'yes  ') error stop 2\n  if (table(2,1) /= 'a'//achar(10)//'b  ') error stop 3\n  if (table(1,2) /= 'no   ') error stop 4\n  print *, 'ok'\nend program p\n",
+    );
+
+    let chars_obj = dir.join("chars.o");
+    let compile_chars = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            chars.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-o",
+            chars_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("chars module compile failed to spawn");
+    assert!(
+        compile_chars.status.success(),
+        "chars module compile failed: {}",
+        String::from_utf8_lossy(&compile_chars.stderr)
+    );
+
+    let provider_obj = dir.join("provider.o");
+    let compile_provider = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            provider.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-o",
+            provider_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("provider imported char const compile failed to spawn");
+    assert!(
+        compile_provider.status.success(),
+        "provider imported char const compile failed: {}",
+        String::from_utf8_lossy(&compile_provider.stderr)
+    );
+
+    let consumer_obj = dir.join("consumer.o");
+    let compile_consumer = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            consumer.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            "-o",
+            consumer_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("consumer imported char const compile failed to spawn");
+    assert!(
+        compile_consumer.status.success(),
+        "consumer imported char const compile failed: {}",
+        String::from_utf8_lossy(&compile_consumer.stderr)
+    );
+
+    let out = dir.join("consumer.bin");
+    let link = Command::new(compiler("armfortas"))
+        .args([
+            chars_obj.to_str().unwrap(),
+            provider_obj.to_str().unwrap(),
+            consumer_obj.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("imported char const link failed to spawn");
+    assert!(
+        link.status.success(),
+        "imported char const link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("imported char const run failed");
+    assert!(
+        run.status.success(),
+        "imported char const run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected imported char const output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+}
+
+#[test]
 fn stream_unformatted_narrow_integer_io_preserves_raw_widths() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
