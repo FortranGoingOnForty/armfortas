@@ -673,12 +673,20 @@ fn emit_parameter(
             .as_ref()
             .map(|hex| format!(" @charhex {}", hex))
             .unwrap_or_default();
-        writeln!(
-            out,
-            "@param {} : {} @ir {}{}",
-            name, type_with_attr, info.symbol, char_suf
-        )
-        .unwrap();
+        write!(out, "@param {} : {} @ir {}", name, type_with_attr, info.symbol).unwrap();
+        if info.deferred_char {
+            write!(out, " @deferred_char").unwrap();
+        }
+        if info.declared_rank > 0 {
+            write!(out, " @rank {}", info.declared_rank).unwrap();
+        }
+        if !info.dims.is_empty() {
+            write!(out, " @dims").unwrap();
+            for (lo, ext) in &info.dims {
+                write!(out, " {}:{}", lo, ext).unwrap();
+            }
+        }
+        writeln!(out, "{}", char_suf).unwrap();
     } else {
         let suf = if is_private { ", private" } else { "" };
         let char_suf = const_char_hex
