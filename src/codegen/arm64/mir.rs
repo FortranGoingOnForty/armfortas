@@ -539,6 +539,14 @@ impl MachineFunction {
         id
     }
 
+    /// Return the register class for a virtual register.
+    pub fn vreg_class(&self, id: VRegId) -> Option<RegClass> {
+        self.vregs
+            .get(id.0 as usize)
+            .filter(|vreg| vreg.id == id)
+            .map(|vreg| vreg.class)
+    }
+
     /// Create a new machine block.
     pub fn new_block(&mut self, label: &str) -> MBlockId {
         let id = MBlockId(self.next_block);
@@ -560,6 +568,10 @@ impl MachineFunction {
 
     /// Get a block by ID.
     pub fn block(&self, id: MBlockId) -> &MachineBlock {
+        let idx = id.0 as usize;
+        if idx < self.blocks.len() && self.blocks[idx].id == id {
+            return &self.blocks[idx];
+        }
         self.blocks
             .iter()
             .find(|b| b.id == id)
@@ -568,6 +580,10 @@ impl MachineFunction {
 
     /// Get a mutable block by ID.
     pub fn block_mut(&mut self, id: MBlockId) -> &mut MachineBlock {
+        let idx = id.0 as usize;
+        if idx < self.blocks.len() && self.blocks[idx].id == id {
+            return &mut self.blocks[idx];
+        }
         self.blocks
             .iter_mut()
             .find(|b| b.id == id)
