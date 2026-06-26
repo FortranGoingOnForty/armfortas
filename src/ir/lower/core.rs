@@ -17862,11 +17862,15 @@ pub(super) fn reorder_args_by_keyword_slots_with_formal_skip(
             }
         }
     };
-    let Some(arg_order) = arg_order else {
+    let Some(mut arg_order) = arg_order else {
         let mut slots: Vec<Option<crate::ast::expr::Argument>> = vec![None; formal_skip];
         slots.extend(args.iter().cloned().map(Some));
         return slots;
     };
+    // Imported .amod procedure scopes may carry ABI-only names such as
+    // `arg@len` for hidden character lengths. Those are appended by the
+    // call ABI code below, never passed as visible keyword/positional slots.
+    arg_order.retain(|name| !name.contains('@'));
     // Build slot list the size of the callee's declared params.
     // Positional actuals fill slots 0..K. Keyword actuals look up
     // their slot by name. Unused slots stay None (OPTIONAL args
@@ -19236,7 +19240,8 @@ pub(super) fn emit_resolved_bound_proc_call(
         optional_params
             .and_then(|m| cached_param_mask_for_lookup(st, m, k))
             .or_else(|| callee_optional_arg_mask(st, k))
-    });
+    })
+    .filter(|mask| mask.len() <= arg_slots.len());
     let callee_char_len_star_args = first_procedure_lookup(&abi_lookup_keys, |k| {
         char_len_star_params
             .and_then(|m| cached_param_mask_for_lookup(st, m, k))
