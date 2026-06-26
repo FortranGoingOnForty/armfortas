@@ -11067,6 +11067,122 @@ fn imported_type_bound_alias_preserves_absent_optional_slots() {
 }
 
 #[test]
+fn imported_type_bound_register_ignores_unrelated_optional_register_mask() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_type_bound_register_ignores_unrelated_optional_register_mask count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("imported_tbp_register_optional_mask");
+    let provider_src = write_program_in(
+        &dir,
+        "provider.f90",
+        "module provider_m\n  implicit none\n  type :: table_t\n  contains\n    procedure, private :: reg_char\n    procedure, private :: reg_int\n    generic :: register => reg_char, reg_int\n  end type\ncontains\n  subroutine reg_char(self, command, target_os, status)\n    class(table_t), intent(inout) :: self\n    character(len=*), intent(in) :: command\n    integer, intent(in) :: target_os\n    integer, intent(out) :: status\n    if (len_trim(command) <= 0) then\n      status = -1\n    else if (target_os /= 7) then\n      status = -2\n    else\n      status = len_trim(command)\n    end if\n  end subroutine\n\n  subroutine reg_int(self, code, status)\n    class(table_t), intent(inout) :: self\n    integer, intent(in) :: code\n    integer, intent(out) :: status\n    status = code\n  end subroutine\nend module\n",
+    );
+    let optional_src = write_program_in(
+        &dir,
+        "optional_register.f90",
+        "module optional_register_m\n  implicit none\ncontains\n  subroutine register(a, b, c, d, e, f)\n    integer, intent(in) :: a, b, c, d, f\n    integer, intent(in), optional :: e\n    if (present(e)) continue\n  end subroutine\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use provider_m\n  use optional_register_m, only: register\n  implicit none\n  type(table_t) :: table\n  character(len=*), parameter :: cmd = 'abcde'\n  integer :: status\n  call table%register(cmd, 7, status)\n  if (status /= 5) error stop status\n  print *, 'ok'\nend program\n",
+    );
+
+    let provider_obj = dir.join("provider.o");
+    let provider_compile = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            provider_src.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-o",
+            provider_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("provider compile failed to spawn");
+    assert!(
+        provider_compile.status.success(),
+        "provider compile failed: {}",
+        String::from_utf8_lossy(&provider_compile.stderr)
+    );
+
+    let optional_obj = dir.join("optional_register.o");
+    let optional_compile = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            optional_src.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-o",
+            optional_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("optional register compile failed to spawn");
+    assert!(
+        optional_compile.status.success(),
+        "optional register compile failed: {}",
+        String::from_utf8_lossy(&optional_compile.stderr)
+    );
+
+    let main_obj = dir.join("main.o");
+    let main_compile = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            main_src.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("main compile failed to spawn");
+    assert!(
+        main_compile.status.success(),
+        "main compile failed: {}",
+        String::from_utf8_lossy(&main_compile.stderr)
+    );
+
+    let out = dir.join("main.bin");
+    let link = Command::new(compiler("armfortas"))
+        .args([
+            provider_obj.to_str().unwrap(),
+            optional_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link failed to spawn");
+    assert!(
+        link.status.success(),
+        "link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed to spawn");
+    assert!(
+        run.status.success(),
+        "bound register call should receive the real character length: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected register test output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn type_bound_call_on_allocatable_component_array_element_mutates_real_receiver() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
