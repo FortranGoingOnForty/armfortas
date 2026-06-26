@@ -868,6 +868,113 @@ fn local_character_star_parameter_concat_uses_imported_lengths() {
 }
 
 #[test]
+fn imported_character_star_parameter_array_preserves_shape_and_length() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_character_star_parameter_array_preserves_shape_and_length count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("imported_char_star_param_array");
+    let provider = write_program_in(
+        &dir,
+        "provider.f90",
+        "module provider\n  implicit none\n  character(len=*), parameter :: table(2,3) = reshape([character(len=4) :: 'aa', 'bb', 'cc', 'dd', 'ee', 'ff'], [2, 3])\nend module provider\n",
+    );
+    let consumer = write_program_in(
+        &dir,
+        "consumer.f90",
+        "program p\n  use provider, only: table\n  implicit none\n  if (size(table, 1) /= 2) error stop 1\n  if (size(table, 2) /= 3) error stop 2\n  if (len(table) /= 4) error stop 3\n  print *, 'ok'\nend program p\n",
+    );
+    let provider_obj = dir.join("provider.o");
+    let compile_provider = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            provider.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-o",
+            provider_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("provider char star parameter array compile failed to spawn");
+    assert!(
+        compile_provider.status.success(),
+        "provider char star parameter array compile failed: {}",
+        String::from_utf8_lossy(&compile_provider.stderr)
+    );
+
+    let amod = std::fs::read_to_string(dir.join("provider.amod"))
+        .expect("provider .amod should be emitted");
+    assert!(
+        amod.contains("@param table : character(len=4)")
+            && amod.contains("@rank 2")
+            && amod.contains("@dims 1:2 1:3"),
+        "provider .amod should preserve table length and shape: {}",
+        amod
+    );
+
+    let consumer_obj = dir.join("consumer.o");
+    let compile_consumer = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            consumer.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            "-o",
+            consumer_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("consumer char star parameter array compile failed to spawn");
+    assert!(
+        compile_consumer.status.success(),
+        "consumer char star parameter array compile failed: {}",
+        String::from_utf8_lossy(&compile_consumer.stderr)
+    );
+    let undefined = undefined_symbols(&consumer_obj);
+    assert!(
+        !undefined
+            .iter()
+            .any(|sym| sym.trim_start_matches('_') == "size"),
+        "consumer should fold imported table SIZE() from .amod shape: {:?}",
+        undefined
+    );
+
+    let out = dir.join("consumer.bin");
+    let link = Command::new(compiler("armfortas"))
+        .args([
+            provider_obj.to_str().unwrap(),
+            consumer_obj.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("consumer char star parameter array link failed to spawn");
+    assert!(
+        link.status.success(),
+        "consumer char star parameter array link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("consumer char star parameter array run failed");
+    assert!(
+        run.status.success(),
+        "consumer char star parameter array run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected consumer char star parameter array output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+}
+
+#[test]
 fn stream_unformatted_narrow_integer_io_preserves_raw_widths() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
