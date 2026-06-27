@@ -23080,7 +23080,7 @@ pub(super) fn callee_bind_c_char_arg_mask(
                 .get(arg_name)
                 .map(|sym| {
                     is_bind_c
-                        && matches!(sym.type_info, Some(TypeInfo::Character { len: None, .. }))
+                        && matches!(sym.type_info, Some(TypeInfo::Character { .. }))
                         && !sym.attrs.allocatable
                         && !sym.attrs.pointer
                 })
