@@ -2605,6 +2605,48 @@ fn assumed_length_character_dummy_keeps_hidden_length_abi() {
 }
 
 #[test]
+fn default_character_dummy_does_not_shift_assumed_length_hidden_args() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=default_character_dummy_does_not_shift_assumed_length_hidden_args count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\ncontains\n  logical function matchrange(c, str)\n    character, intent(in) :: c\n    character(len=*), intent(in) :: str\n    matchrange = len(str) >= 3\n    if (.not. matchrange) return\n    matchrange = c /= '-' &\n      .and. str(1:1) /= '-' &\n      .and. str(2:2) == '-' &\n      .and. iachar(c) >= iachar(str(1:1)) &\n      .and. iachar(c) <= iachar(str(3:3))\n  end function matchrange\nend module m\nprogram p\n  use m\n  implicit none\n  if (.not. matchrange('a', 'a-h')) error stop 1\n  if (.not. matchrange('b', 'a-h')) error stop 2\n  if (matchrange('z', 'a-h')) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("default_char_hidden_len_order", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("default-character hidden-length regression compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "default-character hidden-length regression should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "default-character hidden-length regression should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected default-character hidden-length output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fixed_char_out_dummy_writes_back_to_caller() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
