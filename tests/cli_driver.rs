@@ -35558,6 +35558,88 @@ end program
 }
 
 #[test]
+fn block_scalar_shadow_does_not_inherit_prior_array_rank_for_generic_dispatch() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=block_scalar_shadow_does_not_inherit_prior_array_rank_for_generic_dispatch count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        r#"
+module check_like
+  implicit none
+  type :: error_type
+    integer :: code = 0
+  end type
+  interface check
+    module procedure check_logical
+  end interface
+contains
+  subroutine check_logical(error, expression)
+    type(error_type), allocatable, intent(out) :: error
+    logical, intent(in) :: expression
+    if (.not. expression) allocate(error)
+  end subroutine
+end module
+
+program p
+  use check_like, only: error_type, check
+  implicit none
+  type(error_type), allocatable :: error
+
+  block
+    character(5) :: x(2)
+    x = ['abcde', 'fghij']
+    call check(error, all(x == ['abcde', 'fghij']))
+    if (allocated(error)) error stop 1
+  end block
+
+  block
+    character(4) :: x
+    x = 'abcd'
+    call check(error, x == 'abcd')
+    if (allocated(error)) error stop 2
+  end block
+
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("block_scalar_rank_shadow_generic", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("block scalar rank-shadow compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "scalar BLOCK local should not inherit rank from prior array BLOCK local: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("block scalar rank-shadow run failed");
+    assert!(
+        run.status.success(),
+        "block scalar rank-shadow program should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected block scalar rank-shadow output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn nested_imported_generic_result_rank_dispatches_outer_call() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
