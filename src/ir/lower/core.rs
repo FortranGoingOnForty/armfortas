@@ -13664,11 +13664,6 @@ pub(super) fn actual_expr_rank(
                         }
                     }
                 }
-                if let Some(symbol_rank) = symbol_rank {
-                    if symbol_rank > 0 {
-                        return Some(symbol_rank);
-                    }
-                }
                 return Some(0);
             }
             Some(symbol_rank.unwrap_or(0))
