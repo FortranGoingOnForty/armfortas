@@ -46553,6 +46553,43 @@ fn internal_namelist_read_keeps_quoted_commas_and_array_continuations() {
 }
 
 #[test]
+fn namelist_scalar_derived_type_reads_positional_components() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=namelist_scalar_derived_type_reads_positional_components count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  type point\n    integer :: x = 0\n    integer :: y = 0\n    character(len=20) :: color = 'red'\n  end type\n  type(point) :: dot\n  character(len=80) :: readme\n  character(len=160) :: line\n  integer :: unit, ios\n  logical :: saw_x, saw_y, saw_color\n  namelist /nml_dot/ dot\n  readme = '&nml_dot dot=10,20,\"green\"/'\n  read(readme, nml=nml_dot)\n  if (dot%x /= 10) error stop 1\n  if (dot%y /= 20) error stop 2\n  if (trim(dot%color) /= 'green') error stop 3\n  open(newunit=unit, status='scratch', action='readwrite')\n  write(unit, nml=nml_dot)\n  rewind(unit)\n  saw_x = .false.\n  saw_y = .false.\n  saw_color = .false.\n  do\n    read(unit, '(a)', iostat=ios) line\n    if (ios /= 0) exit\n    if (index(line, 'DOT%X') > 0 .and. index(line, '10') > 0) saw_x = .true.\n    if (index(line, 'DOT%Y') > 0 .and. index(line, '20') > 0) saw_y = .true.\n    if (index(line, 'DOT%COLOR') > 0 .and. index(line, 'green') > 0) saw_color = .true.\n  end do\n  close(unit)\n  if (.not. saw_x) error stop 4\n  if (.not. saw_y) error stop 5\n  if (.not. saw_color) error stop 6\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("namelist_scalar_derived_components", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("scalar derived namelist compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "scalar derived namelist compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("scalar derived namelist run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "scalar derived namelist run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn namelist_write_emits_all_fixed_character_array_elements() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

@@ -2484,7 +2484,58 @@ fn namelist_assign_from_text(
     //   var=val            — simple scalar assignment
     //   var(index)=val     — array element assignment (1-based)
     //   var=n*val          — repeat notation (set n consecutive elements)
-    let mut continuation: Option<(usize, usize)> = None;
+    enum Continuation {
+        Array {
+            entry_index: usize,
+            next_index: usize,
+        },
+        Components {
+            entry_indices: Vec<usize>,
+            next_component: usize,
+        },
+    }
+
+    fn component_entries(entries: &[NamelistEntry], aggregate_name: &str) -> Vec<usize> {
+        let prefix = format!("{}%", aggregate_name);
+        entries
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, entry)| {
+                if entry.data.is_null() {
+                    return None;
+                }
+                let ename = unsafe_str(entry.name, entry.name_len).to_lowercase();
+                let suffix = ename.strip_prefix(&prefix)?;
+                if suffix.is_empty() || suffix.contains('%') {
+                    None
+                } else {
+                    Some(idx)
+                }
+            })
+            .collect()
+    }
+
+    fn assign_component_values(
+        entries: &[NamelistEntry],
+        entry_indices: &[usize],
+        start_component: usize,
+        val_str: &str,
+        repeat: usize,
+    ) -> usize {
+        let mut next = start_component;
+        for _ in 0..repeat.max(1) {
+            let Some(entry_index) = entry_indices.get(next).copied() else {
+                break;
+            };
+            if let Some(entry) = entries.get(entry_index) {
+                namelist_assign_value(entry, val_str, None, 1);
+            }
+            next += 1;
+        }
+        next
+    }
+
+    let mut continuation: Option<Continuation> = None;
     for pair in split_namelist_fields(content) {
         let pair = pair.trim();
         if let Some(eq_pos) = pair.find('=') {
@@ -2506,6 +2557,7 @@ fn namelist_assign_from_text(
 
             // Find the matching entry.
             continuation = None;
+            let mut matched = false;
             for (entry_index, entry) in entries_slice.iter().enumerate() {
                 if entry.data.is_null() {
                     continue;
@@ -2515,21 +2567,73 @@ fn namelist_assign_from_text(
                     namelist_assign_value(entry, actual_val, array_index, repeat_count);
                     let next_index = array_index.unwrap_or(1).saturating_add(repeat_count);
                     if entry.data_type == 2 && next_index <= entry.elem_count.max(1) as usize {
-                        continuation = Some((entry_index, next_index));
+                        continuation = Some(Continuation::Array {
+                            entry_index,
+                            next_index,
+                        });
                     }
+                    matched = true;
                     break;
                 }
             }
-        } else if let Some((entry_index, next_index)) = continuation {
+            if !matched && array_index.is_none() {
+                let entry_indices = component_entries(entries_slice, &var_name);
+                if !entry_indices.is_empty() {
+                    let next_component = assign_component_values(
+                        entries_slice,
+                        &entry_indices,
+                        0,
+                        actual_val,
+                        repeat_count,
+                    );
+                    if next_component < entry_indices.len() {
+                        continuation = Some(Continuation::Components {
+                            entry_indices,
+                            next_component,
+                        });
+                    }
+                }
+            }
+        } else if let Some(cont) = continuation.take() {
             let (repeat_count, actual_val) = parse_namelist_repeat(pair);
-            if let Some(entry) = entries_slice.get(entry_index) {
-                namelist_assign_value(entry, actual_val, Some(next_index), repeat_count);
-                let next_index = next_index.saturating_add(repeat_count);
-                continuation = if next_index <= entry.elem_count.max(1) as usize {
-                    Some((entry_index, next_index))
-                } else {
-                    None
-                };
+            match cont {
+                Continuation::Array {
+                    entry_index,
+                    next_index,
+                } => {
+                    if let Some(entry) = entries_slice.get(entry_index) {
+                        namelist_assign_value(entry, actual_val, Some(next_index), repeat_count);
+                        let next_index = next_index.saturating_add(repeat_count);
+                        continuation = if next_index <= entry.elem_count.max(1) as usize {
+                            Some(Continuation::Array {
+                                entry_index,
+                                next_index,
+                            })
+                        } else {
+                            None
+                        };
+                    }
+                }
+                Continuation::Components {
+                    entry_indices,
+                    next_component,
+                } => {
+                    let next_component = assign_component_values(
+                        entries_slice,
+                        &entry_indices,
+                        next_component,
+                        actual_val,
+                        repeat_count,
+                    );
+                    continuation = if next_component < entry_indices.len() {
+                        Some(Continuation::Components {
+                            entry_indices,
+                            next_component,
+                        })
+                    } else {
+                        None
+                    };
+                }
             }
         }
     }
