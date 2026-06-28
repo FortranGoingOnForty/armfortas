@@ -858,9 +858,10 @@ pub fn compute_layout_with_attrs(
                     .array_spec
                     .as_ref()
                     .or(dimension_attr_specs);
-                let declared_array = explicit_array_specs.is_some();
+                let declared_rank = explicit_array_specs.map_or(0, |specs| specs.len());
+                let declared_array = declared_rank > 0;
                 let dims = if is_allocatable || is_pointer {
-                    Vec::new()
+                    vec![(1, 0); declared_rank]
                 } else {
                     eval_explicit_array_dims(explicit_array_specs, const_params)
                 };
@@ -1612,6 +1613,7 @@ mod tests {
         let field = layout.field("lines").expect("missing lines field");
 
         assert_eq!(field.size, 384);
+        assert_eq!(field.dims, vec![(1, 0)]);
         assert!(field.allocatable);
         assert!(field.declared_array);
         assert!(matches!(

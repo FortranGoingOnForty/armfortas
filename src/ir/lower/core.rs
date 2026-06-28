@@ -44937,7 +44937,7 @@ pub(super) fn component_intrinsic_local_info(
         return Some(LocalInfo {
             addr: field_ptr,
             ty: field_storage_ir_type(&field, tl),
-            dims: vec![],
+            dims: field.dims.clone(),
             allocatable: true,
             descriptor_arg: false,
             by_ref: false,
