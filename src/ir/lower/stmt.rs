@@ -222,6 +222,85 @@ fn lower_namelist_entry_value(
     }
 }
 
+#[derive(Clone)]
+enum NamelistEntrySource {
+    Local {
+        name: String,
+    },
+    Component {
+        entry_name: String,
+        base_name: String,
+        component: String,
+        span: crate::lexer::Span,
+        is_logical: bool,
+    },
+}
+
+impl NamelistEntrySource {
+    fn entry_name(&self) -> &str {
+        match self {
+            NamelistEntrySource::Local { name } => name,
+            NamelistEntrySource::Component { entry_name, .. } => entry_name,
+        }
+    }
+}
+
+fn expand_namelist_entry_sources(
+    ctx: &LowerCtx<'_>,
+    vars: &[String],
+    span: crate::lexer::Span,
+) -> Vec<NamelistEntrySource> {
+    let mut sources = Vec::new();
+    for var_name in vars {
+        let var_key = var_name.to_lowercase();
+        if let Some(info) = ctx.locals.get(&var_key) {
+            if info.dims.is_empty() && !info.allocatable && !info.is_pointer {
+                if let Some(type_name) = info.derived_type.as_deref() {
+                    if let Some(layout) = ctx.type_layouts.get(type_name) {
+                        sources.extend(layout.fields.iter().map(|field| {
+                            NamelistEntrySource::Component {
+                                entry_name: format!("{}%{}", var_name, field.name),
+                                base_name: var_name.clone(),
+                                component: field.name.clone(),
+                                span,
+                                is_logical: matches!(
+                                    field.type_info,
+                                    crate::sema::symtab::TypeInfo::Logical { .. }
+                                ),
+                            }
+                        }));
+                        continue;
+                    }
+                }
+            }
+        }
+        sources.push(NamelistEntrySource::Local {
+            name: var_name.clone(),
+        });
+    }
+    sources
+}
+
+fn namelist_component_expr(
+    base_name: &str,
+    component: &str,
+    span: crate::lexer::Span,
+) -> SpannedExpr {
+    let base = crate::ast::Spanned::new(
+        Expr::Name {
+            name: base_name.to_string(),
+        },
+        span,
+    );
+    crate::ast::Spanned::new(
+        Expr::ComponentAccess {
+            base: Box::new(base),
+            component: component.to_string(),
+        },
+        span,
+    )
+}
+
 fn lower_namelist_entries(
     b: &mut FuncBuilder,
     ctx: &mut LowerCtx,
@@ -240,36 +319,67 @@ fn lower_namelist_entries(
         lower_stmt_error(span, &format!("'{}' is not a NAMELIST group", group_name));
     }
     let vars = sym.arg_names.clone();
+    let sources = expand_namelist_entry_sources(ctx, &vars, span);
     let entry_size = 48_i64;
     let entries = b.alloca(IrType::Array(
         Box::new(IrType::Int(IntWidth::I8)),
-        entry_size as u64 * vars.len() as u64,
+        entry_size as u64 * sources.len() as u64,
     ));
     let ptr_ty = IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)));
-    for (idx, var_name) in vars.iter().enumerate() {
-        let var_key = var_name.to_lowercase();
-        let Some(info) = ctx.locals.get(&var_key).cloned() else {
-            lower_stmt_error(
+    for (idx, source) in sources.iter().enumerate() {
+        let entry_name = source.entry_name();
+        let (info, is_logical) = match source {
+            NamelistEntrySource::Local { name } => {
+                let var_key = name.to_lowercase();
+                let Some(info) = ctx.locals.get(&var_key).cloned() else {
+                    lower_stmt_error(
+                        span,
+                        &format!(
+                            "NAMELIST variable '{}' is not available in this scope",
+                            name
+                        ),
+                    );
+                };
+                let is_logical = ctx
+                    .st
+                    .lookup_local_then_any(ctx.proc_scope_id, &var_key)
+                    .and_then(|sym| sym.type_info.as_ref())
+                    .is_some_and(|ty| matches!(ty, crate::sema::symtab::TypeInfo::Logical { .. }));
+                (info, is_logical)
+            }
+            NamelistEntrySource::Component {
+                base_name,
+                component,
                 span,
-                &format!("NAMELIST variable '{}' is not available in this scope", var_name),
-            );
+                is_logical,
+                ..
+            } => {
+                let expr = namelist_component_expr(base_name, component, *span);
+                let Some(info) =
+                    component_field_local_info(b, &ctx.locals, &expr, ctx.st, ctx.type_layouts)
+                else {
+                    lower_stmt_error(
+                        *span,
+                        &format!(
+                            "NAMELIST variable '{}' is not available in this scope",
+                            entry_name
+                        ),
+                    );
+                };
+                (info, *is_logical)
+            }
         };
-        let is_logical = ctx
-            .st
-            .lookup_local_then_any(ctx.proc_scope_id, &var_key)
-            .and_then(|sym| sym.type_info.as_ref())
-            .is_some_and(|ty| matches!(ty, crate::sema::symtab::TypeInfo::Logical { .. }));
         let Some((data_ptr, data_type, data_len, elem_count)) =
             lower_namelist_entry_value(b, &info, is_logical)
         else {
             lower_stmt_error(
                 span,
-                &format!("NAMELIST variable '{}' has unsupported type", var_name),
+                &format!("NAMELIST variable '{}' has unsupported type", entry_name),
             );
         };
         let base = idx as i64 * entry_size;
-        let name_ptr = b.const_string(var_name.as_bytes());
-        let name_len = b.const_i64(var_name.len() as i64);
+        let name_ptr = b.const_string(entry_name.as_bytes());
+        let name_len = b.const_i64(entry_name.len() as i64);
         let data_type_value = b.const_i32(data_type);
         store_byte_aggregate_field(b, entries, base, ptr_ty.clone(), name_ptr);
         store_byte_aggregate_field(
@@ -296,7 +406,7 @@ fn lower_namelist_entries(
             elem_count,
         );
     }
-    (entries, b.const_i32(vars.len() as i32))
+    (entries, b.const_i32(sources.len() as i32))
 }
 
 fn namelist_internal_io_buffer(
