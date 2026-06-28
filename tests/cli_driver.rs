@@ -35640,6 +35640,95 @@ end program
 }
 
 #[test]
+fn select_type_allocatable_component_preserves_rank_for_generic_dispatch() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=select_type_allocatable_component_preserves_rank_for_generic_dispatch count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        r#"
+module sparse_like
+  implicit none
+  type :: coo_type
+    integer, allocatable :: index(:,:)
+    integer :: nnz = 0
+    integer :: nrows = 0
+    integer :: ncols = 0
+  end type
+  interface sort_coo
+    module procedure sort_coo_unique
+  end interface
+contains
+  subroutine sort_coo_unique(a, n, num_rows, num_cols)
+    integer, intent(inout) :: a(2,*)
+    integer, intent(inout) :: n
+    integer, intent(in) :: num_rows
+    integer, intent(in) :: num_cols
+    if (n /= 1) error stop 1
+    if (num_rows /= 2) error stop 2
+    if (num_cols /= 3) error stop 3
+    if (a(1,1) /= 2 .or. a(2,1) /= 3) error stop 4
+  end subroutine
+
+  subroutine run(coo)
+    class(coo_type), intent(inout) :: coo
+    select type(coo)
+    type is(coo_type)
+      call sort_coo(coo%index, coo%nnz, coo%nrows, coo%ncols)
+    end select
+  end subroutine
+end module
+
+program p
+  use sparse_like, only: coo_type, run
+  implicit none
+  type(coo_type) :: coo
+  allocate(coo%index(2,1))
+  coo%index(:,1) = [2, 3]
+  coo%nnz = 1
+  coo%nrows = 2
+  coo%ncols = 3
+  call run(coo)
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("select_type_component_rank_generic", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("select-type component-rank compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "allocatable rank-2 component should match rank-2 generic formal: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("select-type component-rank run failed");
+    assert!(
+        run.status.success(),
+        "select-type component-rank program should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected select-type component-rank output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn nested_imported_generic_result_rank_dispatches_outer_call() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
