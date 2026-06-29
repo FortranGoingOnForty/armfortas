@@ -15471,6 +15471,43 @@ fn cross_tu_polymorphic_name_bound_call_uses_descriptor_lookup() {
 }
 
 #[test]
+fn same_type_as_intrinsic_compares_polymorphic_dynamic_tags() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=same_type_as_intrinsic_compares_polymorphic_dynamic_tags count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type, abstract :: base_t\n    integer :: id = 0\n  end type\n  type, extends(base_t) :: child_t\n  end type\n  type, extends(base_t) :: sibling_t\n  end type\ncontains\n  logical function same_id(left, right) result(ok)\n    class(base_t), intent(in) :: left\n    class(base_t), intent(in) :: right\n    ok = same_type_as(a=left, b=right) .and. (left%id == right%id)\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  type(child_t) :: a, b\n  type(sibling_t) :: c\n  a%id = 7\n  b%id = 7\n  c%id = 7\n  if (.not. same_id(a, b)) error stop 1\n  if (same_id(a, c)) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("same_type_as_polymorphic_tags", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("same_type_as polymorphic compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "same_type_as polymorphic should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("same_type_as polymorphic run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "same_type_as polymorphic run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn imported_derived_function_result_with_explicit_return_round_trips_through_amod_and_runs() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

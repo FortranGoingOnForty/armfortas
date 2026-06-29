@@ -1063,7 +1063,9 @@ pub fn intrinsic_result_type(name: &str, args: &[FortranType]) -> Option<Fortran
         }
 
         // Logical-valued.
-        "allocated" | "associated" | "present" | "btest" => Some(FortranType::default_logical()),
+        "allocated" | "associated" | "present" | "same_type_as" | "btest" => {
+            Some(FortranType::default_logical())
+        }
         "lge" | "lgt" | "lle" | "llt" => Some(FortranType::default_logical()),
         "any" | "all" => Some(FortranType::default_logical()),
 
