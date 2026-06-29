@@ -709,6 +709,86 @@ end program
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn cross_tu_submodule_array_function_passes_explicit_shape_actuals_by_data_pointer() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=cross_tu_submodule_array_function_passes_explicit_shape_actuals_by_data_pointer count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let parent_f90 = dir.join("cross_parent.f90");
+    let child_f90 = dir.join("cross_child.f90");
+    let main_f90 = dir.join("cross_main.f90");
+    let parent_o = dir.join("cross_parent.o");
+    let child_o = dir.join("cross_child.o");
+    let main_o = dir.join("cross_main.o");
+    let binary = dir.join("cross_bin");
+
+    std::fs::write(
+        &parent_f90,
+        r#"module cross_mod
+  implicit none
+  interface
+    module function cross_i(a, b) result(res)
+      integer, intent(in) :: a(3), b(3)
+      integer :: res(3)
+    end function
+  end interface
+end module
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &child_f90,
+        r#"submodule (cross_mod) cross_impl
+contains
+  pure module function cross_i(a, b) result(res)
+    integer, intent(in) :: a(3), b(3)
+    integer :: res(3)
+    res(1) = a(2) * b(3) - a(3) * b(2)
+    res(2) = a(3) * b(1) - a(1) * b(3)
+    res(3) = a(1) * b(2) - a(2) * b(1)
+  end function
+end submodule
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &main_f90,
+        r#"program p
+  use cross_mod, only: cross_i
+  implicit none
+  integer :: u(3), v(3), expected(3), diff(3)
+
+  u = [1, 0, 0]
+  v = [0, 1, 0]
+  expected = [0, 0, 1]
+  diff = expected - cross_i(u, v)
+  if (any(diff /= 0)) error stop 1
+  print *, "ok"
+end program
+"#,
+    )
+    .unwrap();
+
+    compile_file(&compiler, &parent_f90, &parent_o, None);
+    compile_file(&compiler, &child_f90, &child_o, Some(&dir));
+    compile_file(&compiler, &main_f90, &main_o, Some(&dir));
+    link_files(&[&main_o, &child_o, &parent_o], &binary);
+    let output = run_binary(&binary);
+    assert!(
+        output.contains("ok"),
+        "cross-TU submodule array result returned wrong values:\n{}",
+        output
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // l07 DoD: the multi-source driver (`armfortas a.f90 b.f90 ...` in one
 // invocation) topologically orders submodules after their parents, even
 // when files are given in the worst order. Before l07's dep_scan support,
