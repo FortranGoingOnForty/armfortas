@@ -879,6 +879,102 @@ end program
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn cross_tu_submodule_scalar_function_call_broadcasts_to_descriptor_array() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=cross_tu_submodule_scalar_function_call_broadcasts_to_descriptor_array count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let parent_f90 = dir.join("broadcast_parent.f90");
+    let child_f90 = dir.join("broadcast_child.f90");
+    let main_f90 = dir.join("broadcast_main.f90");
+    let parent_o = dir.join("broadcast_parent.o");
+    let child_o = dir.join("broadcast_child.o");
+    let main_o = dir.join("broadcast_main.o");
+    let binary = dir.join("broadcast_bin");
+
+    std::fs::write(
+        &parent_f90,
+        r#"module broadcast_parent
+  implicit none
+  interface
+    module function wrap(a, order) result(e)
+      real, intent(in) :: a(:, :)
+      integer, optional, intent(in) :: order
+      real, allocatable :: e(:, :)
+    end function
+    module subroutine mark_inplace(a, order)
+      real, intent(inout) :: a(:, :)
+      integer, optional, intent(in) :: order
+    end subroutine
+  end interface
+end module
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &child_f90,
+        r#"submodule (broadcast_parent) broadcast_impl
+contains
+  module function wrap(a, order) result(e)
+    real, intent(in) :: a(:, :)
+    integer, optional, intent(in) :: order
+    real, allocatable :: e(:, :)
+    e = a
+    call mark_inplace(e, order)
+  end function
+
+  module subroutine mark_inplace(a, order)
+    real, intent(inout) :: a(:, :)
+    integer, optional, intent(in) :: order
+    if (present(order)) then
+      a = real(order)
+    else
+      a = 11.0
+    end if
+  end subroutine
+end submodule
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &main_f90,
+        r#"program p
+  use broadcast_parent, only: wrap
+  implicit none
+  real :: a(2, 2)
+  real, allocatable :: e(:, :)
+
+  a = 1.0
+  e = wrap(a)
+  if (any(abs(e - 11.0) > 1.0e-6)) error stop 1
+  e = wrap(a, order=3)
+  if (any(abs(e - 3.0) > 1.0e-6)) error stop 2
+  print *, "ok"
+end program
+"#,
+    )
+    .unwrap();
+
+    compile_file(&compiler, &parent_f90, &parent_o, None);
+    compile_file(&compiler, &child_f90, &child_o, Some(&dir));
+    compile_file(&compiler, &main_f90, &main_o, Some(&dir));
+    link_files(&[&main_o, &child_o, &parent_o], &binary);
+    let output = run_binary(&binary);
+    assert!(
+        output.contains("ok"),
+        "cross-TU submodule scalar function-call broadcast failed:\n{}",
+        output
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // l07 DoD: the multi-source driver (`armfortas a.f90 b.f90 ...` in one
 // invocation) topologically orders submodules after their parents, even
 // when files are given in the worst order. Before l07's dep_scan support,
