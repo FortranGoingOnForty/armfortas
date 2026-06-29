@@ -8516,7 +8516,12 @@ pub(super) fn eval_const_scalar_with_any_scope(
             let Expr::Name { name: arr_name } = &arg_expr.node else {
                 return None;
             };
-            let sym = st.find_symbol_any_scope(&arr_name.to_ascii_lowercase())?;
+            let arr_key = arr_name.to_ascii_lowercase();
+            let sym = if let Some(scope_id) = current_proc_scope() {
+                st.lookup_in(scope_id, &arr_key)?
+            } else {
+                st.find_symbol_any_scope(&arr_key)?
+            };
             if sym.attrs.array_spec.is_empty() {
                 return None;
             }

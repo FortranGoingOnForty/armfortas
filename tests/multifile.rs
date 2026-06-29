@@ -975,6 +975,89 @@ end program
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn submodule_runtime_shape_local_uses_dummy_size_not_global_shadow() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=submodule_runtime_shape_local_uses_dummy_size_not_global_shadow count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let parent_f90 = dir.join("shape_parent.f90");
+    let child_f90 = dir.join("shape_child.f90");
+    let main_f90 = dir.join("shape_main.f90");
+    let parent_o = dir.join("shape_parent.o");
+    let child_o = dir.join("shape_child.o");
+    let main_o = dir.join("shape_main.o");
+    let binary = dir.join("shape_bin");
+
+    std::fs::write(
+        &parent_f90,
+        r#"module shape_parent
+  implicit none
+  real :: a(1, 1)
+  interface
+    module subroutine fill(a)
+      real, intent(inout) :: a(:, :)
+    end subroutine
+  end interface
+end module
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &child_f90,
+        r#"submodule (shape_parent) shape_impl
+contains
+  module subroutine fill(a)
+    real, intent(inout) :: a(:, :)
+    real :: tmp(size(a, 1), size(a, 2))
+    integer :: i, j
+
+    do j = 1, size(a, 2)
+      do i = 1, size(a, 1)
+        tmp(i, j) = 10.0 * real(i) + real(j)
+      end do
+    end do
+    a = tmp
+  end subroutine
+end submodule
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &main_f90,
+        r#"program p
+  use shape_parent, only: fill
+  implicit none
+  real :: x(5, 5)
+
+  x = 0.0
+  call fill(x)
+  if (abs(x(5, 5) - 55.0) > 1.0e-6) error stop 1
+  print *, "ok"
+end program
+"#,
+    )
+    .unwrap();
+
+    compile_file(&compiler, &parent_f90, &parent_o, None);
+    compile_file(&compiler, &child_f90, &child_o, Some(&dir));
+    compile_file(&compiler, &main_f90, &main_o, Some(&dir));
+    link_files(&[&main_o, &child_o, &parent_o], &binary);
+    let output = run_binary(&binary);
+    assert!(
+        output.contains("ok"),
+        "submodule runtime-shape local used the wrong size() binding:\n{}",
+        output
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // l07 DoD: the multi-source driver (`armfortas a.f90 b.f90 ...` in one
 // invocation) topologically orders submodules after their parents, even
 // when files are given in the worst order. Before l07's dep_scan support,
