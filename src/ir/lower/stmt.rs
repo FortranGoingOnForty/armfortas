@@ -1468,6 +1468,18 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                     );
                                                 }
                                             } else {
+                                                if actual_expr_rank(
+                                                    array_rhs,
+                                                    &ctx.locals,
+                                                    ctx.st,
+                                                    Some(ctx.type_layouts),
+                                                ) == Some(0)
+                                                {
+                                                    lower_array_assign(
+                                                        b, ctx, name, &info, array_rhs,
+                                                    );
+                                                    return;
+                                                }
                                                 // Function returns a temp descriptor. Mirror
                                                 // the alloc_return path: when dest is a real
                                                 // descriptor, route through afs_assign_allocatable;
@@ -1563,6 +1575,16 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                 );
                                             }
                                         } else {
+                                            if actual_expr_rank(
+                                                array_rhs,
+                                                &ctx.locals,
+                                                ctx.st,
+                                                Some(ctx.type_layouts),
+                                            ) == Some(0)
+                                            {
+                                                lower_array_assign(b, ctx, name, &info, array_rhs);
+                                                return;
+                                            }
                                             // Indirect callee: same dest split as above.
                                             let src_elem_ty = array_function_result_elem_type(
                                                 b,
