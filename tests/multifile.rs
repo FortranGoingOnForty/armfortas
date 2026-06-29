@@ -759,6 +759,96 @@ end program
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn cross_tu_submodule_allocatable_array_result_preserves_amod_abi() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=cross_tu_submodule_allocatable_array_result_preserves_amod_abi count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let parent_f90 = dir.join("alloc_parent.f90");
+    let child_f90 = dir.join("alloc_child.f90");
+    let main_f90 = dir.join("alloc_main.f90");
+    let parent_o = dir.join("alloc_parent.o");
+    let child_o = dir.join("alloc_child.o");
+    let main_o = dir.join("alloc_main.o");
+    let binary = dir.join("alloc_bin");
+
+    std::fs::write(
+        &parent_f90,
+        r#"module alloc_parent
+  implicit none
+  interface
+    module function make_square(n) result(a)
+      integer, intent(in) :: n
+      real, allocatable :: a(:, :)
+    end function
+  end interface
+end module
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &child_f90,
+        r#"submodule (alloc_parent) alloc_impl
+contains
+  module function make_square(n) result(a)
+    integer, intent(in) :: n
+    real, allocatable :: a(:, :)
+    integer :: i
+    allocate(a(n, n))
+    a = 0.0
+    do i = 1, n
+      a(i, i) = real(i)
+    end do
+  end function
+end submodule
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &main_f90,
+        r#"program p
+  use alloc_parent, only: make_square
+  implicit none
+  real, allocatable :: a(:, :)
+
+  a = make_square(3)
+  if (.not. allocated(a)) error stop 1
+  if (size(a, 1) /= 3 .or. size(a, 2) /= 3) error stop 2
+  if (abs(a(1, 1) - 1.0) > 1.0e-6) error stop 3
+  if (abs(a(2, 2) - 2.0) > 1.0e-6) error stop 4
+  if (abs(a(3, 3) - 3.0) > 1.0e-6) error stop 5
+  print *, "ok"
+end program
+"#,
+    )
+    .unwrap();
+
+    compile_file(&compiler, &parent_f90, &parent_o, None);
+    let amod = std::fs::read_to_string(dir.join("alloc_parent.amod")).unwrap();
+    assert!(
+        amod.contains("@function make_square -> real, result_allocatable, result_rank=2"),
+        "allocatable module-function result ABI missing from parent .amod:\n{}",
+        amod
+    );
+    compile_file(&compiler, &child_f90, &child_o, Some(&dir));
+    compile_file(&compiler, &main_f90, &main_o, Some(&dir));
+    link_files(&[&main_o, &child_o, &parent_o], &binary);
+    let output = run_binary(&binary);
+    assert!(
+        output.contains("ok"),
+        "cross-TU submodule allocatable array result returned wrong values:\n{}",
+        output
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // l07 DoD: the multi-source driver (`armfortas a.f90 b.f90 ...` in one
 // invocation) topologically orders submodules after their parents, even
 // when files are given in the worst order. Before l07's dep_scan support,

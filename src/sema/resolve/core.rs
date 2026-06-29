@@ -184,7 +184,7 @@ type InterfaceOuterRef = (
     Option<String>,
     bool, // pure
     bool, // elemental
-    u8,   // result_rank
+    SymbolAttrs,
 );
 
 pub(super) fn resolve_unit(
@@ -501,7 +501,7 @@ pub(super) fn resolve_unit(
                                 normalized_bind_name(bind.as_ref(), fn_name),
                                 pure,
                                 elemental,
-                                result_attrs_for_iface.result_rank,
+                                result_attrs_for_iface,
                             ));
                         }
                         ProgramUnit::Subroutine {
@@ -536,7 +536,7 @@ pub(super) fn resolve_unit(
                                 normalized_bind_name(bind.as_ref(), fn_name),
                                 pure,
                                 elemental,
-                                0,
+                                SymbolAttrs::default(),
                             ));
                         }
                         _ => {}
@@ -570,7 +570,7 @@ pub(super) fn resolve_unit(
             // Surface each declared procedure to the enclosing scope
             // so callers under IMPLICIT NONE can resolve the name,
             // and so BIND(C) external prototypes are callable.
-            for (fn_name, kind, ti, arg_names, binding_label, pure, elemental, result_rank) in
+            for (fn_name, kind, ti, arg_names, binding_label, pure, elemental, result_attrs) in
                 outer_refs
             {
                 let span = unit.span;
@@ -583,7 +583,10 @@ pub(super) fn resolve_unit(
                         binding_label,
                         pure,
                         elemental,
-                        result_rank,
+                        allocatable: result_attrs.allocatable,
+                        pointer: result_attrs.pointer,
+                        result_rank: result_attrs.result_rank,
+                        array_spec: result_attrs.array_spec,
                         ..Default::default()
                     },
                     defined_at: span,
