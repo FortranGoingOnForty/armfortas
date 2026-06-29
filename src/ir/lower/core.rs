@@ -34184,6 +34184,71 @@ pub(super) fn lower_arg_descriptor_full(
     b.const_i64(0)
 }
 
+pub(super) fn lower_same_type_as_intrinsic_ast(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    args: &[crate::ast::expr::Argument],
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) -> Option<ValueId> {
+    let _ = type_layouts?;
+    let mut slots: [Option<&crate::ast::expr::SpannedExpr>; 2] = [None, None];
+    let mut next_positional = 0usize;
+    for arg in args {
+        let slot = if let Some(keyword) = arg.keyword.as_deref() {
+            match keyword.to_ascii_lowercase().as_str() {
+                "a" => Some(0),
+                "b" => Some(1),
+                _ => None,
+            }
+        } else if next_positional < 2 {
+            let slot = next_positional;
+            next_positional += 1;
+            Some(slot)
+        } else {
+            None
+        };
+        let Some(slot) = slot else {
+            continue;
+        };
+        let crate::ast::expr::SectionSubscript::Element(expr) = &arg.value else {
+            return None;
+        };
+        slots[slot] = Some(expr);
+    }
+
+    let left = slots[0]?;
+    let right = slots[1]?;
+    let left_desc = lower_arg_descriptor_full(
+        b,
+        locals,
+        left,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+        true,
+    );
+    let right_desc = lower_arg_descriptor_full(
+        b,
+        locals,
+        right,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+        true,
+    );
+    let left_tag = load_array_desc_type_tag(b, left_desc);
+    let right_tag = load_array_desc_type_tag(b, right_desc);
+    Some(b.icmp(CmpOp::Eq, left_tag, right_tag))
+}
+
 /// Build a minimal rank-0 CLASS(*) descriptor wrapping `expr` so it
 /// can be passed by descriptor to a scalar `class(*)` formal.
 pub(super) fn box_actual_into_class_star_descriptor(
