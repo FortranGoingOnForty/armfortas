@@ -2494,6 +2494,38 @@ pub(crate) fn lower_expr_full(
                         }
                     }
                 }
+                let indirect_hidden_result = if procptr_target.is_some() {
+                    first_procedure_lookup(&abi_lookup_keys, |k| callee_hidden_result_abi(st, k))
+                        .and_then(|hidden_abi| {
+                            let bytes = hidden_result_temp_bytes_for_callee(
+                                st,
+                                type_layouts,
+                                &abi_lookup_keys,
+                                hidden_abi,
+                            )?;
+                            let alloca_ty = if hidden_abi == HiddenResultAbi::ComplexBuffer {
+                                let fw = if bytes == 16 {
+                                    FloatWidth::F64
+                                } else {
+                                    FloatWidth::F32
+                                };
+                                IrType::Array(Box::new(IrType::Float(fw)), 2)
+                            } else {
+                                IrType::Array(Box::new(IrType::Int(IntWidth::I8)), bytes)
+                            };
+                            let desc = b.alloca(alloca_ty);
+                            let zero_i32 = b.const_i32(0);
+                            let size = b.const_i64(bytes as i64);
+                            b.call(
+                                FuncRef::External("memset".into()),
+                                vec![desc, zero_i32, size],
+                                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                            );
+                            Some(desc)
+                        })
+                } else {
+                    None
+                };
                 let callee_value_args =
                     first_procedure_lookup(&abi_lookup_keys, |k| callee_value_arg_mask(st, k));
                 let callee_descriptor_args = first_procedure_lookup(&abi_lookup_keys, |k| {
@@ -2514,7 +2546,11 @@ pub(crate) fn lower_expr_full(
                     first_procedure_lookup(&abi_lookup_keys, |k| callee_class_arg_mask(st, k));
                 let opt_flags =
                     first_procedure_lookup(&abi_lookup_keys, |k| callee_optional_arg_mask(st, k));
-                let mut ref_arg_vals: Vec<ValueId> = Vec::with_capacity(arg_slots.len());
+                let mut ref_arg_vals: Vec<ValueId> =
+                    Vec::with_capacity(arg_slots.len() + indirect_hidden_result.is_some() as usize);
+                if let Some(desc) = indirect_hidden_result {
+                    ref_arg_vals.push(desc);
+                }
                 for (i, slot) in arg_slots.iter().enumerate() {
                     let is_value = callee_value_args
                         .as_ref()
@@ -2775,10 +2811,14 @@ pub(crate) fn lower_expr_full(
                 }
 
                 // Look up callee return type from symbol table.
-                let ret_ty = first_procedure_lookup(&abi_lookup_keys, |k| {
-                    callee_return_ir_type_for_caller(st, k, internal_funcs)
-                })
-                .unwrap_or(IrType::Int(IntWidth::I32));
+                let ret_ty = if indirect_hidden_result.is_some() {
+                    IrType::Void
+                } else {
+                    first_procedure_lookup(&abi_lookup_keys, |k| {
+                        callee_return_ir_type_for_caller(st, k, internal_funcs)
+                    })
+                    .unwrap_or(IrType::Int(IntWidth::I32))
+                };
                 let func_ref = if let Some((target, _, _)) = procptr_target {
                     FuncRef::Indirect(target)
                 } else if resolved_generic.is_some() {
@@ -2802,6 +2842,9 @@ pub(crate) fn lower_expr_full(
                     )
                 };
                 let call_result = b.call(func_ref, ref_arg_vals, ret_ty);
+                if let Some(desc) = indirect_hidden_result {
+                    return desc;
+                }
                 if let Some(tl) = type_layouts {
                     if let Some(type_name) = first_procedure_lookup(&abi_lookup_keys, |k| {
                         callee_return_stabilized_derived_type_name(st, k)
