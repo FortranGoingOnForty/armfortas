@@ -20028,6 +20028,50 @@ fn complex_dot_product_feeds_complex_sqrt_without_pointer_fsqrt() {
 }
 
 #[test]
+fn dot_product_accepts_array_expression_second_actual() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=dot_product_accepts_array_expression_second_actual count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // FAT's third_body_gravity_alt uses dot_product(r, r-two*rb).  The
+    // second actual was only accepted as a simple Name, so the call fell
+    // through to scalar lowering and tried to multiply floats by array
+    // pointer slots.
+    let src = write_program(
+        "program p\n  implicit none\n  real(8) :: r(3), rb(3), q\n  r = [1.0_8, 2.0_8, 3.0_8]\n  rb = [4.0_8, 5.0_8, 6.0_8]\n  q = dot_product(r, r - 2.0_8*rb)\n  if (abs(q - (-50.0_8)) > 1.0e-12_8) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("dot_product_array_expr_second", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("dot_product array expression compile failed");
+    assert!(
+        compile.status.success(),
+        "dot_product array expression should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("dot_product array expression run failed");
+    assert!(
+        run.status.success(),
+        "dot_product array expression should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn complex_unary_minus_negates_lanes_at_call_site() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
