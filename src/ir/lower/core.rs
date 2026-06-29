@@ -46328,41 +46328,51 @@ pub(super) fn lower_array_intrinsic(
             descriptor_params,
         ),
         "dot_product" => {
-            let second_desc = args.get(1).and_then(|a| {
+            let second_arg_expr = args.get(1).and_then(|a| {
                 if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
-                    if let Expr::Name { name } = &e.node {
-                        locals
-                            .get(&name.to_lowercase())
-                            .filter(|i| local_uses_array_descriptor(i) || !i.dims.is_empty())
-                            .map(|i| {
-                                if local_uses_array_descriptor(i) {
-                                    array_descriptor_addr(b, i)
-                                } else {
-                                    materialize_array_descriptor_for_info(b, i)
-                                }
-                            })
-                    } else {
-                        None
-                    }
+                    Some(e)
                 } else {
                     None
                 }
             })?;
-            // Get the first arg's element type for dispatch.
-            let elem_ty = args
-                .first()
-                .and_then(|a| {
-                    if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
-                        if let Expr::Name { name } = &e.node {
-                            locals.get(&name.to_lowercase()).map(|i| i.ty.clone())
-                        } else {
-                            None
-                        }
+            let second_desc = lower_array_expr_descriptor(
+                b,
+                locals,
+                second_arg_expr,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            )
+            .map(|(d, _)| d)
+            .or_else(|| {
+                if let Expr::Name { name } = &second_arg_expr.node {
+                    locals
+                        .get(&name.to_lowercase())
+                        .filter(|i| local_uses_array_descriptor(i) || !i.dims.is_empty())
+                        .map(|i| {
+                            if local_uses_array_descriptor(i) {
+                                array_descriptor_addr(b, i)
+                            } else {
+                                materialize_array_descriptor_for_info(b, i)
+                            }
+                        })
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                let tl = type_layouts?;
+                let info = component_intrinsic_local_info(b, locals, second_arg_expr, st, tl)?;
+                (local_uses_array_descriptor(&info) || !info.dims.is_empty()).then(|| {
+                    if local_uses_array_descriptor(&info) {
+                        array_descriptor_addr(b, &info)
                     } else {
-                        None
+                        materialize_array_descriptor_for_info(b, &info)
                     }
                 })
-                .unwrap_or(IrType::Float(FloatWidth::F64));
+            })?;
             // The local's `ty` for an array can arrive in several shapes
             // depending on storage class — bare element type, Array(elem, N),
             // Ptr(Array(elem, N)), or descriptor-backed Ptr(Int(I8))). Peel
