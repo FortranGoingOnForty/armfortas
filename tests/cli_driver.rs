@@ -18770,6 +18770,44 @@ fn complex_module_function_result_routes_through_hidden_buffer() {
 }
 
 #[test]
+fn procedure_dummy_complex_result_routes_through_hidden_buffer() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=procedure_dummy_complex_result_routes_through_hidden_buffer count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  abstract interface\n    function func(x) result(f)\n      complex(8), intent(in) :: x\n      complex(8) :: f\n    end function\n  end interface\ncontains\n  subroutine eval_imag(f, x, out)\n    procedure(func) :: f\n    complex(8), intent(in) :: x\n    real(8), intent(out) :: out\n    out = aimag(f(x))\n  end subroutine\n\n  function double_complex(x) result(f)\n    complex(8), intent(in) :: x\n    complex(8) :: f\n    f = x * cmplx(2.0_8, 0.0_8, kind=8)\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  real(8) :: out\n  call eval_imag(double_complex, cmplx(1.0_8, 3.0_8, kind=8), out)\n  if (abs(out - 6.0_8) > 1.0e-12_8) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("procedure_dummy_complex_result", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("procedure dummy complex-result compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "procedure dummy complex-result should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("procedure dummy complex-result run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "procedure dummy complex-result run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn rank_remap_pointer_assignment_builds_2d_descriptor() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
