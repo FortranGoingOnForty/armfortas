@@ -7,6 +7,7 @@
 //! module wasn't seen in-file).
 
 use crate::ast::decl::{ArraySpec, Decl, OnlyItem, SpannedDecl};
+use crate::ast::expr::Expr;
 use crate::sema::symtab::*;
 
 use super::core::{
@@ -435,10 +436,11 @@ pub(super) fn load_external_module(
             // Sprint35-SMP Phase 1: rebuild a same-rank array_spec from
             // the encoded rank + descriptor/allocatable/pointer flags.
             // Bound expressions are not preserved across .amod boundaries;
-            // assumed-shape / deferred-shape kinds are sufficient for the
-            // synthesizer's uses in Phase 2 (the bound expressions are
-            // unused for descriptor-passed dummies anyway — extents come
-            // from the caller's runtime descriptor).
+            // descriptor-passed dummies can use assumed/deferred placeholders
+            // because extents come from the caller's runtime descriptor. Raw
+            // explicit-shape dummies must stay explicit-shaped, though: using
+            // AssumedShape here makes lowering pass a descriptor to callees
+            // whose ABI expects a bare element pointer.
             let array_spec: Vec<ArraySpec> = if arg.rank == 0 {
                 Vec::new()
             } else {
@@ -447,11 +449,16 @@ pub(super) fn load_external_module(
                 } else if arg.descriptor {
                     ArraySpec::AssumedShape { lower: None }
                 } else {
-                    // Non-descriptor array dummy: explicit-shape with
-                    // unknown bounds. The Phase-2 synthesizer treats
-                    // this as a placeholder and the lowering helpers
-                    // pull actual bounds from the caller's array.
-                    ArraySpec::AssumedShape { lower: None }
+                    ArraySpec::Explicit {
+                        lower: None,
+                        upper: crate::ast::Spanned::new(
+                            Expr::IntegerLiteral {
+                                text: "1".to_string(),
+                                kind: None,
+                            },
+                            dummy_span,
+                        ),
+                    }
                 };
                 vec![template; arg.rank as usize]
             };
