@@ -46983,6 +46983,43 @@ fn allocatable_integer_array_broadcasts_len_of_optional_char_array() {
 }
 
 #[test]
+fn optional_fixed_char_array_default_assign_uses_declared_len() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=optional_fixed_char_array_default_assign_uses_declared_len count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\ncontains\n  subroutine fill_default(vec, found, default)\n    character(len=*), allocatable, intent(out) :: vec(:)\n    logical, intent(out), optional :: found\n    character(len=*), intent(in), optional :: default(:)\n    if (present(default)) vec = default\n    if (present(found)) found = .false.\n  end subroutine\n\n  subroutine wrap_fill_default(vec, found, default)\n    character(len=*), allocatable, intent(out) :: vec(:)\n    logical, intent(out), optional :: found\n    character(len=*), intent(in), optional :: default(:)\n    call fill_default(vec, found, default)\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  character(len=1), allocatable :: vec(:)\n  character(len=1), parameter :: cvec_default(1) = ['1']\n  logical :: found\n  call fill_default(vec, found, default=cvec_default)\n  if (found) error stop 1\n  if (.not. allocated(vec)) error stop 2\n  if (size(vec) /= 1) error stop 3\n  if (any(vec /= cvec_default)) error stop 4\n  call wrap_fill_default(vec, found, default=cvec_default)\n  if (found) error stop 5\n  if (.not. allocated(vec)) error stop 6\n  if (size(vec) /= 1) error stop 7\n  if (any(vec /= cvec_default)) error stop 8\n  call fill_default(vec, found, default=['1'])\n  if (found) error stop 9\n  if (.not. allocated(vec)) error stop 10\n  if (size(vec) /= 1) error stop 11\n  if (any(vec /= ['1'])) error stop 12\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("optional_fixed_char_array_default_assign", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("optional fixed char-array default assignment compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "optional fixed char-array default assignment compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("optional fixed char-array default assignment run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "optional fixed char-array default assignment run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn generic_subroutine_matches_use_renamed_class_actual() {
     let src = write_program(
         "module value_m\n  implicit none\n  type :: toml_value\n    character(:), allocatable :: message\n  end type\nend module\nmodule parser_m\n  use value_m, only: toml_value\n  implicit none\n  interface json_load\n    module procedure json_load_file\n    module procedure json_load_unit\n  end interface\ncontains\n  subroutine json_load_file(object, filename, error)\n    class(toml_value), allocatable, intent(out) :: object\n    character(*), intent(in) :: filename\n    integer, intent(out), optional :: error\n    if (present(error)) error = len_trim(filename)\n  end subroutine\n  subroutine json_load_unit(object, io, error)\n    class(toml_value), allocatable, intent(out) :: object\n    integer, intent(in) :: io\n    integer, intent(out), optional :: error\n    if (present(error)) error = io\n  end subroutine\nend module\nmodule facade_m\n  use value_m, only: json_value => toml_value\n  use parser_m, only: json_load\n  implicit none\nend module\nmodule user_m\n  use facade_m, only: json_value, json_load\n  implicit none\ncontains\n  subroutine run(path)\n    character(*), intent(in) :: path\n    type(json_value), allocatable :: holder\n    class(json_value), allocatable :: value\n    integer :: err\n    allocate(holder)\n    holder%message = path\n    call json_load(value, holder%message, error=err)\n  end subroutine\nend module\nprogram p\n  use user_m, only: run\n  call run('pkg.json')\nend program\n",
