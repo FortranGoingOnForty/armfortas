@@ -2132,6 +2132,20 @@ pub(crate) fn lower_expr_full(
                         }
                     }
                 }
+                if !has_named_interface && key == "same_type_as" {
+                    if let Some(result) = lower_same_type_as_intrinsic_ast(
+                        b,
+                        locals,
+                        original_args,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
+                    ) {
+                        return result;
+                    }
+                }
                 let intrinsic_result =
                     if !has_named_interface && crate::sema::validate::is_intrinsic_name(&key) {
                         let intrinsic_arg_slots =

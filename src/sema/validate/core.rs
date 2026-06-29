@@ -3878,7 +3878,7 @@ pub fn is_intrinsic_name(name: &str) -> bool {
         "index" | "scan" | "verify" | "repeat" | "lge" | "lgt" | "lle" | "llt" |
         "kind" | "selected_int_kind" | "selected_real_kind" | "selected_char_kind" |
         "size" | "shape" | "rank" | "lbound" | "ubound" | "allocated" | "associated" |
-        "present" | "merge" | "pack" | "unpack" | "spread" | "reshape" |
+        "present" | "same_type_as" | "merge" | "pack" | "unpack" | "spread" | "reshape" |
         "sum" | "product" | "maxval" | "minval" | "maxloc" | "minloc" | "findloc" | "count" | "any" | "all" |
         "ieee_support_inf" | "ieee_support_nan" | "ieee_support_subnormal" |
         "ieee_support_divide" | "ieee_support_sqrt" | "ieee_support_io" |
