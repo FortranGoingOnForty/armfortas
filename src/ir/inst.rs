@@ -626,7 +626,10 @@ fn sig_contains_i128(module: &Module, sig: &super::types::FuncSig) -> bool {
 fn type_contains_i128(module: &Module, ty: &IrType) -> bool {
     match ty {
         IrType::Int(IntWidth::I128) => true,
-        IrType::Ptr(inner) | IrType::Array(inner, _) => type_contains_i128(module, inner),
+        // Pointer pointee types are annotations for loads/GEPs; the SSA value
+        // itself is still address-sized and does not require wide i128 codegen.
+        IrType::Ptr(_) => false,
+        IrType::Array(inner, _) => type_contains_i128(module, inner),
         IrType::Struct(id) => module.struct_defs.get(*id as usize).is_some_and(|def| {
             def.fields
                 .iter()
@@ -752,9 +755,6 @@ fn inst_i128_backend_o0_supported(module: &Module, func: &Function, inst: &Inst)
         InstKind::Load(_) if matches!(inst.ty, IrType::Int(IntWidth::I128)) => true,
         // Loading a *pointer* whose pointee happens to be i128 is just
         // an 8-byte vreg load — the wide-slot machinery isn't involved.
-        // type_contains_i128 walks through Ptr<>, so without this arm
-        // the catch-all would falsely reject `load ptr<i128>` when
-        // dereferencing an sret-style hidden result-buffer pointer.
         InstKind::Load(_) if matches!(inst.ty, IrType::Ptr(_)) => true,
         InstKind::IAdd(..) | InstKind::ISub(..) | InstKind::INeg(_)
             if matches!(inst.ty, IrType::Int(IntWidth::I128)) =>
@@ -823,6 +823,38 @@ fn terminator_i128_backend_o0_supported(
 mod tests {
     use super::*;
     use crate::ir::builder::FuncBuilder;
+
+    #[test]
+    fn pointer_to_i128_pointee_is_not_an_i128_codegen_surface() {
+        let mut module = Module::new("test".into(), crate::target::TargetLayout::LP64);
+        let mut func = Function::new("main".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+            let bytes = b.const_i64(16);
+            let ptr = b.runtime_call(
+                RuntimeFunc::Allocate,
+                vec![bytes],
+                IrType::Ptr(Box::new(IrType::Int(IntWidth::I128))),
+            );
+            let slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I128))));
+            b.store(ptr, slot);
+            b.ret_void();
+        }
+        module.add_function(func);
+
+        assert!(
+            !module.contains_i128(),
+            "ptr<i128> is an address-sized value, not a live integer(16) surface"
+        );
+        assert!(
+            !module.contains_i128_outside_globals(),
+            "ptr<i128> should not select the widened i128 optimization lane"
+        );
+        assert!(
+            module.i128_backend_o0_supported(),
+            "ptr<i128> should pass the O0 backend support gate"
+        );
+    }
 
     #[test]
     fn runtime_print_i128_is_supported_by_backend_gate() {
