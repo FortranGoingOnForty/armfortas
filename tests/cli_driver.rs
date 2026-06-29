@@ -19721,6 +19721,51 @@ fn proc_pointer_component_call_passes_assumed_shape_array_as_descriptor() {
 }
 
 #[test]
+fn proc_pointer_component_explicit_shape_intent_in_accepts_array_expression_actual() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=proc_pointer_component_explicit_shape_intent_in_accepts_array_expression_actual count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // FAT's RK steppers call procedure-pointer components with explicit-shape
+    // intent(in) array dummies and expression actuals like `x+h2*f1`.
+    // The proc-pointer component call path skipped the intent-in array mask,
+    // so by-ref fallback tried to scalar-lower the array expression and
+    // emitted float ops over descriptor pointers.
+    let src = write_program(
+        "module callbacks\n  implicit none\n  abstract interface\n    subroutine step_iface(x, y)\n      real(8), intent(in) :: x(3)\n      real(8), intent(out) :: y(3)\n    end subroutine\n  end interface\n  type :: holder_t\n    procedure(step_iface), pointer, nopass :: step => null()\n  end type\ncontains\n  subroutine copy_step(x, y)\n    real(8), intent(in) :: x(3)\n    real(8), intent(out) :: y(3)\n    y = x\n  end subroutine\nend module\nprogram p\n  use callbacks\n  implicit none\n  type(holder_t) :: holder\n  real(8) :: x(3), f(3), y(3)\n  x = [1.0_8, 2.0_8, 3.0_8]\n  f = [10.0_8, 20.0_8, 30.0_8]\n  holder%step => copy_step\n  call holder%step(x + 2.0_8*f, y)\n  if (abs(y(1) - 21.0_8) > 1.0e-12_8) error stop 1\n  if (abs(y(2) - 42.0_8) > 1.0e-12_8) error stop 2\n  if (abs(y(3) - 63.0_8) > 1.0e-12_8) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("proc_ptr_explicit_shape_array_expr", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("proc-ptr explicit-shape array expression compile failed");
+    assert!(
+        compile.status.success(),
+        "proc-ptr explicit-shape array expression should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("proc-ptr explicit-shape array expression run failed");
+    assert!(
+        run.status.success(),
+        "proc-ptr explicit-shape array expression should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn merge_intrinsic_routes_array_operands_through_descriptor_path() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
