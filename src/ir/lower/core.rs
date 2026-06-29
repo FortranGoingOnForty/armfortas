@@ -10015,19 +10015,7 @@ pub(super) fn char_addr_and_substring_bound_len(
 
 pub(super) fn local_char_runtime_len(b: &mut FuncBuilder, info: &LocalInfo) -> Option<ValueId> {
     match &info.char_kind {
-        CharKind::Fixed(n) => {
-            if *n == 1
-                && local_uses_array_descriptor(info)
-                && info.allocatable
-                && info.dims.is_empty()
-                && !info.descriptor_arg
-            {
-                let desc = array_descriptor_addr(b, info);
-                Some(descriptor_elem_size(b, desc))
-            } else {
-                Some(b.const_i64(*n))
-            }
-        }
+        CharKind::Fixed(n) => Some(b.const_i64(*n)),
         CharKind::FixedRuntime { len_addr } | CharKind::AssumedLen { len_addr } => {
             Some(b.load(*len_addr))
         }
