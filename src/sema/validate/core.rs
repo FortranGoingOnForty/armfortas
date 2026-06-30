@@ -922,10 +922,11 @@ fn validate_c_f_strpointer(ctx: &mut Ctx<'_>, args: &[crate::ast::expr::Argument
         kw: &str,
         pos: usize,
     ) -> Option<&'a crate::ast::expr::SpannedExpr> {
-        if let Some(a) = args
-            .iter()
-            .find(|a| a.keyword.as_deref().is_some_and(|k| k.eq_ignore_ascii_case(kw)))
-        {
+        if let Some(a) = args.iter().find(|a| {
+            a.keyword
+                .as_deref()
+                .is_some_and(|k| k.eq_ignore_ascii_case(kw))
+        }) {
             if let SectionSubscript::Element(e) = &a.value {
                 return Some(e);
             }
@@ -995,10 +996,11 @@ fn validate_c_f_pointer(ctx: &mut Ctx<'_>, args: &[crate::ast::expr::Argument]) 
         kw: &str,
         pos: usize,
     ) -> Option<&'a crate::ast::expr::SpannedExpr> {
-        if let Some(a) = args
-            .iter()
-            .find(|a| a.keyword.as_deref().is_some_and(|k| k.eq_ignore_ascii_case(kw)))
-        {
+        if let Some(a) = args.iter().find(|a| {
+            a.keyword
+                .as_deref()
+                .is_some_and(|k| k.eq_ignore_ascii_case(kw))
+        }) {
             if let SectionSubscript::Element(e) = &a.value {
                 return Some(e);
             }
@@ -1085,10 +1087,9 @@ fn smp_type_compatible(a: &TypeInfo, b: &TypeInfo) -> bool {
         | (TypeInfo::Real { kind: k1 }, TypeInfo::Real { kind: k2 })
         | (TypeInfo::Complex { kind: k1 }, TypeInfo::Complex { kind: k2 })
         | (TypeInfo::Logical { kind: k1 }, TypeInfo::Logical { kind: k2 })
-        | (
-            TypeInfo::Character { kind: k1, .. },
-            TypeInfo::Character { kind: k2, .. },
-        ) => kinds_ok(k1, k2),
+        | (TypeInfo::Character { kind: k1, .. }, TypeInfo::Character { kind: k2, .. }) => {
+            kinds_ok(k1, k2)
+        }
         (TypeInfo::Derived(n1), TypeInfo::Derived(n2))
         | (TypeInfo::Class(n1), TypeInfo::Class(n2)) => n1.eq_ignore_ascii_case(n2),
         _ => std::mem::discriminant(a) == std::mem::discriminant(b),

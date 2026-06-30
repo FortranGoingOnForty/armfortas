@@ -2709,12 +2709,12 @@ fn namelist_assign_value(
 ) {
     // For array elements, compute byte offset from 1-based index.
     let elem_size = match entry.data_type {
-        0 => 4, // integer (i32)
-        1 => 8, // real (f64)
+        0 => 4,                              // integer (i32)
+        1 => 8,                              // real (f64)
         2 => entry.data_len.max(1) as usize, // fixed string element
-        3 => 4, // logical (i32)
-        5 => 1, // logical (bool/i8)
-        _ => 1, // string
+        3 => 4,                              // logical (i32)
+        5 => 1,                              // logical (bool/i8)
+        _ => 1,                              // string
     };
     let start_index = index.unwrap_or(1).max(1);
     let max_elems = entry.elem_count.max(1) as usize;
@@ -2756,11 +2756,7 @@ fn namelist_assign_value(
                             std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, copy_len);
                         }
                         if copy_len < slot_len {
-                            std::ptr::write_bytes(
-                                ptr.add(copy_len),
-                                b' ',
-                                slot_len - copy_len,
-                            );
+                            std::ptr::write_bytes(ptr.add(copy_len), b' ', slot_len - copy_len);
                         }
                     }
                 }
@@ -3781,12 +3777,17 @@ use std::cell::RefCell;
 
 enum FmtSink {
     Unit(i32),
-    Internal { buf: *mut u8, buf_len: usize },
+    Internal {
+        buf: *mut u8,
+        buf_len: usize,
+    },
     /// Internal write whose target is a deferred-length allocatable
     /// `character(:), allocatable` scalar. An already allocated target is
     /// treated as a fixed internal file; an unallocated target is allocated
     /// to the formatted record length.
-    InternalAlloc { desc: *mut u8 },
+    InternalAlloc {
+        desc: *mut u8,
+    },
     /// Internal write whose target is a whole character array: each
     /// formatted record goes into one element (truncated or blank-
     /// padded to the element length). Elements after the last record
@@ -4238,25 +4239,25 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                         .unwrap_or(LeadingZeroMode::Default);
                     engine.set_leading_zero(c.stmt_leading_zero.unwrap_or(conn_mode));
                     match engine.format_values_reverting_checked(&c.values) {
-                    Ok(output) => {
-                        if let Some(u) = state.get_unit(unit) {
-                            if u.write_str(&output).is_err() {
+                        Ok(output) => {
+                            if let Some(u) = state.get_unit(unit) {
+                                if u.write_str(&output).is_err() {
+                                    io_status = 1;
+                                    io_msg = Some("write failed");
+                                }
+                                if io_status == 0 && advance != 0 && u.write_str("\n").is_err() {
+                                    io_status = 1;
+                                    io_msg = Some("write failed");
+                                }
+                            } else {
                                 io_status = 1;
-                                io_msg = Some("write failed");
+                                io_msg = Some("unit not connected");
                             }
-                            if io_status == 0 && advance != 0 && u.write_str("\n").is_err() {
-                                io_status = 1;
-                                io_msg = Some("write failed");
-                            }
-                        } else {
-                            io_status = 1;
-                            io_msg = Some("unit not connected");
                         }
-                    }
-                    Err(_) => {
-                        io_status = 1;
-                        io_msg = Some("format error");
-                    }
+                        Err(_) => {
+                            io_status = 1;
+                            io_msg = Some("format error");
+                        }
                     }
                 }
                 FmtSink::Internal { buf, buf_len } => {
@@ -5663,11 +5664,7 @@ mod tests {
         // plain (F6.3) write to that unit drops the leading zero. A WRITE
         // statement override beats the connection mode; INQUIRE reads the
         // connection's current mode back.
-        let path = format!(
-            "/tmp/afs_lz_conn_{}_{}.txt",
-            std::process::id(),
-            line!()
-        );
+        let path = format!("/tmp/afs_lz_conn_{}_{}.txt", std::process::id(), line!());
         let _ = std::fs::remove_file(&path);
         let mut iostat = -99i32;
         let cb = OpenControlBlock {

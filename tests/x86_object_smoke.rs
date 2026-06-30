@@ -276,20 +276,15 @@ fn conversion_spill_traffic_uses_fp_width() {
                 .first()
                 .expect("cvttsd2si source operand")
                 .trim_end_matches(',');
-            let narrow_load = lines
-                .iter()
-                .take(i)
-                .rev()
-                .take(4)
-                .any(|prev| {
-                    prev.starts_with("movss")
-                        && prev
-                            .split(',')
-                            .nth(1)
-                            .map(str::trim)
-                            .map(|dst| dst.trim_end_matches(','))
-                            == Some(src)
-                });
+            let narrow_load = lines.iter().take(i).rev().take(4).any(|prev| {
+                prev.starts_with("movss")
+                    && prev
+                        .split(',')
+                        .nth(1)
+                        .map(str::trim)
+                        .map(|dst| dst.trim_end_matches(','))
+                        == Some(src)
+            });
             assert!(
                 !narrow_load,
                 "cvttsd2si double source loaded narrow near: {} | {}",

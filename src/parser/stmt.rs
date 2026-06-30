@@ -2637,7 +2637,10 @@ end if
             if let Stmt::Format { spec } = &stmt.node {
                 assert_eq!(spec, "('src_',i0)");
             } else {
-                panic!("labeled inner statement should be Format, got {:?}", stmt.node);
+                panic!(
+                    "labeled inner statement should be Format, got {:?}",
+                    stmt.node
+                );
             }
         } else {
             panic!("not Labeled, got {:?}", s.node);
