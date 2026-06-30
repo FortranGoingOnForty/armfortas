@@ -38492,7 +38492,7 @@ fn imported_bound_proc_dummy_closure_uses_target_scope_over_same_name() {
     let other_src = write_program_in(
         &dir,
         "other_init_m.f90",
-        "module other_init_m\n  implicit none\ncontains\n  subroutine initialize(value)\n    integer, intent(out) :: value\n    value = -1\n  end subroutine initialize\nend module other_init_m\n",
+        "module other_init_m\n  implicit none\ncontains\n  subroutine initialize(value, a, b, c, d, e, f, g)\n    integer, intent(out) :: value\n    integer, intent(in), optional :: a, b, c, d, e, f, g\n    value = -1\n    if (present(a)) value = value + a\n    if (present(g)) value = value + g\n  end subroutine initialize\nend module other_init_m\n",
     );
     let main_src = write_program_in(
         &dir,
