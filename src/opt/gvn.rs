@@ -687,9 +687,14 @@ fn gvn_function(func: &mut Function, pure_calls: &[PureCallPolicy]) -> bool {
         let mut new_keys = Vec::new();
         let block = func.block(block_id);
         for inst in &block.insts {
-            if let Some(key) =
-                key_of(inst, &replacements, pure_calls, &wrapper_values, &defs, fpenv_barrier)
-            {
+            if let Some(key) = key_of(
+                inst,
+                &replacements,
+                pure_calls,
+                &wrapper_values,
+                &defs,
+                fpenv_barrier,
+            ) {
                 if let Some(&existing) = vn_table.get(&key) {
                     // This expression is already available from a dominating block.
                     replacements.insert(inst.id, existing);

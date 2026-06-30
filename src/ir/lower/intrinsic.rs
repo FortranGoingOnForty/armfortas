@@ -1521,23 +1521,21 @@ pub(crate) fn lower_intrinsic(
         // helpers (`runtime/src/ieee.rs`) rather than compare-based IR: a
         // call is opaque to const folding, so `x /= x`-style identities
         // that passes rewrite to `.false.` can't break NaN detection.
-        "ieee_is_nan" | "ieee_is_finite" | "ieee_is_normal" => {
-            args.first().map(|arg| {
-                let suffix = ieee_float_suffix(b, *arg);
-                let op = match name {
-                    "ieee_is_nan" => "is_nan",
-                    "ieee_is_finite" => "is_finite",
-                    _ => "is_normal",
-                };
-                let r = b.call(
-                    FuncRef::External(format!("afs_ieee_{}_{}", op, suffix)),
-                    vec![*arg],
-                    IrType::Int(IntWidth::I32),
-                );
-                let zero = b.const_i32(0);
-                b.icmp(CmpOp::Ne, r, zero)
-            })
-        }
+        "ieee_is_nan" | "ieee_is_finite" | "ieee_is_normal" => args.first().map(|arg| {
+            let suffix = ieee_float_suffix(b, *arg);
+            let op = match name {
+                "ieee_is_nan" => "is_nan",
+                "ieee_is_finite" => "is_finite",
+                _ => "is_normal",
+            };
+            let r = b.call(
+                FuncRef::External(format!("afs_ieee_{}_{}", op, suffix)),
+                vec![*arg],
+                IrType::Int(IntWidth::I32),
+            );
+            let zero = b.const_i32(0);
+            b.icmp(CmpOp::Ne, r, zero)
+        }),
         "ieee_unordered" => {
             if args.len() < 2 {
                 None
@@ -1656,9 +1654,9 @@ pub(crate) fn lower_intrinsic(
         | "ieee_support_io"
         | "ieee_support_rounding"
         | "ieee_support_flag" => Some(b.const_bool(true)),
-        "ieee_support_underflow_control"
-        | "ieee_support_halting"
-        | "ieee_support_standard" => Some(b.const_bool(false)),
+        "ieee_support_underflow_control" | "ieee_support_halting" | "ieee_support_standard" => {
+            Some(b.const_bool(false))
+        }
         "maxexponent" => {
             // F2018 §16.9.124: returns the maximum exponent in the model
             // for the same kind as the argument. For IEEE binary32 = 128,
