@@ -1405,6 +1405,24 @@ pub(crate) fn lower_unit(
                     ctx.st,
                     &ctx.ambiguous_use_warnings,
                 );
+                if hidden_result_abi == HiddenResultAbi::ArrayDescriptor {
+                    if let Some(info) = ctx.locals.get(&result_name).cloned() {
+                        if !info.allocatable || info.is_pointer {
+                            // Already handled above by attribute exclusion.
+                        }
+                        allocate_runtime_shape_array_result(
+                            &mut b,
+                            &ctx.locals,
+                            &result_name,
+                            ValueId(0),
+                            &info.ty,
+                            decls,
+                            &visible_param_consts,
+                            ctx.st,
+                            type_layouts,
+                        );
+                    }
+                }
                 super::alloc::alloc_decls(
                     &mut b,
                     &mut ctx.locals,
@@ -1450,24 +1468,6 @@ pub(crate) fn lower_unit(
                     ctx.proc_scope_id,
                     Some(type_layouts),
                 );
-                if hidden_result_abi == HiddenResultAbi::ArrayDescriptor {
-                    if let Some(info) = ctx.locals.get(&result_name).cloned() {
-                        if !info.allocatable || info.is_pointer {
-                            // Already handled above by attribute exclusion.
-                        }
-                        allocate_runtime_shape_array_result(
-                            &mut b,
-                            &ctx.locals,
-                            &result_name,
-                            ValueId(0),
-                            &info.ty,
-                            decls,
-                            &visible_param_consts,
-                            ctx.st,
-                            type_layouts,
-                        );
-                    }
-                }
                 collect_label_blocks(&mut b, body, &mut ctx.label_blocks);
                 collect_format_labels(body, &mut ctx.format_labels);
                 let _proc_scope_guard = ProcScopeGuard::enter(ctx.proc_scope_id);
