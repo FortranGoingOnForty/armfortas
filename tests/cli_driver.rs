@@ -6055,6 +6055,51 @@ fn type_bound_runtime_bound_bulk_array_expr_uses_runtime_extent() {
 }
 
 #[test]
+fn contained_runtime_bound_local_array_closure_passes_data_pointer() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=contained_runtime_bound_local_array_closure_passes_data_pointer count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type :: t\n    integer :: n = 0\n  contains\n    procedure :: run\n    procedure :: fill\n  end type t\ncontains\n  subroutine run(me, out)\n    class(t), intent(inout) :: me\n    real(8), dimension(me%n), intent(out) :: out\n    real(8), dimension(me%n) :: tmp\n    tmp = 0.0d0\n    call inner()\n    out = tmp\n  contains\n    subroutine inner()\n      call me%fill(tmp)\n    end subroutine inner\n  end subroutine run\n\n  subroutine fill(me, x)\n    class(t), intent(inout) :: me\n    real(8), dimension(me%n), intent(out) :: x\n    integer :: i\n    do i = 1, me%n\n      x(i) = dble(i)\n    end do\n  end subroutine fill\nend module m\n\nprogram p\n  use m\n  implicit none\n  type(t) :: obj\n  real(8), dimension(5) :: got\n  obj%n = 5\n  call obj%run(got)\n  if (any(abs(got - [1.0d0, 2.0d0, 3.0d0, 4.0d0, 5.0d0]) > 1.0d-12)) error stop 1\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("contained_runtime_bound_array_closure", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("contained runtime-bound local array closure compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "contained runtime-bound local array closure should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("contained runtime-bound local array closure run failed");
+    assert!(
+        run.status.success(),
+        "contained runtime-bound local array closure should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected contained runtime-bound local array closure output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fixed_component_array_size_lowers_without_raw_symbol() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
