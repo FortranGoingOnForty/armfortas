@@ -19789,11 +19789,16 @@ pub(super) fn emit_resolved_bound_proc_call(
         }
     }
 
+    let proc_closure_lookup_key = abi_lookup_keys
+        .iter()
+        .find(|key| callee_scope_for_lookup(st, key).is_some())
+        .map(String::as_str)
+        .unwrap_or(target_key.as_str());
     append_procedure_dummy_closure_args_for_call(
         b,
         locals,
         st,
-        &target_key,
+        proc_closure_lookup_key,
         &arg_slots,
         contained_host_refs,
         &mut call_args,
