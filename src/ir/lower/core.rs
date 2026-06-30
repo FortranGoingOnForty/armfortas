@@ -22760,6 +22760,15 @@ pub(super) fn append_host_closure_args_raw(
             let slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
             b.store(ptr, slot);
             slot
+        } else if info.allocatable
+            && !info.descriptor_arg
+            && !info.dims.is_empty()
+            && !host_ref_explicit_array_uses_descriptor(&info.dims, &info.ty, b.layout)
+        {
+            // Runtime-bound explicit-shape locals are backed by an
+            // ArrayDescriptor for storage, but the hidden closure ABI for
+            // small explicit arrays is still the raw element buffer pointer.
+            array_data_ptr_for_call(b, &info)
         } else {
             info.addr
         };
