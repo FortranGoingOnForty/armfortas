@@ -7143,6 +7143,28 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     }
                     if let Expr::Name { name: src_name } = &value.node {
                         let src_key = src_name.to_lowercase();
+                        if let Some(src_info) = ctx.locals.get(&src_key) {
+                            let closure_args = procedure_dummy_closure_args_from_locals(
+                                b,
+                                &ctx.locals,
+                                &src_key,
+                            );
+                            if !closure_args.is_empty() {
+                                let load_ty = if src_info.ty.is_ptr() {
+                                    src_info.ty.clone()
+                                } else {
+                                    IrType::Ptr(Box::new(src_info.ty.clone()))
+                                };
+                                let addr = b.load_typed(src_info.addr, load_ty);
+                                store_procedure_pointer_component_record(
+                                    b,
+                                    *tgt_field_ptr,
+                                    addr,
+                                    &closure_args,
+                                );
+                                return;
+                            }
+                        }
                         if let Some(sym) = ctx.st.lookup_local_then_any(ctx.proc_scope_id, &src_key)
                         {
                             if matches!(
@@ -7169,17 +7191,24 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     link_name
                                 };
                                 let addr = b.global_addr(&lowered_name, IrType::Int(IntWidth::I8));
-                                let mut closure_args = Vec::new();
-                                append_host_closure_args(
-                                    b,
-                                    ctx,
-                                    if ctx.contained_host_refs.contains_key(&resolved_key) {
-                                        &resolved_key
-                                    } else {
-                                        &src_key
-                                    },
-                                    &mut closure_args,
-                                );
+                                let mut closure_args =
+                                    procedure_dummy_closure_args_from_locals(
+                                        b,
+                                        &ctx.locals,
+                                        &src_key,
+                                    );
+                                if closure_args.is_empty() {
+                                    append_host_closure_args(
+                                        b,
+                                        ctx,
+                                        if ctx.contained_host_refs.contains_key(&resolved_key) {
+                                            &resolved_key
+                                        } else {
+                                            &src_key
+                                        },
+                                        &mut closure_args,
+                                    );
+                                }
                                 store_procedure_pointer_component_record(
                                     b,
                                     *tgt_field_ptr,

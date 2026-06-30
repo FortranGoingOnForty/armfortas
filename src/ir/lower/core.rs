@@ -48759,7 +48759,12 @@ pub(super) fn store_derived_field_expr(
                     } else {
                         b.load_typed(src_info.addr, load_ty)
                     };
-                    store_procedure_pointer_component_record(b, field_ptr, addr, &[]);
+                    let closure_args = procedure_dummy_closure_args_from_locals(
+                        b,
+                        locals,
+                        &src_key,
+                    );
+                    store_procedure_pointer_component_record(b, field_ptr, addr, &closure_args);
                     return;
                 }
 
