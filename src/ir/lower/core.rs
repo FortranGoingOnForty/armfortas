@@ -345,6 +345,13 @@ fn bound_proc_slot_target_symbol(
     internal_funcs: &HashMap<String, u32>,
     available_targets: &HashSet<String>,
 ) -> Option<String> {
+    if layout.owner_module.is_none()
+        && bp.target_name
+            .to_ascii_lowercase()
+            .starts_with("afs_modproc_")
+    {
+        return Some(bp.target_name.clone());
+    }
     let local_target = if layout.owner_module.is_none() {
         find_procedure_scope_id(st, &bp.target_name)
             .or_else(|| find_procedure_scope_id(st, &bp.abi_name))
