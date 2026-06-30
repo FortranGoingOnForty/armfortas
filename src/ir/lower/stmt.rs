@@ -63,6 +63,20 @@ fn copy_array_result_to_fixed_dest(
     );
 }
 
+fn copy_array_result_to_descriptor_dest(
+    b: &mut FuncBuilder,
+    info: &LocalInfo,
+    src_desc: ValueId,
+) {
+    let dest_desc = array_descriptor_addr(b, info);
+    let null_stat = b.const_i64(0);
+    b.call(
+        FuncRef::External("afs_copy_array_data_no_realloc".into()),
+        vec![dest_desc, src_desc, null_stat],
+        IrType::Void,
+    );
+}
+
 fn synth_defined_unary_array_result_call(
     ctx: &LowerCtx<'_>,
     value: &crate::ast::expr::SpannedExpr,
@@ -116,9 +130,10 @@ fn io_control_by_keyword<'a>(controls: &'a [IoControl], needle: &str) -> Option<
 }
 
 fn namelist_i8_ptr(b: &mut FuncBuilder, value: ValueId) -> ValueId {
-    if b.func().value_type(value).is_some_and(|ty| {
-        ty == IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)))
-    }) {
+    if b.func()
+        .value_type(value)
+        .is_some_and(|ty| ty == IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
+    {
         return value;
     }
     let raw = b.ptr_to_int(value);
@@ -313,7 +328,10 @@ fn lower_namelist_entries(
         .lookup_local_then_any(ctx.proc_scope_id, &key)
         .or_else(|| ctx.st.find_symbol_any_scope(&key))
     else {
-        lower_stmt_error(span, &format!("NAMELIST group '{}' is not declared", group_name));
+        lower_stmt_error(
+            span,
+            &format!("NAMELIST group '{}' is not declared", group_name),
+        );
     };
     if sym.kind != crate::sema::symtab::SymbolKind::Namelist {
         lower_stmt_error(span, &format!("'{}' is not a NAMELIST group", group_name));
@@ -382,13 +400,7 @@ fn lower_namelist_entries(
         let name_len = b.const_i64(entry_name.len() as i64);
         let data_type_value = b.const_i32(data_type);
         store_byte_aggregate_field(b, entries, base, ptr_ty.clone(), name_ptr);
-        store_byte_aggregate_field(
-            b,
-            entries,
-            base + 8,
-            IrType::Int(IntWidth::I64),
-            name_len,
-        );
+        store_byte_aggregate_field(b, entries, base + 8, IrType::Int(IntWidth::I64), name_len);
         store_byte_aggregate_field(b, entries, base + 16, ptr_ty.clone(), data_ptr);
         store_byte_aggregate_field(
             b,
@@ -1290,7 +1302,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                         matches!(
                                                             &arg.value,
                                                             crate::ast::expr::SectionSubscript::Element(e)
-                                                                if expr_contains_array_refs(e, &ctx.locals)
+                                                                if actual_expr_rank(
+                                                                    e,
+                                                                    &ctx.locals,
+                                                                    ctx.st,
+                                                                    Some(ctx.type_layouts),
+                                                                )
+                                                                .is_some_and(|rank| rank > 0)
+                                                                    || expr_contains_array_refs(e, &ctx.locals)
                                                                     || expr_contains_array_constructor(e)
                                                         )
                                                     })
@@ -1566,6 +1585,10 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                             src_desc,
                                                             dest_elem_len,
                                                         );
+                                                    } else if !info.allocatable {
+                                                        copy_array_result_to_descriptor_dest(
+                                                            b, &info, src_desc,
+                                                        );
                                                     } else {
                                                         let src_kind_tag = src_elem_ty
                                                             .as_ref()
@@ -1665,6 +1688,10 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                         dest_desc,
                                                         src_desc,
                                                         dest_elem_len,
+                                                    );
+                                                } else if !info.allocatable {
+                                                    copy_array_result_to_descriptor_dest(
+                                                        b, &info, src_desc,
                                                     );
                                                 } else {
                                                     let src_kind_tag = src_elem_ty
@@ -1840,6 +1867,20 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         if let Some(info) = ctx.locals.get(&akey).cloned() {
                             let is_scalar_fixed_alloc_char =
                                 local_fixed_char_allocatable_scalar_len(&info).is_some();
+                            let has_literal_vector_subscript = args.iter().any(|arg| {
+                                matches!(
+                                    &arg.value,
+                                    crate::ast::expr::SectionSubscript::Element(e)
+                                        if matches!(e.node, Expr::ArrayConstructor { .. })
+                                )
+                            });
+                            if local_is_array_like(&info)
+                                && !is_scalar_fixed_alloc_char
+                                && has_literal_vector_subscript
+                                && lower_vector_subscript_section_assign(b, ctx, &info, args, value)
+                            {
+                                return;
+                            }
                             // Vector subscript: a([i1, i2, ...]) = scalar
                             // Expand to scalar assignments a(i1) = scalar, etc.
                             if local_is_array_like(&info)
@@ -3551,16 +3592,6 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             callee.span,
                         )
                     };
-                    let arg_slots = if procptr_target.is_some() {
-                        reorder_args_by_keyword_slots(args, &signature_key, ctx.st)
-                    } else {
-                        reorder_args_by_keyword_slots_for_target(
-                            args,
-                            resolved_name.as_str(),
-                            &resolved_key,
-                            ctx.st,
-                        )
-                    };
                     let abi_lookup_keys = procedure_abi_lookup_keys_for_call_target(
                         ctx.st,
                         resolved_name.as_str(),
@@ -3570,6 +3601,19 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         .first()
                         .map(String::as_str)
                         .unwrap_or(resolved_key.as_str());
+                    let arg_order_key = if procptr_target.is_some() {
+                        signature_key.as_str()
+                    } else {
+                        abi_lookup_keys
+                            .iter()
+                            .find(|k| {
+                                callee_scope_for_lookup(ctx.st, k)
+                                    .is_some_and(|scope| !scope.arg_order.is_empty())
+                            })
+                            .map(String::as_str)
+                            .unwrap_or(resolved_key.as_str())
+                    };
+                    let arg_slots = reorder_args_by_keyword_slots(args, arg_order_key, ctx.st);
                     let value_mask = first_procedure_lookup(&abi_lookup_keys, |k| {
                         callee_value_arg_mask(ctx.st, k)
                     });
@@ -7144,11 +7188,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     if let Expr::Name { name: src_name } = &value.node {
                         let src_key = src_name.to_lowercase();
                         if let Some(src_info) = ctx.locals.get(&src_key) {
-                            let closure_args = procedure_dummy_closure_args_from_locals(
-                                b,
-                                &ctx.locals,
-                                &src_key,
-                            );
+                            let closure_args =
+                                procedure_dummy_closure_args_from_locals(b, &ctx.locals, &src_key);
                             if !closure_args.is_empty() {
                                 let load_ty = if src_info.ty.is_ptr() {
                                     src_info.ty.clone()
@@ -7191,12 +7232,11 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     link_name
                                 };
                                 let addr = b.global_addr(&lowered_name, IrType::Int(IntWidth::I8));
-                                let mut closure_args =
-                                    procedure_dummy_closure_args_from_locals(
-                                        b,
-                                        &ctx.locals,
-                                        &src_key,
-                                    );
+                                let mut closure_args = procedure_dummy_closure_args_from_locals(
+                                    b,
+                                    &ctx.locals,
+                                    &src_key,
+                                );
                                 if closure_args.is_empty() {
                                     append_host_closure_args(
                                         b,
