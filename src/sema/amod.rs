@@ -686,7 +686,12 @@ fn emit_parameter(
             .as_ref()
             .map(|hex| format!(" @charhex {}", hex))
             .unwrap_or_default();
-        write!(out, "@param {} : {} @ir {}", name, type_with_attr, info.symbol).unwrap();
+        write!(
+            out,
+            "@param {} : {} @ir {}",
+            name, type_with_attr, info.symbol
+        )
+        .unwrap();
         if info.deferred_char {
             write!(out, " @deferred_char").unwrap();
         }
@@ -1194,6 +1199,9 @@ fn emit_type(out: &mut String, name: &str, type_layouts: &TypeLayoutRegistry) {
             }
             if field.pointer {
                 attrs.push_str(" @pointer");
+            }
+            if field.deferred_char {
+                attrs.push_str(" @deferred_char");
             }
             if field.procedure_pointer {
                 attrs.push_str(" @procptr");
@@ -2166,6 +2174,7 @@ fn parse_type(
                 }
                 let mut allocatable = false;
                 let mut pointer = false;
+                let mut deferred_char = false;
                 let mut target = false;
                 let mut declared_array = false;
                 let mut procedure_pointer = false;
@@ -2175,6 +2184,7 @@ fn parse_type(
                     match token {
                         "@allocatable" => allocatable = true,
                         "@pointer" => pointer = true,
+                        "@deferred_char" => deferred_char = true,
                         "@procptr" => procedure_pointer = true,
                         "@nopass" => procedure_pointer_nopass = true,
                         "@target" => target = true,
@@ -2197,6 +2207,7 @@ fn parse_type(
                     type_info: ftype.unwrap_or(TypeInfo::Integer { kind: None }),
                     allocatable,
                     pointer,
+                    deferred_char,
                     target,
                     procedure_pointer,
                     procedure_pointer_nopass,
