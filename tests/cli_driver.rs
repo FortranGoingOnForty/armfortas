@@ -7014,6 +7014,534 @@ end program
 }
 
 #[test]
+fn elemental_intrinsic_array_function_actual_materializes_descriptor() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=elemental_intrinsic_array_function_actual_materializes_descriptor count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // PRIMA's linalg::linspace_i assigns an automatic integer array
+    // result from `nint(linspace_r(...), IK)`. The RHS actual is an
+    // array-returning function call, not a direct local-array ref; the
+    // scalar call path truncated the temporary descriptor pointer to i32
+    // before passing it to afs_assign_allocatable.
+    let src = write_program(
+        r#"
+module m
+  implicit none
+  integer, parameter :: ik = 4
+contains
+  function linspace_r(xstart, xstop, n) result(x)
+    real(8), intent(in) :: xstart
+    real(8), intent(in) :: xstop
+    integer(ik), intent(in) :: n
+    real(8) :: x(max(n, 0_ik))
+    integer(ik) :: i
+
+    if (n <= 0_ik) return
+    if (n == 1_ik) then
+      x = xstop
+    else
+      do i = 1_ik, n
+        x(i) = xstart + (xstop - xstart) * real(i - 1_ik, 8) / real(n - 1_ik, 8)
+      end do
+    end if
+  end function
+
+  function linspace_i(xstart, xstop, n) result(x)
+    integer(ik), intent(in) :: xstart
+    integer(ik), intent(in) :: xstop
+    integer(ik), intent(in) :: n
+    integer(ik) :: x(max(n, 0_ik))
+
+    x = nint(linspace_r(real(xstart, 8), real(xstop, 8), n), ik)
+  end function
+end module
+
+program p
+  use m
+  implicit none
+  integer(ik) :: got(4)
+
+  got = linspace_i(1_ik, 4_ik, 4_ik)
+  if (got(1) /= 1_ik) error stop 1
+  if (got(2) /= 2_ik) error stop 2
+  if (got(3) /= 3_ik) error stop 3
+  if (got(4) /= 4_ik) error stop 4
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("elemental_intrinsic_array_function_actual", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("elemental intrinsic array function actual compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "elemental intrinsic array function actual should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("elemental intrinsic array function actual run failed");
+    assert!(
+        run.status.success(),
+        "elemental intrinsic array function actual should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected elemental intrinsic array function actual output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn array_constructor_flattens_zero_extent_transpose_without_null_load() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=array_constructor_flattens_zero_extent_transpose_without_null_load count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // PRIMA get_lincon builds a constructor containing transpose(Aeq)
+    // where Aeq can have a zero extent. TRANSPOSE must preserve shape
+    // even when the payload base is null; otherwise the constructor sees
+    // a rank-0 descriptor, assumes size 1, and loads from null.
+    let src = write_program(
+        r#"
+program p
+  implicit none
+  real(8), allocatable :: a(:, :)
+  real(8), allocatable :: flat(:)
+
+  allocate(a(0, 2))
+  flat = [transpose(a)]
+  if (.not. allocated(flat)) error stop 1
+  if (size(flat) /= 0) error stop 2
+  flat = [-transpose(a)]
+  if (size(flat) /= 0) error stop 3
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("zero_extent_transpose_constructor", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("zero extent transpose constructor compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "zero extent transpose constructor should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("zero extent transpose constructor run failed");
+    assert!(
+        run.status.success(),
+        "zero extent transpose constructor should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected zero extent transpose constructor output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn zero_extent_array_expr_actual_preserves_function_result_shape() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=zero_extent_array_expr_actual_preserves_function_result_shape count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // PRIMA moderatec receives `matprod(...) - bvec`; when that
+    // expression is zero-sized its descriptor has a null base by design.
+    // Assignment to an automatic function result must preserve the
+    // rank/extent so following elemental loops see size 0, not rank-0
+    // size 1.
+    let src = write_program(
+        r#"
+module m
+  implicit none
+contains
+  function clamp(c) result(y)
+    real(8), intent(in) :: c(:)
+    real(8) :: y(size(c))
+
+    y = c
+    y = max(-1.0_8, min(1.0_8, y))
+  end function
+end module
+
+program p
+  use m, only : clamp
+  implicit none
+  real(8), allocatable :: a(:), b(:), c(:)
+
+  allocate(a(0), b(0))
+  c = clamp(a - b)
+  if (.not. allocated(c)) error stop 1
+  if (size(c) /= 0) error stop 2
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("zero_extent_expr_actual_result", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("zero extent expr actual result compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "zero extent expr actual result should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("zero extent expr actual result run failed");
+    assert!(
+        run.status.success(),
+        "zero extent expr actual result should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected zero extent expr actual result output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn dim_reduction_over_empty_extent_preserves_unreduced_shape() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=dim_reduction_over_empty_extent_preserves_unreduced_shape count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // PRIMA fcratio computes cmin/cmax from minval/maxval(-conmat,
+    // dim=2). For a shape like (6,0), the source temporary has a null
+    // payload but the reduced result still has the unreduced shape (6).
+    // Returning a zeroed descriptor made the later `0.5*cmax` loop
+    // treat cmax as a rank-0 scalar and load from null.
+    let src = write_program(
+        r#"
+module m
+  implicit none
+contains
+  function ratio(conmat) result(r)
+    real(8), intent(in) :: conmat(:, :)
+    real(8) :: r
+    real(8) :: cmax(size(conmat, 1))
+    real(8) :: cmin(size(conmat, 1))
+
+    cmin = minval(-conmat, dim=2)
+    cmax = maxval(-conmat, dim=2)
+    r = 0.0_8
+    if (any(cmin < 0.5_8 * cmax)) error stop 1
+  end function
+end module
+
+program p
+  use m, only : ratio
+  implicit none
+  real(8), allocatable :: conmat(:, :)
+  real(8) :: got
+
+  allocate(conmat(6, 0))
+  got = ratio(conmat)
+  if (got /= 0.0_8) error stop 2
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("empty_extent_dim_reduction", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("empty extent dim reduction compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "empty extent dim reduction should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("empty extent dim reduction run failed");
+    assert!(
+        run.status.success(),
+        "empty extent dim reduction should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected empty extent dim reduction output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn maxloc_dim_returns_per_slice_indices_without_scalar_broadcast() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=maxloc_dim_returns_per_slice_indices_without_scalar_broadcast count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // PRIMA BOBYQA's geostep computes ksqs = int(maxloc(predsq, dim=2),
+    // kind(ksqs)). The compiler used to lower this as whole-array scalar
+    // MAXLOC(predsq), then broadcast that one index into ksqs, yielding
+    // values beyond the second dimension and an out-of-bounds follow-up
+    // lookup.
+    let src = write_program(
+        r#"
+program p
+  implicit none
+  real(8) :: predsq(3, 4)
+  integer :: ksqs(3)
+  integer :: mins(3)
+  integer :: isq
+  integer :: ksq
+
+  predsq(1, 1) = 1.0_8
+  predsq(2, 1) = 8.0_8
+  predsq(3, 1) = 0.0_8
+  predsq(1, 2) = -5.0_8
+  predsq(2, 2) = 6.0_8
+  predsq(3, 2) = 7.0_8
+  predsq(1, 3) = 3.0_8
+  predsq(2, 3) = -2.0_8
+  predsq(3, 3) = 11.0_8
+  predsq(1, 4) = 9.0_8
+  predsq(2, 4) = 1.0_8
+  predsq(3, 4) = 4.0_8
+
+  ksqs = int(maxloc(predsq, dim=2), kind(ksqs))
+  if (ksqs(1) /= 4 .or. ksqs(2) /= 1 .or. ksqs(3) /= 3) error stop 1
+
+  mins = int(minloc(predsq, dim=2), kind(mins))
+  if (mins(1) /= 2 .or. mins(2) /= 3 .or. mins(3) /= 1) error stop 2
+
+  isq = int(maxloc([predsq(1, ksqs(1)), predsq(2, ksqs(2)), predsq(3, ksqs(3))], dim=1), kind(isq))
+  ksq = ksqs(isq)
+  if (isq /= 3 .or. ksq /= 3) error stop 3
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("maxloc_dim_per_slice", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("maxloc dim per-slice compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "maxloc dim per-slice should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("maxloc dim per-slice run failed");
+    assert!(
+        run.status.success(),
+        "maxloc dim per-slice should run: status={:?} stderr={} stdout={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr),
+        String::from_utf8_lossy(&run.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected maxloc dim per-slice output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn assumed_shape_assignment_from_array_function_does_not_reallocate_dummy() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=assumed_shape_assignment_from_array_function_does_not_reallocate_dummy count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // PRIMA COBYLA passes an automatic local `z(size(d), size(d))` to
+    // trstlp_sub, whose stage-1 initialization does `z = eye(n)`. The
+    // LHS is an assumed-shape inout dummy backed by the caller's automatic
+    // array, so assignment must copy into the existing descriptor. Routing
+    // it through allocatable assignment can free the caller-owned payload
+    // and leave the parent cleanup to double-free it.
+    let src = write_program(
+        r#"
+module m
+  implicit none
+contains
+  function eye(n) result(x)
+    integer, intent(in) :: n
+    real(8) :: x(n, n)
+    integer :: i
+
+    x = 0.0_8
+    do i = 1, n
+      x(i, i) = 1.0_8
+    end do
+  end function
+
+  subroutine fill(z)
+    real(8), intent(inout) :: z(:, :)
+    z = eye(size(z, 1))
+  end subroutine
+
+  subroutine parent(n)
+    integer, intent(in) :: n
+    real(8) :: z(n, n)
+
+    z = -1.0_8
+    call fill(z)
+    if (z(1, 1) /= 1.0_8) error stop 1
+  end subroutine
+end module
+
+program p
+  use m, only : parent
+  implicit none
+
+  call parent(1)
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("assumed_shape_array_function_copy", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("assumed-shape array function copy compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "assumed-shape array function copy should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("assumed-shape array function copy run failed");
+    assert!(
+        run.status.success(),
+        "assumed-shape array function copy should run: status={:?} stderr={} stdout={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr),
+        String::from_utf8_lossy(&run.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected assumed-shape array function copy output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn automatic_local_can_depend_on_hidden_array_result_shape() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=automatic_local_can_depend_on_hidden_array_result_shape count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // PRIMA COBYLA's trstlp result `d` is a runtime-shaped array, and a
+    // sibling automatic local is declared as `z(size(d), size(d))`. The
+    // hidden result descriptor must be allocated before ordinary automatic
+    // locals evaluate bounds derived from it.
+    let src = write_program(
+        r#"
+module m
+  implicit none
+contains
+  function make(n) result(d)
+    integer, intent(in) :: n
+    real(8) :: d(n)
+    real(8) :: z(size(d), size(d))
+
+    z = 0.0_8
+    if (size(z, 1) /= n .or. size(z, 2) /= n) error stop 1
+    d = 1.0_8
+  end function
+end module
+
+program p
+  use m, only : make
+  implicit none
+  real(8), allocatable :: got(:)
+
+  got = make(2)
+  if (size(got) /= 2) error stop 2
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("hidden_result_shape_before_locals", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("hidden result shape before locals compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "hidden result shape before locals should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("hidden result shape before locals run failed");
+    assert!(
+        run.status.success(),
+        "hidden result shape before locals should run: status={:?} stderr={} stdout={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr),
+        String::from_utf8_lossy(&run.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected hidden result shape before locals output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn intrinsic_trim_not_shadowed_by_loaded_only_named_interface() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -9779,7 +10307,12 @@ fn formatted_write_nested_implied_do_preserves_loop_order() {
     );
     let stdout = String::from_utf8_lossy(&run.stdout);
     let fields: Vec<&str> = stdout.split_whitespace().collect();
-    assert_eq!(fields, ["1", "2", "3", "4"], "unexpected stdout: {}", stdout);
+    assert_eq!(
+        fields,
+        ["1", "2", "3", "4"],
+        "unexpected stdout: {}",
+        stdout
+    );
 
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
@@ -12816,6 +13349,30 @@ fn missing_response_file_uses_io_exit_code() {
 }
 
 #[test]
+fn darwin_loader_at_paths_are_not_response_files() {
+    let result = Command::new(compiler("armfortas"))
+        .args([
+            "--help",
+            "@rpath/libprimaf.dylib",
+            "@loader_path/libdep.dylib",
+            "@executable_path/libdep.dylib",
+        ])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        result.status.success(),
+        "Darwin loader @paths should not be opened as response files: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(
+        stdout.contains("USAGE"),
+        "expected --help output: {}",
+        stdout
+    );
+}
+
+#[test]
 fn escaped_at_prefixed_input_is_treated_as_literal_filename() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -12881,7 +13438,18 @@ fn dash_j_writes_amod_to_chosen_directory() {
         String::from_utf8_lossy(&result.stderr)
     );
     let amod = amod_dir.join("dashj_mod.amod");
+    let mod_alias = amod_dir.join("dashj_mod.mod");
     assert!(amod.exists(), "-J should place .amod in the requested dir");
+    assert!(
+        mod_alias.exists(),
+        "-J should also place a conventional .mod alias in the requested dir"
+    );
+    let amod_text = std::fs::read_to_string(&amod).expect("missing .amod");
+    let mod_text = std::fs::read_to_string(&mod_alias).expect("missing .mod alias");
+    assert_eq!(
+        amod_text, mod_text,
+        ".mod compatibility alias should match .amod exactly"
+    );
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
     let _ = std::fs::remove_dir_all(&amod_dir);
@@ -21486,6 +22054,43 @@ fn scalar_spread_write_materializes_array_descriptor() {
 }
 
 #[test]
+fn rank1_array_source_spread_materializes_rank2_descriptor() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=rank1_array_source_spread_materializes_rank2_descriptor count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  real :: x(2)\n  real :: d(2)\n  real :: y(2, 3)\n  x = [1.0, 2.0]\n  d = [10.0, 20.0]\n  y = spread(x + d, dim=2, ncopies=3)\n  if (any(abs(y(:, 1) - [11.0, 22.0]) > 1.0e-6)) error stop 1\n  if (any(abs(y(:, 2) - [11.0, 22.0]) > 1.0e-6)) error stop 2\n  if (any(abs(y(:, 3) - [11.0, 22.0]) > 1.0e-6)) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("rank1_array_source_spread", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("rank-1 array-source SPREAD compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "rank-1 array-source SPREAD should compile + link: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("rank-1 array-source SPREAD run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "rank-1 array-source SPREAD run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn submodule_dispatching_private_parent_generic_interface_resolves_via_amod() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -24012,6 +24617,53 @@ fn shared_compile_emits_amod_and_links_cleanly() {
         stdout.trim().ends_with("42"),
         "unexpected output: {}",
         stdout
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn dynamiclib_driver_spelling_forwards_darwin_linker_flags() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=dynamiclib_driver_spelling_forwards_darwin_linker_flags count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    if armfortas::testing::native_macho_toolchain_support().is_err() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=dynamiclib_driver_spelling_forwards_darwin_linker_flags count=1 reason=\"Mach-O dylib flow only\""
+        );
+        return;
+    }
+    let dir = unique_dir("dynamiclib_flags");
+    let src = write_program_in(
+        &dir,
+        "m.f90",
+        "module m\ncontains\n  integer function answer()\n    answer = 42\n  end function\nend module\n",
+    );
+    let dylib = dir.join("libm.dylib");
+    let result = Command::new(compiler("armfortas"))
+        .args([
+            "-dynamiclib",
+            "-Wl,-headerpad_max_install_names",
+            "-install_name",
+            "@rpath/libm.dylib",
+            src.to_str().unwrap(),
+            "-o",
+            dylib.to_str().unwrap(),
+        ])
+        .output()
+        .expect("dynamiclib compile spawn failed");
+    assert!(
+        result.status.success(),
+        "dynamiclib compile failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(dylib.exists(), "dynamiclib output should exist");
+    assert!(
+        dir.join("m.amod").exists(),
+        "dynamiclib compile should emit m.amod"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -45802,6 +46454,117 @@ fn rank2_vector_subscript_assignment_scatters_array_rhs() {
 }
 
 #[test]
+fn vector_subscript_binary_index_expr_gathers_columns() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=vector_subscript_binary_index_expr_gathers_columns count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: ij(2, 2)\n  real :: xpt(3, 5)\n  real :: got(3, 2)\n  ij = reshape([1, 2, 2, 3], [2, 2])\n  xpt(:, 1) = [1.0, 10.0, 100.0]\n  xpt(:, 2) = [2.0, 20.0, 200.0]\n  xpt(:, 3) = [3.0, 30.0, 300.0]\n  xpt(:, 4) = [4.0, 40.0, 400.0]\n  xpt(:, 5) = [5.0, 50.0, 500.0]\n  got = xpt(:, ij(1, :) + 1) + xpt(:, ij(2, :) + 1)\n  if (any(abs(got(:, 1) - [5.0, 50.0, 500.0]) > 1.0e-6)) error stop 1\n  if (any(abs(got(:, 2) - [7.0, 70.0, 700.0]) > 1.0e-6)) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("vector_subscript_binary_index_expr", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("binary-index vector subscript compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "binary-index vector subscript compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("binary-index vector subscript run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "binary-index vector subscript run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn array_constructor_flattens_vector_subscript_binary_exprs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=array_constructor_flattens_vector_subscript_binary_exprs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module locs\ncontains\n  function falseloc(x) result(loc)\n    logical, intent(in) :: x(:)\n    integer, allocatable :: loc(:)\n    integer :: i, n\n    allocate(loc(count(.not. x)))\n    n = 0\n    do i = 1, size(x)\n      if (.not. x(i)) then\n        n = n + 1\n        loc(n) = i\n      end if\n    end do\n  end function falseloc\nend module locs\nprogram p\n  use locs, only: falseloc\n  implicit none\n  real, parameter :: eps = 0.001\n  real :: x0(4), xl(4), xu(4), rhobeg\n  logical :: lbx(4), ubx(4)\n  x0 = [10.0, 20.0, 30.0, 40.0]\n  xl = [9.0, 15.0, 29.0, 37.0]\n  xu = [13.0, 22.0, 35.0, 41.0]\n  lbx = [.true., .false., .true., .false.]\n  ubx = [.false., .true., .false., .true.]\n  rhobeg = 100.0\n  rhobeg = max(eps, minval([rhobeg, x0(falseloc(lbx)) - xl(falseloc(lbx)), xu(falseloc(ubx)) - x0(falseloc(ubx))]))\n  if (abs(rhobeg - 3.0) > 1.0e-6) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("array_constructor_vector_subscript_binary", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("array-constructor vector-subscript binary compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "array-constructor vector-subscript binary compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("array-constructor vector-subscript binary run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "array-constructor vector-subscript binary run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn non_elemental_generic_array_actuals_are_not_scalarized() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=non_elemental_generic_array_actuals_are_not_scalarized count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module linalg_probe\n  implicit none\n  interface matprod\n    module procedure matprod12, matprod21, matprod22\n  end interface\ncontains\n  function matprod12(x, y) result(z)\n    real(8), intent(in) :: x(:)\n    real(8), intent(in) :: y(:, :)\n    real(8) :: z(size(y, 2))\n    integer :: j\n    do j = 1, size(y, 2)\n      z(j) = sum(x * y(:, j))\n    end do\n  end function\n  function matprod21(x, y) result(z)\n    real(8), intent(in) :: x(:, :)\n    real(8), intent(in) :: y(:)\n    real(8) :: z(size(x, 1))\n    z = 0.0_8\n  end function\n  function matprod22(x, y) result(z)\n    real(8), intent(in) :: x(:, :)\n    real(8), intent(in) :: y(:, :)\n    real(8) :: z(size(x, 1), size(y, 2))\n    z = 0.0_8\n  end function\nend module\nmodule caller_probe\n  use linalg_probe, only: matprod\n  implicit none\ncontains\n  subroutine run(a, b, dnew, iact)\n    real(8), intent(in) :: a(:, :)\n    real(8), intent(in) :: b(:)\n    real(8), intent(in) :: dnew(:)\n    integer, intent(in) :: iact(:)\n    real(8) :: cviol\n    real(8) :: cvshift(size(b))\n    cviol = 100.0_8\n    cvshift = cviol - (matprod(dnew, a(:, iact)) - b(iact))\n    if (abs(cvshift(1) - (100.0_8 - (194.0_8 - 7.0_8))) > 1.0e-9_8) error stop 1\n    if (abs(cvshift(2) - (100.0_8 - (74.0_8 - 5.0_8))) > 1.0e-9_8) error stop 2\n    print *, 'ok'\n  end subroutine\nend module\nprogram p\n  use caller_probe, only: run\n  implicit none\n  real(8) :: a(3, 4), b(4), dnew(3)\n  integer :: iact(2)\n  integer :: i, j\n  do j = 1, 4\n    do i = 1, 3\n      a(i, j) = real(10*j + i, 8)\n    end do\n  end do\n  b = [5.0_8, 6.0_8, 7.0_8, 8.0_8]\n  dnew = [1.0_8, 2.0_8, 3.0_8]\n  iact = [3, 1]\n  call run(a, b, dnew, iact)\nend program\n",
+        "f90",
+    );
+    let out = unique_path("non_elemental_generic_array_actuals", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("non-elemental generic array actual compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "non-elemental generic array actual compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("non-elemental generic array actual run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "non-elemental generic array actual run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn rank1_vector_subscript_assignment_scatters_array_rhs() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -45830,6 +46593,43 @@ fn rank1_vector_subscript_assignment_scatters_array_rhs() {
     assert!(
         run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
         "rank-1 vector subscript assignment run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn rank1_literal_vector_subscript_assignment_swaps_with_temp_rhs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=rank1_literal_vector_subscript_assignment_swaps_with_temp_rhs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: y(3)\n  integer :: i\n  y = [1, 2, 3]\n  i = 2\n  y([i - 1, i]) = y([i, i - 1])\n  if (any(y /= [2, 1, 3])) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("rank1_literal_vector_subscript_swap", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("rank-1 literal vector subscript assignment compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "rank-1 literal vector subscript assignment compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("rank-1 literal vector subscript assignment run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "rank-1 literal vector subscript assignment run failed: status={:?} stdout={} stderr={}",
         run.status,
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr)
