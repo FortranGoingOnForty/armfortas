@@ -105,6 +105,25 @@ fn run_binary(binary: &Path) -> String {
     String::from_utf8_lossy(&result.stdout).into_owned()
 }
 
+fn undefined_symbols(path: &Path) -> Vec<String> {
+    let out = Command::new("nm")
+        .args(["-u", "-j", path.to_str().unwrap()])
+        .output()
+        .expect("failed to spawn nm");
+    assert!(
+        out.status.success(),
+        "nm failed for {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
 /// Full multi-file test: write sources, compile, link, run, check.
 fn multifile_test(mod_source: &str, main_source: &str, expected_substring: &str) {
     let compiler = find_compiler();
@@ -1199,6 +1218,74 @@ fn parent_vtable_references_submodule_tbp_target() {
     assert!(
         output.contains("ok"),
         "submodule-backed TBP vtable dispatch failed:\n{}",
+        output
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn local_child_vtable_keeps_imported_tbp_target_over_same_abi_interface_name() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=local_child_vtable_keeps_imported_tbp_target_over_same_abi_interface_name count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let rk_a_f90 = dir.join("rk_a.f90");
+    let rk_b_f90 = dir.join("rk_b.f90");
+    let facade_f90 = dir.join("facade.f90");
+    let main_f90 = dir.join("main.f90");
+    let rk_a_o = dir.join("rk_a.o");
+    let rk_b_o = dir.join("rk_b.o");
+    let facade_o = dir.join("facade.o");
+    let main_o = dir.join("main.o");
+    let binary = dir.join("facade_vtable_bin");
+
+    std::fs::write(
+        &rk_a_f90,
+        "module rk_a\n  implicit none\n  type, abstract :: rk_class\n  contains\n    procedure(step_func), deferred :: step\n    procedure :: integrate => a_integrate\n  end type\n  abstract interface\n    subroutine step_func(self)\n      import :: rk_class\n      class(rk_class), intent(inout) :: self\n    end subroutine\n  end interface\n  type, extends(rk_class) :: rk8_10_class\n  contains\n    procedure :: step => rk8_10\n  end type\ncontains\n  subroutine a_integrate(self)\n    class(rk_class), intent(inout) :: self\n    call self%step()\n  end subroutine\n  subroutine rk8_10(self)\n    class(rk8_10_class), intent(inout) :: self\n  end subroutine\nend module\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &rk_b_f90,
+        "module rk_b\n  implicit none\n  type, abstract :: other_class\n  contains\n    procedure(step_func), deferred :: step\n    procedure :: integrate => b_integrate\n  end type\n  abstract interface\n    subroutine step_func(self)\n      import :: other_class\n      class(other_class), intent(inout) :: self\n    end subroutine\n  end interface\ncontains\n  subroutine b_integrate(self)\n    class(other_class), intent(inout) :: self\n  end subroutine\nend module\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &facade_f90,
+        "module facade\n  use rk_a\n  use rk_b\n  implicit none\nend module\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &main_f90,
+        "program p\n  use facade\n  implicit none\n  type, extends(rk8_10_class) :: spacecraft\n    integer :: marker = 0\n  end type\n  type(spacecraft) :: s\n  call s%integrate()\n  print *, \"ok\"\nend program\n",
+    )
+    .unwrap();
+
+    compile_file(&compiler, &rk_a_f90, &rk_a_o, None);
+    compile_file(&compiler, &rk_b_f90, &rk_b_o, Some(&dir));
+    compile_file(&compiler, &facade_f90, &facade_o, Some(&dir));
+    compile_file(&compiler, &main_f90, &main_o, Some(&dir));
+
+    let undef = undefined_symbols(&main_o);
+    assert!(
+        !undef.iter().any(|sym| {
+            sym.trim_start_matches('_')
+                == "afs_modproc_rk_b_step_func"
+        }),
+        "local child vtable should keep rk_a's imported target, not rk_b's interface placeholder: {:?}",
+        undef
+    );
+
+    link_files(&[&rk_a_o, &rk_b_o, &facade_o, &main_o], &binary);
+    let output = run_binary(&binary);
+    assert!(
+        output.contains("ok"),
+        "facade-imported child vtable dispatch failed:\n{}",
         output
     );
 
