@@ -39094,6 +39094,50 @@ fn imported_procptr_component_function_preserves_return_type() {
 }
 
 #[test]
+fn procptr_function_on_class_alloc_component_calls_target() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=procptr_function_on_class_alloc_component_calls_target count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  abstract interface\n    real(8) function norm_iface(x) result(r)\n      real(8), intent(in) :: x(:)\n    end function\n  end interface\n  type :: stepsize_class\n    procedure(norm_iface), pointer, nopass :: norm => null()\n  end type\n  type :: integrator_t\n    class(stepsize_class), allocatable :: stepsize_method\n  end type\ncontains\n  real(8) function pick_norm(x) result(r)\n    real(8), intent(in) :: x(:)\n    r = x(2) + 1.0_8\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  type(integrator_t) :: me\n  real(8) :: x(3)\n  real(8) :: got\n  allocate(stepsize_class :: me%stepsize_method)\n  me%stepsize_method%norm => pick_norm\n  x = [2.0_8, 4.0_8, 8.0_8]\n  got = me%stepsize_method%norm(x)\n  if (abs(got - 5.0_8) > 1.0e-12_8) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("class_alloc_component_procptr_function", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("class-component procptr function compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "class-component procptr function should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("class-component procptr function run failed");
+    assert!(
+        run.status.success(),
+        "class-component procptr function run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected class-component procptr function output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn contained_procptr_component_preserves_host_derived_dummy() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
