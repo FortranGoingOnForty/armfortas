@@ -34569,8 +34569,27 @@ pub(super) fn array_total_elems_value(b: &mut FuncBuilder, info: &LocalInfo) -> 
             IrType::Int(IntWidth::I64),
         )
     } else {
-        let total: i64 = info.dims.iter().map(|(_, extent)| *extent).product();
-        b.const_i64(total.max(0))
+        let rank = local_declared_rank(info);
+        let mut total: Option<ValueId> = None;
+        let mut static_total: i64 = 1;
+        for dim_idx in 0..rank {
+            let (lower, static_extent) = info.dims.get(dim_idx).copied().unwrap_or((1, 1));
+            let extent = if let Some(upper) = info.runtime_dim_upper.get(dim_idx).and_then(|u| *u)
+            {
+                let lower_val = b.const_i64(lower);
+                let span = b.isub(upper, lower_val);
+                let one = b.const_i64(1);
+                b.iadd(span, one)
+            } else {
+                b.const_i64(static_extent.max(0))
+            };
+            total = Some(match total {
+                Some(prev) => b.imul(prev, extent),
+                None => extent,
+            });
+            static_total = static_total.saturating_mul(static_extent.max(0));
+        }
+        total.unwrap_or_else(|| b.const_i64(static_total.max(0)))
     }
 }
 

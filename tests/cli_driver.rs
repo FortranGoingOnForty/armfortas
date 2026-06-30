@@ -6010,6 +6010,51 @@ fn explicit_shape_runtime_bound_function_result_array_compiles_and_runs() {
 }
 
 #[test]
+fn type_bound_runtime_bound_bulk_array_expr_uses_runtime_extent() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=type_bound_runtime_bound_bulk_array_expr_uses_runtime_extent count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type :: t\n    integer :: n = 0\n  contains\n    procedure :: step\n  end type t\ncontains\n  subroutine step(me, x, y)\n    class(t), intent(inout) :: me\n    real(8), dimension(me%n), intent(in) :: x\n    real(8), dimension(me%n), intent(out) :: y\n    real(8), dimension(me%n) :: tmp\n    tmp = x + 1.0d0\n    y = tmp + x\n  end subroutine step\nend module m\n\nprogram p\n  use m\n  implicit none\n  type(t) :: obj\n  real(8), dimension(4) :: x, y\n  obj%n = 4\n  x = [1.0d0, 2.0d0, 3.0d0, 4.0d0]\n  call obj%step(x, y)\n  if (any(abs(y - [3.0d0, 5.0d0, 7.0d0, 9.0d0]) > 1.0d-12)) error stop 1\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("tbp_runtime_bound_bulk_array", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("type-bound runtime-bound bulk array compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "type-bound runtime-bound bulk array should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("type-bound runtime-bound bulk array run failed");
+    assert!(
+        run.status.success(),
+        "type-bound runtime-bound bulk array should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected type-bound runtime-bound bulk array output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fixed_component_array_size_lowers_without_raw_symbol() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
