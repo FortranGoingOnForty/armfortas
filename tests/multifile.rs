@@ -1195,7 +1195,11 @@ fn cross_tu_tbp_targets_submodule_procedure() {
         String::from_utf8_lossy(&result.stderr)
     );
     let output = run_binary(&binary);
-    assert!(output.contains("ok"), "cross-TU TBP→SMP wrong result:\n{}", output);
+    assert!(
+        output.contains("ok"),
+        "cross-TU TBP→SMP wrong result:\n{}",
+        output
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

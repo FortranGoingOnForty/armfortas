@@ -670,19 +670,17 @@ pub fn apply_allocation(f: &mut X86Function, result: &AllocResult) {
             // bridge slot just before the call (occ guaranteed the
             // pre_phys survives the arg setup); the post-half load
             // follows the call below.
-            let bridge_here: Vec<SplitRecord> = if matches!(
-                inst.opcode,
-                X86Opcode::Call | X86Opcode::CallReg
-            ) {
-                result
-                    .split_records
-                    .iter()
-                    .filter(|r| r.call_position == cur_pos)
-                    .cloned()
-                    .collect()
-            } else {
-                Vec::new()
-            };
+            let bridge_here: Vec<SplitRecord> =
+                if matches!(inst.opcode, X86Opcode::Call | X86Opcode::CallReg) {
+                    result
+                        .split_records
+                        .iter()
+                        .filter(|r| r.call_position == cur_pos)
+                        .cloned()
+                        .collect()
+                } else {
+                    Vec::new()
+                };
             for r in &bridge_here {
                 out.push(store(
                     r.pre_phys,
