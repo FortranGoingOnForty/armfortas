@@ -194,6 +194,9 @@ pub struct Options {
     /// `-shared` / `-static`.
     pub shared: bool,
     pub static_link: bool,
+    /// Linker flags accepted by compiler-driver compatibility spellings
+    /// such as `-Wl,` and Darwin's `-install_name`.
+    pub extra_link_args: Vec<String>,
     /// `-rpath` entries passed to `ld`.
     pub rpath: Vec<PathBuf>,
 
@@ -262,6 +265,7 @@ impl Default for Options {
             link_libs: Vec::new(),
             shared: false,
             static_link: false,
+            extra_link_args: Vec::new(),
             rpath: Vec::new(),
             target: crate::target::TargetSpec::host(),
             crt_search_dirs: Vec::new(),
@@ -457,8 +461,30 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
                     .push(PathBuf::from(args.get(i).ok_or("-rpath requires a path")?));
             }
 
-            "-shared" => opts.shared = true,
+            "-shared" | "-dynamiclib" => opts.shared = true,
             "-static" => opts.static_link = true,
+            arg if arg.starts_with("-Wl,") => {
+                opts.extra_link_args.extend(
+                    arg["-Wl,".len()..]
+                        .split(',')
+                        .filter(|s| !s.is_empty())
+                        .map(ToOwned::to_owned),
+                );
+            }
+            "-Xlinker" => {
+                i += 1;
+                opts.extra_link_args
+                    .push(args.get(i).ok_or("-Xlinker requires an argument")?.clone());
+            }
+            "-install_name" | "-compatibility_version" | "-current_version" => {
+                opts.extra_link_args.push(arg.clone());
+                i += 1;
+                opts.extra_link_args.push(
+                    args.get(i)
+                        .ok_or_else(|| format!("{} requires an argument", arg))?
+                        .clone(),
+                );
+            }
 
             // ---- Standards / language flags ----
             arg if arg.starts_with("-std=") => {
@@ -638,6 +664,11 @@ fn expand_response_arg(
         return Ok(());
     }
 
+    if is_darwin_loader_path_token(arg) {
+        expanded.push(arg.to_string());
+        return Ok(());
+    }
+
     let Some(path) = arg.strip_prefix('@') else {
         expanded.push(arg.to_string());
         return Ok(());
@@ -669,6 +700,12 @@ fn expand_response_arg(
     }
     stack.pop();
     Ok(())
+}
+
+fn is_darwin_loader_path_token(arg: &str) -> bool {
+    arg.starts_with("@rpath/")
+        || arg.starts_with("@loader_path/")
+        || arg.starts_with("@executable_path/")
 }
 
 fn resolve_response_file_path(path: &str, base_dir: Option<&Path>) -> PathBuf {
@@ -1556,7 +1593,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     let local_char_len_star_params =
         crate::ir::lower::collect_char_len_star_params_for_units(&units);
 
-    // Emit .amod files for each MODULE in the compilation unit.
+    // Emit module interface files for each MODULE in the compilation unit.
     // -J <dir> overrides where they go. For compile-only (-c) builds
     // without -J, keep the traditional compiler behavior of writing
     // module files into the current working directory even if the
@@ -1593,6 +1630,13 @@ pub fn compile(opts: &Options) -> Result<(), String> {
                 let amod_path = amod_dir.join(format!("{}.amod", mod_key));
                 fs::write(&amod_path, &amod_text)
                     .map_err(|e| format!("cannot write '{}': {}", amod_path.display(), e))?;
+                // `.amod` remains the ARMFORTAS module ABI file. A
+                // byte-identical `.mod` alias keeps conventional Fortran
+                // build systems such as CMake able to track module
+                // dependencies for unknown compilers.
+                let mod_path = amod_dir.join(format!("{}.mod", mod_key));
+                fs::write(&mod_path, &amod_text)
+                    .map_err(|e| format!("cannot write '{}': {}", mod_path.display(), e))?;
                 if opts.verbose {
                     eprintln!(" amod: {}", amod_path.display());
                 }
@@ -1911,6 +1955,7 @@ fn push_link_flags(args: &mut Vec<String>, opts: &Options) {
         args.push("-rpath".into());
         args.push(path.to_string_lossy().into_owned());
     }
+    args.extend(opts.extra_link_args.iter().cloned());
     if opts.shared {
         args.push("-dylib".into());
     }
@@ -1935,6 +1980,7 @@ fn push_afs_ld_link_flags(args: &mut Vec<String>, opts: &Options) {
         args.push("-rpath".into());
         args.push(path.to_string_lossy().into_owned());
     }
+    args.extend(opts.extra_link_args.iter().cloned());
 }
 
 /// ELF assembler routing (x14). `None` means the in-process afs-as
