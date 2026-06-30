@@ -20556,6 +20556,67 @@ fn pack_strided_row_section_uses_descriptor_strides() {
 }
 
 #[test]
+fn pack_scalar_mask_inside_array_constructor_lowers_descriptor() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=pack_scalar_mask_inside_array_constructor_lowers_descriptor count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  real(8) :: eye(2,2)\n  real(8) :: x(5)\n  eye = reshape([1.0_8, 2.0_8, 3.0_8, 4.0_8], [2,2])\n  x = [9.0_8, pack(eye, mask=.true.)]\n  if (abs(x(1) - 9.0_8) > 1.0e-12_8) error stop 1\n  if (abs(x(2) - 1.0_8) > 1.0e-12_8) error stop 2\n  if (abs(x(3) - 2.0_8) > 1.0e-12_8) error stop 3\n  if (abs(x(4) - 3.0_8) > 1.0e-12_8) error stop 4\n  if (abs(x(5) - 4.0_8) > 1.0e-12_8) error stop 5\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let obj = unique_path("pack_scalar_mask_ctor", "o");
+    let compile_obj = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", obj.to_str().unwrap()])
+        .output()
+        .expect("pack scalar-mask constructor object compile failed to spawn");
+    assert!(
+        compile_obj.status.success(),
+        "pack scalar-mask constructor object should compile: {}",
+        String::from_utf8_lossy(&compile_obj.stderr)
+    );
+    let undef = undefined_symbols(&obj);
+    assert!(
+        !undef.iter().any(|s| s == "_pack"),
+        "PACK with scalar mask in constructor should not lower to raw _pack: {:?}",
+        undef
+    );
+
+    let out = unique_path("pack_scalar_mask_ctor", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("pack scalar-mask constructor compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "pack scalar-mask constructor should compile + link: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("pack scalar-mask constructor run failed");
+    assert!(
+        run.status.success(),
+        "pack scalar-mask constructor should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected ok marker, got: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&obj);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn all_over_int8_pack_compare_lowers_descriptor() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

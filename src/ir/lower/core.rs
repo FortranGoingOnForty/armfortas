@@ -36873,7 +36873,7 @@ pub(super) fn lower_pack_array_expr_descriptor(
         contained_host_refs,
         descriptor_params,
     )?;
-    let (mask_desc, _) = lower_array_expr_descriptor(
+    let mask_desc = lower_pack_mask_descriptor(
         b,
         locals,
         mask_expr,
@@ -36924,6 +36924,61 @@ pub(super) fn lower_pack_array_expr_descriptor(
     );
 
     Some((result_desc, elem_ty))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_pack_mask_descriptor(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    mask_expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) -> Option<ValueId> {
+    if let Some((mask_desc, _)) = lower_array_expr_descriptor(
+        b,
+        locals,
+        mask_expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    ) {
+        return Some(mask_desc);
+    }
+
+    if actual_expr_rank(mask_expr, locals, st, type_layouts).is_some_and(|rank| rank > 0) {
+        return None;
+    }
+    if !matches!(
+        operator_expr_type_info(mask_expr, Some(locals), st, type_layouts),
+        Some(crate::sema::symtab::TypeInfo::Logical { .. })
+    ) {
+        return None;
+    }
+
+    let raw = super::expr::lower_expr_full(
+        b,
+        locals,
+        mask_expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    );
+    let value = coerce_to_type(b, raw, &IrType::Bool);
+    let slot = b.alloca(IrType::Bool);
+    b.store(value, slot);
+    let base_raw = b.ptr_to_int(slot);
+    let base = b.int_to_ptr(base_raw, IrType::Int(IntWidth::I8));
+    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let elem_size = b.const_i64(1);
+    store_scalar_polymorphic_descriptor_view(b, desc, base, Some(elem_size), None, None);
+    Some(desc)
 }
 
 /// F2018 §16.9.194: lower UNPACK(VECTOR, MASK, FIELD) to a freshly
