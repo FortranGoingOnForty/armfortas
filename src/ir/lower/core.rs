@@ -50307,16 +50307,13 @@ pub(super) fn resolve_component_base_for_method(
             let field = layout_component_field_or_parent_view(layout, component, tl)?;
             let offset = b.const_i64(field.offset as i64);
             let field_ptr = b.gep(inner_addr, vec![offset], IrType::Int(IntWidth::I8));
-            if let crate::sema::symtab::TypeInfo::Derived(ref nested_type) = field.type_info {
-                if is_opaque_c_handle_type(&field.type_info) {
-                    return None;
-                }
+            if let Some(nested_type) = field_derived_type_name(&field) {
                 let addr = if field.size == 384 && (field.allocatable || field.pointer) {
                     b.load_typed(field_ptr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
                 } else {
                     field_ptr
                 };
-                Some((addr, nested_type.clone()))
+                Some((addr, nested_type))
             } else {
                 None
             }
