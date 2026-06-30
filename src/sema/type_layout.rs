@@ -60,6 +60,7 @@ pub struct FieldLayout {
     /// component's attributes, not the base variable's.
     pub allocatable: bool,
     pub pointer: bool,
+    pub deferred_char: bool,
     pub target: bool,
     pub procedure_pointer: bool,
     pub procedure_pointer_nopass: bool,
@@ -854,10 +855,13 @@ pub fn compute_layout_with_attrs(
                     entity.char_len.as_ref(),
                     const_params,
                 );
-                let explicit_array_specs = entity
-                    .array_spec
-                    .as_ref()
-                    .or(dimension_attr_specs);
+                let effective_char_len = entity.char_len.as_ref().or_else(|| match type_spec {
+                    crate::ast::decl::TypeSpec::Character(Some(sel)) => sel.len.as_ref(),
+                    _ => None,
+                });
+                let deferred_char =
+                    matches!(effective_char_len, Some(crate::ast::decl::LenSpec::Colon));
+                let explicit_array_specs = entity.array_spec.as_ref().or(dimension_attr_specs);
                 let declared_rank = explicit_array_specs.map_or(0, |specs| specs.len());
                 let declared_array = declared_rank > 0;
                 let dims = if is_allocatable || is_pointer {
@@ -957,6 +961,7 @@ pub fn compute_layout_with_attrs(
                     type_info: ti.clone(),
                     allocatable: is_allocatable,
                     pointer: is_pointer,
+                    deferred_char,
                     target: is_target,
                     procedure_pointer: is_proc_pointer_component,
                     procedure_pointer_nopass,
@@ -1192,6 +1197,7 @@ mod tests {
                     type_info: TypeInfo::Real { kind: Some(4) },
                     allocatable: false,
                     pointer: false,
+                    deferred_char: false,
                     target: false,
                     procedure_pointer: false,
                     procedure_pointer_nopass: false,
@@ -1206,6 +1212,7 @@ mod tests {
                     type_info: TypeInfo::Real { kind: Some(4) },
                     allocatable: false,
                     pointer: false,
+                    deferred_char: false,
                     target: false,
                     procedure_pointer: false,
                     procedure_pointer_nopass: false,
@@ -1246,6 +1253,7 @@ mod tests {
                     type_info: TypeInfo::Integer { kind: Some(1) },
                     allocatable: false,
                     pointer: false,
+                    deferred_char: false,
                     target: false,
                     procedure_pointer: false,
                     procedure_pointer_nopass: false,
@@ -1260,6 +1268,7 @@ mod tests {
                     type_info: TypeInfo::Real { kind: Some(8) },
                     allocatable: false,
                     pointer: false,
+                    deferred_char: false,
                     target: false,
                     procedure_pointer: false,
                     procedure_pointer_nopass: false,
@@ -1274,6 +1283,7 @@ mod tests {
                     type_info: TypeInfo::Integer { kind: Some(4) },
                     allocatable: false,
                     pointer: false,
+                    deferred_char: false,
                     target: false,
                     procedure_pointer: false,
                     procedure_pointer_nopass: false,
@@ -1616,6 +1626,7 @@ mod tests {
         assert_eq!(field.dims, vec![(1, 0)]);
         assert!(field.allocatable);
         assert!(field.declared_array);
+        assert!(field.deferred_char);
         assert!(matches!(
             field.type_info,
             TypeInfo::Character {
