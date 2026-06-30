@@ -38923,6 +38923,50 @@ fn procedure_pointer_component_call_updates_integer_argument() {
 }
 
 #[test]
+fn procedure_dummy_assigned_to_procptr_component_preserves_host_closure() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=procedure_dummy_assigned_to_procptr_component_preserves_host_closure count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  abstract interface\n    subroutine cb(x, out)\n      integer, intent(in) :: x\n      integer, intent(out) :: out\n    end subroutine\n  end interface\n  type :: holder_t\n    procedure(cb), pointer, nopass :: f => null()\n  end type\n  type(holder_t) :: holder\n  integer :: bias\n  integer :: got\n  bias = 39\n  call install(holder, add_bias)\n  call holder%f(3, got)\n  if (got /= 42) error stop 1\n  print *, got\ncontains\n  subroutine install(obj, proc)\n    type(holder_t), intent(inout) :: obj\n    procedure(cb) :: proc\n    obj%f => proc\n  end subroutine\n\n  subroutine add_bias(x, out)\n    integer, intent(in) :: x\n    integer, intent(out) :: out\n    out = x + bias\n  end subroutine\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("proc_dummy_to_procptr_component_closure", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("procedure dummy procptr component closure compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "procedure dummy procptr component closure compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("procedure dummy procptr component closure run failed");
+    assert!(
+        run.status.success(),
+        "procedure dummy procptr component closure run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("42"),
+        "unexpected procedure dummy procptr component closure output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn procedure_pointer_component_default_passes_receiver() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
