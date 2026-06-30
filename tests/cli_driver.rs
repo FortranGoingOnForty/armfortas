@@ -38475,6 +38475,97 @@ fn bound_procedure_dummy_forwards_contained_callback_closure() {
 }
 
 #[test]
+fn imported_bound_proc_dummy_closure_uses_target_scope_over_same_name() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_bound_proc_dummy_closure_uses_target_scope_over_same_name count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("imported_bound_proc_dummy_closure_scope");
+    let prop_src = write_program_in(
+        &dir,
+        "prop_m.f90",
+        "module prop_m\n  implicit none\n  type :: prop_t\n    procedure(cb_i), pointer, nopass :: f => null()\n  contains\n    procedure :: initialize\n    procedure :: step\n  end type prop_t\n  abstract interface\n    subroutine cb_i(x, out)\n      integer, intent(in) :: x\n      integer, intent(out) :: out\n    end subroutine cb_i\n  end interface\ncontains\n  subroutine initialize(self, f)\n    class(prop_t), intent(inout) :: self\n    procedure(cb_i) :: f\n    self%f => f\n  end subroutine initialize\n\n  subroutine step(self, x, out)\n    class(prop_t), intent(inout) :: self\n    integer, intent(in) :: x\n    integer, intent(out) :: out\n    call self%f(x, out)\n  end subroutine step\nend module prop_m\n",
+    );
+    let other_src = write_program_in(
+        &dir,
+        "other_init_m.f90",
+        "module other_init_m\n  implicit none\ncontains\n  subroutine initialize(value)\n    integer, intent(out) :: value\n    value = -1\n  end subroutine initialize\nend module other_init_m\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use prop_m, only : prop_t\n  use other_init_m, only : initialize\n  implicit none\n  type(prop_t) :: prop\n  integer :: bias\n  integer :: got\n  integer :: scratch\n  bias = 39\n  call initialize(scratch)\n  call prop%initialize(func)\n  call prop%step(3, got)\n  if (scratch /= -1) error stop 1\n  if (got /= 42) error stop 2\n  print *, got\ncontains\n  subroutine func(x, out)\n    integer, intent(in) :: x\n    integer, intent(out) :: out\n    out = x + bias\n  end subroutine func\nend program p\n",
+    );
+
+    let prop_obj = dir.join("prop_m.o");
+    let other_obj = dir.join("other_init_m.o");
+    let main_obj = dir.join("main.o");
+    let exe = dir.join("imported_bound_proc_dummy_closure_scope.bin");
+
+    for (src, obj, needs_i) in [
+        (&prop_src, &prop_obj, false),
+        (&other_src, &other_obj, false),
+        (&main_src, &main_obj, true),
+    ] {
+        let mut cmd = Command::new(compiler("armfortas"));
+        cmd.current_dir(&dir).arg("-c");
+        if needs_i {
+            cmd.args(["-I", dir.to_str().unwrap()]);
+        }
+        cmd.args([
+            "-J",
+            dir.to_str().unwrap(),
+            src.to_str().unwrap(),
+            "-o",
+            obj.to_str().unwrap(),
+        ]);
+        let compile = cmd.output().expect("compile spawn failed");
+        assert!(
+            compile.status.success(),
+            "imported bound-proc procedure dummy closure compile failed for {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            prop_obj.to_str().unwrap(),
+            other_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link spawn failed");
+    assert!(
+        link.status.success(),
+        "imported bound-proc procedure dummy closure link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "imported bound-proc procedure dummy closure runtime failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("42"),
+        "unexpected imported bound-proc procedure dummy closure output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn procedure_dummy_closure_survives_contained_helper_call() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
