@@ -975,6 +975,140 @@ fn imported_character_star_parameter_array_preserves_shape_and_length() {
 }
 
 #[test]
+fn imported_real_parameters_round_trip_values_through_amod() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_real_parameters_round_trip_values_through_amod count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("imported_real_param_amod");
+    let numbers = write_program_in(
+        &dir,
+        "numbers_mod.f90",
+        "module numbers_mod\n  implicit none\n  real(8), parameter :: one = 1.0d0\n  real(8), parameter :: pi = 3.141592653589793238462643383279502884197d0\nend module numbers_mod\n",
+    );
+    let conversion = write_program_in(
+        &dir,
+        "conversion_mod.f90",
+        "module conversion_mod\n  use numbers_mod, only: one, pi\n  implicit none\n  real(8), parameter :: deg2rad = pi / 180.0d0\n  real(8), parameter :: rad2deg = 180.0d0 / pi\n  real(8), parameter :: twice = one + one\nend module conversion_mod\n",
+    );
+    let consumer = write_program_in(
+        &dir,
+        "consumer.f90",
+        "program p\n  use conversion_mod, only: deg2rad, rad2deg, twice\n  implicit none\n  if (abs(deg2rad * 180.0d0 - 3.141592653589793d0) > 1.0d-12) error stop 1\n  if (abs(rad2deg * deg2rad - 1.0d0) > 1.0d-12) error stop 2\n  if (abs(twice - 2.0d0) > 1.0d-12) error stop 3\n  print *, 'ok'\nend program p\n",
+    );
+
+    let numbers_obj = dir.join("numbers_mod.o");
+    let compile_numbers = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            numbers.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-o",
+            numbers_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("numbers real parameter module compile failed to spawn");
+    assert!(
+        compile_numbers.status.success(),
+        "numbers real parameter module compile failed: {}",
+        String::from_utf8_lossy(&compile_numbers.stderr)
+    );
+
+    let numbers_amod =
+        std::fs::read_to_string(dir.join("numbers_mod.amod")).expect("missing numbers .amod");
+    assert!(
+        numbers_amod.contains("@param pi : real(8) ="),
+        "numbers .amod should preserve real parameter pi: {}",
+        numbers_amod
+    );
+
+    let conversion_obj = dir.join("conversion_mod.o");
+    let compile_conversion = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            conversion.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-o",
+            conversion_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("conversion real parameter module compile failed to spawn");
+    assert!(
+        compile_conversion.status.success(),
+        "conversion real parameter module compile failed: {}",
+        String::from_utf8_lossy(&compile_conversion.stderr)
+    );
+
+    let conversion_amod =
+        std::fs::read_to_string(dir.join("conversion_mod.amod")).expect("missing conversion .amod");
+    assert!(
+        conversion_amod.contains("@param deg2rad : real(8) =")
+            && conversion_amod.contains("@param rad2deg : real(8) =")
+            && conversion_amod.contains("@param twice : real(8) ="),
+        "conversion .amod should preserve folded real parameter values: {}",
+        conversion_amod
+    );
+
+    let consumer_obj = dir.join("consumer.o");
+    let compile_consumer = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            consumer.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            "-o",
+            consumer_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("consumer real parameter compile failed to spawn");
+    assert!(
+        compile_consumer.status.success(),
+        "consumer real parameter compile failed: {}",
+        String::from_utf8_lossy(&compile_consumer.stderr)
+    );
+
+    let out = dir.join("consumer.bin");
+    let link = Command::new(compiler("armfortas"))
+        .args([
+            numbers_obj.to_str().unwrap(),
+            conversion_obj.to_str().unwrap(),
+            consumer_obj.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("consumer real parameter link failed to spawn");
+    assert!(
+        link.status.success(),
+        "consumer real parameter link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("consumer real parameter run failed");
+    assert!(
+        run.status.success(),
+        "consumer real parameter run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected consumer real parameter output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+}
+
+#[test]
 fn character_parameter_array_reshape_uses_imported_char_constants() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

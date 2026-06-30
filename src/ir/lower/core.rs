@@ -3017,6 +3017,7 @@ pub struct ModuleGlobalInfo {
     /// storage in the current object. Importers should inline this instead
     /// of loading through the global.
     pub const_value: Option<i128>,
+    pub const_real_value: Option<f64>,
     /// External modules (from .amod files) — skip emitting Global
     /// data entries since the storage lives in the other .o file.
     pub external: bool,
@@ -4212,6 +4213,26 @@ pub(super) fn collect_module_globals(
             if assoc.local_name.is_empty() {
                 continue;
             }
+            let source_mod_key = match &st.scope(assoc.source_scope).kind {
+                crate::sema::symtab::ScopeKind::Module(n)
+                | crate::sema::symtab::ScopeKind::Submodule(n) => Some(n.to_lowercase()),
+                _ => None,
+            };
+            if let Some(source_mod_key) = source_mod_key {
+                if let Some(info) =
+                    globals.get(&(source_mod_key, assoc.original_name.to_lowercase()))
+                {
+                    if let Some(value) = info.const_value {
+                        param_consts
+                            .entry(assoc.local_name.clone())
+                            .or_insert(ConstScalar::Int(value));
+                    } else if let Some(value) = info.const_real_value {
+                        param_consts
+                            .entry(assoc.local_name.clone())
+                            .or_insert(ConstScalar::Float(value));
+                    }
+                }
+            }
             if let Some(sym) = st.lookup_in(assoc.source_scope, &assoc.original_name) {
                 if matches!(
                     sym.kind,
@@ -4340,6 +4361,7 @@ pub(super) fn collect_module_globals(
                             derived_type: derived_type_name.clone(),
                             char_kind: array_char_kind,
                             const_value: None,
+                            const_real_value: None,
                             external: false,
                             private: false,
                         },
@@ -4371,6 +4393,7 @@ pub(super) fn collect_module_globals(
                             derived_type: None,
                             char_kind: CharKind::Deferred,
                             const_value: None,
+                            const_real_value: None,
                             external: false,
                             private: false,
                         },
@@ -4534,6 +4557,7 @@ pub(super) fn collect_module_globals(
                             derived_type: derived_type_name.clone(),
                             char_kind: global_char_kind.clone(),
                             const_value: None,
+                            const_real_value: None,
                             external: false,
                             private: false,
                         },
@@ -4560,6 +4584,7 @@ pub(super) fn collect_module_globals(
                                 derived_type: derived_type_name.clone(),
                                 char_kind: global_char_kind.clone(),
                                 const_value: None,
+                                const_real_value: None,
                                 external: false,
                                 private: false,
                             },
@@ -4598,6 +4623,7 @@ pub(super) fn collect_module_globals(
                                     derived_type: None,
                                     char_kind: CharKind::Fixed(len),
                                     const_value: None,
+                                    const_real_value: None,
                                     external: false,
                                     private: false,
                                 },
@@ -4647,6 +4673,7 @@ pub(super) fn collect_module_globals(
                                     derived_type: Some(type_name.clone()),
                                     char_kind: CharKind::None,
                                     const_value: None,
+                                    const_real_value: None,
                                     external: false,
                                     private: false,
                                 },
@@ -4686,6 +4713,14 @@ pub(super) fn collect_module_globals(
                     } else {
                         None
                     };
+                    let const_real_value = if is_parameter {
+                        match init.as_ref() {
+                            Some(GlobalInit::Float(v)) => Some(*v),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
                     module.add_global(Global {
                         name: symbol.clone(),
                         ty: ir_ty.clone(),
@@ -4704,6 +4739,7 @@ pub(super) fn collect_module_globals(
                             derived_type: None,
                             char_kind: global_char_kind.clone(),
                             const_value,
+                            const_real_value,
                             external: false,
                             private: false,
                         },
@@ -7741,9 +7777,12 @@ fn install_global_inline_const(
     local_key: String,
     info: &ModuleGlobalInfo,
 ) -> bool {
-    let Some(value) = info.const_value else {
-        return false;
+    let value = match (info.const_value, info.const_real_value) {
+        (Some(value), _) => ConstScalar::Int(value),
+        (None, Some(value)) => ConstScalar::Float(value),
+        (None, None) => return false,
     };
+    let value = clamp_const_to_type(value, &info.ty);
     if locals.contains_key(&local_key)
         || !info.dims.is_empty()
         || info.allocatable
@@ -7766,7 +7805,7 @@ fn install_global_inline_const(
             by_ref: false,
             char_kind: info.char_kind.clone(),
             derived_type: None,
-            inline_const: Some(ConstScalar::Int(value)),
+            inline_const: Some(value),
             is_pointer: false,
             runtime_dim_upper: vec![],
             is_class: false,
