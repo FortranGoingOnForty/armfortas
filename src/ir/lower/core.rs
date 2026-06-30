@@ -19389,12 +19389,6 @@ pub(super) fn emit_resolved_bound_proc_call(
     let target = bp.target_name.clone();
     let target_key = abi_key_for_link_name(st, &target).unwrap_or_else(|| bp.abi_name.clone());
     let nopass = bp.nopass;
-    let arg_slots = reorder_args_by_keyword_slots_with_formal_skip(
-        args,
-        &target_key,
-        st,
-        if nopass { 0 } else { 1 },
-    );
     let mut abi_seed_keys = vec![target.clone(), target_key.clone(), bp.abi_name.clone()];
     abi_seed_keys.extend(module_procedure_link_name_candidates(&target));
     let abi_seed_refs: Vec<&str> = abi_seed_keys.iter().map(String::as_str).collect();
@@ -19403,6 +19397,17 @@ pub(super) fn emit_resolved_bound_proc_call(
         .first()
         .map(String::as_str)
         .unwrap_or(target_key.as_str());
+    let callee_lookup_key = abi_lookup_keys
+        .iter()
+        .find(|key| callee_scope_for_lookup(st, key).is_some())
+        .map(String::as_str)
+        .unwrap_or(target_key.as_str());
+    let arg_slots = reorder_args_by_keyword_slots_with_formal_skip(
+        args,
+        callee_lookup_key,
+        st,
+        if nopass { 0 } else { 1 },
+    );
     let callee_value_args =
         first_procedure_lookup(&abi_lookup_keys, |k| callee_value_arg_mask(st, k));
     let callee_descriptor_args = first_procedure_lookup(&abi_lookup_keys, |k| {
@@ -19681,16 +19686,11 @@ pub(super) fn emit_resolved_bound_proc_call(
         }
     }
 
-    let proc_closure_lookup_key = abi_lookup_keys
-        .iter()
-        .find(|key| callee_scope_for_lookup(st, key).is_some())
-        .map(String::as_str)
-        .unwrap_or(target_key.as_str());
     append_procedure_dummy_closure_args_for_call(
         b,
         locals,
         st,
-        proc_closure_lookup_key,
+        callee_lookup_key,
         &arg_slots,
         contained_host_refs,
         &mut call_args,
