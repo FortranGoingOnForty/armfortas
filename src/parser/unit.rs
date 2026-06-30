@@ -1410,9 +1410,8 @@ mod tests {
         use crate::ast::decl::{Attribute, Decl};
         // `allocatable :: a` folds onto a (splitting the `integer :: a, b`
         // declaration) without affecting b; the AttributeStmt is consumed.
-        let u = parse_unit(
-            "program p\n  integer :: a, b\n  allocatable :: a\n  a = 0\nend program\n",
-        );
+        let u =
+            parse_unit("program p\n  integer :: a, b\n  allocatable :: a\n  a = 0\nend program\n");
         let ProgramUnit::Program { decls, .. } = &u.node else {
             panic!("not Program");
         };

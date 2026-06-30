@@ -122,7 +122,10 @@ fn run(cmd: &mut Command, what: &str) {
 }
 
 fn run_case(opt_flag: &str) {
-    let cobj = unique_temp_path(&format!("helper_{}", opt_flag.trim_start_matches('-')), ".o");
+    let cobj = unique_temp_path(
+        &format!("helper_{}", opt_flag.trim_start_matches('-')),
+        ".o",
+    );
     let fobj = unique_temp_path(&format!("main_{}", opt_flag.trim_start_matches('-')), ".o");
     let bin = unique_temp_path(&format!("bin_{}", opt_flag.trim_start_matches('-')), "");
 
