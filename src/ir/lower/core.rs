@@ -43386,6 +43386,74 @@ fn try_lower_empty_typed_scalar_allocatable_constructor_assign(
     true
 }
 
+fn try_lower_intrinsic_scalar_allocatable_assign(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    dest_info: &LocalInfo,
+    dest_desc: ValueId,
+    value: &crate::ast::expr::SpannedExpr,
+) -> bool {
+    if !dest_info.allocatable
+        || local_declared_rank(dest_info) != 0
+        || dest_info.derived_type.is_some()
+        || dest_info.char_kind != CharKind::None
+        || local_fixed_char_allocatable_scalar_len(dest_info).is_some()
+    {
+        return false;
+    }
+
+    let zero32 = b.const_i32(0);
+    let allocated = b.call(
+        FuncRef::External("afs_allocated".into()),
+        vec![dest_desc],
+        IrType::Int(IntWidth::I32),
+    );
+    let needs_alloc = b.icmp(CmpOp::Eq, allocated, zero32);
+    let alloc_bb = b.create_block("scalar_alloc_assign_alloc");
+    let store_bb = b.create_block("scalar_alloc_assign_store");
+    let done_bb = b.create_block("scalar_alloc_assign_done");
+    b.cond_branch(needs_alloc, alloc_bb, vec![], store_bb, vec![]);
+
+    b.set_block(alloc_bb);
+    let stat = b.alloca(IrType::Int(IntWidth::I32));
+    b.store(zero32, stat);
+    let elem_size = b.const_i64(ir_scalar_byte_size(&dest_info.ty, ctx.layout));
+    let rank0 = b.const_i32(0);
+    let null_dims = b.const_i64(0);
+    b.call(
+        FuncRef::External("afs_allocate_array".into()),
+        vec![dest_desc, elem_size, rank0, null_dims, stat],
+        IrType::Void,
+    );
+    b.branch(store_bb, vec![]);
+
+    b.set_block(store_bb);
+    let raw = super::expr::lower_expr_ctx_tl(b, ctx, value);
+    let dest_base = b.load_typed(
+        dest_desc,
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+    if is_complex_ty(&dest_info.ty) {
+        let raw_ty = b.func().value_type(raw);
+        let src_ptr = match raw_ty {
+            Some(IrType::Ptr(inner)) if inner.as_ref() == &dest_info.ty => raw,
+            _ => materialize_complex_operand(b, raw, complex_float_width(&dest_info.ty)),
+        };
+        let copy_bytes = b.const_i64(complex_byte_size(&dest_info.ty));
+        b.call(
+            FuncRef::External("memcpy".into()),
+            vec![dest_base, src_ptr, copy_bytes],
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        );
+    } else {
+        let scalar = coerce_to_type(b, raw, &dest_info.ty);
+        b.store(scalar, dest_base);
+    }
+    b.branch(done_bb, vec![]);
+    b.set_block(done_bb);
+    true
+}
+
 fn try_lower_typed_char_allocatable_constructor_assign(
     b: &mut FuncBuilder,
     ctx: &mut LowerCtx,
@@ -43842,6 +43910,9 @@ pub(super) fn lower_array_assign(
             return;
         }
         if try_lower_fixed_char_allocatable_constructor_assign(b, ctx, dest_info, value) {
+            return;
+        }
+        if try_lower_intrinsic_scalar_allocatable_assign(b, ctx, dest_info, dest_desc, value) {
             return;
         }
 
