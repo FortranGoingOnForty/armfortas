@@ -17938,6 +17938,7 @@ pub(super) fn emit_resolved_operator_call(
     });
 
     let mut call_args = Vec::with_capacity(2 + hidden_result.is_some() as usize + 4);
+    let mut call_arg_array_temps = Vec::new();
     let mut char_actual_lens = [None, None];
     if let Some(desc) = hidden_result {
         call_args.push(desc);
@@ -17994,7 +17995,7 @@ pub(super) fn emit_resolved_operator_call(
         } else if is_value {
             coerce_value_call_arg(b, st, abi_primary_key, i, actual)
         } else if wants_descriptor {
-            lower_arg_descriptor_full(
+            let desc = lower_arg_descriptor_full(
                 b,
                 locals,
                 expr,
@@ -18004,7 +18005,17 @@ pub(super) fn emit_resolved_operator_call(
                 contained_host_refs,
                 descriptor_params,
                 wants_polymorphic_descriptor,
-            )
+            );
+            track_call_arg_array_temp_descriptor(
+                b,
+                &mut call_arg_array_temps,
+                locals,
+                expr,
+                st,
+                type_layouts,
+                desc,
+            );
+            desc
         } else if wants_string_descriptor {
             lower_arg_string_descriptor(b, locals, expr, st, type_layouts)
         } else if wants_bind_c_char {
@@ -18105,6 +18116,7 @@ pub(super) fn emit_resolved_operator_call(
         .unwrap_or(IrType::Int(IntWidth::I32))
     };
     let call_result = b.call(func_ref, call_args, ret_ty);
+    deallocate_call_arg_array_temp_descriptors(b, &call_arg_array_temps);
 
     if let Some(desc) = hidden_result {
         return desc;
@@ -19196,6 +19208,7 @@ pub(super) fn emit_named_function_call(
         first_procedure_lookup(&abi_lookup_keys, |k| callee_intent_in_array_arg_mask(st, k));
 
     let mut call_args = Vec::new();
+    let mut call_arg_array_temps = Vec::new();
     if let Some(desc) = hidden_result {
         call_args.push(desc);
     }
@@ -19296,7 +19309,7 @@ pub(super) fn emit_named_function_call(
                     );
                     coerce_value_call_arg(b, st, abi_primary_key, i, raw)
                 } else if wants_descriptor {
-                    lower_arg_descriptor_full(
+                    let desc = lower_arg_descriptor_full(
                         b,
                         locals,
                         e,
@@ -19306,7 +19319,17 @@ pub(super) fn emit_named_function_call(
                         contained_host_refs,
                         descriptor_params,
                         wants_polymorphic_descriptor,
-                    )
+                    );
+                    track_call_arg_array_temp_descriptor(
+                        b,
+                        &mut call_arg_array_temps,
+                        locals,
+                        e,
+                        st,
+                        type_layouts,
+                        desc,
+                    );
+                    desc
                 } else if wants_string_descriptor {
                     lower_arg_string_descriptor(b, locals, e, st, type_layouts)
                 } else if wants_bind_c_char {
@@ -19484,7 +19507,9 @@ pub(super) fn emit_named_function_call(
         &[&callee_key, &key],
         call_name,
     );
-    b.call(func_ref, call_args, ret_ty)
+    let call_result = b.call(func_ref, call_args, ret_ty);
+    deallocate_call_arg_array_temp_descriptors(b, &call_arg_array_temps);
+    call_result
 }
 
 pub(super) fn emit_bound_function_call(
@@ -19624,6 +19649,7 @@ pub(super) fn emit_resolved_bound_proc_call(
 
     let mut call_args =
         Vec::with_capacity(arg_slots.len() + hidden_result.is_some() as usize + (!nopass) as usize);
+    let mut call_arg_array_temps = Vec::new();
     if let Some(result) = hidden_result {
         call_args.push(result);
     }
@@ -19735,7 +19761,7 @@ pub(super) fn emit_resolved_bound_proc_call(
                         // behind a copy).
                         let force_box =
                             wants_polymorphic_descriptor && !matches!(e.node, Expr::Name { .. });
-                        lower_arg_descriptor_full(
+                        let desc = lower_arg_descriptor_full(
                             b,
                             locals,
                             e,
@@ -19745,7 +19771,17 @@ pub(super) fn emit_resolved_bound_proc_call(
                             contained_host_refs,
                             descriptor_params,
                             force_box,
-                        )
+                        );
+                        track_call_arg_array_temp_descriptor(
+                            b,
+                            &mut call_arg_array_temps,
+                            locals,
+                            e,
+                            st,
+                            type_layouts,
+                            desc,
+                        );
+                        desc
                     } else if wants_string_descriptor {
                         lower_arg_string_descriptor(b, locals, e, st, type_layouts)
                     } else if wants_bind_c_char {
@@ -19883,6 +19919,7 @@ pub(super) fn emit_resolved_bound_proc_call(
     );
 
     let call_result = b.call(func_ref, call_args, ret_ty);
+    deallocate_call_arg_array_temp_descriptors(b, &call_arg_array_temps);
     if let Some(result) = hidden_result {
         return Some(result);
     }
@@ -38082,6 +38119,7 @@ fn lower_complex_part_array_descriptor(
     b.branch(bb_check, vec![]);
 
     b.set_block(bb_exit);
+    deallocate_array_expr_descriptor_if_temp(b, locals, base, st, src_desc);
     Some((result_desc, lane_ty))
 }
 
@@ -38189,6 +38227,9 @@ fn lower_complex_part_array_assignment(
     b.branch(bb_check, vec![]);
 
     b.set_block(bb_exit);
+    if let Some((desc, _)) = src_desc {
+        deallocate_array_expr_descriptor_if_temp(b, &ctx.locals, value, ctx.st, desc);
+    }
 }
 
 pub(super) fn try_lower_complex_part_assignment(
@@ -39779,6 +39820,7 @@ pub(super) fn lower_vector_subscript_gather_descriptor(
     b.branch(bb_check, vec![]);
 
     b.set_block(bb_exit);
+    deallocate_array_expr_descriptor_if_temp(b, locals, idx_expr, st, idx_desc);
     Some((result_desc, elem_ty))
 }
 
@@ -39954,6 +39996,121 @@ pub(super) fn store_rank1_array_desc_elem(
     b.store(stored, ptr);
 }
 
+pub(super) fn deallocate_array_temp_descriptor(b: &mut FuncBuilder, desc: ValueId) {
+    let stat = b.alloca(IrType::Int(IntWidth::I32));
+    let zero32 = b.const_i32(0);
+    b.store(zero32, stat);
+    b.call(
+        FuncRef::External("afs_deallocate_array".into()),
+        vec![desc, stat],
+        IrType::Void,
+    );
+}
+
+fn function_call_is_local_array_designator(
+    callee: &crate::ast::expr::SpannedExpr,
+    locals: &HashMap<String, LocalInfo>,
+) -> bool {
+    match &callee.node {
+        Expr::Name { name } => locals
+            .get(&name.to_lowercase())
+            .map(local_is_array_like)
+            .unwrap_or(false),
+        Expr::ComponentAccess { .. } => true,
+        _ => false,
+    }
+}
+
+fn function_call_has_vector_subscript(
+    args: &[crate::ast::expr::Argument],
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+) -> bool {
+    args.iter().any(|arg| {
+        if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
+            expr_returns_array(e, locals, st)
+        } else {
+            false
+        }
+    })
+}
+
+fn array_expr_descriptor_may_own_temp(
+    expr: &crate::ast::expr::SpannedExpr,
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+) -> bool {
+    match &expr.node {
+        Expr::ParenExpr { inner } => array_expr_descriptor_may_own_temp(inner, locals, st),
+        Expr::UnaryOp { op, operand } => {
+            if matches!(op, UnaryOp::Plus) {
+                array_expr_descriptor_may_own_temp(operand, locals, st)
+            } else {
+                true
+            }
+        }
+        Expr::BinaryOp { .. } | Expr::ArrayConstructor { .. } => true,
+        Expr::ComponentAccess { base, component } => {
+            matches!(component.to_ascii_lowercase().as_str(), "re" | "im")
+                && expr_returns_array(base, locals, st)
+        }
+        Expr::FunctionCall { callee, args } => {
+            if function_call_is_local_array_designator(callee, locals) {
+                return function_call_has_vector_subscript(args, locals, st);
+            }
+            true
+        }
+        Expr::Name { .. } => false,
+        _ => false,
+    }
+}
+
+pub(super) fn deallocate_array_expr_descriptor_if_temp(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    desc: ValueId,
+) {
+    if array_expr_descriptor_may_own_temp(expr, locals, st) {
+        deallocate_array_temp_descriptor(b, desc);
+    }
+}
+
+pub(super) fn track_call_arg_array_temp_descriptor(
+    b: &FuncBuilder,
+    temps: &mut Vec<ValueId>,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    desc: ValueId,
+) {
+    let is_array_descriptor = matches!(
+        b.func().value_type(desc),
+        Some(IrType::Ptr(inner))
+            if matches!(
+                inner.as_ref(),
+                IrType::Array(elem, 384) if matches!(elem.as_ref(), IrType::Int(IntWidth::I8))
+            )
+    );
+    if actual_expr_rank(expr, locals, st, type_layouts).is_some_and(|rank| rank > 0)
+        && is_array_descriptor
+        && array_expr_descriptor_may_own_temp(expr, locals, st)
+    {
+        temps.push(desc);
+    }
+}
+
+pub(super) fn deallocate_call_arg_array_temp_descriptors(
+    b: &mut FuncBuilder,
+    temps: &[ValueId],
+) {
+    for desc in temps {
+        deallocate_array_temp_descriptor(b, *desc);
+    }
+}
+
 pub(super) fn lower_rank1_array_unary_descriptor(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -40031,6 +40188,7 @@ pub(super) fn lower_rank1_array_unary_descriptor(
     b.branch(bb_check, vec![]);
 
     b.set_block(bb_exit);
+    deallocate_array_expr_descriptor_if_temp(b, locals, operand, st, source_desc);
     Some((result_desc, elem_ty))
 }
 
@@ -40307,6 +40465,12 @@ pub(super) fn lower_rank1_array_compare_descriptor(
         b.store(next, i_addr);
         b.branch(bb_check, vec![]);
         b.set_block(bb_exit);
+        if let Some(desc) = lhs_desc {
+            deallocate_array_expr_descriptor_if_temp(b, locals, left, st, desc);
+        }
+        if let Some(desc) = rhs_desc {
+            deallocate_array_expr_descriptor_if_temp(b, locals, right, st, desc);
+        }
         return Some((result_desc, IrType::Bool));
     }
 
@@ -40365,6 +40529,12 @@ pub(super) fn lower_rank1_array_compare_descriptor(
     b.branch(bb_check, vec![]);
 
     b.set_block(bb_exit);
+    if let Some(desc) = lhs_desc {
+        deallocate_array_expr_descriptor_if_temp(b, locals, left, st, desc);
+    }
+    if let Some(desc) = rhs_desc {
+        deallocate_array_expr_descriptor_if_temp(b, locals, right, st, desc);
+    }
     Some((result_desc, IrType::Bool))
 }
 
@@ -40519,7 +40689,15 @@ pub(super) fn lower_rank1_numeric_array_binary_descriptor(
     match &elem_ty {
         IrType::Int(_) | IrType::Float(_) | IrType::Bool => {}
         _ if is_complex_elem => {}
-        _ => return None,
+        _ => {
+            if let Some((desc, _)) = lhs.as_ref() {
+                deallocate_array_expr_descriptor_if_temp(b, locals, left, st, *desc);
+            }
+            if let Some((desc, _)) = rhs.as_ref() {
+                deallocate_array_expr_descriptor_if_temp(b, locals, right, st, *desc);
+            }
+            return None;
+        }
     }
     // F2018 §10.1.5: relational operators on array operands produce a
     // logical array of the same shape. Take a separate path for those
@@ -40591,6 +40769,12 @@ pub(super) fn lower_rank1_numeric_array_binary_descriptor(
                 descriptor_params,
             );
         }
+        if let Some((desc, _)) = lhs.as_ref() {
+            deallocate_array_expr_descriptor_if_temp(b, locals, left, st, *desc);
+        }
+        if let Some((desc, _)) = rhs.as_ref() {
+            deallocate_array_expr_descriptor_if_temp(b, locals, right, st, *desc);
+        }
         return None;
     }
     let op_supported = if is_complex_elem {
@@ -40618,6 +40802,12 @@ pub(super) fn lower_rank1_numeric_array_binary_descriptor(
         )
     };
     if !op_supported {
+        if let Some((desc, _)) = lhs.as_ref() {
+            deallocate_array_expr_descriptor_if_temp(b, locals, left, st, *desc);
+        }
+        if let Some((desc, _)) = rhs.as_ref() {
+            deallocate_array_expr_descriptor_if_temp(b, locals, right, st, *desc);
+        }
         return None;
     }
 
@@ -40909,6 +41099,12 @@ pub(super) fn lower_rank1_numeric_array_binary_descriptor(
     b.branch(bb_check, vec![]);
 
     b.set_block(bb_exit);
+    if let Some((desc, _)) = lhs.as_ref() {
+        deallocate_array_expr_descriptor_if_temp(b, locals, left, st, *desc);
+    }
+    if let Some((desc, _)) = rhs.as_ref() {
+        deallocate_array_expr_descriptor_if_temp(b, locals, right, st, *desc);
+    }
     Some((result_desc, elem_ty))
 }
 
@@ -41224,7 +41420,7 @@ pub(super) fn lower_array_expr_descriptor(
                         if let crate::ast::expr::SectionSubscript::Element(first_expr) =
                             &first_arg.value
                         {
-                            if let Some((_, elem_ty)) = lower_array_expr_descriptor(
+                            if let Some((probe_desc, elem_ty)) = lower_array_expr_descriptor(
                                 b,
                                 locals,
                                 first_expr,
@@ -41234,6 +41430,9 @@ pub(super) fn lower_array_expr_descriptor(
                                 contained_host_refs,
                                 descriptor_params,
                             ) {
+                                deallocate_array_expr_descriptor_if_temp(
+                                    b, locals, first_expr, st, probe_desc,
+                                );
                                 let key = name.to_ascii_lowercase();
                                 if let Some(desc) = lower_array_intrinsic(
                                     b,
@@ -41297,6 +41496,9 @@ pub(super) fn lower_array_expr_descriptor(
                                         vec![src_desc, result_desc],
                                         IrType::Void,
                                     );
+                                    deallocate_array_expr_descriptor_if_temp(
+                                        b, locals, first_expr, st, src_desc,
+                                    );
                                     return Some((result_desc, elem_ty));
                                 }
                             }
@@ -41340,6 +41542,9 @@ pub(super) fn lower_array_expr_descriptor(
                                         elem_ty.clone(),
                                         source_rank,
                                     ) {
+                                        deallocate_array_expr_descriptor_if_temp(
+                                            b, locals, first_expr, st, src_desc,
+                                        );
                                         return Some(result);
                                     }
                                 }
@@ -41373,6 +41578,9 @@ pub(super) fn lower_array_expr_descriptor(
                                         FuncRef::External(runtime.into()),
                                         vec![src_desc, result_desc],
                                         IrType::Void,
+                                    );
+                                    deallocate_array_expr_descriptor_if_temp(
+                                        b, locals, first_expr, st, src_desc,
                                     );
                                     return Some((result_desc, IrType::Float(fw)));
                                 }
@@ -42057,6 +42265,10 @@ pub(super) fn lower_dynamic_vector_subscript_assign(
     b.branch(bb_check, vec![]);
 
     b.set_block(bb_exit);
+    deallocate_array_expr_descriptor_if_temp(b, &ctx.locals, idx_expr, ctx.st, idx_desc);
+    if let Some((desc, _)) = src_desc {
+        deallocate_array_expr_descriptor_if_temp(b, &ctx.locals, value, ctx.st, desc);
+    }
     true
 }
 
@@ -42099,6 +42311,7 @@ pub(super) fn lower_vector_subscript_section_assign(
             idx_desc: ValueId,
             idx_elem_ty: IrType,
             result_dim: usize,
+            owns_temp: bool,
         },
         Scalar {
             val: ValueId,
@@ -42191,6 +42404,7 @@ pub(super) fn lower_vector_subscript_section_assign(
                     idx_desc,
                     idx_elem_ty,
                     result_dim,
+                    owns_temp: array_expr_descriptor_may_own_temp(e, &ctx.locals, ctx.st),
                 });
             }
             SectionSubscript::Element(e) => {
@@ -42287,6 +42501,7 @@ pub(super) fn lower_vector_subscript_section_assign(
                 idx_desc,
                 idx_elem_ty,
                 result_dim,
+                ..
             } => {
                 let raw =
                     load_rank1_array_desc_elem(b, *idx_desc, idx_elem_ty, coords[*result_dim]);
@@ -42346,6 +42561,19 @@ pub(super) fn lower_vector_subscript_section_assign(
     b.branch(bb_check, vec![]);
 
     b.set_block(bb_exit);
+    for kind in &dim_kinds {
+        if let DimKind::Vector {
+            idx_desc,
+            owns_temp: true,
+            ..
+        } = kind
+        {
+            deallocate_array_temp_descriptor(b, *idx_desc);
+        }
+    }
+    if let Some((desc, _)) = src_desc {
+        deallocate_array_expr_descriptor_if_temp(b, &ctx.locals, value, ctx.st, desc);
+    }
     true
 }
 
@@ -42535,6 +42763,9 @@ pub(super) fn lower_multi_d_section_assign(
     b.branch(bb_check, vec![]);
 
     b.set_block(bb_exit);
+    if let Some((desc, _)) = src_desc {
+        deallocate_array_expr_descriptor_if_temp(b, &ctx.locals, value, ctx.st, desc);
+    }
     true
 }
 
@@ -43952,15 +44183,9 @@ pub(super) fn lower_array_assign(
                         dest_elem_len,
                     );
                     if let Some(tmp_desc) = tmp_src_desc {
-                        let tmp_stat = b.alloca(IrType::Int(IntWidth::I32));
-                        let zero32 = b.const_i32(0);
-                        b.store(zero32, tmp_stat);
-                        b.call(
-                            FuncRef::External("afs_deallocate_array".into()),
-                            vec![tmp_desc, tmp_stat],
-                            IrType::Void,
-                        );
+                        deallocate_array_temp_descriptor(b, tmp_desc);
                     }
+                    deallocate_array_expr_descriptor_if_temp(b, &ctx.locals, value, ctx.st, src_desc);
                     return;
                 }
                 // F2018 §10.2.1.3: numeric element type mismatch between
@@ -43983,15 +44208,15 @@ pub(super) fn lower_array_assign(
                             IrType::Void,
                         );
                         if let Some(tmp_desc) = tmp_src_desc {
-                            let tmp_stat = b.alloca(IrType::Int(IntWidth::I32));
-                            let zero32 = b.const_i32(0);
-                            b.store(zero32, tmp_stat);
-                            b.call(
-                                FuncRef::External("afs_deallocate_array".into()),
-                                vec![tmp_desc, tmp_stat],
-                                IrType::Void,
-                            );
+                            deallocate_array_temp_descriptor(b, tmp_desc);
                         }
+                        deallocate_array_expr_descriptor_if_temp(
+                            b,
+                            &ctx.locals,
+                            value,
+                            ctx.st,
+                            src_desc,
+                        );
                         return;
                     }
                 }
@@ -44001,15 +44226,9 @@ pub(super) fn lower_array_assign(
                     IrType::Void,
                 );
                 if let Some(tmp_desc) = tmp_src_desc {
-                    let tmp_stat = b.alloca(IrType::Int(IntWidth::I32));
-                    let zero32 = b.const_i32(0);
-                    b.store(zero32, tmp_stat);
-                    b.call(
-                        FuncRef::External("afs_deallocate_array".into()),
-                        vec![tmp_desc, tmp_stat],
-                        IrType::Void,
-                    );
+                    deallocate_array_temp_descriptor(b, tmp_desc);
                 }
+                deallocate_array_expr_descriptor_if_temp(b, &ctx.locals, value, ctx.st, src_desc);
                 return;
             }
 
@@ -44102,6 +44321,7 @@ pub(super) fn lower_array_assign(
                             IrType::Void,
                         );
                     }
+                    deallocate_array_expr_descriptor_if_temp(b, &ctx.locals, value, ctx.st, src_desc);
                     return;
                 }
             }
@@ -44160,6 +44380,7 @@ pub(super) fn lower_array_assign(
                         dest_stride,
                         src_desc,
                     );
+                    deallocate_array_expr_descriptor_if_temp(b, &ctx.locals, value, ctx.st, src_desc);
                     return;
                 }
             }
@@ -44283,6 +44504,9 @@ pub(super) fn lower_array_assign(
         b.branch(bb_check, vec![]);
 
         b.set_block(bb_exit);
+        if let Some((desc, _)) = src_desc {
+            deallocate_array_expr_descriptor_if_temp(b, &ctx.locals, value, ctx.st, desc);
+        }
         return;
     }
 
@@ -44465,15 +44689,9 @@ pub(super) fn lower_array_assign(
                 b.branch(bb_chk, vec![]);
                 b.set_block(bb_ext);
                 if let Some(tmp_desc) = tmp_src_desc {
-                    let tmp_stat = b.alloca(IrType::Int(IntWidth::I32));
-                    let zero32 = b.const_i32(0);
-                    b.store(zero32, tmp_stat);
-                    b.call(
-                        FuncRef::External("afs_deallocate_array".into()),
-                        vec![tmp_desc, tmp_stat],
-                        IrType::Void,
-                    );
+                    deallocate_array_temp_descriptor(b, tmp_desc);
                 }
+                deallocate_array_expr_descriptor_if_temp(b, &ctx.locals, value, ctx.st, src_desc);
                 return;
             }
         }
@@ -46613,7 +46831,7 @@ pub(super) fn lower_array_intrinsic(
         (desc, info.ty.clone())
     };
 
-    match name {
+    let result = match name {
         "rank" => {
             let off_rank = b.const_i64(16);
             let rank_ptr = b.gep(desc, vec![off_rank], IrType::Int(IntWidth::I8));
@@ -46823,6 +47041,7 @@ pub(super) fn lower_array_intrinsic(
                 contained_host_refs,
                 descriptor_params,
             ) {
+                deallocate_array_expr_descriptor_if_temp(b, locals, first_expr, st, desc);
                 return Some(result_desc);
             }
             // Whole-array form; result kind matches the input element kind.
@@ -46902,6 +47121,10 @@ pub(super) fn lower_array_intrinsic(
                     call_args.push(mask);
                 }
                 b.call(FuncRef::External(func.into()), call_args, IrType::Void);
+                if let (Some(mask_expr), Some(mask)) = (mask_arg_expr, mask_desc) {
+                    deallocate_array_expr_descriptor_if_temp(b, locals, mask_expr, st, mask);
+                }
+                deallocate_array_expr_descriptor_if_temp(b, locals, first_expr, st, desc);
                 return Some(out);
             }
             let is_real = elem_ty.is_float();
@@ -47186,6 +47409,8 @@ pub(super) fn lower_array_intrinsic(
                     vec![desc, second_desc, out],
                     IrType::Void,
                 );
+                deallocate_array_expr_descriptor_if_temp(b, locals, first_expr, st, desc);
+                deallocate_array_expr_descriptor_if_temp(b, locals, second_arg_expr, st, second_desc);
                 return Some(out);
             }
             let mut probe = elem_ty.clone();
@@ -47365,7 +47590,11 @@ pub(super) fn lower_array_intrinsic(
             Some(result_desc)
         }
         _ => None,
+    };
+    if result.is_some() {
+        deallocate_array_expr_descriptor_if_temp(b, locals, first_expr, st, desc);
     }
+    result
 }
 
 /// Check if `actual_type` is or extends `target_type` (for CLASS IS matching).
@@ -53514,6 +53743,84 @@ end program
         );
         assert!(ir.contains("doconc_check"));
         assert!(ir.contains("call @afs_internal___prog_test_1("));
+    }
+
+    #[test]
+    fn lower_chained_array_expr_assignment_deallocates_temporaries() {
+        let (_, ir) = lower_and_verify(
+            "\
+program test
+  implicit none
+  real(8) :: a(4), b(4), c(4)
+  a = 1.0_8
+  b = 2.0_8
+  c = 3.0_8
+  a = a + b + c
+end program
+",
+        );
+        let dealloc_count = ir.matches("call @afs_deallocate_array").count();
+        assert!(
+            dealloc_count >= 2,
+            "expected chained array-expression temporaries to be cleaned up, got {} in:\n{}",
+            dealloc_count,
+            ir
+        );
+    }
+
+    #[test]
+    fn lower_reduction_over_array_expr_deallocates_operand_temporary() {
+        let (_, ir) = lower_and_verify(
+            "\
+program test
+  implicit none
+  real(8) :: z(4), r
+  z = [-1.0_8, 2.0_8, -3.0_8, 4.0_8]
+  r = maxval(abs(z))
+end program
+",
+        );
+        assert!(
+            ir.contains("call @afs_array_maxval_real8"),
+            "expected maxval runtime reduction in:\n{}",
+            ir
+        );
+        assert!(
+            ir.contains("call @afs_deallocate_array"),
+            "expected reduction operand temporary cleanup in:\n{}",
+            ir
+        );
+    }
+
+    #[test]
+    fn lower_array_expr_call_actual_deallocates_after_call() {
+        let (_, ir) = lower_and_verify(
+            "\
+program test
+  implicit none
+  real(8) :: a(3, 3), s
+  integer :: idx(2)
+  idx = [1, 3]
+  a = 1.0_8
+  s = first(a(:, idx))
+contains
+  function first(x) result(r)
+    real(8), intent(in) :: x(:, :)
+    real(8) :: r
+    r = x(1, 1)
+  end function
+end program
+",
+        );
+        let call_pos = ir
+            .find("call @afs_internal___prog_test_1")
+            .unwrap_or_else(|| panic!("expected internal function call in:\n{}", ir));
+        let post_call = &ir[call_pos..];
+        assert!(
+            post_call.contains("call @afs_deallocate_array"),
+            "expected array-expression call actual cleanup after call in:\n{}",
+            ir
+        );
     }
 
     #[test]

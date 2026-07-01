@@ -3227,6 +3227,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         callee_intent_in_array_arg_mask(ctx.st, k)
                     });
                     let mut arg_vals: Vec<ValueId> = Vec::with_capacity(arg_slots.len());
+                    let mut call_arg_array_temps = Vec::new();
                     for (i, slot) in arg_slots.iter().enumerate() {
                         let mask_wants_descriptor = desc_mask
                             .as_ref()
@@ -3451,7 +3452,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         value,
                                     )
                                     };
-                                        lower_call_arg_maybe_conditional(
+                                        let value = lower_call_arg_maybe_conditional(
                                             b,
                                             &ctx.locals,
                                             ctx.st,
@@ -3464,7 +3465,33 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                             i,
                                             is_value,
                                             &mut materialize,
-                                        )
+                                        );
+                                        let wants_descriptor = (mask_wants_descriptor
+                                            || (desc_mask.is_none()
+                                                && actual_is_descriptor_backed(
+                                                    &ctx.locals,
+                                                    arg_expr,
+                                                    ctx.st,
+                                                    Some(ctx.type_layouts),
+                                                )))
+                                            && !wants_bind_c_char;
+                                        if wants_descriptor
+                                            && !matches!(
+                                                arg_expr.node,
+                                                Expr::ConditionalExpr { .. } | Expr::NilArgument
+                                            )
+                                        {
+                                            track_call_arg_array_temp_descriptor(
+                                                b,
+                                                &mut call_arg_array_temps,
+                                                &ctx.locals,
+                                                arg_expr,
+                                                ctx.st,
+                                                Some(ctx.type_layouts),
+                                                value,
+                                            );
+                                        }
+                                        value
                                     }
                                     _ => b.const_i32(0),
                                 }
@@ -3517,6 +3544,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     }
                     arg_vals.extend(closure_args);
                     b.call(FuncRef::Indirect(target), arg_vals, IrType::Void);
+                    deallocate_call_arg_array_temp_descriptors(b, &call_arg_array_temps);
                 }
             } else if let Expr::Name { name } = &callee.node {
                 let key = name.to_lowercase();
@@ -3645,6 +3673,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         callee_intent_in_array_arg_mask(ctx.st, k)
                     });
                     let mut arg_vals: Vec<ValueId> = Vec::with_capacity(arg_slots.len());
+                    let mut call_arg_array_temps = Vec::new();
                     for (i, slot) in arg_slots.iter().enumerate() {
                         let is_value = value_mask
                             .as_ref()
@@ -3839,7 +3868,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         value,
                                     )
                                     };
-                                        lower_call_arg_maybe_conditional(
+                                        let value = lower_call_arg_maybe_conditional(
                                             b,
                                             &ctx.locals,
                                             ctx.st,
@@ -3852,7 +3881,33 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                             i,
                                             is_value,
                                             &mut materialize,
-                                        )
+                                        );
+                                        let wants_descriptor = (mask_wants_descriptor
+                                            || (desc_mask.is_none()
+                                                && actual_is_descriptor_backed(
+                                                    &ctx.locals,
+                                                    arg_expr,
+                                                    ctx.st,
+                                                    Some(ctx.type_layouts),
+                                                )))
+                                            && !wants_bind_c_char;
+                                        if wants_descriptor
+                                            && !matches!(
+                                                arg_expr.node,
+                                                Expr::ConditionalExpr { .. } | Expr::NilArgument
+                                            )
+                                        {
+                                            track_call_arg_array_temp_descriptor(
+                                                b,
+                                                &mut call_arg_array_temps,
+                                                &ctx.locals,
+                                                arg_expr,
+                                                ctx.st,
+                                                Some(ctx.type_layouts),
+                                                value,
+                                            );
+                                        }
+                                        value
                                     }
                                     _ => b.const_i32(0),
                                 }
@@ -3942,6 +3997,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         )
                     };
                     b.call(func_ref, arg_vals, IrType::Void);
+                    deallocate_call_arg_array_temp_descriptors(b, &call_arg_array_temps);
                 }
             }
         }
