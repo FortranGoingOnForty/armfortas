@@ -220,6 +220,89 @@ fn no_input_after_flags_prints_help_and_mentions_missing_input() {
 }
 
 #[test]
+fn c_f_procpointer_associates_c_funptr_and_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=c_f_procpointer_associates_c_funptr_and_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let src = write_program(
+        "program p\n  use iso_c_binding, only: c_funptr, c_funloc, c_f_procpointer, c_int\n  implicit none\n  abstract interface\n    subroutine cb_i(out) bind(C)\n      import :: c_int\n      integer(c_int), intent(out) :: out\n    end subroutine\n  end interface\n  procedure(cb_i), pointer :: fp\n  type(c_funptr) :: raw\n  integer(c_int) :: got\n\n  raw = c_funloc(fill_answer)\n  call c_f_procpointer(raw, fp)\n  got = -1_c_int\n  call fp(got)\n  if (got /= 42_c_int) error stop 1\n  print *, 'ok'\ncontains\n  subroutine fill_answer(out) bind(C)\n    integer(c_int), intent(out) :: out\n    out = 42_c_int\n  end subroutine fill_answer\nend program\n",
+        "f90",
+    );
+    let out = unique_path("c_f_procpointer", "bin");
+    let result = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("c_f_procpointer compile failed to spawn");
+    assert!(
+        result.status.success(),
+        "c_f_procpointer should compile and link: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("c_f_procpointer run failed");
+    assert!(
+        run.status.success(),
+        "c_f_procpointer run failed: status={:?} stdout={} stderr={}",
+        run.status.code(),
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected c_f_procpointer output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+}
+
+#[test]
+fn contained_c_f_procpointer_call_loads_host_slot_target() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=contained_c_f_procpointer_call_loads_host_slot_target count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let src = write_program(
+        "program p\n  use iso_c_binding, only: c_funptr, c_funloc, c_f_procpointer, c_int\n  implicit none\n  abstract interface\n    subroutine cb_i(out) bind(C)\n      import :: c_int\n      integer(c_int), intent(out) :: out\n    end subroutine\n  end interface\n  procedure(cb_i), pointer :: fp\n  type(c_funptr) :: raw\n  integer(c_int) :: got\n\n  raw = c_funloc(fill_answer)\n  call c_f_procpointer(raw, fp)\n  got = -1_c_int\n  call wrapper(got)\n  if (got /= 42_c_int) error stop 1\n  print *, 'ok'\ncontains\n  subroutine wrapper(out)\n    integer(c_int), intent(out) :: out\n    call fp(out)\n  end subroutine wrapper\n\n  subroutine fill_answer(out) bind(C)\n    integer(c_int), intent(out) :: out\n    out = 42_c_int\n  end subroutine fill_answer\nend program\n",
+        "f90",
+    );
+    let out = unique_path("contained_c_f_procpointer", "bin");
+    let result = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-O2", "-o", out.to_str().unwrap()])
+        .output()
+        .expect("contained c_f_procpointer compile failed to spawn");
+    assert!(
+        result.status.success(),
+        "contained c_f_procpointer should compile and link: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("contained c_f_procpointer run failed");
+    assert!(
+        run.status.success(),
+        "contained c_f_procpointer run failed: status={:?} stdout={} stderr={}",
+        run.status.code(),
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected contained c_f_procpointer output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+}
+
+
+#[test]
 fn ambiguous_use_warning_is_deduped_across_contained_procedures() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
