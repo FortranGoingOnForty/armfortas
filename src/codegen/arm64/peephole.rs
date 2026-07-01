@@ -44,7 +44,9 @@
 //! After fusion the multiply is removed and the add/sub is replaced
 //! with the three-source instruction.
 
-use super::mir::{ArmOpcode, MachineFunction, MachineInst, MachineOperand, RegClass, VRegId};
+use super::mir::{
+    ArmOpcode, MachineFunction, MachineInst, MachineOperand, PhysReg, RegClass, VRegId,
+};
 use std::collections::HashMap;
 
 /// Run all peephole passes on a machine function. Iterates to fixpoint
@@ -816,15 +818,38 @@ fn class_byte_width(c: RegClass) -> u32 {
 }
 
 /// Width inferred from operand[0] of a load/store instruction. For
-/// loads the operand is the dest vreg; for stores it is the source
-/// vreg — both carry the access width via their RegClass.
+/// pre-regalloc stores this is usually a source vreg; physical
+/// destinations/sources can also appear in hand-lowered helper paths.
 fn ldst_access_width(mf: &MachineFunction, inst: &MachineInst) -> Option<u32> {
-    let v = match inst.operands.first()? {
-        MachineOperand::VReg(v) => *v,
-        _ => return None,
-    };
-    let class = vreg_class(mf, v)?;
-    Some(class_byte_width(class))
+    match inst.operands.first()? {
+        MachineOperand::VReg(v) => vreg_class(mf, *v).map(class_byte_width),
+        MachineOperand::PhysReg(PhysReg::Gp32(_) | PhysReg::Fp32(_)) => Some(4),
+        MachineOperand::PhysReg(PhysReg::Gp(_) | PhysReg::Fp(_)) => Some(8),
+        _ => None,
+    }
+}
+
+fn phys_reg_same_storage(a: PhysReg, b: PhysReg) -> bool {
+    match (a, b) {
+        (PhysReg::Gp(a), PhysReg::Gp(b))
+        | (PhysReg::Gp(a), PhysReg::Gp32(b))
+        | (PhysReg::Gp32(a), PhysReg::Gp(b))
+        | (PhysReg::Gp32(a), PhysReg::Gp32(b)) => a == b,
+        (PhysReg::Fp(a), PhysReg::Fp(b))
+        | (PhysReg::Fp(a), PhysReg::Fp32(b))
+        | (PhysReg::Fp32(a), PhysReg::Fp(b))
+        | (PhysReg::Fp32(a), PhysReg::Fp32(b)) => a == b,
+        (PhysReg::Sp, PhysReg::Sp) => true,
+        _ => false,
+    }
+}
+
+fn operand_same_storage(a: &MachineOperand, b: &MachineOperand) -> bool {
+    match (a, b) {
+        (MachineOperand::VReg(a), MachineOperand::VReg(b)) => a == b,
+        (MachineOperand::PhysReg(a), MachineOperand::PhysReg(b)) => phys_reg_same_storage(*a, *b),
+        _ => false,
+    }
 }
 
 fn ldp_imm_in_range(off: i64, width: u32) -> bool {
@@ -953,34 +978,37 @@ fn ldp_stp_fuse_block(mf: &mut MachineFunction, mb_idx: usize) {
             continue;
         }
 
-        // For loads: forbid same-dest UNPREDICTABLE form, and forbid
-        // dest1 == base which would silently change the second load's
-        // address.
+        // For loads: only fuse physical-register destinations. The
+        // MachineInst model has one `def`, while an LDP writes two
+        // destinations; fusing vreg-def LDRs before register allocation
+        // loses the def/store for at least one value. For physical
+        // destinations the writes are carried directly in the operand
+        // list and no virtual liveness bookkeeping is required.
         let (is_load, base_v) = match (&ka, a_base) {
-            (LdSt::LdrInt | LdSt::LdrFp, MachineOperand::VReg(v)) => (true, Some(*v)),
+            (LdSt::LdrInt | LdSt::LdrFp, _) => (true, Some(a_base)),
             _ => (false, None),
         };
         if is_load {
-            let (MachineOperand::VReg(va), MachineOperand::VReg(vb)) = (av, bv) else {
-                i += 1;
-                continue;
-            };
-            if va == vb {
+            if a.def.is_some() || b.def.is_some() {
                 i += 1;
                 continue;
             }
-            if let Some(b_v) = base_v {
+            if !matches!(av, MachineOperand::PhysReg(_))
+                || !matches!(bv, MachineOperand::PhysReg(_))
+            {
+                i += 1;
+                continue;
+            }
+            if operand_same_storage(av, bv) {
+                i += 1;
+                continue;
+            }
+            if let Some(base) = base_v {
                 // The first load (program order) is at index i. Its
                 // dest must not be the base — otherwise the second
                 // load (i+1) would be reading a different base.
-                let first_dest = match &mf.blocks[mb_idx].insts[i].operands[0] {
-                    MachineOperand::VReg(v) => *v,
-                    _ => {
-                        i += 1;
-                        continue;
-                    }
-                };
-                if first_dest == b_v {
+                let first_dest = &mf.blocks[mb_idx].insts[i].operands[0];
+                if operand_same_storage(first_dest, base) {
                     i += 1;
                     continue;
                 }
@@ -990,25 +1018,6 @@ fn ldp_stp_fuse_block(mf: &mut MachineFunction, mb_idx: usize) {
 
         // Build the LdpOffset / StpOffset. Operands: [r1, r2, base, imm].
         let new_opcode = paired_opcode(&ka);
-        let new_def = if is_load {
-            // LDP defines two regs but our MachineInst.def is single-
-            // value. Track the higher of the two so reg-allocator
-            // liveness sees at least one def; the actual two-write
-            // semantics live in the operand list. (Existing prologue
-            // LdpOffset uses this same shape.)
-            match &lower_op_value {
-                MachineOperand::VReg(_) => Some(match upper_op_value {
-                    MachineOperand::VReg(v) => v,
-                    _ => {
-                        i += 1;
-                        continue;
-                    }
-                }),
-                _ => None,
-            }
-        } else {
-            None
-        };
         let new_inst = MachineInst {
             opcode: new_opcode,
             operands: vec![
@@ -1017,7 +1026,7 @@ fn ldp_stp_fuse_block(mf: &mut MachineFunction, mb_idx: usize) {
                 a_base.clone(),
                 MachineOperand::Imm(lower_off),
             ],
-            def: new_def,
+            def: None,
         };
         plans.push(PairPlan {
             lower_idx: i,
@@ -1450,9 +1459,11 @@ mod tests {
         mf
     }
 
-    /// Two adjacent `ldr x_, [base, #imm]` with offsets 0 and 8 fuse to `ldp`.
+    /// Virtual-register loads must not fuse: `MachineInst` has a
+    /// single `def`, but LDP writes two destinations. Fusing these
+    /// before register allocation loses at least one receipt value.
     #[test]
-    fn ldp_fusion_int64_pair() {
+    fn ldp_no_fusion_virtual_def_pair() {
         // vregs: 0,1,2 = Gp64
         let classes = vec![RegClass::Gp64; 3];
         let ldr1 = MachineInst {
@@ -1468,12 +1479,50 @@ mod tests {
         let mut mf = mf_with_classes(vec![ldr1, ldr2], &classes);
         ldp_stp_fusion(&mut mf);
         let block = &mf.blocks[0];
+        assert_eq!(block.insts.len(), 2);
+        assert_eq!(block.insts[0].opcode, ArmOpcode::LdrImm);
+        assert_eq!(block.insts[1].opcode, ArmOpcode::LdrImm);
+    }
+
+    /// Physical-register loads can fuse: the two writes are represented
+    /// directly in the operand list and do not need vreg def tracking.
+    #[test]
+    fn ldp_fusion_physical_int64_pair() {
+        let ldr1 = MachineInst {
+            opcode: ArmOpcode::LdrImm,
+            operands: vec![
+                MachineOperand::PhysReg(PhysReg::Gp(12)),
+                MachineOperand::PhysReg(PhysReg::Gp(14)),
+                MachineOperand::Imm(0),
+            ],
+            def: None,
+        };
+        let ldr2 = MachineInst {
+            opcode: ArmOpcode::LdrImm,
+            operands: vec![
+                MachineOperand::PhysReg(PhysReg::Gp(13)),
+                MachineOperand::PhysReg(PhysReg::Gp(14)),
+                MachineOperand::Imm(8),
+            ],
+            def: None,
+        };
+        let mut mf = mf_with_classes(vec![ldr1, ldr2], &[]);
+        ldp_stp_fusion(&mut mf);
+        let block = &mf.blocks[0];
         assert_eq!(block.insts.len(), 1);
         assert_eq!(block.insts[0].opcode, ArmOpcode::LdpOffset);
-        // Lower-offset (0) load goes into Rt1 = vreg(0); higher (8) into Rt2 = vreg(1).
-        assert_eq!(block.insts[0].operands[0], vreg(0));
-        assert_eq!(block.insts[0].operands[1], vreg(1));
-        assert_eq!(block.insts[0].operands[2], vreg(2));
+        assert_eq!(
+            block.insts[0].operands[0],
+            MachineOperand::PhysReg(PhysReg::Gp(12))
+        );
+        assert_eq!(
+            block.insts[0].operands[1],
+            MachineOperand::PhysReg(PhysReg::Gp(13))
+        );
+        assert_eq!(
+            block.insts[0].operands[2],
+            MachineOperand::PhysReg(PhysReg::Gp(14))
+        );
         assert_eq!(block.insts[0].operands[3], MachineOperand::Imm(0));
     }
 
