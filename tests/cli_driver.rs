@@ -6042,6 +6042,51 @@ fn scalar_allocatable_components_store_into_descriptor_payloads() {
 }
 
 #[test]
+fn local_scalar_allocatable_real_kind_assignment_allocates_payload() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=local_scalar_allocatable_real_kind_assignment_allocates_payload count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  integer, parameter :: dp = kind(1.0d0)\n  real(dp), allocatable :: x\n  real(dp) :: y\n  y = 1.0_dp + 2.0_dp**(-30)\n  x = real(y, kind(x))\n  if (.not. allocated(x)) error stop 1\n  if (abs(x - y) > 1.0e-14_dp) error stop 2\n  x = real(y + 1.0_dp, kind(x))\n  if (.not. allocated(x)) error stop 3\n  if (abs(x - (y + 1.0_dp)) > 1.0e-14_dp) error stop 4\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("local_scalar_alloc_real_kind", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-O2", "-o", out.to_str().unwrap()])
+        .output()
+        .expect("local scalar allocatable real-kind compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "local scalar allocatable real-kind compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("local scalar allocatable real-kind run failed");
+    assert!(
+        run.status.success(),
+        "local scalar allocatable real-kind run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected local scalar allocatable real-kind output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn scalar_allocatable_component_actuals_pass_payloads() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
