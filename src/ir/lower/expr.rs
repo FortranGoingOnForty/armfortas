@@ -2548,6 +2548,7 @@ pub(crate) fn lower_expr_full(
                     first_procedure_lookup(&abi_lookup_keys, |k| callee_optional_arg_mask(st, k));
                 let mut ref_arg_vals: Vec<ValueId> =
                     Vec::with_capacity(arg_slots.len() + indirect_hidden_result.is_some() as usize);
+                let mut call_arg_array_temps = Vec::new();
                 if let Some(desc) = indirect_hidden_result {
                     ref_arg_vals.push(desc);
                 }
@@ -2707,7 +2708,7 @@ pub(crate) fn lower_expr_full(
                                         value,
                                     )
                                 };
-                                super::stmt::lower_call_arg_maybe_conditional(
+                                let value = super::stmt::lower_call_arg_maybe_conditional(
                                     b,
                                     locals,
                                     st,
@@ -2720,7 +2721,24 @@ pub(crate) fn lower_expr_full(
                                     i,
                                     is_value,
                                     &mut materialize,
-                                )
+                                );
+                                if wants_descriptor
+                                    && !matches!(
+                                        arg_expr.node,
+                                        Expr::ConditionalExpr { .. } | Expr::NilArgument
+                                    )
+                                {
+                                    track_call_arg_array_temp_descriptor(
+                                        b,
+                                        &mut call_arg_array_temps,
+                                        locals,
+                                        arg_expr,
+                                        st,
+                                        type_layouts,
+                                        value,
+                                    );
+                                }
+                                value
                             }
                             _ => b.const_i32(0),
                         },
@@ -2842,6 +2860,7 @@ pub(crate) fn lower_expr_full(
                     )
                 };
                 let call_result = b.call(func_ref, ref_arg_vals, ret_ty);
+                deallocate_call_arg_array_temp_descriptors(b, &call_arg_array_temps);
                 if let Some(desc) = indirect_hidden_result {
                     return desc;
                 }
@@ -2953,6 +2972,7 @@ pub(crate) fn lower_expr_full(
                                     );
                                     let mut arg_vals: Vec<ValueId> =
                                         Vec::with_capacity(arg_slots.len());
+                                    let mut call_arg_array_temps = Vec::new();
                                     for (i, slot) in arg_slots.iter().enumerate() {
                                         let mask_says_descriptor = callee_descriptor_args
                                             .as_ref()
@@ -2999,7 +3019,7 @@ pub(crate) fn lower_expr_full(
                                                 let wants_descriptor =
                                                     mask_says_descriptor || actual_uses_descriptor;
                                                 let v = if wants_descriptor {
-                                                    lower_arg_descriptor_full(
+                                                    let desc = lower_arg_descriptor_full(
                                                         b,
                                                         locals,
                                                         e,
@@ -3009,7 +3029,17 @@ pub(crate) fn lower_expr_full(
                                                         contained_host_refs,
                                                         descriptor_params,
                                                         false,
-                                                    )
+                                                    );
+                                                    track_call_arg_array_temp_descriptor(
+                                                        b,
+                                                        &mut call_arg_array_temps,
+                                                        locals,
+                                                        e,
+                                                        st,
+                                                        type_layouts,
+                                                        desc,
+                                                    );
+                                                    desc
                                                 } else {
                                                     lower_arg_by_ref_full(
                                                         b,
@@ -3027,7 +3057,13 @@ pub(crate) fn lower_expr_full(
                                         }
                                     }
                                     arg_vals.extend(closure_args);
-                                    return b.call(FuncRef::Indirect(target_ptr), arg_vals, ret_ty);
+                                    let call_result =
+                                        b.call(FuncRef::Indirect(target_ptr), arg_vals, ret_ty);
+                                    deallocate_call_arg_array_temp_descriptors(
+                                        b,
+                                        &call_arg_array_temps,
+                                    );
+                                    return call_result;
                                 }
                             }
                             let bp = bp_opt.unwrap_or_else(|| {
@@ -3135,6 +3171,7 @@ pub(crate) fn lower_expr_full(
                                 });
 
                             let mut call_args = Vec::with_capacity(arg_slots.len() + 1);
+                            let mut call_arg_array_temps = Vec::new();
                             for (i, slot) in arg_slots.iter().enumerate() {
                                 if !nopass && i == 0 {
                                     let wants_bind_c_char = callee_bind_c_char_args
@@ -3227,7 +3264,7 @@ pub(crate) fn lower_expr_full(
                                                     raw,
                                                 )
                                             } else if wants_descriptor {
-                                                lower_arg_descriptor_full(
+                                                let desc = lower_arg_descriptor_full(
                                                     b,
                                                     locals,
                                                     e,
@@ -3237,7 +3274,17 @@ pub(crate) fn lower_expr_full(
                                                     contained_host_refs,
                                                     descriptor_params,
                                                     false,
-                                                )
+                                                );
+                                                track_call_arg_array_temp_descriptor(
+                                                    b,
+                                                    &mut call_arg_array_temps,
+                                                    locals,
+                                                    e,
+                                                    st,
+                                                    type_layouts,
+                                                    desc,
+                                                );
+                                                desc
                                             } else if wants_string_descriptor {
                                                 lower_arg_string_descriptor(
                                                     b,
@@ -3371,6 +3418,7 @@ pub(crate) fn lower_expr_full(
                             .unwrap_or(IrType::Int(IntWidth::I32));
                             let call_result =
                                 b.call(FuncRef::External(call_name), call_args, ret_ty);
+                            deallocate_call_arg_array_temp_descriptors(b, &call_arg_array_temps);
                             if let Some(tl) = type_layouts {
                                 if let Some(type_name) =
                                     callee_return_stabilized_derived_type_name(st, &target_key)
