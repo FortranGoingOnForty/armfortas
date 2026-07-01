@@ -143,6 +143,11 @@ pub struct Options {
     pub preprocess_only: bool, // -E
     pub preprocessor_defines: Vec<(String, String)>,
     pub cpp_compat: bool, // -cpp (accepted; preprocessing already runs)
+    /// Emit a make-style dependency file (`-MD`/`-MMD`, optionally `-MF`).
+    pub emit_depfile: bool,
+    pub depfile: Option<PathBuf>,
+    pub dep_targets: Vec<String>,
+    pub depfile_phony: bool,
 
     // ---- Language ----
     pub std: Option<crate::sema::validate::FortranStandard>,
@@ -160,6 +165,7 @@ pub struct Options {
     pub backslash_escapes: bool,
     pub free_line_length_none_compat: bool,
     pub max_stack_var_size: Option<u64>,
+    pub no_stack_arrays_compat: bool,
 
     // ---- Optimization ----
     pub opt_level: OptLevel,
@@ -234,6 +240,10 @@ impl Default for Options {
             preprocess_only: false,
             preprocessor_defines: Vec::new(),
             cpp_compat: false,
+            emit_depfile: false,
+            depfile: None,
+            dep_targets: Vec::new(),
+            depfile_phony: false,
             std: Some(crate::sema::validate::FortranStandard::F2018),
             std_explicit: false,
             source_form_override: None,
@@ -244,6 +254,7 @@ impl Default for Options {
             backslash_escapes: false,
             free_line_length_none_compat: false,
             max_stack_var_size: None,
+            no_stack_arrays_compat: false,
             opt_level: OptLevel::O0,
             warn_all: false,
             warn_extra: false,
@@ -411,6 +422,15 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
             arg if arg.starts_with("-I") => opts
                 .module_search_paths
                 .push(PathBuf::from(short_option_value(arg, "-I", "a directory")?)),
+            "-isystem" => {
+                i += 1;
+                opts.module_search_paths.push(PathBuf::from(
+                    args.get(i).ok_or("-isystem requires a directory")?,
+                ));
+            }
+            arg if arg.starts_with("-isystem") => opts.module_search_paths.push(PathBuf::from(
+                short_option_value(arg, "-isystem", "a directory")?,
+            )),
 
             "-J" => {
                 i += 1;
@@ -528,6 +548,9 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
             "-fdefault-real-8" => opts.default_real_8 = true,
             "-fimplicit-none" => opts.force_implicit_none = true,
             "-frecursive" => opts.recursive_default = true,
+            "-fno-stack-arrays" => opts.no_stack_arrays_compat = true,
+            "-fPIC" | "-fpic" | "-fPIE" | "-fpie" => {}
+            "-fpreprocessed" | "-nocpp" => {}
             "-fbackslash" => opts.backslash_escapes = true,
             "-fno-backslash" => opts.backslash_escapes = false,
             arg if arg.starts_with("-fmax-stack-var-size=") => {
@@ -557,6 +580,43 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
             }
             arg if arg.starts_with("-W") => {
                 unknown_warning_flags.push(arg.to_string());
+            }
+            "-w" => {}
+
+            // ---- Make-style dependency-file compatibility ----
+            "-MD" | "-MMD" => opts.emit_depfile = true,
+            "-MP" => {
+                opts.emit_depfile = true;
+                opts.depfile_phony = true;
+            }
+            "-MF" => {
+                i += 1;
+                opts.emit_depfile = true;
+                opts.depfile = Some(PathBuf::from(args.get(i).ok_or("-MF requires a file")?));
+            }
+            arg if arg.starts_with("-MF") => {
+                opts.emit_depfile = true;
+                opts.depfile = Some(PathBuf::from(short_option_value(arg, "-MF", "a file")?));
+            }
+            "-MT" | "-MQ" => {
+                let flag = arg.clone();
+                i += 1;
+                opts.emit_depfile = true;
+                opts.dep_targets.push(
+                    args.get(i)
+                        .ok_or_else(|| format!("{} requires a target", flag))?
+                        .clone(),
+                );
+            }
+            arg if arg.starts_with("-MT") => {
+                opts.emit_depfile = true;
+                opts.dep_targets
+                    .push(short_option_value(arg, "-MT", "a target")?.to_string());
+            }
+            arg if arg.starts_with("-MQ") => {
+                opts.emit_depfile = true;
+                opts.dep_targets
+                    .push(short_option_value(arg, "-MQ", "a target")?.to_string());
             }
 
             // ---- Debug / introspection ----
@@ -804,6 +864,10 @@ fn collect_cli_warnings(opts: &mut Options, unknown_warning_flags: &[String]) {
     if opts.max_stack_var_size.is_some() {
         opts.cli_warnings
             .push("-fmax-stack-var-size is recognized but not yet implemented".into());
+    }
+    if opts.no_stack_arrays_compat {
+        opts.cli_warnings
+            .push("-fno-stack-arrays is recognized but automatic array placement is not yet configurable".into());
     }
     if opts.free_line_length_none_compat {
         opts.cli_warnings.push(
@@ -1537,6 +1601,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         let out = opts.output_path();
         fs::write(&out, &asm_text)
             .map_err(|e| format!("cannot write '{}': {}", out.display(), e))?;
+        write_dependency_file(opts, &out)?;
         if opts.verbose {
             eprintln!(" wrote: {}", out.display());
         }
@@ -1704,6 +1769,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         }
         if opts.emit_obj {
             let _ = fs::remove_file(&asm_path);
+            write_dependency_file(opts, &obj_path)?;
             if opts.verbose {
                 eprintln!(" assembled: {}", obj_path.display());
             }
@@ -1748,6 +1814,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     }
 
     if opts.emit_obj {
+        write_dependency_file(opts, &obj_path)?;
         phases.report();
         return Ok(());
     }
@@ -1767,6 +1834,62 @@ pub fn compile(opts: &Options) -> Result<(), String> {
 
     phases.report();
     Ok(())
+}
+
+fn write_dependency_file(opts: &Options, output: &Path) -> Result<(), String> {
+    if !opts.emit_depfile && opts.depfile.is_none() {
+        return Ok(());
+    }
+
+    let depfile = opts.depfile.clone().unwrap_or_else(|| {
+        let mut path = output.to_path_buf();
+        path.set_extension("d");
+        path
+    });
+    if let Some(parent) = depfile.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("cannot create depfile directory '{}': {}", parent.display(), e))?;
+        }
+    }
+
+    let targets: Vec<String> = if opts.dep_targets.is_empty() {
+        vec![output.to_string_lossy().into_owned()]
+    } else {
+        opts.dep_targets.clone()
+    };
+    let mut body = String::new();
+    for (idx, target) in targets.iter().enumerate() {
+        if idx > 0 {
+            body.push(' ');
+        }
+        body.push_str(&escape_make_dep_token(target));
+    }
+    body.push_str(": ");
+    body.push_str(&escape_make_dep_token(&opts.input.to_string_lossy()));
+    body.push('\n');
+    if opts.depfile_phony {
+        body.push('\n');
+        body.push_str(&escape_make_dep_token(&opts.input.to_string_lossy()));
+        body.push_str(":\n");
+    }
+
+    fs::write(&depfile, body)
+        .map_err(|e| format!("cannot write depfile '{}': {}", depfile.display(), e))
+}
+
+fn escape_make_dep_token(token: &str) -> String {
+    let mut out = String::with_capacity(token.len());
+    for ch in token.chars() {
+        match ch {
+            ' ' | '#' | '\\' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 /// Link an object file with the runtime library to produce a binary.
