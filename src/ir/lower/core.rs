@@ -18854,7 +18854,29 @@ pub(super) fn abi_key_for_link_name(st: &SymbolTable, link_name: &str) -> Option
     use crate::sema::symtab::SymbolKind;
 
     let link_lower = link_name.to_lowercase();
+    let mut suffix_match: Option<(usize, String)> = None;
     for scope in st.all_scopes() {
+        match &scope.kind {
+            crate::sema::symtab::ScopeKind::Function(name)
+            | crate::sema::symtab::ScopeKind::Subroutine(name) => {
+                let key = name.to_lowercase();
+                if link_lower == key {
+                    return Some(key);
+                }
+                let suffix = format!("_{}", key);
+                if link_lower.ends_with(&suffix) {
+                    let len = key.len();
+                    if suffix_match
+                        .as_ref()
+                        .map(|(best_len, _)| len > *best_len)
+                        .unwrap_or(true)
+                    {
+                        suffix_match = Some((len, key));
+                    }
+                }
+            }
+            _ => {}
+        }
         for sym in scope.symbols.values() {
             if matches!(
                 sym.kind,
@@ -18881,12 +18903,20 @@ pub(super) fn abi_key_for_link_name(st: &SymbolTable, link_name: &str) -> Option
             ) {
                 let suffix = format!("_{}", sym.name.to_lowercase());
                 if link_lower.ends_with(&suffix) {
-                    return Some(sym.name.to_lowercase());
+                    let key = sym.name.to_lowercase();
+                    let len = key.len();
+                    if suffix_match
+                        .as_ref()
+                        .map(|(best_len, _)| len > *best_len)
+                        .unwrap_or(true)
+                    {
+                        suffix_match = Some((len, key));
+                    }
                 }
             }
         }
     }
-    None
+    suffix_match.map(|(_, key)| key)
 }
 
 pub(super) fn find_linkable_symbol_any_scope<'a>(
