@@ -44030,6 +44030,55 @@ fn array_constructor_array_sections_lower_through_descriptor_path() {
 }
 
 #[test]
+fn implied_do_constructor_length_uses_implied_do_scope_for_array_expr() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=implied_do_constructor_length_uses_implied_do_scope_for_array_expr count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // PRIMA newuob computes:
+    //   [(sum((x - (xbase + xpt(:, k)))**2, dim=1), k = 1, npt)]
+    // The constructor length pass must bind the implied-do `k`; otherwise
+    // an outer `k` can be captured while materializing the inner array
+    // expression just to ask for its size.
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: k\n  real(8), allocatable :: vals(:)\n  real(8) :: xpt(3,2), xbase(3), x(3)\n  k = -100000\n  xbase = 0.0_8\n  x = 0.0_8\n  xpt(:, 1) = [10.0_8, 20.0_8, 30.0_8]\n  xpt(:, 2) = [1.0_8, 2.0_8, 3.0_8]\n  vals = [(sum((x - (xbase + xpt(:, k)))**2, dim=1), k = 1, 2)]\n  if (size(vals) /= 2) error stop 1\n  if (abs(vals(1) - 1400.0_8) > 1.0e-9_8) error stop 2\n  if (abs(vals(2) - 14.0_8) > 1.0e-9_8) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("implied_do_array_expr_scope", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("implied-do array expr scope compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "implied-do array expr scope compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("implied-do array expr scope run failed");
+    assert!(
+        run.status.success(),
+        "implied-do array expr scope run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected implied-do array expr scope output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn mixed_numeric_array_binary_exprs_coerce_array_lanes() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
