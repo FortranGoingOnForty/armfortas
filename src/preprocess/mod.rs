@@ -22,9 +22,7 @@ pub struct PreprocConfig {
 }
 
 impl PreprocConfig {
-    /// Predefined macros for a target. The arm64-macos define set is
-    /// contractual: it must stay byte-identical to what shipped before
-    /// targets existed (sprint x00).
+    /// Predefined macros for a target.
     pub fn for_target(target: &crate::target::TargetSpec) -> Self {
         use crate::target::{Arch, Os};
 
@@ -32,6 +30,14 @@ impl PreprocConfig {
         defines.insert("__ARMFORTAS__".into(), MacroDef::object("1"));
         defines.insert("__ARMFORTAS_MAJOR__".into(), MacroDef::object("0"));
         defines.insert("__ARMFORTAS_MINOR__".into(), MacroDef::object("1"));
+        // Build systems such as CMake key GNU-compatible Fortran
+        // behavior off these predefines before they know our compiler
+        // name.  Advertise an old GCC-compatible surface: enough for
+        // module-dir and dependency-file flags, without inviting newer
+        // LTO/visibility flag families.
+        defines.insert("__GNUC__".into(), MacroDef::object("4"));
+        defines.insert("__GNUC_MINOR__".into(), MacroDef::object("4"));
+        defines.insert("__GNUC_PATCHLEVEL__".into(), MacroDef::object("0"));
         match target.arch {
             Arch::Arm64 => {
                 defines.insert("__aarch64__".into(), MacroDef::object("1"));
@@ -2574,8 +2580,7 @@ deep
         );
     }
 
-    /// Golden per-target define sets (sprint x00). The arm64-macos set is
-    /// contractual: byte-identical to the pre-target-model predefines.
+    /// Golden per-target define sets.
     #[test]
     fn target_define_sets_are_golden() {
         use crate::target::TargetSpec;
@@ -2594,6 +2599,9 @@ deep
             "__ARMFORTAS_MAJOR__",
             "__ARMFORTAS_MINOR__",
             "__ARMFORTAS__",
+            "__GNUC_MINOR__",
+            "__GNUC_PATCHLEVEL__",
+            "__GNUC__",
         ];
 
         let golden = |extra: &[&str]| -> Vec<String> {
@@ -2633,5 +2641,21 @@ deep
         assert!(run("x86_64-freebsd").contains("x = 1"));
         assert!(run("arm64-macos").contains("x = 2"));
         assert!(run("x86_64-linux-gnu").contains("x = 3"));
+    }
+
+    #[test]
+    fn gnu_compat_defines_select_cmake_compiler_id_branch() {
+        let target = crate::target::TargetSpec::parse("arm64-macos").unwrap();
+        let config = PreprocConfig::for_target(&target);
+        let out = preprocess(
+            "#if defined(__GNUC__)\nprint *, 'INFO:compiler[GNU]'\n#else\nprint *, 'INFO:compiler[]'\n#endif\n",
+            &config,
+        )
+        .unwrap()
+        .text;
+        assert!(
+            out.contains("INFO:compiler[GNU]"),
+            "CMake compiler-id macro branch should be reachable: {out:?}"
+        );
     }
 }
