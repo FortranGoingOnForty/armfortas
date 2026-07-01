@@ -20636,8 +20636,14 @@ pub(super) fn procedure_pointer_call_target(
     } else {
         IrType::Ptr(Box::new(info.ty.clone()))
     };
+    let target = if info.by_ref && info.is_pointer {
+        let caller_slot = b.load(info.addr);
+        b.load_typed(caller_slot, load_ty)
+    } else {
+        b.load_typed(info.addr, load_ty)
+    };
     Some((
-        b.load_typed(info.addr, load_ty),
+        target,
         procedure_dummy_closure_args_from_locals(b, locals, key),
         signature_key,
     ))
