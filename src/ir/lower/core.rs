@@ -27672,9 +27672,44 @@ pub(super) fn lower_runtime_array_constructor_len(
                 }
             }
             crate::ast::expr::AcValue::ImpliedDo(ido) => {
-                let inner = lower_runtime_array_constructor_len(
+                let var_ty = IrType::Int(IntWidth::I32);
+                let var_addr = b.alloca(var_ty.clone());
+                let start_val = super::expr::lower_expr_full(
                     b,
                     locals,
+                    &ido.start,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                );
+                let start_coerced = coerce_to_type(b, start_val, &var_ty);
+                b.store(start_coerced, var_addr);
+
+                let mut scratch_locals = locals.clone();
+                scratch_locals.insert(
+                    ido.var.to_lowercase(),
+                    LocalInfo {
+                        addr: var_addr,
+                        ty: var_ty,
+                        dims: vec![],
+                        allocatable: false,
+                        descriptor_arg: false,
+                        by_ref: false,
+                        char_kind: CharKind::None,
+                        derived_type: None,
+                        inline_const: None,
+                        is_pointer: false,
+                        runtime_dim_upper: vec![],
+                        is_class: false,
+                        logical_kind: None,
+                        last_dim_assumed_size: false,
+                    },
+                );
+                let inner = lower_runtime_array_constructor_len(
+                    b,
+                    &scratch_locals,
                     &ido.values,
                     st,
                     type_layouts,
