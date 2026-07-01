@@ -105,6 +105,61 @@ fn dash_j_writes_amod_and_mod_alias() {
 }
 
 #[test]
+fn gnu_depfile_flags_write_make_dependency_file() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=driver_link_compat test=gnu_depfile_flags_write_make_dependency_file count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("gnu_depfile_flags");
+    let src = write_program_in(
+        &dir,
+        "m.f90",
+        "module m\ncontains\n  integer function answer()\n    answer = 42\n  end function\nend module\n",
+    );
+    let amod_dir = dir.join("mods");
+    std::fs::create_dir_all(&amod_dir).expect("cannot create module dir");
+    let obj = dir.join("m.o");
+    let depfile = dir.join("m.d");
+    let result = Command::new(compiler("armfortas"))
+        .args([
+            "-fPIC",
+            "-MD",
+            "-MF",
+            depfile.to_str().unwrap(),
+            "-MT",
+            "custom_target",
+            "-c",
+            src.to_str().unwrap(),
+            "-J",
+            amod_dir.to_str().unwrap(),
+            "-o",
+            obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("compile spawn failed");
+    assert!(
+        result.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let deps = std::fs::read_to_string(&depfile).expect("missing dependency file");
+    assert!(
+        deps.contains("custom_target:"),
+        "dependency file should use -MT target, got: {deps}"
+    );
+    assert!(
+        deps.contains(src.to_str().unwrap()),
+        "dependency file should mention source, got: {deps}"
+    );
+    assert!(amod_dir.join("m.amod").exists(), "expected .amod output");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn dynamiclib_driver_spelling_forwards_darwin_linker_flags() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
