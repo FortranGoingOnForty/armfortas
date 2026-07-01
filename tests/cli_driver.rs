@@ -301,6 +301,237 @@ fn contained_c_f_procpointer_call_loads_host_slot_target() {
     );
 }
 
+#[test]
+fn o2_scalar_callee_name_suffix_does_not_inherit_array_result_abi() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=o2_scalar_callee_name_suffix_does_not_inherit_array_result_abi count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let src = write_program(
+        r#"
+module suffix_hidden_abi_m
+  implicit none
+  integer, parameter :: rp = kind(1.0d0)
+contains
+  function biglag(n) result(out)
+    integer, intent(in) :: n
+    real(rp) :: out(n)
+    real(rp) :: cf(5)
+    cf = [10.0_rp, 2.0_rp, 30.0_rp, 40.0_rp, 5.0_rp]
+    if (abs(circle_fun_biglag(2.0_rp, cf)) <= 1.1_rp * abs(circle_fun_biglag(0.0_rp, cf))) error stop 1
+    out = 7.0_rp
+  end function
+
+  function circle_fun_biglag(theta, args) result(f)
+    real(rp), intent(in) :: theta
+    real(rp), intent(in) :: args(:)
+    real(rp) :: f
+    f = args(1) + args(2) * theta + args(5)
+  end function
+end module
+
+program p
+  use suffix_hidden_abi_m
+  implicit none
+  real(rp), allocatable :: got(:)
+  got = biglag(2)
+  if (size(got) /= 2) error stop 2
+  if (any(abs(got - 7.0_rp) > 1.0e-9_rp)) error stop 3
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("suffix_hidden_abi", "bin");
+    let result = Command::new(compiler("armfortas"))
+        .args(["-O2", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("suffix hidden ABI compile failed to spawn");
+    assert!(
+        result.status.success(),
+        "suffix hidden ABI probe should compile and link: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("suffix hidden ABI probe run failed");
+    assert!(
+        run.status.success(),
+        "suffix hidden ABI probe run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected suffix hidden ABI output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn o2_separate_unit_absent_allocatable_optionals_stay_null_on_stack() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=o2_separate_unit_absent_allocatable_optionals_stay_null_on_stack count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("o2_absent_alloc_optional_stack");
+    let module_src = write_program_in(
+        &dir,
+        "edge_mod.f90",
+        r#"
+module o2_absent_alloc_optional_stack_m
+  implicit none
+  abstract interface
+    subroutine obj(x, f)
+      real(8), intent(in) :: x(:)
+      real(8), intent(out) :: f
+    end subroutine obj
+    subroutine cb(x, f)
+      real(8), intent(in) :: x(:)
+      real(8), intent(in) :: f
+    end subroutine cb
+  end interface
+contains
+  subroutine big(calfun, x, f, xl, xu, nf, rhobeg, rhoend, ftarget, maxfun, npt, iprint, &
+      eta1, eta2, gamma1, gamma2, xhist, fhist, maxhist, honour_x0, callback_fcn, info)
+    procedure(obj) :: calfun
+    real(8), intent(inout) :: x(:)
+    real(8), intent(out), optional :: f
+    real(8), intent(in), optional :: xl(:), xu(:)
+    integer, intent(out), optional :: nf, info
+    real(8), intent(in), optional :: rhobeg, rhoend, ftarget, eta1, eta2, gamma1, gamma2
+    integer, intent(in), optional :: maxfun, npt, iprint, maxhist
+    logical, intent(in), optional :: honour_x0
+    real(8), allocatable, intent(out), optional :: xhist(:, :)
+    real(8), allocatable, intent(out), optional :: fhist(:)
+    procedure(cb), optional :: callback_fcn
+    real(8) :: local_f
+
+    if (.not. present(xl)) error stop 10
+    if (.not. present(xu)) error stop 11
+    if (.not. present(f)) error stop 12
+    if (present(xhist)) error stop 13
+    if (present(fhist)) error stop 14
+    if (present(callback_fcn)) error stop 15
+    call calfun(x, local_f)
+    f = local_f
+  end subroutine big
+end module o2_absent_alloc_optional_stack_m
+"#,
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        r#"
+module o2_absent_alloc_optional_stack_caller
+  implicit none
+contains
+  subroutine calfun(x, f)
+    real(8), intent(in) :: x(:)
+    real(8), intent(out) :: f
+    f = x(1) + x(2)
+  end subroutine calfun
+end module o2_absent_alloc_optional_stack_caller
+
+program p
+  use o2_absent_alloc_optional_stack_m, only : big
+  use o2_absent_alloc_optional_stack_caller, only : calfun
+  implicit none
+  real(8) :: f, x(2), xl(2), xu(2)
+  x = [1.0_8, 2.0_8]
+  xl = [0.0_8, 0.0_8]
+  xu = [4.0_8, 4.0_8]
+  call big(calfun, x, f, xl, xu)
+  if (f /= 3.0_8) error stop 1
+  print *, 'ok'
+end program p
+"#,
+    );
+
+    let module_o = dir.join("edge_mod.o");
+    let main_o = dir.join("main.o");
+    let bin = dir.join("a.out");
+    let dir_s = dir.to_str().unwrap();
+    let module_compile = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            "-O2",
+            module_src.to_str().unwrap(),
+            "-J",
+            dir_s,
+            "-o",
+            module_o.to_str().unwrap(),
+        ])
+        .output()
+        .expect("O2 optional-stack module compile failed to spawn");
+    assert!(
+        module_compile.status.success(),
+        "O2 optional-stack module compile failed: {}",
+        String::from_utf8_lossy(&module_compile.stderr)
+    );
+
+    let main_compile = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            "-O2",
+            main_src.to_str().unwrap(),
+            "-I",
+            dir_s,
+            "-J",
+            dir_s,
+            "-o",
+            main_o.to_str().unwrap(),
+        ])
+        .output()
+        .expect("O2 optional-stack main compile failed to spawn");
+    assert!(
+        main_compile.status.success(),
+        "O2 optional-stack main compile failed: {}",
+        String::from_utf8_lossy(&main_compile.stderr)
+    );
+
+    let link = Command::new(compiler("armfortas"))
+        .args([
+            main_o.to_str().unwrap(),
+            module_o.to_str().unwrap(),
+            "-o",
+            bin.to_str().unwrap(),
+        ])
+        .output()
+        .expect("O2 optional-stack link failed to spawn");
+    assert!(
+        link.status.success(),
+        "O2 optional-stack link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&bin)
+        .output()
+        .expect("O2 optional-stack run failed to spawn");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        run.status.success() && stdout.contains("ok"),
+        "O2 optional-stack run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        stdout,
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
 
 #[test]
 fn ambiguous_use_warning_is_deduped_across_contained_procedures() {
