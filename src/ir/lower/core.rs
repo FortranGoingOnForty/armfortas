@@ -47532,8 +47532,21 @@ pub(super) fn expr_is_character_expr(
                     || descriptor_backed_runtime_char_array(info)
                     || local_fixed_char_allocatable_scalar_len(info).is_some();
             }
-            st.find_symbol_any_scope(&key)
-                .and_then(|sym| sym.type_info.as_ref())
+            // Scope-correct lookup: a bare name is a character entity
+            // *here* only if it is visible in this procedure's scope
+            // (local, USE, or host). A scope-blind scan would pick up an
+            // unrelated procedure's local `parameter :: int` and then
+            // misclassify the intrinsic `int(x)` as a character substring
+            // — that is what broke fpm's m_cli2::a2i (`valu = int(valu8)`
+            // lowered to substring math on a leaked constant). Fall back
+            // to the blind scan only when the procedure scope is unknown.
+            let sym = match callee_scope_id_for_lookup(st, b.func().name.as_str())
+                .or_else(current_proc_scope)
+            {
+                Some(scope_id) => st.lookup_in(scope_id, &key),
+                None => st.find_symbol_any_scope(&key),
+            };
+            sym.and_then(|sym| sym.type_info.as_ref())
                 .is_some_and(|ty| matches!(ty, crate::sema::symtab::TypeInfo::Character { .. }))
         }
         Expr::ComponentAccess { .. } => type_layouts
