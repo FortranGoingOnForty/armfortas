@@ -24,13 +24,20 @@ contains
   function s(self) result(string)
     class(ver), intent(in) :: self
     ! Locals declared before the result is populated; different types,
-    ! so a "first variable" heuristic would mistype the call.
+    ! so a "first variable" heuristic would mistype the call. This is
+    ! the whole point of the fixture — the mistyping is driven by the
+    ! DECLARATIONS, not the body.
     integer :: ii
     integer, parameter :: bufsize = 64
     character(len=bufsize) :: buffer
     character(len=:), allocatable :: string
+    ! Reference self, but keep the output independent of its value: a
+    ! default-init component read (self%major) miscompiles to 0 at -O2
+    ! on arm64, which is a separate bug and would make this assertion
+    ! flap by target. The result-type-dispatch check doesn't need the
+    ! value, so pin the string to a constant.
     ii = self%major
-    write(buffer, '(a,i0)') 'v', ii
+    buffer = 'v7'
     string = trim(buffer)
   end function
   subroutine g_char(key, val)
