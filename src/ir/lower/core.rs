@@ -54,6 +54,9 @@ pub fn lower_file(
     layout: crate::target::TargetLayout,
 ) -> (Module, HashMap<(String, String), ModuleGlobalInfo>) {
     let mut module = Module::new("main".into(), layout);
+    // Modules defined in this unit — lets any function CALL a local-module
+    // type's out-of-line memory helpers instead of inlining the walk.
+    module.local_modules = Rc::new(collect_local_owner_modules(units));
     let mut globals: HashMap<(String, String), ModuleGlobalInfo> = external_globals;
     let ambiguous_use_warnings: AmbiguousUseWarnings = Rc::new(RefCell::new(HashSet::new()));
 
@@ -512,6 +515,13 @@ fn derived_memory_helper_symbol(
     )
 }
 
+/// Strict gate: a type's per-type memory helper is callable only from a
+/// module procedure of the type's own owner module (or from the helper
+/// family itself). This is the conservative rule used by derived-type
+/// *initialization*: routing local-type init through the out-of-line
+/// helper from an arbitrary caller exposes a latent -O2 miscompile
+/// (mvbits_component_class_i64), so init stays inline outside the owner
+/// module.
 fn derived_memory_helper_available_from_current_func(
     b: &FuncBuilder,
     layout: &crate::sema::type_layout::TypeLayout,
@@ -524,6 +534,26 @@ fn derived_memory_helper_available_from_current_func(
     func.starts_with(&format!("afs_modproc_{}_", owner))
         || func.contains(&format!("_afs_modproc_{}_", owner))
         || func.starts_with(&format!("afs_derived_{}_", owner))
+}
+
+/// Extended gate for dealloc/copy walks: also callable from ANY function
+/// in this unit when the type's owner module is compiled locally, because
+/// `emit_derived_memory_helpers` emits a helper for every local-module
+/// type. This is what stops a routine that assembles derived types from
+/// many modules (fpm's `build_model`) from inlining every dealloc/copy
+/// walk and ballooning to 140k+ blocks. For separate compilation the only
+/// local module is the current one, so it collapses to the strict check.
+/// Not used for init (see the strict gate's note on the -O2 miscompile).
+fn derived_memory_helper_available_xmodule(
+    b: &FuncBuilder,
+    layout: &crate::sema::type_layout::TypeLayout,
+) -> bool {
+    if let Some(owner) = layout.owner_module.as_ref() {
+        if b.owner_module_is_local(&owner.to_lowercase()) {
+            return true;
+        }
+    }
+    derived_memory_helper_available_from_current_func(b, layout)
 }
 
 fn ptr_i8_ty() -> IrType {
@@ -46481,7 +46511,7 @@ pub(super) fn deallocate_derived_descriptor_components(
     if !derived_layout_needs_component_deallocation(layout, registry) {
         return;
     }
-    if !derived_memory_helper_available_from_current_func(b, layout) {
+    if !derived_memory_helper_available_xmodule(b, layout) {
         emit_deallocate_derived_descriptor_components_inline(b, desc, layout, registry, stat_addr);
         return;
     }
@@ -46553,7 +46583,7 @@ pub(super) fn deallocate_derived_storage_components(
     if !derived_layout_needs_component_deallocation(layout, registry) {
         return;
     }
-    if !derived_memory_helper_available_from_current_func(b, layout) {
+    if !derived_memory_helper_available_xmodule(b, layout) {
         emit_deallocate_derived_storage_components_inline(
             b, base_addr, layout, registry, stat_addr,
         );
@@ -47814,7 +47844,7 @@ pub(super) fn emit_derived_value_copy(
         emit_memcpy_bytes(b, dest_ptr, src_ptr, layout.size as i64);
         return;
     }
-    if !derived_memory_helper_available_from_current_func(b, layout) {
+    if !derived_memory_helper_available_xmodule(b, layout) {
         emit_derived_value_copy_inline(b, type_layouts, layout, dest_ptr, src_ptr);
         return;
     }
@@ -49025,7 +49055,7 @@ pub(super) fn emit_derived_array_desc_copy(
     if derived_layout_needs_deep_copy(layout, type_layouts)
         || derived_layout_needs_runtime_initialization(layout, type_layouts)
     {
-        if !derived_memory_helper_available_from_current_func(b, layout) {
+        if !derived_memory_helper_available_xmodule(b, layout) {
             emit_derived_array_desc_copy_inline(b, type_layouts, layout, dest_desc, source_desc);
             return;
         }

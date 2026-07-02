@@ -14,6 +14,13 @@ pub struct FuncBuilder<'a> {
     /// Target layout of the module under construction (x02); helpers
     /// that compute sizes while emitting read it from here.
     pub layout: crate::target::TargetLayout,
+    /// Lowercase names of modules compiled in this unit (an `Rc` clone of
+    /// `Module::local_modules`). Set for real function bodies; left empty
+    /// for the per-type memory-helper bodies (they never consult it).
+    /// Lets derived-type cleanup CALL a cross-module-but-local type's
+    /// helper instead of inlining the walk. See
+    /// `derived_memory_helper_available_from_current_func`.
+    local_modules: std::rc::Rc<std::collections::HashSet<String>>,
 }
 
 impl<'a> FuncBuilder<'a> {
@@ -23,7 +30,21 @@ impl<'a> FuncBuilder<'a> {
             func,
             current_block: entry,
             layout,
+            local_modules: std::rc::Rc::new(std::collections::HashSet::new()),
         }
+    }
+
+    /// Record the set of modules compiled in this unit (a cheap `Rc`
+    /// clone of `Module::local_modules`), so derived-type cleanup can
+    /// call out-of-line helpers for any local-module type.
+    pub fn set_local_modules(&mut self, m: std::rc::Rc<std::collections::HashSet<String>>) {
+        self.local_modules = m;
+    }
+
+    /// True if `module_lc` (lowercase module name) is defined in this
+    /// compilation unit and therefore has its memory helpers emitted here.
+    pub fn owner_module_is_local(&self, module_lc: &str) -> bool {
+        self.local_modules.contains(module_lc)
     }
 
     /// Switch to emitting into a different block.
