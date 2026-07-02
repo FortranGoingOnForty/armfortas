@@ -27540,6 +27540,18 @@ pub(super) fn store_ac_values_at_off(
 
                     if let (Some(type_name), Some(tl)) = (derived_type, type_layouts) {
                         emit_derived_value_copy(b, tl, type_name, dest_ptr, src_ptr);
+                    } else if elem_bytes > 16 && matches!(elem_ty, IrType::Array(..)) {
+                        // Aggregate element (e.g. character(len=N)): copy the
+                        // whole element with memcpy. A load_typed(elem_ty)+store
+                        // of a large `[i8 x N]` value puts a multi-KB aggregate
+                        // "in a register" — x86 isel has no register class for
+                        // it (panics), and arm64 would emit a single 8-byte copy
+                        // (silent truncation). memcpy is correct on both.
+                        b.call(
+                            FuncRef::External("memcpy".into()),
+                            vec![dest_ptr, src_ptr, step_bytes],
+                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                        );
                     } else {
                         let raw = b.load_typed(src_ptr, elem_ty.clone());
                         b.store(raw, dest_ptr);
