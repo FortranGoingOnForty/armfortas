@@ -1455,8 +1455,17 @@ pub(super) fn collect_char_len_star_params(
     unit: &ProgramUnit,
     out: &mut HashMap<String, Vec<bool>>,
 ) {
+    collect_char_len_star_params_in(unit, None, out);
+}
+
+fn collect_char_len_star_params_in(
+    unit: &ProgramUnit,
+    module: Option<&str>,
+    out: &mut HashMap<String, Vec<bool>>,
+) {
     use crate::ast::unit::DummyArg;
     let record = |name: &str,
+                  module: Option<&str>,
                   args: &[DummyArg],
                   decls: &[crate::ast::decl::SpannedDecl],
                   out: &mut HashMap<String, Vec<bool>>| {
@@ -1469,6 +1478,17 @@ pub(super) fn collect_char_len_star_params(
             return;
         }
         let flags = compute_char_len_star_flags(args, decls);
+        // Record the mangled key unconditionally so a call resolving to a
+        // specific module reads that module's mask instead of a same-named
+        // procedure's (see collect_descriptor_params). An all-false entry is
+        // still correct (no hidden-length args) and blocks the bare-name
+        // collision that the last-collected definition would otherwise win.
+        if let Some(module) = module {
+            out.insert(
+                module_procedure_symbol_name(module, name).to_lowercase(),
+                flags.clone(),
+            );
+        }
         if flags.iter().any(|f| *f) {
             out.insert(name.to_lowercase(), flags);
         }
@@ -1481,9 +1501,9 @@ pub(super) fn collect_char_len_star_params(
             contains,
             ..
         } => {
-            record(name, args, decls, out);
+            record(name, module, args, decls, out);
             for sub in contains {
-                collect_char_len_star_params(&sub.node, out);
+                collect_char_len_star_params_in(&sub.node, None, out);
             }
         }
         ProgramUnit::Function {
@@ -1493,22 +1513,26 @@ pub(super) fn collect_char_len_star_params(
             contains,
             ..
         } => {
-            record(name, args, decls, out);
+            record(name, module, args, decls, out);
             for sub in contains {
-                collect_char_len_star_params(&sub.node, out);
+                collect_char_len_star_params_in(&sub.node, None, out);
             }
         }
-        ProgramUnit::Program { contains, .. }
-        | ProgramUnit::Module { contains, .. }
-        | ProgramUnit::Submodule { contains, .. } => {
+        ProgramUnit::Module { name, contains, .. }
+        | ProgramUnit::Submodule { name, contains, .. } => {
             for sub in contains {
-                collect_char_len_star_params(&sub.node, out);
+                collect_char_len_star_params_in(&sub.node, Some(name), out);
+            }
+        }
+        ProgramUnit::Program { contains, .. } => {
+            for sub in contains {
+                collect_char_len_star_params_in(&sub.node, None, out);
             }
         }
         ProgramUnit::InterfaceBlock { bodies, .. } => {
             for body in bodies {
                 if let crate::ast::unit::InterfaceBody::Subprogram(sub) = body {
-                    collect_char_len_star_params(&sub.node, out);
+                    collect_char_len_star_params_in(&sub.node, None, out);
                 }
             }
         }
@@ -1537,9 +1561,18 @@ pub fn collect_char_len_star_params_for_units(
 }
 
 pub(super) fn collect_optional_params(unit: &ProgramUnit, out: &mut HashMap<String, Vec<bool>>) {
+    collect_optional_params_in(unit, None, out);
+}
+
+fn collect_optional_params_in(
+    unit: &ProgramUnit,
+    module: Option<&str>,
+    out: &mut HashMap<String, Vec<bool>>,
+) {
     use crate::ast::decl::Attribute;
     use crate::ast::unit::DummyArg;
     let record = |name: &str,
+                  module: Option<&str>,
                   args: &[DummyArg],
                   decls: &[crate::ast::decl::SpannedDecl],
                   out: &mut HashMap<String, Vec<bool>>| {
@@ -1573,6 +1606,16 @@ pub(super) fn collect_optional_params(unit: &ProgramUnit, out: &mut HashMap<Stri
                 false
             })
             .collect();
+        // Record the mangled key too so a call resolving to a specific module
+        // reads that module's optional mask, not a same-named procedure's
+        // last-collected one (see collect_descriptor_params). Getting this
+        // wrong drops the trailing optional-null and hidden-length arguments.
+        if let Some(module) = module {
+            out.insert(
+                module_procedure_symbol_name(module, name).to_lowercase(),
+                optional_flags.clone(),
+            );
+        }
         out.insert(name.to_lowercase(), optional_flags);
     };
     match unit {
@@ -1583,9 +1626,9 @@ pub(super) fn collect_optional_params(unit: &ProgramUnit, out: &mut HashMap<Stri
             contains,
             ..
         } => {
-            record(name, args, decls, out);
+            record(name, module, args, decls, out);
             for sub in contains {
-                collect_optional_params(&sub.node, out);
+                collect_optional_params_in(&sub.node, None, out);
             }
         }
         ProgramUnit::Function {
@@ -1595,16 +1638,20 @@ pub(super) fn collect_optional_params(unit: &ProgramUnit, out: &mut HashMap<Stri
             contains,
             ..
         } => {
-            record(name, args, decls, out);
+            record(name, module, args, decls, out);
             for sub in contains {
-                collect_optional_params(&sub.node, out);
+                collect_optional_params_in(&sub.node, None, out);
             }
         }
-        ProgramUnit::Program { contains, .. }
-        | ProgramUnit::Module { contains, .. }
-        | ProgramUnit::Submodule { contains, .. } => {
+        ProgramUnit::Module { name, contains, .. }
+        | ProgramUnit::Submodule { name, contains, .. } => {
             for sub in contains {
-                collect_optional_params(&sub.node, out);
+                collect_optional_params_in(&sub.node, Some(name), out);
+            }
+        }
+        ProgramUnit::Program { contains, .. } => {
+            for sub in contains {
+                collect_optional_params_in(&sub.node, None, out);
             }
         }
         _ => {}
@@ -2496,8 +2543,17 @@ pub(super) fn dummy_local_ir_type(
 /// Record which positional dummy arguments are lowered through an
 /// ArrayDescriptor rather than a raw element pointer.
 pub(super) fn collect_descriptor_params(unit: &ProgramUnit, out: &mut HashMap<String, Vec<bool>>) {
+    collect_descriptor_params_in(unit, None, out);
+}
+
+fn collect_descriptor_params_in(
+    unit: &ProgramUnit,
+    module: Option<&str>,
+    out: &mut HashMap<String, Vec<bool>>,
+) {
     use crate::ast::unit::DummyArg;
     let record = |name: &str,
+                  module: Option<&str>,
                   args: &[DummyArg],
                   decls: &[crate::ast::decl::SpannedDecl],
                   out: &mut HashMap<String, Vec<bool>>| {
@@ -2518,6 +2574,17 @@ pub(super) fn collect_descriptor_params(unit: &ProgramUnit, out: &mut HashMap<St
             .iter()
             .map(|pname| arg_uses_descriptor_from_decls(pname, decls))
             .collect();
+        // Record the mangled module-procedure name too. Keying only by the
+        // bare name lets a same-named procedure in another module (fpm has
+        // several `next` subroutines) clobber this one's descriptor mask, so
+        // a call that resolves to a specific module reads the wrong mask.
+        // The call site tries the mangled key first, so this disambiguates.
+        if let Some(module) = module {
+            out.insert(
+                module_procedure_symbol_name(module, name).to_lowercase(),
+                flags.clone(),
+            );
+        }
         out.insert(name.to_lowercase(), flags);
     };
     match unit {
@@ -2528,9 +2595,9 @@ pub(super) fn collect_descriptor_params(unit: &ProgramUnit, out: &mut HashMap<St
             contains,
             ..
         } => {
-            record(name, args, decls, out);
+            record(name, module, args, decls, out);
             for sub in contains {
-                collect_descriptor_params(&sub.node, out);
+                collect_descriptor_params_in(&sub.node, None, out);
             }
         }
         ProgramUnit::Function {
@@ -2540,22 +2607,26 @@ pub(super) fn collect_descriptor_params(unit: &ProgramUnit, out: &mut HashMap<St
             contains,
             ..
         } => {
-            record(name, args, decls, out);
+            record(name, module, args, decls, out);
             for sub in contains {
-                collect_descriptor_params(&sub.node, out);
+                collect_descriptor_params_in(&sub.node, None, out);
             }
         }
-        ProgramUnit::Program { contains, .. }
-        | ProgramUnit::Module { contains, .. }
-        | ProgramUnit::Submodule { contains, .. } => {
+        ProgramUnit::Module { name, contains, .. }
+        | ProgramUnit::Submodule { name, contains, .. } => {
             for sub in contains {
-                collect_descriptor_params(&sub.node, out);
+                collect_descriptor_params_in(&sub.node, Some(name), out);
+            }
+        }
+        ProgramUnit::Program { contains, .. } => {
+            for sub in contains {
+                collect_descriptor_params_in(&sub.node, None, out);
             }
         }
         ProgramUnit::InterfaceBlock { bodies, .. } => {
             for body in bodies {
                 if let crate::ast::unit::InterfaceBody::Subprogram(sub) = body {
-                    collect_descriptor_params(&sub.node, out);
+                    collect_descriptor_params_in(&sub.node, None, out);
                 }
             }
         }
@@ -22231,7 +22302,27 @@ pub(super) fn callee_scope_id_for_lookup(
 ) -> Option<crate::sema::symtab::ScopeId> {
     use crate::sema::symtab::{ScopeKind, SymbolKind};
 
+    // When a bare procedure name matches several definitions (e.g. fpm has
+    // ten `next` subroutines across modules), the plain name scan below
+    // returns whichever was defined last — the wrong ABI/descriptor mask
+    // for the caller's actual callee. Prefer the definition visible from
+    // the caller's own module (a module-contained sibling), which is what
+    // host/use association would resolve. Falls back to the name scan when
+    // there is no caller context or no same-module match.
+    let caller_module = current_proc_scope().and_then(|sid| {
+        let mut cur = Some(sid);
+        while let Some(id) = cur {
+            let sc = st.scope(id);
+            if let Some(m) = scope_module_name(sc) {
+                return Some(m.to_lowercase());
+            }
+            cur = sc.parent;
+        }
+        None
+    });
+
     let mut name_match = None;
+    let mut caller_module_match = None;
     for (scope_id, scope) in st.all_scopes().iter().enumerate().rev() {
         let proc_name = match &scope.kind {
             ScopeKind::Function(name) | ScopeKind::Subroutine(name) | ScopeKind::Program(name) => {
@@ -22239,8 +22330,19 @@ pub(super) fn callee_scope_id_for_lookup(
             }
             _ => continue,
         };
-        if proc_name.eq_ignore_ascii_case(callee_name) && name_match.is_none() {
-            name_match = Some(scope_id);
+        if proc_name.eq_ignore_ascii_case(callee_name) {
+            if name_match.is_none() {
+                name_match = Some(scope_id);
+            }
+            if caller_module_match.is_none() {
+                if let (Some(caller_mod), Some(parent_id)) = (caller_module.as_ref(), scope.parent) {
+                    if scope_module_name(st.scope(parent_id))
+                        .is_some_and(|m| m.eq_ignore_ascii_case(caller_mod))
+                    {
+                        caller_module_match = Some(scope_id);
+                    }
+                }
+            }
         }
         if matches!(scope.kind, ScopeKind::Program(_))
             && format!("__prog_{}", proc_name.to_lowercase()).eq_ignore_ascii_case(callee_name)
@@ -22276,7 +22378,7 @@ pub(super) fn callee_scope_id_for_lookup(
             return Some(scope_id);
         }
     }
-    name_match
+    caller_module_match.or(name_match)
 }
 
 pub(super) fn scope_module_name(scope: &crate::sema::symtab::Scope) -> Option<&str> {
@@ -27635,6 +27737,45 @@ pub(super) fn store_ac_values_at_off(
                         vec![p, src_ptr, sz],
                         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
                     );
+                } else if let IrType::Array(inner, n) = elem_ty {
+                    if matches!(inner.as_ref(), IrType::Int(IntWidth::I8)) {
+                        // Fixed-length character element (`character(len=N)`
+                        // → `[i8 x N]`). `raw` is a Ptr<i8> to the source
+                        // string; a coerce+store would drop 8 pointer bytes
+                        // into the N-byte slot (silent corruption — the
+                        // coerce stub can't type Ptr → [i8 x N] anyway).
+                        // Copy the source into the slot with blank padding,
+                        // matching character assignment and the dedicated
+                        // char-AC path (`store_char_ac_values_at_off`).
+                        let (src_ptr, src_len) = lower_string_expr_full(
+                            b,
+                            locals,
+                            e,
+                            st,
+                            type_layouts,
+                            internal_funcs,
+                            contained_host_refs,
+                            descriptor_params,
+                        );
+                        let dest_len = b.const_i64(*n as i64);
+                        b.call(
+                            FuncRef::External("afs_assign_char_fixed".into()),
+                            vec![p, dest_len, src_ptr, src_len],
+                            IrType::Void,
+                        );
+                    } else if matches!(b.func().value_type(raw), Some(IrType::Ptr(_))) {
+                        // Other aggregate element already materialized as a
+                        // pointer: memcpy the whole element rather than
+                        // storing a coerced scalar.
+                        b.call(
+                            FuncRef::External("memcpy".into()),
+                            vec![p, raw, step_bytes],
+                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                        );
+                    } else {
+                        let coerced = coerce_to_type(b, raw, elem_ty);
+                        b.store(coerced, p);
+                    }
                 } else {
                     let coerced = coerce_to_type(b, raw, elem_ty);
                     b.store(coerced, p);
