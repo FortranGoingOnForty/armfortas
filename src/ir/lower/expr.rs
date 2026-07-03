@@ -2321,7 +2321,7 @@ pub(crate) fn lower_expr_full(
                         let _ = std::io::stderr().flush();
                         std::process::exit(1);
                     }
-                    resolved_symbol_call_target(st, &key, name)
+                    resolved_symbol_call_target_caller_aware(st, b, &key, name)
                 };
                 let arg_slots = reorder_args_by_keyword_slots(
                     original_args,

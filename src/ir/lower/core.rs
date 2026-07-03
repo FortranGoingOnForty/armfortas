@@ -18462,6 +18462,25 @@ fn resolved_symbol_call_target_from_scope(
     resolved_symbol_call_target(st, key, fallback_name)
 }
 
+/// Resolve a bare call name preferring the caller's own scope over a global
+/// same-name scan. The plain `resolved_symbol_call_target` (via
+/// find_linkable_symbol_any_scope) returns the first callable in source order,
+/// which binds to a same-named procedure in an unrelated module — e.g. tomlf's
+/// `next_token` calling its sibling `match(lexer,pos,kind)` bound to
+/// fpm_versioning's earlier `match(lhs,rhs)`. Resolving through the caller's
+/// scope first respects USE/host association; the global scan remains the
+/// fallback for genuinely external names.
+pub(super) fn resolved_symbol_call_target_caller_aware(
+    st: &SymbolTable,
+    b: &FuncBuilder,
+    key: &str,
+    fallback_name: &str,
+) -> (String, String) {
+    let caller_scope_id =
+        callee_scope_id_for_lookup(st, b.func().name.as_str()).or_else(current_proc_scope);
+    resolved_symbol_call_target_from_scope(st, caller_scope_id, key, fallback_name)
+}
+
 pub(super) fn resolved_symbol_call_target_for_candidate(
     st: &SymbolTable,
     candidate: &SpecificProcCandidate,
