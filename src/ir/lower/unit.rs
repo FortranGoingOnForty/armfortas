@@ -142,6 +142,7 @@ pub(crate) fn lower_unit(
 
             {
                 let mut b = FuncBuilder::new(&mut func, ctx.layout);
+                b.set_local_modules(module.local_modules.clone());
                 let _setup_proc_scope_guard = ProcScopeGuard::enter(ctx.proc_scope_id);
                 install_common_locals(&mut b, &mut ctx.locals, decls, ctx.st);
                 install_equivalence_locals(
@@ -480,6 +481,7 @@ pub(crate) fn lower_unit(
 
             {
                 let mut b = FuncBuilder::new(&mut func, ctx.layout);
+                b.set_local_modules(module.local_modules.clone());
                 let _setup_proc_scope_guard = ProcScopeGuard::enter(ctx.proc_scope_id);
 
                 // Set up hidden-length locals for assumed-len char dummies.
@@ -1012,6 +1014,7 @@ pub(crate) fn lower_unit(
 
             {
                 let mut b = FuncBuilder::new(&mut func, ctx.layout);
+                b.set_local_modules(module.local_modules.clone());
                 let _setup_proc_scope_guard = ProcScopeGuard::enter(ctx.proc_scope_id);
 
                 let mut hidden_len_addrs: HashMap<String, ValueId> = HashMap::new();

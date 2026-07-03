@@ -25,7 +25,12 @@ impl std::fmt::Display for VerifyError {
 pub fn verify_module(module: &Module) -> Vec<VerifyError> {
     let mut errors = Vec::new();
     for func in &module.functions {
-        errors.extend(verify_function(func));
+        // Prefix each finding with the enclosing function so a failure
+        // in a large amalgamated build points at the offending routine.
+        for mut e in verify_function(func) {
+            e.msg = format!("in '{}': {}", func.name, e.msg);
+            errors.push(e);
+        }
     }
     errors
 }

@@ -131,6 +131,16 @@ fn vreg_capacity(f: &X86Function) -> usize {
     max_idx
 }
 
+/// Bytes the backward-dataflow live sets will allocate for `f`: two
+/// bitsets (`live_in` + `live_out`) per block, each `num_vregs` bits.
+/// Used by the codegen driver to reject a pathologically large function
+/// with a clear error instead of letting the `O(blocks × vregs)`
+/// allocation OOM-kill the process.
+pub fn liveness_footprint_bytes(f: &X86Function) -> u64 {
+    let words = (vreg_capacity(f) as u64).div_ceil(64);
+    2 * f.blocks.len() as u64 * words * 8
+}
+
 /// Compute live intervals for all vregs in an x86 machine function.
 pub fn compute_liveness(f: &X86Function) -> LivenessResult {
     let num_vregs = vreg_capacity(f);

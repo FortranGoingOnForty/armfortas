@@ -464,6 +464,15 @@ pub struct Module {
     /// holding `&Module` read sizes from here instead of growing a
     /// parameter on every helper.
     pub layout: crate::target::TargetLayout,
+    /// Lowercase names of the modules defined in this compilation unit.
+    /// A function may CALL a derived type's out-of-line memory helper
+    /// (emitted once per local-module type) instead of inlining the
+    /// recursive dealloc/copy walk whenever the type's owner module is in
+    /// this set — even across modules. Without this, a routine that
+    /// assembles derived types owned by dozens of modules (fpm's
+    /// build_model) inlines every walk and explodes to 140k+ blocks.
+    /// Handed to each function's `FuncBuilder` as a cheap `Rc` clone.
+    pub local_modules: std::rc::Rc<std::collections::HashSet<String>>,
 }
 
 /// An external function declaration.
@@ -482,6 +491,7 @@ impl Module {
             struct_defs: Vec::new(),
             extern_funcs: Vec::new(),
             layout,
+            local_modules: std::rc::Rc::new(std::collections::HashSet::new()),
         }
     }
 

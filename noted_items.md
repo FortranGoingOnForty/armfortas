@@ -481,3 +481,25 @@ Found during l04 (2026-06-12):
   `x%n` at -O2. Likely default-init of a derived local elided or the
   intent(inout) copy losing the initializer at O2 on arm64. Owner:
   arm64 opt / default-init.
+
+- **fpm coerce_to_type Ptr(i8)→Array(i8,4096) silent miscompile (x12,
+  2026-07-02)**: with the fpm stage0 bringup fixes landed (PR #85), the
+  full 53k-line `fpm-0.13.0.F90` now compiles → links → runs (17MB x86_64
+  ELF, `armfortas fpm-0.13.0.F90 -o fpm_bin`), but `fpm_bin --version` /
+  `--help` print NOTHING. Cause: during lowering of
+  `fpm_command_line::get_command_line_settings`, `coerce_to_type`
+  (src/ir/lower/helpers.rs:220, the `_ =>` fallback) hits
+  `Ptr(Int(I8)) → Array(Int(I8), 4096)`, eprintln's, and returns `val`
+  UNCHANGED — a ptr where a 4096-byte char-array aggregate is expected
+  (the classic "silently wrong is worse than a panic" stub). The buffer
+  is `character(len=4096) :: cmdarg` (fpm line 17329); the coercion is on
+  a `char(4096) = <allocatable char>`-style path (`cmdarg =
+  get_subcommand()` at 17374, get_subcommand returns
+  `character(len=:),allocatable`). NOT reproduced by the obvious minimal
+  cases (buf=greet(), buf=trim(a), call fill(buf) all work) — needs a
+  closer M_CLI2-shaped reduction. Do NOT "fix" by loading the whole
+  Array(i8,4096) — x86 isel has no register class for it (see bug-14);
+  fix at the producer/consumer so the pointer is used directly, or make
+  the fallback error loudly and handle Ptr→Array(char) as a memcpy into
+  the buffer slot. This is the next fpm edge. Owner: char aggregate ABI /
+  ir/lower helpers.

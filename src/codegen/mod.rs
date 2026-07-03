@@ -57,6 +57,27 @@ pub fn emit_module(
                     x86::peephole::run_peephole(f);
                 }
                 x86::twoaddr::convert_to_two_address(f);
+                // Safety guard: a lowering size explosion (e.g. a routine
+                // that inlines derived-type cleanup for dozens of types)
+                // can produce a function whose dense liveness bitsets are
+                // tens of GB — enough to OOM-kill the host. Reject it with
+                // a clear error instead. 2 GiB is far above any sane
+                // function; tripping this means the IR ballooned upstream.
+                const LIVENESS_FOOTPRINT_CAP: u64 = 2 * 1024 * 1024 * 1024;
+                let footprint = x86::liveness::liveness_footprint_bytes(f);
+                if footprint > LIVENESS_FOOTPRINT_CAP {
+                    return Err(format!(
+                        "codegen: function '{}' is too large to register-allocate \
+                         ({} basic blocks, {} instructions → {} MB of liveness \
+                         bitsets, over the {} MB cap). This indicates an IR size \
+                         explosion in lowering, not a normal program.",
+                        f.name,
+                        f.blocks.len(),
+                        f.blocks.iter().map(|b| b.insts.len()).sum::<usize>(),
+                        footprint / (1024 * 1024),
+                        LIVENESS_FOOTPRINT_CAP / (1024 * 1024),
+                    ));
+                }
                 let force_naive = std::env::var_os("ARMFORTAS_USE_NAIVE_REGALLOC").is_some();
                 let use_linear = x86_use_linear_scan(opts.opt_level, force_naive);
                 if use_linear {

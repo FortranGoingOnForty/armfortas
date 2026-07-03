@@ -54,6 +54,9 @@ pub fn lower_file(
     layout: crate::target::TargetLayout,
 ) -> (Module, HashMap<(String, String), ModuleGlobalInfo>) {
     let mut module = Module::new("main".into(), layout);
+    // Modules defined in this unit — lets any function CALL a local-module
+    // type's out-of-line memory helpers instead of inlining the walk.
+    module.local_modules = Rc::new(collect_local_owner_modules(units));
     let mut globals: HashMap<(String, String), ModuleGlobalInfo> = external_globals;
     let ambiguous_use_warnings: AmbiguousUseWarnings = Rc::new(RefCell::new(HashSet::new()));
 
@@ -512,6 +515,13 @@ fn derived_memory_helper_symbol(
     )
 }
 
+/// Strict gate: a type's per-type memory helper is callable only from a
+/// module procedure of the type's own owner module (or from the helper
+/// family itself). This is the conservative rule used by derived-type
+/// *initialization*: routing local-type init through the out-of-line
+/// helper from an arbitrary caller exposes a latent -O2 miscompile
+/// (mvbits_component_class_i64), so init stays inline outside the owner
+/// module.
 fn derived_memory_helper_available_from_current_func(
     b: &FuncBuilder,
     layout: &crate::sema::type_layout::TypeLayout,
@@ -524,6 +534,26 @@ fn derived_memory_helper_available_from_current_func(
     func.starts_with(&format!("afs_modproc_{}_", owner))
         || func.contains(&format!("_afs_modproc_{}_", owner))
         || func.starts_with(&format!("afs_derived_{}_", owner))
+}
+
+/// Extended gate for dealloc/copy walks: also callable from ANY function
+/// in this unit when the type's owner module is compiled locally, because
+/// `emit_derived_memory_helpers` emits a helper for every local-module
+/// type. This is what stops a routine that assembles derived types from
+/// many modules (fpm's `build_model`) from inlining every dealloc/copy
+/// walk and ballooning to 140k+ blocks. For separate compilation the only
+/// local module is the current one, so it collapses to the strict check.
+/// Not used for init (see the strict gate's note on the -O2 miscompile).
+fn derived_memory_helper_available_xmodule(
+    b: &FuncBuilder,
+    layout: &crate::sema::type_layout::TypeLayout,
+) -> bool {
+    if let Some(owner) = layout.owner_module.as_ref() {
+        if b.owner_module_is_local(&owner.to_lowercase()) {
+            return true;
+        }
+    }
+    derived_memory_helper_available_from_current_func(b, layout)
 }
 
 fn ptr_i8_ty() -> IrType {
@@ -13737,24 +13767,13 @@ fn function_scope_result_type_info(
     let ScopeKind::Function(function_name) = &scope.kind else {
         return None;
     };
-    let arg_set: HashSet<String> = scope
-        .arg_order
-        .iter()
-        .map(|arg| arg.to_lowercase())
-        .collect();
-    for (key, sym) in &scope.symbols {
-        if arg_set.contains(key) {
-            continue;
-        }
-        if matches!(sym.kind, SymbolKind::Variable | SymbolKind::Parameter) {
-            if let Some(ti) = sym.type_info.clone() {
-                return Some(ti);
-            }
-        }
-    }
-
     let key = function_name.to_ascii_lowercase();
-    scope
+
+    // The function symbol carries the result type sema computed; it
+    // handles `result(X)` clauses and implicit typing uniformly. Prefer
+    // it — the symbol lives in this scope (a recursion self-reference) or
+    // in the parent module.
+    if let Some(ti) = scope
         .symbols
         .get(&key)
         .and_then(function_symbol_result_type_info)
@@ -13766,6 +13785,42 @@ fn function_scope_result_type_info(
                     .and_then(function_symbol_result_type_info)
             })
         })
+    {
+        return Some(ti);
+    }
+
+    // Fallback: scan the body for the result variable. With a `result(X)`
+    // clause the result variable is named X (not the function name), and a
+    // function can have other locals/parameters too — `scope.symbols` is a
+    // HashMap, so returning the first non-argument variable picked a
+    // nondeterministic one (fpm version_t%s(): result var `string` vs
+    // locals `buffer`, `ii` — generic dispatch on the call then matched
+    // the wrong specific, or none). Pick deterministically by declaration
+    // position, which puts the header-declared result variable first.
+    let arg_set: HashSet<String> = scope
+        .arg_order
+        .iter()
+        .map(|arg| arg.to_lowercase())
+        .collect();
+    let mut candidates: Vec<_> = scope
+        .symbols
+        .iter()
+        .filter(|(k, sym)| {
+            !arg_set.contains(*k)
+                && matches!(sym.kind, SymbolKind::Variable | SymbolKind::Parameter)
+                && sym.type_info.is_some()
+        })
+        .collect();
+    candidates.sort_by(|(ak, a), (bk, b)| {
+        (a.defined_at.start.line, a.defined_at.start.col, ak.as_str()).cmp(&(
+            b.defined_at.start.line,
+            b.defined_at.start.col,
+            bk.as_str(),
+        ))
+    });
+    candidates
+        .first()
+        .and_then(|(_, sym)| sym.type_info.clone())
 }
 
 fn bound_proc_result_type_info(
@@ -27515,6 +27570,18 @@ pub(super) fn store_ac_values_at_off(
 
                     if let (Some(type_name), Some(tl)) = (derived_type, type_layouts) {
                         emit_derived_value_copy(b, tl, type_name, dest_ptr, src_ptr);
+                    } else if elem_bytes > 16 && matches!(elem_ty, IrType::Array(..)) {
+                        // Aggregate element (e.g. character(len=N)): copy the
+                        // whole element with memcpy. A load_typed(elem_ty)+store
+                        // of a large `[i8 x N]` value puts a multi-KB aggregate
+                        // "in a register" — x86 isel has no register class for
+                        // it (panics), and arm64 would emit a single 8-byte copy
+                        // (silent truncation). memcpy is correct on both.
+                        b.call(
+                            FuncRef::External("memcpy".into()),
+                            vec![dest_ptr, src_ptr, step_bytes],
+                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                        );
                     } else {
                         let raw = b.load_typed(src_ptr, elem_ty.clone());
                         b.store(raw, dest_ptr);
@@ -46444,7 +46511,7 @@ pub(super) fn deallocate_derived_descriptor_components(
     if !derived_layout_needs_component_deallocation(layout, registry) {
         return;
     }
-    if !derived_memory_helper_available_from_current_func(b, layout) {
+    if !derived_memory_helper_available_xmodule(b, layout) {
         emit_deallocate_derived_descriptor_components_inline(b, desc, layout, registry, stat_addr);
         return;
     }
@@ -46516,7 +46583,7 @@ pub(super) fn deallocate_derived_storage_components(
     if !derived_layout_needs_component_deallocation(layout, registry) {
         return;
     }
-    if !derived_memory_helper_available_from_current_func(b, layout) {
+    if !derived_memory_helper_available_xmodule(b, layout) {
         emit_deallocate_derived_storage_components_inline(
             b, base_addr, layout, registry, stat_addr,
         );
@@ -47465,8 +47532,21 @@ pub(super) fn expr_is_character_expr(
                     || descriptor_backed_runtime_char_array(info)
                     || local_fixed_char_allocatable_scalar_len(info).is_some();
             }
-            st.find_symbol_any_scope(&key)
-                .and_then(|sym| sym.type_info.as_ref())
+            // Scope-correct lookup: a bare name is a character entity
+            // *here* only if it is visible in this procedure's scope
+            // (local, USE, or host). A scope-blind scan would pick up an
+            // unrelated procedure's local `parameter :: int` and then
+            // misclassify the intrinsic `int(x)` as a character substring
+            // — that is what broke fpm's m_cli2::a2i (`valu = int(valu8)`
+            // lowered to substring math on a leaked constant). Fall back
+            // to the blind scan only when the procedure scope is unknown.
+            let sym = match callee_scope_id_for_lookup(st, b.func().name.as_str())
+                .or_else(current_proc_scope)
+            {
+                Some(scope_id) => st.lookup_in(scope_id, &key),
+                None => st.find_symbol_any_scope(&key),
+            };
+            sym.and_then(|sym| sym.type_info.as_ref())
                 .is_some_and(|ty| matches!(ty, crate::sema::symtab::TypeInfo::Character { .. }))
         }
         Expr::ComponentAccess { .. } => type_layouts
@@ -47777,7 +47857,7 @@ pub(super) fn emit_derived_value_copy(
         emit_memcpy_bytes(b, dest_ptr, src_ptr, layout.size as i64);
         return;
     }
-    if !derived_memory_helper_available_from_current_func(b, layout) {
+    if !derived_memory_helper_available_xmodule(b, layout) {
         emit_derived_value_copy_inline(b, type_layouts, layout, dest_ptr, src_ptr);
         return;
     }
@@ -48988,7 +49068,7 @@ pub(super) fn emit_derived_array_desc_copy(
     if derived_layout_needs_deep_copy(layout, type_layouts)
         || derived_layout_needs_runtime_initialization(layout, type_layouts)
     {
-        if !derived_memory_helper_available_from_current_func(b, layout) {
+        if !derived_memory_helper_available_xmodule(b, layout) {
             emit_derived_array_desc_copy_inline(b, type_layouts, layout, dest_desc, source_desc);
             return;
         }
