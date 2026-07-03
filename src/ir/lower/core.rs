@@ -1455,8 +1455,17 @@ pub(super) fn collect_char_len_star_params(
     unit: &ProgramUnit,
     out: &mut HashMap<String, Vec<bool>>,
 ) {
+    collect_char_len_star_params_in(unit, None, out);
+}
+
+fn collect_char_len_star_params_in(
+    unit: &ProgramUnit,
+    module: Option<&str>,
+    out: &mut HashMap<String, Vec<bool>>,
+) {
     use crate::ast::unit::DummyArg;
     let record = |name: &str,
+                  module: Option<&str>,
                   args: &[DummyArg],
                   decls: &[crate::ast::decl::SpannedDecl],
                   out: &mut HashMap<String, Vec<bool>>| {
@@ -1469,6 +1478,17 @@ pub(super) fn collect_char_len_star_params(
             return;
         }
         let flags = compute_char_len_star_flags(args, decls);
+        // Record the mangled key unconditionally so a call resolving to a
+        // specific module reads that module's mask instead of a same-named
+        // procedure's (see collect_descriptor_params). An all-false entry is
+        // still correct (no hidden-length args) and blocks the bare-name
+        // collision that the last-collected definition would otherwise win.
+        if let Some(module) = module {
+            out.insert(
+                module_procedure_symbol_name(module, name).to_lowercase(),
+                flags.clone(),
+            );
+        }
         if flags.iter().any(|f| *f) {
             out.insert(name.to_lowercase(), flags);
         }
@@ -1481,9 +1501,9 @@ pub(super) fn collect_char_len_star_params(
             contains,
             ..
         } => {
-            record(name, args, decls, out);
+            record(name, module, args, decls, out);
             for sub in contains {
-                collect_char_len_star_params(&sub.node, out);
+                collect_char_len_star_params_in(&sub.node, None, out);
             }
         }
         ProgramUnit::Function {
@@ -1493,22 +1513,26 @@ pub(super) fn collect_char_len_star_params(
             contains,
             ..
         } => {
-            record(name, args, decls, out);
+            record(name, module, args, decls, out);
             for sub in contains {
-                collect_char_len_star_params(&sub.node, out);
+                collect_char_len_star_params_in(&sub.node, None, out);
             }
         }
-        ProgramUnit::Program { contains, .. }
-        | ProgramUnit::Module { contains, .. }
-        | ProgramUnit::Submodule { contains, .. } => {
+        ProgramUnit::Module { name, contains, .. }
+        | ProgramUnit::Submodule { name, contains, .. } => {
             for sub in contains {
-                collect_char_len_star_params(&sub.node, out);
+                collect_char_len_star_params_in(&sub.node, Some(name), out);
+            }
+        }
+        ProgramUnit::Program { contains, .. } => {
+            for sub in contains {
+                collect_char_len_star_params_in(&sub.node, None, out);
             }
         }
         ProgramUnit::InterfaceBlock { bodies, .. } => {
             for body in bodies {
                 if let crate::ast::unit::InterfaceBody::Subprogram(sub) = body {
-                    collect_char_len_star_params(&sub.node, out);
+                    collect_char_len_star_params_in(&sub.node, None, out);
                 }
             }
         }
@@ -1537,9 +1561,18 @@ pub fn collect_char_len_star_params_for_units(
 }
 
 pub(super) fn collect_optional_params(unit: &ProgramUnit, out: &mut HashMap<String, Vec<bool>>) {
+    collect_optional_params_in(unit, None, out);
+}
+
+fn collect_optional_params_in(
+    unit: &ProgramUnit,
+    module: Option<&str>,
+    out: &mut HashMap<String, Vec<bool>>,
+) {
     use crate::ast::decl::Attribute;
     use crate::ast::unit::DummyArg;
     let record = |name: &str,
+                  module: Option<&str>,
                   args: &[DummyArg],
                   decls: &[crate::ast::decl::SpannedDecl],
                   out: &mut HashMap<String, Vec<bool>>| {
@@ -1573,6 +1606,16 @@ pub(super) fn collect_optional_params(unit: &ProgramUnit, out: &mut HashMap<Stri
                 false
             })
             .collect();
+        // Record the mangled key too so a call resolving to a specific module
+        // reads that module's optional mask, not a same-named procedure's
+        // last-collected one (see collect_descriptor_params). Getting this
+        // wrong drops the trailing optional-null and hidden-length arguments.
+        if let Some(module) = module {
+            out.insert(
+                module_procedure_symbol_name(module, name).to_lowercase(),
+                optional_flags.clone(),
+            );
+        }
         out.insert(name.to_lowercase(), optional_flags);
     };
     match unit {
@@ -1583,9 +1626,9 @@ pub(super) fn collect_optional_params(unit: &ProgramUnit, out: &mut HashMap<Stri
             contains,
             ..
         } => {
-            record(name, args, decls, out);
+            record(name, module, args, decls, out);
             for sub in contains {
-                collect_optional_params(&sub.node, out);
+                collect_optional_params_in(&sub.node, None, out);
             }
         }
         ProgramUnit::Function {
@@ -1595,16 +1638,20 @@ pub(super) fn collect_optional_params(unit: &ProgramUnit, out: &mut HashMap<Stri
             contains,
             ..
         } => {
-            record(name, args, decls, out);
+            record(name, module, args, decls, out);
             for sub in contains {
-                collect_optional_params(&sub.node, out);
+                collect_optional_params_in(&sub.node, None, out);
             }
         }
-        ProgramUnit::Program { contains, .. }
-        | ProgramUnit::Module { contains, .. }
-        | ProgramUnit::Submodule { contains, .. } => {
+        ProgramUnit::Module { name, contains, .. }
+        | ProgramUnit::Submodule { name, contains, .. } => {
             for sub in contains {
-                collect_optional_params(&sub.node, out);
+                collect_optional_params_in(&sub.node, Some(name), out);
+            }
+        }
+        ProgramUnit::Program { contains, .. } => {
+            for sub in contains {
+                collect_optional_params_in(&sub.node, None, out);
             }
         }
         _ => {}
