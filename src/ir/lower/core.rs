@@ -22231,7 +22231,27 @@ pub(super) fn callee_scope_id_for_lookup(
 ) -> Option<crate::sema::symtab::ScopeId> {
     use crate::sema::symtab::{ScopeKind, SymbolKind};
 
+    // When a bare procedure name matches several definitions (e.g. fpm has
+    // ten `next` subroutines across modules), the plain name scan below
+    // returns whichever was defined last — the wrong ABI/descriptor mask
+    // for the caller's actual callee. Prefer the definition visible from
+    // the caller's own module (a module-contained sibling), which is what
+    // host/use association would resolve. Falls back to the name scan when
+    // there is no caller context or no same-module match.
+    let caller_module = current_proc_scope().and_then(|sid| {
+        let mut cur = Some(sid);
+        while let Some(id) = cur {
+            let sc = st.scope(id);
+            if let Some(m) = scope_module_name(sc) {
+                return Some(m.to_lowercase());
+            }
+            cur = sc.parent;
+        }
+        None
+    });
+
     let mut name_match = None;
+    let mut caller_module_match = None;
     for (scope_id, scope) in st.all_scopes().iter().enumerate().rev() {
         let proc_name = match &scope.kind {
             ScopeKind::Function(name) | ScopeKind::Subroutine(name) | ScopeKind::Program(name) => {
@@ -22239,8 +22259,19 @@ pub(super) fn callee_scope_id_for_lookup(
             }
             _ => continue,
         };
-        if proc_name.eq_ignore_ascii_case(callee_name) && name_match.is_none() {
-            name_match = Some(scope_id);
+        if proc_name.eq_ignore_ascii_case(callee_name) {
+            if name_match.is_none() {
+                name_match = Some(scope_id);
+            }
+            if caller_module_match.is_none() {
+                if let (Some(caller_mod), Some(parent_id)) = (caller_module.as_ref(), scope.parent) {
+                    if scope_module_name(st.scope(parent_id))
+                        .is_some_and(|m| m.eq_ignore_ascii_case(caller_mod))
+                    {
+                        caller_module_match = Some(scope_id);
+                    }
+                }
+            }
         }
         if matches!(scope.kind, ScopeKind::Program(_))
             && format!("__prog_{}", proc_name.to_lowercase()).eq_ignore_ascii_case(callee_name)
@@ -22276,7 +22307,7 @@ pub(super) fn callee_scope_id_for_lookup(
             return Some(scope_id);
         }
     }
-    name_match
+    caller_module_match.or(name_match)
 }
 
 pub(super) fn scope_module_name(scope: &crate::sema::symtab::Scope) -> Option<&str> {
