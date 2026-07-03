@@ -17929,7 +17929,27 @@ pub(super) fn resolve_subroutine_call_name(
     // USE/host association.
     let caller_scope_id =
         callee_scope_id_for_lookup(st, b.func().name.as_str()).or_else(current_proc_scope);
-    if internal_funcs.is_some_and(|funcs| funcs.contains_key(key)) {
+    // The internal-subprogram map is UNIT-WIDE: it holds every internal
+    // subprogram name in the file, keyed by bare name. `contains_key` alone
+    // therefore fires for a call whose name happens to match an internal sub of
+    // some UNRELATED procedure — e.g. tomlf's `context%push_back` calls the
+    // generic `resize` (imported from tomlf_de_token), but `resize` is also an
+    // internal subprogram of the parser's `parse_table_header`, so the branch
+    // hijacked the generic and global-scanned to the wrong (toml_key) resize.
+    // Only treat the call as an internal-sub call when the caller's OWN scope
+    // resolves the name to a host-associated concrete procedure (not a
+    // use-associated generic or import).
+    let caller_sees_internal = internal_funcs.is_some_and(|funcs| funcs.contains_key(key))
+        && caller_scope_id
+            .and_then(|sid| st.lookup_in(sid, key).map(|sym| (sid, sym)))
+            .is_some_and(|(sid, sym)| {
+                matches!(
+                    sym.kind,
+                    crate::sema::symtab::SymbolKind::Subroutine
+                        | crate::sema::symtab::SymbolKind::Function
+                ) && scope_is_host_associated_or_self(st, sid, sym.scope)
+            });
+    if caller_sees_internal {
         return resolved_symbol_call_target_from_scope(st, caller_scope_id, key, orig_name);
     }
     if let Some(scope_id) = caller_scope_id {
