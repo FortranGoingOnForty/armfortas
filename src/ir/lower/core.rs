@@ -19365,7 +19365,22 @@ pub(super) fn emit_dynamic_bound_proc_lookup_dispatch(
     ));
     let abi_seed_refs: Vec<&str> = abi_seed_keys.iter().map(String::as_str).collect();
     let abi_lookup_keys = procedure_abi_lookup_keys(st, &abi_seed_refs);
-    let hidden_abi = first_procedure_lookup(&abi_lookup_keys, |k| callee_hidden_result_abi(st, k));
+    // A hidden result argument only exists for FUNCTION calls. A subroutine
+    // CALL statement dispatches here with explicit_ret_ty == Void; there is no
+    // result, so never synthesize a hidden-result descriptor. The bare-name
+    // ABI fallthrough below is otherwise ambiguous: fpm defines both a `get`
+    // TBP subroutine and an M_CLI2 `function get()` returning an allocatable
+    // string, so it grafted the string's 32-byte hidden-result descriptor onto
+    // the subroutine dispatch, shifting every argument by one and crashing the
+    // manifest writer. Deferred bindings (target_name is an abstract-interface
+    // placeholder with no scope) make the callee-scope check unreliable, so key
+    // off the call context instead.
+    let is_subroutine_call = matches!(explicit_ret_ty, Some(IrType::Void));
+    let hidden_abi = if is_subroutine_call {
+        None
+    } else {
+        first_procedure_lookup(&abi_lookup_keys, |k| callee_hidden_result_abi(st, k))
+    };
     let hidden_result = hidden_abi.and_then(|abi| {
         let bytes =
             hidden_result_temp_bytes_for_callee(st, Some(type_layouts), &abi_lookup_keys, abi)?;
