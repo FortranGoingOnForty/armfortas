@@ -2496,8 +2496,17 @@ pub(super) fn dummy_local_ir_type(
 /// Record which positional dummy arguments are lowered through an
 /// ArrayDescriptor rather than a raw element pointer.
 pub(super) fn collect_descriptor_params(unit: &ProgramUnit, out: &mut HashMap<String, Vec<bool>>) {
+    collect_descriptor_params_in(unit, None, out);
+}
+
+fn collect_descriptor_params_in(
+    unit: &ProgramUnit,
+    module: Option<&str>,
+    out: &mut HashMap<String, Vec<bool>>,
+) {
     use crate::ast::unit::DummyArg;
     let record = |name: &str,
+                  module: Option<&str>,
                   args: &[DummyArg],
                   decls: &[crate::ast::decl::SpannedDecl],
                   out: &mut HashMap<String, Vec<bool>>| {
@@ -2518,6 +2527,17 @@ pub(super) fn collect_descriptor_params(unit: &ProgramUnit, out: &mut HashMap<St
             .iter()
             .map(|pname| arg_uses_descriptor_from_decls(pname, decls))
             .collect();
+        // Record the mangled module-procedure name too. Keying only by the
+        // bare name lets a same-named procedure in another module (fpm has
+        // several `next` subroutines) clobber this one's descriptor mask, so
+        // a call that resolves to a specific module reads the wrong mask.
+        // The call site tries the mangled key first, so this disambiguates.
+        if let Some(module) = module {
+            out.insert(
+                module_procedure_symbol_name(module, name).to_lowercase(),
+                flags.clone(),
+            );
+        }
         out.insert(name.to_lowercase(), flags);
     };
     match unit {
@@ -2528,9 +2548,9 @@ pub(super) fn collect_descriptor_params(unit: &ProgramUnit, out: &mut HashMap<St
             contains,
             ..
         } => {
-            record(name, args, decls, out);
+            record(name, module, args, decls, out);
             for sub in contains {
-                collect_descriptor_params(&sub.node, out);
+                collect_descriptor_params_in(&sub.node, None, out);
             }
         }
         ProgramUnit::Function {
@@ -2540,22 +2560,26 @@ pub(super) fn collect_descriptor_params(unit: &ProgramUnit, out: &mut HashMap<St
             contains,
             ..
         } => {
-            record(name, args, decls, out);
+            record(name, module, args, decls, out);
             for sub in contains {
-                collect_descriptor_params(&sub.node, out);
+                collect_descriptor_params_in(&sub.node, None, out);
             }
         }
-        ProgramUnit::Program { contains, .. }
-        | ProgramUnit::Module { contains, .. }
-        | ProgramUnit::Submodule { contains, .. } => {
+        ProgramUnit::Module { name, contains, .. }
+        | ProgramUnit::Submodule { name, contains, .. } => {
             for sub in contains {
-                collect_descriptor_params(&sub.node, out);
+                collect_descriptor_params_in(&sub.node, Some(name), out);
+            }
+        }
+        ProgramUnit::Program { contains, .. } => {
+            for sub in contains {
+                collect_descriptor_params_in(&sub.node, None, out);
             }
         }
         ProgramUnit::InterfaceBlock { bodies, .. } => {
             for body in bodies {
                 if let crate::ast::unit::InterfaceBody::Subprogram(sub) = body {
-                    collect_descriptor_params(&sub.node, out);
+                    collect_descriptor_params_in(&sub.node, None, out);
                 }
             }
         }
