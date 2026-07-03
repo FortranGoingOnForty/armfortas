@@ -17916,7 +17916,19 @@ pub(super) fn resolve_subroutine_call_name(
     actual_vals: &[ValueId],
     span: crate::lexer::Span,
 ) -> (String, String) {
-    let caller_scope_id = callee_scope_id_for_lookup(st, b.func().name.as_str());
+    // Prefer the reverse map from the caller's link name, but fall back to the
+    // scope actually being lowered. An internal subprogram's link name (e.g.
+    // `afs_internal_afs_modproc_m_c_make_file_0`) has no matching scope name, so
+    // callee_scope_id_for_lookup returns None; without the fallback, resolution
+    // drops to find_linkable_symbol_any_scope, which picks the first same-named
+    // callable in source order regardless of what the caller actually imported.
+    // fpm's create_verified_basic_manifest (internal to cmd_new) `use`s only
+    // fpm_filesystem's fileopen, but M_CLI2 also exports a `fileopen` defined
+    // earlier, so the global scan bound the call to the wrong module's fileopen.
+    // current_proc_scope() is the real scope and resolves through the caller's
+    // USE/host association.
+    let caller_scope_id =
+        callee_scope_id_for_lookup(st, b.func().name.as_str()).or_else(current_proc_scope);
     if internal_funcs.is_some_and(|funcs| funcs.contains_key(key)) {
         return resolved_symbol_call_target_from_scope(st, caller_scope_id, key, orig_name);
     }
@@ -18448,6 +18460,25 @@ fn resolved_symbol_call_target_from_scope(
         }
     }
     resolved_symbol_call_target(st, key, fallback_name)
+}
+
+/// Resolve a bare call name preferring the caller's own scope over a global
+/// same-name scan. The plain `resolved_symbol_call_target` (via
+/// find_linkable_symbol_any_scope) returns the first callable in source order,
+/// which binds to a same-named procedure in an unrelated module — e.g. tomlf's
+/// `next_token` calling its sibling `match(lexer,pos,kind)` bound to
+/// fpm_versioning's earlier `match(lhs,rhs)`. Resolving through the caller's
+/// scope first respects USE/host association; the global scan remains the
+/// fallback for genuinely external names.
+pub(super) fn resolved_symbol_call_target_caller_aware(
+    st: &SymbolTable,
+    b: &FuncBuilder,
+    key: &str,
+    fallback_name: &str,
+) -> (String, String) {
+    let caller_scope_id =
+        callee_scope_id_for_lookup(st, b.func().name.as_str()).or_else(current_proc_scope);
+    resolved_symbol_call_target_from_scope(st, caller_scope_id, key, fallback_name)
 }
 
 pub(super) fn resolved_symbol_call_target_for_candidate(
