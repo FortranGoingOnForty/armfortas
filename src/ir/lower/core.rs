@@ -17916,7 +17916,19 @@ pub(super) fn resolve_subroutine_call_name(
     actual_vals: &[ValueId],
     span: crate::lexer::Span,
 ) -> (String, String) {
-    let caller_scope_id = callee_scope_id_for_lookup(st, b.func().name.as_str());
+    // Prefer the reverse map from the caller's link name, but fall back to the
+    // scope actually being lowered. An internal subprogram's link name (e.g.
+    // `afs_internal_afs_modproc_m_c_make_file_0`) has no matching scope name, so
+    // callee_scope_id_for_lookup returns None; without the fallback, resolution
+    // drops to find_linkable_symbol_any_scope, which picks the first same-named
+    // callable in source order regardless of what the caller actually imported.
+    // fpm's create_verified_basic_manifest (internal to cmd_new) `use`s only
+    // fpm_filesystem's fileopen, but M_CLI2 also exports a `fileopen` defined
+    // earlier, so the global scan bound the call to the wrong module's fileopen.
+    // current_proc_scope() is the real scope and resolves through the caller's
+    // USE/host association.
+    let caller_scope_id =
+        callee_scope_id_for_lookup(st, b.func().name.as_str()).or_else(current_proc_scope);
     if internal_funcs.is_some_and(|funcs| funcs.contains_key(key)) {
         return resolved_symbol_call_target_from_scope(st, caller_scope_id, key, orig_name);
     }
