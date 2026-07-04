@@ -354,13 +354,12 @@ Found during l04 (2026-06-12):
   Most fixtures dodge it via the harness's CHECK whitespace
   normalization; bracketed-token output exposes it. Owner: l05 (I/O).
 
-- **No subroutine-as-function diagnostic** (found l04, 2026-06-12):
-  `r = system_clock()` and `r = split(s, set, p)` (intrinsic
-  subroutines used in function position) both compile silently. The
-  l04 doc assumed an existing "not a function" diagnostic to reuse,
-  but armfortas has none for any intrinsic subroutine. Adding one only
-  for SPLIT/TOKENIZE would be inconsistent. Owner: a dedicated
-  intrinsic-signature-checking pass (same owner as the arity gap).
+- **RESOLVED (2026-07-04, L-tail)** ~~No subroutine-as-function
+  diagnostic~~: the arity gate grew form checking — intrinsic
+  subroutines in function position and CALLs of function intrinsics
+  are both compile errors (intrinsic_is_subroutine + is_call flag in
+  check_intrinsic_call_arity). Shadowing exemption unchanged; no
+  false rejects on corpus or fpm.
 
 - **TOKENIZE implemented in l04a** (2026-06-13): both forms shipped.
   The Form 1 worry in the original deferral (per-element string

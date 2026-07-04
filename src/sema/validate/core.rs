@@ -1419,7 +1419,7 @@ fn validate_const_int_expr_tree(ctx: &mut Ctx<'_>, expr: &crate::ast::expr::Span
                     .iter()
                     .all(|a| matches!(a.value, crate::ast::expr::SectionSubscript::Element(_)))
                 {
-                    check_intrinsic_call_arity(ctx, expr.span, name, args.len());
+                    check_intrinsic_call_arity(ctx, expr.span, name, args.len(), false);
                 }
             }
             // F2023 conditional arguments in FUNCTION references select the
@@ -1868,7 +1868,7 @@ fn validate_stmt_const_int_exprs(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
         Stmt::Call { callee, args } => {
             validate_const_int_expr_tree(ctx, callee);
             if let Expr::Name { name } = &callee.node {
-                check_intrinsic_call_arity(ctx, stmt.span, name, args.len());
+                check_intrinsic_call_arity(ctx, stmt.span, name, args.len(), true);
             }
             let saved = ctx.in_call_arg;
             ctx.in_call_arg = true;
@@ -3934,7 +3934,31 @@ fn intrinsic_arity(name: &str) -> Option<(usize, Option<usize>)> {
     })
 }
 
-/// Reject a reference to an intrinsic with an argument count outside
+/// Intrinsics that are SUBROUTINES (16.9): referencing one in an
+/// expression used to compile and die at link ("undefined symbol:
+/// system_clock"); CALLing a function intrinsic was equally silent.
+fn intrinsic_is_subroutine(name: &str) -> bool {
+    matches!(
+        name,
+        "system_clock"
+            | "date_and_time"
+            | "cpu_time"
+            | "random_number"
+            | "random_seed"
+            | "move_alloc"
+            | "mvbits"
+            | "execute_command_line"
+            | "get_command_argument"
+            | "get_environment_variable"
+            | "split"
+            | "tokenize"
+            | "c_f_pointer"
+            | "c_f_strpointer"
+    )
+}
+
+/// Reject a reference to an intrinsic with the wrong form (subroutine
+/// in function position or vice versa) or an argument count outside
 /// the standard's bounds (`atan2(1.0)` used to compile silently and
 /// produce garbage). Fires only when the name actually resolves to
 /// the intrinsic — any visible user symbol (procedure, array, dummy)
@@ -3944,9 +3968,28 @@ pub(super) fn check_intrinsic_call_arity(
     span: Span,
     name: &str,
     nargs: usize,
+    is_call: bool,
 ) {
     let key = name.to_lowercase();
     if ctx.lookup(&key).is_some() || !is_intrinsic_name(&key) {
+        return;
+    }
+    let is_sub = intrinsic_is_subroutine(&key);
+    if !is_call && is_sub {
+        ctx.error(
+            span,
+            format!("intrinsic '{}' is a subroutine, not a function", key),
+        );
+        return;
+    }
+    if is_call && !is_sub {
+        ctx.error(
+            span,
+            format!(
+                "intrinsic '{}' is a function; reference it in an expression, not a CALL",
+                key
+            ),
+        );
         return;
     }
     let Some((min, max)) = intrinsic_arity(&key) else {
