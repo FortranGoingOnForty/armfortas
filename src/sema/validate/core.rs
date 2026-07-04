@@ -3930,6 +3930,7 @@ fn intrinsic_arity(name: &str) -> Option<(usize, Option<usize>)> {
         "split" => (3, Some(4)),
         "c_f_pointer" => (2, Some(4)),
         "c_associated" => (1, Some(2)),
+        "next" | "previous" => (1, Some(2)),
         _ => return None,
     })
 }
@@ -4008,7 +4009,7 @@ pub fn is_intrinsic_name(name: &str) -> bool {
         "popcnt" | "poppar" | "leadz" | "trailz" |
         "mvbits" | "transfer" | "bge" | "bgt" | "ble" | "blt" |
         "dshiftl" | "dshiftr" | "maskl" | "maskr" | "merge_bits" |
-        "new_line" | "null" | "move_alloc" |
+        "new_line" | "null" | "move_alloc" | "next" | "previous" |
         "system_clock" | "date_and_time" | "cpu_time" | "random_number" | "random_seed" |
         // F2023 string-parsing subroutines.
         "split" | "tokenize" |

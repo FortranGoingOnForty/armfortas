@@ -1103,7 +1103,7 @@ pub fn intrinsic_result_type(name: &str, args: &[FortranType]) -> Option<Fortran
         "matmul" | "transpose" => args.first().cloned(),
 
         // Inquiry intrinsics.
-        "huge" | "tiny" | "epsilon" => args.first().cloned(),
+        "huge" | "tiny" | "epsilon" | "next" | "previous" => args.first().cloned(),
         "precision" | "range" | "digits" | "radix" | "exponent" => {
             Some(FortranType::default_integer())
         }

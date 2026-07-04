@@ -699,3 +699,27 @@ mod tests {
         assert_eq!(first, second);
     }
 }
+
+/// NEXT/PREVIOUS for enumeration values (F2023 16.9.148/16.9.161):
+/// step a 1-based ordinal by +-1 within [1, count]. Out of range:
+/// with a STAT argument, STAT=1 and the value is returned unchanged;
+/// without one, a loud runtime error (exit 1).
+#[no_mangle]
+pub extern "C" fn afs_enum_step(v: i32, count: i32, step: i32, stat: *mut i32) -> i32 {
+    let next = v + step;
+    let ok = next >= 1 && next <= count;
+    if !stat.is_null() {
+        unsafe { *stat = if ok { 0 } else { 1 } };
+        return if ok { next } else { v };
+    }
+    if !ok {
+        eprintln!(
+            "Fortran runtime error: {} of enumeration ordinal {} is out of range 1..{}",
+            if step > 0 { "NEXT" } else { "PREVIOUS" },
+            v,
+            count
+        );
+        std::process::exit(1);
+    }
+    next
+}
