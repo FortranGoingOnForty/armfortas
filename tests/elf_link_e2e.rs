@@ -208,8 +208,13 @@ fn out_of_scope_link_paths_diagnose_cleanly() {
     let src = programs_dir().join("hello.f90");
     let out = std::env::temp_dir().join(format!("afs_elfe2e_diag_{}", std::process::id()));
 
+    // x16 arc: AFS_LD routing is honored on ELF now. AFS_LD=1
+    // resolves the sibling afs-ld, which has no ELF support yet, so
+    // the failure comes from the substitute linker rejecting the
+    // input — not from a guard. AFS_LD_PATH at a real GNU ld must
+    // link successfully through the routed contract.
     let r = Command::new(compiler())
-        .env("AFS_LD", "1")
+        .env("AFS_LD_PATH", "/nonexistent/afs-ld")
         .arg(&src)
         .arg("-o")
         .arg(&out)
@@ -217,8 +222,9 @@ fn out_of_scope_link_paths_diagnose_cleanly() {
         .unwrap();
     assert!(!r.status.success());
     assert!(
-        String::from_utf8_lossy(&r.stderr).contains("Mach-O only"),
-        "AFS_LD on ELF should say afs-ld is Mach-O only"
+        String::from_utf8_lossy(&r.stderr).contains("cannot run linker"),
+        "a missing substitute linker must be named in the diagnostic, got:\n{}",
+        String::from_utf8_lossy(&r.stderr)
     );
 
     let r = Command::new(compiler())
