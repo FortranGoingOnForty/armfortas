@@ -29025,19 +29025,12 @@ pub(super) fn internal_io_alloc_target(
     }
 }
 
-pub(super) fn lower_internal_write_items(
-    b: &mut FuncBuilder,
-    ctx: &mut LowerCtx,
-    items: &[crate::ast::expr::SpannedExpr],
-    buf_ptr: ValueId,
-    buf_len: ValueId,
-) {
-    let zero = b.const_i64(0);
-    let pos = b.alloca(IrType::Int(IntWidth::I64));
-    b.store(zero, pos);
-
-    for item in items {
-        let is_char = match &item.node {
+/// Shared list-directed item classifier: does this WRITE item lower
+/// as character data (string writer) rather than a numeric value?
+/// Used by both the fixed-buffer and the deferred-alloc paths so the
+/// two render identically.
+fn internal_write_item_is_char(ctx: &LowerCtx, item: &crate::ast::expr::SpannedExpr) -> bool {
+    match &item.node {
             Expr::Name { name } => ctx
                 .locals
                 .get(&name.to_lowercase())
@@ -29095,7 +29088,22 @@ pub(super) fn lower_internal_write_items(
                 ..
             } => true,
             _ => false,
-        };
+    }
+}
+
+pub(super) fn lower_internal_write_items(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    items: &[crate::ast::expr::SpannedExpr],
+    buf_ptr: ValueId,
+    buf_len: ValueId,
+) {
+    let zero = b.const_i64(0);
+    let pos = b.alloca(IrType::Int(IntWidth::I64));
+    b.store(zero, pos);
+
+    for item in items {
+        let is_char = internal_write_item_is_char(ctx, item);
 
         if is_char || matches!(item.node, Expr::StringLiteral { .. }) {
             let (ptr, len) = lower_string_expr_ctx(b, ctx, item);
@@ -29151,6 +29159,79 @@ pub(super) fn lower_internal_write_items(
                 b.call(
                     FuncRef::External("afs_write_internal_real64".into()),
                     vec![buf_ptr, buf_len, widened, pos],
+                    IrType::Void,
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+/// List-directed internal WRITE items into a deferred-length
+/// allocatable scalar target: the record is collected in the runtime
+/// (afs_lst_ia_*) and stored in one shot at end, so an unallocated
+/// target gets allocated to the record length instead of presenting
+/// a len-0 view to the fixed-buffer writers (which silently produced
+/// an empty string). Item classification and rendering match the
+/// fixed path exactly.
+pub(super) fn lower_internal_write_items_alloc(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    items: &[crate::ast::expr::SpannedExpr],
+) {
+    for item in items {
+        let is_char = internal_write_item_is_char(ctx, item);
+
+        if is_char || matches!(item.node, Expr::StringLiteral { .. }) {
+            let (ptr, len) = lower_string_expr_ctx(b, ctx, item);
+            b.call(
+                FuncRef::External("afs_lst_ia_string".into()),
+                vec![ptr, len],
+                IrType::Void,
+            );
+            continue;
+        }
+
+        let val = super::expr::lower_expr_ctx_tl(b, ctx, item);
+        let ty = b
+            .func()
+            .value_type(val)
+            .unwrap_or(IrType::Int(IntWidth::I32));
+        match ty {
+            IrType::Int(IntWidth::I128) => {
+                b.call(
+                    FuncRef::External("afs_lst_ia_int128".into()),
+                    vec![val],
+                    IrType::Void,
+                );
+            }
+            IrType::Int(IntWidth::I64) => {
+                b.call(
+                    FuncRef::External("afs_lst_ia_int".into()),
+                    vec![val],
+                    IrType::Void,
+                );
+            }
+            IrType::Int(_) => {
+                let wide = b.int_extend(val, IntWidth::I64, true);
+                b.call(
+                    FuncRef::External("afs_lst_ia_int".into()),
+                    vec![wide],
+                    IrType::Void,
+                );
+            }
+            IrType::Float(FloatWidth::F64) => {
+                b.call(
+                    FuncRef::External("afs_lst_ia_real".into()),
+                    vec![val],
+                    IrType::Void,
+                );
+            }
+            IrType::Float(_) => {
+                let widened = b.float_extend(val, FloatWidth::F64);
+                b.call(
+                    FuncRef::External("afs_lst_ia_real".into()),
+                    vec![widened],
                     IrType::Void,
                 );
             }

@@ -3722,6 +3722,107 @@ pub extern "C" fn afs_fmt_begin_internal_alloc(
     });
 }
 
+/// List-directed internal WRITE to a deferred-length allocatable
+/// character scalar. The fixed-buffer writers can't serve this target
+/// (an unallocated descriptor presents a len-0 view), so the record
+/// is collected here and stored in one shot through
+/// `store_internal_alloc_record` — the same allocate-when-absent /
+/// fixed-when-present semantics as the formatted path. Item rendering
+/// matches `afs_write_internal_*` exactly (leading blank + `{}`).
+struct LstIaContext {
+    desc: *mut crate::descriptor::StringDescriptor,
+    record: Vec<u8>,
+    iostat: *mut i32,
+    iomsg: *mut u8,
+    iomsg_len: i64,
+}
+
+unsafe impl Send for LstIaContext {}
+
+thread_local! {
+    static LST_IA_CTX: RefCell<Vec<LstIaContext>> = const { RefCell::new(Vec::new()) };
+}
+
+#[no_mangle]
+pub extern "C" fn afs_lst_ia_begin(desc: *mut u8, iostat: *mut i32, iomsg: *mut u8, iomsg_len: i64) {
+    LST_IA_CTX.with(|ctx| {
+        ctx.borrow_mut().push(LstIaContext {
+            desc: desc as *mut crate::descriptor::StringDescriptor,
+            record: Vec::new(),
+            iostat,
+            iomsg,
+            iomsg_len,
+        });
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn afs_lst_ia_int(val: i64) {
+    LST_IA_CTX.with(|ctx| {
+        if let Some(c) = ctx.borrow_mut().last_mut() {
+            c.record.extend_from_slice(format!(" {}", val).as_bytes());
+        }
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn afs_lst_ia_int128(val: i128) {
+    LST_IA_CTX.with(|ctx| {
+        if let Some(c) = ctx.borrow_mut().last_mut() {
+            c.record.extend_from_slice(format!(" {}", val).as_bytes());
+        }
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn afs_lst_ia_real(val: f64) {
+    LST_IA_CTX.with(|ctx| {
+        if let Some(c) = ctx.borrow_mut().last_mut() {
+            c.record.extend_from_slice(format!(" {}", val).as_bytes());
+        }
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn afs_lst_ia_string(ptr: *const u8, len: i64) {
+    LST_IA_CTX.with(|ctx| {
+        if let Some(c) = ctx.borrow_mut().last_mut() {
+            c.record.push(b' ');
+            if !ptr.is_null() && len > 0 {
+                let slice = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+                c.record.extend_from_slice(slice);
+            }
+        }
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn afs_lst_ia_end() {
+    let Some(c) = LST_IA_CTX.with(|ctx| ctx.borrow_mut().pop()) else {
+        return;
+    };
+    let mut io_status = 0i32;
+    let mut io_msg = "";
+    if !store_internal_alloc_record(c.desc, &c.record) {
+        io_status = 1;
+        io_msg = "out of memory";
+    }
+    if !c.iostat.is_null() {
+        unsafe { *c.iostat = io_status };
+    }
+    if !c.iomsg.is_null() && c.iomsg_len > 0 {
+        let cap = c.iomsg_len as usize;
+        let bytes = io_msg.as_bytes();
+        let copy = bytes.len().min(cap);
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), c.iomsg, copy);
+            if copy < cap {
+                std::ptr::write_bytes(c.iomsg.add(copy), b' ', cap - copy);
+            }
+        }
+    }
+}
+
 /// Set the per-statement LEADING_ZERO= override for the in-flight
 /// formatted write. Called between `afs_fmt_begin*` and `afs_fmt_end`
 /// when the WRITE statement carries a LEADING_ZERO= specifier. The
