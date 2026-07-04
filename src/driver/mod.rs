@@ -165,7 +165,10 @@ pub struct Options {
     pub backslash_escapes: bool,
     pub free_line_length_none_compat: bool,
     pub max_stack_var_size: Option<u64>,
+    pub max_errors_compat: Option<u64>,
     pub no_stack_arrays_compat: bool,
+    pub check_array_temps_compat: bool,
+    pub coarray_single_compat: bool,
 
     // ---- Optimization ----
     pub opt_level: OptLevel,
@@ -176,6 +179,7 @@ pub struct Options {
     pub warn_pedantic: bool,
     pub warn_deprecated: bool,
     pub warn_as_error: bool,
+    pub werror_implicit_interface_compat: bool,
     pub disabled_warnings: Vec<String>,
     pub cli_warnings: Vec<String>,
 
@@ -254,13 +258,17 @@ impl Default for Options {
             backslash_escapes: false,
             free_line_length_none_compat: false,
             max_stack_var_size: None,
+            max_errors_compat: None,
             no_stack_arrays_compat: false,
+            check_array_temps_compat: false,
+            coarray_single_compat: false,
             opt_level: OptLevel::O0,
             warn_all: false,
             warn_extra: false,
             warn_pedantic: false,
             warn_deprecated: false,
             warn_as_error: false,
+            werror_implicit_interface_compat: false,
             disabled_warnings: Vec::new(),
             cli_warnings: Vec::new(),
             debug_info: false,
@@ -560,9 +568,18 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
                         .map_err(|_| format!("invalid -fmax-stack-var-size value: {}", val))?,
                 );
             }
+            arg if arg.starts_with("-fmax-errors=") => {
+                let val = &arg["-fmax-errors=".len()..];
+                opts.max_errors_compat = Some(
+                    val.parse()
+                        .map_err(|_| format!("invalid -fmax-errors value: {}", val))?,
+                );
+            }
+            "-fcoarray=single" => opts.coarray_single_compat = true,
 
             // ---- Runtime checks ----
             "-fcheck=bounds" => opts.check_bounds = true,
+            "-fcheck=array-temps" => opts.check_array_temps_compat = true,
             "-fcheck=all" => {
                 opts.check_bounds = true;
                 opts.check_all = true;
@@ -575,6 +592,11 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
             "-Wpedantic" | "-pedantic" => opts.warn_pedantic = true,
             "-Wdeprecated" => opts.warn_deprecated = true,
             "-Werror" => opts.warn_as_error = true,
+            "-Werror=implicit-interface" => opts.werror_implicit_interface_compat = true,
+            arg if arg.starts_with("-Werror=") => {
+                opts.warn_as_error = true;
+                unknown_warning_flags.push(arg.to_string());
+            }
             arg if arg.starts_with("-Wno-") => {
                 opts.disabled_warnings.push(arg[5..].to_string());
             }
@@ -865,9 +887,23 @@ fn collect_cli_warnings(opts: &mut Options, unknown_warning_flags: &[String]) {
         opts.cli_warnings
             .push("-fmax-stack-var-size is recognized but not yet implemented".into());
     }
+    if opts.max_errors_compat.is_some() {
+        opts.cli_warnings
+            .push("-fmax-errors is recognized but diagnostic error limiting is not yet implemented".into());
+    }
     if opts.no_stack_arrays_compat {
         opts.cli_warnings
             .push("-fno-stack-arrays is recognized but automatic array placement is not yet configurable".into());
+    }
+    if opts.check_array_temps_compat {
+        opts.cli_warnings.push(
+            "-fcheck=array-temps is accepted for compatibility; array temporary diagnostics are not yet implemented".into(),
+        );
+    }
+    if opts.coarray_single_compat {
+        opts.cli_warnings.push(
+            "-fcoarray=single is accepted for compatibility; coarray features are not yet implemented".into(),
+        );
     }
     if opts.free_line_length_none_compat {
         opts.cli_warnings.push(
@@ -891,6 +927,11 @@ fn collect_cli_warnings(opts: &mut Options, unknown_warning_flags: &[String]) {
     if opts.warn_extra {
         opts.cli_warnings
             .push("-Wextra is recognized but warning-group emission is not yet implemented".into());
+    }
+    if opts.werror_implicit_interface_compat {
+        opts.cli_warnings.push(
+            "-Werror=implicit-interface is accepted for compatibility; implicit-interface diagnostics are not yet implemented".into(),
+        );
     }
 
     if opts.debug_info {
@@ -970,6 +1011,7 @@ LANGUAGE:
   -frecursive                 Make all procedures recursive by default
   -fbackslash                 Interpret backslash in strings as escape
   -fmax-stack-var-size=<n>    Stack variable size threshold (bytes)
+  -fmax-errors=<n>            GNU-compatible diagnostic limit spelling
 
 OPTIMIZATION:
   -O0, -O1, -O2, -O3          Optimization level (default -O0)
@@ -982,6 +1024,7 @@ WARNINGS:
   -Wpedantic                  Pedantic standard conformance warnings
   -Wdeprecated                Deprecated feature warnings
   -Werror                     Treat warnings as errors
+  -Werror=implicit-interface  Accept GNU-style implicit-interface diagnostic flag
   -Wno-<name>                 Disable specific warning
 
 DEBUGGING:
@@ -993,7 +1036,9 @@ DEBUGGING:
   -v, --verbose               Verbose output (show compilation phases)
   --time-report               Show time spent in each compilation phase
   -fcheck=bounds              Enable runtime array bounds checking
+  -fcheck=array-temps         Accept GNU-style array-temp diagnostic flag
   -fcheck=all                 Enable all runtime checks
+  -fcoarray=single            Accept GNU-style single-image coarray mode flag
   --diagnostics-format=text|json
                               Diagnostic output format
 
@@ -2598,6 +2643,66 @@ mod tests {
                 "-fbacktrace is accepted, but runtime backtrace control is not yet implemented"
             )),
             "expected a compatibility warning for -fbacktrace, got {:?}",
+            opts.cli_warnings
+        );
+    }
+
+    #[test]
+    fn parse_cli_accepts_fpm_gnu_debug_probe_flags() {
+        let args = vec![
+            "-fmax-errors=1".to_string(),
+            "-fcheck=array-temps".to_string(),
+            "-fcoarray=single".to_string(),
+            "-Werror=implicit-interface".to_string(),
+            "hello.f90".to_string(),
+        ];
+        let ParsedCli::Compile(opts) =
+            parse_cli(&args).expect("driver should accept fpm GNU debug probe flags")
+        else {
+            panic!("expected compile options");
+        };
+        assert_eq!(opts.max_errors_compat, Some(1));
+        assert!(opts.check_array_temps_compat);
+        assert!(opts.coarray_single_compat);
+        assert!(opts.werror_implicit_interface_compat);
+        assert!(
+            !opts.warn_as_error,
+            "-Werror=implicit-interface should not promote every compatibility warning"
+        );
+        for needle in [
+            "-fmax-errors is recognized",
+            "-fcheck=array-temps is accepted for compatibility",
+            "-fcoarray=single is accepted for compatibility",
+            "-Werror=implicit-interface is accepted for compatibility",
+        ] {
+            assert!(
+                opts.cli_warnings
+                    .iter()
+                    .any(|warning| warning.contains(needle)),
+                "missing warning `{}` in {:?}",
+                needle,
+                opts.cli_warnings
+            );
+        }
+    }
+
+    #[test]
+    fn parse_cli_rejects_unknown_werror_warning_names_as_errors() {
+        let args = vec![
+            "-Werror=unknown-flag".to_string(),
+            "hello.f90".to_string(),
+        ];
+        let ParsedCli::Compile(opts) =
+            parse_cli(&args).expect("driver should parse unknown -Werror warning names")
+        else {
+            panic!("expected compile options");
+        };
+        assert!(opts.warn_as_error);
+        assert!(
+            opts.cli_warnings
+                .iter()
+                .any(|warning| warning.contains("unrecognized warning option")),
+            "expected unknown warning option diagnostic, got {:?}",
             opts.cli_warnings
         );
     }
