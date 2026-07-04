@@ -376,14 +376,12 @@ Found during l04 (2026-06-12):
   the third argument's type. See afs_tokenize_positions /
   afs_tokenize_tokens in runtime/src/string.rs.
 
-- **SPLIT does not bounds-check POS** (found l04, 2026-06-12):
-  gfortran's split_3/split_4 dg-shouldfail tests expect a runtime
-  error when POS is out of range (or BACK with POS at the string
-  start). armfortas intrinsics don't emit runtime argument bounds
-  checks, so these run and exit 0. Kept XFAIL. SELECTED_CHAR_KIND
-  (F2003, used by split_2) is also unimplemented (undefined symbol at
-  link). Owners: intrinsic runtime-bounds pass / F2003 intrinsic
-  backlog respectively.
+- **PARTIALLY RESOLVED (2026-07-04, L-tail)** ~~SPLIT does not
+  bounds-check POS~~: afs_split now enforces the 16.9.197 POS ranges
+  (forward 0..LEN, BACK 1..LEN+1) with a loud runtime error, exit 1;
+  split_3/split_4 XFAILs flipped to live EXIT_CODE tests. STILL OPEN:
+  SELECTED_CHAR_KIND (F2003, used by split_2) remains unimplemented
+  (undefined symbol at link). Owner: F2003 intrinsic backlog.
 
 - **`print '(format)'` ignores the format — FIXED (x12, 2026-06-20)**:
   Stmt::Print dropped its `format` field and always lowered through the
