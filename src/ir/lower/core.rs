@@ -28989,6 +28989,54 @@ pub(super) fn internal_io_buffer(
     Some(lower_string_expr_ctx(b, ctx, &control.value))
 }
 
+/// If `control` designates a WHOLE character array (a bare name),
+/// return (base_ptr, elem_len, nelems) for the record-per-element
+/// internal-file path. Fixed inline-storage arrays and
+/// descriptor-backed (allocatable/assumed-shape) character arrays
+/// both qualify; elements, sections, substrings, and component
+/// designators stay on their existing paths. Fixed arrays with
+/// runtime bounds are not matched (rare as internal units; they
+/// keep the previous behavior).
+pub(super) fn internal_io_array_target(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    control: &crate::ast::stmt::IoControl,
+) -> Option<(ValueId, ValueId, ValueId)> {
+    if control
+        .keyword
+        .as_deref()
+        .map(|k| !k.eq_ignore_ascii_case("unit"))
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let name = match &control.value.node {
+        Expr::Name { name } => name,
+        _ => return None,
+    };
+    let info = ctx.locals.get(&name.to_lowercase())?;
+    if descriptor_backed_runtime_char_array(info) {
+        let desc = array_descriptor_addr(b, info);
+        let base = b.load_typed(desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+        let elem = descriptor_elem_size(b, desc);
+        let n = array_descriptor_total_elements_dynamic(b, desc);
+        return Some((base, elem, n));
+    }
+    if !info.dims.is_empty()
+        && inline_char_array_storage(info)
+        && !info.runtime_dim_upper.iter().any(|d| d.is_some())
+    {
+        if let CharKind::Fixed(len) = info.char_kind {
+            let nelems: i64 = info.dims.iter().map(|(_, e)| *e).product();
+            let base = array_data_ptr_for_call(b, info);
+            let elem = b.const_i64(len);
+            let n = b.const_i64(nelems);
+            return Some((base, elem, n));
+        }
+    }
+    None
+}
+
 /// If `control` designates a deferred-length allocatable
 /// `character(:), allocatable` scalar (a bare name — not a substring,
 /// array element, or pointer), return its StringDescriptor address for

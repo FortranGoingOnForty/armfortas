@@ -2460,6 +2460,40 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     );
                     return;
                 }
+                // Whole character array as the internal unit: formatted
+                // writes get record-per-element semantics; unallocated or
+                // overflowed targets error loudly in the runtime. Our
+                // list-directed processor emits a single record, which
+                // goes into element one (previously both shapes silently
+                // wrote nothing through a zero-length buffer view).
+                if let Some((base, elem_len, nelems)) = internal_io_array_target(b, ctx, ctrl) {
+                    if is_list_directed {
+                        lower_internal_write_items(b, ctx, items, base, elem_len);
+                        return;
+                    }
+                    let (fmt_ptr, fmt_len) =
+                        lower_format_expr(b, ctx, &fmt_control.unwrap().value);
+                    b.call(
+                        FuncRef::External("afs_fmt_begin_internal_array".into()),
+                        vec![
+                            base, elem_len, nelems, fmt_ptr, fmt_len, iostat_ptr, iomsg_ptr,
+                            iomsg_len,
+                        ],
+                        IrType::Void,
+                    );
+                    lower_fmt_leading_zero_override(b, ctx, leading_zero_ctrl);
+                    for item in items {
+                        lower_fmt_push(b, ctx, item);
+                    }
+                    let adv = advance_runtime
+                        .unwrap_or_else(|| b.const_i32(if advance { 1 } else { 0 }));
+                    b.call(
+                        FuncRef::External("afs_fmt_end".into()),
+                        vec![adv],
+                        IrType::Void,
+                    );
+                    return;
+                }
                 if let Some((buf_ptr, buf_len)) = internal_io_buffer(b, ctx, ctrl) {
                     if is_list_directed {
                         lower_internal_write_items(b, ctx, items, buf_ptr, buf_len);

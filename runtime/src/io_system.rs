@@ -3521,6 +3521,17 @@ enum FmtSink {
     /// treated as a fixed internal file; an unallocated target is allocated
     /// to the formatted record length.
     InternalAlloc { desc: *mut u8 },
+    /// Internal write whose target is a whole character array: each
+    /// formatted record goes into one element (truncated or blank-
+    /// padded to the element length). Elements after the last record
+    /// written are left unchanged (F2023 12.6.4.8.3 leaves them
+    /// undefined). Overflowing the array or targeting an unallocated
+    /// one is an error — loud when no IOSTAT= is present.
+    InternalArray {
+        buf: *mut u8,
+        elem_len: i64,
+        nelems: i64,
+    },
 }
 
 /// Thread-local state for active formatted I/O operations.
@@ -3712,6 +3723,37 @@ pub extern "C" fn afs_fmt_begin_internal_alloc(
     FMT_CTX.with(|ctx| {
         ctx.borrow_mut().push(FmtContext {
             sink: FmtSink::InternalAlloc { desc },
+            format_str: fmt,
+            values: Vec::new(),
+            iostat,
+            iomsg,
+            iomsg_len,
+            stmt_leading_zero: None,
+        });
+    });
+}
+
+/// Begin a formatted internal WRITE whose unit is a whole character
+/// array: record-per-element semantics via FmtSink::InternalArray.
+#[no_mangle]
+pub extern "C" fn afs_fmt_begin_internal_array(
+    buf: *mut u8,
+    elem_len: i64,
+    nelems: i64,
+    fmt_str: *const u8,
+    fmt_len: i64,
+    iostat: *mut i32,
+    iomsg: *mut u8,
+    iomsg_len: i64,
+) {
+    let fmt = unsafe_str(fmt_str, fmt_len);
+    FMT_CTX.with(|ctx| {
+        ctx.borrow_mut().push(FmtContext {
+            sink: FmtSink::InternalArray {
+                buf,
+                elem_len,
+                nelems,
+            },
             format_str: fmt,
             values: Vec::new(),
             iostat,
@@ -3983,6 +4025,59 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                             ) {
                                 io_status = 1;
                                 io_msg = Some("out of memory");
+                            }
+                        }
+                        Err(_) => {
+                            io_status = 1;
+                            io_msg = Some("format error");
+                        }
+                    }
+                }
+                FmtSink::InternalArray {
+                    buf,
+                    elem_len,
+                    nelems,
+                } => {
+                    if let Some(mode) = c.stmt_leading_zero {
+                        engine.set_leading_zero(mode);
+                    }
+                    // Reverting: each new format scan starts a new record,
+                    // i.e. the next array element.
+                    match engine.format_values_reverting_checked(&c.values) {
+                        Ok(output) => {
+                            if buf.is_null() || elem_len <= 0 || nelems <= 0 {
+                                io_status = 1;
+                                io_msg = Some("internal file is not allocated");
+                                if c.iostat.is_null() {
+                                    eprintln!(
+                                        "ERROR: internal WRITE to an unallocated or zero-size character array"
+                                    );
+                                    std::process::exit(2);
+                                }
+                            } else {
+                                let records: Vec<&str> = output.split('\n').collect();
+                                if records.len() as i64 > nelems {
+                                    io_status = 1;
+                                    io_msg = Some("write exceeds internal file size");
+                                    if c.iostat.is_null() {
+                                        eprintln!(
+                                            "ERROR: internal WRITE of {} records into a {}-element character array",
+                                            records.len(),
+                                            nelems
+                                        );
+                                        std::process::exit(2);
+                                    }
+                                } else {
+                                    for (i, rec) in records.iter().enumerate() {
+                                        write_to_buffer(
+                                            unsafe { buf.add(i * elem_len as usize) },
+                                            elem_len as usize,
+                                            0,
+                                            rec.as_bytes(),
+                                            std::ptr::null_mut(),
+                                        );
+                                    }
+                                }
                             }
                         }
                         Err(_) => {
