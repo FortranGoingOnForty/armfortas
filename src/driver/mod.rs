@@ -1754,12 +1754,6 @@ pub(crate) fn link_inputs_elf(
             opts.target, host
         ));
     }
-    if env_override("AFS_LD").is_some() || env_override("AFS_LD_PATH").is_some() {
-        return Err(
-            "AFS_LD routing is Mach-O only: afs-ld has no ELF writer (out of this arc; see the sprint index)"
-                .to_string(),
-        );
-    }
     if opts.static_link {
         return Err("-static on ELF targets lands in sprint x11 (musl static story)".to_string());
     }
@@ -1797,13 +1791,19 @@ pub(crate) fn link_inputs_elf(
         &opts.link_libs,
     )?;
 
+    // x16: honor the AFS_LD routing on ELF targets too — previously
+    // this path went straight to the system linker and
+    // afs_ld_override() was consulted only for Mach-O. The substitute
+    // linker receives the same ld-compatible argument list (that flag
+    // surface IS the drop-in contract afs-ld's ELF support targets).
+    let linker = afs_ld_override().unwrap_or_else(|| "ld".into());
     if opts.verbose {
-        eprintln!(" linking: ld {}", args.join(" "));
+        eprintln!(" linking: {} {}", linker, args.join(" "));
     }
-    let result = Command::new("ld")
+    let result = Command::new(&linker)
         .args(&args)
         .output()
-        .map_err(|e| format!("cannot run ld: {}", e))?;
+        .map_err(|e| format!("cannot run linker '{}': {}", linker, e))?;
     if !result.status.success() {
         return Err(format!(
             "linker failed:\n{}",
