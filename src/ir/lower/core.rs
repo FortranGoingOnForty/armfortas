@@ -5904,6 +5904,54 @@ fn eval_const_char_bytes_with_context(
                 }
                 return Some(vec![b'\n']);
             }
+            if intrinsic == "repeat" {
+                if args.len() != 2 {
+                    return None;
+                }
+                let mut pattern_arg = None;
+                let mut copies_arg = None;
+                for (i, arg) in args.iter().enumerate() {
+                    let crate::ast::expr::SectionSubscript::Element(expr) = &arg.value else {
+                        return None;
+                    };
+                    match arg.keyword.as_deref().map(str::to_ascii_lowercase) {
+                        Some(keyword) if keyword == "string" && pattern_arg.is_none() => {
+                            pattern_arg = Some(expr);
+                        }
+                        Some(keyword) if keyword == "ncopies" && copies_arg.is_none() => {
+                            copies_arg = Some(expr);
+                        }
+                        None if i == 0 && pattern_arg.is_none() => pattern_arg = Some(expr),
+                        None if i == 1 && copies_arg.is_none() => copies_arg = Some(expr),
+                        _ => return None,
+                    }
+                }
+                let pattern = eval_const_char_bytes_with_context(
+                    pattern_arg?,
+                    param_consts,
+                    param_chars,
+                    st,
+                    scope_id,
+                    type_layouts,
+                )?;
+                let copies = eval_const_char_int_expr(copies_arg?, param_consts, param_chars)
+                    .or_else(|| {
+                        st.and_then(|st| {
+                            eval_const_int_in_scope_or_any_scope(copies_arg?, param_consts, st)
+                                .map(i128::from)
+                        })
+                    })?;
+                if copies < 0 {
+                    return None;
+                }
+                let copies = usize::try_from(copies).ok()?;
+                let total = pattern.len().checked_mul(copies)?;
+                let mut out = Vec::with_capacity(total);
+                for _ in 0..copies {
+                    out.extend_from_slice(&pattern);
+                }
+                return Some(out);
+            }
             if intrinsic != "char" && intrinsic != "achar" {
                 return None;
             }
