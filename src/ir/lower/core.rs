@@ -8240,6 +8240,9 @@ pub(super) fn eval_const_scalar_with_any_scope(
                 let crate::ast::expr::SectionSubscript::Element(arg_expr) = &arg.value else {
                     return None;
                 };
+                if let Some(fold) = enum_const_inquiry(&key, arg_expr, &[], st) {
+                    return fold;
+                }
                 let ty = const_expr_ir_type_from_any_scope(arg_expr, param_consts, st)?;
                 return const_inquiry_for_ir_type(&key, &ty);
             }
@@ -8888,6 +8891,45 @@ fn const_expr_ir_type_from_any_scope(
     }
 }
 
+/// Const-fold inquiry intrinsics whose argument is an F2023
+/// enumeration value. The IR type of an enum ordinal is a plain i32,
+/// so the IR-type-based fold below would answer i32::MAX for HUGE —
+/// a silent wrong answer (16.9.118: the last enumerator). Returns
+/// Some(Some(v)) to fold, Some(None) to block the fold entirely
+/// (enum arg, non-foldable key), None when the arg is not an enum.
+fn enum_const_inquiry(
+    key: &str,
+    expr: &crate::ast::expr::SpannedExpr,
+    decls: &[crate::ast::decl::SpannedDecl],
+    st: &SymbolTable,
+) -> Option<Option<ConstScalar>> {
+    let Expr::Name { name } = &expr.node else {
+        return None;
+    };
+    let ename = declared_type_spec_for_name(name, decls)
+        .and_then(|ts| match ts {
+            crate::ast::decl::TypeSpec::Type(n) => Some(n.clone()),
+            _ => None,
+        })
+        .or_else(|| {
+            st.find_symbol_any_scope(&name.to_ascii_lowercase())
+                .and_then(|sym| sym.type_info.as_ref())
+                .and_then(|ti| match ti {
+                    crate::sema::symtab::TypeInfo::Enumeration(n) => Some(n.clone()),
+                    _ => None,
+                })
+        })?;
+    let esym = st.find_symbol_any_scope(&ename.to_ascii_lowercase())?;
+    if !matches!(esym.kind, crate::sema::symtab::SymbolKind::EnumerationType) {
+        return None;
+    }
+    if key == "huge" {
+        Some(Some(ConstScalar::Int(esym.arg_names.len() as i128)))
+    } else {
+        Some(None)
+    }
+}
+
 fn const_inquiry_for_ir_type(key: &str, ty: &IrType) -> Option<ConstScalar> {
     match key {
         "huge" => match ty {
@@ -9142,6 +9184,9 @@ pub(super) fn eval_const_scalar_with_decl_scope(
                 | "bit_size" | "maxexponent" | "minexponent" => {
                     let arg = args.first()?;
                     let arg_expr = const_call_arg_expr(arg)?;
+                    if let Some(fold) = enum_const_inquiry(&key, arg_expr, decls, st) {
+                        return fold;
+                    }
                     let ty = decl_scope_const_ir_type(arg_expr, decls, param_consts, st)?;
                     const_inquiry_for_ir_type(&key, &ty)
                 }
