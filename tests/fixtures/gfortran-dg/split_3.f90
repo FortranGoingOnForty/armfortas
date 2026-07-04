@@ -3,11 +3,10 @@
 ! Original directives: { dg-do run } { dg-shouldfail "Fortran runtime error" } (POS out of range)
 ! Conversion notes: tests/fixtures/gfortran-dg/README.md
 ! Expected runtime failure (POS out of range). EXIT_CODE 1 follows the
-! armfortas runtime-error convention (runtime aborts exit(1)); l04 must
-! confirm SPLIT's error semantics when it lands.
+! armfortas runtime-error convention; afs_split bounds-checks POS
+! per 16.9.197 (L-tail, 2026-07-04).
 ! FLAGS: --std=f2023
 ! EXIT_CODE: 1
-! XFAIL: SPLIT POS-out-of-range runtime check not implemented (dg-shouldfail case); armfortas intrinsics do not bounds-check POS. See noted_items.md
 program b
   character(len=:), allocatable :: input
   character(len=2) :: set = ', '

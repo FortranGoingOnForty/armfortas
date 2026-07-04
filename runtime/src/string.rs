@@ -524,6 +524,23 @@ pub extern "C" fn afs_split(
         return;
     }
     let cur = unsafe { *pos };
+    // F2023 16.9.197 bounds: forward requires 0 <= POS <= LEN(STRING);
+    // BACK requires 1 <= POS <= LEN(STRING)+1. gfortran's split_3/
+    // split_4 dg-shouldfail tests pin the runtime-error behavior.
+    let in_range = if back == 0 {
+        cur >= 0 && cur <= str_len
+    } else {
+        cur >= 1 && cur <= str_len + 1
+    };
+    if !in_range {
+        eprintln!(
+            "Fortran runtime error: SPLIT POS={} is out of range for a length-{} string{}",
+            cur,
+            str_len,
+            if back != 0 { " with BACK=.true." } else { "" }
+        );
+        std::process::exit(1);
+    }
     let s: &[u8] = if str_ptr.is_null() || str_len <= 0 {
         &[]
     } else {
