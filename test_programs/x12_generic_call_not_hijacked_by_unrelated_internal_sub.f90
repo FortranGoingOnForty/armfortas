@@ -33,7 +33,9 @@ contains
      integer, intent(in), optional :: n
      type(tok_t), allocatable :: tmp(:)
      integer :: m, i
-     m = 8; if (present(n)) m = n
+     m = 8
+     if (allocated(var)) m = 2 * size(var)   ! grow, don't pin to 8
+     if (present(n)) m = n
      if (allocated(var)) then
         call move_alloc(var, tmp)
         allocate(var(m))
@@ -69,7 +71,9 @@ contains
         integer, intent(in), optional :: n
         type(key_t), allocatable :: tmp(:)
         integer :: m, j
-        m = 8; if (present(n)) m = n
+        m = 8
+        if (allocated(s)) m = 2 * size(s)
+        if (present(n)) m = n
         if (allocated(s)) then
            call move_alloc(s, tmp)
            allocate(s(m))
