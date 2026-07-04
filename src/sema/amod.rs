@@ -341,6 +341,36 @@ pub fn write_amod(
         writeln!(out).unwrap();
     }
 
+    // ---- F2023 strict enumeration types ----
+    // `@enumtype <access> <name> <e1> <e2> ...`; enumerator ordinals
+    // are positional (1-based), so the one record re-registers both
+    // the type and its typed constants on USE.
+    let enum_syms: Vec<_> = all_syms
+        .iter()
+        .filter(|(_, sym)| {
+            matches!(sym.kind, SymbolKind::EnumerationType)
+                && matches!(sym.type_info, Some(TypeInfo::Enumeration(_)))
+        })
+        .collect();
+    for (name, sym) in &enum_syms {
+        let access = if matches!(sym.attrs.access, Access::Private) {
+            "private"
+        } else {
+            "public"
+        };
+        writeln!(
+            out,
+            "@enumtype {} {} {}",
+            access,
+            name,
+            sym.arg_names.join(" ")
+        )
+        .unwrap();
+    }
+    if !enum_syms.is_empty() {
+        writeln!(out).unwrap();
+    }
+
     // ---- Procedures ----
     let interface_specifics: BTreeSet<String> = syms
         .iter()
@@ -1466,6 +1496,9 @@ pub struct ModuleInterface {
     pub procedures: Vec<AmodProc>,
     pub types: Vec<crate::sema::type_layout::TypeLayout>,
     pub interfaces: Vec<AmodInterface>,
+    /// F2023 strict enumeration types: (type name, enumerators in
+    /// declaration order, access). Ordinals are positional (1-based).
+    pub enum_types: Vec<(String, Vec<String>, Access)>,
     pub checksum: Option<String>,
 }
 
@@ -1583,6 +1616,7 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
     let mut procedures = Vec::new();
     let mut types = Vec::new();
     let mut interfaces = Vec::new();
+    let mut enum_types: Vec<(String, Vec<String>, Access)> = Vec::new();
 
     while let Some(line) = lines.next() {
         let trimmed = line.trim();
@@ -1610,6 +1644,19 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
         } else if trimmed.starts_with("@function ") || trimmed.starts_with("@subroutine ") {
             let proc = parse_proc(trimmed, &mut lines);
             procedures.push(proc);
+        } else if let Some(rest) = trimmed.strip_prefix("@enumtype ") {
+            // `@enumtype <public|private> <name> <e1> <e2> ...`
+            let mut it = rest.split_whitespace();
+            let access = match it.next() {
+                Some("private") => Access::Private,
+                _ => Access::Public,
+            };
+            if let Some(name) = it.next() {
+                let enums: Vec<String> = it.map(|e| e.to_string()).collect();
+                if !enums.is_empty() {
+                    enum_types.push((name.to_string(), enums, access));
+                }
+            }
         } else if trimmed.starts_with("@type ") {
             let layout = parse_type(trimmed, &mut lines);
             types.push(layout);
@@ -1650,6 +1697,7 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
         procedures,
         types,
         interfaces,
+        enum_types,
         checksum,
     })
 }

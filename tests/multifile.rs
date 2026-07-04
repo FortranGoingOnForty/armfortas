@@ -35,7 +35,17 @@ fn find_compiler() -> PathBuf {
 }
 
 fn find_runtime() -> PathBuf {
-    for dir in &["target/release", "target/debug"] {
+    // Mirror find_compiler's staleness fix: prefer THIS test
+    // profile's archive. With a stale other-profile runtime first,
+    // the linker pulls members from both archives and errors on
+    // duplicate symbols the moment the fresh runtime gains a symbol
+    // the stale one lacks.
+    let dirs: [&str; 2] = if cfg!(debug_assertions) {
+        ["target/debug", "target/release"]
+    } else {
+        ["target/release", "target/debug"]
+    };
+    for dir in &dirs {
         let p = PathBuf::from(dir).join("libarmfortas_rt.a");
         if p.exists() {
             return p;
@@ -46,10 +56,21 @@ fn find_runtime() -> PathBuf {
 
 /// Compile a .f90 file with -c, producing .o and optionally .amod.
 fn compile_file(compiler: &Path, source: &Path, output: &Path, search_dir: Option<&Path>) {
+    compile_file_flags(compiler, source, output, search_dir, &[]);
+}
+
+fn compile_file_flags(
+    compiler: &Path,
+    source: &Path,
+    output: &Path,
+    search_dir: Option<&Path>,
+    flags: &[&str],
+) {
     let mut cmd = Command::new(compiler);
     if let Some(parent) = source.parent() {
         cmd.current_dir(parent);
     }
+    cmd.args(flags);
     cmd.args([
         source.to_str().unwrap(),
         "-c",
@@ -107,6 +128,15 @@ fn run_binary(binary: &Path) -> String {
 
 /// Full multi-file test: write sources, compile, link, run, check.
 fn multifile_test(mod_source: &str, main_source: &str, expected_substring: &str) {
+    multifile_test_flags(mod_source, main_source, expected_substring, &[]);
+}
+
+fn multifile_test_flags(
+    mod_source: &str,
+    main_source: &str,
+    expected_substring: &str,
+    flags: &[&str],
+) {
     let compiler = find_compiler();
     let dir = unique_dir();
     let mod_f90 = dir.join("mod.f90");
@@ -118,8 +148,8 @@ fn multifile_test(mod_source: &str, main_source: &str, expected_substring: &str)
     std::fs::write(&mod_f90, mod_source).unwrap();
     std::fs::write(&main_f90, main_source).unwrap();
 
-    compile_file(&compiler, &mod_f90, &mod_o, None);
-    compile_file(&compiler, &main_f90, &main_o, Some(&dir));
+    compile_file_flags(&compiler, &mod_f90, &mod_o, None, flags);
+    compile_file_flags(&compiler, &main_f90, &main_o, Some(&dir), flags);
     link_files(&[&mod_o, &main_o], &binary);
     let output = run_binary(&binary);
 
@@ -957,4 +987,25 @@ fn cross_tu_vtable_slots_match_source_and_amod_views() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn enumeration_type_amod_roundtrip() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=enumeration_type_amod_roundtrip count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // Orphaned l03 deferral (was l07's row): USE of a module that
+    // defines an F2023 ENUMERATION TYPE must re-register the type and
+    // its typed enumerator constants from the .amod — declaration,
+    // assignment, NEXT, and HUGE all through the round-trip.
+    multifile_test_flags(
+        "module emod\n  implicit none\n  enumeration type :: color\n    enumerator :: red, green, blue\n  end enumeration type\nend module\n",
+        "program p\n  use emod\n  implicit none\n  type(color) :: c\n  c = green\n  c = next(c)\n  print '(i0,1x,i0)', int(c), int(huge(c))\nend program\n",
+        "3 3",
+        &["--std=f2023"],
+    );
 }

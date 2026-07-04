@@ -2017,6 +2017,61 @@ pub(crate) fn lower_expr_full(
                     }
                 }
 
+                // F2023 enumeration intrinsics key off the SEMANTIC type —
+                // the IR type is a plain i32 ordinal, so the numeric
+                // inquiry path above would answer i32::MAX for HUGE.
+                // HUGE(v) is the last enumerator (16.9.118); NEXT/PREVIOUS
+                // step the ordinal with bounds handling in the runtime.
+                if !has_named_interface && matches!(key.as_str(), "huge" | "next" | "previous") {
+                    if let Some(crate::ast::expr::SectionSubscript::Element(arg_expr)) =
+                        args.first().map(|a| &a.value)
+                    {
+                        if let Some(crate::sema::symtab::TypeInfo::Enumeration(ename)) =
+                            generic_actual_expr_type_info(arg_expr, locals, st, type_layouts)
+                        {
+                            let count = st
+                                .find_symbol_any_scope(&ename.to_lowercase())
+                                .filter(|s| {
+                                    matches!(
+                                        s.kind,
+                                        crate::sema::symtab::SymbolKind::EnumerationType
+                                    )
+                                })
+                                .map(|s| s.arg_names.len() as i32)
+                                .unwrap_or(0);
+                            if key == "huge" {
+                                return b.const_i32(count);
+                            }
+                            let v = lower_expr_full(
+                                b,
+                                locals,
+                                arg_expr,
+                                st,
+                                type_layouts,
+                                internal_funcs,
+                                contained_host_refs,
+                                descriptor_params,
+                            );
+                            let cnt = b.const_i32(count);
+                            let step = b.const_i32(if key == "next" { 1 } else { -1 });
+                            let stat_ptr = if let Some(
+                                crate::ast::expr::SectionSubscript::Element(stat_expr),
+                            ) = args.get(1).map(|a| &a.value)
+                            {
+                                lower_arg_by_ref(b, locals, stat_expr, st)
+                            } else {
+                                let z = b.const_i64(0);
+                                b.int_to_ptr(z, IrType::Int(IntWidth::I8))
+                            };
+                            return b.call(
+                                FuncRef::External("afs_enum_step".into()),
+                                vec![v, cnt, step, stat_ptr],
+                                IrType::Int(IntWidth::I32),
+                            );
+                        }
+                    }
+                }
+
                 // F2018 §16.9.96/130/79/178/176/61: HUGE/TINY/EPSILON/PRECISION/
                 // RANGE/DIGITS are numeric inquiry intrinsics whose result depends
                 // ONLY on the type/kind of the argument, not its value. The

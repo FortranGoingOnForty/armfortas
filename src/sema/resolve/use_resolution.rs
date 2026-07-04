@@ -369,6 +369,45 @@ pub(super) fn load_external_module(
         });
     }
 
+    // Re-register F2023 enumeration types and their typed enumerator
+    // constants (mirrors Decl::EnumerationTypeDef in resolve/core.rs;
+    // ordinals are positional, 1-based). Without this, `type(color)`
+    // in a USEing unit fell to the unknown-derived path and every
+    // enum assignment was rejected.
+    for (ename, enumerators, access) in &iface.enum_types {
+        let _ = st.define(Symbol {
+            name: ename.clone(),
+            kind: SymbolKind::EnumerationType,
+            type_info: Some(TypeInfo::Enumeration(ename.clone())),
+            attrs: SymbolAttrs {
+                access: *access,
+                ..Default::default()
+            },
+            defined_at: dummy_span,
+            scope: scope_id,
+            arg_names: enumerators.clone(),
+            const_value: None,
+            const_char_value: None,
+        });
+        for (i, member) in enumerators.iter().enumerate() {
+            let _ = st.define(Symbol {
+                name: member.clone(),
+                kind: SymbolKind::Enumerator,
+                type_info: Some(TypeInfo::Enumeration(ename.clone())),
+                attrs: SymbolAttrs {
+                    access: *access,
+                    parameter: true,
+                    ..Default::default()
+                },
+                defined_at: dummy_span,
+                scope: scope_id,
+                arg_names: vec![],
+                const_value: Some((i + 1) as i64),
+                const_char_value: None,
+            });
+        }
+    }
+
     // Populate procedures. Each proc is defined as a symbol in the
     // module scope AND given its own Function/Subroutine scope whose
     // symbols carry the argument type_info. The dedicated scope is
