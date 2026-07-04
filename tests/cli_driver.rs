@@ -13347,6 +13347,7 @@ fn accepted_but_unimplemented_flags_emit_warnings() {
             "-fbackslash",
             "-Wall",
             "-Wextra",
+            "-Werror=implicit-interface",
             "-Wpedantic",
             "-Wdeprecated",
             src.to_str().unwrap(),
@@ -13368,6 +13369,7 @@ fn accepted_but_unimplemented_flags_emit_warnings() {
         "-fbackslash is recognized but string escape processing is not yet implemented",
         "-Wall is recognized but warning-group emission is not yet implemented",
         "-Wextra is recognized but warning-group emission is not yet implemented",
+        "-Werror=implicit-interface is accepted for compatibility",
     ] {
         assert!(
             stderr.contains(needle),
@@ -13391,6 +13393,87 @@ fn accepted_but_unimplemented_flags_emit_warnings() {
     );
     let _ = std::fs::remove_file(&src);
     let _ = std::fs::remove_file(&out);
+}
+
+#[test]
+fn fpm_gnu_debug_probe_flags_compile_link_and_run_hello_world() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fpm_gnu_debug_probe_flags_compile_link_and_run_hello_world count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(" print *, 'Hello world!'; end\n", "f90");
+    let obj = unique_path("fpm_gnu_debug_probe", "o");
+    let exe = unique_path("fpm_gnu_debug_probe", "exe");
+    let fpm_gnu_debug_flags = [
+        "-Wall",
+        "-Wextra",
+        "-Wno-external-argument-mismatch",
+        "-fmax-errors=1",
+        "-g",
+        "-fcheck=bounds",
+        "-fcheck=array-temps",
+        "-fbacktrace",
+        "-fcoarray=single",
+    ];
+
+    let mut compile_args = vec!["-c", src.to_str().unwrap()];
+    compile_args.extend(fpm_gnu_debug_flags);
+    compile_args.extend(["-o", obj.to_str().unwrap()]);
+    let compile = Command::new(compiler("armfortas"))
+        .args(&compile_args)
+        .output()
+        .expect("compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "fpm-style compile probe should succeed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let compile_stderr = String::from_utf8_lossy(&compile.stderr);
+    for needle in [
+        "-fmax-errors is recognized",
+        "-fcheck=array-temps is accepted for compatibility",
+        "-fcoarray=single is accepted for compatibility",
+    ] {
+        assert!(
+            compile_stderr.contains(needle),
+            "missing warning `{}` in {}",
+            needle,
+            compile_stderr
+        );
+    }
+
+    let mut link_args = Vec::from(fpm_gnu_debug_flags);
+    link_args.push(obj.to_str().unwrap());
+    link_args.extend(["-o", exe.to_str().unwrap()]);
+    let link = Command::new(compiler("armfortas"))
+        .args(&link_args)
+        .output()
+        .expect("link spawn failed");
+    assert!(
+        link.status.success(),
+        "fpm-style link probe should succeed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe).output().expect("run spawn failed");
+    assert!(
+        run.status.success(),
+        "linked fpm-style probe should run: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("Hello world!"),
+        "expected hello-world output, got {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&obj);
+    let _ = std::fs::remove_file(&exe);
 }
 
 #[test]
@@ -13576,6 +13659,41 @@ fn unknown_warning_flag_emits_warning() {
     assert!(
         stderr.contains("unrecognized warning option '-Weverything'"),
         "expected unknown-warning diagnostic: {}",
+        stderr
+    );
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&out);
+}
+
+#[test]
+fn unknown_werror_warning_flag_fails_like_gnu_probe() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=unknown_werror_warning_flag_fails_like_gnu_probe count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program("program p\n  print *, 7\nend program\n", "f90");
+    let out = unique_path("werror_unknown", "o");
+    let result = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            "-Werror=unknown-flag",
+            src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        !result.status.success(),
+        "-Werror=unknown-flag should fail the compiler probe"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("error: unrecognized warning option '-Werror=unknown-flag'"),
+        "expected promoted unknown-warning diagnostic: {}",
         stderr
     );
     let _ = std::fs::remove_file(&src);
