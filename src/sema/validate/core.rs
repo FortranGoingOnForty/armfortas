@@ -1412,6 +1412,15 @@ fn validate_const_int_expr_tree(ctx: &mut Ctx<'_>, expr: &crate::ast::expr::Span
                 {
                     ctx.require_std(expr.span, FortranStandard::F2023, "SELECTED_LOGICAL_KIND");
                 }
+                // Arity gate: only when every arg is an Element — a
+                // Range subscript makes this a section or substring
+                // of a variable, never an intrinsic reference.
+                if args
+                    .iter()
+                    .all(|a| matches!(a.value, crate::ast::expr::SectionSubscript::Element(_)))
+                {
+                    check_intrinsic_call_arity(ctx, expr.span, name, args.len());
+                }
             }
             // F2023 conditional arguments in FUNCTION references select the
             // argument association per arm on the fn-call lowering path
@@ -1858,6 +1867,9 @@ fn validate_stmt_const_int_exprs(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
         }
         Stmt::Call { callee, args } => {
             validate_const_int_expr_tree(ctx, callee);
+            if let Expr::Name { name } = &callee.node {
+                check_intrinsic_call_arity(ctx, stmt.span, name, args.len());
+            }
             let saved = ctx.in_call_arg;
             ctx.in_call_arg = true;
             for arg in args {
@@ -3858,6 +3870,104 @@ fn check_expr_names(
         }
         _ => {}
     }
+}
+
+/// Argument-count bounds for intrinsics where F2023 16.9 pins them
+/// unambiguously, counting positional and keyword actuals alike.
+/// `None` max means unbounded (the MAX/MIN family). Names absent
+/// from this table are NOT arity-checked — extend it only with a
+/// standard citation in hand: a wrong bound here rejects valid
+/// programs, which is worse than the silent-acceptance gap it closes.
+fn intrinsic_arity(name: &str) -> Option<(usize, Option<usize>)> {
+    Some(match name {
+        // Exactly one argument.
+        "abs" | "iabs" | "dabs" | "cabs" | "conjg" | "aimag" | "dimag" | "acos" | "asin"
+        | "acosh" | "asinh" | "atanh" | "cos" | "sin" | "tan" | "cosh" | "sinh" | "tanh"
+        | "exp" | "log" | "log10" | "sqrt" | "dsqrt" | "gamma" | "log_gamma" | "erf"
+        | "erfc" | "fraction" | "exponent" | "trim" | "adjustl" | "adjustr" | "allocated"
+        | "present" | "kind" | "precision" | "range" | "radix" | "digits" | "huge"
+        | "tiny" | "epsilon" | "maxexponent" | "minexponent" | "bit_size" | "popcnt"
+        | "poppar" | "leadz" | "trailz" | "not" | "sngl" | "float" | "dfloat" | "idint"
+        | "ifix" | "idnint" | "dnint" | "dint" | "acosd" | "asind" | "cosd" | "sind"
+        | "tand" | "acospi" | "asinpi" | "cospi" | "sinpi" | "tanpi"
+        | "selected_logical_kind" | "selected_int_kind" | "selected_char_kind"
+        | "is_iostat_end" | "is_iostat_eor" | "c_loc" | "c_funloc" | "c_sizeof"
+        | "new_line" | "transpose" | "dble" | "random_number" | "cpu_time"
+        | "ieee_is_nan" | "ieee_is_finite" | "ieee_is_normal" => (1, Some(1)),
+        // Exactly two.
+        "atan2" | "atan2d" | "atan2pi" | "hypot" | "mod" | "modulo" | "sign" | "dim"
+        | "dprod" | "lge" | "lgt" | "lle" | "llt" | "bge" | "bgt" | "ble" | "blt"
+        | "ishft" | "shiftl" | "shiftr" | "shifta" | "ibset" | "ibclr" | "btest"
+        | "iand" | "ior" | "ieor" | "matmul" | "dot_product" | "scale" | "repeat"
+        | "ieee_copy_sign" | "ieee_unordered" => (2, Some(2)),
+        // Exactly three.
+        "ibits" | "merge" | "merge_bits" | "dshiftl" | "dshiftr" | "unpack" | "spread" => {
+            (3, Some(3))
+        }
+        // Optional-argument ranges (F2023 16.9 per-procedure).
+        "atan" | "atand" | "atanpi" | "aint" | "anint" | "nint" | "int" | "real"
+        | "logical" | "char" | "ichar" | "achar" | "iachar" | "len" | "len_trim"
+        | "floor" | "ceiling" | "maskl" | "maskr" | "shape" | "storage_size"
+        | "associated" | "any" | "all" | "norm2" | "f_c_string" => (1, Some(2)),
+        "cmplx" | "size" | "lbound" | "ubound" | "sum" | "product" | "maxval"
+        | "minval" | "count" | "selected_real_kind" => (1, Some(3)),
+        "ishftc" | "pack" | "transfer" | "c_f_strpointer" => (2, Some(3)),
+        "index" | "scan" | "verify" | "reshape" => (2, Some(4)),
+        "null" => (0, Some(1)),
+        "mvbits" => (5, Some(5)),
+        "max" | "min" | "max0" | "min0" | "max1" | "min1" | "amax0" | "amin0"
+        | "amax1" | "amin1" | "dmax1" | "dmin1" => (2, None),
+        "maxloc" | "minloc" => (1, Some(5)),
+        "findloc" => (2, Some(6)),
+        "move_alloc" => (2, Some(4)),
+        "system_clock" => (0, Some(3)),
+        "date_and_time" => (0, Some(4)),
+        "random_seed" => (0, Some(3)),
+        "execute_command_line" => (1, Some(5)),
+        "get_command_argument" => (1, Some(5)),
+        "get_environment_variable" => (1, Some(6)),
+        "command_argument_count" | "compiler_version" | "compiler_options" => (0, Some(0)),
+        "split" => (3, Some(4)),
+        "c_f_pointer" => (2, Some(4)),
+        "c_associated" => (1, Some(2)),
+        _ => return None,
+    })
+}
+
+/// Reject a reference to an intrinsic with an argument count outside
+/// the standard's bounds (`atan2(1.0)` used to compile silently and
+/// produce garbage). Fires only when the name actually resolves to
+/// the intrinsic — any visible user symbol (procedure, array, dummy)
+/// shadows it and is exempt.
+pub(super) fn check_intrinsic_call_arity(
+    ctx: &mut Ctx<'_>,
+    span: Span,
+    name: &str,
+    nargs: usize,
+) {
+    let key = name.to_lowercase();
+    if ctx.lookup(&key).is_some() || !is_intrinsic_name(&key) {
+        return;
+    }
+    let Some((min, max)) = intrinsic_arity(&key) else {
+        return;
+    };
+    if nargs >= min && max.is_none_or(|m| nargs <= m) {
+        return;
+    }
+    let expect = match (min, max) {
+        (a, Some(b)) if a == b => a.to_string(),
+        (a, Some(b)) => format!("{} to {}", a, b),
+        (a, None) => format!("at least {}", a),
+    };
+    let noun = if expect == "1" { "argument" } else { "arguments" };
+    ctx.error(
+        span,
+        format!(
+            "intrinsic '{}' takes {} {}, got {}",
+            key, expect, noun, nargs
+        ),
+    );
 }
 
 pub fn is_intrinsic_name(name: &str) -> bool {
