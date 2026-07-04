@@ -339,6 +339,16 @@ pub(super) fn load_external_module(
         } else {
             SymbolKind::Variable
         };
+        let array_spec = if var.rank == 0 {
+            Vec::new()
+        } else {
+            let template = if var.allocatable || var.pointer {
+                ArraySpec::Deferred
+            } else {
+                ArraySpec::AssumedShape { lower: None }
+            };
+            vec![template; var.rank]
+        };
         let attrs = SymbolAttrs {
             access: var.access,
             allocatable: var.allocatable,
@@ -347,6 +357,7 @@ pub(super) fn load_external_module(
             target: var.target,
             parameter: var.is_parameter,
             external: var.proc_pointer,
+            array_spec,
             procedure_iface: if var.proc_pointer {
                 match &var.type_info {
                     Some(TypeInfo::Derived(name)) => Some(name.clone()),
