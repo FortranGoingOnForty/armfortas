@@ -2690,6 +2690,17 @@ pub(crate) fn lower_expr_full(
                 .unwrap_or(IrType::Int(IntWidth::I32));
                 let func_ref = if let Some((target, _, _)) = procptr_target {
                     FuncRef::Indirect(target)
+                } else if resolved_generic.is_some() {
+                    // Post-generic-resolution the specific is authoritative;
+                    // the bare generic name must not participate in the
+                    // internal-subprogram rebind (see emit_named_function_call).
+                    same_unit_func_ref(
+                        st,
+                        b.func().name.as_str(),
+                        internal_funcs,
+                        &[&callee_key],
+                        call_name,
+                    )
                 } else {
                     same_unit_func_ref(
                         st,
