@@ -1227,3 +1227,25 @@ mod tests {
         assert_eq!(afs_lgt(b"a".as_ptr(), 1, b"a".as_ptr(), 1), 0); // equal → GT false
     }
 }
+
+/// SELECTED_CHAR_KIND (F2003 16.9.180): DEFAULT/ASCII are kind 1;
+/// ISO_10646 answers 4 to match the constant-fold path, though UCS-4
+/// character DATA is not implemented; anything else is -1. Trailing
+/// blanks in the name are insignificant.
+#[no_mangle]
+pub extern "C" fn afs_selected_char_kind(ptr: *const u8, len: i64) -> i32 {
+    let s: &[u8] = if ptr.is_null() || len <= 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(ptr, len as usize) }
+    };
+    let name = String::from_utf8_lossy(s);
+    let name = name.trim();
+    if name.eq_ignore_ascii_case("default") || name.eq_ignore_ascii_case("ascii") {
+        1
+    } else if name.eq_ignore_ascii_case("iso_10646") {
+        4
+    } else {
+        -1
+    }
+}

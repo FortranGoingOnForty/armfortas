@@ -6225,6 +6225,16 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             };
 
             if let Some(ctrl) = controls.first() {
+                // Whole-char-array internal READ produced silent garbage
+                // (the len-0 buffer view class, same as WRITE had). Until
+                // the read path grows record-per-element semantics, reject
+                // loudly — element units (rec(2)) work and stay routed.
+                if internal_io_array_target(b, ctx, ctrl).is_some() {
+                    eprintln!(
+                        "armfortas: error: internal READ from a whole character array is not implemented; read elements individually"
+                    );
+                    std::process::exit(1);
+                }
                 if let Some((buf_ptr, buf_len)) = internal_io_buffer(b, ctx, ctrl) {
                     if is_list_directed {
                         lower_internal_read_items(b, ctx, items, buf_ptr, buf_len, iostat_addr);

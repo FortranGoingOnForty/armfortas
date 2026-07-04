@@ -3997,15 +3997,30 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                     if let Some(mode) = c.stmt_leading_zero {
                         engine.set_leading_zero(mode);
                     }
-                    match engine.format_values_checked(&c.values) {
+                    // Reverting scans: a scalar internal file has exactly
+                    // one record, so a second scan (or an explicit '/')
+                    // is an overflow — previously the excess values were
+                    // silently dropped.
+                    match engine.format_values_reverting_checked(&c.values) {
                         Ok(output) => {
-                            write_to_buffer(
-                                buf,
-                                buf_len,
-                                0,
-                                output.as_bytes(),
-                                std::ptr::null_mut(),
-                            );
+                            if output.contains('\n') {
+                                io_status = 1;
+                                io_msg = Some("write exceeds internal file size");
+                                if c.iostat.is_null() {
+                                    eprintln!(
+                                        "ERROR: internal WRITE of more than one record into a character scalar"
+                                    );
+                                    std::process::exit(2);
+                                }
+                            } else {
+                                write_to_buffer(
+                                    buf,
+                                    buf_len,
+                                    0,
+                                    output.as_bytes(),
+                                    std::ptr::null_mut(),
+                                );
+                            }
                         }
                         Err(_) => {
                             io_status = 1;
@@ -4017,9 +4032,19 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                     if let Some(mode) = c.stmt_leading_zero {
                         engine.set_leading_zero(mode);
                     }
-                    match engine.format_values_checked(&c.values) {
+                    // Same one-record rule as FmtSink::Internal.
+                    match engine.format_values_reverting_checked(&c.values) {
                         Ok(output) => {
-                            if !store_internal_alloc_record(
+                            if output.contains('\n') {
+                                io_status = 1;
+                                io_msg = Some("write exceeds internal file size");
+                                if c.iostat.is_null() {
+                                    eprintln!(
+                                        "ERROR: internal WRITE of more than one record into a character scalar"
+                                    );
+                                    std::process::exit(2);
+                                }
+                            } else if !store_internal_alloc_record(
                                 desc as *mut crate::descriptor::StringDescriptor,
                                 output.as_bytes(),
                             ) {

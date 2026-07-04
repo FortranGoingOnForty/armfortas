@@ -2185,6 +2185,23 @@ pub(crate) fn lower_expr_full(
                                 super::const_scalar::selected_char_kind_value(value) as i32,
                             );
                         }
+                        // Non-literal NAME: evaluate at runtime (was an
+                        // undefined-symbol link error).
+                        let (ptr, len) = lower_string_expr_full(
+                            b,
+                            locals,
+                            arg_expr,
+                            st,
+                            type_layouts,
+                            internal_funcs,
+                            contained_host_refs,
+                            descriptor_params,
+                        );
+                        return b.call(
+                            FuncRef::External("afs_selected_char_kind".into()),
+                            vec![ptr, len],
+                            IrType::Int(IntWidth::I32),
+                        );
                     }
                 }
                 let intrinsic_result =
