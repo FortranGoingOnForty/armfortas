@@ -16304,6 +16304,49 @@ fn module_character_star_parameter_from_component_concat_initializes_runtime_byt
 }
 
 #[test]
+fn module_character_star_parameter_repeat_concat_initializes_runtime_bytes() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=module_character_star_parameter_repeat_concat_initializes_runtime_bytes count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  character(len=*), parameter :: fmt = '(\"#\", *(1x, a))'\n  character(len=*), parameter :: indent = repeat(' ', 5) // repeat('.', 3)\ncontains\n  subroutine check()\n    integer :: i\n    if (len(indent) /= 8) error stop 1\n    do i = 1, 5\n      if (iachar(indent(i:i)) /= 32) error stop 10 + i\n    end do\n    do i = 6, 8\n      if (indent(i:i) /= '.') error stop 20 + i\n    end do\n    write(*, fmt) indent, 'name', '[PASSED]'\n  end subroutine\nend module\nprogram p\n  use m, only: check\n  implicit none\n  call check()\nend program\n",
+        "f90",
+    );
+    let out = unique_path("module_char_star_repeat_concat", "bin");
+
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("module char star repeat concat compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "module char star repeat concat compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("module char star repeat concat run failed");
+    assert!(
+        run.status.success(),
+        "module char star repeat concat run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "#      ... name [PASSED]\n"
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn module_character_star_parameter_with_achar_and_repeat_defaults_initializes_runtime_bytes() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
