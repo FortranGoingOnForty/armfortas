@@ -5342,6 +5342,7 @@ mod tests {
             0,
             lz.as_mut_ptr(),
             lz.len() as i64,
+            std::ptr::null_mut(),
         );
         assert_eq!(&lz[..8], b"SUPPRESS");
 
