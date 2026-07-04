@@ -6,6 +6,8 @@
 !.docs/audits/x86_64-o0-sweep.md
 # x09 DoD requires the pass audit committed.
 !.docs/audits/x09-pass-audit.md
+# x12 deliverable 6: the real-project campaign log is a committed artifact.
+!.docs/audits/x86-campaign-log.md
 .fackr/
 .refs/
 target/

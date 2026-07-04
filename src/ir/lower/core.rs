@@ -18223,6 +18223,37 @@ pub(super) fn find_procedure_scope_id_for_caller(
     find_procedure_scope_id(st, name)
 }
 
+/// Caller-relative procedure-scope walk with NO global fallback: the
+/// caller itself or a contained sibling reachable via host association,
+/// or nothing. `same_unit_func_ref` uses this so a bare name that
+/// happens to match an internal subprogram of an unrelated procedure
+/// can never override an already-resolved callee.
+pub(super) fn find_procedure_scope_id_for_caller_strict(
+    st: &SymbolTable,
+    name: &str,
+    caller_scope: Option<crate::sema::symtab::ScopeId>,
+) -> Option<crate::sema::symtab::ScopeId> {
+    let start = caller_scope?;
+    let mut cur = Some(start);
+    while let Some(cur_id) = cur {
+        let cur_scope = st.scope(cur_id);
+        if scope_matches_procedure_name(cur_scope, name) && scope_has_linkable_parent(st, cur_id) {
+            return Some(cur_id);
+        }
+        let sibling = st.all_scopes().iter().enumerate().find_map(|(idx, scope)| {
+            (scope.parent == Some(cur_id)
+                && scope_matches_procedure_name(scope, name)
+                && scope_has_linkable_parent(st, idx))
+            .then_some(idx)
+        });
+        if sibling.is_some() {
+            return sibling;
+        }
+        cur = cur_scope.parent;
+    }
+    None
+}
+
 pub(super) fn lowered_scope_symbol_name(
     st: &SymbolTable,
     internal_funcs: &HashMap<String, u32>,
@@ -18327,7 +18358,20 @@ pub(super) fn same_unit_func_ref(
     // in the sort submodule), so `int32_increase_sort`'s introsort
     // would silently call into bitset_large_decrease's helpers.
     let caller_scope = current_proc_scope();
-    let Some(scope_id) = find_procedure_scope_id_for_caller(st, matched_key, caller_scope) else {
+    // Host-association ONLY: the rebind exists to redirect calls to
+    // contained procedures the caller can actually reach (F2018 §11.2.1).
+    // The old path fell back to a global last-match scan when the
+    // caller-relative walk found nothing, which let an internal
+    // subprogram of an UNRELATED procedure hijack an already-resolved
+    // call: tomlf's ordered-map push_back resolved its generic `resize`
+    // to tomlf_structure_node's specific (bare name "resize"), then the
+    // global scan rebound it to parse_table_header's internal toml_key
+    // resize — toml_key strides over a toml_node array, scribbling text
+    // pointers into polymorphic val slots. When the walk finds nothing,
+    // the already-resolved fallback name is the right answer.
+    let Some(scope_id) =
+        find_procedure_scope_id_for_caller_strict(st, matched_key, caller_scope)
+    else {
         return FuncRef::External(fallback_call_name);
     };
     let Some(lowered) = lowered_scope_symbol_name(st, internal_funcs, scope_id) else {
@@ -19018,13 +19062,32 @@ pub(super) fn emit_named_function_call(
     };
     append_host_closure_args_raw(b, locals, contained_host_refs, closure_key, &mut call_args);
 
-    let func_ref = same_unit_func_ref(
-        st,
-        b.func().name.as_str(),
-        internal_funcs,
-        &[&callee_key, &key],
-        call_name,
-    );
+    // After generic resolution the specific is authoritative: never let the
+    // BARE generic name participate in the internal-subprogram rebind.
+    // tomlf_diagnostic's render calls to_string(line); the generic resolved
+    // to tomlf_utils' to_string_i4 (1 arg) and the call_args were built for
+    // it, but same_unit_func_ref matched the bare "to_string" in the
+    // unit-wide internal_funcs map and rewrote the callee to the caller
+    // module's 2-arg to_string(val, width) — a 2-arg vector welded onto a
+    // 3-param function, so `width` read garbage and every fpm manifest
+    // diagnostic crashed instead of rendering.
+    let func_ref = if resolved_generic.is_some() {
+        same_unit_func_ref(
+            st,
+            b.func().name.as_str(),
+            internal_funcs,
+            &[&callee_key],
+            call_name,
+        )
+    } else {
+        same_unit_func_ref(
+            st,
+            b.func().name.as_str(),
+            internal_funcs,
+            &[&callee_key, &key],
+            call_name,
+        )
+    };
     b.call(func_ref, call_args, ret_ty)
 }
 

@@ -3175,6 +3175,7 @@ pub extern "C" fn afs_inquire_unit(
     unformatted_buf_len: i64,
     leading_zero_buf: *mut u8,
     leading_zero_buf_len: i64,
+    pos_out: *mut i64,
 ) {
     let state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     let unit_entry = state.units.get(&unit);
@@ -3241,6 +3242,21 @@ pub extern "C" fn afs_inquire_unit(
                 *size_out = sz;
             }
         }
+        if !pos_out.is_null() {
+            // F2018 §12.10.2.22: POS= is the file storage unit the next
+            // read/write would address, 1-based; stream access only.
+            // `impl Seek for &File` lets us query without a mutable unit.
+            let p = match &u.stream {
+                UnitStream::FileRaw(f) => (&*f)
+                    .stream_position()
+                    .map(|off| off as i64 + 1)
+                    .unwrap_or(-1),
+                _ => -1,
+            };
+            unsafe {
+                *pos_out = p;
+            }
+        }
     } else {
         write_inquire_string(name_buf, name_buf_len, "");
         write_inquire_string(access_buf, access_buf_len, "UNDEFINED");
@@ -3275,6 +3291,11 @@ pub extern "C" fn afs_inquire_unit(
         if !size_out.is_null() {
             unsafe {
                 *size_out = -1;
+            }
+        }
+        if !pos_out.is_null() {
+            unsafe {
+                *pos_out = -1;
             }
         }
     }
