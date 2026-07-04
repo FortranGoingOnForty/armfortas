@@ -1600,31 +1600,63 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         }
     }
 
-    // host arch matches (gas on FreeBSD/Linux; `as --64`). Cross-
-    // assembly from a non-x86 host waits for afs-as's x86 encoder
-    // (x14). Mach-O keeps the existing as/AFS_AS routing below.
+    // ELF assembly routing (x14): the in-process afs-as x86 pipeline
+    // is the default. AFS_AS_PATH substitutes a subprocess assembler
+    // (invoked `<as> --64 -o obj asm`); AFS_AS=0 forces the system
+    // `as`. Mach-O keeps the existing as/AFS_AS routing below.
     if opts.target.object_format() == crate::target::ObjectFormat::Elf {
+        let route = elf_assembler_override();
         let host = crate::target::TargetSpec::host();
-        if host.arch != opts.target.arch || host.object_format() != crate::target::ObjectFormat::Elf
-        {
-            return Err(format!(
-                "cannot assemble for target '{}' on this host: cross-assembly needs the afs-as x86 encoder (sprint x14)",
-                opts.target
-            ));
+        let cross = host.arch != opts.target.arch
+            || host.object_format() != crate::target::ObjectFormat::Elf;
+        if cross {
+            if route.is_some() {
+                return Err(format!(
+                    "cannot assemble for target '{}' with a host assembler: unset AFS_AS_PATH/AFS_AS to use the built-in one",
+                    opts.target
+                ));
+            }
+            if !opts.emit_obj {
+                return Err(format!(
+                    "cannot link for target '{}' on this host: cross-linking is not supported, use -c",
+                    opts.target
+                ));
+            }
         }
         let phase = phases.start("assemble");
-        let as_result = Command::new(env_override("AFS_AS_PATH").unwrap_or_else(|| "as".into()))
-            .args(["--64", "-o"])
-            .arg(&obj_path)
-            .arg(&asm_path)
-            .output()
-            .map_err(|e| format!("cannot run assembler: {}", e))?;
-        phase.end(&mut phases);
-        if !as_result.status.success() {
-            return Err(format!(
-                "assembler failed:\n{}",
-                String::from_utf8_lossy(&as_result.stderr)
-            ));
+        match &route {
+            None => {
+                // In-process: parse + encode + relax, then write the
+                // ELF object directly.
+                let src = fs::read_to_string(&asm_path)
+                    .map_err(|e| format!("cannot read '{}': {}", asm_path.display(), e))?;
+                let osabi = match opts.target.os {
+                    crate::target::Os::FreeBsd => afs_as::elf::ELFOSABI_FREEBSD,
+                    _ => afs_as::elf::ELFOSABI_NONE,
+                };
+                let obj = afs_as::x86::assemble::assemble_x86(&src, osabi)
+                    .map_err(|e| format!("afs-as: {}: {}", asm_path.display(), e))?;
+                let bytes = afs_as::elf::write_elf(&obj)
+                    .map_err(|e| format!("afs-as: elf writer: {}", e))?;
+                fs::write(&obj_path, bytes)
+                    .map_err(|e| format!("cannot write '{}': {}", obj_path.display(), e))?;
+                phase.end(&mut phases);
+            }
+            Some(assembler) => {
+                let as_result = Command::new(assembler)
+                    .args(["--64", "-o"])
+                    .arg(&obj_path)
+                    .arg(&asm_path)
+                    .output()
+                    .map_err(|e| format!("cannot run assembler: {}", e))?;
+                phase.end(&mut phases);
+                if !as_result.status.success() {
+                    return Err(format!(
+                        "assembler failed:\n{}",
+                        String::from_utf8_lossy(&as_result.stderr)
+                    ));
+                }
+            }
         }
         if opts.emit_obj {
             let _ = fs::remove_file(&asm_path);
@@ -1903,6 +1935,24 @@ fn push_afs_ld_link_flags(args: &mut Vec<String>, opts: &Options) {
         args.push("-rpath".into());
         args.push(path.to_string_lossy().into_owned());
     }
+}
+
+/// ELF assembler routing (x14). `None` means the in-process afs-as
+/// pipeline — the default. `Some(path)` means spawn `<path> --64 -o
+/// obj asm`: AFS_AS_PATH names a substitute assembler, AFS_AS=0
+/// (or false/no/off) falls back to the system `as`.
+fn elf_assembler_override() -> Option<String> {
+    if let Some(assembler) = env_override("AFS_AS_PATH") {
+        return Some(assembler);
+    }
+    let enabled = env_override("AFS_AS")?;
+    if matches!(
+        enabled.as_str(),
+        "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF"
+    ) {
+        return Some("as".into());
+    }
+    None
 }
 
 fn afs_ld_override() -> Option<String> {

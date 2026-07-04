@@ -46064,11 +46064,11 @@ fn target_flag_x86_64_links_natively_or_diagnoses_the_host_boundary() {
         .output()
         .expect("failed to spawn armfortas");
     // The boundary advanced sprint by sprint — x00 errored at the
-    // backend, x03 at instruction selection, x05 at the link step —
-    // and x06 removed it on the matching host: a FreeBSD x86_64 box
-    // links and the binary exists. Elsewhere a guard still fires and
-    // names what unblocks it: cross-assembly (x14) on non-x86 hosts,
-    // cross-linking on x86 hosts with a different OS.
+    // backend, x03 at instruction selection, x05 at the link step,
+    // x06 removed it on the matching host, and x14 removed the
+    // assembly boundary entirely (the built-in afs-as pipeline runs
+    // anywhere). What remains is linking: only a matching host can
+    // produce a runnable binary.
     if cfg!(all(target_os = "freebsd", target_arch = "x86_64")) {
         assert_eq!(out.status.code(), Some(0), "status: {:?}", out.status);
         assert!(exe.exists(), "successful link must write the output path");
@@ -46079,8 +46079,8 @@ fn target_flag_x86_64_links_natively_or_diagnoses_the_host_boundary() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
             stderr.contains("cross-linking is out of scope")
-                || stderr.contains("cross-assembly needs the afs-as x86 encoder (sprint x14)"),
-            "expected the cross-link (or x14 cross-assembly) diagnostic, got: {}",
+                || stderr.contains("cross-linking is not supported, use -c"),
+            "expected a cross-link diagnostic, got: {}",
             stderr
         );
         assert!(
@@ -46090,6 +46090,36 @@ fn target_flag_x86_64_links_natively_or_diagnoses_the_host_boundary() {
     }
 
     let _ = fs::remove_file(&src);
+}
+
+#[test]
+fn target_flag_x86_64_object_emission_works_on_every_host() {
+    // x14: `-c` for an ELF target needs no host toolchain — the
+    // in-process afs-as pipeline assembles and writes the object on
+    // any host, including arm64 macOS.
+    let src = unique_path("x14_cross_obj", "f90");
+    fs::write(&src, "program p\n  print *, 1\nend program p\n").unwrap();
+    let obj = unique_path("x14_cross_obj", "o");
+
+    let out = Command::new(compiler("armfortas"))
+        .args(["--target", "x86_64-freebsd", "-c"])
+        .arg(&src)
+        .arg("-o")
+        .arg(&obj)
+        .output()
+        .expect("failed to spawn armfortas");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let bytes = fs::read(&obj).expect("object must exist");
+    assert_eq!(&bytes[..4], b"\x7fELF", "not an ELF object");
+    assert_eq!(bytes[7], 9, "EI_OSABI must be FreeBSD for a freebsd target");
+
+    let _ = fs::remove_file(&src);
+    let _ = fs::remove_file(&obj);
 }
 
 #[test]
