@@ -3447,7 +3447,6 @@ pub extern "C" fn afs_inquire_unit(
     unformatted_buf_len: i64,
     leading_zero_buf: *mut u8,
     leading_zero_buf_len: i64,
-    pos_out: *mut i64,
 ) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     let unit_entry = state.units.get_mut(&unit);
