@@ -18691,9 +18691,18 @@ pub(super) fn emit_named_function_call(
     let (call_name, callee_key) = match resolved_generic.as_ref() {
         Some(candidate) => resolved_symbol_call_target_for_candidate(st, candidate),
         None => {
+            // Caller-scope-aware, like the expr.rs function-call fallback:
+            // the scope-blind scan binds the first same-named callable in
+            // source order. fpm defines both M_CLI2::join_path (collapses
+            // "//" via substitute) and fpm_filesystem::join_path (keeps
+            // it); every one of the 164 join_path calls in the binary
+            // bound to M_CLI2's, so a "./" root turned "../toml-f" into
+            // ".../toml-f" and path dependencies could not resolve. This
+            // hidden-character-result path bypasses expr.rs's resolution,
+            // so it needs the same treatment.
             let resolved_name = callee_name.to_string();
             let resolved_key = resolved_name.to_lowercase();
-            resolved_symbol_call_target(st, &resolved_key, &resolved_name)
+            resolved_symbol_call_target_caller_aware(st, b, &resolved_key, &resolved_name)
         }
     };
     let abi_lookup_keys =
