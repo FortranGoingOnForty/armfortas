@@ -2323,15 +2323,16 @@ pub(crate) fn lower_expr_full(
                     }
                     resolved_symbol_call_target_caller_aware(st, b, &key, name)
                 };
-                let arg_slots = reorder_args_by_keyword_slots(
-                    original_args,
-                    if procptr_target.is_some() {
-                        &signature_key
-                    } else {
-                        &callee_key
-                    },
-                    st,
-                );
+                let arg_slots = if procptr_target.is_some() {
+                    reorder_args_by_keyword_slots(original_args, &signature_key, st)
+                } else {
+                    reorder_args_by_keyword_slots_for_target(
+                        original_args,
+                        call_name.as_str(),
+                        &callee_key,
+                        st,
+                    )
+                };
                 let arg_slots = if let Some(candidate) = resolved_generic.as_ref() {
                     reorder_args_for_specific_candidate(st, candidate, original_args)
                         .unwrap_or(arg_slots)
