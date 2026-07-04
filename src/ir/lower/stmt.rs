@@ -2418,33 +2418,81 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             };
 
             if let Some(ctrl) = controls.first() {
-                // Formatted internal WRITE to a deferred-length allocatable
+                // Internal WRITE to a deferred-length allocatable
                 // `character(:), allocatable` scalar: unallocated targets are
                 // allocated to the record length, while allocated targets
-                // behave as fixed internal files. List-directed to such a
-                // target stays on the fixed-buffer path below.
-                if !is_list_directed {
-                    if let Some(desc) = internal_io_alloc_target(b, ctx, ctrl) {
-                        let (fmt_ptr, fmt_len) =
-                            lower_format_expr(b, ctx, &fmt_control.unwrap().value);
+                // behave as fixed internal files. Formatted goes through the
+                // fmt engine's InternalAlloc sink; list-directed collects the
+                // record in the runtime (afs_lst_ia_*) and stores it in one
+                // shot with the same semantics.
+                if let Some(desc) = internal_io_alloc_target(b, ctx, ctrl) {
+                    if is_list_directed {
                         b.call(
-                            FuncRef::External("afs_fmt_begin_internal_alloc".into()),
-                            vec![desc, fmt_ptr, fmt_len, iostat_ptr, iomsg_ptr, iomsg_len],
+                            FuncRef::External("afs_lst_ia_begin".into()),
+                            vec![desc, iostat_ptr, iomsg_ptr, iomsg_len],
                             IrType::Void,
                         );
-                        lower_fmt_leading_zero_override(b, ctx, leading_zero_ctrl);
-                        for item in items {
-                            lower_fmt_push(b, ctx, item);
-                        }
-                        let adv = advance_runtime
-                            .unwrap_or_else(|| b.const_i32(if advance { 1 } else { 0 }));
+                        lower_internal_write_items_alloc(b, ctx, items);
                         b.call(
-                            FuncRef::External("afs_fmt_end".into()),
-                            vec![adv],
+                            FuncRef::External("afs_lst_ia_end".into()),
+                            vec![],
                             IrType::Void,
                         );
                         return;
                     }
+                    let (fmt_ptr, fmt_len) =
+                        lower_format_expr(b, ctx, &fmt_control.unwrap().value);
+                    b.call(
+                        FuncRef::External("afs_fmt_begin_internal_alloc".into()),
+                        vec![desc, fmt_ptr, fmt_len, iostat_ptr, iomsg_ptr, iomsg_len],
+                        IrType::Void,
+                    );
+                    lower_fmt_leading_zero_override(b, ctx, leading_zero_ctrl);
+                    for item in items {
+                        lower_fmt_push(b, ctx, item);
+                    }
+                    let adv = advance_runtime
+                        .unwrap_or_else(|| b.const_i32(if advance { 1 } else { 0 }));
+                    b.call(
+                        FuncRef::External("afs_fmt_end".into()),
+                        vec![adv],
+                        IrType::Void,
+                    );
+                    return;
+                }
+                // Whole character array as the internal unit: formatted
+                // writes get record-per-element semantics; unallocated or
+                // overflowed targets error loudly in the runtime. Our
+                // list-directed processor emits a single record, which
+                // goes into element one (previously both shapes silently
+                // wrote nothing through a zero-length buffer view).
+                if let Some((base, elem_len, nelems)) = internal_io_array_target(b, ctx, ctrl) {
+                    if is_list_directed {
+                        lower_internal_write_items(b, ctx, items, base, elem_len);
+                        return;
+                    }
+                    let (fmt_ptr, fmt_len) =
+                        lower_format_expr(b, ctx, &fmt_control.unwrap().value);
+                    b.call(
+                        FuncRef::External("afs_fmt_begin_internal_array".into()),
+                        vec![
+                            base, elem_len, nelems, fmt_ptr, fmt_len, iostat_ptr, iomsg_ptr,
+                            iomsg_len,
+                        ],
+                        IrType::Void,
+                    );
+                    lower_fmt_leading_zero_override(b, ctx, leading_zero_ctrl);
+                    for item in items {
+                        lower_fmt_push(b, ctx, item);
+                    }
+                    let adv = advance_runtime
+                        .unwrap_or_else(|| b.const_i32(if advance { 1 } else { 0 }));
+                    b.call(
+                        FuncRef::External("afs_fmt_end".into()),
+                        vec![adv],
+                        IrType::Void,
+                    );
+                    return;
                 }
                 if let Some((buf_ptr, buf_len)) = internal_io_buffer(b, ctx, ctrl) {
                     if is_list_directed {

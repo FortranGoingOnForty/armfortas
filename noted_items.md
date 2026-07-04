@@ -506,3 +506,21 @@ Found during l04 (2026-06-12):
   — repo policy, silent wrong-typed forwarding is a miscompile factory.
   Canary: lib 1301/0, run_programs 120/0, and the full 53k-line fpm
   compile all pass with the loud fallback, so no live path relies on it.
+
+Found during the L-tail internal-file work (2026-07-04):
+
+- **Scalar internal WRITE drops values past one format scan**: the
+  Internal and InternalAlloc sinks call the non-reverting
+  `format_values_checked`, so `write(s,'(i0)') 1, 2` silently writes
+  only "1" into a scalar unit. A scalar internal file has exactly one
+  record — the overflow should be an IOSTAT/loud error like the new
+  array-sink path. Owner: l10.
+- **List-directed internal WRITE to a char array emits one record**
+  (into element 1; the rest untouched). Record splitting for
+  list-directed output is processor-dependent; gfortran wraps at the
+  element length. Recorded decision, revisit if a target project
+  compares against gfortran here. Owner: l10 if a project hits it.
+- **Internal READ from whole char arrays unprobed**: the WRITE side
+  was silently broken (fixed 2026-07-04, record-per-element); the
+  READ side likely has the same len-0-view flaw. Probe and fix.
+  Owner: l10.

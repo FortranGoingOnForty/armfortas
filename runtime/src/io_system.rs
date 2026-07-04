@@ -3521,6 +3521,17 @@ enum FmtSink {
     /// treated as a fixed internal file; an unallocated target is allocated
     /// to the formatted record length.
     InternalAlloc { desc: *mut u8 },
+    /// Internal write whose target is a whole character array: each
+    /// formatted record goes into one element (truncated or blank-
+    /// padded to the element length). Elements after the last record
+    /// written are left unchanged (F2023 12.6.4.8.3 leaves them
+    /// undefined). Overflowing the array or targeting an unallocated
+    /// one is an error — loud when no IOSTAT= is present.
+    InternalArray {
+        buf: *mut u8,
+        elem_len: i64,
+        nelems: i64,
+    },
 }
 
 /// Thread-local state for active formatted I/O operations.
@@ -3722,6 +3733,138 @@ pub extern "C" fn afs_fmt_begin_internal_alloc(
     });
 }
 
+/// Begin a formatted internal WRITE whose unit is a whole character
+/// array: record-per-element semantics via FmtSink::InternalArray.
+#[no_mangle]
+pub extern "C" fn afs_fmt_begin_internal_array(
+    buf: *mut u8,
+    elem_len: i64,
+    nelems: i64,
+    fmt_str: *const u8,
+    fmt_len: i64,
+    iostat: *mut i32,
+    iomsg: *mut u8,
+    iomsg_len: i64,
+) {
+    let fmt = unsafe_str(fmt_str, fmt_len);
+    FMT_CTX.with(|ctx| {
+        ctx.borrow_mut().push(FmtContext {
+            sink: FmtSink::InternalArray {
+                buf,
+                elem_len,
+                nelems,
+            },
+            format_str: fmt,
+            values: Vec::new(),
+            iostat,
+            iomsg,
+            iomsg_len,
+            stmt_leading_zero: None,
+        });
+    });
+}
+
+/// List-directed internal WRITE to a deferred-length allocatable
+/// character scalar. The fixed-buffer writers can't serve this target
+/// (an unallocated descriptor presents a len-0 view), so the record
+/// is collected here and stored in one shot through
+/// `store_internal_alloc_record` — the same allocate-when-absent /
+/// fixed-when-present semantics as the formatted path. Item rendering
+/// matches `afs_write_internal_*` exactly (leading blank + `{}`).
+struct LstIaContext {
+    desc: *mut crate::descriptor::StringDescriptor,
+    record: Vec<u8>,
+    iostat: *mut i32,
+    iomsg: *mut u8,
+    iomsg_len: i64,
+}
+
+unsafe impl Send for LstIaContext {}
+
+thread_local! {
+    static LST_IA_CTX: RefCell<Vec<LstIaContext>> = const { RefCell::new(Vec::new()) };
+}
+
+#[no_mangle]
+pub extern "C" fn afs_lst_ia_begin(desc: *mut u8, iostat: *mut i32, iomsg: *mut u8, iomsg_len: i64) {
+    LST_IA_CTX.with(|ctx| {
+        ctx.borrow_mut().push(LstIaContext {
+            desc: desc as *mut crate::descriptor::StringDescriptor,
+            record: Vec::new(),
+            iostat,
+            iomsg,
+            iomsg_len,
+        });
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn afs_lst_ia_int(val: i64) {
+    LST_IA_CTX.with(|ctx| {
+        if let Some(c) = ctx.borrow_mut().last_mut() {
+            c.record.extend_from_slice(format!(" {}", val).as_bytes());
+        }
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn afs_lst_ia_int128(val: i128) {
+    LST_IA_CTX.with(|ctx| {
+        if let Some(c) = ctx.borrow_mut().last_mut() {
+            c.record.extend_from_slice(format!(" {}", val).as_bytes());
+        }
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn afs_lst_ia_real(val: f64) {
+    LST_IA_CTX.with(|ctx| {
+        if let Some(c) = ctx.borrow_mut().last_mut() {
+            c.record.extend_from_slice(format!(" {}", val).as_bytes());
+        }
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn afs_lst_ia_string(ptr: *const u8, len: i64) {
+    LST_IA_CTX.with(|ctx| {
+        if let Some(c) = ctx.borrow_mut().last_mut() {
+            c.record.push(b' ');
+            if !ptr.is_null() && len > 0 {
+                let slice = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+                c.record.extend_from_slice(slice);
+            }
+        }
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn afs_lst_ia_end() {
+    let Some(c) = LST_IA_CTX.with(|ctx| ctx.borrow_mut().pop()) else {
+        return;
+    };
+    let mut io_status = 0i32;
+    let mut io_msg = "";
+    if !store_internal_alloc_record(c.desc, &c.record) {
+        io_status = 1;
+        io_msg = "out of memory";
+    }
+    if !c.iostat.is_null() {
+        unsafe { *c.iostat = io_status };
+    }
+    if !c.iomsg.is_null() && c.iomsg_len > 0 {
+        let cap = c.iomsg_len as usize;
+        let bytes = io_msg.as_bytes();
+        let copy = bytes.len().min(cap);
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), c.iomsg, copy);
+            if copy < cap {
+                std::ptr::write_bytes(c.iomsg.add(copy), b' ', cap - copy);
+            }
+        }
+    }
+}
+
 /// Set the per-statement LEADING_ZERO= override for the in-flight
 /// formatted write. Called between `afs_fmt_begin*` and `afs_fmt_end`
 /// when the WRITE statement carries a LEADING_ZERO= specifier. The
@@ -3882,6 +4025,59 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                             ) {
                                 io_status = 1;
                                 io_msg = Some("out of memory");
+                            }
+                        }
+                        Err(_) => {
+                            io_status = 1;
+                            io_msg = Some("format error");
+                        }
+                    }
+                }
+                FmtSink::InternalArray {
+                    buf,
+                    elem_len,
+                    nelems,
+                } => {
+                    if let Some(mode) = c.stmt_leading_zero {
+                        engine.set_leading_zero(mode);
+                    }
+                    // Reverting: each new format scan starts a new record,
+                    // i.e. the next array element.
+                    match engine.format_values_reverting_checked(&c.values) {
+                        Ok(output) => {
+                            if buf.is_null() || elem_len <= 0 || nelems <= 0 {
+                                io_status = 1;
+                                io_msg = Some("internal file is not allocated");
+                                if c.iostat.is_null() {
+                                    eprintln!(
+                                        "ERROR: internal WRITE to an unallocated or zero-size character array"
+                                    );
+                                    std::process::exit(2);
+                                }
+                            } else {
+                                let records: Vec<&str> = output.split('\n').collect();
+                                if records.len() as i64 > nelems {
+                                    io_status = 1;
+                                    io_msg = Some("write exceeds internal file size");
+                                    if c.iostat.is_null() {
+                                        eprintln!(
+                                            "ERROR: internal WRITE of {} records into a {}-element character array",
+                                            records.len(),
+                                            nelems
+                                        );
+                                        std::process::exit(2);
+                                    }
+                                } else {
+                                    for (i, rec) in records.iter().enumerate() {
+                                        write_to_buffer(
+                                            unsafe { buf.add(i * elem_len as usize) },
+                                            elem_len as usize,
+                                            0,
+                                            rec.as_bytes(),
+                                            std::ptr::null_mut(),
+                                        );
+                                    }
+                                }
                             }
                         }
                         Err(_) => {
@@ -5241,6 +5437,7 @@ mod tests {
             0,
             lz.as_mut_ptr(),
             lz.len() as i64,
+            std::ptr::null_mut(),
         );
         assert_eq!(&lz[..8], b"SUPPRESS");
 
