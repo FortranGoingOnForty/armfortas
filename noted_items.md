@@ -328,13 +328,15 @@ Found running the FULL workspace suite on FreeBSD for the first time
 
 Found during l04 (2026-06-12):
 
-- **No general intrinsic argument-count checking.** `atan2(1.0)` (one
-  arg to a two-arg intrinsic) compiles silently, as does `atan2d(1.0)`.
-  armfortas has no arity gate for elemental/transformational
-  intrinsics; misuse is caught only if lowering happens to panic. Out
-  of scope for l04 (the F2023 trig additions match the existing
-  intrinsics' lack of checking by design). Owner: a dedicated
-  intrinsic-signature-checking sprint if a target project surfaces it.
+- **RESOLVED (2026-07-04, L-tail)** ~~No general intrinsic
+  argument-count checking~~: `intrinsic_arity()` table +
+  `check_intrinsic_call_arity` in sema validate cover ~150 names with
+  F2023 16.9 bounds, on both function references and CALL statements.
+  Fires only when the name resolves to the intrinsic (user symbols
+  shadow); Range-subscripted references (sections/substrings) are
+  exempt by shape. Names outside the table remain unchecked —
+  extend with standard citations only. Validated no-false-reject
+  against the full corpus and the 53k-line fpm amalgamation.
 
 - **SYSTEM_CLOCK runtime is not integer-kind aware** (found l04,
   2026-06-12): afs_system_clock writes i64 COUNT (nanoseconds, ~1.7e18)
