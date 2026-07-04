@@ -515,3 +515,43 @@ E. stable PTY failures — CLASSIFIED + FIXED (commit 975fe77).
    are the gfortran-shared git tests) — armfortas now MATCHES gfortran on
    the PTY suite. Fixture: test_programs/x12_alloc_char_scalar_assumed_len.f90.
    lib 1290/0, run_programs 120/0, clippy clean.
+
+## afs-as x86_64/ELF (x13 + x14) — COMPLETE 2026-07-04
+
+The bespoke assembler now owns the ELF pipeline end to end. No system
+`as` in the default path on FreeBSD or Linux.
+
+x13 (ELF writer): afs-as/src/elf.rs — ELF64 relocatable model, writer,
+reader, validate. Record-level byte fidelity against gas 2.44 (dorado)
+and 2.46 (hasu); EI_OSABI pinned FreeBSD=9 / Linux=0; RELA-only,
+locals-first symtab, gas NOBITS conventions. Merged afs-as #8's
+predecessor (elf-writer, 570fdf7), pin PR #92.
+
+x14 (x86 encoder + assembler): AT&T-subset parser (self-contained),
+table-driven encoder (REX/ModRM/SIB, integer + SSE families, movq
+imm64 widening, width-reinterpreted immediates), two-pass assembler
+with rel8/rel32 relaxation fixed-point, gas local-symbol model
+(same-section PC-rel resolved at assembly, cross-section folded to
+STT_SECTION), .size dot markers, gas NOP fill. afs-as PRs #8 + #9.
+
+Referees, all green on dorado (gas 2.44) and hasu (gas 2.46):
+- per-instruction differential: 175 cases byte- + reloc-identical
+- whole-file: 6 backend fixtures + 8 relaxation boundary cases
+- whole-corpus (root crate): every test_programs at -O0/-O2/-O3,
+  1623 objects, section bytes + relocs + symbols equal
+- seeded fuzz: 96 program-shaped seeds vs gas; 512 garbage seeds
+  error-not-panic; 128 stress seeds roundtrip write/parse/write
+- NOP fill compared modulo binutils split order (2.44 longest-first,
+  2.46 remainder-first) — found on hasu, 614 padding-only diffs
+
+Fuzzer catches before any user did: movq $imm64 must widen to movabs
+form; orw $65535 must sign-reinterpret to the 83 imm8 form.
+
+Driver flip: in-process afs_as::x86::assemble default for ELF targets;
+AFS_AS_PATH subprocess contract kept (afs-as grew `--64` CLI);
+AFS_AS=0 falls back to system as. Cross-arch `-c` now works from any
+host (in-process pipeline); cross-linking still errors with guidance.
+run_programs 120/120 on all three routes (in-process, AFS_AS_PATH,
+AFS_AS=0); determinism_sweep green; fpm bootstrap ladder
+(stage0 -> stage3 byte-identical fixed point) green with the
+in-process assembler.
