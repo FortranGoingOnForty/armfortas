@@ -48338,6 +48338,119 @@ fn allocatable_character_array_self_section_assignment_preserves_values() {
 }
 
 #[test]
+fn separate_compilation_imported_alloc_char_array_parameter_assignment_reallocates() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=separate_compilation_imported_alloc_char_array_parameter_assignment_reallocates count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("sep_imported_alloc_char_param_assign");
+    let state_src = write_program_in(
+        &dir,
+        "cli_state.f90",
+        "module cli_state\n  implicit none\n  character(len=:), allocatable, public :: unnamed(:)\nend module\n",
+    );
+    let command_src = write_program_in(
+        &dir,
+        "command_line.f90",
+        "module command_line\n  use cli_state, only: unnamed\n  implicit none\n  character(len=20), parameter :: manual(*) = [character(len=20) :: ' ', 'fpm', 'new', 'build']\ncontains\n  subroutine expand_manual()\n    allocate(character(len=6) :: unnamed(2))\n    unnamed(1) = 'help'\n    unnamed(2) = 'manual'\n    if (unnamed(2) == 'manual') unnamed = manual\n  end subroutine\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use cli_state, only: unnamed\n  use command_line, only: expand_manual\n  implicit none\n  call expand_manual()\n  if (size(unnamed) /= 4) error stop 1\n  if (len(unnamed) /= 20) error stop 2\n  if (trim(unnamed(2)) /= 'fpm') then\n    print *, 'bad:', trim(unnamed(2))\n    print *, ichar(unnamed(2)(1:1)), ichar(unnamed(2)(2:2)), ichar(unnamed(2)(3:3))\n    error stop 3\n  end if\n  print *, 'ok'\nend program\n",
+    );
+    let state_obj = dir.join("cli_state.o");
+    let command_obj = dir.join("command_line.o");
+    let main_obj = dir.join("main.o");
+    let compile_state = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            state_src.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-o",
+            state_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("cli_state compile failed to spawn");
+    assert!(
+        compile_state.status.success(),
+        "cli_state compile failed: {}",
+        String::from_utf8_lossy(&compile_state.stderr)
+    );
+    let compile_command = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            command_src.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-o",
+            command_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("command_line compile failed to spawn");
+    assert!(
+        compile_command.status.success(),
+        "command_line compile failed: {}",
+        String::from_utf8_lossy(&compile_command.stderr)
+    );
+    let compile_main = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            main_src.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("main compile failed to spawn");
+    assert!(
+        compile_main.status.success(),
+        "main compile failed: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+    let out = dir.join("main.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            state_obj.to_str().unwrap(),
+            command_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("separate compilation alloc-char parameter assignment link failed to spawn");
+    assert!(
+        link.status.success(),
+        "separate compilation alloc-char parameter assignment link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("separate compilation alloc-char parameter assignment run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "separate compilation alloc-char parameter assignment run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn allocatable_fixed_character_array_implied_do_constructor_reallocates() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

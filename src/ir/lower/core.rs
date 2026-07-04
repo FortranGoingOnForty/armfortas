@@ -7741,6 +7741,7 @@ pub(super) fn install_one_global(
     if locals.contains_key(&local_key) {
         return;
     }
+    let rank = rank.max(info.declared_rank);
     // Rank known, bounds unknown until allocation: encode rank with None
     // upper bounds (the same shape the decl/allocate paths use). Fixed
     // arrays already carry their rank in `info.dims`.
