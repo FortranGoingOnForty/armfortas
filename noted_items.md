@@ -338,17 +338,13 @@ Found during l04 (2026-06-12):
   extend with standard citations only. Validated no-false-reject
   against the full corpus and the 53k-line fpm amalgamation.
 
-- **SYSTEM_CLOCK runtime is not integer-kind aware** (found l04,
-  2026-06-12): afs_system_clock writes i64 COUNT (nanoseconds, ~1.7e18)
-  and COUNT_MAX (i64::MAX) into the caller's temp, which the lowering
-  then truncates to the argument kind. With default integer (kind 4)
-  COUNT and COUNT_MAX overflow — COUNT_MAX reads back as -1. gfortran
-  picks a rate/max that fits the argument kind (rate 1000, max
-  HUGE(kind)). Fix needs the kind threaded into the runtime call (new
-  signature or per-kind entry points). l04 delivered the F2023
-  argument-kind RESTRICTIONS (validation); this runtime value-range
-  fix is separate. Owner: l05 (I/O + runtime) or a dedicated
-  system-intrinsics pass.
+- **RESOLVED (2026-07-04, L-tail)** ~~SYSTEM_CLOCK runtime is not
+  integer-kind aware~~: afs_system_clock_k takes the smallest integer
+  kind among the present args (threaded from the lowering's writeback
+  types). kind>=8 nanoseconds; kind 4 millisecond clock wrapped at
+  HUGE(int32) (rate 1000, gfortran-compatible); kinds 1/2 "no clock"
+  per F2018 16.9.202. l04_system_clock_kinds asserts exact kind-4
+  and kind-8 values.
 
 - **PRINT with a character format inserts spurious spaces** (found
   l04, 2026-06-12): `print '(A,A,A)', 'x[', s(1:1), ']'` emits

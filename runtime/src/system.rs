@@ -1,28 +1,54 @@
 //! Fortran system intrinsics: clock, timing, command-line, environment.
 
-/// SYSTEM_CLOCK: returns monotonic clock count, rate, and max.
-/// count_rate is nanoseconds (1_000_000_000 ticks per second).
+/// SYSTEM_CLOCK: returns monotonic clock count, rate, and max
+/// (kind-8 resolution; see afs_system_clock_k).
 #[no_mangle]
 pub extern "C" fn afs_system_clock(count: *mut i64, count_rate: *mut i64, count_max: *mut i64) {
+    afs_system_clock_k(count, count_rate, count_max, 8);
+}
+
+/// SYSTEM_CLOCK keyed by the smallest integer kind among the present
+/// arguments (gfortran's behavior): kind >= 8 gets the nanosecond
+/// clock, kind 4 a millisecond clock wrapped at HUGE(int32) so COUNT
+/// and COUNT_MAX fit, and kinds 1/2 report "no clock" per F2018
+/// 16.9.202 (COUNT = -HUGE, RATE = 0, MAX = 0). Values are written as
+/// i64; the lowering truncates to each argument's declared kind,
+/// which is lossless for the ranges chosen here.
+#[no_mangle]
+pub extern "C" fn afs_system_clock_k(
+    count: *mut i64,
+    count_rate: *mut i64,
+    count_max: *mut i64,
+    kind: i32,
+) {
     use std::time::SystemTime;
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default();
-    let nanos = now.as_nanos() as i64;
+
+    let (count_val, rate_val, max_val) = match kind {
+        k if k >= 8 => (now.as_nanos() as i64, 1_000_000_000i64, i64::MAX),
+        4 => {
+            let max = i32::MAX as i64;
+            ((now.as_millis() as i64) % (max + 1), 1_000, max)
+        }
+        2 => (-(i16::MAX as i64), 0, 0),
+        _ => (-(i8::MAX as i64), 0, 0),
+    };
 
     if !count.is_null() {
         unsafe {
-            *count = nanos;
+            *count = count_val;
         }
     }
     if !count_rate.is_null() {
         unsafe {
-            *count_rate = 1_000_000_000;
+            *count_rate = rate_val;
         }
     }
     if !count_max.is_null() {
         unsafe {
-            *count_max = i64::MAX;
+            *count_max = max_val;
         }
     }
 }

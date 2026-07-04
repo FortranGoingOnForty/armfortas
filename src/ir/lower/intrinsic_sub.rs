@@ -297,13 +297,33 @@ pub(crate) fn lower_intrinsic_subroutine(
             true
         }
         "system_clock" => {
-            // call system_clock(count, count_rate, count_max) — all optional
+            // call system_clock(count, count_rate, count_max) — all optional.
+            // The clock resolution keys off the smallest integer kind among
+            // the present arguments (gfortran behavior): default-integer
+            // callers get a millisecond clock that fits kind 4 instead of
+            // truncated nanoseconds (COUNT_MAX used to read back as -1).
             let (count, count_writeback) = nth_arg_i64_out(b, ctx, args, 0);
             let (rate, rate_writeback) = nth_arg_i64_out(b, ctx, args, 1);
             let (max, max_writeback) = nth_arg_i64_out(b, ctx, args, 2);
+            let mut kind: i64 = 16;
+            for wb in [&count_writeback, &rate_writeback, &max_writeback]
+                .into_iter()
+                .flatten()
+            {
+                let k = match wb.dest_ty {
+                    IrType::Int(IntWidth::I8) => 1,
+                    IrType::Int(IntWidth::I16) => 2,
+                    IrType::Int(IntWidth::I32) => 4,
+                    IrType::Int(IntWidth::I64) => 8,
+                    IrType::Int(IntWidth::I128) => 16,
+                    _ => continue, // REAL count_rate doesn't key the clock
+                };
+                kind = kind.min(k);
+            }
+            let kind_arg = b.const_i32(if kind == 16 { 8 } else { kind as i32 });
             b.call(
-                FuncRef::External("afs_system_clock".into()),
-                vec![count, rate, max],
+                FuncRef::External("afs_system_clock_k".into()),
+                vec![count, rate, max, kind_arg],
                 IrType::Void,
             );
             for writeback in [count_writeback, rate_writeback, max_writeback]
