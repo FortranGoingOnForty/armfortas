@@ -61,6 +61,29 @@ fn o3_vectorizes_manual_dot_product_loop() {
         "expected dot-product shape (vmul + vadd + vreduce_sum):\n{}",
         o3_ir
     );
+    if !cfg!(target_arch = "aarch64") {
+        // Pin the SSE2 legality of the synthesis: pmuludq even/odd
+        // lanes, never SSE4.1's pmulld — the baseline promise would
+        // break silently on older hardware if pmulld leaked in.
+        let o3_asm = capture_text(
+            CaptureRequest {
+                input: source.clone(),
+                requested: BTreeSet::from([Stage::Asm]),
+                opt_level: OptLevel::O3,
+            },
+            Stage::Asm,
+        );
+        assert!(
+            o3_asm.contains("pmuludq"),
+            "i32 lane multiply must use the SSE2 pmuludq synthesis:\n{}",
+            o3_asm
+        );
+        assert!(
+            !o3_asm.contains("pmulld"),
+            "pmulld is SSE4.1 — illegal at the SSE2 baseline:\n{}",
+            o3_asm
+        );
+    }
 
     // Runtime: sum(i*i for i = 1..32) = 32*33*65/6 = 11440.
     let stdout = capture_run_stdout(CaptureRequest {

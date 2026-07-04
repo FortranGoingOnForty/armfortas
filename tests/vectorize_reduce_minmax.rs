@@ -73,6 +73,19 @@ fn o3_vectorizes_int_max_and_min_reductions() {
             "VMax/VMin in the body should lower via smax.4s / smin.4s:\n{}",
             o3_asm
         );
+    } else {
+        // Pin the SSE2 legality of the synthesis: pcmpgtd
+        // compare-and-blend, never SSE4.1's pminsd/pmaxsd.
+        assert!(
+            o3_asm.contains("pcmpgtd"),
+            "i32 min/max on SSE2 should lower via the pcmpgtd compare-and-blend:\n{}",
+            o3_asm
+        );
+        assert!(
+            !o3_asm.contains("pminsd") && !o3_asm.contains("pmaxsd"),
+            "pminsd/pmaxsd are SSE4.1 — illegal at the SSE2 baseline:\n{}",
+            o3_asm
+        );
     }
 
     let stdout = capture_run_stdout(CaptureRequest {
