@@ -17802,6 +17802,64 @@ pub(super) fn reorder_args_by_keyword_slots_with_formal_skip(
     slots
 }
 
+/// Reorder keyword actuals against a KNOWN parameter order (the resolved
+/// callee's own `arg_order`). Mirrors the slot-filling in
+/// `reorder_args_by_keyword_slots_with_formal_skip` once the order is fixed.
+fn reorder_args_into_declared_slots(
+    args: &[crate::ast::expr::Argument],
+    arg_order: &[String],
+    formal_skip: usize,
+) -> Vec<Option<crate::ast::expr::Argument>> {
+    let mut slots: Vec<Option<crate::ast::expr::Argument>> = vec![None; arg_order.len()];
+    let mut last_positional = formal_skip.min(slots.len());
+    for a in args {
+        if let Some(kw) = &a.keyword {
+            let key = kw.to_lowercase();
+            if let Some(idx) = arg_order.iter().position(|n| n.to_lowercase() == key) {
+                slots[idx] = Some(a.clone());
+                continue;
+            }
+            slots.push(Some(a.clone()));
+            continue;
+        }
+        if last_positional < slots.len() {
+            slots[last_positional] = Some(a.clone());
+            last_positional += 1;
+        } else {
+            slots.push(Some(a.clone()));
+        }
+    }
+    slots
+}
+
+/// Reorder keyword actuals, preferring the RESOLVED target's parameter order.
+///
+/// The bare `callee_key` used by `reorder_args_by_keyword_slots` resolves the
+/// arg_order through `callee_scope_for_lookup`, which for an ambiguous bare name
+/// returns the last-defined same-named procedure. fpm defines both
+/// `fpm_filesystem::run(cmd, echo, exitstat, verbose, redirect)` and
+/// `fpm_installer::run(self, command, error)`; a keyword call to the former was
+/// reordered against the latter's parameter names, so `echo`/`exitstat` fell to
+/// null and the hidden character lengths landed in the wrong slots — `run` then
+/// read `redirect`'s length from garbage and faulted. Resolve the arg_order
+/// from the precise link name first; fall back to the bare-key path.
+pub(super) fn reorder_args_by_keyword_slots_for_target(
+    args: &[crate::ast::expr::Argument],
+    resolved_link: &str,
+    callee_key: &str,
+    st: &SymbolTable,
+) -> Vec<Option<crate::ast::expr::Argument>> {
+    if args.iter().any(|a| a.keyword.is_some()) {
+        if let Some(order) = callee_scope_for_lookup(st, resolved_link)
+            .map(|scope| scope.arg_order.clone())
+            .filter(|v| !v.is_empty())
+        {
+            return reorder_args_into_declared_slots(args, &order, 0);
+        }
+    }
+    reorder_args_by_keyword_slots(args, callee_key, st)
+}
+
 pub(super) fn intrinsic_subroutine_arg_order(callee_key: &str) -> Option<&'static [&'static str]> {
     match callee_key {
         "move_alloc" => Some(&["from", "to"]),

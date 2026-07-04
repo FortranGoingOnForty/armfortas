@@ -3079,15 +3079,16 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             callee.span,
                         )
                     };
-                    let arg_slots = reorder_args_by_keyword_slots(
-                        args,
-                        if procptr_target.is_some() {
-                            &signature_key
-                        } else {
-                            &resolved_key
-                        },
-                        ctx.st,
-                    );
+                    let arg_slots = if procptr_target.is_some() {
+                        reorder_args_by_keyword_slots(args, &signature_key, ctx.st)
+                    } else {
+                        reorder_args_by_keyword_slots_for_target(
+                            args,
+                            resolved_name.as_str(),
+                            &resolved_key,
+                            ctx.st,
+                        )
+                    };
                     let abi_lookup_keys = procedure_abi_lookup_keys_for_call_target(
                         ctx.st,
                         resolved_name.as_str(),
