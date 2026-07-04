@@ -346,13 +346,12 @@ Found during l04 (2026-06-12):
   per F2018 16.9.202. l04_system_clock_kinds asserts exact kind-4
   and kind-8 values.
 
-- **PRINT with a character format inserts spurious spaces** (found
-  l04, 2026-06-12): `print '(A,A,A)', 'x[', s(1:1), ']'` emits
-  `   x[ a ]` (leading spaces + spaces around the variable-length
-  item), while `write(*,'(A,A,A)') ...` emits `x[a]` correctly. PRINT
-  with an explicit char format is not honoring it like WRITE does.
-  Most fixtures dodge it via the harness's CHECK whitespace
-  normalization; bracketed-token output exposes it. Owner: l05 (I/O).
+- **RESOLVED (2026-07-04, verified stale)** ~~PRINT with a character
+  format inserts spurious spaces~~: no longer reproduces on trunk —
+  fixed as a side effect of #91's PRINT-format routing (FMT_CTX
+  stack, proc-call items un-gated). Both the bracketed-char shape and
+  the intrinsic-shadowing function-result shape emit byte-exact
+  output now; pinned by ltail_print_char_format_exact.f90.
 
 - **No subroutine-as-function diagnostic** (found l04, 2026-06-12):
   `r = system_clock()` and `r = split(s, set, p)` (intrinsic
