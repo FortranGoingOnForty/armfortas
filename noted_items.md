@@ -375,9 +375,11 @@ Found during l04 (2026-06-12):
 - **PARTIALLY RESOLVED (2026-07-04, L-tail)** ~~SPLIT does not
   bounds-check POS~~: afs_split now enforces the 16.9.197 POS ranges
   (forward 0..LEN, BACK 1..LEN+1) with a loud runtime error, exit 1;
-  split_3/split_4 XFAILs flipped to live EXIT_CODE tests. STILL OPEN:
-  SELECTED_CHAR_KIND (F2003, used by split_2) remains unimplemented
-  (undefined symbol at link). Owner: F2003 intrinsic backlog.
+  split_3/split_4 XFAILs flipped to live EXIT_CODE tests.
+  SELECTED_CHAR_KIND: variable-argument form implemented 2026-07-04
+  (l10, afs_selected_char_kind; literals already const-folded);
+  split_2 itself still needs UCS-4 character DATA, which stays out of
+  scope (README entry).
 
 - **`print '(format)'` ignores the format — FIXED (x12, 2026-06-20)**:
   Stmt::Print dropped its `format` field and always lowered through the
@@ -503,18 +505,18 @@ Found during l04 (2026-06-12):
 
 Found during the L-tail internal-file work (2026-07-04):
 
-- **Scalar internal WRITE drops values past one format scan**: the
-  Internal and InternalAlloc sinks call the non-reverting
-  `format_values_checked`, so `write(s,'(i0)') 1, 2` silently writes
-  only "1" into a scalar unit. A scalar internal file has exactly one
-  record — the overflow should be an IOSTAT/loud error like the new
-  array-sink path. Owner: l10.
+- **RESOLVED (2026-07-04, l10)** ~~Scalar internal WRITE drops values
+  past one format scan~~: both scalar sinks use reverting scans with
+  the one-record rule — overflow is IOSTAT=1 or a loud exit 2
+  (l10_internal_write_scalar_overflow{,_loud} fixtures).
 - **List-directed internal WRITE to a char array emits one record**
   (into element 1; the rest untouched). Record splitting for
   list-directed output is processor-dependent; gfortran wraps at the
   element length. Recorded decision, revisit if a target project
   compares against gfortran here. Owner: l10 if a project hits it.
-- **Internal READ from whole char arrays unprobed**: the WRITE side
-  was silently broken (fixed 2026-07-04, record-per-element); the
-  READ side likely has the same len-0-view flaw. Probe and fix.
-  Owner: l10.
+- **DECIDED (2026-07-04, l10)** ~~Internal READ from whole char
+  arrays unprobed~~: probed — same len-0-view silent garbage. Until
+  the read path grows record-per-element semantics it is REJECTED at
+  compile time (element units keep working); fixture
+  l10_internal_read_array_reject. Full read support is the recorded
+  follow-up.

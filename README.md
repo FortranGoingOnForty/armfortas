@@ -127,15 +127,19 @@ Submodules (F2008) work: separate module procedure bodies (both the `module proc
 
 ## What Doesn't Work Yet
 
-**In progress or deferred:**
+(Refreshed 2026-07-04, l10 — every entry on the previous list had
+shipped: complex intrinsics, >32KB frames via heap promotion, the
+NEON/SSE vectorizers, inlining, multi-file `.amod` builds, and the
+full optimizer pipeline are all live and CI-gated.)
 
-- Complex number intrinsics (`REAL()`, `AIMAG()`, `CONJG()`, `CMPLX()`) — storage works, intrinsic calls don't
-- Stack frames larger than ~32KB — prologue/epilogue currently broken above that threshold; practically affects very large local arrays
-- `-O3` vectorization (NEON/SIMD) — accepted and correct but runs `-O2` passes
-- Function inlining — not yet implemented at any level
-- Multi-file compilation and `.amod` module files — Sprint 30
-- Loop unrolling, GVN, SROA, dead store elimination — later optimizer sprints
 - Coarray Fortran
+- C descriptor (`CFI_cdesc_t` / ISO_Fortran_binding.h) interop
+- UCS-4 (`ISO_10646`) character data — `SELECTED_CHAR_KIND` answers 4,
+  but kind-4 character storage and I/O are not implemented
+- Internal READ whose unit is a whole character array — rejected
+  loudly; read elements individually (the WRITE side does
+  record-per-element)
+- Parameterized derived types beyond what the target projects require
 
 ## Architecture
 
