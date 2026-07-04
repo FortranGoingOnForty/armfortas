@@ -318,16 +318,13 @@ Deferred from l03's enumeration type-safety pass (2026-06-12):
 Found running the FULL workspace suite on FreeBSD for the first time
 (2026-06-12, l03):
 
-- **19 afs-as suites and 1 afs-ld test hard-fail off macOS arm64**:
-  the differential corpus (verify_against_system_as, corpus_compat,
-  roundtrip, hello_world, ...) assembles with the system `as`, links
-  for the Apple target, and runs the binaries — none of it can work
-  on a GNU/x86 host, and none of it skips. clang_probe_dashboard got
-  its skip gate (afs-as a02dc89); the rest need either the same gate
-  or, better, real ELF coverage. Owner: the afs-as x86_64/ELF phase
-  of the multi-platform campaign. Until then `cargo test --workspace`
-  is macOS-only; the FreeBSD surface is `cargo test -p armfortas`
-  plus the armfortas integration suites (all green here).
+- **RESOLVED (2026-07-04, x14)** ~~19 afs-as suites and 1 afs-ld test
+  hard-fail off macOS arm64~~: afs-as 482090d gated all 848
+  macOS-toolchain tests behind `native_macho_host()` (loud
+  HARNESS_SKIP, 33/33 suites ok on FreeBSD), and the x13/x14 ELF
+  writer + x86_64 assembler added real ELF coverage on GNU/x86 hosts
+  (per-instruction and whole-corpus differentials vs gas).
+  `cargo test -p afs-as` is now green on every fleet host.
 
 Found during l04 (2026-06-12):
 
