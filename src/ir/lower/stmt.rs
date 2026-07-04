@@ -7078,7 +7078,6 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         unformatted_len,
                         leading_zero_ptr,
                         leading_zero_len,
-                        pos_addr,
                     ],
                     IrType::Void,
                 );
