@@ -22,11 +22,12 @@ use crate::ir::types::{FloatWidth, IntWidth, IrType};
 ///   * Bool ↔ Int (round-trip via int_extend; Fortran logicals
 ///     occupy a full kind so this is rare but legal).
 ///
-/// Anything that doesn't match one of those cases falls into the
-/// `_ => val` arm and a `debug_assert!` fires — silently passing
-/// the wrong-typed value would let a future caller wire mismatched
-/// types into a Store, which the verifier (after MAJOR-4) would
-/// then catch much later. Better to fail loudly at the source.
+/// Anything that doesn't match one of those cases is an internal
+/// compiler error — silently passing the wrong-typed value would let
+/// a future caller wire mismatched types into a Store, which the
+/// verifier (after MAJOR-4) would catch much later, or which the
+/// produced binary would discover at runtime. Fail loudly at the
+/// source.
 pub(super) fn coerce_to_type(b: &mut FuncBuilder, val: ValueId, target: &IrType) -> ValueId {
     let src = match b.func().value_type(val) {
         Some(t) => t,
@@ -218,11 +219,17 @@ pub(super) fn coerce_to_type(b: &mut FuncBuilder, val: ValueId, target: &IrType)
             b.icmp(CmpOp::Ne, byte, zero)
         }
         _ => {
-            eprintln!(
-                "coerce_to_type: unhandled coercion {:?} → {:?}",
+            // Repo policy: a stub that returns a wrong-typed value is a
+            // silent miscompile factory (fpm's char array-constructor
+            // element went through here as garbage before #86 handled
+            // it). Fail loudly at the source instead of letting the
+            // verifier or — worse — the produced binary discover it.
+            panic!(
+                "coerce_to_type: unhandled coercion {:?} -> {:?} — \
+                 add an explicit arm; silently forwarding the value \
+                 miscompiles the store site",
                 src, target
             );
-            val
         }
     }
 }
