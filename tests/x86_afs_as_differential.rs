@@ -69,6 +69,41 @@ fn host_osabi() -> u8 {
     }
 }
 
+/// Rewrite maximal runs of the gas 1..=11-byte NOP-filler patterns
+/// as repeated 0x90. binutils changed the fill split order between
+/// 2.44 (longest-first) and 2.46 (remainder-first); padding is not
+/// architectural output, so it is compared modulo that choice. Same
+/// rewrite as afs-as tests/common/elf.rs.
+fn canonicalize_nop_fill(text: &[u8]) -> Vec<u8> {
+    const NOPS: [&[u8]; 11] = [
+        &[0x66, 0x66, 0x2e, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+        &[0x66, 0x2e, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+        &[0x66, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+        &[0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+        &[0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00],
+        &[0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00],
+        &[0x0f, 0x1f, 0x44, 0x00, 0x00],
+        &[0x0f, 0x1f, 0x40, 0x00],
+        &[0x0f, 0x1f, 0x00],
+        &[0x66, 0x90],
+        &[0x90],
+    ];
+    let mut out = Vec::with_capacity(text.len());
+    let mut i = 0;
+    'outer: while i < text.len() {
+        for pat in NOPS {
+            if text[i..].starts_with(pat) {
+                out.resize(out.len() + pat.len(), 0x90);
+                i += pat.len();
+                continue 'outer;
+            }
+        }
+        out.push(text[i]);
+        i += 1;
+    }
+    out
+}
+
 // Same policy as afs-as tests/common/elf.rs normalize().
 type NormSections = BTreeMap<String, (u32, u64, Vec<u8>, u64)>;
 type NormRelocs = Vec<(String, u64, u32, String, i64)>;
@@ -83,7 +118,11 @@ fn normalize(obj: &ObjectFile) -> (NormSections, NormRelocs, NormSymbols) {
             (
                 sec.sh_type,
                 sec.sh_flags,
-                sec.data.clone(),
+                if sec.name == ".text" {
+                    canonicalize_nop_fill(&sec.data)
+                } else {
+                    sec.data.clone()
+                },
                 if sec.sh_type == SHT_NOBITS {
                     sec.nobits_size
                 } else {
