@@ -398,19 +398,18 @@ Found during l04 (2026-06-12):
   commit "Honor PRINT's character format string" and
   test_programs/x12_print_format_string.f90. Supersedes the earlier
   PRINT spurious-space / multi-item notes.
-  CAVEAT + DEFERRED (format-engine re-entrancy): the push-based formatted
-  runtime keeps format-parse state in a single GLOBAL formatter across
-  begin→push→end. An output item whose evaluation does nested I/O (e.g. a
-  function that runs an internal `write(str, ...)`) clobbers that state
-  and the record comes out empty. This already bit WRITE
-  (`write(*,'(A)') trim(real_to_str(x))` prints nothing) and the PRINT
-  fix initially inherited it, regressing cli_driver
-  `contained_program_char_function_inside_adjustl_and_trim`. Worked around
-  by keeping PRINT on the stateless list-directed path when any item
-  contains a procedure call (commit "Keep PRINT list-directed when an item
-  may do nested I/O"); WRITE still has the underlying bug. Real fix: make
-  the runtime format engine re-entrant (save/restore on nested begin, or
-  evaluate all items into temporaries before begin). Owner: runtime I/O.
+  ~~CAVEAT + DEFERRED (format-engine re-entrancy)~~ — RESOLVED
+  (2026-07-04): the runtime formatter is re-entrant now — FMT_CTX is a
+  STACK of contexts (begin pushes, end pops), so nested I/O during
+  output-item evaluation runs in its own context. The PRINT
+  list-directed fallback for procedure-call items was therefore pure
+  harm (`print '(a,f8.3)', 'area = ', area(r)` silently ignored the
+  format, emitting list-directed E-notation — seen live in fpm demo
+  output) and has been removed. Verified: the historically-regressed
+  cli_driver contained_program_char_function_inside_adjustl_and_trim
+  passes, and the WRITE shape (`write(*,'(A)') trim(real_to_str(x))`)
+  now matches gfortran. Fixture x12_print_format_with_function_item
+  pins the function-item format + a nested internal formatted write.
 
 - **fpm self-hosting stage0 bringup (x12, 2026-06-20)**: compiling the
   amalgamated `fpm-0.13.0.F90` (53k lines, fpm + vendored M_CLI2,
