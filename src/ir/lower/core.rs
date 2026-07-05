@@ -22675,7 +22675,8 @@ pub(super) fn clear_intent_out_deferred_char_params(
             continue;
         };
         if info.is_pointer
-            || local_uses_array_descriptor(info)
+            || info.descriptor_arg
+            || !info.dims.is_empty()
             || !matches!(info.char_kind, CharKind::Deferred)
         {
             continue;

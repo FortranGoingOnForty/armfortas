@@ -1174,6 +1174,47 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     }
                                     b.branch(done_bb, vec![]);
                                     b.set_block(done_bb);
+                                } else if info.is_class
+                                    && local_declared_rank(&info) == 0
+                                    && ctx
+                                        .st
+                                        .find_symbol_any_scope(&key)
+                                        .map(|s| s.attrs.allocatable)
+                                        .unwrap_or(info.allocatable)
+                                    && matches!(value.node, Expr::ComponentAccess { .. })
+                                {
+                                    // Scalar polymorphic allocatable assign:
+                                    // `class(*), allocatable :: out; out = h%poly_field`
+                                    // — copy the 384-byte descriptor verbatim
+                                    // when the RHS is a polymorphic component
+                                    // access. This must run before the general
+                                    // allocatable branch below; otherwise scalar
+                                    // CLASS(*) dummies are mistaken for arrays
+                                    // and their payload is loaded through a
+                                    // bogus concrete element type.
+                                    let dst = array_descriptor_addr(b, &info);
+                                    let src_desc_opt: Option<ValueId> =
+                                        resolve_component_field_access(
+                                            b,
+                                            &ctx.locals,
+                                            value,
+                                            ctx.st,
+                                            ctx.type_layouts,
+                                        )
+                                        .map(|(p, _)| p);
+                                    if let Some(src) = src_desc_opt {
+                                        let sz = b.const_i64(384);
+                                        b.call(
+                                            FuncRef::External("memcpy".into()),
+                                            vec![dst, src, sz],
+                                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                                        );
+                                    } else {
+                                        let val = super::expr::lower_expr_ctx_tl(b, ctx, value);
+                                        let coerced = coerce_to_type(b, val, &info.ty);
+                                        let ptr = b.load(info.addr);
+                                        b.store(coerced, ptr);
+                                    }
                                 } else if !info.dims.is_empty() || info.allocatable {
                                     if try_lower_elemental_array_assign(b, ctx, name, &info, value)
                                     {

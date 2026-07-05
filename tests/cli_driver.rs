@@ -49093,6 +49093,80 @@ fn allocatable_integer_array_broadcasts_len_of_optional_char_array() {
 }
 
 #[test]
+fn optional_allocatable_intent_out_array_assignment_reallocates() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=optional_allocatable_intent_out_array_assignment_reallocates count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type :: box_t\n    integer, allocatable :: vals(:)\n    integer :: n = 0\n  contains\n    procedure :: configuration\n  end type\ncontains\n  pure subroutine configuration(self, out)\n    class(box_t), intent(in) :: self\n    integer, allocatable, intent(out), optional :: out(:)\n    if (present(out)) then\n      if (self%n > 0) then\n        out = self%vals(1:self%n)\n      else\n        allocate(out(0))\n      end if\n    end if\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(box_t) :: box\n  integer, allocatable :: got(:)\n  allocate(box%vals(5))\n  box%vals = [10, 20, 30, 40, 50]\n  box%n = 3\n  call box%configuration(out=got)\n  if (.not. allocated(got)) error stop 1\n  if (size(got) /= 3) error stop 2\n  if (any(got /= [10, 20, 30])) error stop 3\n  box%n = 0\n  call box%configuration(out=got)\n  if (.not. allocated(got)) error stop 4\n  if (size(got) /= 0) error stop 5\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("optional_alloc_intent_out_array_assign", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("optional allocatable intent(out) array assignment compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "optional allocatable intent(out) array assignment compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("optional allocatable intent(out) array assignment run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "optional allocatable intent(out) array assignment run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn scalar_class_star_allocatable_component_assignment_copies_descriptor() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=scalar_class_star_allocatable_component_assignment_copies_descriptor count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type :: payload_t\n    integer :: value = 0\n  end type\n  type :: entry_t\n    class(*), allocatable :: other\n  end type\n  type :: map_t\n    type(entry_t), allocatable :: entries(:)\n  contains\n    procedure :: get_other\n  end type\ncontains\n  subroutine get_other(self, other)\n    class(map_t), intent(in) :: self\n    class(*), allocatable, intent(out) :: other\n    other = self%entries(1)%other\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(map_t) :: map\n  class(*), allocatable :: other\n  allocate(map%entries(1))\n  allocate(payload_t :: map%entries(1)%other)\n  select type (payload => map%entries(1)%other)\n  type is (payload_t)\n    payload%value = 42\n  class default\n    error stop 1\n  end select\n  call map%get_other(other)\n  select type (other)\n  type is (payload_t)\n    if (other%value /= 42) error stop 2\n  class default\n    error stop 3\n  end select\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("class_star_component_descriptor_assign", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("scalar class(*) allocatable component assignment compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "scalar class(*) allocatable component assignment compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("scalar class(*) allocatable component assignment run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "scalar class(*) allocatable component assignment run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn optional_fixed_char_array_default_assign_uses_declared_len() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

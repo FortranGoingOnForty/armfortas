@@ -535,11 +535,12 @@ pub(crate) fn lower_unit(
                         } else {
                             arg_char_kind_from_decls(pname, decls, st)
                         };
+                        let is_allocatable = decl_is_allocatable(pname, decls);
                         let info = LocalInfo {
                             addr: slot,
                             ty: local_elem_ty,
                             dims: arg_dims_from_decls(pname, decls, &visible_param_consts, st),
-                            allocatable: false,
+                            allocatable: is_allocatable,
                             descriptor_arg: uses_descriptor,
                             by_ref: true,
                             char_kind: ck,
@@ -1077,13 +1078,14 @@ pub(crate) fn lower_unit(
                         } else {
                             arg_char_kind_from_decls(pname, decls, st)
                         };
+                        let is_allocatable = decl_is_allocatable(pname, decls);
                         ctx.locals.insert(
                             pname.clone(),
                             LocalInfo {
                                 addr: slot,
                                 ty: local_elem_ty,
                                 dims: arg_dims_from_decls(pname, decls, &visible_param_consts, st),
-                                allocatable: false,
+                                allocatable: is_allocatable,
                                 descriptor_arg: uses_descriptor,
                                 by_ref: true,
                                 char_kind: ck,
