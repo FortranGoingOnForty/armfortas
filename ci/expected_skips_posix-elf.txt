@@ -3,8 +3,13 @@
 # suites on x86_64: what remains is Mach-O artifact audits, the
 # afs-as/afs-ld standalone toolchain (x13/x14), reference-compiler
 # differentials, and cli_driver's ELF-gated -shared test.
+#
+# elf_static_link is the x16 rung-2 afs-ld static-link gate: it needs
+# FreeBSD /usr/lib crt+static-libc and skips on every other host
+# (glibc and musl included).
 abi_differential
 artifact_audit_29_10
 cli_driver
+elf_static_link
 standalone_toolchain
 testing
