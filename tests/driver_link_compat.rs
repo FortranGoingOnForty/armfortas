@@ -105,6 +105,79 @@ fn dash_j_writes_amod_and_mod_alias() {
 }
 
 #[test]
+fn dash_j_writes_smod_alias_for_submodule() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=driver_link_compat test=dash_j_writes_smod_alias_for_submodule count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("dash_j_smod_alias");
+    let parent = write_program_in(
+        &dir,
+        "parent.f90",
+        "module smod_parent\n  interface\n    module subroutine fill(x)\n      integer, intent(out) :: x\n    end subroutine\n  end interface\nend module\n",
+    );
+    let child = write_program_in(
+        &dir,
+        "child.f90",
+        "submodule (smod_parent) smod_child\ncontains\n  module procedure fill\n    x = 7\n  end procedure\nend submodule\n",
+    );
+    let mod_dir = dir.join("mods");
+    std::fs::create_dir_all(&mod_dir).expect("cannot create module dir");
+
+    let parent_obj = dir.join("parent.o");
+    let parent_result = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            parent.to_str().unwrap(),
+            "-J",
+            mod_dir.to_str().unwrap(),
+            "-o",
+            parent_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("parent compile spawn failed");
+    assert!(
+        parent_result.status.success(),
+        "parent compile failed: {}",
+        String::from_utf8_lossy(&parent_result.stderr)
+    );
+
+    let child_obj = dir.join("child.o");
+    let child_result = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            child.to_str().unwrap(),
+            "-I",
+            mod_dir.to_str().unwrap(),
+            "-J",
+            mod_dir.to_str().unwrap(),
+            "-o",
+            child_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("submodule compile spawn failed");
+    assert!(
+        child_result.status.success(),
+        "submodule compile failed: {}",
+        String::from_utf8_lossy(&child_result.stderr)
+    );
+
+    let smod = mod_dir.join("smod_parent@smod_child.smod");
+    assert!(smod.exists(), "expected CMake-compatible .smod output");
+    assert!(
+        std::fs::read_to_string(&smod)
+            .expect("missing .smod")
+            .contains("@parent smod_parent"),
+        "smod should record its parent"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn gnu_depfile_flags_write_make_dependency_file() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -200,7 +273,13 @@ fn dynamiclib_driver_spelling_forwards_darwin_linker_flags() {
         String::from_utf8_lossy(&result.stderr)
     );
     assert!(dylib.exists(), "dynamiclib output should exist");
-    assert!(dir.join("m.amod").exists(), "dynamiclib compile should emit .amod");
-    assert!(dir.join("m.mod").exists(), "dynamiclib compile should emit .mod alias");
+    assert!(
+        dir.join("m.amod").exists(),
+        "dynamiclib compile should emit .amod"
+    );
+    assert!(
+        dir.join("m.mod").exists(),
+        "dynamiclib compile should emit .mod alias"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

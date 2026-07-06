@@ -1739,6 +1739,18 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     let local_char_len_star_params =
         crate::ir::lower::collect_char_len_star_params_for_units(&units);
 
+    let module_artifact_dir: std::path::PathBuf =
+        opts.module_output_dir.clone().unwrap_or_else(|| {
+            if opts.emit_obj {
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+            } else {
+                opts.output_path()
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .to_path_buf()
+            }
+        });
+
     // Emit module interface files for each MODULE in the compilation unit.
     // -J <dir> overrides where they go. For compile-only (-c) builds
     // without -J, keep the traditional compiler behavior of writing
@@ -1761,31 +1773,54 @@ pub fn compile(opts: &Options) -> Result<(), String> {
                     &local_descriptor_params,
                     &local_char_len_star_params,
                 );
-                let amod_dir: std::path::PathBuf =
-                    opts.module_output_dir.clone().unwrap_or_else(|| {
-                        if opts.emit_obj {
-                            std::env::current_dir()
-                                .unwrap_or_else(|_| std::path::PathBuf::from("."))
-                        } else {
-                            opts.output_path()
-                                .parent()
-                                .unwrap_or_else(|| std::path::Path::new("."))
-                                .to_path_buf()
-                        }
-                    });
-                let amod_path = amod_dir.join(format!("{}.amod", mod_key));
+                let amod_path = module_artifact_dir.join(format!("{}.amod", mod_key));
                 fs::write(&amod_path, &amod_text)
                     .map_err(|e| format!("cannot write '{}': {}", amod_path.display(), e))?;
                 // `.amod` remains the ARMFORTAS module ABI file. A
                 // byte-identical `.mod` alias keeps conventional Fortran
                 // build systems such as CMake able to track module
                 // dependencies for unknown compilers.
-                let mod_path = amod_dir.join(format!("{}.mod", mod_key));
+                let mod_path = module_artifact_dir.join(format!("{}.mod", mod_key));
                 fs::write(&mod_path, &amod_text)
                     .map_err(|e| format!("cannot write '{}': {}", mod_path.display(), e))?;
                 if opts.verbose {
                     eprintln!(" amod: {}", amod_path.display());
                 }
+            }
+        }
+    }
+    for unit in &units {
+        if let crate::ast::unit::ProgramUnit::Submodule {
+            parent,
+            ancestor,
+            name,
+            ..
+        } = &unit.node
+        {
+            let parent_key = parent.to_lowercase();
+            let name_key = name.to_lowercase();
+            let parent_spec = if let Some(ancestor) = ancestor {
+                format!("{}:{}", parent_key, ancestor.to_lowercase())
+            } else {
+                parent_key.clone()
+            };
+            let smod_stem = if let Some(ancestor) = ancestor {
+                format!("{}@{}@{}", parent_key, ancestor.to_lowercase(), name_key)
+            } else {
+                format!("{}@{}", parent_key, name_key)
+            };
+            let smod_text = format!(
+                "#!smod 1\n# compiler: armfortas {}\n# source: {}\n@parent {}\n@submodule {}\n",
+                env!("CARGO_PKG_VERSION"),
+                opts.input.to_str().unwrap_or(""),
+                parent_spec,
+                name_key
+            );
+            let smod_path = module_artifact_dir.join(format!("{}.smod", smod_stem));
+            fs::write(&smod_path, &smod_text)
+                .map_err(|e| format!("cannot write '{}': {}", smod_path.display(), e))?;
+            if opts.verbose {
+                eprintln!(" smod: {}", smod_path.display());
             }
         }
     }
