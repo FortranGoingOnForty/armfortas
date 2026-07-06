@@ -1778,21 +1778,21 @@ unsafe fn copy_same_type_payload_between_descriptors(
     for _ in 0..total {
         let mut src_off: i64 = 0;
         let mut dest_off: i64 = 0;
-        for d in 0..rank {
-            src_off += idx[d] * source.dims[d].stride;
-            dest_off += idx[d] * dest.dims[d].stride;
+        for (d, &index) in idx.iter().enumerate().take(rank) {
+            src_off += index * source.dims[d].stride;
+            dest_off += index * dest.dims[d].stride;
         }
         ptr::copy(
             source.base_addr.offset((src_off * elem_size) as isize),
             dest.base_addr.offset((dest_off * dest.elem_size) as isize),
             elem_size as usize,
         );
-        for d in 0..rank {
-            idx[d] += 1;
-            if idx[d] < extents[d] {
+        for (d, index) in idx.iter_mut().enumerate().take(rank) {
+            *index += 1;
+            if *index < extents[d] {
                 break;
             }
-            idx[d] = 0;
+            *index = 0;
         }
     }
 }

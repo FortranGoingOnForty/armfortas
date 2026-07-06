@@ -1536,8 +1536,8 @@ mod tests {
     fn format_real_f() {
         let descs = parse_format("(F8.3)");
         let mut engine = FormatEngine::new(descs);
-        let out = engine.format_values(&[IoValue::Real(3.14159)]);
-        assert_eq!(out, "   3.142");
+        let out = engine.format_values(&[IoValue::Real(1.23456)]);
+        assert_eq!(out, "   1.235");
     }
 
     #[test]
@@ -1880,7 +1880,7 @@ mod tests {
     fn format_decimal_comma() {
         let descs = parse_format("(DC, F8.3)");
         let mut engine = FormatEngine::new(descs);
-        let out = engine.format_values(&[IoValue::Real(3.14)]);
+        let out = engine.format_values(&[IoValue::Real(1.23)]);
         assert!(out.contains(','), "expected comma in output: {}", out);
         assert!(!out.contains('.'), "expected no dot in output: {}", out);
     }

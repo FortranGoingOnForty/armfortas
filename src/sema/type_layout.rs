@@ -855,7 +855,7 @@ pub fn compute_layout_with_attrs(
                     entity.char_len.as_ref(),
                     const_params,
                 );
-                let effective_char_len = entity.char_len.as_ref().or_else(|| match type_spec {
+                let effective_char_len = entity.char_len.as_ref().or(match type_spec {
                     crate::ast::decl::TypeSpec::Character(Some(sel)) => sel.len.as_ref(),
                     _ => None,
                 });

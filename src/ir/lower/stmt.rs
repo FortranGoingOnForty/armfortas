@@ -151,7 +151,7 @@ fn namelist_group_name(ctrl: &IoControl) -> Option<String> {
     from_expr(&ctrl.value)
 }
 
-fn namelist_unit_control<'a>(controls: &'a [IoControl]) -> Option<&'a IoControl> {
+fn namelist_unit_control(controls: &[IoControl]) -> Option<&IoControl> {
     controls.iter().find(|c| {
         c.keyword
             .as_deref()

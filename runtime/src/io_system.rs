@@ -3633,6 +3633,7 @@ fn write_form_capabilities(
 }
 
 /// Write ACCESS, FORM, ACTION, RECL for a connected unit.
+#[allow(clippy::too_many_arguments)]
 fn write_unit_properties(
     u: &Unit,
     access_buf: *mut u8,
@@ -5956,14 +5957,14 @@ mod tests {
 
         afs_fmt_begin(99, "(I5, F8.2)".as_ptr(), 10);
         afs_fmt_push_int(42);
-        afs_fmt_push_real(3.14);
+        afs_fmt_push_real(1.23);
         afs_fmt_end(1); // with newline
 
         afs_close(99, std::ptr::null_mut());
 
         let content = std::fs::read_to_string(path).unwrap();
         assert!(content.contains("42"), "expected 42 in: {}", content);
-        assert!(content.contains("3.14"), "expected 3.14 in: {}", content);
+        assert!(content.contains("1.23"), "expected 1.23 in: {}", content);
     }
 
     #[test]
