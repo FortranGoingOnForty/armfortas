@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use crate::ir::inst::*;
 use crate::ir::types::{FloatWidth, IntWidth, IrType};
 
-use super::loop_utils::{find_preheader, resolve_const_int};
+use super::loop_utils::{find_preheader, loop_defined_values, resolve_const_int};
 use super::util::{inst_uses, terminator_uses, NaturalLoop};
 
 #[derive(Debug, Clone, Copy)]
@@ -1752,6 +1752,12 @@ pub(crate) struct ReductionPlan {
     /// retarget the bound to `iv_init + head_count - 1`.
     pub(crate) cond_id: ValueId,
     pub(crate) bound_const_id: ValueId,
+    /// Element-wise stores carried in the same body as the reduction
+    /// (`c(i)=a(i)*b(i)` alongside `dot=dot+a(i)*b(i)`). Each is an
+    /// offset-0, full-range, ISA-legal store of the reduction's lane
+    /// width; `apply_reduction_plan` widens them to VStores beside the
+    /// vector reduction. Empty for a pure reduction.
+    pub(crate) elementwise_stores: Vec<Statement>,
     pub(crate) span: crate::lexer::Span,
 }
 
@@ -1846,24 +1852,6 @@ pub(crate) fn detect_reduction_plan(
         .insts
         .iter()
         .any(|inst| matches!(inst.kind, InstKind::Call(..) | InstKind::RuntimeCall(..)))
-    {
-        return None;
-    }
-    // A pure reduction writes no memory in the loop body: the
-    // accumulator is an SSA block param folded to a scalar after the
-    // loop, and the operands are loads. Any Store/VStore is therefore an
-    // independent elementwise write (`c(i) = a(i)*b(i)` carried alongside
-    // `dot = dot + a(i)*b(i)`). The reduction rewrite widens the IV to
-    // `lanes` stride but does not vectorize that store, so it would run
-    // once per vector iteration and drop lanes 1..lanes-1 (uninitialized
-    // output, silent — the reduction still comes out right). Refuse the
-    // plan and leave the loop scalar rather than miscompile it.
-    if func
-        .blocks
-        .iter()
-        .filter(|b| lp.body.contains(&b.id))
-        .flat_map(|b| b.insts.iter())
-        .any(|inst| matches!(inst.kind, InstKind::Store(..) | InstKind::VStore(..)))
     {
         return None;
     }
@@ -2144,6 +2132,55 @@ pub(crate) fn detect_reduction_plan(
         return None;
     }
 
+    // Fuse element-wise stores carried in the same body as the reduction
+    // (e.g. `c(i)=a(i)*b(i)` alongside `dot=dot+a(i)*b(i)`). Each store
+    // must write its array at exactly the induction index (offset 0),
+    // over the full trip, at the reduction's lane width, with a value
+    // that is an ISA-legal element-wise expression — the same shape the
+    // pure element-wise vectorizer accepts. Because every load and store
+    // is index-`iv`-aligned and we widen in place (preserving program
+    // order), there is no cross-lane or aliasing hazard.
+    // apply_reduction_plan widens each store to a VStore beside the
+    // vector reduction, reusing any load/product shared with it. If ANY
+    // store is not fusible we bail (return None) and the loop stays fully
+    // scalar — correct, never a dropped-lane miscompile.
+    let synthetic_shape = CountedLoop {
+        preheader,
+        header,
+        body,
+        iv_param,
+        iv_init,
+        iv_bound,
+        cond_id,
+        bound_const_id,
+    };
+    let loop_defs = loop_defined_values(func, lp);
+    let mut elementwise_stores = Vec::new();
+    for inst in &func.block(body).insts {
+        let InstKind::Store(stored_value, dest_ptr) = inst.kind else {
+            continue;
+        };
+        let dest = classify_array_access(func, dest_ptr, iv_param)?;
+        if !covers_full_array(&synthetic_shape, &dest) || lane_count_for(&dest.elem_ty) != Some(lanes)
+        {
+            return None;
+        }
+        let stored_inst = defs.get(&stored_value)?;
+        let op = classify_body_op(
+            stored_value,
+            &stored_inst.kind,
+            func,
+            &synthetic_shape,
+            &dest,
+            &loop_defs,
+            isa,
+        )?;
+        elementwise_stores.push(Statement {
+            op,
+            store: inst.id,
+        });
+    }
+
     Some(ReductionPlan {
         preheader,
         header,
@@ -2167,6 +2204,7 @@ pub(crate) fn detect_reduction_plan(
         tail_count,
         cond_id,
         bound_const_id,
+        elementwise_stores,
         span: accumulate_inst.span,
     })
 }

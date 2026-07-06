@@ -23,7 +23,8 @@ use super::util::{find_natural_loops, predecessors, NaturalLoop};
 use super::vec_analysis::{
     build_vector_plan, build_where_plan, detect_counted_loop, detect_reduction_plan,
     detect_where_loop, loop_values_escape, AccumulateSource, BinaryKind, BinopOperand, BodyOp,
-    CountedLoop, ReductionKind, ReductionPlan, UnaryKind, VectorPlan, WhereLoop, WherePlan,
+    CountedLoop, ReductionKind, ReductionPlan, Statement, UnaryKind, VectorPlan, WhereLoop,
+    WherePlan,
 };
 
 pub struct NeonVectorize;
@@ -108,6 +109,163 @@ fn vector_ty(elem: &IrType, lanes: u8) -> IrType {
     }
 }
 
+/// Widen one element-wise statement — its array loads, arithmetic, and
+/// the destination store — to vector form, in place. Shared by the pure
+/// element-wise vectorizer (`apply_vector_plan`) and the reduction
+/// vectorizer, which fuses element-wise stores carried in the same body
+/// (`c(i)=a(i)*b(i)` alongside `dot=dot+a(i)*b(i)`) into the widened
+/// loop. Every match arm fires only on the scalar op kind, so widening a
+/// load or product the reduction already turned into a VLoad/VMul is a
+/// no-op — the shared value is reused rather than re-widened.
+fn widen_statement(
+    func: &mut Function,
+    body: BlockId,
+    preheader: BlockId,
+    v_ty: &IrType,
+    span: crate::lexer::Span,
+    stmt: &Statement,
+) {
+    for op in op_operands(&stmt.op) {
+        rewrite_array_load(func, body, op, v_ty);
+    }
+    let (lhs_subst, rhs_subst) = match &stmt.op {
+        BodyOp::Copy { .. } | BodyOp::Unary { .. } => (None, None),
+        BodyOp::Binop { lhs, rhs, .. } => (
+            broadcast_if_invariant(func, preheader, lhs, v_ty, span),
+            broadcast_if_invariant(func, preheader, rhs, v_ty, span),
+        ),
+        BodyOp::Fma { .. } => (None, None),
+    };
+    let fma_subst = if let BodyOp::Fma { a, b, c, .. } = &stmt.op {
+        Some((
+            broadcast_if_invariant(func, preheader, a, v_ty, span),
+            broadcast_if_invariant(func, preheader, b, v_ty, span),
+            broadcast_if_invariant(func, preheader, c, v_ty, span),
+        ))
+    } else {
+        None
+    };
+
+    if let BodyOp::Unary {
+        unary_id,
+        kind: unary_kind,
+        source,
+    } = &stmt.op
+    {
+        // Integer abs folds from a `select(icmp, x, ineg(x))`, so its
+        // unary_id is the Select, not an FAbs/INeg — take the abs
+        // source from the classified operand (the load, already
+        // rewritten to a VLoad above). The dead cmp/ineg/const left
+        // behind are DCE'd, same as the min/max select's dead cmp.
+        let src_load = match source {
+            BinopOperand::ArrayLoad(id) => Some(*id),
+            BinopOperand::InvariantScalar(_) => None,
+        };
+        let body_block = func.block_mut(body);
+        if let Some(inst) = body_block.insts.iter_mut().find(|i| i.id == *unary_id) {
+            let new_kind = match (inst.kind.clone(), unary_kind) {
+                (InstKind::INeg(s), UnaryKind::Neg) | (InstKind::FNeg(s), UnaryKind::Neg) => {
+                    InstKind::VNeg(s)
+                }
+                (InstKind::FAbs(s), UnaryKind::Abs) => InstKind::VAbs(s),
+                (InstKind::FSqrt(s), UnaryKind::Sqrt) => InstKind::VSqrt(s),
+                (InstKind::Select(..), UnaryKind::Abs) => {
+                    InstKind::VAbs(src_load.expect("integer abs source must be an array load"))
+                }
+                _ => inst.kind.clone(),
+            };
+            inst.kind = new_kind;
+            inst.ty = v_ty.clone();
+        }
+        func.register_type(*unary_id, v_ty.clone());
+    }
+
+    if let BodyOp::Binop {
+        binop_id,
+        kind: binop_kind,
+        ..
+    } = &stmt.op
+    {
+        let body_block = func.block_mut(body);
+        if let Some(inst) = body_block.insts.iter_mut().find(|i| i.id == *binop_id) {
+            let new_kind = match (inst.kind.clone(), binop_kind) {
+                (InstKind::IAdd(l, r), BinaryKind::Add)
+                | (InstKind::FAdd(l, r), BinaryKind::Add) => {
+                    InstKind::VAdd(lhs_subst.unwrap_or(l), rhs_subst.unwrap_or(r))
+                }
+                (InstKind::ISub(l, r), BinaryKind::Sub)
+                | (InstKind::FSub(l, r), BinaryKind::Sub) => {
+                    InstKind::VSub(lhs_subst.unwrap_or(l), rhs_subst.unwrap_or(r))
+                }
+                (InstKind::IMul(l, r), BinaryKind::Mul)
+                | (InstKind::FMul(l, r), BinaryKind::Mul) => {
+                    InstKind::VMul(lhs_subst.unwrap_or(l), rhs_subst.unwrap_or(r))
+                }
+                (InstKind::FDiv(l, r), BinaryKind::Div) => {
+                    InstKind::VDiv(lhs_subst.unwrap_or(l), rhs_subst.unwrap_or(r))
+                }
+                (InstKind::Select(_, t, f), BinaryKind::Max) => {
+                    InstKind::VMax(lhs_subst.unwrap_or(t), rhs_subst.unwrap_or(f))
+                }
+                (InstKind::Select(_, t, f), BinaryKind::Min) => {
+                    InstKind::VMin(lhs_subst.unwrap_or(t), rhs_subst.unwrap_or(f))
+                }
+                _ => inst.kind.clone(),
+            };
+            inst.kind = new_kind;
+            inst.ty = v_ty.clone();
+        }
+        func.register_type(*binop_id, v_ty.clone());
+    }
+
+    if let BodyOp::Fma {
+        fmul_id, fadd_id, ..
+    } = &stmt.op
+    {
+        let (a_subst, b_subst, c_subst) = fma_subst.unwrap();
+        let body_block = func.block_mut(body);
+        // Rewrite fmul to VMul (becomes dead — DCE will clean up;
+        // we still rewrite to avoid leaving a scalar fmul whose
+        // operands have been retyped to vectors).
+        if let Some(inst) = body_block.insts.iter_mut().find(|i| i.id == *fmul_id) {
+            if let InstKind::FMul(l, r) = inst.kind {
+                inst.kind = InstKind::VMul(a_subst.unwrap_or(l), b_subst.unwrap_or(r));
+                inst.ty = v_ty.clone();
+            }
+        }
+        func.register_type(*fmul_id, v_ty.clone());
+        // Rewrite fadd to VFma(a, b, c). Lookup fmul to recover
+        // its (possibly subst'd) operands so VFma reads the
+        // original / broadcast values rather than the dead VMul.
+        let (a_v, b_v) = {
+            let body_ro = func.block(body);
+            let fmul_inst = body_ro.insts.iter().find(|i| i.id == *fmul_id).unwrap();
+            if let InstKind::VMul(l, r) = fmul_inst.kind {
+                (l, r)
+            } else {
+                unreachable!()
+            }
+        };
+        let body_block = func.block_mut(body);
+        if let Some(inst) = body_block.insts.iter_mut().find(|i| i.id == *fadd_id) {
+            if let InstKind::FAdd(l, r) = inst.kind {
+                let c = if l == *fmul_id { r } else { l };
+                let c_final = c_subst.unwrap_or(c);
+                inst.kind = InstKind::VFma(a_v, b_v, c_final);
+                inst.ty = v_ty.clone();
+            }
+        }
+        func.register_type(*fadd_id, v_ty.clone());
+    }
+
+    let body_block = func.block_mut(body);
+    if let Some(inst) = body_block.insts.iter_mut().find(|i| i.id == stmt.store) {
+        if let InstKind::Store(val, ptr) = inst.kind {
+            inst.kind = InstKind::VStore(val, ptr);
+        }
+    }
+}
+
 fn apply_vector_plan(func: &mut Function, shape: &CountedLoop, plan: VectorPlan) {
     let v_ty = vector_ty(&plan.elem_ty, plan.lanes);
 
@@ -168,145 +326,7 @@ fn apply_vector_plan(func: &mut Function, shape: &CountedLoop, plan: VectorPlan)
     //    emit any required preheader VBroadcasts, rewrite the binop
     //    into a v-op, and finally rewrite the store into a VStore.
     for stmt in plan.statements.clone() {
-        for op in op_operands(&stmt.op) {
-            rewrite_array_load(func, shape.body, op, &v_ty);
-        }
-        let (lhs_subst, rhs_subst) = match &stmt.op {
-            BodyOp::Copy { .. } | BodyOp::Unary { .. } => (None, None),
-            BodyOp::Binop { lhs, rhs, .. } => (
-                broadcast_if_invariant(func, shape.preheader, lhs, &v_ty, plan.span),
-                broadcast_if_invariant(func, shape.preheader, rhs, &v_ty, plan.span),
-            ),
-            BodyOp::Fma { .. } => (None, None),
-        };
-        let fma_subst = if let BodyOp::Fma { a, b, c, .. } = &stmt.op {
-            Some((
-                broadcast_if_invariant(func, shape.preheader, a, &v_ty, plan.span),
-                broadcast_if_invariant(func, shape.preheader, b, &v_ty, plan.span),
-                broadcast_if_invariant(func, shape.preheader, c, &v_ty, plan.span),
-            ))
-        } else {
-            None
-        };
-
-        if let BodyOp::Unary {
-            unary_id,
-            kind: unary_kind,
-            source,
-        } = &stmt.op
-        {
-            // Integer abs folds from a `select(icmp, x, ineg(x))`, so its
-            // unary_id is the Select, not an FAbs/INeg — take the abs
-            // source from the classified operand (the load, already
-            // rewritten to a VLoad above). The dead cmp/ineg/const left
-            // behind are DCE'd, same as the min/max select's dead cmp.
-            let src_load = match source {
-                BinopOperand::ArrayLoad(id) => Some(*id),
-                BinopOperand::InvariantScalar(_) => None,
-            };
-            let body_block = func.block_mut(shape.body);
-            if let Some(inst) = body_block.insts.iter_mut().find(|i| i.id == *unary_id) {
-                let new_kind = match (inst.kind.clone(), unary_kind) {
-                    (InstKind::INeg(s), UnaryKind::Neg) | (InstKind::FNeg(s), UnaryKind::Neg) => {
-                        InstKind::VNeg(s)
-                    }
-                    (InstKind::FAbs(s), UnaryKind::Abs) => InstKind::VAbs(s),
-                    (InstKind::FSqrt(s), UnaryKind::Sqrt) => InstKind::VSqrt(s),
-                    (InstKind::Select(..), UnaryKind::Abs) => {
-                        InstKind::VAbs(src_load.expect("integer abs source must be an array load"))
-                    }
-                    _ => inst.kind.clone(),
-                };
-                inst.kind = new_kind;
-                inst.ty = v_ty.clone();
-            }
-            func.register_type(*unary_id, v_ty.clone());
-        }
-
-        if let BodyOp::Binop {
-            binop_id,
-            kind: binop_kind,
-            ..
-        } = &stmt.op
-        {
-            let body_block = func.block_mut(shape.body);
-            if let Some(inst) = body_block.insts.iter_mut().find(|i| i.id == *binop_id) {
-                let new_kind = match (inst.kind.clone(), binop_kind) {
-                    (InstKind::IAdd(l, r), BinaryKind::Add)
-                    | (InstKind::FAdd(l, r), BinaryKind::Add) => {
-                        InstKind::VAdd(lhs_subst.unwrap_or(l), rhs_subst.unwrap_or(r))
-                    }
-                    (InstKind::ISub(l, r), BinaryKind::Sub)
-                    | (InstKind::FSub(l, r), BinaryKind::Sub) => {
-                        InstKind::VSub(lhs_subst.unwrap_or(l), rhs_subst.unwrap_or(r))
-                    }
-                    (InstKind::IMul(l, r), BinaryKind::Mul)
-                    | (InstKind::FMul(l, r), BinaryKind::Mul) => {
-                        InstKind::VMul(lhs_subst.unwrap_or(l), rhs_subst.unwrap_or(r))
-                    }
-                    (InstKind::FDiv(l, r), BinaryKind::Div) => {
-                        InstKind::VDiv(lhs_subst.unwrap_or(l), rhs_subst.unwrap_or(r))
-                    }
-                    (InstKind::Select(_, t, f), BinaryKind::Max) => {
-                        InstKind::VMax(lhs_subst.unwrap_or(t), rhs_subst.unwrap_or(f))
-                    }
-                    (InstKind::Select(_, t, f), BinaryKind::Min) => {
-                        InstKind::VMin(lhs_subst.unwrap_or(t), rhs_subst.unwrap_or(f))
-                    }
-                    _ => inst.kind.clone(),
-                };
-                inst.kind = new_kind;
-                inst.ty = v_ty.clone();
-            }
-            func.register_type(*binop_id, v_ty.clone());
-        }
-
-        if let BodyOp::Fma {
-            fmul_id, fadd_id, ..
-        } = &stmt.op
-        {
-            let (a_subst, b_subst, c_subst) = fma_subst.unwrap();
-            let body_block = func.block_mut(shape.body);
-            // Rewrite fmul to VMul (becomes dead — DCE will clean up;
-            // we still rewrite to avoid leaving a scalar fmul whose
-            // operands have been retyped to vectors).
-            if let Some(inst) = body_block.insts.iter_mut().find(|i| i.id == *fmul_id) {
-                if let InstKind::FMul(l, r) = inst.kind {
-                    inst.kind = InstKind::VMul(a_subst.unwrap_or(l), b_subst.unwrap_or(r));
-                    inst.ty = v_ty.clone();
-                }
-            }
-            func.register_type(*fmul_id, v_ty.clone());
-            // Rewrite fadd to VFma(a, b, c). Lookup fmul to recover
-            // its (possibly subst'd) operands so VFma reads the
-            // original / broadcast values rather than the dead VMul.
-            let (a_v, b_v) = {
-                let body_ro = func.block(shape.body);
-                let fmul_inst = body_ro.insts.iter().find(|i| i.id == *fmul_id).unwrap();
-                if let InstKind::VMul(l, r) = fmul_inst.kind {
-                    (l, r)
-                } else {
-                    unreachable!()
-                }
-            };
-            let body_block = func.block_mut(shape.body);
-            if let Some(inst) = body_block.insts.iter_mut().find(|i| i.id == *fadd_id) {
-                if let InstKind::FAdd(l, r) = inst.kind {
-                    let c = if l == *fmul_id { r } else { l };
-                    let c_final = c_subst.unwrap_or(c);
-                    inst.kind = InstKind::VFma(a_v, b_v, c_final);
-                    inst.ty = v_ty.clone();
-                }
-            }
-            func.register_type(*fadd_id, v_ty.clone());
-        }
-
-        let body_block = func.block_mut(shape.body);
-        if let Some(inst) = body_block.insts.iter_mut().find(|i| i.id == stmt.store) {
-            if let InstKind::Store(val, ptr) = inst.kind {
-                inst.kind = InstKind::VStore(val, ptr);
-            }
-        }
+        widen_statement(func, shape.body, shape.preheader, &v_ty, plan.span, &stmt);
     }
 
     // 3. Scalar tail. If `tail_count` remainder iterations live at the
@@ -1077,6 +1097,17 @@ fn apply_reduction_plan(func: &mut Function, lp: &NaturalLoop, plan: ReductionPl
         inst.ty = v_ty.clone();
     }
     func.register_type(plan.accumulate_id, v_ty.clone());
+
+    // 5b. Widen element-wise stores fused into the reduction body
+    //     (`c(i)=a(i)*b(i)` beside `dot=dot+a(i)*b(i)`). Runs after the
+    //     reduction chain so a load/product shared with it is already a
+    //     VLoad/VMul and gets reused rather than re-widened. The
+    //     scalar-tail peel below replays the pre-mutation body snapshot,
+    //     so any peeled iterations still run these stores scalar-ly at
+    //     the correct index.
+    for stmt in plan.elementwise_stores.clone() {
+        widen_statement(func, plan.body, plan.preheader, &v_ty, plan.span, &stmt);
+    }
 
     // 6. Insert `acc_scalar = vreduce_*(acc_param)` at the top of
     //    the exit block, then walk every block NOT in the loop and
