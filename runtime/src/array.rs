@@ -3784,11 +3784,7 @@ fn for_each_reduce_along_dim_with_index<F: FnMut(usize, usize, i64)>(
     }
 }
 
-fn ensure_location_dim_result(
-    src: &ArrayDescriptor,
-    dim: i32,
-    dst: *mut ArrayDescriptor,
-) -> bool {
+fn ensure_location_dim_result(src: &ArrayDescriptor, dim: i32, dst: *mut ArrayDescriptor) -> bool {
     if dst.is_null() || dim < 1 || dim as usize > src.rank as usize {
         return false;
     }

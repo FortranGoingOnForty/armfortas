@@ -4053,7 +4053,12 @@ thread_local! {
 }
 
 #[no_mangle]
-pub extern "C" fn afs_lst_ia_begin(desc: *mut u8, iostat: *mut i32, iomsg: *mut u8, iomsg_len: i64) {
+pub extern "C" fn afs_lst_ia_begin(
+    desc: *mut u8,
+    iostat: *mut i32,
+    iomsg: *mut u8,
+    iomsg_len: i64,
+) {
     LST_IA_CTX.with(|ctx| {
         ctx.borrow_mut().push(LstIaContext {
             desc: desc as *mut crate::descriptor::StringDescriptor,
