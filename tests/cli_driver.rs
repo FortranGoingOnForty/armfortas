@@ -13631,6 +13631,42 @@ fn ffree_line_length_none_is_accepted_with_warning() {
 }
 
 #[test]
+fn numeric_ffree_line_length_is_accepted() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=numeric_ffree_line_length_is_accepted count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program("program p\n  print *, 7\nend program\n", "f90");
+    let out = unique_path("ffree_line_length_132", "o");
+    let result = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            "-ffree-line-length-132",
+            src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        result.status.success(),
+        "numeric free-line-length flag should be accepted: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        !stderr.contains("unknown option"),
+        "numeric free-line-length flag must not be rejected: {}",
+        stderr
+    );
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&out);
+}
+
+#[test]
 fn unknown_warning_flag_emits_warning() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

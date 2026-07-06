@@ -163,6 +163,7 @@ pub struct Options {
     pub force_implicit_none: bool,
     pub recursive_default: bool,
     pub backslash_escapes: bool,
+    pub free_line_length_limit: Option<usize>,
     pub free_line_length_none_compat: bool,
     pub max_stack_var_size: Option<u64>,
     pub max_errors_compat: Option<u64>,
@@ -256,6 +257,7 @@ impl Default for Options {
             force_implicit_none: false,
             recursive_default: false,
             backslash_escapes: false,
+            free_line_length_limit: None,
             free_line_length_none_compat: false,
             max_stack_var_size: None,
             max_errors_compat: None,
@@ -556,7 +558,20 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
             }
             "-ffree-form" => opts.source_form_override = Some(SourceFormOverride::Free),
             "-ffixed-form" => opts.source_form_override = Some(SourceFormOverride::Fixed),
-            "-ffree-line-length-none" => opts.free_line_length_none_compat = true,
+            "-ffree-line-length-none" => {
+                opts.free_line_length_limit = None;
+                opts.free_line_length_none_compat = true;
+            }
+            arg if arg.starts_with("-ffree-line-length-") => {
+                opts.free_line_length_limit =
+                    Some(parse_free_line_length(&arg["-ffree-line-length-".len()..])?);
+                opts.free_line_length_none_compat = false;
+            }
+            arg if arg.starts_with("-ffree-line-length=") => {
+                opts.free_line_length_limit =
+                    Some(parse_free_line_length(&arg["-ffree-line-length=".len()..])?);
+                opts.free_line_length_none_compat = false;
+            }
             "-fdefault-integer-8" => opts.default_integer_8 = true,
             "-fdefault-real-8" => opts.default_real_8 = true,
             "-fimplicit-none" => opts.force_implicit_none = true,
@@ -874,6 +889,16 @@ fn set_output_path(opts: &mut Options, value: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn parse_free_line_length(value: &str) -> Result<usize, String> {
+    let limit: usize = value
+        .parse()
+        .map_err(|_| format!("invalid -ffree-line-length value: {}", value))?;
+    if limit == 0 {
+        return Err("-ffree-line-length requires a positive value".into());
+    }
+    Ok(limit)
+}
+
 fn collect_cli_warnings(opts: &mut Options, unknown_warning_flags: &[String]) {
     if opts.cpp_compat {
         opts.cli_warnings.push(
@@ -1013,6 +1038,7 @@ LANGUAGE:
   --std=<standard>            Fortran standard (f77, f90, f95, f2003, f2008, f2018, f2023)
   -ffree-form                 Force free-form source
   -ffixed-form                Force fixed-form source
+  -ffree-line-length-<n>      Override free-form line conformance warning limit
   -ffree-line-length-none     GNU-compatible alias; free-form inputs are already unlimited
   -fdefault-integer-8         Make default integer kind 8 bytes
   -fdefault-real-8            Make default real kind 8 bytes
@@ -1329,6 +1355,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
             std,
             source_form,
             opts.free_line_length_none_compat,
+            opts.free_line_length_limit,
         ) {
             diag::render(&file_str, &source, w.span, diag::Level::Warning, &w.msg, 1);
         }
@@ -2743,6 +2770,22 @@ mod tests {
             "expected a compatibility warning for -ffree-line-length-none, got {:?}",
             opts.cli_warnings
         );
+    }
+
+    #[test]
+    fn parse_cli_accepts_numeric_ffree_line_length_flag() {
+        let args = vec![
+            "-ffree-line-length-132".to_string(),
+            "hello.f90".to_string(),
+        ];
+        let ParsedCli::Compile(opts) =
+            parse_cli(&args).expect("driver should accept -ffree-line-length-132")
+        else {
+            panic!("expected compile options");
+        };
+        assert_eq!(opts.free_line_length_limit, Some(132));
+        assert!(!opts.free_line_length_none_compat);
+        assert!(opts.cli_warnings.is_empty());
     }
 
     #[test]
