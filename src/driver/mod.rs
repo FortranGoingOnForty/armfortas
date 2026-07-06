@@ -2086,7 +2086,7 @@ pub(crate) fn link_inputs_elf(
     // surface IS the drop-in contract afs-ld's ELF support targets).
     let linker = afs_ld_override().unwrap_or_else(|| "ld".into());
     if opts.verbose {
-        eprintln!(" linking: {} {}", linker, args.join(" "));
+        print_verbose_command_line(&linker, &args);
     }
     let result = Command::new(&linker)
         .args(&args)
@@ -2135,6 +2135,10 @@ fn link_inputs(inputs: &[PathBuf], output: &Path, opts: &Options) -> Result<(), 
     }
     push_link_flags(&mut args, opts);
 
+    if opts.verbose {
+        print_verbose_command_line("ld", &args);
+    }
+
     let ld_result = Command::new("ld")
         .args(&args)
         .output()
@@ -2173,6 +2177,10 @@ fn link_inputs_with_afs_ld(
     args.push(rt_path);
     args.push(libsystem_tbd);
     push_afs_ld_link_flags(&mut args, opts);
+
+    if opts.verbose {
+        print_verbose_command_line(linker, &args);
+    }
 
     let output = Command::new(linker)
         .args(&args)
@@ -2213,6 +2221,14 @@ fn push_link_flags(args: &mut Vec<String>, opts: &Options) {
         // -search_paths_first to bias toward .a archives.  Keep the
         // intent visible without breaking link.
         args.push("-search_paths_first".into());
+    }
+}
+
+fn print_verbose_command_line(program: &str, args: &[String]) {
+    if args.is_empty() {
+        eprintln!("{}", program);
+    } else {
+        eprintln!("{} {}", program, args.join(" "));
     }
 }
 

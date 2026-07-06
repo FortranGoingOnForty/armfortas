@@ -283,3 +283,62 @@ fn dynamiclib_driver_spelling_forwards_darwin_linker_flags() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn verbose_link_only_darwin_line_exposes_runtime_for_cmake() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=driver_link_compat test=verbose_link_only_darwin_line_exposes_runtime_for_cmake count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    if armfortas::testing::native_macho_toolchain_support().is_err() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=driver_link_compat test=verbose_link_only_darwin_line_exposes_runtime_for_cmake count=1 reason=\"Mach-O link flow only\""
+        );
+        return;
+    }
+
+    let dir = unique_dir("verbose_link_runtime");
+    let src = write_program_in(&dir, "p.f90", "program p\n  print *, 'ok'\nend program\n");
+    let obj = dir.join("p.o");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", obj.to_str().unwrap()])
+        .output()
+        .expect("object compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "object compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let exe = dir.join("p");
+    let link = Command::new(compiler("armfortas"))
+        .env_remove("AFS_LD")
+        .env_remove("AFS_LD_PATH")
+        .args([
+            "-v",
+            "-Wl,-v",
+            obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link spawn failed");
+    assert!(
+        link.status.success(),
+        "link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&link.stderr);
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line.trim_start().starts_with("ld ")
+                && line.contains("libarmfortas_rt.a")),
+        "verbose link output should expose an ld command line with the runtime archive for CMake implicit-link parsing:\n{}",
+        stderr
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
