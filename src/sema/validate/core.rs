@@ -351,6 +351,20 @@ fn int_kind_bounds(kind: u8) -> Option<(i128, i128)> {
     Some((-(1i128 << shift), (1i128 << shift) - 1))
 }
 
+/// `type(c_ptr)` / `type(c_funptr)` are interoperable opaque pointer
+/// types from ISO_C_BINDING: ABI-wise a single 8-byte pointer (INTEGER
+/// class — one GP register), not an aggregate. They lower as scalar
+/// pointers, so a BIND(C) VALUE dummy or function result of these types
+/// works and must be exempt from the derived-type by-value / return
+/// rejections (audit C2). Every other derived type is a real aggregate.
+fn is_c_interop_pointer_typespec(ts: &crate::ast::decl::TypeSpec) -> bool {
+    matches!(
+        ts,
+        crate::ast::decl::TypeSpec::Type(name)
+            if name.eq_ignore_ascii_case("c_ptr") || name.eq_ignore_ascii_case("c_funptr")
+    )
+}
+
 fn checked_int_value(value: i128, kind: u8, span: Span) -> Result<ConstIntValue, ConstIntError> {
     let Some((min, max)) = int_kind_bounds(kind) else {
         return Ok(ConstIntValue { value, kind });
@@ -2153,6 +2167,8 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             contains,
             args,
             bind,
+            result,
+            return_type,
             ..
         } => {
             validate_smp_body(ctx, name, prefix, unit.span);
@@ -2160,6 +2176,44 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             let saved_elemental = ctx.in_elemental;
             let saved_bind_c = ctx.in_bind_c_unit;
             ctx.in_bind_c_unit = bind.is_some();
+            // A BIND(C) function returning a derived type hits the
+            // unimplemented aggregate-return ABI: the result comes back
+            // from a never-written buffer (reads 0), broken at every
+            // struct size and on every target. Reject loudly until the C
+            // struct-return convention lands. Audit finding C2.
+            if bind.is_some() {
+                let result_name = result
+                    .clone()
+                    .unwrap_or_else(|| name.clone())
+                    .to_lowercase();
+                let result_ts = return_type.clone().or_else(|| {
+                    decls.iter().find_map(|d| match &d.node {
+                        Decl::TypeDecl {
+                            type_spec,
+                            entities,
+                            ..
+                        } if entities
+                            .iter()
+                            .any(|e| e.name.eq_ignore_ascii_case(&result_name)) =>
+                        {
+                            Some(type_spec.clone())
+                        }
+                        _ => None,
+                    })
+                });
+                if matches!(
+                    result_ts,
+                    Some(crate::ast::decl::TypeSpec::Type(_))
+                        | Some(crate::ast::decl::TypeSpec::Class(_))
+                ) && !result_ts.as_ref().is_some_and(is_c_interop_pointer_typespec)
+                {
+                    ctx.error(
+                        unit.span,
+                        "a BIND(C) function returning a derived type is not supported yet \
+                         (aggregate return ABI is a separate calling-convention change)",
+                    );
+                }
+            }
             ctx.in_pure = prefix.iter().any(|p| matches!(p, Prefix::Pure));
             ctx.in_elemental = prefix.iter().any(|p| matches!(p, Prefix::Elemental));
             let is_impure = prefix.iter().any(|p| matches!(p, Prefix::Impure));
@@ -2367,6 +2421,28 @@ fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
                     decl.span,
                     "the VALUE attribute on CHARACTER dummies is not supported yet \
                      (copy-in lowering is a separate calling-convention change)",
+                );
+            }
+
+            // Derived-type / CLASS VALUE dummies are not lowered: the
+            // callee reads the dummy's components as constant 0 instead
+            // of the passed aggregate (the SysV/AAPCS64 by-value struct
+            // ABI is unwired — the classifier in src/codegen/x86/abi.rs
+            // has no producer). This is a silent miscompile in both
+            // directions on every target (the by-pointer IR is
+            // target-independent), so reject loudly until the aggregate
+            // by-value calling convention lands. Audit finding C2.
+            if attrs.iter().any(|a| matches!(a, Attribute::Value))
+                && matches!(
+                    type_spec,
+                    crate::ast::decl::TypeSpec::Type(_) | crate::ast::decl::TypeSpec::Class(_)
+                )
+                && !is_c_interop_pointer_typespec(type_spec)
+            {
+                ctx.error(
+                    decl.span,
+                    "the VALUE attribute on derived-type dummies is not supported yet \
+                     (by-value aggregate passing is a separate calling-convention change)",
                 );
             }
 
