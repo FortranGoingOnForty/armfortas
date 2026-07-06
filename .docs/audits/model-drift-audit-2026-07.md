@@ -139,17 +139,27 @@ coverage — which is why every suite is green while these ship.
 
 ### afs-as
 
+A1-A4 all **FIXED 2026-07-06 (afs-as PR #11, one commit)**: each assembled
+a valid-looking line into wrong bytes silently. New tests —
+`tests/x86_encode_rejects.rs` (A2-A4 error and gas rejects the same forms)
+and two RIP+imm8 cases in `tests/x86_encode_differential.rs` (A1 addend).
+
 - **A1 — SSE imm8 + RIP memory: PC32 addend off by one.** imm8 pushed after
   the addend is computed. `pshufd $3,tbl(%rip),%xmm0` → gas `tbl-5`, afs
   `tbl-4`; links, reads one byte past the constant. `src/x86/encode.rs:616`.
   Backend emits reg,reg only today; assembler accepts the mem form.
+  Fix: route the trailing immediate through the tail before `finish()` so
+  the existing trailing-byte addend accounting counts it.
 - **A2 — `movhlps` with a memory operand silently assembles as `movlps`**
   (different instruction). The guard comment claiming rejection is dead code;
-  the `SSE_RM` lookup wins first. `src/x86/encode.rs:517,596`.
+  the `SSE_RM` lookup wins first. `src/x86/encode.rs:517,596`. Fix: move the
+  guard ahead of the `SSE_RM` lookup.
 - **A3 — displacements outside i32 silently truncate.**
   `movq 4294967296(%rax),%rbx` → `movq 0(%rax)`. `src/x86/encode.rs:165`.
+  Fix: reject (`i32::try_from`) after the RIP early-return, matching gas.
 - **A4 — `%ch/%dh/%bh` accepted as a shift count, encoded as `%cl`.**
-  `src/x86/encode.rs:1124` (no register-class check).
+  `src/x86/encode.rs:1124` (no register-class check). Fix: require the
+  count to be a low GP register (`class == RegClass::Gp`).
 - **A5 — panic-instead-of-diagnostic:** `.ascii/.asciz/.zero` before any
   section (`assemble.rs:217`); PC-rel patch into a NOBITS section
   (`assemble.rs:627`).
