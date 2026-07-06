@@ -106,6 +106,13 @@ coverage — which is why every suite is green while these ship.
 
 ### afs-ld
 
+L1+L2 **FIXED 2026-07-06 (afs-ld PR #7, pin b46543a)**: extracted one
+`resolve_globals` used by both `link_static_exec` and `link_dynamic_exec`
+— strong beats weak regardless of order, duplicate strong is an error,
+version aliasing applies default (`@@`) versions first then by link order
+(never HashMap order). Dynamic path also gained version aliasing + the
+COMMON hard error it lacked. Unit tests incl. a 64-run determinism check.
+
 - **L1 — no weak/strong resolution in the dynamic path; first def wins.**
   `src/elf.rs:1629` (`globals.entry(name).or_insert(...)`). Weak `foo=7`
   before strong `foo=42` → exits 7; static path and system ld exit 42. Also
