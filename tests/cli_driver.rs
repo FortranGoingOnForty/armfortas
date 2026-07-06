@@ -35076,6 +35076,110 @@ fn implicit_len1_char_component_assignment_preserves_bytes() {
 }
 
 #[test]
+fn o2_runtime_partial_unroll_preserves_post_do_index_for_bitset_tail() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=o2_runtime_partial_unroll_preserves_post_do_index_for_bitset_tail count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let src = write_program(
+        r#"module bitset_probe_mod
+  use iso_fortran_env, only: int32, int64
+  implicit none
+
+  type :: bitset_large
+    integer(int32) :: num_bits = 0_int32
+    integer(int64), allocatable :: blocks(:)
+  contains
+    procedure :: init_zero
+    procedure :: flip_not
+  end type
+
+contains
+
+  subroutine init_zero(self, bits)
+    class(bitset_large), intent(inout) :: self
+    integer(int32), intent(in) :: bits
+    integer(int32) :: nblocks
+
+    self%num_bits = bits
+    nblocks = (bits - 1_int32) / 64_int32 + 1_int32
+    allocate(self%blocks(nblocks))
+    self%blocks = 0_int64
+  end subroutine
+
+  subroutine flip_not(self)
+    class(bitset_large), intent(inout) :: self
+    integer(int32) :: bit, full_blocks, block
+    integer :: remaining_bits
+
+    full_blocks = self%num_bits / 64_int32
+
+    do block = 1_int32, full_blocks
+      self%blocks(block) = not(self%blocks(block))
+    end do
+
+    remaining_bits = self%num_bits - full_blocks * 64_int32
+
+    do bit = 0_int32, remaining_bits - 1
+      if (btest(self%blocks(block), bit)) then
+        self%blocks(block) = ibclr(self%blocks(block), bit)
+      else
+        self%blocks(block) = ibset(self%blocks(block), bit)
+      end if
+    end do
+  end subroutine
+end module
+
+program p
+  use bitset_probe_mod
+  implicit none
+
+  type(bitset_large) :: set10
+
+  call set10%init_zero(99_int32)
+  call set10%flip_not()
+
+  if (size(set10%blocks) /= 2) error stop 10
+  if (set10%blocks(1) /= -1_int64) error stop 11
+  if (set10%blocks(2) /= 34359738367_int64) error stop 12
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("o2_partial_unroll_post_do_bitset_tail", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-O2", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("O2 partial-unroll post-DO bitset compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "O2 partial-unroll post-DO bitset compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("O2 partial-unroll post-DO bitset run failed");
+    assert!(
+        run.status.success(),
+        "O2 partial-unroll post-DO bitset run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "unexpected stdout: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn logical_whole_array_copy_preserves_elements() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
