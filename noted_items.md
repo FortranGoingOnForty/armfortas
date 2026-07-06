@@ -529,11 +529,17 @@ on a built binary. Capability: 6 of 16 real projects behave correctly
 (gfortran passes all 16 — failures are ours). The audit doc holds the
 ranked findings, reproducers, and fix ladder; the load-bearing ones:
 
-- **REGRESSION — stdlib no longer builds.** The "library builds 100%,
-  1288/0" state (976de26) is gone: build dies ~52% on `sort_coo` generic
-  resolution (the open 9bcecbd "generic insert" item), 0 tests run.
-  gfortran control on the same tree: 1289/0. Fix the generic match or the
-  claim must be retracted from every doc that cites it.
+- **REGRESSION — stdlib no longer builds. → FIXED 2026-07-06** (#125). Two
+  generic-dispatch bugs: (a) allocatable rank-N derived-type component
+  dropped its declared rank (deferred-shape `index(:,:)` → empty dims →
+  inferred rank 1), blocked `sort_coo` at ~52% — carry `FieldLayout.rank`
+  and round-trip `@rank N` through .amod (f3ad081); (b) order-dependent
+  block-local scalar actual promoted to rank 1 via a foreign same-named
+  rank-1 dummy from a USE'd module (`actual_expr_rank` any-scope fallback),
+  blocked `dense()`/`check()` in the test exes — restrict the rank
+  cross-check to the current scope (267c8ce). Full `fpm test` now 1288/0,
+  matching 976de26; gfortran control 1289/0. Regression tests in
+  test_programs/ + tests/multifile.rs.
 - **memmove −1 length → SIGSEGV** on derived-type-with-allocatable-char
   assignment (`x = ctor()`), fault addr 0xffff...ffff. Crashes 7 fgof
   libraries — highest-leverage single fix. Same family as the deferred
