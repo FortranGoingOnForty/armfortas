@@ -20513,6 +20513,27 @@ pub(super) fn lower_alloc_return_call_into_desc(
     callee_name: &str,
     args: &[crate::ast::expr::Argument],
 ) {
+    // The callee allocates its allocatable-array result straight into
+    // `desc_addr` (the assignment target's descriptor, per the sret
+    // "write straight in" optimization). If the target was already
+    // allocated — `allocate(c(0)); c = f(...)`, exactly the fgof
+    // `allocate(c_parent(0)); c_parent = to_c_string(x)` idiom — the
+    // callee's `allocate(result)` sees a live descriptor and reuses or
+    // corrupts it (a size-0 target yields a -1 base and SIGSEGVs in the
+    // callee's first element write). Intrinsic assignment to an
+    // allocatable deallocates the target first anyway, so free it here.
+    // A non-null STAT makes this a no-op on an unallocated descriptor
+    // (the zeroed temp descriptors some callers pass), rather than the
+    // hard error `afs_deallocate_array` raises without STAT.
+    let dealloc_stat = b.alloca(IrType::Int(IntWidth::I32));
+    let dealloc_zero = b.const_i32(0);
+    b.store(dealloc_zero, dealloc_stat);
+    b.call(
+        FuncRef::External("afs_deallocate_array".into()),
+        vec![desc_addr, dealloc_stat],
+        IrType::Void,
+    );
+
     let key = callee_name.to_lowercase();
     let arg_slots = reorder_args_by_keyword_slots(args, &key, ctx.st);
     let present_args: Vec<crate::ast::expr::Argument> =
