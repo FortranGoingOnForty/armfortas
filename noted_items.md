@@ -554,10 +554,46 @@ ranked findings, reproducers, and fix ladder; the load-bearing ones:
   under `AFS_LD=1` binaries lack the unwind header the driver requests.
 - **T2 / arm64 -O2+ default-init miscompile now has zero coverage** —
   both exposing fixtures (ffb7d0a, 5e250a4) were neutered; the XFAIL
-  grammar has no opt-level qualifier so a plain `XFAIL(arm64)` panics as
-  unexpected-pass at -O0. Add `XFAIL(arch,Olevel)` grammar, reinstate a
-  failing fixture. This is the structural cause of the fixture-softening
-  pattern, not a one-off.
+  grammar had no opt-level qualifier so a plain `XFAIL(arm64)` panics as
+  unexpected-pass at -O0.
+  - **GRAMMAR FIXED 2026-07-06 (99cdc2d)**: opt-level selectors added —
+    `O2` exact, `O2+` rank-and-above (Os=rank 2, Ofast=3); target ∧ opt
+    dimensions conjoin so `XFAIL(arm64,O2+)` works. Unit-tested.
+  - **FIXTURE PENDING an arm64 run**: wrote a minimal repro (derived local
+    with `integer::n=3` default-init, passed intent(inout) to a sub that
+    reads `%n`, CHECK n=3/hl=T, `XFAIL(arm64,O2+)`). Correct on x86_64 at
+    all 6 levels (n=3). NOT committed to test_programs/ yet because I
+    can't confirm from FreeBSD that this *minimal* form triggers the bug
+    on arm64 (the original used a type-bound proc `s%has_loc()`); a wrong
+    repro would XPASS and break the macOS gate. nomad (only arm64 box) was
+    unreachable 2026-07-06. Validate on arm64 (n must be 0 at -O2/-O3/
+    -Ofast/-Os, 3 at -O0/-O1), tighten the repro to a TBP form if the
+    plain sub doesn't trigger, THEN commit. Fixture source:
+
+    ```fortran
+    ! XFAIL(arm64,O2+): arm64 default-init component read returns 0 at -O2+ (audit T2)
+    ! CHECK: n=3
+    ! CHECK: hl=T
+    module x12_default_init_m
+      implicit none
+      type :: settings
+        integer :: n = 3
+      end type settings
+    contains
+      subroutine show(s)
+        type(settings), intent(inout) :: s
+        print '(a,i0)', 'n=', s%n
+        print '(a,l1)', 'hl=', s%n > 0
+      end subroutine show
+    end module x12_default_init_m
+
+    program x12_arm64_default_init_intent_inout
+      use x12_default_init_m
+      implicit none
+      type(settings) :: local
+      call show(local)
+    end program x12_arm64_default_init_intent_inout
+    ```
 
 Memmove -1 crash split into two bugs (2026-07-06):
 - **FIXED (cd6bbe9)**: cross-module assumed-size `(*)` / explicit-shape

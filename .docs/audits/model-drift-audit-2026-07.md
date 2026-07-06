@@ -196,10 +196,15 @@ and two RIP+imm8 cases in `tests/x86_encode_differential.rs` (A1 addend).
 - **T2 — the arm64 -O2+ default-init miscompile now has zero failing
   coverage.** ffb7d0a and 5e250a4 both reworked the fixtures that exposed it;
   no `XFAIL(arm64)` replaced them. Structural cause: the XFAIL grammar has no
-  opt-level qualifier (`tests/run_programs.rs:2799`), so a plain XFAIL panics
-  as "unexpectedly passed" at -O0/-O1 — which channels developers into
-  fixture-softening. Fix the grammar (`XFAIL(arm64,O2+):`) and reinstate a
-  failing fixture.
+  opt-level qualifier, so a plain XFAIL panics as "unexpectedly passed" at
+  -O0/-O1 — which channels developers into fixture-softening.
+  **GRAMMAR FIXED 2026-07-06 (99cdc2d)**: opt-level selectors (`O2` exact,
+  `O2+` rank-and-above; target ∧ opt conjunction) + unit tests.
+  **Fixture reinstatement pending an arm64 run** (nomad unreachable
+  2026-07-06): repro written and x86-validated, but committing an
+  unvalidated `XFAIL(arm64,O2+)` risks an XPASS that breaks the macOS gate,
+  so it is held until arm64 confirms the minimal form triggers the bug —
+  source + procedure in `noted_items.md`.
 - **T3 — silent-degrade stubs added since June:** `.amod` rank/dims
   `unwrap_or(0/1)` (`src/sema/amod.rs:1781`), C_F_POINTER rank `unwrap_or(0)`
   (`intrinsic_sub.rs:801`), "emit zero as a safe fallback" ELF global
