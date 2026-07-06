@@ -13805,8 +13805,16 @@ pub(super) fn actual_expr_rank(
         }
         Expr::Name { name } => {
             let key = name.to_lowercase();
-            let symbol_rank = st
-                .lookup_local_then_any(current_proc_scope(), &key)
+            // For a KNOWN LOCAL, the symbol-table cross-check must stay
+            // inside the current scope. `lookup_local_then_any` falls back
+            // to `find_symbol_any_scope`, which — when many modules are
+            // USE-associated — resolves `a` to a same-named dummy in an
+            // unrelated module and returns its rank. Which foreign `a` wins
+            // depends on module load order, so a scalar local `A` was
+            // promoted to rank 1 and generic dispatch matched no rank-0
+            // specific (stdlib `dense(A)` / `check(...)`, order-dependent).
+            let symbol_rank_local = current_proc_scope()
+                .and_then(|sid| st.lookup_in(sid, &key))
                 .and_then(value_symbol_declared_rank);
             if let Some(info) = locals.get(&key) {
                 if local_is_array_like(info) {
@@ -13814,18 +13822,25 @@ pub(super) fn actual_expr_rank(
                     if local_rank > 0 {
                         return Some(local_rank);
                     }
-                    if let Some(symbol_rank) = symbol_rank {
+                    if let Some(symbol_rank) = symbol_rank_local {
                         if symbol_rank > 0 {
                             return Some(symbol_rank);
                         }
                     }
                 }
-                if (info.descriptor_arg || info.by_ref) && symbol_rank.is_some_and(|rank| rank > 0)
+                // Remote's descriptor/by-ref gate, but sourced from the
+                // scope-restricted lookup so a scalar block-local can't
+                // inherit an unrelated USE-associated dummy's rank.
+                if (info.descriptor_arg || info.by_ref)
+                    && symbol_rank_local.is_some_and(|rank| rank > 0)
                 {
-                    return symbol_rank;
+                    return symbol_rank_local;
                 }
                 return Some(0);
             }
+            let symbol_rank = st
+                .lookup_local_then_any(current_proc_scope(), &key)
+                .and_then(value_symbol_declared_rank);
             Some(symbol_rank.unwrap_or(0))
         }
         Expr::ParenExpr { inner } => actual_expr_rank(inner, locals, st, type_layouts),

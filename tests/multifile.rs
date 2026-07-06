@@ -1519,3 +1519,27 @@ fn generic_dispatch_allocatable_rank2_component_cross_module() {
         "12",
     );
 }
+
+#[test]
+fn generic_dispatch_block_local_scalar_not_shadowed_by_foreign_dummy_rank() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=generic_dispatch_block_local_scalar_not_shadowed_by_foreign_dummy_rank count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // The order-dependent stdlib `dense(A)` / `check(...)` regression. A
+    // scalar derived-type actual `a` declared inside a BLOCK isn't in the
+    // procedure scope, so the generic dispatcher's rank cross-check fell
+    // through to a whole-symbol-table lookup and picked up a same-named
+    // rank-1 dummy from the use-associated noise_mod — inferring the scalar
+    // actual as rank 1 and matching no rank-0 specific. Which foreign `a`
+    // won depended on module load order. The rank cross-check for a known
+    // local now stays in the current scope. Correct dispatch: 5 + 100.
+    multifile_test(
+        "module noise_mod\n  implicit none\ncontains\n  subroutine noise(a)\n    integer, intent(inout) :: a(:)\n    a = a + 1\n  end subroutine\nend module\nmodule wt_mod\n  implicit none\n  type :: wt\n    integer :: v = 0\n  end type\n  interface widen\n    module procedure widen_t\n  end interface\ncontains\n  integer function widen_t(a) result(r)\n    type(wt), intent(in) :: a\n    r = a%v + 100\n  end function\nend module\n",
+        "program p\n  use noise_mod\n  use wt_mod\n  implicit none\n  block\n    type(wt) :: a\n    a%v = 5\n    print '(i0)', widen(a)\n  end block\nend program\n",
+        "105",
+    );
+}
