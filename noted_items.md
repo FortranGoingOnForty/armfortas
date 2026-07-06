@@ -553,6 +553,28 @@ ranked findings, reproducers, and fix ladder; the load-bearing ones:
   failing fixture. This is the structural cause of the fixture-softening
   pattern, not a one-off.
 
+Memmove -1 crash split into two bugs (2026-07-06):
+- **FIXED (cd6bbe9)**: cross-module assumed-size `(*)` / explicit-shape
+  array dummy was passed as a descriptor instead of a bare data address.
+  `descriptor_param_mask_for_lookup` let the `.amod` rank-based dummy
+  reconstruction (which rebuilds `(*)` as AssumedShape) override the
+  authoritative descriptor mask. Now trusts the cache when present.
+  Regression tests: tests/multifile.rs assumed_size_{integer,cchar}_*.
+  Fixes `from_c_string`-style C-interop scans in isolation.
+- **OPEN — x86_64 hidden char-length ABI**: fgof-temp (and likely all 7
+  crashing fgof libs) still SIGSEGV via `create_temp_file_posix`. lldb:
+  memmove dest=-1 in `to_c_string(parent_dir)` because `len(parent_dir)`
+  is garbage — a hidden character-length arg is misplaced. The `.amod`
+  emits `cc=aapcs64` with ARM64 x0..x7 naming (8 int arg regs) even on
+  x86_64 (6 int regs), so for an 8-arg fn (5 explicit + 3 hidden lengths)
+  the last two hidden lengths spill to the stack on x86. The callee
+  prologue reads them correctly and every faithful minimal repro passes;
+  only the real module-compiled function crashes — suspect the caller-side
+  hidden-length placement or interaction with the 4096-byte-local
+  stack-probe frame. Full crash frame, ABI dump, and the six negative
+  repros in scratchpad/memmove-diagnosis.md. Blocks fgof-fs/process/pty/
+  watch/temp/cache/state. Owner: x86 call ABI / hidden char-length args.
+
 Other verified miscompiles (details + repros in the audit doc), all with
 zero fixture coverage: reduction vectorizer drops elementwise stores at
 -O3/-Ofast (C1, arm64 likely too); BIND(C) aggregate ABI is dead code,
