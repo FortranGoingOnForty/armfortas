@@ -1496,3 +1496,26 @@ fn assumed_size_cchar_dummy_cross_module_reads_correctly() {
         "3",
     );
 }
+
+#[test]
+fn generic_dispatch_allocatable_rank2_component_cross_module() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=generic_dispatch_allocatable_rank2_component_cross_module count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // The stdlib sparse `sort_coo(COO%index, ...)` regression: dispatching a
+    // generic on an allocatable rank-2 derived-type component whose type is
+    // defined in a separately compiled module. A deferred-shape component's
+    // `.amod` layout carries empty dims, so its declared rank (2) was lost;
+    // the actual reported rank 1 and no rank-2 specific matched. The `.amod`
+    // now records `@rank 2` and the consumer recovers it. Correct dispatch
+    // binds the 4-arg specific: 5 + 7 + 0 = 12.
+    multifile_test(
+        "module gdx_types\n  implicit none\n  integer, parameter :: ilp = 4\n  type :: base_t\n    integer(ilp) :: nrows = 0, ncols = 0, nnz = 0\n  end type\n  type, extends(base_t) :: coo_t\n    integer(ilp), allocatable :: index(:,:)\n  end type\nend module\nmodule gdx_ops\n  use gdx_types\n  implicit none\n  interface sort_coo\n    module procedure sort4\n    module procedure sort5\n  end interface\ncontains\n  subroutine sort4(a, n, num_rows, num_cols)\n    integer(ilp), intent(inout) :: a(2,*)\n    integer(ilp), intent(inout) :: n\n    integer(ilp), intent(in) :: num_rows, num_cols\n    n = num_rows + num_cols + a(1,1)\n  end subroutine\n  subroutine sort5(a, data, n, num_rows, num_cols)\n    integer(ilp), intent(inout) :: a(2,*)\n    real, intent(inout) :: data(*)\n    integer(ilp), intent(inout) :: n\n    integer(ilp), intent(in) :: num_rows, num_cols\n    n = num_rows\n  end subroutine\nend module\n",
+        "program p\n  use gdx_types\n  use gdx_ops\n  implicit none\n  type(coo_t) :: c\n  allocate(c%index(2,10))\n  c%index = 0\n  c%nnz = 3\n  c%nrows = 5\n  c%ncols = 7\n  call sort_coo(c%index, c%nnz, c%nrows, c%ncols)\n  print '(i0)', c%nnz\nend program\n",
+        "12",
+    );
+}
