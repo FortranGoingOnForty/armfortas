@@ -8,6 +8,8 @@
 !.docs/audits/x09-pass-audit.md
 # x12 deliverable 6: the real-project campaign log is a committed artifact.
 !.docs/audits/x86-campaign-log.md
+# Model-drift audit: consolidated findings from the 5-agent sweep.
+!.docs/audits/model-drift-audit-2026-07.md
 .fackr/
 .refs/
 target/

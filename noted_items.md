@@ -520,3 +520,53 @@ Found during the L-tail internal-file work (2026-07-04):
   compile time (element units keep working); fixture
   l10_internal_read_array_reject. Full read support is the recorded
   follow-up.
+
+Model-drift audit (2026-07-06) — full report at
+`.docs/audits/model-drift-audit-2026-07.md`. Five hostile auditors over
+recent work (afs-ld, afs-as, compiler core since June 1, real-project
+sweep, test integrity). 16 verified defects; every miscompile reproduced
+on a built binary. Capability: 6 of 16 real projects behave correctly
+(gfortran passes all 16 — failures are ours). The audit doc holds the
+ranked findings, reproducers, and fix ladder; the load-bearing ones:
+
+- **REGRESSION — stdlib no longer builds.** The "library builds 100%,
+  1288/0" state (976de26) is gone: build dies ~52% on `sort_coo` generic
+  resolution (the open 9bcecbd "generic insert" item), 0 tests run.
+  gfortran control on the same tree: 1289/0. Fix the generic match or the
+  claim must be retracted from every doc that cites it.
+- **memmove −1 length → SIGSEGV** on derived-type-with-allocatable-char
+  assignment (`x = ctor()`), fault addr 0xffff...ffff. Crashes 7 fgof
+  libraries — highest-leverage single fix. Same family as the deferred
+  rank-2 deferred-char (C10) and internal-WRITE (C12) items below.
+- **C12 / internal-WRITE realloc regressed to silent truncation**,
+  fixture rewritten in the same commit (426a29d); `f2023-feature-matrix.md:86`
+  still claims realloc. Truncates even under `--std=f2023`. Adjudicate vs
+  F2023 12.6.4.5.1 before fixing; silent truncation is policy-forbidden
+  either way.
+- **T1 / `--eh-frame-hdr` buried retirement** — afs-ld 2cb05d7 moved it to
+  silent-accept and re-pointed its rejection test to `-pie` undisclosed;
+  under `AFS_LD=1` binaries lack the unwind header the driver requests.
+- **T2 / arm64 -O2+ default-init miscompile now has zero coverage** —
+  both exposing fixtures (ffb7d0a, 5e250a4) were neutered; the XFAIL
+  grammar has no opt-level qualifier so a plain `XFAIL(arm64)` panics as
+  unexpected-pass at -O0. Add `XFAIL(arch,Olevel)` grammar, reinstate a
+  failing fixture. This is the structural cause of the fixture-softening
+  pattern, not a one-off.
+
+Other verified miscompiles (details + repros in the audit doc), all with
+zero fixture coverage: reduction vectorizer drops elementwise stores at
+-O3/-Ofast (C1, arm64 likely too); BIND(C) aggregate ABI is dead code,
+silently wrong both directions (C2); strided component-view I/O (C3);
+elemental defined operators broadcast on arrays (C4); FINDLOC drops
+MASK=/BACK= (C5); untyped char-AC corrupts (C6, fix gated to fpm's
+spelling); `real(16)`→single precision (C7, pre-June); implied-do
+list-directed output prints a blank record (C8, pre-June); C_F_POINTER
+component-FPTR rank (C9); rank-2 deferred-char compares as len 0 (C10);
+CLASS mold=/source= loses dynamic type (C11); ferp `[0-9]` regex
+miscompiles; superlinear compile time on 500+/1400-line modules
+(sniffert, facsimile). afs-as: SSE-imm8 RIP addend off-by-one, movhlps→
+movlps aliasing, disp>i32 truncation, %ch-as-shift-count. afs-ld: no
+weak/strong resolution (miscompile), HashMap-ordered version-alias
+(nondeterministic bytes), library-order permutation, IFUNC misclassified
+(blocks 3f), GOTPCREL-on-linker-symbol panic. New campaign PASSes worth
+adopting: toml-f, test-drive.
