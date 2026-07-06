@@ -1849,6 +1849,24 @@ pub(crate) fn detect_reduction_plan(
     {
         return None;
     }
+    // A pure reduction writes no memory in the loop body: the
+    // accumulator is an SSA block param folded to a scalar after the
+    // loop, and the operands are loads. Any Store/VStore is therefore an
+    // independent elementwise write (`c(i) = a(i)*b(i)` carried alongside
+    // `dot = dot + a(i)*b(i)`). The reduction rewrite widens the IV to
+    // `lanes` stride but does not vectorize that store, so it would run
+    // once per vector iteration and drop lanes 1..lanes-1 (uninitialized
+    // output, silent — the reduction still comes out right). Refuse the
+    // plan and leave the loop scalar rather than miscompile it.
+    if func
+        .blocks
+        .iter()
+        .filter(|b| lp.body.contains(&b.id))
+        .flat_map(|b| b.insts.iter())
+        .any(|inst| matches!(inst.kind, InstKind::Store(..) | InstKind::VStore(..)))
+    {
+        return None;
+    }
     let body_term_arg_iv;
     let body_term_arg_acc;
     match &body_block.terminator {
