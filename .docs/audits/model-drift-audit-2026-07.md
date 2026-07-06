@@ -41,12 +41,21 @@ coverage — which is why every suite is green while these ship.
   `src/opt/neon_vectorize.rs:873`. Analysis is shared with NEON → arm64
   likely affected. Hole predates June (May f9f3610); x10 SSE `int_mul`
   (9cce9f6) made it reachable on x86.
-- **C2 — BIND(C) aggregate ABI silently wrong both directions.** The SysV
-  struct classifier (`src/codegen/x86/abi.rs`, 2443a79/180d615) is faithful to
-  the psABI but has no producer — unit-test-only dead code.
-  `src/codegen/x86/isel.rs:3513` never emits aggregates. Struct-by-VALUE goes
-  as a pointer; struct return reads a never-written buffer. 180d615 added loud
-  rejection for character VALUE dummies but let derived-type VALUE through.
+- **C2 — BIND(C) aggregate ABI silently wrong both directions.
+  LOUD-REJECTED 2026-07-06 (9b50a7e).** The SysV struct classifier
+  (`src/codegen/x86/abi.rs`, 2443a79/180d615) is faithful to the psABI but
+  has no producer — unit-test-only dead code. `src/codegen/x86/isel.rs:3513`
+  never emits aggregates. Struct-by-VALUE goes as a pointer (callee read
+  components as const 0); struct return reads a never-written buffer (both
+  directions, all sizes, all targets — the by-pointer IR is
+  target-independent). Interim: sema now rejects derived-type VALUE dummies
+  and derived-type BIND(C) results, mirroring the char-VALUE rejection;
+  `type(c_ptr)`/`type(c_funptr)` exempt (ABI-scalar). Full aggregate
+  calling convention (wire the classifier into isel + returns) remains
+  scheduled. Residual: an interface-only external C function taking/returning
+  a struct by value has no Fortran definition to reject — caller-side ABI
+  still unhandled. Fixtures `test_programs/bind_c_derived_type_{value,result}_rejected.f90`,
+  `bind_c_cptr_value_and_result_ok.f90`.
 - **C3 — strided component views ignore stride in whole-array I/O.**
   `associate(ids => a%id)` prints the sibling component's bit patterns
   interleaved; `sum(ids)` is correct so the descriptor is right and I/O
