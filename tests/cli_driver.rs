@@ -378,6 +378,168 @@ end program
 }
 
 #[test]
+fn o2_stdlib_real32_string_parser_keeps_liveout_multiply() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=o2_stdlib_real32_string_parser_keeps_liveout_multiply count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let src = write_program(
+        r#"
+program p
+  use iso_fortran_env, only: int8, int64, real32, real64
+  implicit none
+  character(len=*), parameter :: s = &
+      '0.140129846432481707092372958328991613128026194187651577175706828388979' // &
+      '108268586060148663818836212158203125E-44'
+  real(real32) :: v
+
+  v = to_sp(s, v)
+  if (abs(v - real(1.401298464324817d-45, real32)) > 0.0_real32) error stop 1
+  print *, 'tiny ok'
+contains
+  elemental function to_sp(input, mold) result(v)
+    character(*), intent(in) :: input
+    real(real32), intent(in) :: mold
+    real(real32) :: v
+    integer(int8) :: p
+    integer(int8) :: stat
+    call to_sp_base(input, v, p, stat)
+  end function
+
+  pure integer(int8) function shift_to_nonwhitespace(input) result(p)
+    character(*), intent(in) :: input
+    integer :: i
+    p = 1_int8
+    do i = 1, len(input)
+      if (iachar(input(i:i)) /= 32) then
+        p = int(i, int8)
+        return
+      end if
+    end do
+  end function
+
+  elemental subroutine to_sp_base(input, v, p, stat)
+    character(*), intent(in) :: input
+    real(real32), intent(inout) :: v
+    integer(int8), intent(out) :: p
+    integer(int8), intent(out) :: stat
+    integer(int8), parameter :: digit_0 = iachar('0', int8)
+    integer(int8), parameter :: period = iachar('.', int8) - digit_0
+    integer(int8), parameter :: minus_sign = iachar('-', int8) - digit_0
+    integer(int8), parameter :: plus_sign = iachar('+', int8) - digit_0
+    integer(int8), parameter :: le = iachar('e', int8) - digit_0
+    integer(int8), parameter :: be = iachar('E', int8) - digit_0
+    integer(int8), parameter :: ld = iachar('d', int8) - digit_0
+    integer(int8), parameter :: bd = iachar('D', int8) - digit_0
+    integer(int8), parameter :: nwnb = 39
+    integer(int8), parameter :: nfnb = 37
+    integer, parameter :: maxdpt = 11
+    integer :: e
+    real(real64), parameter :: whole_number_base(nwnb) = [(10._real64**(nwnb - e), e = 1, nwnb)]
+    real(real64), parameter :: fractional_base(nfnb) = [(10._real64**(-e), e = 1, nfnb)]
+    real(real64), parameter :: expbase(nwnb + nfnb) = [whole_number_base, fractional_base]
+    integer(int8) :: sign, sige
+    integer(int64) :: int_wp
+    integer :: i_exp
+    integer :: exp_aux
+    integer(int8) :: i, pP, pE, val, resp
+
+    stat = 23
+    p = shift_to_nonwhitespace(input)
+    sign = 1
+    if (iachar(input(p:p)) == minus_sign + digit_0) then
+      sign = -1
+      p = p + 1
+    end if
+    pP = 127
+    int_wp = 0
+    do i = p, min(maxdpt + p - 1, len(input))
+      val = iachar(input(i:i)) - digit_0
+      if (val >= 0 .and. val <= 9) then
+        int_wp = int_wp * 10 + val
+      else if (val == period) then
+        pP = i
+      else
+        exit
+      end if
+    end do
+    pE = i
+    do while (i <= len(input))
+      val = iachar(input(i:i)) - digit_0
+      if (val < 0 .or. val > 9) exit
+      i = i + 1
+    end do
+    p = i
+    resp = pE - min(pP, p)
+    if (resp <= 0) resp = resp + 1
+    sige = 1
+    if (p < len(input)) then
+      if (any([le, be, ld, bd] + digit_0 == iachar(input(p:p)))) p = p + 1
+      if (iachar(input(p:p)) == minus_sign + digit_0) then
+        sige = -1
+        p = p + 1
+      else if (iachar(input(p:p)) == plus_sign + digit_0) then
+        p = p + 1
+      end if
+    end if
+    i_exp = 0
+    do while (p <= len(input))
+      val = iachar(input(p:p)) - digit_0
+      if (val >= 0 .and. val <= 9) then
+        i_exp = i_exp * 10_int8 + val
+        p = p + 1
+      else
+        exit
+      end if
+    end do
+    exp_aux = nwnb - 1 + resp - sige * i_exp
+    if (exp_aux > 0 .and. exp_aux <= nwnb + nfnb) then
+      v = sign * int_wp * expbase(exp_aux)
+    else
+      v = sign * int_wp * 10._real64**(sige * i_exp - resp + 1)
+    end if
+    stat = 0
+  end subroutine
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("stdlib_real32_to_num_o2", "bin");
+    let result = Command::new(compiler("armfortas"))
+        .args(["-O2", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("stdlib real32 parser compile failed to spawn");
+    assert!(
+        result.status.success(),
+        "stdlib real32 parser probe should compile and link: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("stdlib real32 parser probe run failed");
+    assert!(
+        run.status.success(),
+        "stdlib real32 parser probe run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("tiny ok"),
+        "unexpected stdlib real32 parser output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn o2_separate_unit_absent_allocatable_optionals_stay_null_on_stack() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

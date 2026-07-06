@@ -81,37 +81,14 @@ fn total_inst_count(mf: &MachineFunction) -> usize {
 
 /// FMADD/FMSUB/FNMSUB fusion.
 fn fma_fusion(mf: &mut MachineFunction) {
+    let use_count = compute_global_use_counts(mf);
     for mb_idx in 0..mf.blocks.len() {
-        fma_fuse_block(mf, mb_idx);
+        fma_fuse_block(mf, mb_idx, &use_count);
     }
 }
 
-fn fma_fuse_block(mf: &mut MachineFunction, mb_idx: usize) {
+fn fma_fuse_block(mf: &mut MachineFunction, mb_idx: usize, use_count: &HashMap<VRegId, usize>) {
     let block = &mf.blocks[mb_idx];
-
-    // Count uses of each defined VReg within this block.
-    // A fmul result is fusable only when its use count == 1 (the fadd/fsub).
-    let mut use_count: HashMap<VRegId, usize> = HashMap::new();
-    for inst in &block.insts {
-        for op in &inst.operands {
-            if let MachineOperand::VReg(v) = op {
-                *use_count.entry(*v).or_insert(0) += 1;
-            }
-        }
-    }
-    // Subtract the self-def (operands[0] is the dest, counted in use_count
-    // but it's a def not a use). For a 3-operand FmulS [dest, src0, src1]:
-    // dest appears once in operands but it's the definition, not a use.
-    // Re-compute: only operands[1..] are uses.
-    let mut use_count: HashMap<VRegId, usize> = HashMap::new();
-    for inst in &block.insts {
-        // Operands beyond index 0 are inputs (index 0 is the output dest).
-        for op in inst.operands.iter().skip(1) {
-            if let MachineOperand::VReg(v) = op {
-                *use_count.entry(*v).or_insert(0) += 1;
-            }
-        }
-    }
 
     // Map: vreg defined by a fmul instruction → (block-instruction-index, precision)
     #[derive(Clone, Copy)]
@@ -345,25 +322,14 @@ fn fma_fuse_block(mf: &mut MachineFunction, mb_idx: usize) {
 /// Preconditions match the FP version: same block, mul result has
 /// exactly one use (the add/sub).
 fn madd_fusion(mf: &mut MachineFunction) {
+    let use_count = compute_global_use_counts(mf);
     for mb_idx in 0..mf.blocks.len() {
-        madd_fuse_block(mf, mb_idx);
+        madd_fuse_block(mf, mb_idx, &use_count);
     }
 }
 
-fn madd_fuse_block(mf: &mut MachineFunction, mb_idx: usize) {
+fn madd_fuse_block(mf: &mut MachineFunction, mb_idx: usize, use_count: &HashMap<VRegId, usize>) {
     let block = &mf.blocks[mb_idx];
-
-    // Per-block use counts of values, *as inputs only*. operands[0] is
-    // the def for AddReg/SubReg/Mul, so we skip index 0 to count true
-    // uses.
-    let mut use_count: HashMap<VRegId, usize> = HashMap::new();
-    for inst in &block.insts {
-        for op in inst.operands.iter().skip(1) {
-            if let MachineOperand::VReg(v) = op {
-                *use_count.entry(*v).or_insert(0) += 1;
-            }
-        }
-    }
 
     // VReg defined by an integer Mul → block index of that mul.
     let mut mul_defs: HashMap<VRegId, usize> = HashMap::new();
@@ -1080,6 +1046,30 @@ mod tests {
         mf
     }
 
+    fn mf_with_two_blocks(
+        entry_insts: Vec<MachineInst>,
+        next_insts: Vec<MachineInst>,
+        class: RegClass,
+    ) -> MachineFunction {
+        let mut mf = MachineFunction::new("test".into());
+        for _ in 0..12 {
+            mf.new_vreg(class);
+        }
+        mf.blocks = vec![
+            MachineBlock {
+                id: MBlockId(0),
+                label: "entry".into(),
+                insts: entry_insts,
+            },
+            MachineBlock {
+                id: MBlockId(1),
+                label: "next".into(),
+                insts: next_insts,
+            },
+        ];
+        mf
+    }
+
     fn vreg(v: u32) -> MachineOperand {
         MachineOperand::VReg(VRegId(v))
     }
@@ -1319,6 +1309,35 @@ mod tests {
         assert_eq!(mf.blocks[0].insts[0].opcode, ArmOpcode::Mul);
     }
 
+    /// mul result with an extra cross-block consumer must NOT fuse.
+    #[test]
+    fn integer_mul_used_in_later_block_not_fused() {
+        let mul = MachineInst {
+            opcode: ArmOpcode::Mul,
+            operands: vec![vreg_gp(0), vreg_gp(1), vreg_gp(2)],
+            def: Some(vid(0)),
+        };
+        let sub = MachineInst {
+            opcode: ArmOpcode::SubReg,
+            operands: vec![vreg_gp(4), vreg_gp(3), vreg_gp(0)],
+            def: Some(vid(4)),
+        };
+        let later_use = MachineInst {
+            opcode: ArmOpcode::AddReg,
+            operands: vec![vreg_gp(5), vreg_gp(0), vreg_gp(6)],
+            def: Some(vid(5)),
+        };
+        let mut mf = mf_with_two_blocks(vec![mul, sub], vec![later_use], RegClass::Gp64);
+        madd_fusion(&mut mf);
+        assert_eq!(
+            mf.blocks[0].insts.len(),
+            2,
+            "live-out mul must remain materialized"
+        );
+        assert_eq!(mf.blocks[0].insts[0].opcode, ArmOpcode::Mul);
+        assert_eq!(mf.blocks[0].insts[1].opcode, ArmOpcode::SubReg);
+    }
+
     /// fmul result used twice: must NOT be fused.
     #[test]
     fn no_fusion_if_mul_used_twice() {
@@ -1343,6 +1362,35 @@ mod tests {
         // No fusion — fmul has 2 uses.
         assert_eq!(mf.blocks[0].insts.len(), 3);
         assert_eq!(mf.blocks[0].insts[0].opcode, ArmOpcode::FmulS);
+    }
+
+    /// fmul result with an extra cross-block consumer must NOT fuse.
+    #[test]
+    fn no_fusion_if_fmul_used_in_later_block() {
+        let fmul = MachineInst {
+            opcode: ArmOpcode::FmulS,
+            operands: vec![vreg(0), vreg(1), vreg(2)],
+            def: Some(vid(0)),
+        };
+        let fsub = MachineInst {
+            opcode: ArmOpcode::FsubS,
+            operands: vec![vreg(4), vreg(3), vreg(0)],
+            def: Some(vid(4)),
+        };
+        let later_use = MachineInst {
+            opcode: ArmOpcode::FaddS,
+            operands: vec![vreg(5), vreg(0), vreg(6)],
+            def: Some(vid(5)),
+        };
+        let mut mf = mf_with_two_blocks(vec![fmul, fsub], vec![later_use], RegClass::Fp32);
+        fma_fusion(&mut mf);
+        assert_eq!(
+            mf.blocks[0].insts.len(),
+            2,
+            "live-out fmul must remain materialized"
+        );
+        assert_eq!(mf.blocks[0].insts[0].opcode, ArmOpcode::FmulS);
+        assert_eq!(mf.blocks[0].insts[1].opcode, ArmOpcode::FsubS);
     }
 
     /// LdrFpImm fed by AddReg(base, Mul(idx, Movz(8))) → LdrFpReg with lsl=3.
