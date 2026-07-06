@@ -28,7 +28,11 @@ coverage — which is why every suite is green while these ship.
 
 ### Compiler core (armfortas)
 
-- **C1 — reduction vectorizer drops elementwise stores at -O3/-Ofast.**
+- **C1 — reduction vectorizer drops elementwise stores at -O3/-Ofast.
+  FIXED 2026-07-06 (36a51ad).** `detect_reduction_plan` now refuses any
+  loop whose body writes memory (Store/VStore); pure reductions and pure
+  map loops are unaffected. Fixture
+  `test_programs/vec_reduction_with_elementwise_store.f90`.
   A loop carrying both `c(i)=a(i)*b(i)` and `dot=dot+a(i)*b(i)` widens the IV
   to stride 4 but leaves the scalar store in the widened body → 3 of 4 stores
   lost, uninitialized output; the reduction stays correct so nothing
