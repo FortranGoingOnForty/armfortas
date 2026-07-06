@@ -436,9 +436,14 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
                     args.get(i).ok_or("-isystem requires a directory")?,
                 ));
             }
-            arg if arg.starts_with("-isystem") => opts.module_search_paths.push(PathBuf::from(
-                short_option_value(arg, "-isystem", "a directory")?,
-            )),
+            arg if arg.starts_with("-isystem") => {
+                opts.module_search_paths
+                    .push(PathBuf::from(short_option_value(
+                        arg,
+                        "-isystem",
+                        "a directory",
+                    )?))
+            }
 
             "-J" => {
                 i += 1;
@@ -888,12 +893,16 @@ fn collect_cli_warnings(opts: &mut Options, unknown_warning_flags: &[String]) {
             .push("-fmax-stack-var-size is recognized but not yet implemented".into());
     }
     if opts.max_errors_compat.is_some() {
-        opts.cli_warnings
-            .push("-fmax-errors is recognized but diagnostic error limiting is not yet implemented".into());
+        opts.cli_warnings.push(
+            "-fmax-errors is recognized but diagnostic error limiting is not yet implemented"
+                .into(),
+        );
     }
     if opts.no_stack_arrays_compat {
-        opts.cli_warnings
-            .push("-fno-stack-arrays is recognized but automatic array placement is not yet configurable".into());
+        opts.cli_warnings.push(
+            "-fno-stack-arrays is recognized but automatic array placement is not yet configurable"
+                .into(),
+        );
     }
     if opts.check_array_temps_compat {
         opts.cli_warnings.push(
@@ -1893,8 +1902,13 @@ fn write_dependency_file(opts: &Options, output: &Path) -> Result<(), String> {
     });
     if let Some(parent) = depfile.parent() {
         if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("cannot create depfile directory '{}': {}", parent.display(), e))?;
+            fs::create_dir_all(parent).map_err(|e| {
+                format!(
+                    "cannot create depfile directory '{}': {}",
+                    parent.display(),
+                    e
+                )
+            })?;
         }
     }
 
@@ -2052,6 +2066,11 @@ fn link_inputs(inputs: &[PathBuf], output: &Path, opts: &Options) -> Result<(), 
         "-e".into(),
         "_main".into(),
     ]);
+    if !opts.shared {
+        // The Rust static runtime is packaged in coarse archive members. Let
+        // Apple ld trim unused runtime surfaces from final executables.
+        args.push("-dead_strip".into());
+    }
     push_link_flags(&mut args, opts);
 
     let ld_result = Command::new("ld")
@@ -2688,10 +2707,7 @@ mod tests {
 
     #[test]
     fn parse_cli_rejects_unknown_werror_warning_names_as_errors() {
-        let args = vec![
-            "-Werror=unknown-flag".to_string(),
-            "hello.f90".to_string(),
-        ];
+        let args = vec!["-Werror=unknown-flag".to_string(), "hello.f90".to_string()];
         let ParsedCli::Compile(opts) =
             parse_cli(&args).expect("driver should parse unknown -Werror warning names")
         else {
