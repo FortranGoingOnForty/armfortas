@@ -600,6 +600,36 @@ fn parse_target_selector(token: &str) -> Option<TargetSelector> {
     }
 }
 
+/// Optimization-level rank for opt-level directive selectors. `-Os` and
+/// `-O2` share rank 2; `-Ofast` sits with `-O3` at 3. `None` for a token
+/// that is not an opt level.
+fn opt_rank(level: &str) -> Option<u8> {
+    match level {
+        "O0" => Some(0),
+        "O1" => Some(1),
+        "O2" | "Os" => Some(2),
+        "O3" | "Ofast" => Some(3),
+        _ => None,
+    }
+}
+
+/// An opt-level directive selector.
+enum OptSelector<'a> {
+    /// `O3` — the named level exactly (so `O3` does not match `-Ofast`).
+    Exact(&'a str),
+    /// `O2+` — that rank and every higher one (`Os` counts as rank 2).
+    AtLeast(u8),
+}
+
+/// Parse an opt-level selector token: `O2` (that level only) or `O2+`
+/// (that rank and above). `None` for a token that is not an opt level.
+fn parse_opt_selector(token: &str) -> Option<OptSelector<'_>> {
+    match token.strip_suffix('+') {
+        Some(base) => opt_rank(base).map(OptSelector::AtLeast),
+        None => opt_rank(token).map(|_| OptSelector::Exact(token)),
+    }
+}
+
 /// Match an optionally target-qualified directive line: `! NAME: rest`
 /// (active on every target) or `! NAME(sel[,sel...]): rest` (active iff
 /// any selector matches `active`). Returns `Ok(None)` when the line is
@@ -610,6 +640,7 @@ fn match_qualified_directive<'a>(
     line: &'a str,
     name: &str,
     active: &TargetSpec,
+    opt: Option<&str>,
     filename: &str,
     line_num: usize,
 ) -> Result<Option<(bool, &'a str)>, String> {
@@ -639,7 +670,12 @@ fn match_qualified_directive<'a>(
             filename, line_num, name,
         ));
     };
-    let mut is_active = false;
+    // Selectors of the same dimension OR together; the target and opt
+    // dimensions AND together — `(arm64,O2+)` means arm64 AND -O2-or-above.
+    let cur_level = opt.map(|o| o.trim_start_matches('-'));
+    let cur_rank = cur_level.and_then(opt_rank);
+    let (mut target_seen, mut target_active) = (false, false);
+    let (mut opt_seen, mut opt_active) = (false, false);
     let mut seen_any = false;
     for token in selector_list.split(',') {
         let token = token.trim();
@@ -647,29 +683,43 @@ fn match_qualified_directive<'a>(
             continue;
         }
         seen_any = true;
-        let selector = parse_target_selector(token).ok_or_else(|| {
-            format!(
-                "{}:{}: unknown target selector '{}' in {} qualifier; \
-                 selectors: arm64, x86_64, macos, freebsd, linux, \
-                 x86_64-linux, or a triple ({})",
+        if let Some(sel) = parse_opt_selector(token) {
+            opt_seen = true;
+            let hit = match sel {
+                OptSelector::Exact(name) => cur_level == Some(name),
+                OptSelector::AtLeast(rank) => cur_rank.is_some_and(|c| c >= rank),
+            };
+            if hit {
+                opt_active = true;
+            }
+        } else if let Some(selector) = parse_target_selector(token) {
+            target_seen = true;
+            if selector.matches(active) {
+                target_active = true;
+            }
+        } else {
+            return Err(format!(
+                "{}:{}: unknown selector '{}' in {} qualifier; \
+                 targets: arm64, x86_64, macos, freebsd, linux, x86_64-linux, \
+                 or a triple ({}); opt levels: O0, O1, O2, O3, Os, Ofast, \
+                 optionally with '+' (e.g. O2+)",
                 filename,
                 line_num,
                 token,
                 name,
                 armfortas::target::SUPPORTED_TARGETS.join(", "),
-            )
-        })?;
-        if selector.matches(active) {
-            is_active = true;
+            ));
         }
     }
     if !seen_any {
         return Err(format!(
-            "{}:{}: empty {} target qualifier",
+            "{}:{}: empty {} qualifier",
             filename, line_num, name,
         ));
     }
-    Ok(Some((is_active, rest)))
+    let target_ok = !target_seen || target_active;
+    let opt_ok = !opt_seen || opt_active;
+    Ok(Some((target_ok && opt_ok, rest)))
 }
 
 /// Extract `! XFAIL:` / `! XFAIL(<selectors>):` reason text. The first
@@ -681,11 +731,12 @@ fn extract_xfail(
     source: &str,
     filename: &str,
     active: &TargetSpec,
+    opt_flag: &str,
 ) -> Result<Option<String>, String> {
     let mut first_active: Option<String> = None;
     for (i, line) in source.lines().enumerate() {
         if let Some((is_active, rest)) =
-            match_qualified_directive(line, "XFAIL", active, filename, i + 1)?
+            match_qualified_directive(line, "XFAIL", active, Some(opt_flag), filename, i + 1)?
         {
             if is_active && first_active.is_none() {
                 first_active = Some(rest.trim().to_string());
@@ -1317,7 +1368,7 @@ fn extract_asm_checks(
         let bare_check = line.trim().starts_with("! ASM_CHECK:");
         let bare_not = line.trim().starts_with("! ASM_NOT:");
         if let Some((is_active, rest)) =
-            match_qualified_directive(line, "ASM_CHECK", active, filename, i + 1)?
+            match_qualified_directive(line, "ASM_CHECK", active, None, filename, i + 1)?
         {
             let is_active = is_active && (!bare_check || bare_active);
             if is_active {
@@ -1330,7 +1381,7 @@ fn extract_asm_checks(
             continue;
         }
         if let Some((is_active, rest)) =
-            match_qualified_directive(line, "ASM_NOT", active, filename, i + 1)?
+            match_qualified_directive(line, "ASM_NOT", active, None, filename, i + 1)?
         {
             let is_active = is_active && (!bare_not || bare_active);
             if is_active {
@@ -2265,7 +2316,7 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
     // The harness compiles for the host (no --target yet; x07 widens
     // this), so the host is the active target for directive qualifiers.
     let active_target = TargetSpec::host();
-    let xfail_reason = match extract_xfail(&source_text, filename, &active_target) {
+    let xfail_reason = match extract_xfail(&source_text, filename, &active_target, opt_flag) {
         Ok(reason) => reason,
         Err(e) => return TestOutcome::Fail(e),
     };
@@ -5411,7 +5462,7 @@ fn gfortran_dg_fixtures() {
 fn qualifier_bare_directive_is_active_everywhere() {
     let host = TargetSpec::host();
     let (active, rest) =
-        match_qualified_directive("! XFAIL: some reason", "XFAIL", &host, "t.f90", 1)
+        match_qualified_directive("! XFAIL: some reason", "XFAIL", &host, None, "t.f90", 1)
             .unwrap()
             .expect("directive should match");
     assert!(active);
@@ -5425,7 +5476,7 @@ fn qualifier_selector_matching() {
     let musl = TargetSpec::parse("x86_64-linux-musl").unwrap();
 
     let active_on = |line: &str, t: &TargetSpec| -> bool {
-        match_qualified_directive(line, "XFAIL", t, "t.f90", 1)
+        match_qualified_directive(line, "XFAIL", t, None, "t.f90", 1)
             .unwrap()
             .expect("directive should match")
             .0
@@ -5460,7 +5511,7 @@ fn qualifier_unknown_selector_is_loud_even_when_inactive() {
         "! XFAIL(arm64: r", // missing close paren
     ] {
         assert!(
-            match_qualified_directive(bad, "XFAIL", &mac, "t.f90", 1).is_err(),
+            match_qualified_directive(bad, "XFAIL", &mac, Some("-O2"), "t.f90", 1).is_err(),
             "must reject: {}",
             bad
         );
@@ -5472,14 +5523,47 @@ fn qualifier_first_active_xfail_wins() {
     let mac = TargetSpec::parse("arm64-macos").unwrap();
     let src = "! XFAIL(x86_64-linux): linux reason\n! XFAIL: everywhere reason\nprogram t\nend\n";
     assert_eq!(
-        extract_xfail(src, "t.f90", &mac).unwrap().as_deref(),
+        extract_xfail(src, "t.f90", &mac, "-O2").unwrap().as_deref(),
         Some("everywhere reason")
     );
     let musl = TargetSpec::parse("x86_64-linux-musl").unwrap();
     assert_eq!(
-        extract_xfail(src, "t.f90", &musl).unwrap().as_deref(),
+        extract_xfail(src, "t.f90", &musl, "-O2").unwrap().as_deref(),
         Some("linux reason")
     );
+}
+
+/// Sprint T2: opt-level XFAIL qualifiers. `O2+` fires at -O2 and above
+/// (Os counts as O2), never at -O0/-O1; combining a target and an opt
+/// selector conjoins them.
+#[test]
+fn qualifier_opt_level_matching() {
+    let mac = TargetSpec::parse("arm64-macos").unwrap();
+    let fbsd = TargetSpec::parse("x86_64-freebsd").unwrap();
+    let xf = |src: &str, t: &TargetSpec, opt: &str| -> Option<String> {
+        extract_xfail(src, "t.f90", t, opt).unwrap()
+    };
+
+    // Bare opt selector: level-scoped, target-agnostic.
+    let o2plus = "! XFAIL(O2+): opt bug\nprogram t\nend\n";
+    assert!(xf(o2plus, &mac, "-O0").is_none(), "O2+ inactive at -O0");
+    assert!(xf(o2plus, &mac, "-O1").is_none(), "O2+ inactive at -O1");
+    assert!(xf(o2plus, &mac, "-O2").is_some(), "O2+ active at -O2");
+    assert!(xf(o2plus, &mac, "-O3").is_some(), "O2+ active at -O3");
+    assert!(xf(o2plus, &mac, "-Ofast").is_some(), "O2+ active at -Ofast");
+    assert!(xf(o2plus, &mac, "-Os").is_some(), "O2+ includes -Os");
+
+    // Exact level.
+    let o3 = "! XFAIL(O3): only O3\nprogram t\nend\n";
+    assert!(xf(o3, &mac, "-O2").is_none());
+    assert!(xf(o3, &mac, "-O3").is_some());
+    assert!(xf(o3, &mac, "-Ofast").is_none(), "exact O3 excludes Ofast");
+
+    // Target AND opt: arm64 AND -O2-or-above.
+    let both = "! XFAIL(arm64,O2+): arm64 opt bug\nprogram t\nend\n";
+    assert!(xf(both, &mac, "-O2").is_some(), "arm64 + O2 fires");
+    assert!(xf(both, &mac, "-O1").is_none(), "arm64 but -O1: inactive");
+    assert!(xf(both, &fbsd, "-O2").is_none(), "x86 at -O2: inactive");
 }
 
 #[test]
