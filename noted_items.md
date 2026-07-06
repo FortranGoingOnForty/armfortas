@@ -561,19 +561,25 @@ Memmove -1 crash split into two bugs (2026-07-06):
   authoritative descriptor mask. Now trusts the cache when present.
   Regression tests: tests/multifile.rs assumed_size_{integer,cchar}_*.
   Fixes `from_c_string`-style C-interop scans in isolation.
-- **OPEN — x86_64 hidden char-length ABI**: fgof-temp (and likely all 7
-  crashing fgof libs) still SIGSEGV via `create_temp_file_posix`. lldb:
-  memmove dest=-1 in `to_c_string(parent_dir)` because `len(parent_dir)`
-  is garbage — a hidden character-length arg is misplaced. The `.amod`
-  emits `cc=aapcs64` with ARM64 x0..x7 naming (8 int arg regs) even on
-  x86_64 (6 int regs), so for an 8-arg fn (5 explicit + 3 hidden lengths)
-  the last two hidden lengths spill to the stack on x86. The callee
-  prologue reads them correctly and every faithful minimal repro passes;
-  only the real module-compiled function crashes — suspect the caller-side
-  hidden-length placement or interaction with the 4096-byte-local
-  stack-probe frame. Full crash frame, ABI dump, and the six negative
-  repros in scratchpad/memmove-diagnosis.md. Blocks fgof-fs/process/pty/
-  watch/temp/cache/state. Owner: x86 call ABI / hidden char-length args.
+- **FIXED (3e15d80)**: the second root cause was NOT the hidden char-length
+  ABI (that theory was disproved — the length forwards correctly). It was
+  the sret "write straight in" path: `lower_alloc_return_call_into_desc`
+  passed the assignment target's LIVE descriptor as the callee's
+  allocatable-array result slot without resetting it. For an already-
+  allocated target (`allocate(c(0)); c = f(...)` — the fgof
+  `allocate(c_parent(0)); c_parent = to_c_string(x)` idiom) the callee's
+  `allocate(result)` reused/corrupted it; a size-0 target gave a -1 base
+  and SIGSEGV'd in the callee's first element write. Fix: deallocate the
+  target first (STAT makes it a no-op on the unallocated temp descriptors).
+  Regression fixture test_programs/alloc_array_result_into_preallocated_
+  target.f90. Result: memmove SIGSEGV ELIMINATED from all 7 fgof libs;
+  5 of 7 now fully pass (temp 9/9, state, cache, fs, pty). lib 1301/0,
+  multifile/cli_driver/run_programs all unchanged.
+- **RESIDUAL (open, lower severity)**: fgof-process and fgof-watch no
+  longer crash but a few test executables `error stop`/exit 1 (behavioral,
+  not SIGSEGV): process test_parent_state/test_run_options/test_validation,
+  watch test_watch_filters. Distinct bug — assertion-level, needs its own
+  reduction. Owner: TBD (behavioral, not the crash class).
 
 Other verified miscompiles (details + repros in the audit doc), all with
 zero fixture coverage: reduction vectorizer drops elementwise stores at
