@@ -29,17 +29,23 @@ coverage — which is why every suite is green while these ship.
 ### Compiler core (armfortas)
 
 - **C1 — reduction vectorizer drops elementwise stores at -O3/-Ofast.
-  FIXED 2026-07-06 (36a51ad).** `detect_reduction_plan` now refuses any
-  loop whose body writes memory (Store/VStore); pure reductions and pure
-  map loops are unaffected. Fixture
-  `test_programs/vec_reduction_with_elementwise_store.f90`.
-  A loop carrying both `c(i)=a(i)*b(i)` and `dot=dot+a(i)*b(i)` widens the IV
-  to stride 4 but leaves the scalar store in the widened body → 3 of 4 stores
-  lost, uninitialized output; the reduction stays correct so nothing
-  downstream notices. `src/opt/vec_analysis.rs:1758`
-  (`detect_reduction_plan` never scans the body for stores),
-  `src/opt/neon_vectorize.rs:873`. Analysis is shared with NEON → arm64
-  likely affected. Hole predates June (May f9f3610); x10 SSE `int_mul`
+  FIXED 2026-07-06 — first a conservative bail (36a51ad), then the full
+  fusion (b113ba3).** A loop carrying both `c(i)=a(i)*b(i)` and
+  `dot=dot+a(i)*b(i)` widened the IV to stride 4 but left the scalar store
+  in the widened body → 3 of 4 stores lost, uninitialized output; the
+  reduction stayed correct so nothing downstream noticed. `detect_reduction_plan`
+  now collects the body's stores and classifies each with the existing
+  elementwise machinery (`classify_body_op`); `apply_reduction_plan` widens
+  them to VStores beside the vector reduction, reusing any load/product it
+  already shares with the reduction. Every load and store must be
+  index-`i`-aligned over the full trip, so widening in place preserves
+  program order with no cross-lane or aliasing hazard; a store that doesn't
+  fit bails the whole plan to scalar. Fixture
+  `test_programs/vec_reduction_with_elementwise_store.f90` guards
+  correctness at every opt level; `tests/vectorize_reduction_fused_store.rs`
+  asserts both a VStore and a VReduceSum appear (fusion actually happens,
+  not a scalar fallback). Analysis is shared with NEON → arm64 covered by
+  the same code. Hole predated June (May f9f3610); x10 SSE `int_mul`
   (9cce9f6) made it reachable on x86.
 - **C2 — BIND(C) aggregate ABI silently wrong both directions.
   LOUD-REJECTED 2026-07-06 (9b50a7e).** The SysV struct classifier
