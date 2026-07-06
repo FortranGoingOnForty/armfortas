@@ -1449,3 +1449,50 @@ fn enumeration_type_amod_roundtrip() {
         &["--std=f2023"],
     );
 }
+
+#[test]
+fn assumed_size_integer_dummy_cross_module_passes_data_address() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=assumed_size_integer_dummy_cross_module_passes_data_address count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // A module procedure with an assumed-size `buf(*)` dummy passes its
+    // argument by bare data address, not by descriptor. The `.amod`
+    // records this correctly (no `descriptor` attr), but the consumer
+    // reconstructs the dummy as AssumedShape (rank-based fallback), and
+    // `descriptor_param_mask_for_lookup` used to let that lossy scope
+    // reconstruction override the authoritative `.amod` mask — so the
+    // caller passed a descriptor pointer the callee then read as data
+    // (garbage element reads). Same-file callers were unaffected, which
+    // is why every single-file fixture missed it.
+    multifile_test(
+        "module asize_i\n  implicit none\ncontains\n  integer function count_pos(buf) result(n)\n    integer, intent(in) :: buf(*)\n    n = 0\n    do while (buf(n + 1) /= 0)\n      n = n + 1\n    end do\n  end function\nend module\n",
+        "program p\n  use asize_i\n  implicit none\n  integer :: a(6)\n  a = 0\n  a(1) = 7\n  a(2) = 8\n  a(3) = 9\n  print '(i0)', count_pos(a)\nend program\n",
+        "3",
+    );
+}
+
+#[test]
+fn assumed_size_cchar_dummy_cross_module_reads_correctly() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=assumed_size_cchar_dummy_cross_module_reads_correctly count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // The C-interop shape that crashed 7 fgof libraries: a NUL-terminator
+    // scan over a `character(kind=c_char) :: buf(*)` assumed-size dummy in
+    // a separately compiled module. Before the descriptor-mask fix the
+    // caller passed a descriptor, the callee read garbage element values,
+    // the scan overran, and the resulting bad length fed memmove and
+    // SIGSEGV'd.
+    multifile_test(
+        "module asize_c\n  use iso_c_binding, only : c_char, c_null_char\n  implicit none\ncontains\n  integer function clen(buf) result(n)\n    character(kind=c_char), intent(in) :: buf(*)\n    n = 0\n    do while (buf(n + 1) /= c_null_char)\n      n = n + 1\n    end do\n  end function\nend module\n",
+        "program p\n  use asize_c\n  use iso_c_binding, only : c_char, c_null_char\n  implicit none\n  character(kind=c_char) :: b(8)\n  integer :: i\n  do i = 1, 8\n    b(i) = c_null_char\n  end do\n  b(1) = 'x'\n  b(2) = 'y'\n  b(3) = 'z'\n  print '(i0)', clen(b)\nend program\n",
+        "3",
+    );
+}

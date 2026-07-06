@@ -23238,21 +23238,35 @@ pub(super) fn descriptor_param_mask_for_lookup(
     callee_name: &str,
 ) -> Option<Vec<bool>> {
     let direct_mask = cache.get(callee_name).cloned();
-    let scope = callee_scope_for_lookup(st, callee_name)?;
+    let Some(scope) = callee_scope_for_lookup(st, callee_name) else {
+        return direct_mask;
+    };
     let proc_name = match &scope.kind {
         crate::sema::symtab::ScopeKind::Function(name)
         | crate::sema::symtab::ScopeKind::Subroutine(name) => name.to_lowercase(),
         _ => return direct_mask,
     };
     let proc_mask = cache.get(&proc_name).cloned();
-    let cached = direct_mask.clone().or_else(|| proc_mask.clone());
-    if cached
-        .as_ref()
-        .is_some_and(|mask| mask.iter().any(|flag| *flag))
-    {
-        return cached;
+    // The cache is authoritative. For an external call it is the `.amod`
+    // `descriptor` attr, derived from the callee's real lowered IR param type
+    // (Ptr(Array(i8, 384)) == a runtime descriptor); for a local call it is
+    // `arg_uses_descriptor_from_decls` over the callee's real declarations.
+    // The scope reconstruction below rebuilds an assumed-size `(*)` (or
+    // explicit-shape `(n)`) dummy as AssumedShape, which
+    // `symbol_uses_descriptor_for_lowering` reports as descriptor-backed. If
+    // that lossy reconstruction were allowed to override a cache that
+    // correctly says "bare address", the caller would pass a descriptor
+    // pointer where the callee expects the data address — the callee then
+    // reads the descriptor as data (a garbage base/length), which for a
+    // C-interop `character(kind=c_char) :: buf(*)` dummy feeds memmove a -1
+    // length and SIGSEGVs. So trust the cache whenever it has the procedure.
+    if let Some(cached) = direct_mask.or(proc_mask) {
+        return Some(cached);
     }
 
+    // Cache miss: the callee is reachable only through the reconstructed scope
+    // (e.g. an interface block without a recorded descriptor mask). Fall back
+    // to the scope-derived mask so genuine descriptor dummies still bind.
     let scope_mask: Vec<bool> = scope
         .arg_order
         .iter()
@@ -23266,7 +23280,7 @@ pub(super) fn descriptor_param_mask_for_lookup(
     if scope_mask.iter().any(|flag| *flag) {
         return Some(scope_mask);
     }
-    cached
+    None
 }
 
 pub(super) fn callee_value_arg_mask(st: &SymbolTable, callee_name: &str) -> Option<Vec<bool>> {
