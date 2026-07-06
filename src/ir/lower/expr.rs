@@ -2204,6 +2204,20 @@ pub(crate) fn lower_expr_full(
                         );
                     }
                 }
+                if !has_named_interface && key == "same_type_as" {
+                    if let Some(result) = lower_same_type_as_intrinsic_ast(
+                        b,
+                        locals,
+                        original_args,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
+                    ) {
+                        return result;
+                    }
+                }
                 let intrinsic_result =
                     if !has_named_interface && crate::sema::validate::is_intrinsic_name(&key) {
                         let intrinsic_arg_slots =
@@ -2480,6 +2494,38 @@ pub(crate) fn lower_expr_full(
                         }
                     }
                 }
+                let indirect_hidden_result = if procptr_target.is_some() {
+                    first_procedure_lookup(&abi_lookup_keys, |k| callee_hidden_result_abi(st, k))
+                        .and_then(|hidden_abi| {
+                            let bytes = hidden_result_temp_bytes_for_callee(
+                                st,
+                                type_layouts,
+                                &abi_lookup_keys,
+                                hidden_abi,
+                            )?;
+                            let alloca_ty = if hidden_abi == HiddenResultAbi::ComplexBuffer {
+                                let fw = if bytes == 16 {
+                                    FloatWidth::F64
+                                } else {
+                                    FloatWidth::F32
+                                };
+                                IrType::Array(Box::new(IrType::Float(fw)), 2)
+                            } else {
+                                IrType::Array(Box::new(IrType::Int(IntWidth::I8)), bytes)
+                            };
+                            let desc = b.alloca(alloca_ty);
+                            let zero_i32 = b.const_i32(0);
+                            let size = b.const_i64(bytes as i64);
+                            b.call(
+                                FuncRef::External("memset".into()),
+                                vec![desc, zero_i32, size],
+                                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                            );
+                            Some(desc)
+                        })
+                } else {
+                    None
+                };
                 let callee_value_args =
                     first_procedure_lookup(&abi_lookup_keys, |k| callee_value_arg_mask(st, k));
                 let callee_descriptor_args = first_procedure_lookup(&abi_lookup_keys, |k| {
@@ -2500,7 +2546,12 @@ pub(crate) fn lower_expr_full(
                     first_procedure_lookup(&abi_lookup_keys, |k| callee_class_arg_mask(st, k));
                 let opt_flags =
                     first_procedure_lookup(&abi_lookup_keys, |k| callee_optional_arg_mask(st, k));
-                let mut ref_arg_vals: Vec<ValueId> = Vec::with_capacity(arg_slots.len());
+                let mut ref_arg_vals: Vec<ValueId> =
+                    Vec::with_capacity(arg_slots.len() + indirect_hidden_result.is_some() as usize);
+                let mut call_arg_array_temps = Vec::new();
+                if let Some(desc) = indirect_hidden_result {
+                    ref_arg_vals.push(desc);
+                }
                 for (i, slot) in arg_slots.iter().enumerate() {
                     let is_value = callee_value_args
                         .as_ref()
@@ -2657,7 +2708,7 @@ pub(crate) fn lower_expr_full(
                                         value,
                                     )
                                 };
-                                super::stmt::lower_call_arg_maybe_conditional(
+                                let value = super::stmt::lower_call_arg_maybe_conditional(
                                     b,
                                     locals,
                                     st,
@@ -2670,7 +2721,24 @@ pub(crate) fn lower_expr_full(
                                     i,
                                     is_value,
                                     &mut materialize,
-                                )
+                                );
+                                if wants_descriptor
+                                    && !matches!(
+                                        arg_expr.node,
+                                        Expr::ConditionalExpr { .. } | Expr::NilArgument
+                                    )
+                                {
+                                    track_call_arg_array_temp_descriptor(
+                                        b,
+                                        &mut call_arg_array_temps,
+                                        locals,
+                                        arg_expr,
+                                        st,
+                                        type_layouts,
+                                        value,
+                                    );
+                                }
+                                value
                             }
                             _ => b.const_i32(0),
                         },
@@ -2679,7 +2747,12 @@ pub(crate) fn lower_expr_full(
                     ref_arg_vals.push(value);
                 }
                 if let Some(opt_flags) = opt_flags {
-                    for flag in opt_flags.iter().skip(ref_arg_vals.len()) {
+                    let missing_slots = arg_slots.len().saturating_sub(ref_arg_vals.len());
+                    for flag in opt_flags
+                        .iter()
+                        .skip(ref_arg_vals.len())
+                        .take(missing_slots)
+                    {
                         if *flag {
                             ref_arg_vals.push(b.const_i64(0));
                         }
@@ -2756,10 +2829,14 @@ pub(crate) fn lower_expr_full(
                 }
 
                 // Look up callee return type from symbol table.
-                let ret_ty = first_procedure_lookup(&abi_lookup_keys, |k| {
-                    callee_return_ir_type_for_caller(st, k, internal_funcs)
-                })
-                .unwrap_or(IrType::Int(IntWidth::I32));
+                let ret_ty = if indirect_hidden_result.is_some() {
+                    IrType::Void
+                } else {
+                    first_procedure_lookup(&abi_lookup_keys, |k| {
+                        callee_return_ir_type_for_caller(st, k, internal_funcs)
+                    })
+                    .unwrap_or(IrType::Int(IntWidth::I32))
+                };
                 let func_ref = if let Some((target, _, _)) = procptr_target {
                     FuncRef::Indirect(target)
                 } else if resolved_generic.is_some() {
@@ -2783,6 +2860,10 @@ pub(crate) fn lower_expr_full(
                     )
                 };
                 let call_result = b.call(func_ref, ref_arg_vals, ret_ty);
+                deallocate_call_arg_array_temp_descriptors(b, &call_arg_array_temps);
+                if let Some(desc) = indirect_hidden_result {
+                    return desc;
+                }
                 if let Some(tl) = type_layouts {
                     if let Some(type_name) = first_procedure_lookup(&abi_lookup_keys, |k| {
                         callee_return_stabilized_derived_type_name(st, k)
@@ -2891,6 +2972,7 @@ pub(crate) fn lower_expr_full(
                                     );
                                     let mut arg_vals: Vec<ValueId> =
                                         Vec::with_capacity(arg_slots.len());
+                                    let mut call_arg_array_temps = Vec::new();
                                     for (i, slot) in arg_slots.iter().enumerate() {
                                         let mask_says_descriptor = callee_descriptor_args
                                             .as_ref()
@@ -2937,7 +3019,7 @@ pub(crate) fn lower_expr_full(
                                                 let wants_descriptor =
                                                     mask_says_descriptor || actual_uses_descriptor;
                                                 let v = if wants_descriptor {
-                                                    lower_arg_descriptor_full(
+                                                    let desc = lower_arg_descriptor_full(
                                                         b,
                                                         locals,
                                                         e,
@@ -2947,7 +3029,17 @@ pub(crate) fn lower_expr_full(
                                                         contained_host_refs,
                                                         descriptor_params,
                                                         false,
-                                                    )
+                                                    );
+                                                    track_call_arg_array_temp_descriptor(
+                                                        b,
+                                                        &mut call_arg_array_temps,
+                                                        locals,
+                                                        e,
+                                                        st,
+                                                        type_layouts,
+                                                        desc,
+                                                    );
+                                                    desc
                                                 } else {
                                                     lower_arg_by_ref_full(
                                                         b,
@@ -2965,7 +3057,13 @@ pub(crate) fn lower_expr_full(
                                         }
                                     }
                                     arg_vals.extend(closure_args);
-                                    return b.call(FuncRef::Indirect(target_ptr), arg_vals, ret_ty);
+                                    let call_result =
+                                        b.call(FuncRef::Indirect(target_ptr), arg_vals, ret_ty);
+                                    deallocate_call_arg_array_temp_descriptors(
+                                        b,
+                                        &call_arg_array_temps,
+                                    );
+                                    return call_result;
                                 }
                             }
                             let bp = bp_opt.unwrap_or_else(|| {
@@ -3073,6 +3171,7 @@ pub(crate) fn lower_expr_full(
                                 });
 
                             let mut call_args = Vec::with_capacity(arg_slots.len() + 1);
+                            let mut call_arg_array_temps = Vec::new();
                             for (i, slot) in arg_slots.iter().enumerate() {
                                 if !nopass && i == 0 {
                                     let wants_bind_c_char = callee_bind_c_char_args
@@ -3165,7 +3264,7 @@ pub(crate) fn lower_expr_full(
                                                     raw,
                                                 )
                                             } else if wants_descriptor {
-                                                lower_arg_descriptor_full(
+                                                let desc = lower_arg_descriptor_full(
                                                     b,
                                                     locals,
                                                     e,
@@ -3175,7 +3274,17 @@ pub(crate) fn lower_expr_full(
                                                     contained_host_refs,
                                                     descriptor_params,
                                                     false,
-                                                )
+                                                );
+                                                track_call_arg_array_temp_descriptor(
+                                                    b,
+                                                    &mut call_arg_array_temps,
+                                                    locals,
+                                                    e,
+                                                    st,
+                                                    type_layouts,
+                                                    desc,
+                                                );
+                                                desc
                                             } else if wants_string_descriptor {
                                                 lower_arg_string_descriptor(
                                                     b,
@@ -3309,6 +3418,7 @@ pub(crate) fn lower_expr_full(
                             .unwrap_or(IrType::Int(IntWidth::I32));
                             let call_result =
                                 b.call(FuncRef::External(call_name), call_args, ret_ty);
+                            deallocate_call_arg_array_temp_descriptors(b, &call_arg_array_temps);
                             if let Some(tl) = type_layouts {
                                 if let Some(type_name) =
                                     callee_return_stabilized_derived_type_name(st, &target_key)

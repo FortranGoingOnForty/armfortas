@@ -10,6 +10,7 @@
 // marked `unsafe` without breaking the C calling convention contract.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 #![allow(clippy::missing_safety_doc)]
+#![allow(clippy::items_after_test_module)]
 
 pub mod array;
 pub mod descriptor;
@@ -22,3 +23,4 @@ pub mod math;
 mod mem;
 pub mod string;
 pub mod system;
+pub mod tokenize;

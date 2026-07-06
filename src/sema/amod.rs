@@ -643,11 +643,24 @@ fn emit_parameter(
         .const_char_value
         .as_ref()
         .map(|value| hex_encode_bytes(value.as_bytes()));
-    if let Some(cv) = sym
+    let const_int = sym
         .const_value
         .map(i128::from)
-        .or_else(|| global_info.and_then(|info| info.const_value))
-    {
+        .or_else(|| global_info.and_then(|info| info.const_value));
+    let const_real = global_info.and_then(|info| info.const_real_value);
+    if let Some(rv) = const_real {
+        let suf = if is_private { ", private" } else { "" };
+        let char_suf = const_char_hex
+            .as_ref()
+            .map(|hex| format!(" @charhex {}", hex))
+            .unwrap_or_default();
+        writeln!(
+            out,
+            "@param {} : {} = {:.17e}{}{}",
+            name, type_str, rv, suf, char_suf
+        )
+        .unwrap();
+    } else if let Some(cv) = const_int {
         // Place `, private` after the value so parse_var's
         // rfind(" = ") inside type_str continues to work.
         let suf = if is_private { ", private" } else { "" };
@@ -673,12 +686,25 @@ fn emit_parameter(
             .as_ref()
             .map(|hex| format!(" @charhex {}", hex))
             .unwrap_or_default();
-        writeln!(
+        write!(
             out,
-            "@param {} : {} @ir {}{}",
-            name, type_with_attr, info.symbol, char_suf
+            "@param {} : {} @ir {}",
+            name, type_with_attr, info.symbol
         )
         .unwrap();
+        if info.deferred_char {
+            write!(out, " @deferred_char").unwrap();
+        }
+        if info.declared_rank > 0 {
+            write!(out, " @rank {}", info.declared_rank).unwrap();
+        }
+        if !info.dims.is_empty() {
+            write!(out, " @dims").unwrap();
+            for (lo, ext) in &info.dims {
+                write!(out, " {}:{}", lo, ext).unwrap();
+            }
+        }
+        writeln!(out, "{}", char_suf).unwrap();
     } else {
         let suf = if is_private { ", private" } else { "" };
         let char_suf = const_char_hex
@@ -1174,6 +1200,9 @@ fn emit_type(out: &mut String, name: &str, type_layouts: &TypeLayoutRegistry) {
             if field.pointer {
                 attrs.push_str(" @pointer");
             }
+            if field.deferred_char {
+                attrs.push_str(" @deferred_char");
+            }
             if field.procedure_pointer {
                 attrs.push_str(" @procptr");
             }
@@ -1454,6 +1483,7 @@ pub struct AmodVar {
     pub rank: usize,
     pub dims: Vec<(i64, i64)>,
     pub const_value: Option<i64>,
+    pub const_real_value: Option<f64>,
     pub const_char_value: Option<String>,
     /// Access level. F2008 §11.2.3 requires private parent symbols to
     /// be visible in submodules, so the writer emits private entries
@@ -1724,15 +1754,15 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
     };
 
     let mut const_value = None;
+    let mut const_real_value = None;
     let mut const_char_value = None;
     // For @param with `= value`, strip the value suffix from the
     // type string before parsing the type.
     let clean_type_str = if is_param {
         if let Some(eq_idx) = type_str.rfind(" = ") {
             let val_str = type_str[eq_idx + 3..].trim();
-            if let Ok(v) = val_str.parse::<i64>() {
-                const_value = Some(v);
-            }
+            const_value = val_str.parse::<i64>().ok();
+            const_real_value = val_str.parse::<f64>().ok();
             &type_str[..eq_idx]
         } else {
             type_str
@@ -1813,6 +1843,7 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
         rank: rank.max(dims.len()),
         dims,
         const_value,
+        const_real_value,
         const_char_value,
         access,
     }
@@ -2143,6 +2174,7 @@ fn parse_type(
                 }
                 let mut allocatable = false;
                 let mut pointer = false;
+                let mut deferred_char = false;
                 let mut target = false;
                 let mut declared_array = false;
                 let mut procedure_pointer = false;
@@ -2152,6 +2184,7 @@ fn parse_type(
                     match token {
                         "@allocatable" => allocatable = true,
                         "@pointer" => pointer = true,
+                        "@deferred_char" => deferred_char = true,
                         "@procptr" => procedure_pointer = true,
                         "@nopass" => procedure_pointer_nopass = true,
                         "@target" => target = true,
@@ -2174,6 +2207,7 @@ fn parse_type(
                     type_info: ftype.unwrap_or(TypeInfo::Integer { kind: None }),
                     allocatable,
                     pointer,
+                    deferred_char,
                     target,
                     procedure_pointer,
                     procedure_pointer_nopass,
@@ -2325,10 +2359,18 @@ pub fn extract_module_globals(
         // host-associated references through the same globals map.
         // The `private` flag lets the "filtered out by USE ONLY"
         // diagnostic skip them — ordinary USE would never see them.
-        if var.is_parameter && var.ir_symbol.is_none() {
+        let inline_real_param = var.is_parameter
+            && var.ir_symbol.is_none()
+            && var.const_real_value.is_some()
+            && matches!(
+                var.type_info.as_ref(),
+                Some(TypeInfo::Real { .. } | TypeInfo::DoublePrecision)
+            );
+        if var.is_parameter && var.ir_symbol.is_none() && !inline_real_param {
             continue;
         } // PARAMETERs with folded values inline; others still need storage
-        if let Some(ref ir_sym) = var.ir_symbol {
+        if var.ir_symbol.is_some() || inline_real_param {
+            let ir_sym = var.ir_symbol.clone().unwrap_or_default();
             let declared_rank = var.rank.max(var.dims.len());
             let derived_type = match var.type_info.as_ref() {
                 Some(TypeInfo::Derived(name))
@@ -2390,7 +2432,7 @@ pub fn extract_module_globals(
             out.insert(
                 (mod_key.clone(), var.name.to_lowercase()),
                 crate::ir::lower::ModuleGlobalInfo {
-                    symbol: ir_sym.clone(),
+                    symbol: ir_sym,
                     ty: ir_ty,
                     dims: var.dims.clone(),
                     declared_rank,
@@ -2408,6 +2450,7 @@ pub fn extract_module_globals(
                         _ => crate::ir::lower::CharKind::None,
                     },
                     const_value: var.const_value.map(i128::from),
+                    const_real_value: var.const_real_value,
                     external: true,
                     private: var.access == Access::Private,
                 },

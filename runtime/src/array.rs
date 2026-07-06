@@ -1551,13 +1551,21 @@ fn descriptor_looks_sane(desc: &ArrayDescriptor) -> bool {
     if desc.elem_size < 0 {
         return false;
     }
-    if desc.is_allocated() && desc.base_addr.is_null() {
+    if desc.is_allocated() && desc.base_addr.is_null() && !descriptor_is_zero_size_array(desc) {
         return false;
     }
     if !desc.is_allocated() && !desc.base_addr.is_null() {
         return false;
     }
     true
+}
+
+fn descriptor_is_zero_size_array(desc: &ArrayDescriptor) -> bool {
+    desc.rank > 0 && desc.elem_size > 0 && desc.total_elements() == 0
+}
+
+fn descriptor_has_payload_or_zero_size_array(desc: &ArrayDescriptor) -> bool {
+    !desc.base_addr.is_null() || descriptor_is_zero_size_array(desc)
 }
 
 /// Assign one array to another with automatic reallocation (F2003).
@@ -1580,7 +1588,10 @@ pub extern "C" fn afs_assign_allocatable(
         *dest = ArrayDescriptor::zeroed();
     }
 
-    if !source.is_allocated() && source.base_addr.is_null() {
+    if !source.is_allocated()
+        && source.base_addr.is_null()
+        && !descriptor_is_zero_size_array(source)
+    {
         if dest.is_allocated() && !dest.base_addr.is_null() {
             unsafe {
                 libc_free(dest.base_addr);
@@ -1747,6 +1758,113 @@ unsafe fn copy_same_type_payload_to_contiguous(source: &ArrayDescriptor, dest_ba
     }
 }
 
+unsafe fn copy_same_type_payload_between_descriptors(
+    dest: &ArrayDescriptor,
+    source: &ArrayDescriptor,
+) {
+    let total = source.total_elements();
+    let elem_size = source.elem_size;
+    if total <= 0 || elem_size <= 0 || source.base_addr.is_null() || dest.base_addr.is_null() {
+        return;
+    }
+    if source.rank == 0 {
+        ptr::copy(source.base_addr, dest.base_addr, elem_size as usize);
+        return;
+    }
+
+    let rank = source.rank as usize;
+    let extents: Vec<i64> = (0..rank).map(|i| source.dims[i].extent()).collect();
+    let mut idx = vec![0i64; rank];
+    for _ in 0..total {
+        let mut src_off: i64 = 0;
+        let mut dest_off: i64 = 0;
+        for (d, &index) in idx.iter().enumerate().take(rank) {
+            src_off += index * source.dims[d].stride;
+            dest_off += index * dest.dims[d].stride;
+        }
+        ptr::copy(
+            source.base_addr.offset((src_off * elem_size) as isize),
+            dest.base_addr.offset((dest_off * dest.elem_size) as isize),
+            elem_size as usize,
+        );
+        for (d, index) in idx.iter_mut().enumerate().take(rank) {
+            *index += 1;
+            if *index < extents[d] {
+                break;
+            }
+            *index = 0;
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_copy_array_data_no_realloc(
+    dest: *mut ArrayDescriptor,
+    source: *const ArrayDescriptor,
+    stat: *mut i32,
+) {
+    if dest.is_null() || source.is_null() {
+        if !stat.is_null() {
+            unsafe {
+                *stat = 1;
+            }
+            return;
+        }
+        eprintln!("Array assignment: null descriptor");
+        std::process::exit(1);
+    }
+
+    let dest_ref = unsafe { &mut *dest };
+    let source_ref = unsafe { &*source };
+    let shapes_match = dest_ref.rank == source_ref.rank
+        && dest_ref.elem_size == source_ref.elem_size
+        && (0..dest_ref.rank as usize)
+            .all(|i| dest_ref.dims[i].extent() == source_ref.dims[i].extent());
+    let valid_source = descriptor_has_payload_or_zero_size_array(source_ref);
+    let valid_dest = !dest_ref.base_addr.is_null() || descriptor_is_zero_size_array(dest_ref);
+
+    if !shapes_match || !valid_source || !valid_dest {
+        if !stat.is_null() {
+            unsafe {
+                *stat = 4;
+            }
+            return;
+        }
+        eprintln!(
+            "Array assignment: destination shape does not conform to source \
+             (dest rank={} elem={} allocated={} base_null={} extents={:?}; \
+             source rank={} elem={} allocated={} base_null={} extents={:?})",
+            dest_ref.rank,
+            dest_ref.elem_size,
+            dest_ref.is_allocated(),
+            dest_ref.base_addr.is_null(),
+            (0..dest_ref.rank as usize)
+                .map(|i| dest_ref.dims[i].extent())
+                .collect::<Vec<_>>(),
+            source_ref.rank,
+            source_ref.elem_size,
+            source_ref.is_allocated(),
+            source_ref.base_addr.is_null(),
+            (0..source_ref.rank as usize)
+                .map(|i| source_ref.dims[i].extent())
+                .collect::<Vec<_>>()
+        );
+        std::process::exit(1);
+    }
+
+    unsafe {
+        copy_same_type_payload_between_descriptors(dest_ref, source_ref);
+    }
+    dest_ref.set_scalar_type_tag(source_ref.scalar_type_tag());
+    dest_ref.set_scalar_tbp_lookup_ptr(source_ref.scalar_tbp_lookup_ptr());
+
+    if !stat.is_null() {
+        unsafe {
+            *stat = 0;
+        }
+    }
+}
+
 fn numeric_kind_elem_size(kind_tag: i32) -> Option<i64> {
     match kind_tag {
         0 => Some(1),
@@ -1784,7 +1902,10 @@ pub extern "C" fn afs_assign_allocatable_convert(
         *dest_ref = ArrayDescriptor::zeroed();
     }
 
-    if !source_ref.is_allocated() && source_ref.base_addr.is_null() {
+    if !source_ref.is_allocated()
+        && source_ref.base_addr.is_null()
+        && !descriptor_is_zero_size_array(source_ref)
+    {
         if dest_ref.is_allocated() && !dest_ref.base_addr.is_null() {
             unsafe {
                 libc_free(dest_ref.base_addr);
@@ -2531,6 +2652,203 @@ mod tests {
     }
 
     #[test]
+    fn assign_allocatable_preserves_nonowning_zero_size_source_shape() {
+        let mut source = ArrayDescriptor::zeroed();
+        source.elem_size = 8;
+        source.rank = 1;
+        source.flags = DESC_CONTIGUOUS;
+        source.dims[0] = DimDescriptor {
+            lower_bound: 1,
+            upper_bound: 0,
+            stride: 1,
+        };
+        let mut dest = ArrayDescriptor::zeroed();
+
+        afs_assign_allocatable(&mut dest, &source);
+
+        assert!(dest.is_allocated());
+        assert!(dest.base_addr.is_null());
+        assert_eq!(dest.rank, 1);
+        assert_eq!(dest.elem_size, 8);
+        assert_eq!(dest.total_elements(), 0);
+        assert_eq!(afs_array_size(&dest), 0);
+    }
+
+    #[test]
+    fn dim_reductions_allocate_unreduced_shape_for_empty_reduced_extent() {
+        let mut source = ArrayDescriptor::zeroed();
+        source.elem_size = 8;
+        source.rank = 2;
+        source.flags = DESC_ALLOCATED | DESC_CONTIGUOUS;
+        source.dims[0] = DimDescriptor {
+            lower_bound: 1,
+            upper_bound: 6,
+            stride: 1,
+        };
+        source.dims[1] = DimDescriptor {
+            lower_bound: 1,
+            upper_bound: 0,
+            stride: 6,
+        };
+        assert_eq!(source.total_elements(), 0);
+        assert!(source.base_addr.is_null());
+
+        let mut max_result = ArrayDescriptor::zeroed();
+        afs_array_maxval_real8_dim(&source, 2, &mut max_result);
+        assert!(max_result.is_allocated());
+        assert_eq!(max_result.rank, 1);
+        assert_eq!(max_result.dims[0].extent(), 6);
+        assert!(!max_result.base_addr.is_null());
+        let max_values =
+            unsafe { core::slice::from_raw_parts(max_result.base_addr as *const f64, 6) };
+        assert!(max_values
+            .iter()
+            .all(|value| value.is_infinite() && value.is_sign_negative()));
+
+        let mut min_result = ArrayDescriptor::zeroed();
+        afs_array_minval_real8_dim(&source, 2, &mut min_result);
+        assert!(min_result.is_allocated());
+        assert_eq!(min_result.rank, 1);
+        assert_eq!(min_result.dims[0].extent(), 6);
+        assert!(!min_result.base_addr.is_null());
+        let min_values =
+            unsafe { core::slice::from_raw_parts(min_result.base_addr as *const f64, 6) };
+        assert!(min_values
+            .iter()
+            .all(|value| value.is_infinite() && value.is_sign_positive()));
+
+        let mut sum_result = ArrayDescriptor::zeroed();
+        afs_array_sum_real8_dim(&source, 2, &mut sum_result);
+        assert!(sum_result.is_allocated());
+        assert_eq!(sum_result.rank, 1);
+        assert_eq!(sum_result.dims[0].extent(), 6);
+        assert!(!sum_result.base_addr.is_null());
+        let sum_values =
+            unsafe { core::slice::from_raw_parts(sum_result.base_addr as *const f64, 6) };
+        assert!(sum_values.iter().all(|value| *value == 0.0));
+
+        afs_deallocate_array(&mut max_result, ptr::null_mut());
+        afs_deallocate_array(&mut min_result, ptr::null_mut());
+        afs_deallocate_array(&mut sum_result, ptr::null_mut());
+    }
+
+    #[test]
+    fn location_dim_reductions_return_indices_along_reduced_extent() {
+        let mut source = ArrayDescriptor::zeroed();
+        let dims = [
+            DimDescriptor {
+                lower_bound: 1,
+                upper_bound: 3,
+                stride: 1,
+            },
+            DimDescriptor {
+                lower_bound: 1,
+                upper_bound: 4,
+                stride: 3,
+            },
+        ];
+        afs_allocate_array(&mut source, 8, 2, dims.as_ptr(), ptr::null_mut());
+        assert!(source.is_allocated());
+
+        let values = unsafe { core::slice::from_raw_parts_mut(source.base_addr as *mut f64, 12) };
+        values.copy_from_slice(&[
+            1.0, 8.0, 0.0, -5.0, 6.0, 7.0, 3.0, -2.0, 11.0, 9.0, 1.0, 4.0,
+        ]);
+
+        let mut max_result = ArrayDescriptor::zeroed();
+        afs_array_maxloc_real8_dim(&source, 2, &mut max_result);
+        assert!(max_result.is_allocated());
+        assert_eq!(max_result.rank, 1);
+        assert_eq!(max_result.elem_size, 4);
+        assert_eq!(max_result.dims[0].extent(), 3);
+        let max_values =
+            unsafe { core::slice::from_raw_parts(max_result.base_addr as *const i32, 3) };
+        assert_eq!(max_values, &[4, 1, 3]);
+
+        let mut min_result = ArrayDescriptor::zeroed();
+        afs_array_minloc_real8_dim(&source, 2, &mut min_result);
+        assert!(min_result.is_allocated());
+        assert_eq!(min_result.rank, 1);
+        assert_eq!(min_result.elem_size, 4);
+        assert_eq!(min_result.dims[0].extent(), 3);
+        let min_values =
+            unsafe { core::slice::from_raw_parts(min_result.base_addr as *const i32, 3) };
+        assert_eq!(min_values, &[2, 3, 1]);
+
+        afs_deallocate_array(&mut source, ptr::null_mut());
+        afs_deallocate_array(&mut max_result, ptr::null_mut());
+        afs_deallocate_array(&mut min_result, ptr::null_mut());
+    }
+
+    #[test]
+    fn copy_array_data_no_realloc_preserves_destination_ownership() {
+        let dims = [
+            DimDescriptor {
+                lower_bound: 1,
+                upper_bound: 2,
+                stride: 1,
+            },
+            DimDescriptor {
+                lower_bound: 1,
+                upper_bound: 2,
+                stride: 2,
+            },
+        ];
+        let mut dest = ArrayDescriptor::zeroed();
+        let mut source = ArrayDescriptor::zeroed();
+        afs_allocate_array(&mut dest, 8, 2, dims.as_ptr(), ptr::null_mut());
+        afs_allocate_array(&mut source, 8, 2, dims.as_ptr(), ptr::null_mut());
+        let dest_base = dest.base_addr;
+
+        let source_values =
+            unsafe { core::slice::from_raw_parts_mut(source.base_addr as *mut f64, 4) };
+        source_values.copy_from_slice(&[1.0, 2.0, 3.0, 4.0]);
+
+        afs_copy_array_data_no_realloc(&mut dest, &source, ptr::null_mut());
+        assert_eq!(dest.base_addr, dest_base);
+        assert!(dest.is_allocated());
+        let dest_values = unsafe { core::slice::from_raw_parts(dest.base_addr as *const f64, 4) };
+        assert_eq!(dest_values, &[1.0, 2.0, 3.0, 4.0]);
+
+        let mut borrowed_values = [0.0_f64; 4];
+        let mut borrowed = ArrayDescriptor::zeroed();
+        borrowed.base_addr = borrowed_values.as_mut_ptr() as *mut u8;
+        borrowed.elem_size = 8;
+        borrowed.rank = 2;
+        borrowed.flags = DESC_CONTIGUOUS;
+        borrowed.dims[0] = DimDescriptor {
+            lower_bound: 1,
+            upper_bound: 2,
+            stride: 1,
+        };
+        borrowed.dims[1] = DimDescriptor {
+            lower_bound: 1,
+            upper_bound: 2,
+            stride: 2,
+        };
+        afs_copy_array_data_no_realloc(&mut borrowed, &source, ptr::null_mut());
+        assert_eq!(borrowed_values, [1.0, 2.0, 3.0, 4.0]);
+        assert!(!borrowed.is_allocated());
+
+        let mismatch_dims = [DimDescriptor {
+            lower_bound: 1,
+            upper_bound: 3,
+            stride: 1,
+        }];
+        let mut mismatch = ArrayDescriptor::zeroed();
+        afs_allocate_array(&mut mismatch, 8, 1, mismatch_dims.as_ptr(), ptr::null_mut());
+        let mut stat = 0;
+        afs_copy_array_data_no_realloc(&mut dest, &mismatch, &mut stat);
+        assert_eq!(stat, 4);
+        assert_eq!(dest.base_addr, dest_base);
+        assert!(dest.is_allocated());
+
+        afs_deallocate_array(&mut dest, ptr::null_mut());
+        afs_deallocate_array(&mut source, ptr::null_mut());
+        afs_deallocate_array(&mut mismatch, ptr::null_mut());
+    }
+
+    #[test]
     fn assign_allocatable_ignores_invalid_garbage_dest_for_unallocated_source() {
         let source = ArrayDescriptor::zeroed();
         let mut dest = ArrayDescriptor::zeroed();
@@ -3036,7 +3354,7 @@ pub extern "C" fn afs_array_count_logical_dim(
     }
     let s = unsafe { &*src };
     let d = unsafe { &mut *dst };
-    if s.base_addr.is_null() {
+    if !descriptor_has_payload_or_zero_size_array(s) {
         return;
     }
     if !d.is_allocated() {
@@ -3192,7 +3510,7 @@ pub extern "C" fn afs_array_norm2_real8_dim(
         return;
     }
     let s = unsafe { &*src };
-    if s.base_addr.is_null() || dim as usize > s.rank as usize {
+    if !descriptor_has_payload_or_zero_size_array(s) || dim as usize > s.rank as usize {
         return;
     }
     let d = unsafe { &mut *dst };
@@ -3258,7 +3576,7 @@ pub extern "C" fn afs_array_norm2_real4_dim(
         return;
     }
     let s = unsafe { &*src };
-    if s.base_addr.is_null() || dim as usize > s.rank as usize {
+    if !descriptor_has_payload_or_zero_size_array(s) || dim as usize > s.rank as usize {
         return;
     }
     let d = unsafe { &mut *dst };
@@ -3407,6 +3725,220 @@ fn for_each_reduce_along_dim<F: FnMut(usize, usize)>(
     }
 }
 
+fn for_each_reduce_along_dim_with_index<F: FnMut(usize, usize, i64)>(
+    src: &ArrayDescriptor,
+    reduce_dim: i32,
+    mut accum: F,
+) {
+    let rank = src.rank as usize;
+    if rank == 0 {
+        return;
+    }
+    let reduce_dim_idx = reduce_dim as usize - 1;
+    if reduce_dim_idx >= rank {
+        return;
+    }
+    let mut extents: [i64; 15] = [0; 15];
+    let mut strides: [i64; 15] = [0; 15];
+    let mut dst_running_stride: [i64; 15] = [0; 15];
+    let mut k = 0usize;
+    let mut acc = 1i64;
+    for i in 0..rank {
+        extents[i] = src.dims[i].extent();
+        strides[i] = src.dims[i].stride.max(1);
+        if i == reduce_dim_idx {
+            continue;
+        }
+        dst_running_stride[k] = acc;
+        acc *= extents[i];
+        k += 1;
+    }
+    let total = (0..rank).map(|i| extents[i]).product::<i64>();
+    if total <= 0 {
+        return;
+    }
+    let mut idx: [i64; 15] = [0; 15];
+    for _ in 0..total {
+        let mut byte_off: i64 = 0;
+        let mut dst_flat: i64 = 0;
+        let mut dk = 0usize;
+        for d in 0..rank {
+            byte_off += idx[d] * strides[d] * src.elem_size;
+            if d != reduce_dim_idx {
+                dst_flat += idx[d] * dst_running_stride[dk];
+                dk += 1;
+            }
+        }
+        accum(
+            byte_off as usize,
+            dst_flat as usize,
+            idx[reduce_dim_idx] + 1,
+        );
+        for d in 0..rank {
+            idx[d] += 1;
+            if idx[d] < extents[d] {
+                break;
+            }
+            idx[d] = 0;
+        }
+    }
+}
+
+fn ensure_location_dim_result(src: &ArrayDescriptor, dim: i32, dst: *mut ArrayDescriptor) -> bool {
+    if dst.is_null() || dim < 1 || dim as usize > src.rank as usize {
+        return false;
+    }
+    let d = unsafe { &mut *dst };
+    if !d.is_allocated() {
+        let new_rank = (src.rank - 1).max(0);
+        let mut dim_buf: [DimDescriptor; 15] = [DimDescriptor {
+            lower_bound: 0,
+            upper_bound: 0,
+            stride: 0,
+        }; 15];
+        let mut k = 0usize;
+        let mut acc: i64 = 1;
+        for i in 0..src.rank as usize {
+            if i + 1 == dim as usize {
+                continue;
+            }
+            let extent = src.dims[i].extent();
+            dim_buf[k].lower_bound = 1;
+            dim_buf[k].upper_bound = extent;
+            dim_buf[k].stride = acc;
+            acc *= extent;
+            k += 1;
+        }
+        let dim_ptr = if new_rank > 0 {
+            dim_buf.as_ptr()
+        } else {
+            ptr::null()
+        };
+        let mut stat: i32 = 0;
+        afs_allocate_array(dst, 4, new_rank, dim_ptr, &mut stat);
+        if stat != 0 {
+            return false;
+        }
+    }
+    let d = unsafe { &*dst };
+    d.is_allocated() && (d.total_elements() == 0 || !d.base_addr.is_null())
+}
+
+fn array_loc_real_dim(
+    src: *const ArrayDescriptor,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+    is_max: bool,
+) {
+    if src.is_null() || dst.is_null() || dim < 1 {
+        return;
+    }
+    let s = unsafe { &*src };
+    if !descriptor_has_payload_or_zero_size_array(s) || dim as usize > s.rank as usize {
+        return;
+    }
+    if !ensure_location_dim_result(s, dim, dst) {
+        return;
+    }
+    let d = unsafe { &mut *dst };
+    let dst_total = d.total_elements() as usize;
+    let out = d.base_addr as *mut i32;
+    if !out.is_null() {
+        unsafe {
+            fill_i32_impl(out, dst_total, 0);
+        }
+    }
+    if dst_total == 0 || s.total_elements() == 0 || s.base_addr.is_null() || out.is_null() {
+        return;
+    }
+    let src_ptr = s.base_addr as *const u8;
+    macro_rules! loc_real_kind {
+        ($t:ty) => {{
+            let mut seen = vec![false; dst_total];
+            let mut best: Vec<$t> = vec![0 as $t; dst_total];
+            for_each_reduce_along_dim_with_index(s, dim, |byte_off, dst_flat, reduce_index| {
+                let v = unsafe { *(src_ptr.add(byte_off) as *const $t) };
+                if !seen[dst_flat]
+                    || (if is_max {
+                        v > best[dst_flat]
+                    } else {
+                        v < best[dst_flat]
+                    })
+                {
+                    seen[dst_flat] = true;
+                    best[dst_flat] = v;
+                    unsafe {
+                        *out.add(dst_flat) = reduce_index as i32;
+                    }
+                }
+            });
+        }};
+    }
+    if s.elem_size == 4 {
+        loc_real_kind!(f32);
+    } else {
+        loc_real_kind!(f64);
+    }
+}
+
+fn array_loc_int_dim(
+    src: *const ArrayDescriptor,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+    is_max: bool,
+) {
+    if src.is_null() || dst.is_null() || dim < 1 {
+        return;
+    }
+    let s = unsafe { &*src };
+    if !descriptor_has_payload_or_zero_size_array(s) || dim as usize > s.rank as usize {
+        return;
+    }
+    if !ensure_location_dim_result(s, dim, dst) {
+        return;
+    }
+    let d = unsafe { &mut *dst };
+    let dst_total = d.total_elements() as usize;
+    let out = d.base_addr as *mut i32;
+    if !out.is_null() {
+        unsafe {
+            fill_i32_impl(out, dst_total, 0);
+        }
+    }
+    if dst_total == 0 || s.total_elements() == 0 || s.base_addr.is_null() || out.is_null() {
+        return;
+    }
+    let src_ptr = s.base_addr as *const u8;
+    macro_rules! loc_int_kind {
+        ($t:ty) => {{
+            let mut seen = vec![false; dst_total];
+            let mut best: Vec<$t> = vec![0 as $t; dst_total];
+            for_each_reduce_along_dim_with_index(s, dim, |byte_off, dst_flat, reduce_index| {
+                let v = unsafe { *(src_ptr.add(byte_off) as *const $t) };
+                if !seen[dst_flat]
+                    || (if is_max {
+                        v > best[dst_flat]
+                    } else {
+                        v < best[dst_flat]
+                    })
+                {
+                    seen[dst_flat] = true;
+                    best[dst_flat] = v;
+                    unsafe {
+                        *out.add(dst_flat) = reduce_index as i32;
+                    }
+                }
+            });
+        }};
+    }
+    match s.elem_size {
+        1 => loc_int_kind!(i8),
+        2 => loc_int_kind!(i16),
+        8 => loc_int_kind!(i64),
+        _ => loc_int_kind!(i32),
+    }
+}
+
 /// SUM(array, DIM=k) — reduce along dimension k, allocate `dst` with
 /// rank `src.rank - 1` and extents = src extents minus the reduction
 /// dim, then write the per-slice sums into dst. Caller passes a
@@ -3424,7 +3956,7 @@ pub extern "C" fn afs_array_sum_real8_dim(
     }
     let s = unsafe { &*src };
     let d = unsafe { &mut *dst };
-    if s.base_addr.is_null() {
+    if !descriptor_has_payload_or_zero_size_array(s) {
         return;
     }
     if !d.is_allocated() {
@@ -3504,7 +4036,7 @@ pub extern "C" fn afs_array_sum_int_dim(
     }
     let s = unsafe { &*src };
     let d = unsafe { &mut *dst };
-    if s.base_addr.is_null() {
+    if !descriptor_has_payload_or_zero_size_array(s) {
         return;
     }
     if !d.is_allocated() {
@@ -3612,7 +4144,7 @@ pub extern "C" fn afs_array_maxval_real8_dim(
         return;
     }
     let s = unsafe { &*src };
-    if s.base_addr.is_null() || dim as usize > s.rank as usize {
+    if !descriptor_has_payload_or_zero_size_array(s) || dim as usize > s.rank as usize {
         return;
     }
     let d = unsafe { &mut *dst };
@@ -3696,7 +4228,7 @@ pub extern "C" fn afs_array_minval_real8_dim(
         return;
     }
     let s = unsafe { &*src };
-    if s.base_addr.is_null() || dim as usize > s.rank as usize {
+    if !descriptor_has_payload_or_zero_size_array(s) || dim as usize > s.rank as usize {
         return;
     }
     let d = unsafe { &mut *dst };
@@ -3779,7 +4311,7 @@ pub extern "C" fn afs_array_maxval_int_dim(
         return;
     }
     let s = unsafe { &*src };
-    if s.base_addr.is_null() || dim as usize > s.rank as usize {
+    if !descriptor_has_payload_or_zero_size_array(s) || dim as usize > s.rank as usize {
         return;
     }
     let d = unsafe { &mut *dst };
@@ -3854,7 +4386,7 @@ pub extern "C" fn afs_array_minval_int_dim(
         return;
     }
     let s = unsafe { &*src };
-    if s.base_addr.is_null() || dim as usize > s.rank as usize {
+    if !descriptor_has_payload_or_zero_size_array(s) || dim as usize > s.rank as usize {
         return;
     }
     let d = unsafe { &mut *dst };
@@ -3931,7 +4463,7 @@ pub extern "C" fn afs_array_sum_complex4_dim(
     }
     let s = unsafe { &*src };
     let d = unsafe { &mut *dst };
-    if s.base_addr.is_null() {
+    if !descriptor_has_payload_or_zero_size_array(s) {
         return;
     }
     if !d.is_allocated() {
@@ -3995,7 +4527,7 @@ pub extern "C" fn afs_array_sum_complex8_dim(
     }
     let s = unsafe { &*src };
     let d = unsafe { &mut *dst };
-    if s.base_addr.is_null() {
+    if !descriptor_has_payload_or_zero_size_array(s) {
         return;
     }
     if !d.is_allocated() {
@@ -4160,7 +4692,9 @@ pub extern "C" fn afs_array_sum_real8_dim_mask(
     let s = unsafe { &*src };
     let d = unsafe { &mut *dst };
     let m = unsafe { &*mask };
-    if s.base_addr.is_null() || m.base_addr.is_null() {
+    if !descriptor_has_payload_or_zero_size_array(s)
+        || !descriptor_has_payload_or_zero_size_array(m)
+    {
         return;
     }
     if !d.is_allocated() {
@@ -4245,7 +4779,9 @@ pub extern "C" fn afs_array_sum_int_dim_mask(
     let s = unsafe { &*src };
     let d = unsafe { &mut *dst };
     let m = unsafe { &*mask };
-    if s.base_addr.is_null() || m.base_addr.is_null() {
+    if !descriptor_has_payload_or_zero_size_array(s)
+        || !descriptor_has_payload_or_zero_size_array(m)
+    {
         return;
     }
     if !d.is_allocated() {
@@ -4321,7 +4857,9 @@ pub extern "C" fn afs_array_sum_complex4_dim_mask(
     let s = unsafe { &*src };
     let d = unsafe { &mut *dst };
     let m = unsafe { &*mask };
-    if s.base_addr.is_null() || m.base_addr.is_null() {
+    if !descriptor_has_payload_or_zero_size_array(s)
+        || !descriptor_has_payload_or_zero_size_array(m)
+    {
         return;
     }
     if !d.is_allocated() {
@@ -4388,7 +4926,9 @@ pub extern "C" fn afs_array_sum_complex8_dim_mask(
     let s = unsafe { &*src };
     let d = unsafe { &mut *dst };
     let m = unsafe { &*mask };
-    if s.base_addr.is_null() || m.base_addr.is_null() {
+    if !descriptor_has_payload_or_zero_size_array(s)
+        || !descriptor_has_payload_or_zero_size_array(m)
+    {
         return;
     }
     if !d.is_allocated() {
@@ -5485,6 +6025,124 @@ pub extern "C" fn afs_array_minloc_real8(desc: *const ArrayDescriptor) -> i32 {
     (idx as i32) + 1
 }
 
+#[no_mangle]
+pub extern "C" fn afs_array_minloc_int(desc: *const ArrayDescriptor) -> i32 {
+    if desc.is_null() {
+        return 0;
+    }
+    let d = unsafe { &*desc };
+    if d.base_addr.is_null() {
+        return 0;
+    }
+    let n = d.total_elements() as usize;
+    if n == 0 {
+        return 0;
+    }
+    let stride = d.dims[0].stride.max(1) as usize;
+    let mut idx = 0usize;
+    match d.elem_size {
+        1 => {
+            let ptr = d.base_addr as *const i8;
+            let mut min = unsafe { *ptr };
+            for i in 1..n {
+                let v = unsafe { *ptr.add(i * stride) };
+                if v < min {
+                    min = v;
+                    idx = i;
+                }
+            }
+        }
+        2 => {
+            let ptr = d.base_addr as *const i16;
+            let mut min = unsafe { *ptr };
+            for i in 1..n {
+                let v = unsafe { *ptr.add(i * stride) };
+                if v < min {
+                    min = v;
+                    idx = i;
+                }
+            }
+        }
+        8 => {
+            let ptr = d.base_addr as *const i64;
+            let mut min = unsafe { *ptr };
+            for i in 1..n {
+                let v = unsafe { *ptr.add(i * stride) };
+                if v < min {
+                    min = v;
+                    idx = i;
+                }
+            }
+        }
+        _ => {
+            let ptr = d.base_addr as *const i32;
+            let mut min = unsafe { *ptr };
+            for i in 1..n {
+                let v = unsafe { *ptr.add(i * stride) };
+                if v < min {
+                    min = v;
+                    idx = i;
+                }
+            }
+        }
+    }
+    (idx as i32) + 1
+}
+
+#[no_mangle]
+pub extern "C" fn afs_array_maxloc_real4_dim(
+    src: *const ArrayDescriptor,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+) {
+    array_loc_real_dim(src, dim, dst, true);
+}
+
+#[no_mangle]
+pub extern "C" fn afs_array_maxloc_real8_dim(
+    src: *const ArrayDescriptor,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+) {
+    array_loc_real_dim(src, dim, dst, true);
+}
+
+#[no_mangle]
+pub extern "C" fn afs_array_maxloc_int_dim(
+    src: *const ArrayDescriptor,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+) {
+    array_loc_int_dim(src, dim, dst, true);
+}
+
+#[no_mangle]
+pub extern "C" fn afs_array_minloc_real4_dim(
+    src: *const ArrayDescriptor,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+) {
+    array_loc_real_dim(src, dim, dst, false);
+}
+
+#[no_mangle]
+pub extern "C" fn afs_array_minloc_real8_dim(
+    src: *const ArrayDescriptor,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+) {
+    array_loc_real_dim(src, dim, dst, false);
+}
+
+#[no_mangle]
+pub extern "C" fn afs_array_minloc_int_dim(
+    src: *const ArrayDescriptor,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+) {
+    array_loc_int_dim(src, dim, dst, false);
+}
+
 /// TRANSPOSE(source, result) — matrix transpose (real(8) version).
 /// source is (m x n), result is (n x m). Both descriptors must be allocated.
 #[no_mangle]
@@ -5496,7 +6154,7 @@ pub extern "C" fn afs_transpose_real8(
         return;
     }
     let src = unsafe { &*source };
-    if src.rank < 2 || src.base_addr.is_null() {
+    if src.rank < 2 {
         return;
     }
 
@@ -5510,6 +6168,9 @@ pub extern "C" fn afs_transpose_real8(
     afs_allocate_1d(result, elem_size, (n * m) as i64);
     let res = unsafe { &mut *result };
     set_rank2_contiguous_shape(res, n, m);
+    if m == 0 || n == 0 || src.base_addr.is_null() || res.base_addr.is_null() {
+        return;
+    }
 
     // Fortran arrays are column-major: source A(i,j) at offset j*m+i for
     // an m-row source; result B = transpose(A) has n rows, so B(j,i) at
@@ -5752,14 +6413,13 @@ pub extern "C" fn afs_transpose_int(source: *const ArrayDescriptor, result: *mut
         return;
     }
     let src = unsafe { &*source };
-    if src.rank < 2 || src.base_addr.is_null() {
+    if src.rank < 2 {
         return;
     }
 
     let m = src.dims[0].extent() as usize;
     let n = src.dims[1].extent() as usize;
     let elem_size = src.elem_size.max(1) as usize;
-    let sp = src.base_addr as *const u8;
 
     // Allocate result with same per-element width so callers using
     // complex (8/16-byte), integer(8) (8-byte), integer(2)/(1) etc. all
@@ -5778,6 +6438,10 @@ pub extern "C" fn afs_transpose_int(source: *const ArrayDescriptor, result: *mut
     let dims = [dim0, dim1];
     afs_allocate_array(result, elem_size as i64, 2, dims.as_ptr(), ptr::null_mut());
     let res = unsafe { &mut *result };
+    if m == 0 || n == 0 || src.base_addr.is_null() || res.base_addr.is_null() {
+        return;
+    }
+    let sp = src.base_addr as *const u8;
     let rp = res.base_addr;
 
     // Column-major: source A(i,j) at offset j*m+i; dest B(j,i) at i*n+j.

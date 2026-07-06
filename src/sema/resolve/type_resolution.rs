@@ -145,9 +145,9 @@ pub(super) fn extract_char_len(sel: &Option<decl::CharSelector>, st: &SymbolTabl
             Some(decl::LenSpec::Expr(e)) => eval_const_int_expr(e, st),
             Some(decl::LenSpec::Star) => None,  // assumed length
             Some(decl::LenSpec::Colon) => None, // deferred length
-            None => None,
+            None => Some(1),
         },
-        None => None,
+        None => Some(1),
     }
 }
 

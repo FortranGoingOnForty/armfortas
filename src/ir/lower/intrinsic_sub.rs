@@ -28,6 +28,11 @@ pub(crate) fn lower_intrinsic_subroutine(
         tmp_ptr: ValueId,
     }
 
+    enum ProcPointerTarget {
+        Local(LocalInfo),
+        Component(ValueId),
+    }
+
     /// Helper: get the nth positional arg as a by-ref pointer, or null if absent.
     fn nth_arg_ref(
         b: &mut FuncBuilder,
@@ -41,6 +46,33 @@ pub(crate) fn lower_intrinsic_subroutine(
             }
         }
         b.const_i64(0) // null pointer for missing optional arg
+    }
+
+    fn nth_proc_pointer_target(
+        b: &mut FuncBuilder,
+        ctx: &LowerCtx,
+        args: &[Option<crate::ast::expr::Argument>],
+        n: usize,
+    ) -> Option<ProcPointerTarget> {
+        let arg = args.get(n)?.as_ref()?;
+        let crate::ast::expr::SectionSubscript::Element(expr) = &arg.value else {
+            return None;
+        };
+        match &expr.node {
+            Expr::Name { name } => {
+                let key = name.to_lowercase();
+                let info = ctx.locals.get(&key)?;
+                (info.is_pointer && info.dims.is_empty())
+                    .then(|| ProcPointerTarget::Local(info.clone()))
+            }
+            Expr::ComponentAccess { .. } => {
+                let (field_ptr, field) =
+                    resolve_component_field_access(b, &ctx.locals, expr, ctx.st, ctx.type_layouts)?;
+                (field.pointer && field.procedure_pointer)
+                    .then_some(ProcPointerTarget::Component(field_ptr))
+            }
+            _ => None,
+        }
     }
 
     /// Helper: get the nth positional arg as a by-value expression, or default.
@@ -875,6 +907,55 @@ pub(crate) fn lower_intrinsic_subroutine(
                     b.store(ptr_val, target_addr);
                     return true;
                 }
+            }
+
+            let fptr = nth_arg_ref(b, ctx, args, 1);
+            let inner_pointee = b
+                .func()
+                .value_type(fptr)
+                .and_then(|ty| {
+                    if let IrType::Ptr(inner) = ty {
+                        if let IrType::Ptr(elem) = inner.as_ref() {
+                            Some(elem.as_ref().clone())
+                        } else {
+                            Some(inner.as_ref().clone())
+                        }
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(IrType::Int(IntWidth::I8));
+            let ptr_val = b.int_to_ptr(cptr, inner_pointee);
+            b.store(ptr_val, fptr);
+            true
+        }
+
+        "c_f_procpointer" => {
+            // call c_f_procpointer(cptr, fptr)
+            //
+            // Procedure pointers are represented as raw code pointers in
+            // local storage, matching type(c_funptr)'s opaque i64 payload.
+            // Associating one is therefore the scalar c_f_pointer case:
+            // convert the incoming C_FUNPTR value to the FPTR slot's
+            // pointee type and store it.
+            let raw_cptr = nth_arg_val(b, ctx, args, 0, 0);
+            let cptr = match b.func().value_type(raw_cptr) {
+                Some(IrType::Int(IntWidth::I64)) => raw_cptr,
+                _ => b.int_extend(raw_cptr, IntWidth::I64, false),
+            };
+            if let Some(target) = nth_proc_pointer_target(b, ctx, args, 1) {
+                match target {
+                    ProcPointerTarget::Local(info) => {
+                        let elem_ty = procedure_pointer_symbol_addr_elem_type(&info);
+                        let ptr_val = b.int_to_ptr(cptr, elem_ty);
+                        store_scalar_pointer_slot_value(b, &info, ptr_val);
+                    }
+                    ProcPointerTarget::Component(field_ptr) => {
+                        let ptr_val = b.int_to_ptr(cptr, IrType::Int(IntWidth::I8));
+                        store_procedure_pointer_component_record(b, field_ptr, ptr_val, &[]);
+                    }
+                }
+                return true;
             }
 
             let fptr = nth_arg_ref(b, ctx, args, 1);

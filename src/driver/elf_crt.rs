@@ -225,7 +225,8 @@ fn newest_gcc_dir(roots: &[&Path]) -> Option<PathBuf> {
 /// libraries follow the runtime archive (`-lc` after
 /// libarmfortas_rt.a or runtime externs go unresolved); crtend/crtn
 /// close. `--eh-frame-hdr` because Rust unwinding needs
-/// `PT_GNU_EH_FRAME`.
+/// `PT_GNU_EH_FRAME`; `--gc-sections` keeps the coarse Rust runtime
+/// archive from dragging unused intrinsic surfaces into small binaries.
 #[allow(clippy::too_many_arguments)]
 pub fn elf_link_args(
     target: &TargetSpec,
@@ -242,6 +243,7 @@ pub fn elf_link_args(
         args.push("-pie".into());
     }
     args.push("--eh-frame-hdr".into());
+    args.push("--gc-sections".into());
     args.push("--dynamic-linker".into());
     args.push(dynamic_linker(target)?.to_string());
     args.push("-o".into());
@@ -388,6 +390,7 @@ mod tests {
         let expect_prefix = [
             "-pie",
             "--eh-frame-hdr",
+            "--gc-sections",
             "--dynamic-linker",
             "/libexec/ld-elf.so.1",
             "-o",

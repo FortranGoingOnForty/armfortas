@@ -2301,8 +2301,13 @@ pub struct NamelistEntry {
     pub name: *const u8,
     pub name_len: i64,
     pub data: *mut u8,
-    pub data_type: i32, // 0=int, 1=real, 2=string, 3=logical
-    pub data_len: i64,  // string length for type 2
+    pub data_type: i32, // 0=int, 1=real, 2=fixed string, 3=i32 logical, 4=StringDescriptor, 5=bool logical
+    pub data_len: i64,  // fixed string length for type 2
+    pub elem_count: i64,
+}
+
+fn quote_namelist_char(s: &str) -> String {
+    format!("'{}'", s.trim_end().replace('\'', "''"))
 }
 
 /// Write a NAMELIST group to a unit.
@@ -2338,13 +2343,32 @@ pub extern "C" fn afs_write_namelist(
                     }
                     2 => {
                         // string
-                        let s = unsafe_str(entry.data, entry.data_len);
-                        format!("'{}'", s.trim_end())
+                        let elem_len = entry.data_len.max(0) as usize;
+                        let elem_count = entry.elem_count.max(1) as usize;
+                        let mut values = Vec::with_capacity(elem_count);
+                        for elem in 0..elem_count {
+                            let ptr = unsafe { entry.data.add(elem * elem_len) };
+                            let s = unsafe_str(ptr, entry.data_len);
+                            values.push(quote_namelist_char(&s));
+                        }
+                        values.join(",")
                     }
                     3 => {
                         // logical
                         let v = unsafe { *(entry.data as *const i32) };
                         (if v != 0 { ".TRUE." } else { ".FALSE." }).to_string()
+                    }
+                    4 => {
+                        // deferred-length string descriptor
+                        let desc =
+                            unsafe { &*(entry.data as *const crate::descriptor::StringDescriptor) };
+                        let s = unsafe_str(desc.data, desc.len);
+                        quote_namelist_char(&s)
+                    }
+                    5 => {
+                        // bool-backed logical
+                        let v = unsafe { *(entry.data as *const u8) } != 0;
+                        (if v { ".TRUE." } else { ".FALSE." }).to_string()
                     }
                     _ => "???".to_string(),
                 };
@@ -2399,74 +2423,281 @@ pub extern "C" fn afs_read_namelist(
             }
         }
 
-        // Parse assignments from the namelist text.
-        if !entries.is_null() && n_entries > 0 {
-            let entries_slice = unsafe { std::slice::from_raw_parts(entries, n_entries as usize) };
-            // Extract the content between & and /.
-            let content = if let Some(start) = all_lines.find(&gname) {
-                let after_name = &all_lines[start + gname.len()..];
-                if let Some(end) = after_name.find('/') {
-                    &after_name[..end]
-                } else {
-                    after_name
-                }
-            } else {
-                ""
-            };
-
-            // Parse var=val pairs. Supports:
-            //   var=val            — simple scalar assignment
-            //   var(index)=val     — array element assignment (1-based)
-            //   var=n*val          — repeat notation (set n consecutive elements)
-            for pair in content.split(',') {
-                let pair = pair.trim();
-                if let Some(eq_pos) = pair.find('=') {
-                    let lhs = pair[..eq_pos].trim().to_lowercase();
-                    let val_str = pair[eq_pos + 1..].trim();
-
-                    // Parse array index from "var(idx)" syntax.
-                    let (var_name, array_index) = if let Some(paren) = lhs.find('(') {
-                        let name = lhs[..paren].trim();
-                        let idx_str = lhs[paren + 1..].trim_end_matches(')').trim();
-                        let idx = idx_str.parse::<usize>().unwrap_or(1);
-                        (name.to_string(), Some(idx))
-                    } else {
-                        (lhs, None)
-                    };
-
-                    // Parse repeat notation "n*val".
-                    let (repeat_count, actual_val) = if let Some(star) = val_str.find('*') {
-                        // Make sure * is preceded by digits (not part of a number like 1.5E*).
-                        let before = val_str[..star].trim();
-                        if let Ok(n) = before.parse::<usize>() {
-                            (n, val_str[star + 1..].trim())
-                        } else {
-                            (1, val_str)
-                        }
-                    } else {
-                        (1, val_str)
-                    };
-
-                    // Find the matching entry.
-                    for entry in entries_slice {
-                        if entry.data.is_null() {
-                            continue;
-                        }
-                        let ename = unsafe_str(entry.name, entry.name_len).to_lowercase();
-                        if ename == var_name {
-                            namelist_assign_value(entry, actual_val, array_index, repeat_count);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
+        let _ = namelist_assign_from_text(&all_lines, &gname, entries, n_entries);
         if !iostat.is_null() {
             unsafe {
                 *iostat = 0;
             }
         }
     }
+}
+
+/// Read a NAMELIST group from an internal character buffer.
+#[no_mangle]
+pub extern "C" fn afs_read_namelist_internal(
+    buf: *const u8,
+    buf_len: i64,
+    group_name: *const u8,
+    group_name_len: i64,
+    entries: *const NamelistEntry,
+    n_entries: i32,
+    iostat: *mut i32,
+) {
+    let gname = unsafe_str(group_name, group_name_len).to_lowercase();
+    let text = unsafe_str(buf, buf_len);
+    let found = namelist_assign_from_text(&text, &gname, entries, n_entries);
+    if !iostat.is_null() {
+        unsafe {
+            *iostat = if found { 0 } else { IOSTAT_END };
+        }
+    }
+}
+
+fn namelist_content<'a>(text: &'a str, group_name: &str) -> Option<&'a str> {
+    let lower = text.to_lowercase();
+    let marker = format!("&{}", group_name.to_lowercase());
+    let start = lower.find(&marker)?;
+    let after_start = start + marker.len();
+    let after_name = &text[after_start..];
+    if let Some(end) = after_name.find('/') {
+        Some(&after_name[..end])
+    } else {
+        Some(after_name)
+    }
+}
+
+fn namelist_assign_from_text(
+    text: &str,
+    group_name: &str,
+    entries: *const NamelistEntry,
+    n_entries: i32,
+) -> bool {
+    let Some(content) = namelist_content(text, group_name) else {
+        return false;
+    };
+    if entries.is_null() || n_entries <= 0 {
+        return true;
+    }
+    let entries_slice = unsafe { std::slice::from_raw_parts(entries, n_entries as usize) };
+
+    // Parse var=val pairs. Supports:
+    //   var=val            — simple scalar assignment
+    //   var(index)=val     — array element assignment (1-based)
+    //   var=n*val          — repeat notation (set n consecutive elements)
+    enum Continuation {
+        Array {
+            entry_index: usize,
+            next_index: usize,
+        },
+        Components {
+            entry_indices: Vec<usize>,
+            next_component: usize,
+        },
+    }
+
+    fn component_entries(entries: &[NamelistEntry], aggregate_name: &str) -> Vec<usize> {
+        let prefix = format!("{}%", aggregate_name);
+        entries
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, entry)| {
+                if entry.data.is_null() {
+                    return None;
+                }
+                let ename = unsafe_str(entry.name, entry.name_len).to_lowercase();
+                let suffix = ename.strip_prefix(&prefix)?;
+                if suffix.is_empty() || suffix.contains('%') {
+                    None
+                } else {
+                    Some(idx)
+                }
+            })
+            .collect()
+    }
+
+    fn assign_component_values(
+        entries: &[NamelistEntry],
+        entry_indices: &[usize],
+        start_component: usize,
+        val_str: &str,
+        repeat: usize,
+    ) -> usize {
+        let mut next = start_component;
+        for _ in 0..repeat.max(1) {
+            let Some(entry_index) = entry_indices.get(next).copied() else {
+                break;
+            };
+            if let Some(entry) = entries.get(entry_index) {
+                namelist_assign_value(entry, val_str, None, 1);
+            }
+            next += 1;
+        }
+        next
+    }
+
+    let mut continuation: Option<Continuation> = None;
+    for pair in split_namelist_fields(content) {
+        let pair = pair.trim();
+        if let Some(eq_pos) = pair.find('=') {
+            let lhs = pair[..eq_pos].trim().to_lowercase();
+            let val_str = pair[eq_pos + 1..].trim();
+
+            // Parse array index from "var(idx)" syntax.
+            let (var_name, array_index) = if let Some(paren) = lhs.find('(') {
+                let name = lhs[..paren].trim();
+                let idx_str = lhs[paren + 1..].trim_end_matches(')').trim();
+                let idx = idx_str.parse::<usize>().unwrap_or(1);
+                (name.to_string(), Some(idx))
+            } else {
+                (lhs, None)
+            };
+
+            // Parse repeat notation "n*val".
+            let (repeat_count, actual_val) = parse_namelist_repeat(val_str);
+
+            // Find the matching entry.
+            continuation = None;
+            let mut matched = false;
+            for (entry_index, entry) in entries_slice.iter().enumerate() {
+                if entry.data.is_null() {
+                    continue;
+                }
+                let ename = unsafe_str(entry.name, entry.name_len).to_lowercase();
+                if ename == var_name {
+                    namelist_assign_value(entry, actual_val, array_index, repeat_count);
+                    let next_index = array_index.unwrap_or(1).saturating_add(repeat_count);
+                    if entry.data_type == 2 && next_index <= entry.elem_count.max(1) as usize {
+                        continuation = Some(Continuation::Array {
+                            entry_index,
+                            next_index,
+                        });
+                    }
+                    matched = true;
+                    break;
+                }
+            }
+            if !matched && array_index.is_none() {
+                let entry_indices = component_entries(entries_slice, &var_name);
+                if !entry_indices.is_empty() {
+                    let next_component = assign_component_values(
+                        entries_slice,
+                        &entry_indices,
+                        0,
+                        actual_val,
+                        repeat_count,
+                    );
+                    if next_component < entry_indices.len() {
+                        continuation = Some(Continuation::Components {
+                            entry_indices,
+                            next_component,
+                        });
+                    }
+                }
+            }
+        } else if let Some(cont) = continuation.take() {
+            let (repeat_count, actual_val) = parse_namelist_repeat(pair);
+            match cont {
+                Continuation::Array {
+                    entry_index,
+                    next_index,
+                } => {
+                    if let Some(entry) = entries_slice.get(entry_index) {
+                        namelist_assign_value(entry, actual_val, Some(next_index), repeat_count);
+                        let next_index = next_index.saturating_add(repeat_count);
+                        continuation = if next_index <= entry.elem_count.max(1) as usize {
+                            Some(Continuation::Array {
+                                entry_index,
+                                next_index,
+                            })
+                        } else {
+                            None
+                        };
+                    }
+                }
+                Continuation::Components {
+                    entry_indices,
+                    next_component,
+                } => {
+                    let next_component = assign_component_values(
+                        entries_slice,
+                        &entry_indices,
+                        next_component,
+                        actual_val,
+                        repeat_count,
+                    );
+                    continuation = if next_component < entry_indices.len() {
+                        Some(Continuation::Components {
+                            entry_indices,
+                            next_component,
+                        })
+                    } else {
+                        None
+                    };
+                }
+            }
+        }
+    }
+    true
+}
+
+fn split_namelist_fields(content: &str) -> Vec<&str> {
+    let mut fields = Vec::new();
+    let mut start = 0;
+    let mut quote = None;
+    let mut chars = content.char_indices().peekable();
+    while let Some((idx, ch)) = chars.next() {
+        if let Some(q) = quote {
+            if ch == q {
+                if chars.peek().is_some_and(|(_, next)| *next == q) {
+                    let _ = chars.next();
+                } else {
+                    quote = None;
+                }
+            }
+        } else if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+        } else if ch == ',' {
+            fields.push(&content[start..idx]);
+            start = idx + ch.len_utf8();
+        }
+    }
+    fields.push(&content[start..]);
+    fields
+}
+
+fn parse_namelist_repeat(val_str: &str) -> (usize, &str) {
+    if let Some(star) = val_str.find('*') {
+        // Make sure * is preceded by digits (not part of a number like 1.5E*).
+        let before = val_str[..star].trim();
+        if let Ok(n) = before.parse::<usize>() {
+            return (n, val_str[star + 1..].trim());
+        }
+    }
+    (1, val_str)
+}
+
+fn parse_namelist_char_value(raw: &str) -> String {
+    let s = raw.trim();
+    let Some(first) = s.as_bytes().first().copied() else {
+        return String::new();
+    };
+    if first != b'\'' && first != b'"' {
+        return s.to_string();
+    }
+    if s.as_bytes().last().copied() != Some(first) || s.len() < 2 {
+        return s.to_string();
+    }
+
+    let quote = first as char;
+    let mut out = String::with_capacity(s.len().saturating_sub(2));
+    let mut chars = s[1..s.len() - 1].chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == quote && chars.peek().copied() == Some(quote) {
+            let _ = chars.next();
+        }
+        out.push(ch);
+    }
+    out
 }
 
 /// Assign a parsed NAMELIST value to an entry, handling array indexing and repeat.
@@ -2478,17 +2709,22 @@ fn namelist_assign_value(
 ) {
     // For array elements, compute byte offset from 1-based index.
     let elem_size = match entry.data_type {
-        0 => 4, // integer (i32)
-        1 => 8, // real (f64)
-        3 => 4, // logical (i32)
-        _ => 1, // string
+        0 => 4,                              // integer (i32)
+        1 => 8,                              // real (f64)
+        2 => entry.data_len.max(1) as usize, // fixed string element
+        3 => 4,                              // logical (i32)
+        5 => 1,                              // logical (bool/i8)
+        _ => 1,                              // string
     };
-    let base_offset = index
-        .map(|i| (i.saturating_sub(1)) * elem_size)
-        .unwrap_or(0);
+    let start_index = index.unwrap_or(1).max(1);
+    let max_elems = entry.elem_count.max(1) as usize;
 
     for r in 0..repeat {
-        let offset = base_offset + r * elem_size;
+        let elem_index = start_index.saturating_add(r);
+        if elem_index > max_elems {
+            break;
+        }
+        let offset = (elem_index - 1) * elem_size;
         let ptr = unsafe { entry.data.add(offset) };
         match entry.data_type {
             0 => {
@@ -2509,23 +2745,21 @@ fn namelist_assign_value(
                 }
             }
             2 => {
-                // string (only first element for repeat, no array stride for strings)
-                let s = val_str.trim_matches('\'').trim_matches('"');
+                // fixed-length string scalar or element
+                let s = parse_namelist_char_value(val_str);
                 let bytes = s.as_bytes();
-                let copy_len = bytes.len().min(entry.data_len as usize);
-                if copy_len > 0 {
+                let slot_len = entry.data_len.max(0) as usize;
+                let copy_len = bytes.len().min(slot_len);
+                if slot_len > 0 {
                     unsafe {
-                        std::ptr::copy_nonoverlapping(bytes.as_ptr(), entry.data, copy_len);
-                        if copy_len < entry.data_len as usize {
-                            std::ptr::write_bytes(
-                                entry.data.add(copy_len),
-                                b' ',
-                                entry.data_len as usize - copy_len,
-                            );
+                        if copy_len > 0 {
+                            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, copy_len);
+                        }
+                        if copy_len < slot_len {
+                            std::ptr::write_bytes(ptr.add(copy_len), b' ', slot_len - copy_len);
                         }
                     }
                 }
-                return; // string repeat doesn't make sense
             }
             3 => {
                 // logical
@@ -2533,6 +2767,24 @@ fn namelist_assign_value(
                 let v = lower.starts_with(".t") || lower.starts_with("t");
                 unsafe {
                     *(ptr as *mut i32) = v as i32;
+                }
+            }
+            4 => {
+                // deferred-length string descriptor
+                let s = parse_namelist_char_value(val_str);
+                crate::string::afs_assign_char_deferred(
+                    entry.data as *mut crate::descriptor::StringDescriptor,
+                    s.as_ptr(),
+                    s.len() as i64,
+                );
+                return;
+            }
+            5 => {
+                // bool-backed logical
+                let lower = val_str.to_lowercase();
+                let v = lower.starts_with(".t") || lower.starts_with("t");
+                unsafe {
+                    *ptr = v as u8;
                 }
             }
             _ => {}
@@ -2982,6 +3234,19 @@ fn write_inquire_string(buf: *mut u8, buf_len: i64, value: &str) {
     }
 }
 
+fn unit_current_fortran_pos(u: &mut Unit) -> i64 {
+    let pos = match &mut u.stream {
+        UnitStream::FileRaw(f) => f.stream_position(),
+        UnitStream::FileRead(r) => r.stream_position(),
+        UnitStream::FileWrite(w) => {
+            let _ = w.flush();
+            w.stream_position()
+        }
+        _ => return -1,
+    };
+    pos.map(|p| p as i64 + 1).unwrap_or(-1)
+}
+
 /// INQUIRE LEADING_ZERO= readback (F2023 12.10.2.15). A formatted
 /// connection reports its current mode (`PRINT`/`SUPPRESS`/
 /// `PROCESSOR_DEFINED`); no connection or an unformatted connection is
@@ -3013,6 +3278,7 @@ pub extern "C" fn afs_inquire_file(
     action_buf_len: i64,
     recl_out: *mut i64,
     size_out: *mut i64,
+    pos_out: *mut i64,
     read_buf: *mut u8,
     read_buf_len: i64,
     write_buf: *mut u8,
@@ -3131,6 +3397,11 @@ pub extern "C" fn afs_inquire_file(
             *size_out = sz;
         }
     }
+    if !pos_out.is_null() {
+        unsafe {
+            *pos_out = -1;
+        }
+    }
 
     if !iostat.is_null() {
         unsafe {
@@ -3157,6 +3428,7 @@ pub extern "C" fn afs_inquire_unit(
     action_buf_len: i64,
     recl_out: *mut i64,
     size_out: *mut i64,
+    pos_out: *mut i64,
     read_buf: *mut u8,
     read_buf_len: i64,
     write_buf: *mut u8,
@@ -3175,10 +3447,9 @@ pub extern "C" fn afs_inquire_unit(
     unformatted_buf_len: i64,
     leading_zero_buf: *mut u8,
     leading_zero_buf_len: i64,
-    pos_out: *mut i64,
 ) {
-    let state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    let unit_entry = state.units.get(&unit);
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+    let unit_entry = state.units.get_mut(&unit);
 
     if !exist.is_null() {
         unsafe {
@@ -3243,18 +3514,8 @@ pub extern "C" fn afs_inquire_unit(
             }
         }
         if !pos_out.is_null() {
-            // F2018 §12.10.2.22: POS= is the file storage unit the next
-            // read/write would address, 1-based; stream access only.
-            // `impl Seek for &File` lets us query without a mutable unit.
-            let p = match &u.stream {
-                UnitStream::FileRaw(f) => (&*f)
-                    .stream_position()
-                    .map(|off| off as i64 + 1)
-                    .unwrap_or(-1),
-                _ => -1,
-            };
             unsafe {
-                *pos_out = p;
+                *pos_out = unit_current_fortran_pos(u);
             }
         }
     } else {
@@ -3372,6 +3633,7 @@ fn write_form_capabilities(
 }
 
 /// Write ACCESS, FORM, ACTION, RECL for a connected unit.
+#[allow(clippy::too_many_arguments)]
 fn write_unit_properties(
     u: &Unit,
     access_buf: *mut u8,
@@ -3515,12 +3777,17 @@ use std::cell::RefCell;
 
 enum FmtSink {
     Unit(i32),
-    Internal { buf: *mut u8, buf_len: usize },
+    Internal {
+        buf: *mut u8,
+        buf_len: usize,
+    },
     /// Internal write whose target is a deferred-length allocatable
     /// `character(:), allocatable` scalar. An already allocated target is
     /// treated as a fixed internal file; an unallocated target is allocated
     /// to the formatted record length.
-    InternalAlloc { desc: *mut u8 },
+    InternalAlloc {
+        desc: *mut u8,
+    },
     /// Internal write whose target is a whole character array: each
     /// formatted record goes into one element (truncated or blank-
     /// padded to the element length). Elements after the last record
@@ -3786,7 +4053,12 @@ thread_local! {
 }
 
 #[no_mangle]
-pub extern "C" fn afs_lst_ia_begin(desc: *mut u8, iostat: *mut i32, iomsg: *mut u8, iomsg_len: i64) {
+pub extern "C" fn afs_lst_ia_begin(
+    desc: *mut u8,
+    iostat: *mut i32,
+    iomsg: *mut u8,
+    iomsg_len: i64,
+) {
     LST_IA_CTX.with(|ctx| {
         ctx.borrow_mut().push(LstIaContext {
             desc: desc as *mut crate::descriptor::StringDescriptor,
@@ -3972,25 +4244,25 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                         .unwrap_or(LeadingZeroMode::Default);
                     engine.set_leading_zero(c.stmt_leading_zero.unwrap_or(conn_mode));
                     match engine.format_values_reverting_checked(&c.values) {
-                    Ok(output) => {
-                        if let Some(u) = state.get_unit(unit) {
-                            if u.write_str(&output).is_err() {
+                        Ok(output) => {
+                            if let Some(u) = state.get_unit(unit) {
+                                if u.write_str(&output).is_err() {
+                                    io_status = 1;
+                                    io_msg = Some("write failed");
+                                }
+                                if io_status == 0 && advance != 0 && u.write_str("\n").is_err() {
+                                    io_status = 1;
+                                    io_msg = Some("write failed");
+                                }
+                            } else {
                                 io_status = 1;
-                                io_msg = Some("write failed");
+                                io_msg = Some("unit not connected");
                             }
-                            if io_status == 0 && advance != 0 && u.write_str("\n").is_err() {
-                                io_status = 1;
-                                io_msg = Some("write failed");
-                            }
-                        } else {
-                            io_status = 1;
-                            io_msg = Some("unit not connected");
                         }
-                    }
-                    Err(_) => {
-                        io_status = 1;
-                        io_msg = Some("format error");
-                    }
+                        Err(_) => {
+                            io_status = 1;
+                            io_msg = Some("format error");
+                        }
                     }
                 }
                 FmtSink::Internal { buf, buf_len } => {
@@ -5397,11 +5669,7 @@ mod tests {
         // plain (F6.3) write to that unit drops the leading zero. A WRITE
         // statement override beats the connection mode; INQUIRE reads the
         // connection's current mode back.
-        let path = format!(
-            "/tmp/afs_lz_conn_{}_{}.txt",
-            std::process::id(),
-            line!()
-        );
+        let path = format!("/tmp/afs_lz_conn_{}_{}.txt", std::process::id(), line!());
         let _ = std::fs::remove_file(&path);
         let mut iostat = -99i32;
         let cb = OpenControlBlock {
@@ -5445,6 +5713,7 @@ mod tests {
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
+            std::ptr::null_mut(),
             0,
             std::ptr::null_mut(),
             0,
@@ -5462,7 +5731,6 @@ mod tests {
             0,
             lz.as_mut_ptr(),
             lz.len() as i64,
-            std::ptr::null_mut(),
         );
         assert_eq!(&lz[..8], b"SUPPRESS");
 
@@ -5694,14 +5962,14 @@ mod tests {
 
         afs_fmt_begin(99, "(I5, F8.2)".as_ptr(), 10);
         afs_fmt_push_int(42);
-        afs_fmt_push_real(3.14);
+        afs_fmt_push_real(1.23);
         afs_fmt_end(1); // with newline
 
         afs_close(99, std::ptr::null_mut());
 
         let content = std::fs::read_to_string(path).unwrap();
         assert!(content.contains("42"), "expected 42 in: {}", content);
-        assert!(content.contains("3.14"), "expected 3.14 in: {}", content);
+        assert!(content.contains("1.23"), "expected 1.23 in: {}", content);
     }
 
     #[test]

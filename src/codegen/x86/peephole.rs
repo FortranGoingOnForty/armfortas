@@ -329,9 +329,7 @@ fn flag_effect(op: X86Opcode) -> FlagEffect {
 fn flags_dead_after(insts: &[X86Inst]) -> Vec<bool> {
     let n = insts.len();
     let mut dead = vec![false; n];
-    let ends_in_ret = insts
-        .last()
-        .is_some_and(|i| i.opcode == X86Opcode::Ret);
+    let ends_in_ret = insts.last().is_some_and(|i| i.opcode == X86Opcode::Ret);
     // `live` = RFLAGS liveness at the point after the current instruction
     // (= live-in of the next).
     let mut live = !ends_in_ret;

@@ -139,6 +139,7 @@ pub(crate) fn lower_unit(
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
                 host_uses.iter().chain(uses.iter()).cloned().collect();
             let required_import_names = collect_required_import_names(decls, body);
+            let decl_spec_import_names = collect_decl_spec_import_names(decls);
 
             {
                 let mut b = FuncBuilder::new(&mut func, ctx.layout);
@@ -151,6 +152,16 @@ pub(crate) fn lower_unit(
                     decls,
                     &visible_param_consts,
                     st,
+                );
+                install_globals_as_locals(
+                    &mut b,
+                    &mut ctx.locals,
+                    globals,
+                    &combined_uses,
+                    Some(&decl_spec_import_names),
+                    host_module,
+                    ctx.st,
+                    &ctx.ambiguous_use_warnings,
                 );
                 super::alloc::alloc_decls(
                     &mut b,
@@ -458,6 +469,7 @@ pub(crate) fn lower_unit(
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
                 host_uses.iter().chain(uses.iter()).cloned().collect();
             let required_import_names = collect_required_import_names(decls, body);
+            let decl_spec_import_names = collect_decl_spec_import_names(decls);
 
             // Collect param info: (name, param_id, elem_type, is_value).
             // Skip hidden params: __len_* (character-length) and __host_*
@@ -523,11 +535,12 @@ pub(crate) fn lower_unit(
                         } else {
                             arg_char_kind_from_decls(pname, decls, st)
                         };
+                        let is_allocatable = decl_is_allocatable(pname, decls);
                         let info = LocalInfo {
                             addr: slot,
                             ty: local_elem_ty,
                             dims: arg_dims_from_decls(pname, decls, &visible_param_consts, st),
-                            allocatable: false,
+                            allocatable: is_allocatable,
                             descriptor_arg: uses_descriptor,
                             by_ref: true,
                             char_kind: ck,
@@ -638,6 +651,16 @@ pub(crate) fn lower_unit(
                 // them available for initialization expressions that
                 // reference host vars.
                 install_host_ref_locals(&mut b, &mut ctx.locals, &host_ref_infos);
+                install_globals_as_locals(
+                    &mut b,
+                    &mut ctx.locals,
+                    globals,
+                    &combined_uses,
+                    Some(&decl_spec_import_names),
+                    host_module,
+                    ctx.st,
+                    &ctx.ambiguous_use_warnings,
+                );
                 super::alloc::alloc_decls(
                     &mut b,
                     &mut ctx.locals,
@@ -991,6 +1014,7 @@ pub(crate) fn lower_unit(
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
                 host_uses.iter().chain(uses.iter()).cloned().collect();
             let required_import_names = collect_required_import_names(decls, body);
+            let decl_spec_import_names = collect_decl_spec_import_names(decls);
 
             // Build param_info skipping the sret param (not a Fortran
             // variable) and __host_* closure-passing pointers (installed
@@ -1054,13 +1078,14 @@ pub(crate) fn lower_unit(
                         } else {
                             arg_char_kind_from_decls(pname, decls, st)
                         };
+                        let is_allocatable = decl_is_allocatable(pname, decls);
                         ctx.locals.insert(
                             pname.clone(),
                             LocalInfo {
                                 addr: slot,
                                 ty: local_elem_ty,
                                 dims: arg_dims_from_decls(pname, decls, &visible_param_consts, st),
-                                allocatable: false,
+                                allocatable: is_allocatable,
                                 descriptor_arg: uses_descriptor,
                                 by_ref: true,
                                 char_kind: ck,
@@ -1372,6 +1397,34 @@ pub(crate) fn lower_unit(
                     st,
                 );
                 install_host_ref_locals(&mut b, &mut ctx.locals, &host_ref_infos);
+                install_globals_as_locals(
+                    &mut b,
+                    &mut ctx.locals,
+                    globals,
+                    &combined_uses,
+                    Some(&decl_spec_import_names),
+                    host_module,
+                    ctx.st,
+                    &ctx.ambiguous_use_warnings,
+                );
+                if hidden_result_abi == HiddenResultAbi::ArrayDescriptor {
+                    if let Some(info) = ctx.locals.get(&result_name).cloned() {
+                        if !info.allocatable || info.is_pointer {
+                            // Already handled above by attribute exclusion.
+                        }
+                        allocate_runtime_shape_array_result(
+                            &mut b,
+                            &ctx.locals,
+                            &result_name,
+                            ValueId(0),
+                            &info.ty,
+                            decls,
+                            &visible_param_consts,
+                            ctx.st,
+                            type_layouts,
+                        );
+                    }
+                }
                 super::alloc::alloc_decls(
                     &mut b,
                     &mut ctx.locals,
@@ -1417,24 +1470,6 @@ pub(crate) fn lower_unit(
                     ctx.proc_scope_id,
                     Some(type_layouts),
                 );
-                if hidden_result_abi == HiddenResultAbi::ArrayDescriptor {
-                    if let Some(info) = ctx.locals.get(&result_name).cloned() {
-                        if !info.allocatable || info.is_pointer {
-                            // Already handled above by attribute exclusion.
-                        }
-                        allocate_runtime_shape_array_result(
-                            &mut b,
-                            &ctx.locals,
-                            &result_name,
-                            ValueId(0),
-                            &info.ty,
-                            decls,
-                            &visible_param_consts,
-                            ctx.st,
-                            type_layouts,
-                        );
-                    }
-                }
                 collect_label_blocks(&mut b, body, &mut ctx.label_blocks);
                 collect_format_labels(body, &mut ctx.format_labels);
                 let _proc_scope_guard = ProcScopeGuard::enter(ctx.proc_scope_id);

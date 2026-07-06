@@ -55,7 +55,10 @@ fn symbol_exports(sym: &Symbol, scope: &Scope) -> bool {
 
 fn merge_symbol_names(into: &mut Vec<String>, additional: &[String]) {
     for name in additional {
-        if !into.iter().any(|existing| existing.eq_ignore_ascii_case(name)) {
+        if !into
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(name))
+        {
             into.push(name.clone());
         }
     }

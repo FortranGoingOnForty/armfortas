@@ -143,6 +143,11 @@ pub struct Options {
     pub preprocess_only: bool, // -E
     pub preprocessor_defines: Vec<(String, String)>,
     pub cpp_compat: bool, // -cpp (accepted; preprocessing already runs)
+    /// Emit a make-style dependency file (`-MD`/`-MMD`, optionally `-MF`).
+    pub emit_depfile: bool,
+    pub depfile: Option<PathBuf>,
+    pub dep_targets: Vec<String>,
+    pub depfile_phony: bool,
 
     // ---- Language ----
     pub std: Option<crate::sema::validate::FortranStandard>,
@@ -160,6 +165,10 @@ pub struct Options {
     pub backslash_escapes: bool,
     pub free_line_length_none_compat: bool,
     pub max_stack_var_size: Option<u64>,
+    pub max_errors_compat: Option<u64>,
+    pub no_stack_arrays_compat: bool,
+    pub check_array_temps_compat: bool,
+    pub coarray_single_compat: bool,
 
     // ---- Optimization ----
     pub opt_level: OptLevel,
@@ -170,6 +179,7 @@ pub struct Options {
     pub warn_pedantic: bool,
     pub warn_deprecated: bool,
     pub warn_as_error: bool,
+    pub werror_implicit_interface_compat: bool,
     pub disabled_warnings: Vec<String>,
     pub cli_warnings: Vec<String>,
 
@@ -194,6 +204,9 @@ pub struct Options {
     /// `-shared` / `-static`.
     pub shared: bool,
     pub static_link: bool,
+    /// Linker flags accepted by compiler-driver compatibility spellings
+    /// such as `-Wl,` and Darwin's `-install_name`.
+    pub extra_link_args: Vec<String>,
     /// `-rpath` entries passed to `ld`.
     pub rpath: Vec<PathBuf>,
 
@@ -231,6 +244,10 @@ impl Default for Options {
             preprocess_only: false,
             preprocessor_defines: Vec::new(),
             cpp_compat: false,
+            emit_depfile: false,
+            depfile: None,
+            dep_targets: Vec::new(),
+            depfile_phony: false,
             std: Some(crate::sema::validate::FortranStandard::F2018),
             std_explicit: false,
             source_form_override: None,
@@ -241,12 +258,17 @@ impl Default for Options {
             backslash_escapes: false,
             free_line_length_none_compat: false,
             max_stack_var_size: None,
+            max_errors_compat: None,
+            no_stack_arrays_compat: false,
+            check_array_temps_compat: false,
+            coarray_single_compat: false,
             opt_level: OptLevel::O0,
             warn_all: false,
             warn_extra: false,
             warn_pedantic: false,
             warn_deprecated: false,
             warn_as_error: false,
+            werror_implicit_interface_compat: false,
             disabled_warnings: Vec::new(),
             cli_warnings: Vec::new(),
             debug_info: false,
@@ -262,6 +284,7 @@ impl Default for Options {
             link_libs: Vec::new(),
             shared: false,
             static_link: false,
+            extra_link_args: Vec::new(),
             rpath: Vec::new(),
             target: crate::target::TargetSpec::host(),
             crt_search_dirs: Vec::new(),
@@ -407,6 +430,20 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
             arg if arg.starts_with("-I") => opts
                 .module_search_paths
                 .push(PathBuf::from(short_option_value(arg, "-I", "a directory")?)),
+            "-isystem" => {
+                i += 1;
+                opts.module_search_paths.push(PathBuf::from(
+                    args.get(i).ok_or("-isystem requires a directory")?,
+                ));
+            }
+            arg if arg.starts_with("-isystem") => {
+                opts.module_search_paths
+                    .push(PathBuf::from(short_option_value(
+                        arg,
+                        "-isystem",
+                        "a directory",
+                    )?))
+            }
 
             "-J" => {
                 i += 1;
@@ -457,8 +494,30 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
                     .push(PathBuf::from(args.get(i).ok_or("-rpath requires a path")?));
             }
 
-            "-shared" => opts.shared = true,
+            "-shared" | "-dynamiclib" => opts.shared = true,
             "-static" => opts.static_link = true,
+            arg if arg.starts_with("-Wl,") => {
+                opts.extra_link_args.extend(
+                    arg["-Wl,".len()..]
+                        .split(',')
+                        .filter(|s| !s.is_empty())
+                        .map(ToOwned::to_owned),
+                );
+            }
+            "-Xlinker" => {
+                i += 1;
+                opts.extra_link_args
+                    .push(args.get(i).ok_or("-Xlinker requires an argument")?.clone());
+            }
+            "-install_name" | "-compatibility_version" | "-current_version" => {
+                opts.extra_link_args.push(arg.clone());
+                i += 1;
+                opts.extra_link_args.push(
+                    args.get(i)
+                        .ok_or_else(|| format!("{} requires an argument", arg))?
+                        .clone(),
+                );
+            }
 
             // ---- Standards / language flags ----
             arg if arg.starts_with("-std=") => {
@@ -502,6 +561,9 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
             "-fdefault-real-8" => opts.default_real_8 = true,
             "-fimplicit-none" => opts.force_implicit_none = true,
             "-frecursive" => opts.recursive_default = true,
+            "-fno-stack-arrays" => opts.no_stack_arrays_compat = true,
+            "-fPIC" | "-fpic" | "-fPIE" | "-fpie" => {}
+            "-fpreprocessed" | "-nocpp" => {}
             "-fbackslash" => opts.backslash_escapes = true,
             "-fno-backslash" => opts.backslash_escapes = false,
             arg if arg.starts_with("-fmax-stack-var-size=") => {
@@ -511,9 +573,18 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
                         .map_err(|_| format!("invalid -fmax-stack-var-size value: {}", val))?,
                 );
             }
+            arg if arg.starts_with("-fmax-errors=") => {
+                let val = &arg["-fmax-errors=".len()..];
+                opts.max_errors_compat = Some(
+                    val.parse()
+                        .map_err(|_| format!("invalid -fmax-errors value: {}", val))?,
+                );
+            }
+            "-fcoarray=single" => opts.coarray_single_compat = true,
 
             // ---- Runtime checks ----
             "-fcheck=bounds" => opts.check_bounds = true,
+            "-fcheck=array-temps" => opts.check_array_temps_compat = true,
             "-fcheck=all" => {
                 opts.check_bounds = true;
                 opts.check_all = true;
@@ -526,11 +597,53 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
             "-Wpedantic" | "-pedantic" => opts.warn_pedantic = true,
             "-Wdeprecated" => opts.warn_deprecated = true,
             "-Werror" => opts.warn_as_error = true,
+            "-Werror=implicit-interface" => opts.werror_implicit_interface_compat = true,
+            arg if arg.starts_with("-Werror=") => {
+                opts.warn_as_error = true;
+                unknown_warning_flags.push(arg.to_string());
+            }
             arg if arg.starts_with("-Wno-") => {
                 opts.disabled_warnings.push(arg[5..].to_string());
             }
             arg if arg.starts_with("-W") => {
                 unknown_warning_flags.push(arg.to_string());
+            }
+            "-w" => {}
+
+            // ---- Make-style dependency-file compatibility ----
+            "-MD" | "-MMD" => opts.emit_depfile = true,
+            "-MP" => {
+                opts.emit_depfile = true;
+                opts.depfile_phony = true;
+            }
+            "-MF" => {
+                i += 1;
+                opts.emit_depfile = true;
+                opts.depfile = Some(PathBuf::from(args.get(i).ok_or("-MF requires a file")?));
+            }
+            arg if arg.starts_with("-MF") => {
+                opts.emit_depfile = true;
+                opts.depfile = Some(PathBuf::from(short_option_value(arg, "-MF", "a file")?));
+            }
+            "-MT" | "-MQ" => {
+                let flag = arg.clone();
+                i += 1;
+                opts.emit_depfile = true;
+                opts.dep_targets.push(
+                    args.get(i)
+                        .ok_or_else(|| format!("{} requires a target", flag))?
+                        .clone(),
+                );
+            }
+            arg if arg.starts_with("-MT") => {
+                opts.emit_depfile = true;
+                opts.dep_targets
+                    .push(short_option_value(arg, "-MT", "a target")?.to_string());
+            }
+            arg if arg.starts_with("-MQ") => {
+                opts.emit_depfile = true;
+                opts.dep_targets
+                    .push(short_option_value(arg, "-MQ", "a target")?.to_string());
             }
 
             // ---- Debug / introspection ----
@@ -638,6 +751,11 @@ fn expand_response_arg(
         return Ok(());
     }
 
+    if is_darwin_loader_path_token(arg) {
+        expanded.push(arg.to_string());
+        return Ok(());
+    }
+
     let Some(path) = arg.strip_prefix('@') else {
         expanded.push(arg.to_string());
         return Ok(());
@@ -669,6 +787,12 @@ fn expand_response_arg(
     }
     stack.pop();
     Ok(())
+}
+
+fn is_darwin_loader_path_token(arg: &str) -> bool {
+    arg.starts_with("@rpath/")
+        || arg.starts_with("@loader_path/")
+        || arg.starts_with("@executable_path/")
 }
 
 fn resolve_response_file_path(path: &str, base_dir: Option<&Path>) -> PathBuf {
@@ -768,6 +892,28 @@ fn collect_cli_warnings(opts: &mut Options, unknown_warning_flags: &[String]) {
         opts.cli_warnings
             .push("-fmax-stack-var-size is recognized but not yet implemented".into());
     }
+    if opts.max_errors_compat.is_some() {
+        opts.cli_warnings.push(
+            "-fmax-errors is recognized but diagnostic error limiting is not yet implemented"
+                .into(),
+        );
+    }
+    if opts.no_stack_arrays_compat {
+        opts.cli_warnings.push(
+            "-fno-stack-arrays is recognized but automatic array placement is not yet configurable"
+                .into(),
+        );
+    }
+    if opts.check_array_temps_compat {
+        opts.cli_warnings.push(
+            "-fcheck=array-temps is accepted for compatibility; array temporary diagnostics are not yet implemented".into(),
+        );
+    }
+    if opts.coarray_single_compat {
+        opts.cli_warnings.push(
+            "-fcoarray=single is accepted for compatibility; coarray features are not yet implemented".into(),
+        );
+    }
     if opts.free_line_length_none_compat {
         opts.cli_warnings.push(
             "-ffree-line-length-none is accepted for compatibility; it silences the line-length conformance warning (free-form lines always compile in full regardless)".into(),
@@ -790,6 +936,11 @@ fn collect_cli_warnings(opts: &mut Options, unknown_warning_flags: &[String]) {
     if opts.warn_extra {
         opts.cli_warnings
             .push("-Wextra is recognized but warning-group emission is not yet implemented".into());
+    }
+    if opts.werror_implicit_interface_compat {
+        opts.cli_warnings.push(
+            "-Werror=implicit-interface is accepted for compatibility; implicit-interface diagnostics are not yet implemented".into(),
+        );
     }
 
     if opts.debug_info {
@@ -869,6 +1020,7 @@ LANGUAGE:
   -frecursive                 Make all procedures recursive by default
   -fbackslash                 Interpret backslash in strings as escape
   -fmax-stack-var-size=<n>    Stack variable size threshold (bytes)
+  -fmax-errors=<n>            GNU-compatible diagnostic limit spelling
 
 OPTIMIZATION:
   -O0, -O1, -O2, -O3          Optimization level (default -O0)
@@ -881,6 +1033,7 @@ WARNINGS:
   -Wpedantic                  Pedantic standard conformance warnings
   -Wdeprecated                Deprecated feature warnings
   -Werror                     Treat warnings as errors
+  -Werror=implicit-interface  Accept GNU-style implicit-interface diagnostic flag
   -Wno-<name>                 Disable specific warning
 
 DEBUGGING:
@@ -892,7 +1045,9 @@ DEBUGGING:
   -v, --verbose               Verbose output (show compilation phases)
   --time-report               Show time spent in each compilation phase
   -fcheck=bounds              Enable runtime array bounds checking
+  -fcheck=array-temps         Accept GNU-style array-temp diagnostic flag
   -fcheck=all                 Enable all runtime checks
+  -fcoarray=single            Accept GNU-style single-image coarray mode flag
   --diagnostics-format=text|json
                               Diagnostic output format
 
@@ -1500,6 +1655,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         let out = opts.output_path();
         fs::write(&out, &asm_text)
             .map_err(|e| format!("cannot write '{}': {}", out.display(), e))?;
+        write_dependency_file(opts, &out)?;
         if opts.verbose {
             eprintln!(" wrote: {}", out.display());
         }
@@ -1556,7 +1712,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     let local_char_len_star_params =
         crate::ir::lower::collect_char_len_star_params_for_units(&units);
 
-    // Emit .amod files for each MODULE in the compilation unit.
+    // Emit module interface files for each MODULE in the compilation unit.
     // -J <dir> overrides where they go. For compile-only (-c) builds
     // without -J, keep the traditional compiler behavior of writing
     // module files into the current working directory even if the
@@ -1593,6 +1749,13 @@ pub fn compile(opts: &Options) -> Result<(), String> {
                 let amod_path = amod_dir.join(format!("{}.amod", mod_key));
                 fs::write(&amod_path, &amod_text)
                     .map_err(|e| format!("cannot write '{}': {}", amod_path.display(), e))?;
+                // `.amod` remains the ARMFORTAS module ABI file. A
+                // byte-identical `.mod` alias keeps conventional Fortran
+                // build systems such as CMake able to track module
+                // dependencies for unknown compilers.
+                let mod_path = amod_dir.join(format!("{}.mod", mod_key));
+                fs::write(&mod_path, &amod_text)
+                    .map_err(|e| format!("cannot write '{}': {}", mod_path.display(), e))?;
                 if opts.verbose {
                     eprintln!(" amod: {}", amod_path.display());
                 }
@@ -1660,6 +1823,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         }
         if opts.emit_obj {
             let _ = fs::remove_file(&asm_path);
+            write_dependency_file(opts, &obj_path)?;
             if opts.verbose {
                 eprintln!(" assembled: {}", obj_path.display());
             }
@@ -1704,6 +1868,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     }
 
     if opts.emit_obj {
+        write_dependency_file(opts, &obj_path)?;
         phases.report();
         return Ok(());
     }
@@ -1723,6 +1888,67 @@ pub fn compile(opts: &Options) -> Result<(), String> {
 
     phases.report();
     Ok(())
+}
+
+fn write_dependency_file(opts: &Options, output: &Path) -> Result<(), String> {
+    if !opts.emit_depfile && opts.depfile.is_none() {
+        return Ok(());
+    }
+
+    let depfile = opts.depfile.clone().unwrap_or_else(|| {
+        let mut path = output.to_path_buf();
+        path.set_extension("d");
+        path
+    });
+    if let Some(parent) = depfile.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|e| {
+                format!(
+                    "cannot create depfile directory '{}': {}",
+                    parent.display(),
+                    e
+                )
+            })?;
+        }
+    }
+
+    let targets: Vec<String> = if opts.dep_targets.is_empty() {
+        vec![output.to_string_lossy().into_owned()]
+    } else {
+        opts.dep_targets.clone()
+    };
+    let mut body = String::new();
+    for (idx, target) in targets.iter().enumerate() {
+        if idx > 0 {
+            body.push(' ');
+        }
+        body.push_str(&escape_make_dep_token(target));
+    }
+    body.push_str(": ");
+    body.push_str(&escape_make_dep_token(&opts.input.to_string_lossy()));
+    body.push('\n');
+    if opts.depfile_phony {
+        body.push('\n');
+        body.push_str(&escape_make_dep_token(&opts.input.to_string_lossy()));
+        body.push_str(":\n");
+    }
+
+    fs::write(&depfile, body)
+        .map_err(|e| format!("cannot write depfile '{}': {}", depfile.display(), e))
+}
+
+fn escape_make_dep_token(token: &str) -> String {
+    let mut out = String::with_capacity(token.len());
+    for ch in token.chars() {
+        match ch {
+            ' ' | '#' | '\\' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 /// Link an object file with the runtime library to produce a binary.
@@ -1840,6 +2066,11 @@ fn link_inputs(inputs: &[PathBuf], output: &Path, opts: &Options) -> Result<(), 
         "-e".into(),
         "_main".into(),
     ]);
+    if !opts.shared {
+        // The Rust static runtime is packaged in coarse archive members. Let
+        // Apple ld trim unused runtime surfaces from final executables.
+        args.push("-dead_strip".into());
+    }
     push_link_flags(&mut args, opts);
 
     let ld_result = Command::new("ld")
@@ -1911,6 +2142,7 @@ fn push_link_flags(args: &mut Vec<String>, opts: &Options) {
         args.push("-rpath".into());
         args.push(path.to_string_lossy().into_owned());
     }
+    args.extend(opts.extra_link_args.iter().cloned());
     if opts.shared {
         args.push("-dylib".into());
     }
@@ -1935,6 +2167,7 @@ fn push_afs_ld_link_flags(args: &mut Vec<String>, opts: &Options) {
         args.push("-rpath".into());
         args.push(path.to_string_lossy().into_owned());
     }
+    args.extend(opts.extra_link_args.iter().cloned());
 }
 
 /// ELF assembler routing (x14). `None` means the in-process afs-as
@@ -2429,6 +2662,63 @@ mod tests {
                 "-fbacktrace is accepted, but runtime backtrace control is not yet implemented"
             )),
             "expected a compatibility warning for -fbacktrace, got {:?}",
+            opts.cli_warnings
+        );
+    }
+
+    #[test]
+    fn parse_cli_accepts_fpm_gnu_debug_probe_flags() {
+        let args = vec![
+            "-fmax-errors=1".to_string(),
+            "-fcheck=array-temps".to_string(),
+            "-fcoarray=single".to_string(),
+            "-Werror=implicit-interface".to_string(),
+            "hello.f90".to_string(),
+        ];
+        let ParsedCli::Compile(opts) =
+            parse_cli(&args).expect("driver should accept fpm GNU debug probe flags")
+        else {
+            panic!("expected compile options");
+        };
+        assert_eq!(opts.max_errors_compat, Some(1));
+        assert!(opts.check_array_temps_compat);
+        assert!(opts.coarray_single_compat);
+        assert!(opts.werror_implicit_interface_compat);
+        assert!(
+            !opts.warn_as_error,
+            "-Werror=implicit-interface should not promote every compatibility warning"
+        );
+        for needle in [
+            "-fmax-errors is recognized",
+            "-fcheck=array-temps is accepted for compatibility",
+            "-fcoarray=single is accepted for compatibility",
+            "-Werror=implicit-interface is accepted for compatibility",
+        ] {
+            assert!(
+                opts.cli_warnings
+                    .iter()
+                    .any(|warning| warning.contains(needle)),
+                "missing warning `{}` in {:?}",
+                needle,
+                opts.cli_warnings
+            );
+        }
+    }
+
+    #[test]
+    fn parse_cli_rejects_unknown_werror_warning_names_as_errors() {
+        let args = vec!["-Werror=unknown-flag".to_string(), "hello.f90".to_string()];
+        let ParsedCli::Compile(opts) =
+            parse_cli(&args).expect("driver should parse unknown -Werror warning names")
+        else {
+            panic!("expected compile options");
+        };
+        assert!(opts.warn_as_error);
+        assert!(
+            opts.cli_warnings
+                .iter()
+                .any(|warning| warning.contains("unrecognized warning option")),
+            "expected unknown warning option diagnostic, got {:?}",
             opts.cli_warnings
         );
     }

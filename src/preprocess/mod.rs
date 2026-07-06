@@ -22,9 +22,7 @@ pub struct PreprocConfig {
 }
 
 impl PreprocConfig {
-    /// Predefined macros for a target. The arm64-macos define set is
-    /// contractual: it must stay byte-identical to what shipped before
-    /// targets existed (sprint x00).
+    /// Predefined macros for a target.
     pub fn for_target(target: &crate::target::TargetSpec) -> Self {
         use crate::target::{Arch, Os};
 
@@ -32,6 +30,14 @@ impl PreprocConfig {
         defines.insert("__ARMFORTAS__".into(), MacroDef::object("1"));
         defines.insert("__ARMFORTAS_MAJOR__".into(), MacroDef::object("0"));
         defines.insert("__ARMFORTAS_MINOR__".into(), MacroDef::object("1"));
+        // Build systems such as CMake key GNU-compatible Fortran
+        // behavior off these predefines before they know our compiler
+        // name.  Advertise an old GCC-compatible surface: enough for
+        // module-dir and dependency-file flags, without inviting newer
+        // LTO/visibility flag families.
+        defines.insert("__GNUC__".into(), MacroDef::object("4"));
+        defines.insert("__GNUC_MINOR__".into(), MacroDef::object("4"));
+        defines.insert("__GNUC_PATCHLEVEL__".into(), MacroDef::object("0"));
         match target.arch {
             Arch::Arm64 => {
                 defines.insert("__aarch64__".into(), MacroDef::object("1"));
@@ -174,6 +180,8 @@ struct Preprocessor {
     include_depth: u32,
     /// Fixed-form source mode.
     fixed_form: bool,
+    /// Whether source stripping is currently inside a C-style block comment.
+    in_c_block_comment: bool,
     /// #line overrides for source map reporting.
     line_override: Option<(u32, String)>,
 }
@@ -184,6 +192,7 @@ impl Preprocessor {
             defines: config.defines.clone(),
             include_paths: config.include_paths.clone(),
             fixed_form: config.fixed_form,
+            in_c_block_comment: false,
             line_override: None,
             cond_stack: Vec::new(),
             skip_depth: 0,
@@ -320,6 +329,9 @@ impl Preprocessor {
                 MacroDef::object(&orig_line_num.to_string()),
             );
 
+            logical_line =
+                strip_c_block_comments_from_line(&logical_line, &mut self.in_c_block_comment);
+
             // Fixed-form: C, c, or * in column 1 is a comment line.
             if self.fixed_form {
                 let first = logical_line.as_bytes().first().copied().unwrap_or(0);
@@ -363,8 +375,8 @@ impl Preprocessor {
         output: &mut String,
         source_map: &mut Vec<SourceLoc>,
     ) -> Result<(), PreprocError> {
-        let rest = line[1..].trim_start(); // skip '#' and whitespace
-        let (directive, args) = split_first_word(rest);
+        let rest = strip_c_directive_comments(line[1..].trim_start()); // skip '#' and whitespace
+        let (directive, args) = split_first_word(&rest);
 
         // Conditionals must be processed even when skipping.
         match directive {
@@ -942,9 +954,8 @@ impl Preprocessor {
                 }
                 let id = std::str::from_utf8(&body_bytes[id_start..bi]).unwrap_or("");
 
-                let is_pasted =
-                    macro_param_is_pasted_left(body_bytes, id_start)
-                        || macro_param_is_pasted_right(body_bytes, bi);
+                let is_pasted = macro_param_is_pasted_left(body_bytes, id_start)
+                    || macro_param_is_pasted_right(body_bytes, bi);
 
                 if id == "__VA_ARGS__" && def.is_variadic {
                     body.push_str(if is_pasted {
@@ -1370,6 +1381,107 @@ fn split_first_word(s: &str) -> (&str, &str) {
     } else {
         (s, "")
     }
+}
+
+fn strip_c_directive_comments(line: &str) -> String {
+    let bytes = line.as_bytes();
+    let mut result = String::with_capacity(line.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'\'' || bytes[i] == b'"' {
+            let quote = bytes[i];
+            result.push(quote as char);
+            i += 1;
+            while i < bytes.len() {
+                result.push(bytes[i] as char);
+                if bytes[i] == quote {
+                    if i + 1 < bytes.len() && bytes[i + 1] == quote {
+                        result.push(bytes[i + 1] as char);
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            result.push(' ');
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            if i + 1 < bytes.len() {
+                i += 2;
+            }
+            continue;
+        }
+
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+            break;
+        }
+
+        result.push(bytes[i] as char);
+        i += 1;
+    }
+
+    result
+}
+
+fn strip_c_block_comments_from_line(line: &str, in_block: &mut bool) -> String {
+    let bytes = line.as_bytes();
+    let mut result = String::with_capacity(line.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if *in_block {
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            if i + 1 < bytes.len() {
+                *in_block = false;
+                i += 2;
+            } else {
+                i = bytes.len();
+            }
+            continue;
+        }
+
+        if bytes[i] == b'\'' || bytes[i] == b'"' {
+            let quote = bytes[i];
+            result.push(quote as char);
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == quote {
+                    result.push(quote as char);
+                    if i + 1 < bytes.len() && bytes[i + 1] == quote {
+                        result.push(quote as char);
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                push_utf8_char(&mut result, bytes, &mut i);
+            }
+            continue;
+        }
+
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            result.push(' ');
+            *in_block = true;
+            i += 2;
+            continue;
+        }
+
+        push_utf8_char(&mut result, bytes, &mut i);
+    }
+
+    result
 }
 
 fn push_utf8_char(result: &mut String, bytes: &[u8], i: &mut usize) {
@@ -2051,12 +2163,10 @@ end program
 
     #[test]
     fn two_step_stringification_prescans_argument() {
-        let out = pp(
-            "#define VERSION 0.13.0\n\
+        let out = pp("#define VERSION 0.13.0\n\
              #define STR_(x) #x\n\
              #define STR(x) STR_(x)\n\
-             y = STR(VERSION)\n",
-        );
+             y = STR(VERSION)\n");
         assert!(out.contains("y = \"0.13.0\""), "got: {out}");
     }
 
@@ -2339,6 +2449,32 @@ deep
         assert!(lines(&out).contains(&"yes"));
     }
 
+    #[test]
+    fn not_defined_without_parens_ignores_trailing_c_comment() {
+        let out = pp("#if !defined GUARD  /* include guard */\nyes\n#endif\n");
+        assert!(lines(&out).contains(&"yes"));
+    }
+
+    #[test]
+    fn directive_c_comment_is_removed_from_macro_body() {
+        let out = pp("#define FEATURE 1  /* enabled */\n#if FEATURE == 1\nyes\n#endif\n");
+        assert!(lines(&out).contains(&"yes"));
+    }
+
+    #[test]
+    fn c_block_comment_header_is_removed_before_directives_and_source() {
+        let out = pp("/* header\n\
+             * text.h\n\
+             * #if 0\n\
+             */\n\
+             #if !defined GUARD  /* include guard */\n\
+             #define GUARD\n\
+             ok\n\
+             #endif\n");
+        assert!(lines(&out).contains(&"ok"));
+        assert!(!out.contains("text.h"), "C block comment leaked: {:?}", out);
+    }
+
     // ---- Multi-elif chain ----
 
     #[test]
@@ -2444,8 +2580,7 @@ deep
         );
     }
 
-    /// Golden per-target define sets (sprint x00). The arm64-macos set is
-    /// contractual: byte-identical to the pre-target-model predefines.
+    /// Golden per-target define sets.
     #[test]
     fn target_define_sets_are_golden() {
         use crate::target::TargetSpec;
@@ -2464,6 +2599,9 @@ deep
             "__ARMFORTAS_MAJOR__",
             "__ARMFORTAS_MINOR__",
             "__ARMFORTAS__",
+            "__GNUC_MINOR__",
+            "__GNUC_PATCHLEVEL__",
+            "__GNUC__",
         ];
 
         let golden = |extra: &[&str]| -> Vec<String> {
@@ -2503,5 +2641,21 @@ deep
         assert!(run("x86_64-freebsd").contains("x = 1"));
         assert!(run("arm64-macos").contains("x = 2"));
         assert!(run("x86_64-linux-gnu").contains("x = 3"));
+    }
+
+    #[test]
+    fn gnu_compat_defines_select_cmake_compiler_id_branch() {
+        let target = crate::target::TargetSpec::parse("arm64-macos").unwrap();
+        let config = PreprocConfig::for_target(&target);
+        let out = preprocess(
+            "#if defined(__GNUC__)\nprint *, 'INFO:compiler[GNU]'\n#else\nprint *, 'INFO:compiler[]'\n#endif\n",
+            &config,
+        )
+        .unwrap()
+        .text;
+        assert!(
+            out.contains("INFO:compiler[GNU]"),
+            "CMake compiler-id macro branch should be reachable: {out:?}"
+        );
     }
 }

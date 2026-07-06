@@ -684,7 +684,7 @@ mod tests {
         for _ in 0..100 {
             let mut x = 0.0f64;
             afs_random_number_f64(&mut x);
-            assert!(x >= 0.0 && x < 1.0, "random out of range: {}", x);
+            assert!((0.0..1.0).contains(&x), "random out of range: {}", x);
         }
     }
 

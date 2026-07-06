@@ -126,6 +126,25 @@ fn run_binary(binary: &Path) -> String {
     String::from_utf8_lossy(&result.stdout).into_owned()
 }
 
+fn undefined_symbols(path: &Path) -> Vec<String> {
+    let out = Command::new("nm")
+        .args(["-u", "-j", path.to_str().unwrap()])
+        .output()
+        .expect("failed to spawn nm");
+    assert!(
+        out.status.success(),
+        "nm failed for {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
 /// Full multi-file test: write sources, compile, link, run, check.
 fn multifile_test(mod_source: &str, main_source: &str, expected_substring: &str) {
     multifile_test_flags(mod_source, main_source, expected_substring, &[]);
@@ -709,6 +728,355 @@ end program
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn cross_tu_submodule_array_function_passes_explicit_shape_actuals_by_data_pointer() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=cross_tu_submodule_array_function_passes_explicit_shape_actuals_by_data_pointer count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let parent_f90 = dir.join("cross_parent.f90");
+    let child_f90 = dir.join("cross_child.f90");
+    let main_f90 = dir.join("cross_main.f90");
+    let parent_o = dir.join("cross_parent.o");
+    let child_o = dir.join("cross_child.o");
+    let main_o = dir.join("cross_main.o");
+    let binary = dir.join("cross_bin");
+
+    std::fs::write(
+        &parent_f90,
+        r#"module cross_mod
+  implicit none
+  interface
+    module function cross_i(a, b) result(res)
+      integer, intent(in) :: a(3), b(3)
+      integer :: res(3)
+    end function
+  end interface
+end module
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &child_f90,
+        r#"submodule (cross_mod) cross_impl
+contains
+  pure module function cross_i(a, b) result(res)
+    integer, intent(in) :: a(3), b(3)
+    integer :: res(3)
+    res(1) = a(2) * b(3) - a(3) * b(2)
+    res(2) = a(3) * b(1) - a(1) * b(3)
+    res(3) = a(1) * b(2) - a(2) * b(1)
+  end function
+end submodule
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &main_f90,
+        r#"program p
+  use cross_mod, only: cross_i
+  implicit none
+  integer :: u(3), v(3), expected(3), diff(3)
+
+  u = [1, 0, 0]
+  v = [0, 1, 0]
+  expected = [0, 0, 1]
+  diff = expected - cross_i(u, v)
+  if (any(diff /= 0)) error stop 1
+  print *, "ok"
+end program
+"#,
+    )
+    .unwrap();
+
+    compile_file(&compiler, &parent_f90, &parent_o, None);
+    compile_file(&compiler, &child_f90, &child_o, Some(&dir));
+    compile_file(&compiler, &main_f90, &main_o, Some(&dir));
+    link_files(&[&main_o, &child_o, &parent_o], &binary);
+    let output = run_binary(&binary);
+    assert!(
+        output.contains("ok"),
+        "cross-TU submodule array result returned wrong values:\n{}",
+        output
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cross_tu_submodule_allocatable_array_result_preserves_amod_abi() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=cross_tu_submodule_allocatable_array_result_preserves_amod_abi count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let parent_f90 = dir.join("alloc_parent.f90");
+    let child_f90 = dir.join("alloc_child.f90");
+    let main_f90 = dir.join("alloc_main.f90");
+    let parent_o = dir.join("alloc_parent.o");
+    let child_o = dir.join("alloc_child.o");
+    let main_o = dir.join("alloc_main.o");
+    let binary = dir.join("alloc_bin");
+
+    std::fs::write(
+        &parent_f90,
+        r#"module alloc_parent
+  implicit none
+  interface
+    module function make_square(n) result(a)
+      integer, intent(in) :: n
+      real, allocatable :: a(:, :)
+    end function
+  end interface
+end module
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &child_f90,
+        r#"submodule (alloc_parent) alloc_impl
+contains
+  module function make_square(n) result(a)
+    integer, intent(in) :: n
+    real, allocatable :: a(:, :)
+    integer :: i
+    allocate(a(n, n))
+    a = 0.0
+    do i = 1, n
+      a(i, i) = real(i)
+    end do
+  end function
+end submodule
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &main_f90,
+        r#"program p
+  use alloc_parent, only: make_square
+  implicit none
+  real, allocatable :: a(:, :)
+
+  a = make_square(3)
+  if (.not. allocated(a)) error stop 1
+  if (size(a, 1) /= 3 .or. size(a, 2) /= 3) error stop 2
+  if (abs(a(1, 1) - 1.0) > 1.0e-6) error stop 3
+  if (abs(a(2, 2) - 2.0) > 1.0e-6) error stop 4
+  if (abs(a(3, 3) - 3.0) > 1.0e-6) error stop 5
+  print *, "ok"
+end program
+"#,
+    )
+    .unwrap();
+
+    compile_file(&compiler, &parent_f90, &parent_o, None);
+    let amod = std::fs::read_to_string(dir.join("alloc_parent.amod")).unwrap();
+    assert!(
+        amod.contains("@function make_square -> real, result_allocatable, result_rank=2"),
+        "allocatable module-function result ABI missing from parent .amod:\n{}",
+        amod
+    );
+    compile_file(&compiler, &child_f90, &child_o, Some(&dir));
+    compile_file(&compiler, &main_f90, &main_o, Some(&dir));
+    link_files(&[&main_o, &child_o, &parent_o], &binary);
+    let output = run_binary(&binary);
+    assert!(
+        output.contains("ok"),
+        "cross-TU submodule allocatable array result returned wrong values:\n{}",
+        output
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cross_tu_submodule_scalar_function_call_broadcasts_to_descriptor_array() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=cross_tu_submodule_scalar_function_call_broadcasts_to_descriptor_array count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let parent_f90 = dir.join("broadcast_parent.f90");
+    let child_f90 = dir.join("broadcast_child.f90");
+    let main_f90 = dir.join("broadcast_main.f90");
+    let parent_o = dir.join("broadcast_parent.o");
+    let child_o = dir.join("broadcast_child.o");
+    let main_o = dir.join("broadcast_main.o");
+    let binary = dir.join("broadcast_bin");
+
+    std::fs::write(
+        &parent_f90,
+        r#"module broadcast_parent
+  implicit none
+  interface
+    module function wrap(a, order) result(e)
+      real, intent(in) :: a(:, :)
+      integer, optional, intent(in) :: order
+      real, allocatable :: e(:, :)
+    end function
+    module subroutine mark_inplace(a, order)
+      real, intent(inout) :: a(:, :)
+      integer, optional, intent(in) :: order
+    end subroutine
+  end interface
+end module
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &child_f90,
+        r#"submodule (broadcast_parent) broadcast_impl
+contains
+  module function wrap(a, order) result(e)
+    real, intent(in) :: a(:, :)
+    integer, optional, intent(in) :: order
+    real, allocatable :: e(:, :)
+    e = a
+    call mark_inplace(e, order)
+  end function
+
+  module subroutine mark_inplace(a, order)
+    real, intent(inout) :: a(:, :)
+    integer, optional, intent(in) :: order
+    if (present(order)) then
+      a = real(order)
+    else
+      a = 11.0
+    end if
+  end subroutine
+end submodule
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &main_f90,
+        r#"program p
+  use broadcast_parent, only: wrap
+  implicit none
+  real :: a(2, 2)
+  real, allocatable :: e(:, :)
+
+  a = 1.0
+  e = wrap(a)
+  if (any(abs(e - 11.0) > 1.0e-6)) error stop 1
+  e = wrap(a, order=3)
+  if (any(abs(e - 3.0) > 1.0e-6)) error stop 2
+  print *, "ok"
+end program
+"#,
+    )
+    .unwrap();
+
+    compile_file(&compiler, &parent_f90, &parent_o, None);
+    compile_file(&compiler, &child_f90, &child_o, Some(&dir));
+    compile_file(&compiler, &main_f90, &main_o, Some(&dir));
+    link_files(&[&main_o, &child_o, &parent_o], &binary);
+    let output = run_binary(&binary);
+    assert!(
+        output.contains("ok"),
+        "cross-TU submodule scalar function-call broadcast failed:\n{}",
+        output
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn submodule_runtime_shape_local_uses_dummy_size_not_global_shadow() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=submodule_runtime_shape_local_uses_dummy_size_not_global_shadow count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let parent_f90 = dir.join("shape_parent.f90");
+    let child_f90 = dir.join("shape_child.f90");
+    let main_f90 = dir.join("shape_main.f90");
+    let parent_o = dir.join("shape_parent.o");
+    let child_o = dir.join("shape_child.o");
+    let main_o = dir.join("shape_main.o");
+    let binary = dir.join("shape_bin");
+
+    std::fs::write(
+        &parent_f90,
+        r#"module shape_parent
+  implicit none
+  real :: a(1, 1)
+  interface
+    module subroutine fill(a)
+      real, intent(inout) :: a(:, :)
+    end subroutine
+  end interface
+end module
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &child_f90,
+        r#"submodule (shape_parent) shape_impl
+contains
+  module subroutine fill(a)
+    real, intent(inout) :: a(:, :)
+    real :: tmp(size(a, 1), size(a, 2))
+    integer :: i, j
+
+    do j = 1, size(a, 2)
+      do i = 1, size(a, 1)
+        tmp(i, j) = 10.0 * real(i) + real(j)
+      end do
+    end do
+    a = tmp
+  end subroutine
+end submodule
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &main_f90,
+        r#"program p
+  use shape_parent, only: fill
+  implicit none
+  real :: x(5, 5)
+
+  x = 0.0
+  call fill(x)
+  if (abs(x(5, 5) - 55.0) > 1.0e-6) error stop 1
+  print *, "ok"
+end program
+"#,
+    )
+    .unwrap();
+
+    compile_file(&compiler, &parent_f90, &parent_o, None);
+    compile_file(&compiler, &child_f90, &child_o, Some(&dir));
+    compile_file(&compiler, &main_f90, &main_o, Some(&dir));
+    link_files(&[&main_o, &child_o, &parent_o], &binary);
+    let output = run_binary(&binary);
+    assert!(
+        output.contains("ok"),
+        "submodule runtime-shape local used the wrong size() binding:\n{}",
+        output
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // l07 DoD: the multi-source driver (`armfortas a.f90 b.f90 ...` in one
 // invocation) topologically orders submodules after their parents, even
 // when files are given in the worst order. Before l07's dep_scan support,
@@ -827,7 +1195,11 @@ fn cross_tu_tbp_targets_submodule_procedure() {
         String::from_utf8_lossy(&result.stderr)
     );
     let output = run_binary(&binary);
-    assert!(output.contains("ok"), "cross-TU TBP→SMP wrong result:\n{}", output);
+    assert!(
+        output.contains("ok"),
+        "cross-TU TBP→SMP wrong result:\n{}",
+        output
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -880,6 +1252,74 @@ fn parent_vtable_references_submodule_tbp_target() {
     assert!(
         output.contains("ok"),
         "submodule-backed TBP vtable dispatch failed:\n{}",
+        output
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn local_child_vtable_keeps_imported_tbp_target_over_same_abi_interface_name() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=local_child_vtable_keeps_imported_tbp_target_over_same_abi_interface_name count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let rk_a_f90 = dir.join("rk_a.f90");
+    let rk_b_f90 = dir.join("rk_b.f90");
+    let facade_f90 = dir.join("facade.f90");
+    let main_f90 = dir.join("main.f90");
+    let rk_a_o = dir.join("rk_a.o");
+    let rk_b_o = dir.join("rk_b.o");
+    let facade_o = dir.join("facade.o");
+    let main_o = dir.join("main.o");
+    let binary = dir.join("facade_vtable_bin");
+
+    std::fs::write(
+        &rk_a_f90,
+        "module rk_a\n  implicit none\n  type, abstract :: rk_class\n  contains\n    procedure(step_func), deferred :: step\n    procedure :: integrate => a_integrate\n  end type\n  abstract interface\n    subroutine step_func(self)\n      import :: rk_class\n      class(rk_class), intent(inout) :: self\n    end subroutine\n  end interface\n  type, extends(rk_class) :: rk8_10_class\n  contains\n    procedure :: step => rk8_10\n  end type\ncontains\n  subroutine a_integrate(self)\n    class(rk_class), intent(inout) :: self\n    call self%step()\n  end subroutine\n  subroutine rk8_10(self)\n    class(rk8_10_class), intent(inout) :: self\n  end subroutine\nend module\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &rk_b_f90,
+        "module rk_b\n  implicit none\n  type, abstract :: other_class\n  contains\n    procedure(step_func), deferred :: step\n    procedure :: integrate => b_integrate\n  end type\n  abstract interface\n    subroutine step_func(self)\n      import :: other_class\n      class(other_class), intent(inout) :: self\n    end subroutine\n  end interface\ncontains\n  subroutine b_integrate(self)\n    class(other_class), intent(inout) :: self\n  end subroutine\nend module\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &facade_f90,
+        "module facade\n  use rk_a\n  use rk_b\n  implicit none\nend module\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &main_f90,
+        "program p\n  use facade\n  implicit none\n  type, extends(rk8_10_class) :: spacecraft\n    integer :: marker = 0\n  end type\n  type(spacecraft) :: s\n  call s%integrate()\n  print *, \"ok\"\nend program\n",
+    )
+    .unwrap();
+
+    compile_file(&compiler, &rk_a_f90, &rk_a_o, None);
+    compile_file(&compiler, &rk_b_f90, &rk_b_o, Some(&dir));
+    compile_file(&compiler, &facade_f90, &facade_o, Some(&dir));
+    compile_file(&compiler, &main_f90, &main_o, Some(&dir));
+
+    let undef = undefined_symbols(&main_o);
+    assert!(
+        !undef.iter().any(|sym| {
+            sym.trim_start_matches('_')
+                == "afs_modproc_rk_b_step_func"
+        }),
+        "local child vtable should keep rk_a's imported target, not rk_b's interface placeholder: {:?}",
+        undef
+    );
+
+    link_files(&[&rk_a_o, &rk_b_o, &facade_o, &main_o], &binary);
+    let output = run_binary(&binary);
+    assert!(
+        output.contains("ok"),
+        "facade-imported child vtable dispatch failed:\n{}",
         output
     );
 

@@ -1655,14 +1655,19 @@ mod tests {
         // F2018 R448: `procedure :: a, b, c` binds all three. The shared
         // attrs prefix applies to each. Surfaced building fpm
         // (fpm_global_settings binds three procedures in one statement).
-        let tokens =
-            Lexer::tokenize("procedure :: has_custom_location, full_path, path_or_empty", 0)
-                .unwrap();
+        let tokens = Lexer::tokenize(
+            "procedure :: has_custom_location, full_path, path_or_empty",
+            0,
+        )
+        .unwrap();
         let mut parser = Parser::new(&tokens);
         parser.advance();
         let tbps = parser.parse_type_bound_proc().unwrap();
         let names: Vec<&str> = tbps.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, vec!["has_custom_location", "full_path", "path_or_empty"]);
+        assert_eq!(
+            names,
+            vec!["has_custom_location", "full_path", "path_or_empty"]
+        );
     }
 
     #[test]
@@ -1733,7 +1738,10 @@ mod tests {
         };
         match &cs.len {
             Some(LenSpec::Expr(e)) => {
-                assert!(matches!(e.node, crate::ast::expr::Expr::ConditionalExpr { .. }));
+                assert!(matches!(
+                    e.node,
+                    crate::ast::expr::Expr::ConditionalExpr { .. }
+                ));
             }
             other => panic!("expected conditional len expr, got {other:?}"),
         }

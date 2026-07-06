@@ -380,7 +380,7 @@ fn select_call_inst(
         }
 
         let arg_vreg = ctx.lookup_vreg(arg_val);
-        let arg_class = mf.vregs.iter().find(|v| v.id == arg_vreg).map(|v| v.class);
+        let arg_class = mf.vreg_class(arg_vreg);
         match (arg_class, loc) {
             (Some(RegClass::Fp64), AbiArgLoc::Fp(reg)) => {
                 pending_reg_arg_moves.push((ArmOpcode::FmovReg, PhysReg::Fp(reg), arg_vreg));
@@ -593,7 +593,7 @@ impl ISelCtx {
     fn get_vreg(&mut self, mf: &mut MachineFunction, val: ValueId, class: RegClass) -> VRegId {
         if let Some(&vreg) = self.value_map.get(&val) {
             debug_assert!(
-                mf.vregs.iter().find(|v| v.id == vreg).map(|v| v.class) == Some(class),
+                mf.vreg_class(vreg) == Some(class),
                 "isel: vreg class mismatch for IR value %{} (existing class \
                  differs from requested {:?}) — phase 4a/4b disagreement",
                 val.0,
@@ -1413,7 +1413,7 @@ fn select_inst(
         // ---- Conversions ----
         InstKind::IntToFloat(a, fw) => {
             let src = ctx.lookup_vreg(*a);
-            let src_class = mf.vregs.iter().find(|v| v.id == src).map(|v| v.class);
+            let src_class = mf.vreg_class(src);
             let is_64bit_src = matches!(src_class, Some(RegClass::Gp64));
             let (class, opcode) = match (fw, is_64bit_src) {
                 (FloatWidth::F32, false) => (RegClass::Fp32, ArmOpcode::ScvtfSW),
@@ -1430,7 +1430,7 @@ fn select_inst(
         }
         InstKind::FloatToInt(a, iw) => {
             let src = ctx.lookup_vreg(*a);
-            let src_class = mf.vregs.iter().find(|v| v.id == src).map(|v| v.class);
+            let src_class = mf.vreg_class(src);
             let is_f64_src = matches!(src_class, Some(RegClass::Fp64));
             let is_64bit_dest = matches!(iw, IntWidth::I64);
             let class = int_width_class(iw);
@@ -1560,12 +1560,7 @@ fn select_inst(
             // generic offset cursor, so dispatching by the pointee
             // would silently truncate non-byte stores.
             let val_ty = func.value_type(*val);
-            let val_class = mf
-                .vregs
-                .iter()
-                .find(|v| v.id == val_vreg)
-                .map(|v| v.class)
-                .unwrap_or(RegClass::Gp64);
+            let val_class = mf.vreg_class(val_vreg).unwrap_or(RegClass::Gp64);
             let opcode = store_opcode_for(val_ty.as_ref(), val_class);
             let (base_op, offset_op) = narrow_load_store_addr(ctx, *addr);
             mf.block_mut(mb).insts.push(MachineInst {
@@ -1579,9 +1574,7 @@ fn select_inst(
             // GEP: base + index * elem_size
             let dest = ctx.get_vreg(mf, inst.id, RegClass::Gp64);
             let base_src = ctx.lookup_vreg(*base);
-            let base_vreg = if mf.vregs.iter().find(|v| v.id == base_src).map(|v| v.class)
-                != Some(RegClass::Gp64)
-            {
+            let base_vreg = if mf.vreg_class(base_src) != Some(RegClass::Gp64) {
                 let widened = mf.new_vreg(RegClass::Gp64);
                 mf.block_mut(mb).insts.push(MachineInst {
                     opcode: ArmOpcode::MovReg,
@@ -1611,9 +1604,7 @@ fn select_inst(
 
             if let Some(idx) = indices.first() {
                 let idx_src = ctx.lookup_vreg(*idx);
-                let idx_vreg = if mf.vregs.iter().find(|v| v.id == idx_src).map(|v| v.class)
-                    == Some(RegClass::Gp64)
-                {
+                let idx_vreg = if mf.vreg_class(idx_src) == Some(RegClass::Gp64) {
                     idx_src
                 } else {
                     let widened = mf.new_vreg(RegClass::Gp64);
@@ -2393,7 +2384,7 @@ fn select_terminator(
             }
             // Move result to X0 (integer) or D0 (float).
             let src = ctx.lookup_vreg(*val);
-            let class = mf.vregs.iter().find(|v| v.id == src).map(|v| v.class);
+            let class = mf.vreg_class(src);
             let (reg, opcode) = match class {
                 Some(RegClass::Fp64) => (PhysReg::Fp(0), ArmOpcode::FmovReg),
                 Some(RegClass::Fp32) => (PhysReg::Fp32(0), ArmOpcode::FmovReg),
@@ -2621,13 +2612,9 @@ fn emit_branch_arg_copies(
         }
     }
 
-    // Helper to look up a vreg's RegClass via mf.vregs.
+    // Helper to look up a vreg's RegClass.
     fn class_of(mf: &MachineFunction, v: VRegId) -> RegClass {
-        mf.vregs
-            .iter()
-            .find(|r| r.id == v)
-            .map(|r| r.class)
-            .expect("isel: vreg not registered")
+        mf.vreg_class(v).expect("isel: vreg not registered")
     }
 
     // Helper to choose the right move opcode for a vreg's class.
