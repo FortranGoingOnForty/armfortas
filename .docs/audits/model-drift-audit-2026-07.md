@@ -178,8 +178,17 @@ and two RIP+imm8 cases in `tests/x86_encode_differential.rs` (A1 addend).
 
 ### Test integrity (ours)
 
-- **T1 — `--eh-frame-hdr` moved to silent-accept AND its rejection test
-  re-pointed to `-pie` in the same undisclosed commit** (afs-ld 2cb05d7).
+- **T1 — FIXED 2026-07-06 (afs-ld PR #8, pin 44ba4af): implemented, not
+  loud-rejected.** `.eh_frame` is now retained (SHT_X86_64_UNWIND added to
+  kept types) and `--eh-frame-hdr` synthesizes `.eh_frame_hdr` +
+  PT_GNU_EH_FRAME in both static and dynamic paths (parse_eh_frame_fdes +
+  build_eh_frame_hdr; pcrel|sdata4 only, else hard error). Generation
+  gated on the flag to match GNU ld; retention unconditional. Verified on
+  FreeBSD (static CFI binary + dynamic-hello both carry a byte-correct
+  header and run). Unit tests + an integration test that the flag emits a
+  well-formed header pointing at `.eh_frame` and its absence emits none.
+- **T1 (original finding) — `--eh-frame-hdr` moved to silent-accept AND its
+  rejection test re-pointed to `-pie` in the same undisclosed commit** (afs-ld 2cb05d7).
   afs-ld emits no eh_frame_hdr; the driver passes the flag for Rust-runtime
   unwinding (`src/driver/elf_crt.rs:227`) → under `AFS_LD=1`, binaries
   silently lack the unwind header. The one genuinely buried test retirement
