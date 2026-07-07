@@ -1808,18 +1808,29 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
                 i += 1;
             } else if parts[i] == "@rank" {
                 if let Some(value) = parts.get(i + 1) {
-                    rank = value.parse().unwrap_or(0);
+                    // The writer always emits an integer here (declared_rank).
+                    // A parse failure means a corrupt or version-mismatched
+                    // .amod; defaulting to 0 would silently demote an array to
+                    // a scalar and miscompile every use (audit T3).
+                    rank = value.parse().unwrap_or_else(|_| {
+                        panic!(".amod: malformed @rank value {value:?} — corrupt or version-mismatched module interface")
+                    });
                 }
                 i += 2;
             } else if parts[i] == "@dims" {
-                // Parse dimension pairs: @dims 1:5 1:10 ...
+                // Parse dimension pairs: @dims 1:5 1:10 ...  The writer emits
+                // i64:i64 pairs; a non-integer bound is corruption, and
+                // defaulting to 1 would silently give the array wrong shape.
                 i += 1;
                 while i < parts.len() && parts[i].contains(':') && !parts[i].starts_with('@') {
                     let pair = parts[i];
                     if let Some((lo_s, ext_s)) = pair.split_once(':') {
-                        let lo = lo_s.parse::<i64>().unwrap_or(1);
-                        let ext = ext_s.parse::<i64>().unwrap_or(1);
-                        dims.push((lo, ext));
+                        let bound = |s: &str, what: &str| -> i64 {
+                            s.parse::<i64>().unwrap_or_else(|_| {
+                                panic!(".amod: malformed @dims {what} {s:?} — corrupt or version-mismatched module interface")
+                            })
+                        };
+                        dims.push((bound(lo_s, "lower bound"), bound(ext_s, "extent")));
                     }
                     i += 1;
                 }
@@ -2581,6 +2592,20 @@ fn type_info_to_ir_type(info: Option<&TypeInfo>) -> crate::ir::types::IrType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Audit T3: a corrupt @rank/@dims in a .amod (the writer only ever emits
+    // integers) must fail loudly, not silently demote the array's shape.
+    #[test]
+    #[should_panic(expected = "malformed @rank")]
+    fn parse_var_rejects_corrupt_rank() {
+        parse_var("@var a : integer @rank notanumber", false);
+    }
+
+    #[test]
+    #[should_panic(expected = "malformed @dims")]
+    fn parse_var_rejects_corrupt_dims() {
+        parse_var("@var a : integer @dims 1:oops", false);
+    }
 
     #[test]
     fn round_trip_physics_amod() {

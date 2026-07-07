@@ -292,9 +292,16 @@ pub fn emit_globals(
             }
             Some(GlobalInit::String(_)) => default_zero.into(),
             Some(GlobalInit::IntArray(_)) | Some(GlobalInit::FloatArray(_)) => {
-                // Array initializer on a scalar-typed global —
-                // shouldn't happen, but emit zero as a safe fallback.
-                default_zero.into()
+                // An array initializer on a scalar-typed global is an IR
+                // invariant violation: array-typed globals are emitted by the
+                // array arm above, which `continue`s before this scalar path.
+                // Emitting zero would silently drop the initializer data
+                // (audit T3); fail loudly at the type/initializer mismatch.
+                panic!(
+                    "global '{symbol}': array initializer on scalar-typed \
+                     global {:?} — IR type/initializer mismatch",
+                    g.ty
+                );
             }
             // QuadTable globals are emitted by the dedicated arm above
             // and never reach this scalar path.

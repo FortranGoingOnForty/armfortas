@@ -828,9 +828,19 @@ pub(crate) fn lower_intrinsic_subroutine(
                         let rank = match &shape_src {
                             Some(CfpDimSource::Literal(vals)) => vals.len(),
                             Some(CfpDimSource::Runtime(..)) => {
+                                // A SHAPE argument means FPTR is an array, so its
+                                // rank equals the shape length (== FPTR's declared
+                                // rank). Defaulting to 0 would build a scalar
+                                // descriptor and miscompile every array access
+                                // (audit T3); fail loudly if neither source knows.
                                 c_f_pointer_shape_static_rank(ctx, args)
                                     .or(fptr_rank)
-                                    .unwrap_or(0)
+                                    .unwrap_or_else(|| {
+                                        panic!(
+                                            "c_f_pointer: cannot determine result rank for a \
+                                             runtime SHAPE with an FPTR of unknown declared rank"
+                                        )
+                                    })
                             }
                             None => 0,
                         };

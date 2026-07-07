@@ -186,19 +186,22 @@ pub(super) fn coerce_to_type(b: &mut FuncBuilder, val: ValueId, target: &IrType)
             let i64_val = b.ptr_to_int(val);
             b.int_trunc(i64_val, *iw)
         }
-        // Ptr<derived/byte-aggregate> → Float: nothing to do at the
-        // IR level. This arises when generic dispatch picks a
-        // wrong-typed specific (e.g. a structure constructor for a
-        // type that has a same-named generic interface). Returning
-        // the val unchanged would propagate a struct ptr to a store
-        // that expects a float and trip the IR verifier; emit a
-        // typed zero of the target so the call/store stays well-typed
-        // (the call's runtime semantics are already broken — this
-        // just keeps the verifier from rejecting the surrounding IR).
-        (IrType::Ptr(_), IrType::Float(fw)) => match fw {
-            FloatWidth::F32 => b.const_f32(0.0),
-            FloatWidth::F64 => b.const_f64(0.0),
-        },
+        // Ptr<derived/byte-aggregate> → Float has no meaning at the IR
+        // level: it only arises when generic dispatch resolved to a
+        // wrong-typed specific (e.g. a structure constructor for a type
+        // that also has a same-named generic interface). The earlier code
+        // emitted a typed 0.0 here so the surrounding IR stayed
+        // well-typed, but that silently miscompiles the call — the store
+        // site gets a fabricated zero instead of the real value (audit
+        // T3). Fail loudly at the resolution bug instead.
+        (IrType::Ptr(_), IrType::Float(_)) => {
+            panic!(
+                "coerce_to_type: pointer-to-aggregate coerced to {target:?} — \
+                 a generic call resolved to a wrong-typed specific; emitting a \
+                 zero here would silently miscompile the store. Fix the \
+                 dispatch, don't fabricate a value."
+            );
+        }
         // Ptr<Bool> → Bool: dereference the pointer. Stdlib's masked
         // reductions (`stdlib_sum_1d_sp_mask` etc.) hit this when the
         // mask actual is passed by reference but the inner expression
