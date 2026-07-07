@@ -32,8 +32,8 @@ already fixed. Reproducers in `scratchpad/rebaseline/`. Verdicts:
 
 - **Fixed upstream:** C9 (C_F_POINTER component shape, `size=10`), C11 (CLASS
   mold=/source= dynamic type). Close both.
-- **Still open (compiler core):** C10, C12.
-  (C3, C4, C5, C6, C7, C8 fixed 2026-07-06.)
+- **Still open (compiler core):** C12.
+  (C3, C4, C5, C6, C7, C8, C10 fixed 2026-07-06.)
 - **Still open (unchanged — submodules the workstream never touched):**
   afs-ld L3, L4, L6–L9; afs-as A5, A6; test-integrity T3 (silent-degrade
   stubs survive), T4 (bencch drift).
@@ -172,9 +172,17 @@ already fixed. Reproducers in `scratchpad/rebaseline/`. Verdicts:
   rank via `c_f_pointer_shape_static_rank`/`fptr_rank` before the
   `unwrap_or(0)` tail (that silent tail is a residual T3 item). Was:
   recovers rank only for a bare-name FPTR, `size(h%p)=1` after a rank-1 bind.
-- **C10 — rank-2 deferred-length char element comparisons read as length 0.**
-  `g(1,1)=='aa'` false after assignment; substring read works. rank==1-shaped
-  guard in the June deferred-char cluster (153ea67).
+- **C10 — rank-2 deferred-length char element comparisons read as length 0.
+  FIXED 2026-07-06 (ba67c10f).** `g(1,1)=='aa'` was false and `g(1,1)` printed
+  empty (though `len()` was right). The character-array-element string read
+  (`lower_string_expr_full` FunctionCall arm) was gated on `args.len()==1`, so
+  a rank-2 element `g(i,j)` fell through to the generic call path — correct
+  data pointer, length 0. `char_array_element_ptr_and_len` /
+  `compute_flat_elem_offset` already fold every subscript into the flat offset,
+  so the gate now accepts any all-scalar-subscript list (a Range still routes
+  to the section/substring paths). Fixes deferred and fixed-length char arrays
+  at every rank. Fixture `deferred_char_rank2_element.f90` (rank-2/3 compare,
+  read, length, substring, fixed-length rank-2).
 - **C11 — CLASS mold=/source= loses dynamic type / zeroes extension
   components. FIXED upstream (compiler-edges workstream) — re-baselined
   2026-07-06:** `allocate(dst,mold=child)` now yields dynamic type `child`;
