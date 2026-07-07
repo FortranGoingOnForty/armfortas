@@ -7777,9 +7777,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 return;
             }
 
-            // Handle section-RHS: pa => ia(lo:hi).  The RHS is a
-            // FunctionCall{Name(arr), [Range(lo,hi)]}.  Build a
-            // descriptor pointing at arr(lo) with extent hi-lo+1.
+            // Handle section-RHS: pa => ia(lo:hi:stride). Reuse the
+            // section descriptor builder so extent and memory stride stay
+            // tied to the actual section triplet.
             if let Expr::FunctionCall {
                 callee,
                 args: val_args,
@@ -7788,107 +7788,35 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 if let Expr::Name { name: arr_name } = &callee.node {
                     let arr_key = arr_name.to_lowercase();
                     if let Some(arr_info) = ctx.locals.get(&arr_key).cloned() {
-                        if (!arr_info.dims.is_empty() || arr_info.allocatable)
-                            && val_args.len() == 1
+                        if local_uses_array_descriptor(&tgt_info)
+                            && (!arr_info.dims.is_empty()
+                                || arr_info.allocatable
+                                || arr_info.descriptor_arg)
+                            && val_args
+                                .iter()
+                                .any(|arg| {
+                                    matches!(
+                                        arg.value,
+                                        crate::ast::expr::SectionSubscript::Range { .. }
+                                    )
+                                })
                         {
-                            if let crate::ast::expr::SectionSubscript::Range {
-                                start,
-                                end,
-                                stride: _,
-                            } = &val_args[0].value
-                            {
-                                let base = array_data_ptr_for_call(b, &arr_info);
-                                let lo = if let Some(se) = start {
-                                    let v = super::expr::lower_expr_ctx(b, ctx, se);
-                                    match b.func().value_type(v) {
-                                        Some(IrType::Int(IntWidth::I64)) => v,
-                                        _ => b.int_extend(v, IntWidth::I64, true),
-                                    }
-                                } else {
-                                    b.const_i64(1)
-                                };
-                                let hi = if let Some(ee) = end {
-                                    let v = super::expr::lower_expr_ctx(b, ctx, ee);
-                                    match b.func().value_type(v) {
-                                        Some(IrType::Int(IntWidth::I64)) => v,
-                                        _ => b.int_extend(v, IntWidth::I64, true),
-                                    }
-                                } else {
-                                    array_total_elems_value(b, &arr_info)
-                                };
-                                // Build a descriptor in the pointer's slot.
-                                let desc = array_descriptor_addr(b, &tgt_info);
-                                let zero32 = b.const_i32(0);
-                                let sz384 = b.const_i64(384);
-                                b.call(
-                                    FuncRef::External("memset".into()),
-                                    vec![desc, zero32, sz384],
-                                    IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                                );
-                                // base_addr: base + (lo - 1) * elem_size
-                                let one = b.const_i64(1);
-                                let lo_0 = b.isub(lo, one);
-                                let elem_bytes =
-                                    b.const_i64(ir_scalar_byte_size(&arr_info.ty, ctx.layout));
-                                let byte_off = b.imul(lo_0, elem_bytes);
-                                let slice_base =
-                                    b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
-                                store_byte_aggregate_field(
-                                    b,
-                                    desc,
-                                    0,
-                                    IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                                    slice_base,
-                                );
-                                store_byte_aggregate_field(
-                                    b,
-                                    desc,
-                                    8,
-                                    IrType::Int(IntWidth::I64),
-                                    elem_bytes,
-                                );
-                                let rank = b.const_i32(1);
-                                store_byte_aggregate_field(
-                                    b,
-                                    desc,
-                                    16,
-                                    IrType::Int(IntWidth::I32),
-                                    rank,
-                                );
-                                let flags = b.const_i32(2);
-                                store_byte_aggregate_field(
-                                    b,
-                                    desc,
-                                    20,
-                                    IrType::Int(IntWidth::I32),
-                                    flags,
-                                );
-                                // dim[0]: lower=1, upper=extent, stride=1
-                                store_byte_aggregate_field(
-                                    b,
-                                    desc,
-                                    24,
-                                    IrType::Int(IntWidth::I64),
-                                    one,
-                                );
-                                let extent = b.isub(hi, lo);
-                                let extent1 = b.iadd(extent, one);
-                                store_byte_aggregate_field(
-                                    b,
-                                    desc,
-                                    32,
-                                    IrType::Int(IntWidth::I64),
-                                    extent1,
-                                );
-                                store_byte_aggregate_field(
-                                    b,
-                                    desc,
-                                    40,
-                                    IrType::Int(IntWidth::I64),
-                                    one,
-                                );
-                                return;
-                            }
+                            let src_desc = lower_array_section(
+                                b,
+                                &ctx.locals,
+                                &arr_info,
+                                val_args,
+                                ctx.st,
+                                Some(ctx.type_layouts),
+                            );
+                            let tgt_desc = array_descriptor_addr(b, &tgt_info);
+                            let size = b.const_i64(384);
+                            b.call(
+                                FuncRef::External("memcpy".into()),
+                                vec![tgt_desc, src_desc, size],
+                                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                            );
+                            return;
                         }
                     }
                 }
