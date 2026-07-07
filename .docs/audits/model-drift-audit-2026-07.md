@@ -32,8 +32,8 @@ already fixed. Reproducers in `scratchpad/rebaseline/`. Verdicts:
 
 - **Fixed upstream:** C9 (C_F_POINTER component shape, `size=10`), C11 (CLASS
   mold=/source= dynamic type). Close both.
-- **Still open (compiler core):** C8 (now a parse error), C10, C12.
-  (C3, C4, C5, C6, C7 fixed 2026-07-06.)
+- **Still open (compiler core):** C10, C12.
+  (C3, C4, C5, C6, C7, C8 fixed 2026-07-06.)
 - **Still open (unchanged — submodules the workstream never touched):**
   afs-ld L3, L4, L6–L9; afs-as A5, A6; test-integrity T3 (silent-degrade
   stubs survive), T4 (bencch drift).
@@ -151,13 +151,21 @@ already fixed. Reproducers in `scratchpad/rebaseline/`. Verdicts:
   literal still reports kind 4 (no literal-kind validation hook), and `kind()`
   on any complex returns 4 regardless of component kind (separate pre-existing
   bug — the value itself is correct double precision).
-- **C8 — implied-do list-directed output prints a blank record.**
-  `write(*,*) (ia(i),i=1,3)` and `print *, (…)` drop all values;
-  `parse_print` (`src/parser/stmt.rs:876`) uses a plain expr loop, not
-  `parse_io_expr_list`. Pre-June; the most basic F77 output idiom.
-  RE-BASELINED 2026-07-06: `print *, (ia(i),i=1,3)` now a hard PARSE ERROR
-  (caret on the implied-do bound), not a silent blank. STILL OPEN — the
-  idiom still doesn't work, now loud instead of silent.
+- **C8 — implied-do list-directed output prints a blank record.
+  FIXED 2026-07-06 (531d19dd).** `write(*,*) (ia(i),i=1,3)` and
+  `print *, (…)` dropped all values. Two bugs: (1) `parse_print`
+  (`src/parser/stmt.rs`) used a plain `parse_expr` loop, so the implied-do's
+  `var=` was a parse error — now shares `parse_io_expr_list` with WRITE/READ,
+  which try/restore-disambiguates a real implied-do from a parenthesized
+  expression. (2) the list-directed lowering (`lower_write_items_adv`) had no
+  array-constructor case, so the item lowered to a stack pointer written as a
+  zero-length string (blank record) — added `lower_write_ac_values` /
+  `lower_write_ac_implied_do` walking the constructor element-wise, mirroring
+  the formatted `lower_fmt_push_ac_values`. The formatted spelling
+  (`print '(...)' , (...)`) already worked. Fixture
+  `implied_do_list_directed_output.f90` covers list-directed + unformatted
+  implied-do, strides, negative stride, nesting, character elements, a plain
+  constructor, and mixed scalar items.
 - **C9 — C_F_POINTER with a component FPTR and non-constant SHAPE mis-sets
   dims. FIXED upstream (compiler-edges workstream) — re-baselined 2026-07-06,
   `size(h%p)=10` correct.** `src/ir/lower/intrinsic_sub.rs` now recovers the
