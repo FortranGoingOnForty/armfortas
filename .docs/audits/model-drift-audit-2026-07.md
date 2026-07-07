@@ -289,14 +289,20 @@ and two RIP+imm8 cases in `tests/x86_encode_differential.rs` (A1 addend).
 - **A4 — `%ch/%dh/%bh` accepted as a shift count, encoded as `%cl`.**
   `src/x86/encode.rs:1124` (no register-class check). Fix: require the
   count to be a low GP register (`class == RegClass::Gp`).
+A5, A6 **FIXED 2026-07-07 (afs-as branch `x86-audit-a5-a6`)**, each
+byte-/behavior-checked against GNU as 2.44 with a regression test; full
+afs-as suite (39 binaries) + clippy green.
+
 - **A5 — panic-instead-of-diagnostic:** `.ascii/.asciz/.zero` before any
-  section (`assemble.rs:217`); PC-rel patch into a NOBITS section
-  (`assemble.rs:627`).
-- **A6 — nonzero `.bss` data silently dropped** (gas errors);
-  **`.p2align N,,M` max-skip ignored** (gcc emits this; layout diverges);
-  **octal `\012` escapes corrupted** (latent — backend emits `.byte` lists).
-  `test $imm,%al` uses the long form not A8/A9 (byte-parity claim broken;
-  the one differential case dodges it).
+  section indexed section `usize::MAX` and panicked; PC-rel patch into a
+  NOBITS section panicked on the empty slice. Leading data now defaults to
+  `.text` (like gas and the insn/label paths); the NOBITS patch diagnoses.
+  Test `x86_bss_and_leading_data.rs`.
+- **A6 — nonzero `.bss` data silently dropped** → error like gas;
+  **`.p2align N,,M` max-skip** parsed + honored (`x86_p2align_max_skip.rs`);
+  **octal `\012` + `\x` hex escapes** decode like gas (`x86_string_escapes.rs`);
+  **`test $imm,%al/%ax/%eax/%rax`** now emits the A8/A9 accumulator short
+  form (differential cases added). 
 
 ### Test integrity (ours)
 
@@ -333,9 +339,18 @@ and two RIP+imm8 cases in `tests/x86_encode_differential.rs` (A1 addend).
   (`src/codegen/shared.rs:293`), afs-ld `entsize==0 → 0` (`elf.rs:307`).
   `coerce_to_type`'s `Ptr→Float => 0.0` arm (`helpers.rs:198`) survived the
   loud-fallback hardening (6ec427b) that panicked the arm right below it.
-- **T4 — bencch drift:** 31 stale XPASS marks, one Mach-O-asserting asm case
-  on an ELF host; nothing in CI runs bencch so the drift is silent. bencch
-  itself is honest (hard-errors on zero matched cases, no skip concept).
+- **T4 — bencch drift** (PARTIAL, bencch PR #1 `t4-clean-stale-xfails`):
+  the x86_64/FreeBSD run now shows 60 stale XPASS (not 31 — the set grew as
+  more gaps closed). Removed the 42 host-independent ones (module value
+  lowering, module-procedure emission, internal I/O — all IR/runtime, so
+  stale on every host): xpassed 60 → 18, passed 1042 → 1084, failed and
+  xfailed unchanged. **Left for a macOS-authoritative run:** the 18
+  `consistency/*` determinism marks (host-dependent). **Not fixed:** the
+  Mach-O-asserting `backend/asm` + `object/layout` cases fail on an ELF
+  host; correcting them needs a platform conditional in the `.afs` grammar
+  (an addition — `when` only selects opt levels), a design call for the
+  bencch repo, not a weakening of the assertions. Root cause stands:
+  nothing in CI runs bencch, so the drift is silent.
 
 ## Real-project capability (sweep)
 
