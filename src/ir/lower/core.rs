@@ -19366,11 +19366,15 @@ pub(super) fn emit_named_function_call(
     let callee_class_args =
         first_procedure_lookup(&abi_lookup_keys, |k| callee_class_arg_mask(st, k));
     let opt_flags = first_procedure_lookup(&abi_lookup_keys, |k| callee_optional_arg_mask(st, k));
-    let callee_intent_in_array_args =
-        first_procedure_lookup(&abi_lookup_keys, |k| callee_intent_in_array_arg_mask(st, k));
+    let callee_sequence_array_args =
+        first_procedure_lookup(&abi_lookup_keys, |k| callee_sequence_array_arg_mask(st, k));
+    let callee_sequence_array_copy_back_args = first_procedure_lookup(&abi_lookup_keys, |k| {
+        callee_sequence_array_copy_back_mask(st, k)
+    });
 
     let mut call_args = Vec::new();
     let mut call_arg_array_temps = Vec::new();
+    let mut call_arg_sequence_temps = Vec::new();
     if let Some(desc) = hidden_result {
         call_args.push(desc);
     }
@@ -19409,7 +19413,11 @@ pub(super) fn emit_named_function_call(
             .as_ref()
             .map(|mask| mask.get(i).copied().unwrap_or(false))
             .unwrap_or(false);
-        let wants_intent_in_array = callee_intent_in_array_args
+        let wants_sequence_array = callee_sequence_array_args
+            .as_ref()
+            .map(|mask| mask.get(i).copied().unwrap_or(false))
+            .unwrap_or(false);
+        let sequence_array_copy_back = callee_sequence_array_copy_back_args
             .as_ref()
             .map(|mask| mask.get(i).copied().unwrap_or(false))
             .unwrap_or(false);
@@ -19442,6 +19450,15 @@ pub(super) fn emit_named_function_call(
         };
         let value = match &arg.value {
             crate::ast::expr::SectionSubscript::Element(e) => {
+                let actual_is_array =
+                    actual_expr_rank(e, locals, st, type_layouts).is_some_and(|rank| rank > 0);
+                let sequence_array_copy_back_for_arg = if wants_sequence_array {
+                    sequence_array_copy_back
+                } else {
+                    true
+                };
+                let sequence_array_for_arg = (wants_sequence_array || actual_is_array)
+                    && !matches!(e.node, Expr::ConditionalExpr { .. } | Expr::NilArgument);
                 let wants_descriptor = (mask_wants_descriptor
                     || (callee_descriptor_args.is_none()
                         && actual_is_descriptor_backed(locals, e, st, type_layouts)))
@@ -19533,8 +19550,8 @@ pub(super) fn emit_named_function_call(
                             lower_arg_by_ref(b, locals, e, st)
                         }
                     })
-                } else if wants_intent_in_array {
-                    lower_contiguous_intent_in_array_actual(
+                } else if sequence_array_for_arg {
+                    lower_sequence_array_actual(
                         b,
                         locals,
                         e,
@@ -19543,6 +19560,8 @@ pub(super) fn emit_named_function_call(
                         internal_funcs,
                         contained_host_refs,
                         descriptor_params,
+                        sequence_array_copy_back_for_arg,
+                        &mut call_arg_sequence_temps,
                     )
                     .unwrap_or_else(|| {
                         if full_ref_context {
@@ -19689,6 +19708,7 @@ pub(super) fn emit_named_function_call(
         )
     };
     let call_result = b.call(func_ref, call_args, ret_ty);
+    finish_sequence_association_temps(b, &call_arg_sequence_temps);
     deallocate_call_arg_array_temp_descriptors(b, &call_arg_array_temps);
     call_result
 }
@@ -23355,7 +23375,37 @@ pub(super) fn callee_optional_arg_mask(st: &SymbolTable, callee_name: &str) -> O
     Some(mask)
 }
 
-pub(super) fn callee_intent_in_array_arg_mask(
+fn symbol_is_sequence_array_dummy(sym: &crate::sema::symtab::Symbol) -> bool {
+    !sym.attrs.array_spec.is_empty()
+        && !sym.attrs.allocatable
+        && !sym.attrs.pointer
+        && sym.attrs.array_spec.iter().all(|spec| {
+            matches!(
+                spec,
+                ArraySpec::Explicit { .. } | ArraySpec::AssumedSize { .. }
+            )
+        })
+}
+
+pub(super) fn callee_sequence_array_arg_mask(
+    st: &SymbolTable,
+    callee_name: &str,
+) -> Option<Vec<bool>> {
+    let callee_scope = callee_scope_for_lookup(st, callee_name)?;
+    let mask: Vec<bool> = callee_scope
+        .arg_order
+        .iter()
+        .map(|arg_name| {
+            callee_scope
+                .symbols
+                .get(arg_name)
+                .is_some_and(symbol_is_sequence_array_dummy)
+        })
+        .collect();
+    mask.iter().any(|flag| *flag).then_some(mask)
+}
+
+pub(super) fn callee_sequence_array_copy_back_mask(
     st: &SymbolTable,
     callee_name: &str,
 ) -> Option<Vec<bool>> {
@@ -23370,10 +23420,8 @@ pub(super) fn callee_intent_in_array_arg_mask(
                 .symbols
                 .get(arg_name)
                 .map(|sym| {
-                    matches!(sym.attrs.intent, Some(Intent::In))
-                        && !sym.attrs.array_spec.is_empty()
-                        && !sym.attrs.allocatable
-                        && !sym.attrs.pointer
+                    symbol_is_sequence_array_dummy(sym)
+                        && !matches!(sym.attrs.intent, Some(Intent::In))
                 })
                 .unwrap_or(false)
         })
@@ -52740,7 +52788,38 @@ pub(super) fn lower_arg_string_descriptor(
     }
 }
 
-pub(super) fn lower_contiguous_intent_in_array_actual(
+#[derive(Clone, Copy)]
+pub(super) struct SequenceAssociationTemp {
+    source_desc: ValueId,
+    temp_desc: ValueId,
+    copy_back: bool,
+    source_owns_temp: bool,
+}
+
+pub(super) fn finish_sequence_association_temps(
+    b: &mut FuncBuilder,
+    temps: &[SequenceAssociationTemp],
+) {
+    for temp in temps {
+        if temp.copy_back && !temp.source_owns_temp {
+            let stat = b.alloca(IrType::Int(IntWidth::I32));
+            let zero = b.const_i32(0);
+            b.store(zero, stat);
+            b.call(
+                FuncRef::External("afs_copy_array_data_no_realloc".into()),
+                vec![temp.source_desc, temp.temp_desc, stat],
+                IrType::Void,
+            );
+        }
+        deallocate_array_temp_descriptor(b, temp.temp_desc);
+        if temp.source_owns_temp {
+            deallocate_array_temp_descriptor(b, temp.source_desc);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn lower_sequence_array_actual(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
     expr: &crate::ast::expr::SpannedExpr,
@@ -52749,8 +52828,10 @@ pub(super) fn lower_contiguous_intent_in_array_actual(
     internal_funcs: Option<&HashMap<String, u32>>,
     contained_host_refs: Option<&HashMap<String, Vec<String>>>,
     descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+    copy_back: bool,
+    temps: &mut Vec<SequenceAssociationTemp>,
 ) -> Option<ValueId> {
-    if explicit_shape_sequence_section_actual(locals, expr) {
+    if contiguous_sequence_section_actual(locals, expr) {
         let (source_desc, elem_ty) = lower_array_expr_descriptor(
             b,
             locals,
@@ -52812,10 +52893,16 @@ pub(super) fn lower_contiguous_intent_in_array_actual(
         vec![tmp_desc, source_desc, stat],
         IrType::Void,
     );
+    temps.push(SequenceAssociationTemp {
+        source_desc,
+        temp_desc: tmp_desc,
+        copy_back,
+        source_owns_temp: array_expr_descriptor_may_own_temp(expr, locals, st),
+    });
     Some(b.load_typed(tmp_desc, IrType::Ptr(Box::new(elem_ty))))
 }
 
-fn explicit_shape_sequence_section_actual(
+fn contiguous_sequence_section_actual(
     locals: &HashMap<String, LocalInfo>,
     expr: &crate::ast::expr::SpannedExpr,
 ) -> bool {
@@ -52830,6 +52917,22 @@ fn explicit_shape_sequence_section_actual(
     };
     if info.dims.is_empty() && !local_uses_array_descriptor(info) {
         return false;
+    }
+    if args.len() == 1 {
+        if let Some(crate::ast::expr::Argument {
+            value:
+                crate::ast::expr::SectionSubscript::Range {
+                    stride: stride_expr, ..
+                },
+            ..
+        }) = args.first()
+        {
+            return stride_expr
+                .as_ref()
+                .and_then(eval_const_int)
+                .unwrap_or(1)
+                == 1;
+        }
     }
 
     let mut saw_range = false;

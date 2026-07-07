@@ -3260,9 +3260,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         cached_param_mask_for_lookup(ctx.st, ctx.optional_params, k)
                             .or_else(|| callee_optional_arg_mask(ctx.st, k))
                     });
-                    let intent_in_array_mask = first_procedure_lookup(&abi_lookup_keys, |k| {
-                        callee_intent_in_array_arg_mask(ctx.st, k)
+                    let sequence_array_mask = first_procedure_lookup(&abi_lookup_keys, |k| {
+                        callee_sequence_array_arg_mask(ctx.st, k)
                     });
+                    let sequence_array_copy_back_mask =
+                        first_procedure_lookup(&abi_lookup_keys, |k| {
+                            callee_sequence_array_copy_back_mask(ctx.st, k)
+                        });
+                    let mut call_arg_sequence_temps = Vec::new();
                     let mut arg_vals: Vec<ValueId> = Vec::with_capacity(arg_slots.len());
                     let mut call_arg_array_temps = Vec::new();
                     for (i, slot) in arg_slots.iter().enumerate() {
@@ -3322,7 +3327,11 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             .as_ref()
                             .map(|mask| mask.get(i).copied().unwrap_or(false))
                             .unwrap_or(false);
-                        let wants_intent_in_array = intent_in_array_mask
+                        let wants_sequence_array = sequence_array_mask
+                            .as_ref()
+                            .map(|mask| mask.get(i).copied().unwrap_or(false))
+                            .unwrap_or(false);
+                        let sequence_array_copy_back = sequence_array_copy_back_mask
                             .as_ref()
                             .map(|mask| mask.get(i).copied().unwrap_or(false))
                             .unwrap_or(false);
@@ -3341,6 +3350,25 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             Some(arg) => {
                                 match &arg.value {
                                     crate::ast::expr::SectionSubscript::Element(arg_expr) => {
+                                        let actual_is_array = actual_expr_rank(
+                                            arg_expr,
+                                            &ctx.locals,
+                                            ctx.st,
+                                            Some(ctx.type_layouts),
+                                        )
+                                        .is_some_and(|rank| rank > 0);
+                                        let sequence_array_for_arg = (wants_sequence_array
+                                            || actual_is_array)
+                                            && !matches!(
+                                                arg_expr.node,
+                                                Expr::ConditionalExpr { .. } | Expr::NilArgument
+                                            );
+                                        let sequence_array_copy_back_for_arg =
+                                            if wants_sequence_array {
+                                                sequence_array_copy_back
+                                            } else {
+                                                true
+                                            };
                                         // Same conditional-argument treatment as
                                         // the direct-call path; wants_descriptor
                                         // is per-arm (it inspects the actual).
@@ -3431,8 +3459,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                 dummy_is_class,
                                             )
                                         })
-                                    } else if wants_intent_in_array {
-                                        lower_contiguous_intent_in_array_actual(
+                                    } else if sequence_array_for_arg {
+                                        lower_sequence_array_actual(
                                             b,
                                             &ctx.locals,
                                             e,
@@ -3441,6 +3469,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                             Some(ctx.internal_funcs),
                                             Some(ctx.contained_host_refs),
                                             Some(ctx.descriptor_params),
+                                            sequence_array_copy_back_for_arg,
+                                            &mut call_arg_sequence_temps,
                                         )
                                         .unwrap_or_else(|| {
                                             lower_arg_by_ref_for_dummy_full(
@@ -3581,6 +3611,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     }
                     arg_vals.extend(closure_args);
                     b.call(FuncRef::Indirect(target), arg_vals, IrType::Void);
+                    finish_sequence_association_temps(b, &call_arg_sequence_temps);
                     deallocate_call_arg_array_temp_descriptors(b, &call_arg_array_temps);
                 }
             } else if let Expr::Name { name } = &callee.node {
@@ -3706,11 +3737,16 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         cached_param_mask_for_lookup(ctx.st, ctx.optional_params, k)
                             .or_else(|| callee_optional_arg_mask(ctx.st, k))
                     });
-                    let intent_in_array_mask = first_procedure_lookup(&abi_lookup_keys, |k| {
-                        callee_intent_in_array_arg_mask(ctx.st, k)
+                    let sequence_array_mask = first_procedure_lookup(&abi_lookup_keys, |k| {
+                        callee_sequence_array_arg_mask(ctx.st, k)
                     });
+                    let sequence_array_copy_back_mask =
+                        first_procedure_lookup(&abi_lookup_keys, |k| {
+                            callee_sequence_array_copy_back_mask(ctx.st, k)
+                        });
                     let mut arg_vals: Vec<ValueId> = Vec::with_capacity(arg_slots.len());
                     let mut call_arg_array_temps = Vec::new();
+                    let mut call_arg_sequence_temps = Vec::new();
                     for (i, slot) in arg_slots.iter().enumerate() {
                         let is_value = value_mask
                             .as_ref()
@@ -3746,7 +3782,11 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 .map(|mask| mask.get(i).copied().unwrap_or(false))
                                 .unwrap_or(false);
                         let wants_string_descriptor = wants_string_descriptor && !wants_bind_c_char;
-                        let wants_intent_in_array = intent_in_array_mask
+                        let wants_sequence_array = sequence_array_mask
+                            .as_ref()
+                            .map(|mask| mask.get(i).copied().unwrap_or(false))
+                            .unwrap_or(false);
+                        let sequence_array_copy_back = sequence_array_copy_back_mask
                             .as_ref()
                             .map(|mask| mask.get(i).copied().unwrap_or(false))
                             .unwrap_or(false);
@@ -3754,6 +3794,25 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             Some(arg) => {
                                 match &arg.value {
                                     crate::ast::expr::SectionSubscript::Element(arg_expr) => {
+                                        let actual_is_array = actual_expr_rank(
+                                            arg_expr,
+                                            &ctx.locals,
+                                            ctx.st,
+                                            Some(ctx.type_layouts),
+                                        )
+                                        .is_some_and(|rank| rank > 0);
+                                        let sequence_array_for_arg = (wants_sequence_array
+                                            || actual_is_array)
+                                            && !matches!(
+                                                arg_expr.node,
+                                                Expr::ConditionalExpr { .. } | Expr::NilArgument
+                                            );
+                                        let sequence_array_copy_back_for_arg =
+                                            if wants_sequence_array {
+                                                sequence_array_copy_back
+                                            } else {
+                                                true
+                                            };
                                         // The materialization tree below is
                                         // reused per conditional-argument arm
                                         // (F2023): each arm builds its own
@@ -3847,8 +3906,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                 dummy_is_class,
                                             )
                                         })
-                                    } else if wants_intent_in_array {
-                                        lower_contiguous_intent_in_array_actual(
+                                    } else if sequence_array_for_arg {
+                                        lower_sequence_array_actual(
                                             b,
                                             &ctx.locals,
                                             e,
@@ -3857,6 +3916,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                             Some(ctx.internal_funcs),
                                             Some(ctx.contained_host_refs),
                                             Some(ctx.descriptor_params),
+                                            sequence_array_copy_back_for_arg,
+                                            &mut call_arg_sequence_temps,
                                         )
                                         .unwrap_or_else(|| {
                                             lower_arg_by_ref_for_dummy_full(
@@ -4034,6 +4095,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         )
                     };
                     b.call(func_ref, arg_vals, IrType::Void);
+                    finish_sequence_association_temps(b, &call_arg_sequence_temps);
                     deallocate_call_arg_array_temp_descriptors(b, &call_arg_array_temps);
                 }
             }
