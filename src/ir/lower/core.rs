@@ -42065,7 +42065,8 @@ pub(super) fn lower_rank1_numeric_array_binary_descriptor(
             (IrType::Float(_), BinaryOp::Div) => b.fdiv(lhs_val, rhs_val),
             (IrType::Float(_), BinaryOp::Pow) => {
                 let r = coerce_to_type(b, rhs_val, &elem_ty);
-                b.fpow(lhs_val, r)
+                super::expr::try_lower_float_square_power(b, lhs_val, right)
+                    .unwrap_or_else(|| b.fpow(lhs_val, r))
             }
             (IrType::Bool, BinaryOp::And) => b.and(lhs_val, rhs_val),
             (IrType::Bool, BinaryOp::Or) => b.or(lhs_val, rhs_val),

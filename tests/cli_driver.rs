@@ -49541,6 +49541,167 @@ fn generic_subroutine_matches_use_renamed_class_actual() {
 }
 
 #[test]
+fn o2_real_square_power_uses_multiply_for_gauss_accuracy() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=o2_real_square_power_uses_multiply_for_gauss_accuracy count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let src = write_program(
+        r#"
+program p
+  implicit none
+  integer, parameter :: dp = kind(1.0d0)
+  real(dp), parameter :: pi = acos(-1.0_dp)
+  real(dp), parameter :: tolerance = 4.0_dp * epsilon(1.0_dp)
+  integer, parameter :: newton_iters = 100
+  integer :: i
+  real(dp) :: analytic, numeric
+
+  analytic = 2.0_dp / 3.0_dp
+  do i = 2, 6
+    block
+      real(dp), dimension(i) :: x, w
+      call gauss_legendre(x, w)
+      numeric = sum(x**2 * w)
+      if (.not. abs(numeric - analytic) < 2 * epsilon(analytic)) error stop i
+    end block
+  end do
+  print *, 'ok'
+contains
+  pure subroutine gauss_legendre(x, w)
+    real(dp), intent(out) :: x(:), w(:)
+
+    associate (n => size(x) - 1)
+    select case (n)
+    case (0)
+      x = 0
+      w = 2
+    case (1)
+      x(1) = -sqrt(1.0_dp / 3.0_dp)
+      x(2) = -x(1)
+      w = 1
+    case default
+      block
+        integer :: i, j
+        real(dp) :: leg, dleg, delta
+
+        do i = 0, (n + 1) / 2 - 1
+          x(i + 1) = -cos((2 * i + 1) / (2.0_dp * n + 2.0_dp) * pi)
+          do j = 1, newton_iters
+            leg = legendre(n + 1, x(i + 1))
+            dleg = dlegendre(n + 1, x(i + 1))
+            delta = -leg / dleg
+            x(i + 1) = x(i + 1) + delta
+            if (abs(delta) <= tolerance * abs(x(i + 1))) exit
+          end do
+          x(n - i + 1) = -x(i + 1)
+
+          dleg = dlegendre(n + 1, x(i + 1))
+          w(i + 1) = 2.0_dp / ((1 - x(i + 1)**2) * dleg**2)
+          w(n - i + 1) = w(i + 1)
+        end do
+
+        if (mod(n, 2) == 0) then
+          x(n / 2 + 1) = 0
+          dleg = dlegendre(n + 1, 0.0_dp)
+          w(n / 2 + 1) = 2.0_dp / (dleg**2)
+        end if
+      end block
+    end select
+    end associate
+  end subroutine
+
+  pure elemental function dlegendre(n, x) result(dleg)
+    integer, intent(in) :: n
+    real(dp), intent(in) :: x
+    real(dp) :: dleg
+
+    select case (n)
+    case (0)
+      dleg = 0
+    case (1)
+      dleg = 1
+    case default
+      block
+        real(dp) :: leg_down1, leg_down2, leg
+        real(dp) :: dleg_down1, dleg_down2
+        integer :: i
+
+        leg_down1 = x
+        dleg_down1 = 1
+        leg_down2 = 1
+        dleg_down2 = 0
+        do i = 2, n
+          leg = (2 * i - 1) * x * leg_down1 / i - (i - 1) * leg_down2 / i
+          dleg = dleg_down2 + (2 * i - 1) * leg_down1
+          leg_down2 = leg_down1
+          leg_down1 = leg
+          dleg_down2 = dleg_down1
+          dleg_down1 = dleg
+        end do
+      end block
+    end select
+  end function
+
+  pure elemental function legendre(n, x) result(leg)
+    integer, intent(in) :: n
+    real(dp), intent(in) :: x
+    real(dp) :: leg
+
+    select case (n)
+    case (0)
+      leg = 1
+    case (1)
+      leg = x
+    case default
+      block
+        real(dp) :: leg_down1, leg_down2
+        integer :: i
+
+        leg_down1 = x
+        leg_down2 = 1
+        do i = 2, n
+          leg = (2 * i - 1) * x * leg_down1 / i - (i - 1) * leg_down2 / i
+          leg_down2 = leg_down1
+          leg_down1 = leg
+        end do
+      end block
+    end select
+  end function
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("o2_real_square_power_gauss", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-O2", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("Gauss square-power accuracy compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "Gauss square-power accuracy compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("Gauss square-power accuracy run failed");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        run.status.success() && stdout.contains("ok"),
+        "Gauss square-power accuracy run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        stdout,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn use_renamed_derived_local_copies_pointer_function_result() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

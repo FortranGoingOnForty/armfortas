@@ -88,6 +88,18 @@ pub(crate) fn lower_expr_ctx_tl(
     )
 }
 
+pub(super) fn try_lower_float_square_power(
+    b: &mut FuncBuilder,
+    base: ValueId,
+    exponent: &SpannedExpr,
+) -> Option<ValueId> {
+    if eval_const_int(exponent) == Some(2) {
+        Some(b.fmul(base, base))
+    } else {
+        None
+    }
+}
+
 pub(super) fn lower_short_circuit_logical_expr(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -1056,7 +1068,9 @@ pub(crate) fn lower_expr_full(
                 (BinaryOp::Mul, IrType::Float(_)) => b.fmul(lhs, rhs),
                 (BinaryOp::Div, IrType::Int(_)) => b.idiv(lhs, rhs),
                 (BinaryOp::Div, IrType::Float(_)) => b.fdiv(lhs, rhs),
-                (BinaryOp::Pow, IrType::Float(_)) => b.fpow(lhs, rhs),
+                (BinaryOp::Pow, IrType::Float(_)) => {
+                    try_lower_float_square_power(b, lhs, right).unwrap_or_else(|| b.fpow(lhs, rhs))
+                }
                 (BinaryOp::Pow, IrType::Int(_)) => {
                     let fl = b.int_to_float(lhs, FloatWidth::F64);
                     let fr = b.int_to_float(rhs, FloatWidth::F64);
