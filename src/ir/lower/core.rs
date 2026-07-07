@@ -47377,6 +47377,27 @@ pub(super) fn with_select_type_intrinsic_guard_binding<F>(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Reduce a loaded logical/numeric value to an i1 truth (nonzero). A logical
+/// already lowers to `Bool`; numeric masks are compared against zero.
+fn findloc_truthy_i1(b: &mut FuncBuilder, v: ValueId) -> ValueId {
+    match b.func().value_type(v) {
+        Some(IrType::Bool) | None => v,
+        Some(IrType::Int(IntWidth::I64)) => {
+            let z = b.const_i64(0);
+            b.icmp(CmpOp::Ne, v, z)
+        }
+        Some(IrType::Int(IntWidth::I128)) => {
+            let z = b.const_i128(0);
+            b.icmp(CmpOp::Ne, v, z)
+        }
+        _ => {
+            let vi = coerce_to_type(b, v, &IrType::Int(IntWidth::I32));
+            let z = b.const_i32(0);
+            b.icmp(CmpOp::Ne, vi, z)
+        }
+    }
+}
+
 fn lower_findloc_rank1_scalar(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -47426,6 +47447,77 @@ fn lower_findloc_rank1_scalar(
     );
     let target = coerce_to_type(b, raw_value, elem_ty);
 
+    // MASK= (slot 3) and BACK= (slot 5) were both ignored (audit C5): the
+    // scan took the first unconditional match. MASK gates which elements
+    // are eligible; BACK=.true. must return the LAST match.
+    let mask_expr = arg_slots.get(3).and_then(|slot| {
+        slot.as_ref().and_then(|arg| match &arg.value {
+            crate::ast::expr::SectionSubscript::Element(e) => Some(e),
+            _ => None,
+        })
+    });
+    let back_expr = arg_slots.get(5).and_then(|slot| {
+        slot.as_ref().and_then(|arg| match &arg.value {
+            crate::ast::expr::SectionSubscript::Element(e) => Some(e),
+            _ => None,
+        })
+    });
+
+    // `early_exit_allowed` = NOT back. Under BACK the loop scans every
+    // element so the body's overwrite leaves the last match standing.
+    let early_exit_allowed = match back_expr {
+        None => b.const_bool(true),
+        Some(e) => {
+            let raw = super::expr::lower_expr_full(
+                b,
+                locals,
+                e,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
+            let t = findloc_truthy_i1(b, raw);
+            b.not(t)
+        }
+    };
+
+    // MASK: a rank-1 logical array (per-element) or a scalar logical.
+    // A mask we can't lower to one of those bails, so it is never silently
+    // dropped.
+    let mut mask_array: Option<(ValueId, IrType)> = None;
+    let mut mask_scalar_i1: Option<ValueId> = None;
+    if let Some(me) = mask_expr {
+        if actual_expr_rank(me, locals, st, type_layouts).is_some_and(|r| r >= 1) {
+            match lower_array_expr_descriptor(
+                b,
+                locals,
+                me,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            ) {
+                Some(md) => mask_array = Some(md),
+                None => return None,
+            }
+        } else {
+            let mv = super::expr::lower_expr_full(
+                b,
+                locals,
+                me,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
+            mask_scalar_i1 = Some(findloc_truthy_i1(b, mv));
+        }
+    }
+
     let result_addr = b.alloca(IrType::Int(IntWidth::I32));
     let zero32 = b.const_i32(0);
     b.store(zero32, result_addr);
@@ -47448,15 +47540,25 @@ fn lower_findloc_rank1_scalar(
     let past_end = b.icmp(CmpOp::Ge, idx, n);
     let current_result = b.load(result_addr);
     let found = b.icmp(CmpOp::Ne, current_result, zero32);
-    let done = b.or(past_end, found);
+    let found_and_exit = b.and(found, early_exit_allowed);
+    let done = b.or(past_end, found_and_exit);
     b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
 
     b.set_block(bb_body);
     let cur_idx = b.load(i_addr);
     let elem = load_rank1_array_desc_elem(b, desc, elem_ty, cur_idx);
-    let is_match = match elem_ty {
+    let raw_match = match elem_ty {
         IrType::Float(_) => b.fcmp(CmpOp::Eq, elem, target),
         _ => b.icmp(CmpOp::Eq, elem, target),
+    };
+    let is_match = if let Some((mask_desc, mask_elem_ty)) = &mask_array {
+        let mv = load_rank1_array_desc_elem(b, *mask_desc, mask_elem_ty, cur_idx);
+        let mtrue = findloc_truthy_i1(b, mv);
+        b.and(raw_match, mtrue)
+    } else if let Some(mtrue) = mask_scalar_i1 {
+        b.and(raw_match, mtrue)
+    } else {
+        raw_match
     };
     let one64 = b.const_i64(1);
     let one_based64 = b.iadd(cur_idx, one64);
