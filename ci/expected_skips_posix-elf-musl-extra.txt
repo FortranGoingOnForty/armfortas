@@ -61,6 +61,7 @@ vectorize_reduce_sum
 vectorize_reduce_sum_diff
 vectorize_reduce_sum_tail
 vectorize_reduce_sum_unary
+vectorize_reduction_fused_store
 vectorize_scalar_tail
 vectorize_sqrt
 vectorize_unary
