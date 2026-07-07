@@ -32,8 +32,8 @@ already fixed. Reproducers in `scratchpad/rebaseline/`. Verdicts:
 
 - **Fixed upstream:** C9 (C_F_POINTER component shape, `size=10`), C11 (CLASS
   mold=/source= dynamic type). Close both.
-- **Still open (compiler core):** C6 (now an ICE), C7, C8 (now a
-  parse error), C10, C12. (C3, C4, C5 fixed 2026-07-06.)
+- **Still open (compiler core):** C7, C8 (now a parse error), C10, C12.
+  (C3, C4, C5, C6 fixed 2026-07-06.)
 - **Still open (unchanged — submodules the workstream never touched):**
   afs-ld L3, L4, L6–L9; afs-as A5, A6; test-integrity T3 (silent-degrade
   stubs survive), T4 (bencch drift).
@@ -119,13 +119,22 @@ already fixed. Reproducers in `scratchpad/rebaseline/`. Verdicts:
   last match. A mask that can't be lowered to an array/scalar logical bails
   (never silently dropped). Fixture `test_programs/findloc_mask_back.f90`.
   Was: a938b53, silently returned the unmasked/forward result.
-- **C6 — untyped char array constructor with an array element corrupts.**
-  Fix (c6e094a) is gated to the exact `[character(len=n) :: ...]` spelling fpm
-  emits; the plain F2008 `c = [c, 'cc']` flattens into wrong-size slots.
-  `src/ir/lower/core.rs:42621`. RE-BASELINED 2026-07-06: now an ICE, not a
-  miscompile — `x05 scope: no register class for Array(Int(I8), 2)` at
-  `src/codegen/x86/isel.rs:3046` (an I8 array reached isel unlowered). STILL
-  OPEN, arguably worse (hard panic).
+- **C6 — char array constructor with an array element corrupts / ICEs.
+  FIXED 2026-07-06 (06e94f3c).** Two bugs in `store_ac_values_at_off`
+  (`src/ir/lower/core.rs`). (1) A `character(len>1)` array element (`[g, ...]`,
+  g a `character(2)` array) was `load_typed`+stored as an `[i8 x N]` value —
+  x86 isel has a register class only for the 8/16-byte array sizes, so len=2
+  panicked `no register class for Array(Int(I8), 2)` at `isel.rs:3046` and
+  arm64 truncated to 8 bytes. Now every aggregate element is memcpy'd
+  regardless of size. (2) A `character(len=1)` scalar element lowered to a
+  `Ptr<i8>`, and `coerce_to_type(Ptr, i8)` emitted `ptr_to_int + int_trunc`,
+  storing the pointer's low address byte instead of the character (silent
+  corruption → garbage that panicked `afs_fmt_end`). The scalar-element path
+  now loads the byte from the pointer. char(len=1) is `Int(I8)` (not `Array`),
+  so it never matched the aggregate arm; genuine `integer(1)` elements lower
+  to a direct i8 value, not a pointer, so they don't reach the new arm.
+  Fixture `test_programs/char_array_constructor.f90` covers len 1/2/3 array +
+  scalar elements at every opt level.
 - **C7 — `real(16)`/`complex(16)` silently compile as single precision.**
   `src/ir/types.rs:170` (`8 => F64, _ => F32`); `kind` reports 4. A
   `complex(16)` result additionally corrupts the stack (ComplexBuffer sizing
