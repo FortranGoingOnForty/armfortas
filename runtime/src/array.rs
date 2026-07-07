@@ -2998,6 +2998,25 @@ mod tests {
     }
 
     #[test]
+    fn array_size_nonowning_data_descriptor_uses_shape() {
+        let mut data = [1i32, 2, 3, 4];
+        let mut desc = ArrayDescriptor::zeroed();
+        desc.base_addr = data.as_mut_ptr() as *mut u8;
+        desc.elem_size = 4;
+        desc.rank = 1;
+        desc.flags = DESC_CONTIGUOUS;
+        desc.dims[0] = DimDescriptor {
+            lower_bound: 1,
+            upper_bound: 4,
+            stride: 1,
+        };
+
+        assert!(!desc.is_allocated());
+        assert_eq!(afs_array_size(&desc), 4);
+        assert_eq!(afs_array_size_dim(&desc, 1), 4);
+    }
+
+    #[test]
     fn pack_zero_size_allocated_arrays_returns_zero_size_result() {
         let mut src = ArrayDescriptor::zeroed();
         let mut mask = ArrayDescriptor::zeroed();
@@ -3179,7 +3198,7 @@ pub extern "C" fn afs_array_size(desc: *const ArrayDescriptor) -> i64 {
         return 0;
     }
     let d = unsafe { &*desc };
-    if !d.is_allocated() {
+    if !d.is_allocated() && d.base_addr.is_null() {
         return 0;
     }
     d.total_elements()
@@ -3192,7 +3211,7 @@ pub extern "C" fn afs_array_size_dim(desc: *const ArrayDescriptor, dim: i32) -> 
         return 0;
     }
     let d = unsafe { &*desc };
-    if !d.is_allocated() {
+    if !d.is_allocated() && d.base_addr.is_null() {
         return 0;
     }
     let idx = (dim - 1) as usize;
