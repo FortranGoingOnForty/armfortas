@@ -532,12 +532,15 @@ ranked findings, reproducers, and fix ladder; the load-bearing ones:
 - **REGRESSION — stdlib no longer builds. → FIXED 2026-07-06** (#125). Two
   generic-dispatch bugs: (a) allocatable rank-N derived-type component
   dropped its declared rank (deferred-shape `index(:,:)` → empty dims →
-  inferred rank 1), blocked `sort_coo` at ~52% — carry `FieldLayout.rank`
-  and round-trip `@rank N` through .amod (f3ad081); (b) order-dependent
+  inferred rank 1), blocked `sort_coo` at ~52% — seed a deferred-shape
+  component's dims with `vec![(1, 0); rank]` so `dims.len()` keeps the
+  declared rank (landed upstream via the compiler-edges workstream;
+  behavioral regression test retained here); (b) order-dependent
   block-local scalar actual promoted to rank 1 via a foreign same-named
   rank-1 dummy from a USE'd module (`actual_expr_rank` any-scope fallback),
   blocked `dense()`/`check()` in the test exes — restrict the rank
-  cross-check to the current scope (267c8ce). Full `fpm test` now 1288/0,
+  cross-check to the current scope, reconciled with the upstream
+  descriptor/by-ref gate (267c8ce). Full `fpm test` now 1288/0,
   matching 976de26; gfortran control 1289/0. Regression tests in
   test_programs/ + tests/multifile.rs.
 - **memmove −1 length → SIGSEGV** on derived-type-with-allocatable-char
