@@ -220,6 +220,38 @@ fn no_input_after_flags_prints_help_and_mentions_missing_input() {
 }
 
 #[test]
+fn cpp_input_is_rejected_before_fortran_preprocessing() {
+    let src = write_program("#include <memory.h>\nint main() { return 0; }\n", "cpp");
+    let out = Command::new(compiler("armfortas"))
+        .arg(&src)
+        .output()
+        .expect("failed to spawn armfortas");
+    assert_eq!(out.status.code(), Some(1), "status: {:?}", out.status);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unsupported source file"),
+        "expected unsupported-source diagnostic, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains(".cpp is not a Fortran source"),
+        "expected extension-specific diagnostic, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("--cxx-compiler"),
+        "expected build-system guidance, got: {}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("cannot find include file"),
+        "C++ input should not enter the Fortran preprocessor: {}",
+        stderr
+    );
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn c_f_procpointer_associates_c_funptr_and_runs() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

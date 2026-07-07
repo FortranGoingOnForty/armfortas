@@ -124,6 +124,7 @@ pub enum ParsedCli {
 enum CliInputKind {
     FortranSource,
     LinkArtifact,
+    UnsupportedSource,
 }
 
 /// Compilation options.
@@ -1224,8 +1225,24 @@ fn classify_cli_input(path: &Path) -> CliInputKind {
         .map(|ext| ext.to_ascii_lowercase());
     match ext.as_deref() {
         Some("o" | "obj" | "a" | "dylib" | "so") => CliInputKind::LinkArtifact,
+        Some("c" | "cc" | "cpp" | "cxx" | "c++" | "h" | "hh" | "hpp" | "hxx" | "m" | "mm") => {
+            CliInputKind::UnsupportedSource
+        }
         _ => CliInputKind::FortranSource,
     }
+}
+
+fn unsupported_source_diagnostic(path: &Path) -> String {
+    let ext = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| format!(".{}", ext))
+        .unwrap_or_else(|| "this extension".to_string());
+    format!(
+        "unsupported source file '{}': {} is not a Fortran source; armfortas only compiles Fortran sources. Compile C/C++/Objective-C inputs with the matching compiler, or pass --c-compiler/--cxx-compiler through the build system.",
+        path.display(),
+        ext
+    )
 }
 
 fn validate_link_only_inputs(opts: &Options) -> Result<(), String> {
@@ -1260,6 +1277,12 @@ fn validate_link_only_inputs(opts: &Options) -> Result<(), String> {
 /// compilation and pure link steps based on the positional inputs.
 pub fn execute(opts: &Options) -> Result<(), String> {
     let inputs = all_input_paths(opts);
+    if let Some(input) = inputs
+        .iter()
+        .find(|path| classify_cli_input(path) == CliInputKind::UnsupportedSource)
+    {
+        return Err(unsupported_source_diagnostic(input));
+    }
     let has_source = inputs
         .iter()
         .any(|path| classify_cli_input(path) == CliInputKind::FortranSource);
