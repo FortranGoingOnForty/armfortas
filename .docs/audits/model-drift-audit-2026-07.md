@@ -24,6 +24,21 @@ dispatch gap on a type/rank/keyword, and fixes shaped like their reproducer
 (the typed-char-constructor and fpm-spelling cases). None have fixture
 coverage — which is why every suite is green while these ship.
 
+## Re-baseline 2026-07-06 (against origin/trunk 2a360a5d)
+
+After a parallel compiler-edges workstream merged ~60 commits (PR #111) into
+trunk, every still-open finding was re-run to avoid re-fixing what upstream
+already fixed. Reproducers in `scratchpad/rebaseline/`. Verdicts:
+
+- **Fixed upstream:** C9 (C_F_POINTER component shape, `size=10`), C11 (CLASS
+  mold=/source= dynamic type). Close both.
+- **Still open (compiler core):** C3, C4, C5, C6 (now an ICE), C7, C8 (now a
+  parse error), C10, C12. Eight of ten stand.
+- **Still open (unchanged — submodules the workstream never touched):**
+  afs-ld L3, L4, L6–L9; afs-as A5, A6; test-integrity T3 (silent-degrade
+  stubs survive), T4 (bencch drift).
+- Already fixed this session on trunk: C1, C2, A1–A4, L1/L2, T1, T2-grammar.
+
 ## Severity-ranked findings
 
 ### Compiler core (armfortas)
@@ -75,7 +90,10 @@ coverage — which is why every suite is green while these ship.
 - **C6 — untyped char array constructor with an array element corrupts.**
   Fix (c6e094a) is gated to the exact `[character(len=n) :: ...]` spelling fpm
   emits; the plain F2008 `c = [c, 'cc']` flattens into wrong-size slots.
-  `src/ir/lower/core.rs:42621`.
+  `src/ir/lower/core.rs:42621`. RE-BASELINED 2026-07-06: now an ICE, not a
+  miscompile — `x05 scope: no register class for Array(Int(I8), 2)` at
+  `src/codegen/x86/isel.rs:3046` (an I8 array reached isel unlowered). STILL
+  OPEN, arguably worse (hard panic).
 - **C7 — `real(16)`/`complex(16)` silently compile as single precision.**
   `src/ir/types.rs:170` (`8 => F64, _ => F32`); `kind` reports 4. A
   `complex(16)` result additionally corrupts the stack (ComplexBuffer sizing
@@ -85,15 +103,23 @@ coverage — which is why every suite is green while these ship.
   `write(*,*) (ia(i),i=1,3)` and `print *, (…)` drop all values;
   `parse_print` (`src/parser/stmt.rs:876`) uses a plain expr loop, not
   `parse_io_expr_list`. Pre-June; the most basic F77 output idiom.
+  RE-BASELINED 2026-07-06: `print *, (ia(i),i=1,3)` now a hard PARSE ERROR
+  (caret on the implied-do bound), not a silent blank. STILL OPEN — the
+  idiom still doesn't work, now loud instead of silent.
 - **C9 — C_F_POINTER with a component FPTR and non-constant SHAPE mis-sets
-  dims.** `src/ir/lower/intrinsic_sub.rs:796` (d1a8a12) recovers rank only for
-  a bare-name FPTR. `size(h%p)=1` after a rank-1 bind.
+  dims. FIXED upstream (compiler-edges workstream) — re-baselined 2026-07-06,
+  `size(h%p)=10` correct.** `src/ir/lower/intrinsic_sub.rs` now recovers the
+  rank via `c_f_pointer_shape_static_rank`/`fptr_rank` before the
+  `unwrap_or(0)` tail (that silent tail is a residual T3 item). Was:
+  recovers rank only for a bare-name FPTR, `size(h%p)=1` after a rank-1 bind.
 - **C10 — rank-2 deferred-length char element comparisons read as length 0.**
   `g(1,1)=='aa'` false after assignment; substring read works. rank==1-shaped
   guard in the June deferred-char cluster (153ea67).
 - **C11 — CLASS mold=/source= loses dynamic type / zeroes extension
-  components.** `allocate(dst,mold=child_poly)` allocates the declared type;
-  scalar `source=` copies only the base size. 7a05e24/567ed0e.
+  components. FIXED upstream (compiler-edges workstream) — re-baselined
+  2026-07-06:** `allocate(dst,mold=child)` now yields dynamic type `child`;
+  `source=` copies the extension (`10 20`). Was: mold allocated the declared
+  type; scalar `source=` copied only the base size. 7a05e24/567ed0e.
 - **C12 — internal WRITE deferred-length: reallocation regressed to silent
   truncation, expectations rewritten in the same commit.** 426a29d changed
   allocated deferred-length targets from F2023-conforming realloc (PR #64,
