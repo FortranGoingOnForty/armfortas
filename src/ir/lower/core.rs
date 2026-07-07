@@ -46956,9 +46956,7 @@ fn lower_allocated_component_through_descriptor_array_element(
         }
         Expr::ComponentAccess { .. } => {
             let info = component_array_local_info(b, locals, callee, st, tl)?;
-            if info.derived_type.is_none() {
-                return None;
-            }
+            info.derived_type.as_ref()?;
             info
         }
         _ => return None,
