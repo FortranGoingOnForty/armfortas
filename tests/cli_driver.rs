@@ -34681,6 +34681,50 @@ fn derived_function_result_keeps_unallocated_allocatable_char_components_unalloc
 }
 
 #[test]
+fn derived_function_result_named_cycle_can_assign_components() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=derived_function_result_named_cycle_can_assign_components count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type :: cycle_t\n    integer :: id = -1\n    logical :: finished = .true.\n  end type cycle_t\ncontains\n  function clear_cycle() result(cycle)\n    type(cycle_t) :: cycle\n    cycle%id = 42\n    cycle%finished = .false.\n  end function clear_cycle\nend module m\n\nprogram p\n  use m\n  implicit none\n  type(cycle_t) :: got\n  got = clear_cycle()\n  if (got%id /= 42) error stop 1\n  if (got%finished) error stop 2\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("derived_result_named_cycle", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("derived result named cycle compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "derived result named cycle compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("derived result named cycle run failed");
+    assert!(
+        run.status.success(),
+        "derived result named cycle run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected derived result named cycle output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn derived_array_growth_keeps_unallocated_allocatable_components_clear() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
