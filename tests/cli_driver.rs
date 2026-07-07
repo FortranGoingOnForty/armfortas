@@ -6443,6 +6443,45 @@ fn allocatable_array_element_component_intrinsics_do_not_escape() {
 }
 
 #[test]
+fn allocated_component_of_unallocated_allocatable_array_element_is_false() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocated_component_of_unallocated_allocatable_array_element_is_false count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type :: pane_t\n    integer :: value = 0\n  end type\n  type :: tab_t\n    integer :: pad(4096) = 0\n    type(pane_t), allocatable :: panes(:)\n  end type\n  type :: editor_t\n    type(tab_t), allocatable :: tabs(:)\n    integer :: active_tab_index = 1\n  end type\ncontains\n  subroutine sync_like(editor)\n    type(editor_t), intent(inout) :: editor\n    integer :: tab_idx\n    tab_idx = editor%active_tab_index\n    if (tab_idx < 1 .or. tab_idx > size(editor%tabs)) return\n    if (.not. allocated(editor%tabs(tab_idx)%panes)) return\n    error stop 2\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(editor_t) :: editor\n  if (size(editor%tabs) /= 0) error stop 1\n  call sync_like(editor)\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("allocated_unallocated_parent_element_component", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("unallocated parent element component allocated compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "unallocated parent element component allocated compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("unallocated parent element component allocated run failed to spawn");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unallocated parent element component allocated run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn allocated_intrinsic_on_class_component_chain_compiles_and_runs() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

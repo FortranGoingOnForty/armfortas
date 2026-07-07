@@ -46869,6 +46869,15 @@ pub(super) fn lower_scalar_allocated_intrinsic(
     let crate::ast::expr::SectionSubscript::Element(expr) = &first.value else {
         return None;
     };
+    if let Some(value) = lower_allocated_component_through_descriptor_array_element(
+        b,
+        locals,
+        expr,
+        st,
+        type_layouts,
+    ) {
+        return Some(value);
+    }
     let (desc, is_string) = match &expr.node {
         Expr::Name { name } => {
             let info = locals.get(&name.to_lowercase())?;
@@ -46907,6 +46916,100 @@ pub(super) fn lower_scalar_allocated_intrinsic(
     );
     let zero = b.const_i32(0);
     Some(b.icmp(CmpOp::Ne, raw, zero))
+}
+
+fn lower_allocated_component_through_descriptor_array_element(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> Option<ValueId> {
+    let tl = type_layouts?;
+    let Expr::ComponentAccess { base, component } = &expr.node else {
+        return None;
+    };
+    let Expr::FunctionCall { callee, args } = &base.node else {
+        return None;
+    };
+    if args
+        .iter()
+        .any(|arg| !matches!(arg.value, crate::ast::expr::SectionSubscript::Element(_)))
+    {
+        return None;
+    }
+
+    let parent_info = match &callee.node {
+        Expr::Name { name } => {
+            let info = locals.get(&name.to_lowercase())?;
+            if !local_uses_array_descriptor(info) || info.derived_type.is_none() {
+                return None;
+            }
+            info.clone()
+        }
+        Expr::ComponentAccess { .. } => {
+            let info = component_array_local_info(b, locals, callee, st, tl)?;
+            if info.derived_type.is_none() {
+                return None;
+            }
+            info
+        }
+        _ => return None,
+    };
+
+    let raw_type_name = parent_info.derived_type.as_ref()?.clone();
+    let scope_id =
+        callee_scope_id_for_lookup(st, b.func().name.as_str()).or_else(current_proc_scope);
+    let type_name = canonical_layout_type_name_for_scope(st, scope_id, &raw_type_name, tl)
+        .unwrap_or(raw_type_name);
+    let layout = tl.get(&type_name)?;
+    let field = layout_component_field_or_parent_view(layout, component, tl)?.clone();
+    let is_string = if matches!(field_char_kind(&field), CharKind::Deferred) && field.size == 32 {
+        true
+    } else if field.allocatable && field.size == 384 {
+        false
+    } else {
+        return None;
+    };
+
+    let parent_desc = array_descriptor_addr(b, &parent_info);
+    let parent_raw = b.call(
+        FuncRef::External("afs_array_allocated".into()),
+        vec![parent_desc],
+        IrType::Int(IntWidth::I32),
+    );
+    let zero = b.const_i32(0);
+    let parent_allocated = b.icmp(CmpOp::Ne, parent_raw, zero);
+    let present_bb = b.create_block("allocated_parent_present");
+    let absent_bb = b.create_block("allocated_parent_absent");
+    let merge_bb = b.create_block("allocated_parent_merge");
+    let result = b.add_block_param(merge_bb, IrType::Bool);
+    b.cond_branch(parent_allocated, present_bb, vec![], absent_bb, vec![]);
+
+    b.set_block(absent_bb);
+    let false_val = b.const_bool(false);
+    b.branch(merge_bb, vec![false_val]);
+
+    b.set_block(present_bb);
+    let elem_addr = lower_array_element(b, locals, &parent_info, args, st, Some(tl));
+    let offset = b.const_i64(field.offset as i64);
+    let desc = b.gep(elem_addr, vec![offset], IrType::Int(IntWidth::I8));
+    let runtime = if is_string {
+        "afs_string_allocated"
+    } else {
+        "afs_array_allocated"
+    };
+    let raw = b.call(
+        FuncRef::External(runtime.into()),
+        vec![desc],
+        IrType::Int(IntWidth::I32),
+    );
+    let zero = b.const_i32(0);
+    let child_allocated = b.icmp(CmpOp::Ne, raw, zero);
+    b.branch(merge_bb, vec![child_allocated]);
+
+    b.set_block(merge_bb);
+    Some(result)
 }
 
 pub(super) fn component_intrinsic_local_info(
