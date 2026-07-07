@@ -49914,6 +49914,129 @@ fn fortran_comment_c_block_marker_does_not_truncate_module() {
 }
 
 #[test]
+fn imported_recursive_allocatable_components_use_owner_dealloc_helper() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_recursive_allocatable_components_use_owner_dealloc_helper count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("imported_recursive_dealloc_helper");
+    let tree_api = write_program_in(
+        &dir,
+        "tree_api.f90",
+        "module tree_api\n  implicit none\n  type :: node_t\n    character(len=:), allocatable :: name\n    type(node_t), allocatable :: children(:)\n  end type\nend module\n",
+    );
+    let editor_api = write_program_in(
+        &dir,
+        "editor_api.f90",
+        "module editor_api\n  use tree_api, only: node_t\n  implicit none\n  type :: panel_t\n    type(node_t), allocatable :: symbols(:)\n  end type\ncontains\n  subroutine make_panel(panel)\n    type(panel_t), intent(out) :: panel\n    allocate(panel%symbols(1))\n    panel%symbols(1)%name = 'root'\n    allocate(panel%symbols(1)%children(1))\n    panel%symbols(1)%children(1)%name = 'child'\n  end subroutine\n  subroutine reset_panel(panel)\n    type(panel_t), intent(out) :: panel\n  end subroutine\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use editor_api, only: panel_t, make_panel, reset_panel\n  implicit none\n  type(panel_t) :: panel\n  call make_panel(panel)\n  if (.not. allocated(panel%symbols)) error stop 1\n  if (.not. allocated(panel%symbols(1)%children)) error stop 2\n  if (panel%symbols(1)%children(1)%name /= 'child') error stop 3\n  call reset_panel(panel)\n  if (allocated(panel%symbols)) error stop 4\n  print *, 'ok'\nend program\n",
+    );
+
+    let tree_obj = dir.join("tree_api.o");
+    let compile_tree = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            tree_api.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-o",
+            tree_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("tree API compile failed to spawn");
+    assert!(
+        compile_tree.status.success(),
+        "tree API compile failed: {}",
+        String::from_utf8_lossy(&compile_tree.stderr)
+    );
+
+    let editor_ir = dir.join("editor_api.ir");
+    let emit_editor = Command::new(compiler("armfortas"))
+        .args([
+            "--emit-ir",
+            editor_api.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-o",
+            editor_ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("editor API IR emit failed to spawn");
+    assert!(
+        emit_editor.status.success(),
+        "editor API IR emit failed: {}",
+        String::from_utf8_lossy(&emit_editor.stderr)
+    );
+    let ir_text = fs::read_to_string(&editor_ir).expect("cannot read editor API IR");
+    assert!(
+        ir_text.contains("call @afs_derived_tree_api_node_t_dealloc_desc"),
+        "imported recursive node_t descriptor cleanup should call the owner helper:\n{}",
+        ir_text
+    );
+
+    let editor_obj = dir.join("editor_api.o");
+    let main_obj = dir.join("main.o");
+    for (src, obj) in [(&editor_api, &editor_obj), (&main_src, &main_obj)] {
+        let compiled = Command::new(compiler("armfortas"))
+            .args([
+                "-c",
+                src.to_str().unwrap(),
+                "-I",
+                dir.to_str().unwrap(),
+                "-J",
+                dir.to_str().unwrap(),
+                "-o",
+                obj.to_str().unwrap(),
+            ])
+            .output()
+            .expect("recursive dealloc helper compile failed to spawn");
+        assert!(
+            compiled.status.success(),
+            "compile {} failed: {}",
+            src.display(),
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+    }
+
+    let bin = dir.join("p");
+    let link = Command::new(compiler("armfortas"))
+        .args([
+            tree_obj.to_str().unwrap(),
+            editor_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            bin.to_str().unwrap(),
+        ])
+        .output()
+        .expect("recursive dealloc helper link failed to spawn");
+    assert!(
+        link.status.success(),
+        "recursive dealloc helper link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+    let run = Command::new(&bin)
+        .output()
+        .expect("recursive dealloc helper run failed to spawn");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "recursive dealloc helper run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+#[test]
 fn use_only_generic_collects_all_bare_reexport_specifics() {
     let src = write_program(
         "module table_api\n  implicit none\n  type :: toml_table\n    integer :: n = 0\n  end type\n  type :: toml_array\n    integer :: n = 0\n  end type\n  interface get_value\n    module procedure get_child_array\n  end interface\ncontains\n  subroutine get_child_array(table, key, ptr, requested)\n    class(toml_table), intent(inout) :: table\n    character(*), intent(in) :: key\n    type(toml_array), pointer, intent(out) :: ptr\n    logical, intent(in), optional :: requested\n    nullify(ptr)\n  end subroutine\nend module\nmodule array_api\n  use table_api, only: toml_array\n  implicit none\n  interface get_value\n    module procedure get_elem_array\n  end interface\ncontains\n  subroutine get_elem_array(array, pos, ptr)\n    class(toml_array), intent(inout) :: array\n    integer, intent(in) :: pos\n    type(toml_array), pointer, intent(out) :: ptr\n    nullify(ptr)\n  end subroutine\nend module\nmodule build_api\n  use array_api\n  use table_api\n  implicit none\nend module\nmodule toml_api\n  use build_api\n  implicit none\nend module\nmodule user_m\n  use toml_api, only: toml_table, toml_array, get_value\n  implicit none\n  interface get_value\n    module procedure get_local_bool\n  end interface\ncontains\n  subroutine run(table, key)\n    type(toml_table), intent(inout) :: table\n    character(*), intent(in) :: key\n    type(toml_array), pointer :: children\n    call get_value(table, key, children, requested=.false.)\n  end subroutine\n  subroutine get_local_bool(table, key, value)\n    type(toml_table), intent(inout) :: table\n    character(*), intent(in) :: key\n    logical, intent(out) :: value\n    value = .false.\n  end subroutine\nend module\nprogram p\n  use user_m, only: run\n  use table_api, only: toml_table\n  type(toml_table) :: table\n  call run(table, 'items')\nend program\n",

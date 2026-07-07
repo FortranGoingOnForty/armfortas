@@ -544,19 +544,20 @@ fn derived_memory_helper_available_from_current_func(
         || func.starts_with(&format!("afs_derived_{}_", owner))
 }
 
-/// Extended gate for dealloc/copy walks: also callable from ANY function
-/// in this unit when the type's owner module is compiled locally, because
-/// `emit_derived_memory_helpers` emits a helper for every local-module
-/// type. This is what stops a routine that assembles derived types from
-/// many modules (fpm's `build_model`) from inlining every dealloc/copy
-/// walk and ballooning to 140k+ blocks. For separate compilation the only
-/// local module is the current one, so it collapses to the strict check.
-/// Not used for init (see the strict gate's note on the -O2 miscompile).
+/// Extended gate for dealloc/copy walks: owner-module helpers are external
+/// ABI helpers, so separate consumers may call them just like module
+/// procedures. This is what stops imported recursive derived layouts from
+/// being expanded inline forever (`type(node_t), allocatable :: children(:)`).
+/// For ownerless local layouts, fall back to the strict current-function
+/// check. Not used for init (see the strict gate's note on the -O2 miscompile).
 fn derived_memory_helper_available_xmodule(
     b: &FuncBuilder,
     layout: &crate::sema::type_layout::TypeLayout,
 ) -> bool {
     if let Some(owner) = layout.owner_module.as_ref() {
+        if !owner.is_empty() {
+            return true;
+        }
         if b.owner_module_is_local(&owner.to_lowercase()) {
             return true;
         }
