@@ -32,8 +32,8 @@ already fixed. Reproducers in `scratchpad/rebaseline/`. Verdicts:
 
 - **Fixed upstream:** C9 (C_F_POINTER component shape, `size=10`), C11 (CLASS
   mold=/source= dynamic type). Close both.
-- **Still open (compiler core):** C4, C5, C6 (now an ICE), C7, C8 (now a
-  parse error), C10, C12. (C3 fixed 2026-07-06.)
+- **Still open (compiler core):** C5, C6 (now an ICE), C7, C8 (now a
+  parse error), C10, C12. (C3, C4 fixed 2026-07-06.)
 - **Still open (unchanged — submodules the workstream never touched):**
   afs-ld L3, L4, L6–L9; afs-as A5, A6; test-integrity T3 (silent-degrade
   stubs survive), T4 (bencch drift).
@@ -94,8 +94,21 @@ already fixed. Reproducers in `scratchpad/rebaseline/`. Verdicts:
   `projected_scalar_component_local_info` bails on non-divisible records
   (pre-existing). Was: June component-projection work (c585e5e, 70a5e6b).
 - **C4 — elemental defined operators broadcast a scalar dispatch on array
-  operands.** `arr = arr + one` → `11 11 11` not `11 12 13`; through a
-  component it's opt-level-dependent garbage. `defined_binary_operator_result_rank`
+  operands. FIXED 2026-07-06.** `arr = arr + one` → `11 11 11` not
+  `11 12 13`: `lower_array_expr_descriptor` has no case for a defined
+  operator, so the RHS was evaluated as a scalar (one operator call on
+  element 0) and broadcast. `try_lower_defined_operator_array_assign`
+  now scalarizes `dest = <elemental defined-op tree>` into a `do
+  concurrent` of `dest(i) = left(i) <op> right(i)` (mirroring
+  `try_lower_elemental_array_assign`), so each element takes the correct
+  scalar operator path; `scalarize_elemental_operator_operand` recurses
+  through nested operators (`a + c + one`) and keeps scalar operands.
+  Fires only for elemental defined operators with a rank-1 destination and
+  a whole-array operand; non-elemental array-valued operators and
+  allocatable/nested-section forms bail to the existing path. Fixture
+  `test_programs/elemental_defined_operator_array.f90`. Residual:
+  allocatable destinations and RHS operands that are array sections rather
+  than whole-array names still broadcast. Was: `defined_binary_operator_result_rank`
   (4b3c7d2, `unwrap_or(0)` on actual ranks).
 - **C5 — FINDLOC ignores MASK= and BACK=.** a938b53. Silently returns the
   unmasked/forward result.
