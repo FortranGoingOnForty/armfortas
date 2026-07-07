@@ -28578,13 +28578,16 @@ pub(super) fn store_ac_values_at_off(
 
                     if let (Some(type_name), Some(tl)) = (derived_type, type_layouts) {
                         emit_derived_value_copy(b, tl, type_name, dest_ptr, src_ptr);
-                    } else if elem_bytes > 16 && matches!(elem_ty, IrType::Array(..)) {
+                    } else if matches!(elem_ty, IrType::Array(..)) {
                         // Aggregate element (e.g. character(len=N)): copy the
                         // whole element with memcpy. A load_typed(elem_ty)+store
-                        // of a large `[i8 x N]` value puts a multi-KB aggregate
-                        // "in a register" — x86 isel has no register class for
-                        // it (panics), and arm64 would emit a single 8-byte copy
-                        // (silent truncation). memcpy is correct on both.
+                        // of an `[i8 x N]` value puts the aggregate "in a
+                        // register" — x86 isel has a register class only for the
+                        // 8-byte and wide-pair array sizes, so any other char
+                        // length (`character(len=2)`, audit C6) panicked with
+                        // "no register class for Array(Int(I8), 2)"; arm64 would
+                        // emit a single 8-byte copy (silent truncation). memcpy
+                        // is correct for every element size on both targets.
                         b.call(
                             FuncRef::External("memcpy".into()),
                             vec![dest_ptr, src_ptr, step_bytes],
@@ -28682,6 +28685,20 @@ pub(super) fn store_ac_values_at_off(
                         let coerced = coerce_to_type(b, raw, elem_ty);
                         b.store(coerced, p);
                     }
+                } else if matches!(elem_ty, IrType::Int(IntWidth::I8))
+                    && matches!(b.func().value_type(raw), Some(IrType::Ptr(_)))
+                {
+                    // character(len=1) scalar element (audit C6). The literal
+                    // or expression lowers to a Ptr<i8> at the source
+                    // character; coerce_to_type(Ptr, i8) emits ptr_to_int +
+                    // int_trunc, storing the pointer's low address byte rather
+                    // than the character (silent corruption). Load the byte
+                    // from the pointer instead. (character(len>1) elements are
+                    // IrType::Array and copied via afs_assign_char_fixed above;
+                    // genuine integer(1) elements lower to a direct i8 value,
+                    // not a pointer, so they never reach this arm.)
+                    let byte = b.load_typed(raw, IrType::Int(IntWidth::I8));
+                    b.store(byte, p);
                 } else {
                     let coerced = coerce_to_type(b, raw, elem_ty);
                     b.store(coerced, p);
