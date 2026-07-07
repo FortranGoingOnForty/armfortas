@@ -32,8 +32,8 @@ already fixed. Reproducers in `scratchpad/rebaseline/`. Verdicts:
 
 - **Fixed upstream:** C9 (C_F_POINTER component shape, `size=10`), C11 (CLASS
   mold=/source= dynamic type). Close both.
-- **Still open (compiler core):** C5, C6 (now an ICE), C7, C8 (now a
-  parse error), C10, C12. (C3, C4 fixed 2026-07-06.)
+- **Still open (compiler core):** C6 (now an ICE), C7, C8 (now a
+  parse error), C10, C12. (C3, C4, C5 fixed 2026-07-06.)
 - **Still open (unchanged — submodules the workstream never touched):**
   afs-ld L3, L4, L6–L9; afs-as A5, A6; test-integrity T3 (silent-degrade
   stubs survive), T4 (bencch drift).
@@ -110,8 +110,15 @@ already fixed. Reproducers in `scratchpad/rebaseline/`. Verdicts:
   allocatable destinations and RHS operands that are array sections rather
   than whole-array names still broadcast. Was: `defined_binary_operator_result_rank`
   (4b3c7d2, `unwrap_or(0)` on actual ranks).
-- **C5 — FINDLOC ignores MASK= and BACK=.** a938b53. Silently returns the
-  unmasked/forward result.
+- **C5 — FINDLOC ignores MASK= and BACK=. FIXED 2026-07-06.** The inline
+  rank-1 scan (`lower_findloc_rank1_scalar`) read only value+dim and took
+  the first unconditional match. Now it reads slot 3 (mask) and slot 5
+  (back): each element's equality is `and`-ed with the mask truth (rank-1
+  logical array loaded per element, or a scalar logical), and under BACK
+  the early-exit-on-found is suppressed so the body's overwrite leaves the
+  last match. A mask that can't be lowered to an array/scalar logical bails
+  (never silently dropped). Fixture `test_programs/findloc_mask_back.f90`.
+  Was: a938b53, silently returned the unmasked/forward result.
 - **C6 — untyped char array constructor with an array element corrupts.**
   Fix (c6e094a) is gated to the exact `[character(len=n) :: ...]` spelling fpm
   emits; the plain F2008 `c = [c, 'cc']` flattens into wrong-size slots.
