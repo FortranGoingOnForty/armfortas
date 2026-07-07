@@ -36656,6 +36656,171 @@ pub(super) fn try_lower_elemental_array_assign(
     true
 }
 
+/// Rewrite one operand of an elemental defined-operator array assignment for
+/// element `loop_var`: a whole-array Name matching the destination becomes
+/// `name(i)`; a nested elemental defined operator (or paren) recurses so
+/// `a + b + c` scalarizes as `(a(i) + b(i)) + c(i)`; a scalar operand is kept
+/// as-is. Anything else with an array reference (a section, a shape-changing
+/// call) returns None so the caller bails to the existing path rather than
+/// emit a wrong element mapping. Sets `saw_array` when it indexes an array.
+fn scalarize_elemental_operator_operand(
+    operand: &crate::ast::expr::SpannedExpr,
+    loop_var: &str,
+    dest_info: &LocalInfo,
+    ctx: &LowerCtx,
+    saw_array: &mut bool,
+) -> Option<crate::ast::expr::SpannedExpr> {
+    if let Some((array_name, array_info)) = whole_array_named_info(&ctx.locals, operand) {
+        if array_info.allocatable
+            || array_info.dims.len() != 1
+            || !bulk_arrays_compatible(dest_info, &array_info)
+        {
+            return None;
+        }
+        *saw_array = true;
+        return Some(synth_indexed_array_expr(&array_name, loop_var, operand.span));
+    }
+    if let Expr::ParenExpr { inner } = &operand.node {
+        let mapped = scalarize_elemental_operator_operand(inner, loop_var, dest_info, ctx, saw_array)?;
+        return Some(crate::ast::Spanned::new(
+            Expr::ParenExpr {
+                inner: Box::new(mapped),
+            },
+            operand.span,
+        ));
+    }
+    if let Expr::BinaryOp { op, left, right } = &operand.node {
+        if let Some(specific) = resolve_defined_binary_operator_specific_by_semantics(
+            ctx.st,
+            Some(&ctx.locals),
+            Some(ctx.type_layouts),
+            op,
+            left,
+            right,
+        ) {
+            let is_elemental = ctx.elemental_funcs.contains(&specific.to_lowercase())
+                || ctx
+                    .st
+                    .find_symbol_any_scope(&specific)
+                    .is_some_and(|s| s.attrs.elemental);
+            if is_elemental {
+                let mapped_left =
+                    scalarize_elemental_operator_operand(left, loop_var, dest_info, ctx, saw_array)?;
+                let mapped_right =
+                    scalarize_elemental_operator_operand(right, loop_var, dest_info, ctx, saw_array)?;
+                return Some(crate::ast::Spanned::new(
+                    Expr::BinaryOp {
+                        op: op.clone(),
+                        left: Box::new(mapped_left),
+                        right: Box::new(mapped_right),
+                    },
+                    operand.span,
+                ));
+            }
+        }
+    }
+    if expr_contains_array_refs(operand, &ctx.locals) {
+        return None;
+    }
+    Some(operand.clone())
+}
+
+/// Audit C4: `arr = arr + one` where `+` is an ELEMENTAL defined operator on
+/// a derived type. `lower_array_expr_descriptor` has no case for a defined
+/// operator, so the assignment fell back to evaluating the RHS as a scalar
+/// (one operator call on element 0) and broadcasting it across the whole
+/// destination — `11 11 11` instead of `11 12 13`. Mirror
+/// `try_lower_elemental_array_assign`: rewrite to a `do concurrent` of the
+/// scalar element assignment `dest(i) = left(i) <op> right(i)`, so each
+/// element goes through the (correct) scalar defined-operator path. Fires
+/// only for elemental defined operators with at least one whole-array
+/// operand matching the rank-1 destination; anything else returns false and
+/// keeps the existing behavior. A non-elemental array-valued defined
+/// operator computes its whole result itself and must NOT be scalarized.
+pub(super) fn try_lower_defined_operator_array_assign(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    dest_name: &str,
+    dest_info: &LocalInfo,
+    value: &crate::ast::expr::SpannedExpr,
+) -> bool {
+    if dest_info.allocatable || dest_info.dims.len() != 1 {
+        return false;
+    }
+    let Expr::BinaryOp { op, left, right } = &value.node else {
+        return false;
+    };
+    // `resolve_...` returns Some only for a DEFINED operator (a user
+    // INTERFACE OPERATOR); intrinsic numeric ops go through the numeric
+    // descriptor path.
+    let Some(specific) = resolve_defined_binary_operator_specific_by_semantics(
+        ctx.st,
+        Some(&ctx.locals),
+        Some(ctx.type_layouts),
+        op,
+        left,
+        right,
+    ) else {
+        return false;
+    };
+    let is_elemental = ctx.elemental_funcs.contains(&specific.to_lowercase())
+        || ctx
+            .st
+            .find_symbol_any_scope(&specific)
+            .is_some_and(|s| s.attrs.elemental);
+    if !is_elemental {
+        return false;
+    }
+
+    let span = value.span;
+    let (dest_lower, dest_extent) = dest_info.dims[0];
+    let dest_upper = dest_lower + dest_extent - 1;
+    let loop_var = fresh_synth_loop_var(&ctx.locals);
+
+    // Index whole-array operands as `operand(i)`, recursing through nested
+    // elemental defined operators and parens; keep scalar operands as-is;
+    // bail on any other array reference rather than risk a wrong mapping.
+    let mut saw_array = false;
+    let Some(mapped_left) =
+        scalarize_elemental_operator_operand(left, &loop_var, dest_info, ctx, &mut saw_array)
+    else {
+        return false;
+    };
+    let Some(mapped_right) =
+        scalarize_elemental_operator_operand(right, &loop_var, dest_info, ctx, &mut saw_array)
+    else {
+        return false;
+    };
+    if !saw_array {
+        return false;
+    }
+
+    let target = synth_indexed_array_expr(dest_name, &loop_var, span);
+    let mapped_value = crate::ast::Spanned::new(
+        Expr::BinaryOp {
+            op: op.clone(),
+            left: Box::new(mapped_left),
+            right: Box::new(mapped_right),
+        },
+        span,
+    );
+    let body = vec![crate::ast::Spanned::new(
+        Stmt::Assignment {
+            target,
+            value: mapped_value,
+        },
+        span,
+    )];
+    let controls = vec![ConcurrentControl {
+        var: loop_var,
+        start: synth_int_expr(dest_lower, span),
+        end: synth_int_expr(dest_upper, span),
+        step: None,
+    }];
+    lower_do_concurrent(b, ctx, &None, &controls, None, &body, span);
+    true
+}
+
 pub(super) fn bulk_arrays_compatible(dest_info: &LocalInfo, other_info: &LocalInfo) -> bool {
     if dest_info.ty != other_info.ty {
         return false;

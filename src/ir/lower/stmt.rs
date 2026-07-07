@@ -1220,6 +1220,11 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     {
                                         return;
                                     }
+                                    if try_lower_defined_operator_array_assign(
+                                        b, ctx, name, &info, value,
+                                    ) {
+                                        return;
+                                    }
                                     let defined_unary_array_result =
                                         synth_defined_unary_array_result_call(ctx, value);
                                     let array_rhs =
