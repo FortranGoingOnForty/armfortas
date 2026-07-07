@@ -29306,6 +29306,17 @@ pub(super) fn lower_write_items_adv(
     advance: bool,
 ) {
     for item in items {
+        // io-implied-do (or plain array-constructor) output item, e.g.
+        // `write(*,*) (a(i), i=1,n)`. The parser wraps it as an
+        // ArrayConstructor carrying an ImpliedDo value — the same shape
+        // formatted output handles via lower_fmt_push_ac_values. Walk it here
+        // so list-directed / unformatted output writes every element; without
+        // this it lowered to a stack pointer and printed a zero-length string,
+        // i.e. a blank record (audit C8).
+        if let Expr::ArrayConstructor { values, .. } = &item.node {
+            lower_write_ac_values(b, ctx, values, unit);
+            continue;
+        }
         let generic_char_call = match &item.node {
             Expr::FunctionCall { callee, args } => {
                 if let Expr::Name { name } = &callee.node {
@@ -29630,6 +29641,119 @@ pub(super) fn lower_write_items_adv(
             vec![unit],
             IrType::Void,
         );
+    }
+}
+
+/// List-directed / unformatted analog of `lower_fmt_push_ac_values`: walk an
+/// array-constructor's values (as produced for an io-implied-do output item
+/// like `write(*,*) (a(i), i=1,n)`) and write each element inline with the
+/// per-element writer, no trailing newline. Audit C8.
+fn lower_write_ac_values(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    values: &[AcValue],
+    unit: ValueId,
+) {
+    for value in values {
+        match value {
+            AcValue::Expr(expr) => {
+                if let Expr::ArrayConstructor { values: nested, .. } = &expr.node {
+                    lower_write_ac_values(b, ctx, nested, unit);
+                } else {
+                    // Reuse the per-item dispatch for one element; advance=false
+                    // so the enclosing WRITE/PRINT emits the record newline once.
+                    lower_write_items_adv(b, ctx, std::slice::from_ref(expr), unit, false);
+                }
+            }
+            AcValue::ImpliedDo(ido) => lower_write_ac_implied_do(b, ctx, ido, unit),
+        }
+    }
+}
+
+/// List-directed / unformatted analog of `lower_fmt_push_ac_implied_do`:
+/// run the implied-do loop, writing its body values each iteration. The loop
+/// scaffolding matches the formatted path exactly; only the body writer
+/// differs. Audit C8.
+fn lower_write_ac_implied_do(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    ido: &crate::ast::expr::ImpliedDoLoop,
+    unit: ValueId,
+) {
+    let var_ty = IrType::Int(IntWidth::I32);
+    let var_addr = b.alloca(var_ty.clone());
+    let start_raw = super::expr::lower_expr_ctx(b, ctx, &ido.start);
+    let start_val = coerce_to_type(b, start_raw, &var_ty);
+    b.store(start_val, var_addr);
+
+    let end_raw = super::expr::lower_expr_ctx(b, ctx, &ido.end);
+    let end_val = coerce_to_type(b, end_raw, &var_ty);
+    let step_raw = match &ido.step {
+        Some(step) => super::expr::lower_expr_ctx(b, ctx, step),
+        None => b.const_i32(1),
+    };
+    let step_val = coerce_to_type(b, step_raw, &var_ty);
+
+    let old_local = ctx.locals.insert(
+        ido.var.to_lowercase(),
+        LocalInfo {
+            addr: var_addr,
+            ty: var_ty,
+            dims: vec![],
+            allocatable: false,
+            descriptor_arg: false,
+            by_ref: false,
+            char_kind: CharKind::None,
+            derived_type: None,
+            inline_const: None,
+            is_pointer: false,
+            runtime_dim_upper: vec![],
+            is_class: false,
+            logical_kind: None,
+            last_dim_assumed_size: false,
+        },
+    );
+
+    let check = b.create_block("write_ac_impdo_check");
+    let body = b.create_block("write_ac_impdo_body");
+    let exit = b.create_block("write_ac_impdo_exit");
+    b.branch(check, vec![]);
+
+    b.set_block(check);
+    let cur_var = b.load(var_addr);
+    let const_step = ido.step.as_ref().and_then(eval_const_int);
+    if let Some(sv) = const_step {
+        let cmp_op = if sv < 0 { CmpOp::Ge } else { CmpOp::Le };
+        let keep_going = b.icmp(cmp_op, cur_var, end_val);
+        b.cond_branch(keep_going, body, vec![], exit, vec![]);
+    } else {
+        let zero = b.const_i32(0);
+        let step_neg = b.icmp(CmpOp::Lt, step_val, zero);
+        let neg_check = b.create_block("write_ac_impdo_neg_check");
+        let pos_check = b.create_block("write_ac_impdo_pos_check");
+        b.cond_branch(step_neg, neg_check, vec![], pos_check, vec![]);
+
+        b.set_block(neg_check);
+        let keep_going_neg = b.icmp(CmpOp::Ge, cur_var, end_val);
+        b.cond_branch(keep_going_neg, body, vec![], exit, vec![]);
+
+        b.set_block(pos_check);
+        let keep_going_pos = b.icmp(CmpOp::Le, cur_var, end_val);
+        b.cond_branch(keep_going_pos, body, vec![], exit, vec![]);
+    }
+
+    b.set_block(body);
+    lower_write_ac_values(b, ctx, &ido.values, unit);
+    let cur_at_end = b.load(var_addr);
+    let next = b.iadd(cur_at_end, step_val);
+    b.store(next, var_addr);
+    b.branch(check, vec![]);
+
+    b.set_block(exit);
+    if let Some(prev) = old_local {
+        ctx.locals.insert(ido.var.to_lowercase(), prev);
+    } else {
+        ctx.locals.remove(&ido.var.to_lowercase());
     }
 }
 

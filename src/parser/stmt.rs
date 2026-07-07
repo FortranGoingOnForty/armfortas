@@ -875,12 +875,13 @@ impl<'a> Parser<'a> {
         };
         let mut items = Vec::new();
         if self.eat(&TokenKind::Comma) {
-            loop {
-                items.push(self.parse_expr()?);
-                if !self.eat(&TokenKind::Comma) {
-                    break;
-                }
-            }
+            // Share the WRITE/READ item-list parser so a PRINT output list
+            // accepts io-implied-do items — `print *, (a(i), i=1,n)` and the
+            // formatted `print '(...)' , (a(i), i=1,n)`. A plain parse_expr
+            // loop read the implied-do's `var=` as a parse error (audit C8);
+            // parse_io_expr_list disambiguates a real implied-do from a
+            // parenthesized expression by trying and restoring on failure.
+            items = self.parse_io_expr_list()?;
         }
         let span = span_from_to(start, self.prev_span());
         Ok(Spanned::new(Stmt::Print { format, items }, span))
