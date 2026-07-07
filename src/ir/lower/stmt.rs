@@ -7384,11 +7384,28 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         && remap_args.iter().all(|a| {
                             matches!(a.value, crate::ast::expr::SectionSubscript::Range { .. })
                         });
-                    if is_remap_target
-                        && all_ranges
-                        && lower_rank_remap_pointer_assignment(b, ctx, &tgt_key, &remap_args, value)
-                    {
-                        return;
+                    if is_remap_target && all_ranges {
+                        if lower_bounds_remap_pointer_assignment(
+                            b,
+                            ctx,
+                            &tgt_key,
+                            &remap_args,
+                            value,
+                        ) || lower_rank_remap_pointer_assignment(
+                            b,
+                            ctx,
+                            &tgt_key,
+                            &remap_args,
+                            value,
+                        ) {
+                            return;
+                        }
+                        eprintln!(
+                            "armfortas: error: {}:{}: pointer bounds remapping shape is not implemented yet",
+                            stmt.span.start.line, stmt.span.start.col
+                        );
+                        let _ = std::io::stderr().flush();
+                        std::process::exit(1);
                     }
                 }
             }

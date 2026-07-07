@@ -34754,6 +34754,95 @@ pub(super) fn store_byte_aggregate_field(
     b.store(stored, ptr);
 }
 
+/// Same-rank pointer bounds remapping:
+///   `p(L1[:U1], ...) => target`
+///
+/// The RHS descriptor already knows the target base address, extent, and
+/// memory stride. Copy it into the pointer slot, then rewrite the exposed
+/// Fortran bounds to start at the LHS lower bounds while preserving each
+/// dimension's RHS extent and stride.
+pub(super) fn lower_bounds_remap_pointer_assignment(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    tgt_key: &str,
+    target_args: &[crate::ast::expr::Argument],
+    value: &crate::ast::expr::SpannedExpr,
+) -> bool {
+    let Some(tgt_info) = ctx.locals.get(tgt_key).cloned() else {
+        return false;
+    };
+    if !tgt_info.is_pointer || !local_uses_array_descriptor(&tgt_info) {
+        return false;
+    }
+    let Some(source_rank) = actual_expr_rank(value, &ctx.locals, ctx.st, Some(ctx.type_layouts))
+    else {
+        return false;
+    };
+    if source_rank == 0 || source_rank != target_args.len() {
+        return false;
+    }
+    if target_args.iter().any(|arg| {
+        !matches!(
+            arg.value,
+            crate::ast::expr::SectionSubscript::Range { stride: None, .. }
+        )
+    }) {
+        return false;
+    }
+
+    let Some((src_desc, _elem_ty)) = lower_array_expr_descriptor(
+        b,
+        &ctx.locals,
+        value,
+        ctx.st,
+        Some(ctx.type_layouts),
+        Some(ctx.internal_funcs),
+        Some(ctx.contained_host_refs),
+        Some(ctx.descriptor_params),
+    ) else {
+        return false;
+    };
+
+    let tgt_desc = array_descriptor_addr(b, &tgt_info);
+    let size = b.const_i64(384);
+    b.call(
+        FuncRef::External("memcpy".into()),
+        vec![tgt_desc, src_desc, size],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+
+    let one = b.const_i64(1);
+    for (i, arg) in target_args.iter().enumerate() {
+        let crate::ast::expr::SectionSubscript::Range { start, .. } = &arg.value else {
+            return false;
+        };
+        let dim_off = 24 + (i as i64) * 24;
+        let old_lo = load_array_desc_i64_field(b, tgt_desc, dim_off);
+        let old_hi = load_array_desc_i64_field(b, tgt_desc, dim_off + 8);
+        let old_span = b.isub(old_hi, old_lo);
+        let old_extent = b.iadd(old_span, one);
+        let new_lo = start
+            .as_ref()
+            .map(|expr| {
+                let raw = super::expr::lower_expr_ctx(b, ctx, expr);
+                widen_idx_to_i64(b, raw)
+            })
+            .unwrap_or(one);
+        let new_hi_exclusive = b.iadd(new_lo, old_extent);
+        let new_hi = b.isub(new_hi_exclusive, one);
+        store_byte_aggregate_field(b, tgt_desc, dim_off, IrType::Int(IntWidth::I64), new_lo);
+        store_byte_aggregate_field(
+            b,
+            tgt_desc,
+            dim_off + 8,
+            IrType::Int(IntWidth::I64),
+            new_hi,
+        );
+    }
+
+    true
+}
+
 /// F2018 §10.2.2.3 rank-remapping pointer assignment:
 ///   `pmat(L1:U1, L2:U2, ...) => array1d`
 /// Build a multi-rank descriptor in the LHS pointer slot pointing at
