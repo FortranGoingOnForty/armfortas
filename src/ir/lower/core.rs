@@ -40189,6 +40189,8 @@ pub(super) fn lower_rank1_elemental_call_descriptor(
         Vec::new();
     let mut control_desc = None;
     let mut control_rank = None;
+    let mut fallback_control_desc = None;
+    let mut fallback_control_rank = None;
     let mut mapped_callee = callee.clone();
 
     match &callee.node {
@@ -40316,8 +40318,13 @@ pub(super) fn lower_rank1_elemental_call_descriptor(
                 expr_is_character_expr(b, locals, actual_expr, st, type_layouts);
             let pass_optional_element_by_ref =
                 !actual_is_character && elemental_actual_may_be_absent(actual_expr, locals, st);
-            control_desc.get_or_insert(actual_desc);
-            control_rank.get_or_insert(actual_rank);
+            if pass_optional_element_by_ref {
+                fallback_control_desc.get_or_insert(actual_desc);
+                fallback_control_rank.get_or_insert(actual_rank);
+            } else {
+                control_desc.get_or_insert(actual_desc);
+                control_rank.get_or_insert(actual_rank);
+            }
             let temp_name = fresh_elemental_temp_name(&loop_locals, "afs_elem_arg", idx);
             let mut char_kind = CharKind::None;
             let temp_addr = if pass_optional_element_by_ref {
@@ -40476,8 +40483,8 @@ pub(super) fn lower_rank1_elemental_call_descriptor(
         }
     }
 
-    let control_desc = control_desc?;
-    let control_rank = control_rank.unwrap_or(1).max(1);
+    let control_desc = control_desc.or(fallback_control_desc)?;
+    let control_rank = control_rank.or(fallback_control_rank).unwrap_or(1).max(1);
     let result_type = operator_expr_type_info(expr, Some(locals), st, type_layouts)?;
     let (result_elem_ty, result_char_len) = match result_type {
         crate::sema::symtab::TypeInfo::Character { len: Some(len), .. } => {
