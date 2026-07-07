@@ -365,6 +365,30 @@ fn is_c_interop_pointer_typespec(ts: &crate::ast::decl::TypeSpec) -> bool {
     )
 }
 
+/// Evaluate a REAL/COMPLEX kind selector to a concrete kind value when
+/// it is an integer literal or a named integer constant in scope (a
+/// PARAMETER such as `dp`, or an ISO_FORTRAN_ENV name like `real64`).
+/// Returns None when the kind can't be determined statically — the
+/// caller must not reject on an unknown kind. `real*16` (the old-style
+/// `Star` selector) is evaluated the same way.
+fn eval_real_complex_kind(ctx: &Ctx<'_>, sel: &Option<crate::ast::decl::KindSelector>) -> Option<u8> {
+    use crate::ast::decl::KindSelector;
+    use crate::ast::expr::Expr;
+    let (KindSelector::Expr(e) | KindSelector::Star(e)) = sel.as_ref()?;
+    match &e.node {
+        Expr::IntegerLiteral { text, .. } => text.parse::<u8>().ok(),
+        Expr::Name { name } => {
+            let key = name.to_lowercase();
+            ctx.st
+                .lookup_in(ctx.scope_id, &key)
+                .or_else(|| ctx.st.find_symbol_any_scope(&key))
+                .and_then(|sym| sym.const_value)
+                .and_then(|v| u8::try_from(v).ok())
+        }
+        _ => None,
+    }
+}
+
 fn checked_int_value(value: i128, kind: u8, span: Span) -> Result<ConstIntValue, ConstIntError> {
     let Some((min, max)) = int_kind_bounds(kind) else {
         return Ok(ConstIntValue { value, kind });
@@ -2214,6 +2238,31 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
                     );
                 }
             }
+            // A prefix return type of real(16)/complex(16) — or any
+            // real/complex kind outside {4, 8} — silently computes the
+            // result in single precision (no backend float wider than 64
+            // bits). The `result(r)` body-declaration spelling is caught by
+            // validate_decls; the prefix `real(16) function f()` spelling is
+            // checked here. Audit finding C7.
+            if let Some(TypeSpec::Real(sel) | TypeSpec::Complex(sel)) = &return_type {
+                if let Some(k) = eval_real_complex_kind(ctx, sel) {
+                    if k != 4 && k != 8 {
+                        let what = if matches!(return_type, Some(TypeSpec::Complex(_))) {
+                            "COMPLEX"
+                        } else {
+                            "REAL"
+                        };
+                        ctx.error(
+                            unit.span,
+                            format!(
+                                "{what}(kind={k}) function result is not supported: the backend \
+                                 has no float wider than 64 bits, so only kind 4 and kind 8 exist. \
+                                 (Previously this was silently computed in single precision.)"
+                            ),
+                        );
+                    }
+                }
+            }
             ctx.in_pure = prefix.iter().any(|p| matches!(p, Prefix::Pure));
             ctx.in_elemental = prefix.iter().any(|p| matches!(p, Prefix::Elemental));
             let is_impure = prefix.iter().any(|p| matches!(p, Prefix::Impure));
@@ -2444,6 +2493,36 @@ fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
                     "the VALUE attribute on derived-type dummies is not supported yet \
                      (by-value aggregate passing is a separate calling-convention change)",
                 );
+            }
+
+            // real(16)/complex(16) (IEEE quad) — and any other real/complex
+            // kind outside {4, 8} — were silently downgraded to single
+            // precision: the IR maps kind 8 -> f64 and every other kind ->
+            // f32 (src/ir/types.rs float_from_kind), so kind() reported 4 and
+            // the value was computed in single precision; a complex(16)
+            // result additionally mis-sized its buffer and SIGSEGV'd at exit.
+            // The backend has no float wider than 64 bits, so reject the
+            // unsupported kind loudly instead of miscompiling. Audit finding
+            // C7. Only reject when the kind evaluates to a definite value —
+            // an unresolved kind selector is left alone.
+            if let TypeSpec::Real(sel) | TypeSpec::Complex(sel) = type_spec {
+                if let Some(k) = eval_real_complex_kind(ctx, sel) {
+                    if k != 4 && k != 8 {
+                        let what = if matches!(type_spec, TypeSpec::Complex(_)) {
+                            "COMPLEX"
+                        } else {
+                            "REAL"
+                        };
+                        ctx.error(
+                            decl.span,
+                            format!(
+                                "{what}(kind={k}) is not supported: the backend has no float \
+                                 wider than 64 bits, so only kind 4 and kind 8 exist. \
+                                 (Previously this was silently computed in single precision.)"
+                            ),
+                        );
+                    }
+                }
             }
 
             // Deferred-length character must be allocatable or pointer.

@@ -626,6 +626,17 @@ Memmove -1 crash split into two bugs (2026-07-06):
   watch test_watch_filters. Distinct bug — assertion-level, needs its own
   reduction. Owner: TBD (behavioral, not the crash class).
 
+- **KIND() on a complex value always returns 4** (found while fixing C7,
+  2026-07-06). `complex(8) :: q; kind(q)` reports 4, not 8, even though the
+  value is stored and computed in full double precision (`real(q)` of
+  `1.0_8/3.0_8` prints 15 correct digits). The kind intrinsic on a complex
+  operand ignores the component kind. Separate from C7 (which is about
+  real(16)/complex(16) being rejected) — the value is correct, only the
+  reported kind is wrong. Low severity, no fixture yet. Would live near the
+  kind-inquiry lowering; the C7 OK fixture
+  (`real_kind_supported_ok.f90`) deliberately proves complex(8) precision
+  via arithmetic instead of `kind()` to route around it.
+
 Other verified miscompiles (details + repros in the audit doc), all with
 zero fixture coverage: reduction vectorizer drops elementwise stores at
 -O3/-Ofast (C1, arm64 likely too); BIND(C) aggregate ABI is dead code,
