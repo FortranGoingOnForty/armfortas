@@ -9,7 +9,7 @@
 //! - Unit 0 → stderr
 //! - * in I/O statements → unit 5 (read) or 6 (write)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::sync::Mutex;
@@ -145,7 +145,7 @@ struct Unit {
     /// Record length for direct access (in bytes). None for sequential/stream.
     recl: Option<i64>,
     /// Buffered tokens from the current input record for list-directed READ.
-    read_tokens: Vec<String>,
+    read_tokens: VecDeque<String>,
     /// Cached formatted input record for the current READ statement.
     formatted_read_record: Option<String>,
     /// Cursor within a cached formatted input record for ADVANCE='NO' reads.
@@ -240,17 +240,22 @@ impl Unit {
                 r.read_line(&mut line)?;
             }
             UnitStream::FileRaw(f) => {
-                let mut byte = [0u8; 1];
+                let mut buf = [0u8; 8192];
                 loop {
-                    match f.read(&mut byte)? {
+                    match f.read(&mut buf)? {
                         0 => break,
-                        1 => {
-                            line.push(byte[0] as char);
-                            if byte[0] == b'\n' {
+                        n => {
+                            let newline_pos = buf[..n].iter().position(|&b| b == b'\n');
+                            let take = newline_pos.map_or(n, |pos| pos + 1);
+                            line.extend(buf[..take].iter().map(|&b| b as char));
+                            if let Some(pos) = newline_pos {
+                                let unread = n - (pos + 1);
+                                if unread > 0 {
+                                    f.seek(SeekFrom::Current(-(unread as i64)))?;
+                                }
                                 break;
                             }
                         }
-                        _ => unreachable!(),
                     }
                 }
             }
@@ -268,8 +273,8 @@ impl Unit {
     /// Reads a new line if the token buffer is empty.
     fn next_read_token(&mut self) -> io::Result<Option<String>> {
         // Consume from buffer first.
-        if !self.read_tokens.is_empty() {
-            return Ok(Some(self.read_tokens.remove(0)));
+        if let Some(token) = self.read_tokens.pop_front() {
+            return Ok(Some(token));
         }
         // Read a new line and tokenize.
         let line = self.read_line()?;
@@ -278,7 +283,7 @@ impl Unit {
             return Ok(None); // EOF or blank line
         }
         // Split on whitespace and commas.
-        let tokens: Vec<String> = trimmed
+        let tokens: VecDeque<String> = trimmed
             .split(|c: char| c.is_whitespace() || c == ',')
             .filter(|s| !s.is_empty())
             .map(String::from)
@@ -287,7 +292,7 @@ impl Unit {
             return Ok(None);
         }
         self.read_tokens = tokens;
-        Ok(Some(self.read_tokens.remove(0)))
+        Ok(self.read_tokens.pop_front())
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -377,7 +382,7 @@ impl IoState {
                 form: Form::Formatted,
                 action: Action::Read,
                 recl: None,
-                read_tokens: Vec::new(),
+                read_tokens: VecDeque::new(),
                 formatted_read_record: None,
                 formatted_read_cursor: 0,
                 scratch: false,
@@ -397,7 +402,7 @@ impl IoState {
                 form: Form::Formatted,
                 action: Action::Write,
                 recl: None,
-                read_tokens: Vec::new(),
+                read_tokens: VecDeque::new(),
                 formatted_read_record: None,
                 formatted_read_cursor: 0,
                 scratch: false,
@@ -417,7 +422,7 @@ impl IoState {
                 form: Form::Formatted,
                 action: Action::Write,
                 recl: None,
-                read_tokens: Vec::new(),
+                read_tokens: VecDeque::new(),
                 formatted_read_record: None,
                 formatted_read_cursor: 0,
                 scratch: false,
@@ -742,7 +747,7 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
                             .as_ref()
                             .and_then(|(_, _, _, _, existing_recl)| *existing_recl)
                     },
-                    read_tokens: Vec::new(),
+                    read_tokens: VecDeque::new(),
                     formatted_read_record: None,
                     formatted_read_cursor: 0,
                     scratch: is_scratch,
