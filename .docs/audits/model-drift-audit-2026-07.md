@@ -32,8 +32,8 @@ already fixed. Reproducers in `scratchpad/rebaseline/`. Verdicts:
 
 - **Fixed upstream:** C9 (C_F_POINTER component shape, `size=10`), C11 (CLASS
   mold=/source= dynamic type). Close both.
-- **Still open (compiler core):** C7, C8 (now a parse error), C10, C12.
-  (C3, C4, C5, C6 fixed 2026-07-06.)
+- **Still open (compiler core):** C8 (now a parse error), C10, C12.
+  (C3, C4, C5, C6, C7 fixed 2026-07-06.)
 - **Still open (unchanged — submodules the workstream never touched):**
   afs-ld L3, L4, L6–L9; afs-as A5, A6; test-integrity T3 (silent-degrade
   stubs survive), T4 (bencch drift).
@@ -135,11 +135,22 @@ already fixed. Reproducers in `scratchpad/rebaseline/`. Verdicts:
   to a direct i8 value, not a pointer, so they don't reach the new arm.
   Fixture `test_programs/char_array_constructor.f90` covers len 1/2/3 array +
   scalar elements at every opt level.
-- **C7 — `real(16)`/`complex(16)` silently compile as single precision.**
-  `src/ir/types.rs:170` (`8 => F64, _ => F32`); `kind` reports 4. A
-  `complex(16)` result additionally corrupts the stack (ComplexBuffer sizing
-  "falls back to sp") → correct-looking single-precision output then SIGSEGV
-  at exit. Pre-June; should be a loud unsupported-kind error.
+- **C7 — `real(16)`/`complex(16)` silently compile as single precision.
+  LOUD-REJECTED 2026-07-06 (c04476c2).** `src/ir/types.rs float_from_kind`
+  maps `8 => F64, _ => F32`, so `real(16)` reported `kind 4` and computed in
+  single precision; a `complex(16)` result also mis-sized its buffer and
+  SIGSEGV'd at exit. The backend has no >64-bit float, so sema now rejects any
+  real/complex kind outside {4, 8} — on a declaration (`validate_decls`) and
+  on a prefix function-result type (`validate_unit`), via a scoped
+  `eval_real_complex_kind` that resolves integer literals and named integer
+  constants (`dp`, `real128`). Only rejects a definite kind; an unresolved
+  selector is left alone. Covers `real(16)`, `real*16`, `real(real128)`,
+  `real(qp)`, `complex(16)`, and both function-result spellings. Fixtures
+  `real_complex_kind16_rejected.f90` (ERROR_EXPECTED) +
+  `real_kind_supported_ok.f90`. Residuals (noted_items.md): a bare `1.0_16`
+  literal still reports kind 4 (no literal-kind validation hook), and `kind()`
+  on any complex returns 4 regardless of component kind (separate pre-existing
+  bug — the value itself is correct double precision).
 - **C8 — implied-do list-directed output prints a blank record.**
   `write(*,*) (ia(i),i=1,3)` and `print *, (…)` drop all values;
   `parse_print` (`src/parser/stmt.rs:876`) uses a plain expr loop, not
