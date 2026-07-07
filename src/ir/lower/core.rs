@@ -24800,25 +24800,34 @@ pub(super) fn lower_string_expr_full(
                     _ => {}
                 }
 
-                // Character array element: words(i) — return the
-                // element's string pointer and element length.
-                if args.len() == 1 {
-                    if let crate::ast::expr::SectionSubscript::Element(_) = &args[0].value {
-                        if let Some(info) = locals.get(&key) {
-                            if (info.char_kind != CharKind::None
-                                || descriptor_backed_runtime_char_array(info))
-                                && (!info.dims.is_empty() || local_uses_array_descriptor(info))
-                            {
-                                if let Some(result) = char_array_element_ptr_and_len(
-                                    b,
-                                    locals,
-                                    info,
-                                    args,
-                                    st,
-                                    type_layouts,
-                                ) {
-                                    return result;
-                                }
+                // Character array element: words(i), or a rank-N element
+                // g(i,j). Every subscript must be a scalar Element — a Range
+                // means a section or substring (handled below). Gating on
+                // args.len()==1 meant a rank-2+ element g(i,j) fell through to
+                // the generic call path and read length 0 (audit C10);
+                // char_array_element_ptr_and_len / compute_flat_elem_offset
+                // already fold every subscript into the flat offset, so a
+                // scalar element of any rank works once the single-subscript
+                // gate is lifted.
+                if !args.is_empty()
+                    && args.iter().all(|a| {
+                        matches!(a.value, crate::ast::expr::SectionSubscript::Element(_))
+                    })
+                {
+                    if let Some(info) = locals.get(&key) {
+                        if (info.char_kind != CharKind::None
+                            || descriptor_backed_runtime_char_array(info))
+                            && (!info.dims.is_empty() || local_uses_array_descriptor(info))
+                        {
+                            if let Some(result) = char_array_element_ptr_and_len(
+                                b,
+                                locals,
+                                info,
+                                args,
+                                st,
+                                type_layouts,
+                            ) {
+                                return result;
                             }
                         }
                     }
