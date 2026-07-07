@@ -1453,6 +1453,11 @@ fn strip_c_block_comments_from_line(line: &str, in_block: &mut bool) -> String {
             continue;
         }
 
+        if bytes[i] == b'!' {
+            result.push_str(&line[i..]);
+            break;
+        }
+
         if bytes[i] == b'\'' || bytes[i] == b'"' {
             let quote = bytes[i];
             result.push(quote as char);
@@ -1850,6 +1855,21 @@ mod tests {
     fn no_expansion_in_comment() {
         let out = pp_with("x = 1 ! FOO comment\n", &[("FOO", "BAR")]);
         assert!(out.contains("! FOO comment"));
+    }
+
+    #[test]
+    fn c_block_marker_inside_fortran_comment_does_not_hide_following_source() {
+        let out = pp("! Handle delimiter /* in prose\ninteger :: still_here\n");
+        assert!(
+            out.contains("! Handle delimiter /* in prose"),
+            "Fortran comment was corrupted: {:?}",
+            out
+        );
+        assert!(
+            out.contains("integer :: still_here"),
+            "source after Fortran comment was hidden: {:?}",
+            out
+        );
     }
 
     #[test]
