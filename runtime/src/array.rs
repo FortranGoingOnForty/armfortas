@@ -3271,10 +3271,17 @@ fn logical_desc_value(desc: &ArrayDescriptor, index: usize) -> bool {
     if desc.base_addr.is_null() || desc.rank < 1 {
         return false;
     }
-    let stride = desc.dims[0].stride.max(1) as usize;
-    let elem_size = desc.elem_size.max(1) as usize;
-    let byte_offset = index.saturating_mul(stride).saturating_mul(elem_size);
-    let ptr = unsafe { desc.base_addr.add(byte_offset) };
+    let rank = desc.rank as usize;
+    let elem_size = desc.elem_size.max(1);
+    let mut linear = index;
+    let mut byte_offset = 0i64;
+    for d in 0..rank {
+        let extent = desc.dims[d].extent().max(1) as usize;
+        let coord = (linear % extent) as i64;
+        linear /= extent;
+        byte_offset += coord * desc.dims[d].stride * elem_size;
+    }
+    let ptr = unsafe { desc.base_addr.offset(byte_offset as isize) };
     unsafe { *ptr != 0 }
 }
 
@@ -3285,13 +3292,20 @@ pub extern "C" fn afs_array_any_logical(desc: *const ArrayDescriptor) -> i32 {
         return 0;
     }
     let d = unsafe { &*desc };
-    let n = d.total_elements().max(0) as usize;
-    for i in 0..n {
-        if logical_desc_value(d, i) {
-            return 1;
-        }
+    if d.base_addr.is_null() {
+        return 0;
     }
-    0
+    let mut found = false;
+    for_each_element_byte_offset(d, |byte_off| unsafe {
+        if mask_byte_offset_is_true(d, byte_off) {
+            found = true;
+        }
+    });
+    if found {
+        1
+    } else {
+        0
+    }
 }
 
 /// ALL(array) for logical arrays — return 1 when every element is true.
@@ -3301,13 +3315,20 @@ pub extern "C" fn afs_array_all_logical(desc: *const ArrayDescriptor) -> i32 {
         return 0;
     }
     let d = unsafe { &*desc };
-    let n = d.total_elements().max(0) as usize;
-    for i in 0..n {
-        if !logical_desc_value(d, i) {
-            return 0;
-        }
+    if d.base_addr.is_null() {
+        return 0;
     }
-    1
+    let mut all_true = true;
+    for_each_element_byte_offset(d, |byte_off| unsafe {
+        if !mask_byte_offset_is_true(d, byte_off) {
+            all_true = false;
+        }
+    });
+    if all_true {
+        1
+    } else {
+        0
+    }
 }
 
 /// COUNT(array) for logical arrays — number of true elements.
@@ -3317,13 +3338,15 @@ pub extern "C" fn afs_array_count_logical(desc: *const ArrayDescriptor) -> i32 {
         return 0;
     }
     let d = unsafe { &*desc };
-    let n = d.total_elements().max(0) as usize;
+    if d.base_addr.is_null() {
+        return 0;
+    }
     let mut count = 0i32;
-    for i in 0..n {
-        if logical_desc_value(d, i) {
+    for_each_element_byte_offset(d, |byte_off| unsafe {
+        if mask_byte_offset_is_true(d, byte_off) {
             count += 1;
         }
-    }
+    });
     count
 }
 
@@ -3639,20 +3662,11 @@ pub extern "C" fn afs_array_sum_real8(desc: *const ArrayDescriptor) -> f64 {
     if d.base_addr.is_null() {
         return 0.0;
     }
-    let n = d.total_elements() as usize;
-    let stride = d.dims[0].stride.max(1) as usize;
     let mut sum: f64 = 0.0;
-    if d.elem_size == 4 {
-        let ptr = d.base_addr as *const f32;
-        for i in 0..n {
-            sum += unsafe { *ptr.add(i * stride) } as f64;
-        }
-    } else {
-        let ptr = d.base_addr as *const f64;
-        for i in 0..n {
-            sum += unsafe { *ptr.add(i * stride) };
-        }
-    }
+    let src = d.base_addr as *const u8;
+    for_each_element_byte_offset(d, |byte_off| unsafe {
+        sum += read_real_as_f64(src, byte_off, d.elem_size);
+    });
     sum
 }
 
@@ -4993,39 +5007,15 @@ pub extern "C" fn afs_array_sum_int(desc: *const ArrayDescriptor) -> i64 {
     if d.base_addr.is_null() {
         return 0;
     }
-    let n = d.total_elements() as usize;
-    let stride = d.dims[0].stride.max(1) as usize;
     let mut sum: i64 = 0;
-    match d.elem_size {
-        1 => {
-            let ptr = d.base_addr as *const i8;
-            for i in 0..n {
-                sum = sum.wrapping_add(unsafe { *ptr.add(i * stride) } as i64);
-            }
-        }
-        2 => {
-            let ptr = d.base_addr as *const i16;
-            for i in 0..n {
-                sum = sum.wrapping_add(unsafe { *ptr.add(i * stride) } as i64);
-            }
-        }
-        8 => {
-            let ptr = d.base_addr as *const i64;
-            for i in 0..n {
-                sum = sum.wrapping_add(unsafe { *ptr.add(i * stride) });
-            }
-        }
-        _ => {
-            let ptr = d.base_addr as *const i32;
-            for i in 0..n {
-                sum = sum.wrapping_add(unsafe { *ptr.add(i * stride) } as i64);
-            }
-        }
-    }
+    let src = d.base_addr as *const u8;
+    for_each_element_byte_offset(d, |byte_off| unsafe {
+        sum = sum.wrapping_add(read_int_as_i64(src, byte_off, d.elem_size));
+    });
     sum
 }
 
-fn for_each_element_byte_offset<F: FnMut(usize)>(desc: &ArrayDescriptor, mut f: F) {
+fn for_each_element_byte_offset<F: FnMut(isize)>(desc: &ArrayDescriptor, mut f: F) {
     let rank = desc.rank as usize;
     if rank == 0 {
         return;
@@ -5038,17 +5028,18 @@ fn for_each_element_byte_offset<F: FnMut(usize)>(desc: &ArrayDescriptor, mut f: 
         if extents[i] <= 0 {
             return;
         }
-        strides[i] = desc.dims[i].stride.max(1);
+        strides[i] = desc.dims[i].stride;
         total *= extents[i];
     }
 
     let mut idx: [i64; 15] = [0; 15];
+    let elem_size = desc.elem_size.max(1);
     for _ in 0..total {
         let mut byte_off = 0i64;
         for d in 0..rank {
-            byte_off += idx[d] * strides[d] * desc.elem_size;
+            byte_off += idx[d] * strides[d] * elem_size;
         }
-        f(byte_off as usize);
+        f(byte_off as isize);
 
         for d in 0..rank {
             idx[d] += 1;
@@ -5060,7 +5051,7 @@ fn for_each_element_byte_offset<F: FnMut(usize)>(desc: &ArrayDescriptor, mut f: 
     }
 }
 
-fn for_each_element_byte_offset_with_mask<F: FnMut(usize)>(
+fn for_each_element_byte_offset_with_mask<F: FnMut(isize)>(
     desc: &ArrayDescriptor,
     mask: &ArrayDescriptor,
     mut f: F,
@@ -5078,9 +5069,9 @@ fn for_each_element_byte_offset_with_mask<F: FnMut(usize)>(
         if extents[i] <= 0 {
             return;
         }
-        s_strides[i] = desc.dims[i].stride.max(1);
+        s_strides[i] = desc.dims[i].stride;
         m_strides[i] = if (i as i32) < mask.rank {
-            mask.dims[i].stride.max(1)
+            mask.dims[i].stride
         } else {
             1
         };
@@ -5088,16 +5079,17 @@ fn for_each_element_byte_offset_with_mask<F: FnMut(usize)>(
     }
 
     let mut idx: [i64; 15] = [0; 15];
+    let src_elem = desc.elem_size.max(1);
     let mask_elem = mask.elem_size.max(1);
     for _ in 0..total {
         let mut s_byte_off = 0i64;
         let mut m_byte_off = 0i64;
         for d in 0..rank {
-            s_byte_off += idx[d] * s_strides[d] * desc.elem_size;
+            s_byte_off += idx[d] * s_strides[d] * src_elem;
             m_byte_off += idx[d] * m_strides[d] * mask_elem;
         }
-        if unsafe { mask_byte_is_true(mask, m_byte_off as usize) } {
-            f(s_byte_off as usize);
+        if unsafe { mask_byte_offset_is_true(mask, m_byte_off as isize) } {
+            f(s_byte_off as isize);
         }
 
         for d in 0..rank {
@@ -5107,6 +5099,36 @@ fn for_each_element_byte_offset_with_mask<F: FnMut(usize)>(
             }
             idx[d] = 0;
         }
+    }
+}
+
+unsafe fn read_real_as_f64(base: *const u8, byte_off: isize, elem_size: i64) -> f64 {
+    let ptr = base.offset(byte_off);
+    if elem_size == 4 {
+        *(ptr as *const f32) as f64
+    } else {
+        *(ptr as *const f64)
+    }
+}
+
+unsafe fn read_int_as_i64(base: *const u8, byte_off: isize, elem_size: i64) -> i64 {
+    let ptr = base.offset(byte_off);
+    match elem_size {
+        1 => *(ptr as *const i8) as i64,
+        2 => *(ptr as *const i16) as i64,
+        8 => *(ptr as *const i64),
+        _ => *(ptr as *const i32) as i64,
+    }
+}
+
+unsafe fn mask_byte_offset_is_true(mask: &ArrayDescriptor, byte_off: isize) -> bool {
+    let p = mask.base_addr.offset(byte_off);
+    match mask.elem_size {
+        1 => *p != 0,
+        2 => *(p as *const u16) != 0,
+        4 => *(p as *const u32) != 0,
+        8 => *(p as *const u64) != 0,
+        _ => *p != 0,
     }
 }
 
@@ -5130,7 +5152,7 @@ pub extern "C" fn afs_array_sum_complex4(out: *mut f32, desc: *const ArrayDescri
     }
     let src = d.base_addr as *const u8;
     for_each_element_byte_offset(d, |byte_off| unsafe {
-        let p = src.add(byte_off) as *const f32;
+        let p = src.offset(byte_off) as *const f32;
         *out.add(0) += *p.add(0);
         *out.add(1) += *p.add(1);
     });
@@ -5156,7 +5178,7 @@ pub extern "C" fn afs_array_sum_complex8(out: *mut f64, desc: *const ArrayDescri
     }
     let src = d.base_addr as *const u8;
     for_each_element_byte_offset(d, |byte_off| unsafe {
-        let p = src.add(byte_off) as *const f64;
+        let p = src.offset(byte_off) as *const f64;
         *out.add(0) += *p.add(0);
         *out.add(1) += *p.add(1);
     });
@@ -5278,7 +5300,7 @@ pub extern "C" fn afs_array_sum_complex4_mask(
     }
     let src = d.base_addr as *const u8;
     for_each_element_byte_offset_with_mask(d, m, |byte_off| unsafe {
-        let p = src.add(byte_off) as *const f32;
+        let p = src.offset(byte_off) as *const f32;
         *out.add(0) += *p.add(0);
         *out.add(1) += *p.add(1);
     });
@@ -5308,7 +5330,7 @@ pub extern "C" fn afs_array_sum_complex8_mask(
     }
     let src = d.base_addr as *const u8;
     for_each_element_byte_offset_with_mask(d, m, |byte_off| unsafe {
-        let p = src.add(byte_off) as *const f64;
+        let p = src.offset(byte_off) as *const f64;
         *out.add(0) += *p.add(0);
         *out.add(1) += *p.add(1);
     });
@@ -5325,20 +5347,11 @@ pub extern "C" fn afs_array_product_real8(desc: *const ArrayDescriptor) -> f64 {
     if d.base_addr.is_null() {
         return 1.0;
     }
-    let n = d.total_elements() as usize;
-    let stride = d.dims[0].stride.max(1) as usize;
     let mut prod: f64 = 1.0;
-    if d.elem_size == 4 {
-        let ptr = d.base_addr as *const f32;
-        for i in 0..n {
-            prod *= unsafe { *ptr.add(i * stride) } as f64;
-        }
-    } else {
-        let ptr = d.base_addr as *const f64;
-        for i in 0..n {
-            prod *= unsafe { *ptr.add(i * stride) };
-        }
-    }
+    let src = d.base_addr as *const u8;
+    for_each_element_byte_offset(d, |byte_off| unsafe {
+        prod *= read_real_as_f64(src, byte_off, d.elem_size);
+    });
     prod
 }
 
@@ -5353,38 +5366,11 @@ pub extern "C" fn afs_array_product_int(desc: *const ArrayDescriptor) -> i64 {
     if d.base_addr.is_null() {
         return 1;
     }
-    let n = d.total_elements() as usize;
-    if n == 0 {
-        return 1;
-    }
-    let stride = d.dims[0].stride.max(1) as usize;
     let mut prod: i64 = 1;
-    match d.elem_size {
-        1 => {
-            let ptr = d.base_addr as *const i8;
-            for i in 0..n {
-                prod = prod.wrapping_mul(unsafe { *ptr.add(i * stride) } as i64);
-            }
-        }
-        2 => {
-            let ptr = d.base_addr as *const i16;
-            for i in 0..n {
-                prod = prod.wrapping_mul(unsafe { *ptr.add(i * stride) } as i64);
-            }
-        }
-        8 => {
-            let ptr = d.base_addr as *const i64;
-            for i in 0..n {
-                prod = prod.wrapping_mul(unsafe { *ptr.add(i * stride) });
-            }
-        }
-        _ => {
-            let ptr = d.base_addr as *const i32;
-            for i in 0..n {
-                prod = prod.wrapping_mul(unsafe { *ptr.add(i * stride) } as i64);
-            }
-        }
-    }
+    let src = d.base_addr as *const u8;
+    for_each_element_byte_offset(d, |byte_off| unsafe {
+        prod = prod.wrapping_mul(read_int_as_i64(src, byte_off, d.elem_size));
+    });
     prod
 }
 
@@ -5656,28 +5642,15 @@ pub extern "C" fn afs_array_maxval_real8(desc: *const ArrayDescriptor) -> f64 {
     if n == 0 {
         return f64::NEG_INFINITY;
     }
-    let stride = d.dims[0].stride.max(1) as usize;
-    if d.elem_size == 4 {
-        let ptr = d.base_addr as *const f32;
-        let mut max = unsafe { *ptr } as f64;
-        for i in 1..n {
-            let v = unsafe { *ptr.add(i * stride) } as f64;
-            if v > max {
-                max = v;
-            }
+    let src = d.base_addr as *const u8;
+    let mut max = f64::NEG_INFINITY;
+    for_each_element_byte_offset(d, |byte_off| unsafe {
+        let v = read_real_as_f64(src, byte_off, d.elem_size);
+        if v > max {
+            max = v;
         }
-        max
-    } else {
-        let ptr = d.base_addr as *const f64;
-        let mut max = unsafe { *ptr };
-        for i in 1..n {
-            let v = unsafe { *ptr.add(i * stride) };
-            if v > max {
-                max = v;
-            }
-        }
-        max
-    }
+    });
+    max
 }
 
 /// MINVAL(array) — minimum element (real version). Dispatches on
@@ -5696,28 +5669,15 @@ pub extern "C" fn afs_array_minval_real8(desc: *const ArrayDescriptor) -> f64 {
     if n == 0 {
         return f64::INFINITY;
     }
-    let stride = d.dims[0].stride.max(1) as usize;
-    if d.elem_size == 4 {
-        let ptr = d.base_addr as *const f32;
-        let mut min = unsafe { *ptr } as f64;
-        for i in 1..n {
-            let v = unsafe { *ptr.add(i * stride) } as f64;
-            if v < min {
-                min = v;
-            }
+    let src = d.base_addr as *const u8;
+    let mut min = f64::INFINITY;
+    for_each_element_byte_offset(d, |byte_off| unsafe {
+        let v = read_real_as_f64(src, byte_off, d.elem_size);
+        if v < min {
+            min = v;
         }
-        min
-    } else {
-        let ptr = d.base_addr as *const f64;
-        let mut min = unsafe { *ptr };
-        for i in 1..n {
-            let v = unsafe { *ptr.add(i * stride) };
-            if v < min {
-                min = v;
-            }
-        }
-        min
-    }
+    });
+    min
 }
 
 /// MAXVAL(array) — maximum element (integer version).
@@ -5736,53 +5696,15 @@ pub extern "C" fn afs_array_maxval_int(desc: *const ArrayDescriptor) -> i64 {
     if n == 0 {
         return i64::MIN;
     }
-    let stride = d.dims[0].stride.max(1) as usize;
-    match d.elem_size {
-        1 => {
-            let ptr = d.base_addr as *const i8;
-            let mut max = unsafe { *ptr } as i64;
-            for i in 1..n {
-                let v = unsafe { *ptr.add(i * stride) } as i64;
-                if v > max {
-                    max = v;
-                }
-            }
-            max
+    let src = d.base_addr as *const u8;
+    let mut max = i64::MIN;
+    for_each_element_byte_offset(d, |byte_off| unsafe {
+        let v = read_int_as_i64(src, byte_off, d.elem_size);
+        if v > max {
+            max = v;
         }
-        2 => {
-            let ptr = d.base_addr as *const i16;
-            let mut max = unsafe { *ptr } as i64;
-            for i in 1..n {
-                let v = unsafe { *ptr.add(i * stride) } as i64;
-                if v > max {
-                    max = v;
-                }
-            }
-            max
-        }
-        8 => {
-            let ptr = d.base_addr as *const i64;
-            let mut max = unsafe { *ptr };
-            for i in 1..n {
-                let v = unsafe { *ptr.add(i * stride) };
-                if v > max {
-                    max = v;
-                }
-            }
-            max
-        }
-        _ => {
-            let ptr = d.base_addr as *const i32;
-            let mut max = unsafe { *ptr } as i64;
-            for i in 1..n {
-                let v = unsafe { *ptr.add(i * stride) } as i64;
-                if v > max {
-                    max = v;
-                }
-            }
-            max
-        }
-    }
+    });
+    max
 }
 
 /// MINVAL(array) — minimum element (integer version).
@@ -5801,53 +5723,15 @@ pub extern "C" fn afs_array_minval_int(desc: *const ArrayDescriptor) -> i64 {
     if n == 0 {
         return i64::MAX;
     }
-    let stride = d.dims[0].stride.max(1) as usize;
-    match d.elem_size {
-        1 => {
-            let ptr = d.base_addr as *const i8;
-            let mut min = unsafe { *ptr } as i64;
-            for i in 1..n {
-                let v = unsafe { *ptr.add(i * stride) } as i64;
-                if v < min {
-                    min = v;
-                }
-            }
-            min
+    let src = d.base_addr as *const u8;
+    let mut min = i64::MAX;
+    for_each_element_byte_offset(d, |byte_off| unsafe {
+        let v = read_int_as_i64(src, byte_off, d.elem_size);
+        if v < min {
+            min = v;
         }
-        2 => {
-            let ptr = d.base_addr as *const i16;
-            let mut min = unsafe { *ptr } as i64;
-            for i in 1..n {
-                let v = unsafe { *ptr.add(i * stride) } as i64;
-                if v < min {
-                    min = v;
-                }
-            }
-            min
-        }
-        8 => {
-            let ptr = d.base_addr as *const i64;
-            let mut min = unsafe { *ptr };
-            for i in 1..n {
-                let v = unsafe { *ptr.add(i * stride) };
-                if v < min {
-                    min = v;
-                }
-            }
-            min
-        }
-        _ => {
-            let ptr = d.base_addr as *const i32;
-            let mut min = unsafe { *ptr } as i64;
-            for i in 1..n {
-                let v = unsafe { *ptr.add(i * stride) } as i64;
-                if v < min {
-                    min = v;
-                }
-            }
-            min
-        }
-    }
+    });
+    min
 }
 
 /// MAXLOC(array, dim=1) for rank-1 input — returns 1-based index of the
