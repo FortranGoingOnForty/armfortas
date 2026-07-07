@@ -32,11 +32,13 @@ impl PreprocConfig {
         defines.insert("__ARMFORTAS_MINOR__".into(), MacroDef::object("1"));
         // Build systems such as CMake key GNU-compatible Fortran
         // behavior off these predefines before they know our compiler
-        // name.  Advertise an old GCC-compatible surface: enough for
-        // module-dir and dependency-file flags, without inviting newer
-        // LTO/visibility flag families.
-        defines.insert("__GNUC__".into(), MacroDef::object("4"));
-        defines.insert("__GNUC_MINOR__".into(), MacroDef::object("4"));
+        // name. Advertise the build-system compatibility surface, not
+        // the armfortas release version: GCC 10 is new enough to avoid
+        // legacy project gates/workarounds while keeping CMake on the
+        // GNU module-dir and dependency-file paths we intentionally
+        // accept in the driver.
+        defines.insert("__GNUC__".into(), MacroDef::object("10"));
+        defines.insert("__GNUC_MINOR__".into(), MacroDef::object("0"));
         defines.insert("__GNUC_PATCHLEVEL__".into(), MacroDef::object("0"));
         match target.arch {
             Arch::Arm64 => {
@@ -1451,6 +1453,11 @@ fn strip_c_block_comments_from_line(line: &str, in_block: &mut bool) -> String {
             continue;
         }
 
+        if bytes[i] == b'!' {
+            result.push_str(&line[i..]);
+            break;
+        }
+
         if bytes[i] == b'\'' || bytes[i] == b'"' {
             let quote = bytes[i];
             result.push(quote as char);
@@ -1848,6 +1855,21 @@ mod tests {
     fn no_expansion_in_comment() {
         let out = pp_with("x = 1 ! FOO comment\n", &[("FOO", "BAR")]);
         assert!(out.contains("! FOO comment"));
+    }
+
+    #[test]
+    fn c_block_marker_inside_fortran_comment_does_not_hide_following_source() {
+        let out = pp("! Handle delimiter /* in prose\ninteger :: still_here\n");
+        assert!(
+            out.contains("! Handle delimiter /* in prose"),
+            "Fortran comment was corrupted: {:?}",
+            out
+        );
+        assert!(
+            out.contains("integer :: still_here"),
+            "source after Fortran comment was hidden: {:?}",
+            out
+        );
     }
 
     #[test]
@@ -2657,5 +2679,20 @@ deep
             out.contains("INFO:compiler[GNU]"),
             "CMake compiler-id macro branch should be reachable: {out:?}"
         );
+    }
+
+    #[test]
+    fn gnu_compat_defines_advertise_modern_cmake_version() {
+        let target = crate::target::TargetSpec::parse("arm64-macos").unwrap();
+        let config = PreprocConfig::for_target(&target);
+        let out = preprocess(
+            "major = __GNUC__\nminor = __GNUC_MINOR__\npatch = __GNUC_PATCHLEVEL__\n",
+            &config,
+        )
+        .unwrap()
+        .text;
+        assert!(out.contains("major = 10"), "{out:?}");
+        assert!(out.contains("minor = 0"), "{out:?}");
+        assert!(out.contains("patch = 0"), "{out:?}");
     }
 }

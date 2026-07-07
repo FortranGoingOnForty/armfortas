@@ -220,6 +220,38 @@ fn no_input_after_flags_prints_help_and_mentions_missing_input() {
 }
 
 #[test]
+fn cpp_input_is_rejected_before_fortran_preprocessing() {
+    let src = write_program("#include <memory.h>\nint main() { return 0; }\n", "cpp");
+    let out = Command::new(compiler("armfortas"))
+        .arg(&src)
+        .output()
+        .expect("failed to spawn armfortas");
+    assert_eq!(out.status.code(), Some(1), "status: {:?}", out.status);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unsupported source file"),
+        "expected unsupported-source diagnostic, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains(".cpp is not a Fortran source"),
+        "expected extension-specific diagnostic, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("--cxx-compiler"),
+        "expected build-system guidance, got: {}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("cannot find include file"),
+        "C++ input should not enter the Fortran preprocessor: {}",
+        stderr
+    );
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn c_f_procpointer_associates_c_funptr_and_runs() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -370,6 +402,168 @@ end program
     assert!(
         String::from_utf8_lossy(&run.stdout).contains("ok"),
         "unexpected suffix hidden ABI output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn o2_stdlib_real32_string_parser_keeps_liveout_multiply() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=o2_stdlib_real32_string_parser_keeps_liveout_multiply count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let src = write_program(
+        r#"
+program p
+  use iso_fortran_env, only: int8, int64, real32, real64
+  implicit none
+  character(len=*), parameter :: s = &
+      '0.140129846432481707092372958328991613128026194187651577175706828388979' // &
+      '108268586060148663818836212158203125E-44'
+  real(real32) :: v
+
+  v = to_sp(s, v)
+  if (abs(v - real(1.401298464324817d-45, real32)) > 0.0_real32) error stop 1
+  print *, 'tiny ok'
+contains
+  elemental function to_sp(input, mold) result(v)
+    character(*), intent(in) :: input
+    real(real32), intent(in) :: mold
+    real(real32) :: v
+    integer(int8) :: p
+    integer(int8) :: stat
+    call to_sp_base(input, v, p, stat)
+  end function
+
+  pure integer(int8) function shift_to_nonwhitespace(input) result(p)
+    character(*), intent(in) :: input
+    integer :: i
+    p = 1_int8
+    do i = 1, len(input)
+      if (iachar(input(i:i)) /= 32) then
+        p = int(i, int8)
+        return
+      end if
+    end do
+  end function
+
+  elemental subroutine to_sp_base(input, v, p, stat)
+    character(*), intent(in) :: input
+    real(real32), intent(inout) :: v
+    integer(int8), intent(out) :: p
+    integer(int8), intent(out) :: stat
+    integer(int8), parameter :: digit_0 = iachar('0', int8)
+    integer(int8), parameter :: period = iachar('.', int8) - digit_0
+    integer(int8), parameter :: minus_sign = iachar('-', int8) - digit_0
+    integer(int8), parameter :: plus_sign = iachar('+', int8) - digit_0
+    integer(int8), parameter :: le = iachar('e', int8) - digit_0
+    integer(int8), parameter :: be = iachar('E', int8) - digit_0
+    integer(int8), parameter :: ld = iachar('d', int8) - digit_0
+    integer(int8), parameter :: bd = iachar('D', int8) - digit_0
+    integer(int8), parameter :: nwnb = 39
+    integer(int8), parameter :: nfnb = 37
+    integer, parameter :: maxdpt = 11
+    integer :: e
+    real(real64), parameter :: whole_number_base(nwnb) = [(10._real64**(nwnb - e), e = 1, nwnb)]
+    real(real64), parameter :: fractional_base(nfnb) = [(10._real64**(-e), e = 1, nfnb)]
+    real(real64), parameter :: expbase(nwnb + nfnb) = [whole_number_base, fractional_base]
+    integer(int8) :: sign, sige
+    integer(int64) :: int_wp
+    integer :: i_exp
+    integer :: exp_aux
+    integer(int8) :: i, pP, pE, val, resp
+
+    stat = 23
+    p = shift_to_nonwhitespace(input)
+    sign = 1
+    if (iachar(input(p:p)) == minus_sign + digit_0) then
+      sign = -1
+      p = p + 1
+    end if
+    pP = 127
+    int_wp = 0
+    do i = p, min(maxdpt + p - 1, len(input))
+      val = iachar(input(i:i)) - digit_0
+      if (val >= 0 .and. val <= 9) then
+        int_wp = int_wp * 10 + val
+      else if (val == period) then
+        pP = i
+      else
+        exit
+      end if
+    end do
+    pE = i
+    do while (i <= len(input))
+      val = iachar(input(i:i)) - digit_0
+      if (val < 0 .or. val > 9) exit
+      i = i + 1
+    end do
+    p = i
+    resp = pE - min(pP, p)
+    if (resp <= 0) resp = resp + 1
+    sige = 1
+    if (p < len(input)) then
+      if (any([le, be, ld, bd] + digit_0 == iachar(input(p:p)))) p = p + 1
+      if (iachar(input(p:p)) == minus_sign + digit_0) then
+        sige = -1
+        p = p + 1
+      else if (iachar(input(p:p)) == plus_sign + digit_0) then
+        p = p + 1
+      end if
+    end if
+    i_exp = 0
+    do while (p <= len(input))
+      val = iachar(input(p:p)) - digit_0
+      if (val >= 0 .and. val <= 9) then
+        i_exp = i_exp * 10_int8 + val
+        p = p + 1
+      else
+        exit
+      end if
+    end do
+    exp_aux = nwnb - 1 + resp - sige * i_exp
+    if (exp_aux > 0 .and. exp_aux <= nwnb + nfnb) then
+      v = sign * int_wp * expbase(exp_aux)
+    else
+      v = sign * int_wp * 10._real64**(sige * i_exp - resp + 1)
+    end if
+    stat = 0
+  end subroutine
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("stdlib_real32_to_num_o2", "bin");
+    let result = Command::new(compiler("armfortas"))
+        .args(["-O2", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("stdlib real32 parser compile failed to spawn");
+    assert!(
+        result.status.success(),
+        "stdlib real32 parser probe should compile and link: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("stdlib real32 parser probe run failed");
+    assert!(
+        run.status.success(),
+        "stdlib real32 parser probe run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("tiny ok"),
+        "unexpected stdlib real32 parser output: {}",
         String::from_utf8_lossy(&run.stdout)
     );
 
@@ -6274,6 +6468,45 @@ fn allocatable_array_element_component_intrinsics_do_not_escape() {
             .any(|sym| sym.trim_start_matches('_') == "allocated"),
         "allocatable array-element component allocated() should not escape as a raw symbol: {:?}",
         undefined
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn allocated_component_of_unallocated_allocatable_array_element_is_false() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocated_component_of_unallocated_allocatable_array_element_is_false count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type :: pane_t\n    integer :: value = 0\n  end type\n  type :: tab_t\n    integer :: pad(4096) = 0\n    type(pane_t), allocatable :: panes(:)\n  end type\n  type :: editor_t\n    type(tab_t), allocatable :: tabs(:)\n    integer :: active_tab_index = 1\n  end type\ncontains\n  subroutine sync_like(editor)\n    type(editor_t), intent(inout) :: editor\n    integer :: tab_idx\n    tab_idx = editor%active_tab_index\n    if (tab_idx < 1 .or. tab_idx > size(editor%tabs)) return\n    if (.not. allocated(editor%tabs(tab_idx)%panes)) return\n    error stop 2\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(editor_t) :: editor\n  if (size(editor%tabs) /= 0) error stop 1\n  call sync_like(editor)\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("allocated_unallocated_parent_element_component", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("unallocated parent element component allocated compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "unallocated parent element component allocated compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("unallocated parent element component allocated run failed to spawn");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unallocated parent element component allocated run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
     );
 
     let _ = std::fs::remove_file(&out);
@@ -13624,6 +13857,42 @@ fn ffree_line_length_none_is_accepted_with_warning() {
     assert!(
         stderr.contains("-ffree-line-length-none is accepted for compatibility"),
         "expected compatibility warning: {}",
+        stderr
+    );
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&out);
+}
+
+#[test]
+fn numeric_ffree_line_length_is_accepted() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=numeric_ffree_line_length_is_accepted count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program("program p\n  print *, 7\nend program\n", "f90");
+    let out = unique_path("ffree_line_length_132", "o");
+    let result = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            "-ffree-line-length-132",
+            src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        result.status.success(),
+        "numeric free-line-length flag should be accepted: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        !stderr.contains("unknown option"),
+        "numeric free-line-length flag must not be rejected: {}",
         stderr
     );
     let _ = std::fs::remove_file(&src);
@@ -21564,6 +21833,52 @@ fn nested_array_constructor_into_allocatable_rank1_flattens_full_size() {
     assert!(
         run.status.success(),
         "nested AC into rank-1 allocatable should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn slash_array_constructor_accepts_multiplicative_element_exprs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=slash_array_constructor_accepts_multiplicative_element_exprs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // Surfaced while building an aerosol-kernel checksum probe: the
+    // `(/ ... /)` parser used a high minimum binding power to avoid
+    // consuming the closing `/)`, which also rejected valid top-level
+    // multiplicative element expressions such as `0.05 * real(i)`.
+    // Only `/)` is a constructor delimiter; other `*` and `/` tokens
+    // remain normal infix operators.
+    let src = write_program(
+        "program t\n  implicit none\n  integer :: i\n  real :: a(5)\n  i = 2\n  a = (/ 0.05 * real(i), real(i) / 4.0, (1.0 + real(i)) * 2.0, real(i) / (1.0 + 1.0), 9.0 / 3.0 /)\n  if (abs(a(1) - 0.1) > 1.0e-6) error stop 1\n  if (abs(a(2) - 0.5) > 1.0e-6) error stop 2\n  if (abs(a(3) - 6.0) > 1.0e-6) error stop 3\n  if (abs(a(4) - 1.0) > 1.0e-6) error stop 4\n  if (abs(a(5) - 3.0) > 1.0e-6) error stop 5\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("slash_ac_multiplicative_exprs", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("slash AC multiplicative expression compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "slash AC multiplicative expression should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("slash AC multiplicative expression run failed");
+    assert!(
+        run.status.success(),
+        "slash AC multiplicative expression should pass: status={:?} stdout={} stderr={}",
         run.status,
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr)
@@ -34483,6 +34798,50 @@ fn derived_function_result_keeps_unallocated_allocatable_char_components_unalloc
 }
 
 #[test]
+fn derived_function_result_named_cycle_can_assign_components() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=derived_function_result_named_cycle_can_assign_components count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type :: cycle_t\n    integer :: id = -1\n    logical :: finished = .true.\n  end type cycle_t\ncontains\n  function clear_cycle() result(cycle)\n    type(cycle_t) :: cycle\n    cycle%id = 42\n    cycle%finished = .false.\n  end function clear_cycle\nend module m\n\nprogram p\n  use m\n  implicit none\n  type(cycle_t) :: got\n  got = clear_cycle()\n  if (got%id /= 42) error stop 1\n  if (got%finished) error stop 2\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("derived_result_named_cycle", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("derived result named cycle compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "derived result named cycle compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("derived result named cycle run failed");
+    assert!(
+        run.status.success(),
+        "derived result named cycle run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok"),
+        "unexpected derived result named cycle output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn derived_array_growth_keeps_unallocated_allocatable_components_clear() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -34868,6 +35227,110 @@ fn implicit_len1_char_component_assignment_preserves_bytes() {
         run.status.success(),
         "implicit len1 char component run failed: status={:?} stderr={}",
         run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "unexpected stdout: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn o2_runtime_partial_unroll_preserves_post_do_index_for_bitset_tail() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=o2_runtime_partial_unroll_preserves_post_do_index_for_bitset_tail count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let src = write_program(
+        r#"module bitset_probe_mod
+  use iso_fortran_env, only: int32, int64
+  implicit none
+
+  type :: bitset_large
+    integer(int32) :: num_bits = 0_int32
+    integer(int64), allocatable :: blocks(:)
+  contains
+    procedure :: init_zero
+    procedure :: flip_not
+  end type
+
+contains
+
+  subroutine init_zero(self, bits)
+    class(bitset_large), intent(inout) :: self
+    integer(int32), intent(in) :: bits
+    integer(int32) :: nblocks
+
+    self%num_bits = bits
+    nblocks = (bits - 1_int32) / 64_int32 + 1_int32
+    allocate(self%blocks(nblocks))
+    self%blocks = 0_int64
+  end subroutine
+
+  subroutine flip_not(self)
+    class(bitset_large), intent(inout) :: self
+    integer(int32) :: bit, full_blocks, block
+    integer :: remaining_bits
+
+    full_blocks = self%num_bits / 64_int32
+
+    do block = 1_int32, full_blocks
+      self%blocks(block) = not(self%blocks(block))
+    end do
+
+    remaining_bits = self%num_bits - full_blocks * 64_int32
+
+    do bit = 0_int32, remaining_bits - 1
+      if (btest(self%blocks(block), bit)) then
+        self%blocks(block) = ibclr(self%blocks(block), bit)
+      else
+        self%blocks(block) = ibset(self%blocks(block), bit)
+      end if
+    end do
+  end subroutine
+end module
+
+program p
+  use bitset_probe_mod
+  implicit none
+
+  type(bitset_large) :: set10
+
+  call set10%init_zero(99_int32)
+  call set10%flip_not()
+
+  if (size(set10%blocks) /= 2) error stop 10
+  if (set10%blocks(1) /= -1_int64) error stop 11
+  if (set10%blocks(2) /= 34359738367_int64) error stop 12
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("o2_partial_unroll_post_do_bitset_tail", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-O2", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("O2 partial-unroll post-DO bitset compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "O2 partial-unroll post-DO bitset compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("O2 partial-unroll post-DO bitset run failed");
+    assert!(
+        run.status.success(),
+        "O2 partial-unroll post-DO bitset run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr)
     );
     let stdout = String::from_utf8_lossy(&run.stdout);
@@ -49239,6 +49702,167 @@ fn generic_subroutine_matches_use_renamed_class_actual() {
 }
 
 #[test]
+fn o2_real_square_power_uses_multiply_for_gauss_accuracy() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=o2_real_square_power_uses_multiply_for_gauss_accuracy count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let src = write_program(
+        r#"
+program p
+  implicit none
+  integer, parameter :: dp = kind(1.0d0)
+  real(dp), parameter :: pi = acos(-1.0_dp)
+  real(dp), parameter :: tolerance = 4.0_dp * epsilon(1.0_dp)
+  integer, parameter :: newton_iters = 100
+  integer :: i
+  real(dp) :: analytic, numeric
+
+  analytic = 2.0_dp / 3.0_dp
+  do i = 2, 6
+    block
+      real(dp), dimension(i) :: x, w
+      call gauss_legendre(x, w)
+      numeric = sum(x**2 * w)
+      if (.not. abs(numeric - analytic) < 2 * epsilon(analytic)) error stop i
+    end block
+  end do
+  print *, 'ok'
+contains
+  pure subroutine gauss_legendre(x, w)
+    real(dp), intent(out) :: x(:), w(:)
+
+    associate (n => size(x) - 1)
+    select case (n)
+    case (0)
+      x = 0
+      w = 2
+    case (1)
+      x(1) = -sqrt(1.0_dp / 3.0_dp)
+      x(2) = -x(1)
+      w = 1
+    case default
+      block
+        integer :: i, j
+        real(dp) :: leg, dleg, delta
+
+        do i = 0, (n + 1) / 2 - 1
+          x(i + 1) = -cos((2 * i + 1) / (2.0_dp * n + 2.0_dp) * pi)
+          do j = 1, newton_iters
+            leg = legendre(n + 1, x(i + 1))
+            dleg = dlegendre(n + 1, x(i + 1))
+            delta = -leg / dleg
+            x(i + 1) = x(i + 1) + delta
+            if (abs(delta) <= tolerance * abs(x(i + 1))) exit
+          end do
+          x(n - i + 1) = -x(i + 1)
+
+          dleg = dlegendre(n + 1, x(i + 1))
+          w(i + 1) = 2.0_dp / ((1 - x(i + 1)**2) * dleg**2)
+          w(n - i + 1) = w(i + 1)
+        end do
+
+        if (mod(n, 2) == 0) then
+          x(n / 2 + 1) = 0
+          dleg = dlegendre(n + 1, 0.0_dp)
+          w(n / 2 + 1) = 2.0_dp / (dleg**2)
+        end if
+      end block
+    end select
+    end associate
+  end subroutine
+
+  pure elemental function dlegendre(n, x) result(dleg)
+    integer, intent(in) :: n
+    real(dp), intent(in) :: x
+    real(dp) :: dleg
+
+    select case (n)
+    case (0)
+      dleg = 0
+    case (1)
+      dleg = 1
+    case default
+      block
+        real(dp) :: leg_down1, leg_down2, leg
+        real(dp) :: dleg_down1, dleg_down2
+        integer :: i
+
+        leg_down1 = x
+        dleg_down1 = 1
+        leg_down2 = 1
+        dleg_down2 = 0
+        do i = 2, n
+          leg = (2 * i - 1) * x * leg_down1 / i - (i - 1) * leg_down2 / i
+          dleg = dleg_down2 + (2 * i - 1) * leg_down1
+          leg_down2 = leg_down1
+          leg_down1 = leg
+          dleg_down2 = dleg_down1
+          dleg_down1 = dleg
+        end do
+      end block
+    end select
+  end function
+
+  pure elemental function legendre(n, x) result(leg)
+    integer, intent(in) :: n
+    real(dp), intent(in) :: x
+    real(dp) :: leg
+
+    select case (n)
+    case (0)
+      leg = 1
+    case (1)
+      leg = x
+    case default
+      block
+        real(dp) :: leg_down1, leg_down2
+        integer :: i
+
+        leg_down1 = x
+        leg_down2 = 1
+        do i = 2, n
+          leg = (2 * i - 1) * x * leg_down1 / i - (i - 1) * leg_down2 / i
+          leg_down2 = leg_down1
+          leg_down1 = leg
+        end do
+      end block
+    end select
+  end function
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("o2_real_square_power_gauss", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-O2", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("Gauss square-power accuracy compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "Gauss square-power accuracy compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("Gauss square-power accuracy run failed");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        run.status.success() && stdout.contains("ok"),
+        "Gauss square-power accuracy run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        stdout,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn use_renamed_derived_local_copies_pointer_function_result() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -49366,6 +49990,167 @@ fn defined_concat_probe_skips_rank_until_semantic_match() {
     );
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fortran_comment_c_block_marker_does_not_truncate_module() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fortran_comment_c_block_marker_does_not_truncate_module count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let src = write_program(
+        "module comment_marker_m\n  implicit none\ncontains\n  subroutine mark(flag)\n    logical, intent(out) :: flag\n    ! Handle multiline comment start (when we encounter /* on a line)\n    flag = .true.\n  end subroutine\nend module\nprogram p\n  use comment_marker_m, only: mark\n  implicit none\n  logical :: seen\n  seen = .false.\n  call mark(seen)\n  if (.not. seen) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("fortran_comment_c_block_marker", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("Fortran comment C-block marker compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "Fortran comment C-block marker compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("Fortran comment C-block marker run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "Fortran comment C-block marker run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn imported_recursive_allocatable_components_use_owner_dealloc_helper() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_recursive_allocatable_components_use_owner_dealloc_helper count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("imported_recursive_dealloc_helper");
+    let tree_api = write_program_in(
+        &dir,
+        "tree_api.f90",
+        "module tree_api\n  implicit none\n  type :: node_t\n    character(len=:), allocatable :: name\n    type(node_t), allocatable :: children(:)\n  end type\nend module\n",
+    );
+    let editor_api = write_program_in(
+        &dir,
+        "editor_api.f90",
+        "module editor_api\n  use tree_api, only: node_t\n  implicit none\n  type :: panel_t\n    type(node_t), allocatable :: symbols(:)\n  end type\ncontains\n  subroutine make_panel(panel)\n    type(panel_t), intent(out) :: panel\n    allocate(panel%symbols(1))\n    panel%symbols(1)%name = 'root'\n    allocate(panel%symbols(1)%children(1))\n    panel%symbols(1)%children(1)%name = 'child'\n  end subroutine\n  subroutine reset_panel(panel)\n    type(panel_t), intent(out) :: panel\n  end subroutine\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use editor_api, only: panel_t, make_panel, reset_panel\n  implicit none\n  type(panel_t) :: panel\n  call make_panel(panel)\n  if (.not. allocated(panel%symbols)) error stop 1\n  if (.not. allocated(panel%symbols(1)%children)) error stop 2\n  if (panel%symbols(1)%children(1)%name /= 'child') error stop 3\n  call reset_panel(panel)\n  if (allocated(panel%symbols)) error stop 4\n  print *, 'ok'\nend program\n",
+    );
+
+    let tree_obj = dir.join("tree_api.o");
+    let compile_tree = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            tree_api.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-o",
+            tree_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("tree API compile failed to spawn");
+    assert!(
+        compile_tree.status.success(),
+        "tree API compile failed: {}",
+        String::from_utf8_lossy(&compile_tree.stderr)
+    );
+
+    let editor_ir = dir.join("editor_api.ir");
+    let emit_editor = Command::new(compiler("armfortas"))
+        .args([
+            "--emit-ir",
+            editor_api.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-o",
+            editor_ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("editor API IR emit failed to spawn");
+    assert!(
+        emit_editor.status.success(),
+        "editor API IR emit failed: {}",
+        String::from_utf8_lossy(&emit_editor.stderr)
+    );
+    let ir_text = fs::read_to_string(&editor_ir).expect("cannot read editor API IR");
+    assert!(
+        ir_text.contains("call @afs_derived_tree_api_node_t_dealloc_desc"),
+        "imported recursive node_t descriptor cleanup should call the owner helper:\n{}",
+        ir_text
+    );
+
+    let editor_obj = dir.join("editor_api.o");
+    let main_obj = dir.join("main.o");
+    for (src, obj) in [(&editor_api, &editor_obj), (&main_src, &main_obj)] {
+        let compiled = Command::new(compiler("armfortas"))
+            .args([
+                "-c",
+                src.to_str().unwrap(),
+                "-I",
+                dir.to_str().unwrap(),
+                "-J",
+                dir.to_str().unwrap(),
+                "-o",
+                obj.to_str().unwrap(),
+            ])
+            .output()
+            .expect("recursive dealloc helper compile failed to spawn");
+        assert!(
+            compiled.status.success(),
+            "compile {} failed: {}",
+            src.display(),
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+    }
+
+    let bin = dir.join("p");
+    let link = Command::new(compiler("armfortas"))
+        .args([
+            tree_obj.to_str().unwrap(),
+            editor_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            bin.to_str().unwrap(),
+        ])
+        .output()
+        .expect("recursive dealloc helper link failed to spawn");
+    assert!(
+        link.status.success(),
+        "recursive dealloc helper link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+    let run = Command::new(&bin)
+        .output()
+        .expect("recursive dealloc helper run failed to spawn");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "recursive dealloc helper run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
 }
 
 #[test]
