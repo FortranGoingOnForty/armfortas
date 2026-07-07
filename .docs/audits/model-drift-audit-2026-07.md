@@ -32,8 +32,8 @@ already fixed. Reproducers in `scratchpad/rebaseline/`. Verdicts:
 
 - **Fixed upstream:** C9 (C_F_POINTER component shape, `size=10`), C11 (CLASS
   mold=/source= dynamic type). Close both.
-- **Still open (compiler core):** C3, C4, C5, C6 (now an ICE), C7, C8 (now a
-  parse error), C10, C12. Eight of ten stand.
+- **Still open (compiler core):** C4, C5, C6 (now an ICE), C7, C8 (now a
+  parse error), C10, C12. (C3 fixed 2026-07-06.)
 - **Still open (unchanged — submodules the workstream never touched):**
   afs-ld L3, L4, L6–L9; afs-as A5, A6; test-integrity T3 (silent-degrade
   stubs survive), T4 (bencch drift).
@@ -77,10 +77,22 @@ already fixed. Reproducers in `scratchpad/rebaseline/`. Verdicts:
   a struct by value has no Fortran definition to reject — caller-side ABI
   still unhandled. Fixtures `test_programs/bind_c_derived_type_{value,result}_rejected.f90`,
   `bind_c_cptr_value_and_result_ok.f90`.
-- **C3 — strided component views ignore stride in whole-array I/O.**
-  `associate(ids => a%id)` prints the sibling component's bit patterns
-  interleaved; `sum(ids)` is correct so the descriptor is right and I/O
-  ignores the stride. June component-projection work (c585e5e, 70a5e6b).
+- **C3 — strided component views ignore stride in whole-array I/O.
+  FIXED 2026-07-06.** `print *, a%id` (a scalar component of an array) is a
+  strided section; the output-list lowering had no `ComponentAccess`-on-
+  array case, so it fell through to the scalar dispatch and wrote only the
+  first element (`10` not `10 20 30`). Added `lower_component_section_write`
+  (list-directed) and `fmt_push_component_section` (push-based formatted),
+  both walking the section by the descriptor's record stride (dim stride at
+  offset 24+16; byte multiplier from the descriptor's stored elem size at
+  offset 8, so a 1-byte-Bool logical in a 4-byte slot spaces correctly).
+  Covers rank-1/rank-2 bases, nonzero-offset components, integer/real/
+  logical (and complex/fixed-char when `record_bytes % elem_bytes == 0`).
+  Fixture `test_programs/component_array_section_io.f90`. Residual: a
+  component whose record size is not a multiple of its element size (e.g.
+  `complex`/`character(3)` in a 12/16-byte record) still falls through —
+  `projected_scalar_component_local_info` bails on non-divisible records
+  (pre-existing). Was: June component-projection work (c585e5e, 70a5e6b).
 - **C4 — elemental defined operators broadcast a scalar dispatch on array
   operands.** `arr = arr + one` → `11 11 11` not `11 12 13`; through a
   component it's opt-level-dependent garbage. `defined_binary_operator_result_rank`
