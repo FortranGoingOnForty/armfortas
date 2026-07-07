@@ -32,8 +32,8 @@ already fixed. Reproducers in `scratchpad/rebaseline/`. Verdicts:
 
 - **Fixed upstream:** C9 (C_F_POINTER component shape, `size=10`), C11 (CLASS
   mold=/source= dynamic type). Close both.
-- **Still open (compiler core):** C12.
-  (C3, C4, C5, C6, C7, C8, C10 fixed 2026-07-06.)
+- **Compiler core: all closed 2026-07-06.** C3, C4, C5, C6, C7, C8, C10, C12
+  fixed by me; C9, C11 fixed upstream. Nothing open in the compiler-core rung.
 - **Still open (unchanged — submodules the workstream never touched):**
   afs-ld L3, L4, L6–L9; afs-as A5, A6; test-integrity T3 (silent-degrade
   stubs survive), T4 (bencch drift).
@@ -189,14 +189,22 @@ already fixed. Reproducers in `scratchpad/rebaseline/`. Verdicts:
   `source=` copies the extension (`10 20`). Was: mold allocated the declared
   type; scalar `source=` copied only the base size. 7a05e24/567ed0e.
 - **C12 — internal WRITE deferred-length: reallocation regressed to silent
-  truncation, expectations rewritten in the same commit.** 426a29d changed
-  allocated deferred-length targets from F2023-conforming realloc (PR #64,
-  2dc803a) to fixed-length truncation and rewrote the fixture CHECK lines to
-  match; no noted_items entry; `.docs/audits/f2023-feature-matrix.md:86` still
-  claims realloc. Truncates even under `--std=f2023` (gfortran errors). One
-  auditor read the standard as forbidding the old realloc; adjudicate against
-  F2023 12.6.4.5.1 in `.docs/refs/` before fixing — but silent truncation is
-  the one option the policy forbids either way.
+  truncation, expectations rewritten in the same commit. FIXED 2026-07-06
+  (91420e2f).** ADJUDICATED against F2023 §12.4 (`.docs/refs/standards/
+  23-007r1-f2023-draft.txt`, "record becomes defined" bullet): *"If the
+  internal file is an allocatable, deferred-length character scalar variable,
+  it is assigned the characters written by intrinsic assignment, allocating or
+  reallocating to have length equal to the number of characters written if
+  necessary."* The "shall not exceed the length of the record" clause is the
+  *"Otherwise"* branch — non-deferred-length units only. So realloc (PR #64,
+  2dc803a) was correct; the auditor who read the standard as forbidding it
+  misread. 426a29d's `store_internal_alloc_record` early branch (treat an
+  already-allocated target as a fixed internal file, truncate/blank-pad to the
+  current length) is removed — the target now reallocates to the record length,
+  growing or shrinking. The list-directed path (`afs_lst_ia_*`) shares the same
+  store. Fixtures `x_l05_internal_write_realloc.f90` and
+  `l05_ld_internal_write_alloc.f90`, the runtime unit test, and the cli_driver
+  e2e test all restored/updated to assert reallocation.
 
 ### afs-ld
 
