@@ -19450,8 +19450,13 @@ pub(super) fn emit_named_function_call(
         };
         let value = match &arg.value {
             crate::ast::expr::SectionSubscript::Element(e) => {
-                let actual_is_array =
-                    actual_expr_rank(e, locals, st, type_layouts).is_some_and(|rank| rank > 0);
+                let actual_is_array_section =
+                    actual_is_array_section_designator(locals, e, st, type_layouts);
+                let actual_is_array = actual_expr_rank(e, locals, st, type_layouts)
+                    .is_some_and(|rank| rank > 0)
+                    || actual_is_array_section;
+                let actual_is_char_sequence =
+                    actual_is_character_array_section_designator(locals, e, st, type_layouts);
                 let sequence_array_copy_back_for_arg = if wants_sequence_array {
                     sequence_array_copy_back
                 } else {
@@ -19551,18 +19556,34 @@ pub(super) fn emit_named_function_call(
                         }
                     })
                 } else if sequence_array_for_arg {
-                    lower_sequence_array_actual(
-                        b,
-                        locals,
-                        e,
-                        st,
-                        type_layouts,
-                        internal_funcs,
-                        contained_host_refs,
-                        descriptor_params,
-                        sequence_array_copy_back_for_arg,
-                        &mut call_arg_sequence_temps,
-                    )
+                    let sequence_actual = if actual_is_char_sequence {
+                        lower_sequence_char_array_actual(
+                            b,
+                            locals,
+                            e,
+                            st,
+                            type_layouts,
+                            internal_funcs,
+                            contained_host_refs,
+                            descriptor_params,
+                            sequence_array_copy_back_for_arg,
+                            &mut call_arg_sequence_temps,
+                        )
+                    } else {
+                        lower_sequence_array_actual(
+                            b,
+                            locals,
+                            e,
+                            st,
+                            type_layouts,
+                            internal_funcs,
+                            contained_host_refs,
+                            descriptor_params,
+                            sequence_array_copy_back_for_arg,
+                            &mut call_arg_sequence_temps,
+                        )
+                    };
+                    sequence_actual
                     .unwrap_or_else(|| {
                         if full_ref_context {
                             lower_arg_by_ref_for_dummy_full(
@@ -19847,10 +19868,16 @@ pub(super) fn emit_resolved_bound_proc_call(
             .and_then(|m| cached_param_mask_for_lookup(st, m, k))
             .or_else(|| callee_char_len_star_mask(st, k))
     });
+    let callee_sequence_array_args =
+        first_procedure_lookup(&abi_lookup_keys, |k| callee_sequence_array_arg_mask(st, k));
+    let callee_sequence_array_copy_back_args = first_procedure_lookup(&abi_lookup_keys, |k| {
+        callee_sequence_array_copy_back_mask(st, k)
+    });
 
     let mut call_args =
         Vec::with_capacity(arg_slots.len() + hidden_result.is_some() as usize + (!nopass) as usize);
     let mut call_arg_array_temps = Vec::new();
+    let mut call_arg_sequence_temps = Vec::new();
     if let Some(result) = hidden_result {
         call_args.push(result);
     }
@@ -19915,6 +19942,14 @@ pub(super) fn emit_resolved_bound_proc_call(
             .as_ref()
             .map(|mask| mask.get(i).copied().unwrap_or(false))
             .unwrap_or(false);
+        let wants_sequence_array = callee_sequence_array_args
+            .as_ref()
+            .map(|mask| mask.get(i).copied().unwrap_or(false))
+            .unwrap_or(false);
+        let sequence_array_copy_back = callee_sequence_array_copy_back_args
+            .as_ref()
+            .map(|mask| mask.get(i).copied().unwrap_or(false))
+            .unwrap_or(false);
         // F2018 §15.5.2.4: a class(*) dummy needs the actual boxed into
         // a polymorphic descriptor when the actual is a literal/scalar
         // expression. The plain-call path threads this through; without
@@ -19924,6 +19959,20 @@ pub(super) fn emit_resolved_bound_proc_call(
         let value = match slot {
             Some(arg) => match &arg.value {
                 crate::ast::expr::SectionSubscript::Element(e) => {
+                    let actual_is_array_section =
+                        actual_is_array_section_designator(locals, e, st, type_layouts);
+                    let actual_is_array = actual_expr_rank(e, locals, st, type_layouts)
+                        .is_some_and(|rank| rank > 0)
+                        || actual_is_array_section;
+                    let sequence_array_for_arg = (wants_sequence_array || actual_is_array)
+                        && !matches!(e.node, Expr::ConditionalExpr { .. } | Expr::NilArgument);
+                    let sequence_array_copy_back_for_arg = if wants_sequence_array {
+                        sequence_array_copy_back
+                    } else {
+                        true
+                    };
+                    let actual_is_char_sequence =
+                        actual_is_character_array_section_designator(locals, e, st, type_layouts);
                     let value = if is_value && wants_bind_c_char {
                         lower_bind_c_char_value_arg(
                             b,
@@ -20008,6 +20057,47 @@ pub(super) fn emit_resolved_bound_proc_call(
                             descriptor_params,
                         )
                         .unwrap_or_else(|| {
+                            lower_arg_by_ref_for_dummy_full(
+                                b,
+                                locals,
+                                e,
+                                st,
+                                type_layouts,
+                                internal_funcs,
+                                contained_host_refs,
+                                descriptor_params,
+                                dummy_is_class,
+                            )
+                        })
+                    } else if sequence_array_for_arg {
+                        let sequence_actual = if actual_is_char_sequence {
+                            lower_sequence_char_array_actual(
+                                b,
+                                locals,
+                                e,
+                                st,
+                                type_layouts,
+                                internal_funcs,
+                                contained_host_refs,
+                                descriptor_params,
+                                sequence_array_copy_back_for_arg,
+                                &mut call_arg_sequence_temps,
+                            )
+                        } else {
+                            lower_sequence_array_actual(
+                                b,
+                                locals,
+                                e,
+                                st,
+                                type_layouts,
+                                internal_funcs,
+                                contained_host_refs,
+                                descriptor_params,
+                                sequence_array_copy_back_for_arg,
+                                &mut call_arg_sequence_temps,
+                            )
+                        };
+                        sequence_actual.unwrap_or_else(|| {
                             lower_arg_by_ref_for_dummy_full(
                                 b,
                                 locals,
@@ -20120,6 +20210,7 @@ pub(super) fn emit_resolved_bound_proc_call(
     );
 
     let call_result = b.call(func_ref, call_args, ret_ty);
+    finish_sequence_association_temps(b, &call_arg_sequence_temps);
     deallocate_call_arg_array_temp_descriptors(b, &call_arg_array_temps);
     if let Some(result) = hidden_result {
         return Some(result);
@@ -42745,7 +42836,23 @@ pub(super) fn lower_array_expr_descriptor(
                 _ => None,
             };
             if let Some(info) = &info {
-                if local_is_array_like(info) {
+                let char_section_array_like = section_args_include_range(args)
+                    && match &callee.node {
+                        Expr::Name { name } => {
+                            let key = name.to_lowercase();
+                            let symbol_rank = current_proc_scope()
+                                .and_then(|sid| st.lookup_in(sid, &key))
+                                .and_then(value_symbol_declared_rank);
+                            (info.char_kind != CharKind::None
+                                || descriptor_backed_runtime_char_array(info))
+                                && (local_declared_rank(info) > 0
+                                    || local_uses_array_descriptor(info)
+                                    || descriptor_backed_runtime_char_array(info)
+                                    || symbol_rank.is_some_and(|rank| rank > 0))
+                        }
+                        _ => false,
+                    };
+                if local_is_array_like(info) || char_section_array_like {
                     if args.is_empty() {
                         let desc = if local_uses_array_descriptor(info) {
                             array_descriptor_addr(b, info)
@@ -52691,6 +52798,9 @@ pub(super) fn lower_char_arg_by_ref(
         Expr::FunctionCall { callee, args } => {
             let Expr::Name { name } = &callee.node else {
                 if let Expr::ComponentAccess { .. } = &callee.node {
+                    if section_args_include_range(args) {
+                        return None;
+                    }
                     let tl = type_layouts?;
                     if let Some((ptr, _len)) =
                         fixed_component_char_array_elem_ptr_and_len(b, locals, callee, args, st, tl)
@@ -52737,6 +52847,9 @@ pub(super) fn lower_char_arg_by_ref(
             if (info.char_kind == CharKind::None && !descriptor_backed_runtime_char_array(info))
                 || (info.dims.is_empty() && !local_uses_array_descriptor(info))
             {
+                return None;
+            }
+            if section_args_include_range(args) {
                 return None;
             }
             let ptr = if local_uses_array_descriptor(info) || inline_char_array_storage(info) {
@@ -52788,6 +52901,74 @@ pub(super) fn lower_arg_string_descriptor(
     }
 }
 
+pub(super) fn actual_is_array_section_designator(
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    _type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> bool {
+    let Expr::FunctionCall { callee, args } = &expr.node else {
+        return false;
+    };
+    if !section_args_include_range(args) {
+        return false;
+    }
+    match &callee.node {
+        Expr::Name { name } => {
+            let key = name.to_lowercase();
+            let symbol_rank = current_proc_scope()
+                .and_then(|sid| st.lookup_in(sid, &key))
+                .and_then(value_symbol_declared_rank);
+            locals.get(&key).is_some_and(|info| {
+                local_is_array_like(info)
+                    || descriptor_backed_runtime_char_array(info)
+                    || symbol_rank.is_some_and(|rank| rank > 0)
+            })
+        }
+        Expr::ComponentAccess { .. } => false,
+        _ => false,
+    }
+}
+
+pub(super) fn actual_is_character_array_section_designator(
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    _type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> bool {
+    let Expr::FunctionCall { callee, args } = &expr.node else {
+        return false;
+    };
+    if !section_args_include_range(args) {
+        return false;
+    }
+    match &callee.node {
+        Expr::Name { name } => {
+            let key = name.to_lowercase();
+            let symbol_rank = current_proc_scope()
+                .and_then(|sid| st.lookup_in(sid, &key))
+                .and_then(value_symbol_declared_rank);
+            locals.get(&key).is_some_and(|info| {
+                let has_character_elements = info.char_kind != CharKind::None
+                    || descriptor_backed_runtime_char_array(info)
+                    || local_fixed_char_allocatable_scalar_len(info).is_some();
+                let has_array_shape = local_declared_rank(info) > 0
+                    || local_uses_array_descriptor(info)
+                    || descriptor_backed_runtime_char_array(info)
+                    || symbol_rank.is_some_and(|rank| rank > 0);
+                has_character_elements && has_array_shape
+            })
+        }
+        Expr::ComponentAccess { .. } => false,
+        _ => false,
+    }
+}
+
+fn section_args_include_range(args: &[crate::ast::expr::Argument]) -> bool {
+    args.iter()
+        .any(|arg| matches!(arg.value, crate::ast::expr::SectionSubscript::Range { .. }))
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct SequenceAssociationTemp {
     source_desc: ValueId,
@@ -52818,6 +52999,19 @@ pub(super) fn finish_sequence_association_temps(
     }
 }
 
+fn sequence_supported_elem_ty(elem_ty: &IrType) -> bool {
+    matches!(elem_ty, IrType::Int(_) | IrType::Float(_) | IrType::Bool)
+        || is_complex_ty(elem_ty)
+}
+
+fn sequence_char_supported_elem_ty(elem_ty: &IrType) -> bool {
+    match elem_ty {
+        IrType::Int(IntWidth::I8) => true,
+        IrType::Array(inner, _) => matches!(inner.as_ref(), IrType::Int(IntWidth::I8)),
+        _ => false,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn lower_sequence_array_actual(
     b: &mut FuncBuilder,
@@ -52842,9 +53036,7 @@ pub(super) fn lower_sequence_array_actual(
             contained_host_refs,
             descriptor_params,
         )?;
-        let supported_elem = matches!(elem_ty, IrType::Int(_) | IrType::Float(_) | IrType::Bool)
-            || is_complex_ty(&elem_ty);
-        if supported_elem {
+        if sequence_supported_elem_ty(&elem_ty) {
             return Some(b.load_typed(source_desc, IrType::Ptr(Box::new(elem_ty))));
         }
     }
@@ -52878,9 +53070,7 @@ pub(super) fn lower_sequence_array_actual(
         contained_host_refs,
         descriptor_params,
     )?;
-    let supported_elem = matches!(elem_ty, IrType::Int(_) | IrType::Float(_) | IrType::Bool)
-        || is_complex_ty(&elem_ty);
-    if !supported_elem {
+    if !sequence_supported_elem_ty(&elem_ty) {
         return None;
     }
 
@@ -52900,6 +53090,58 @@ pub(super) fn lower_sequence_array_actual(
         source_owns_temp: array_expr_descriptor_may_own_temp(expr, locals, st),
     });
     Some(b.load_typed(tmp_desc, IrType::Ptr(Box::new(elem_ty))))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn lower_sequence_char_array_actual(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+    copy_back: bool,
+    temps: &mut Vec<SequenceAssociationTemp>,
+) -> Option<ValueId> {
+    let (source_desc, elem_ty) = lower_array_expr_descriptor(
+        b,
+        locals,
+        expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    )?;
+    if !sequence_char_supported_elem_ty(&elem_ty) {
+        return None;
+    }
+
+    let desc = if contiguous_sequence_section_actual(locals, expr) {
+        source_desc
+    } else {
+        let tmp_desc = allocate_like_array_temp_descriptor_with_elem_type(b, source_desc, &elem_ty);
+        let stat = b.alloca(IrType::Int(IntWidth::I32));
+        let zero = b.const_i32(0);
+        b.store(zero, stat);
+        b.call(
+            FuncRef::External("afs_copy_array_data".into()),
+            vec![tmp_desc, source_desc, stat],
+            IrType::Void,
+        );
+        temps.push(SequenceAssociationTemp {
+            source_desc,
+            temp_desc: tmp_desc,
+            copy_back,
+            source_owns_temp: array_expr_descriptor_may_own_temp(expr, locals, st),
+        });
+        tmp_desc
+    };
+    let raw_base = b.load_typed(desc, IrType::Ptr(Box::new(elem_ty)));
+    let base = ptr_i8_value(b, raw_base);
+    Some(base)
 }
 
 fn contiguous_sequence_section_actual(

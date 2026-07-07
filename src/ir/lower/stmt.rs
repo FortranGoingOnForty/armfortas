@@ -3350,13 +3350,28 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             Some(arg) => {
                                 match &arg.value {
                                     crate::ast::expr::SectionSubscript::Element(arg_expr) => {
+                                        let actual_is_array_section =
+                                            actual_is_array_section_designator(
+                                                &ctx.locals,
+                                                arg_expr,
+                                                ctx.st,
+                                                Some(ctx.type_layouts),
+                                            );
                                         let actual_is_array = actual_expr_rank(
                                             arg_expr,
                                             &ctx.locals,
                                             ctx.st,
                                             Some(ctx.type_layouts),
                                         )
-                                        .is_some_and(|rank| rank > 0);
+                                        .is_some_and(|rank| rank > 0)
+                                            || actual_is_array_section;
+                                        let actual_is_char_sequence =
+                                            actual_is_character_array_section_designator(
+                                                &ctx.locals,
+                                                arg_expr,
+                                                ctx.st,
+                                                Some(ctx.type_layouts),
+                                            );
                                         let sequence_array_for_arg = (wants_sequence_array
                                             || actual_is_array)
                                             && !matches!(
@@ -3460,18 +3475,34 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                             )
                                         })
                                     } else if sequence_array_for_arg {
-                                        lower_sequence_array_actual(
-                                            b,
-                                            &ctx.locals,
-                                            e,
-                                            ctx.st,
-                                            Some(ctx.type_layouts),
-                                            Some(ctx.internal_funcs),
-                                            Some(ctx.contained_host_refs),
-                                            Some(ctx.descriptor_params),
-                                            sequence_array_copy_back_for_arg,
-                                            &mut call_arg_sequence_temps,
-                                        )
+                                        let sequence_actual = if actual_is_char_sequence {
+                                            lower_sequence_char_array_actual(
+                                                b,
+                                                &ctx.locals,
+                                                e,
+                                                ctx.st,
+                                                Some(ctx.type_layouts),
+                                                Some(ctx.internal_funcs),
+                                                Some(ctx.contained_host_refs),
+                                                Some(ctx.descriptor_params),
+                                                sequence_array_copy_back_for_arg,
+                                                &mut call_arg_sequence_temps,
+                                            )
+                                        } else {
+                                            lower_sequence_array_actual(
+                                                b,
+                                                &ctx.locals,
+                                                e,
+                                                ctx.st,
+                                                Some(ctx.type_layouts),
+                                                Some(ctx.internal_funcs),
+                                                Some(ctx.contained_host_refs),
+                                                Some(ctx.descriptor_params),
+                                                sequence_array_copy_back_for_arg,
+                                                &mut call_arg_sequence_temps,
+                                            )
+                                        };
+                                        sequence_actual
                                         .unwrap_or_else(|| {
                                             lower_arg_by_ref_for_dummy_full(
                                                 b,
@@ -3794,13 +3825,28 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             Some(arg) => {
                                 match &arg.value {
                                     crate::ast::expr::SectionSubscript::Element(arg_expr) => {
+                                        let actual_is_array_section =
+                                            actual_is_array_section_designator(
+                                                &ctx.locals,
+                                                arg_expr,
+                                                ctx.st,
+                                                Some(ctx.type_layouts),
+                                            );
                                         let actual_is_array = actual_expr_rank(
                                             arg_expr,
                                             &ctx.locals,
                                             ctx.st,
                                             Some(ctx.type_layouts),
                                         )
-                                        .is_some_and(|rank| rank > 0);
+                                        .is_some_and(|rank| rank > 0)
+                                            || actual_is_array_section;
+                                        let actual_is_char_sequence =
+                                            actual_is_character_array_section_designator(
+                                                &ctx.locals,
+                                                arg_expr,
+                                                ctx.st,
+                                                Some(ctx.type_layouts),
+                                            );
                                         let sequence_array_for_arg = (wants_sequence_array
                                             || actual_is_array)
                                             && !matches!(
@@ -3907,18 +3953,34 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                             )
                                         })
                                     } else if sequence_array_for_arg {
-                                        lower_sequence_array_actual(
-                                            b,
-                                            &ctx.locals,
-                                            e,
-                                            ctx.st,
-                                            Some(ctx.type_layouts),
-                                            Some(ctx.internal_funcs),
-                                            Some(ctx.contained_host_refs),
-                                            Some(ctx.descriptor_params),
-                                            sequence_array_copy_back_for_arg,
-                                            &mut call_arg_sequence_temps,
-                                        )
+                                        let sequence_actual = if actual_is_char_sequence {
+                                            lower_sequence_char_array_actual(
+                                                b,
+                                                &ctx.locals,
+                                                e,
+                                                ctx.st,
+                                                Some(ctx.type_layouts),
+                                                Some(ctx.internal_funcs),
+                                                Some(ctx.contained_host_refs),
+                                                Some(ctx.descriptor_params),
+                                                sequence_array_copy_back_for_arg,
+                                                &mut call_arg_sequence_temps,
+                                            )
+                                        } else {
+                                            lower_sequence_array_actual(
+                                                b,
+                                                &ctx.locals,
+                                                e,
+                                                ctx.st,
+                                                Some(ctx.type_layouts),
+                                                Some(ctx.internal_funcs),
+                                                Some(ctx.contained_host_refs),
+                                                Some(ctx.descriptor_params),
+                                                sequence_array_copy_back_for_arg,
+                                                &mut call_arg_sequence_temps,
+                                            )
+                                        };
+                                        sequence_actual
                                         .unwrap_or_else(|| {
                                             lower_arg_by_ref_for_dummy_full(
                                                 b,
