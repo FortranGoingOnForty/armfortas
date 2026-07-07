@@ -29362,6 +29362,25 @@ pub(super) fn lower_write_items_adv(
                     }
                 }
             }
+            // Whole component array section, e.g. `print *, a%id` where
+            // `a` is an array and `id` a scalar component. This is a
+            // strided view; without a dedicated path the item falls
+            // through to the scalar dispatch below and only the first
+            // element prints (audit C3). Deferred-length char components
+            // carry a per-element string descriptor the strided writer
+            // can't emit, so leave those to the existing path.
+            if let Expr::ComponentAccess { .. } = &item.node {
+                if let Some(sec_info) =
+                    component_intrinsic_local_info(b, &ctx.locals, item, ctx.st, ctx.type_layouts)
+                {
+                    if local_is_array_like(&sec_info)
+                        && !matches!(sec_info.char_kind, CharKind::Deferred)
+                    {
+                        lower_component_section_write(b, ctx, &sec_info, unit);
+                        continue;
+                    }
+                }
+            }
             // Complex literal in print position: detect ptr<[f32/f64 x 2]>
             if matches!(item.node, Expr::ComplexLiteral { .. }) {
                 let addr = super::expr::lower_expr_ctx_tl(b, ctx, item);
@@ -31410,6 +31429,21 @@ pub(super) fn lower_fmt_push(
             }
         }
     }
+    // Whole component array section in formatted output, e.g.
+    // `write(*,fmt) a%id` where `a` is an array and `id` a scalar
+    // component. Strided view; see `lower_component_section_write`.
+    // Deferred-length char components use a per-element string
+    // descriptor the strided pusher can't emit — leave those below.
+    if let Expr::ComponentAccess { .. } = &item.node {
+        if let Some(sec_info) =
+            component_intrinsic_local_info(b, &ctx.locals, item, ctx.st, ctx.type_layouts)
+        {
+            if local_is_array_like(&sec_info) && !matches!(sec_info.char_kind, CharKind::Deferred) {
+                fmt_push_component_section(b, ctx, &sec_info);
+                return;
+            }
+        }
+    }
     if let Expr::FunctionCall { callee, args } = &item.node {
         if let Expr::Name { name } = &callee.node {
             let key = name.to_lowercase();
@@ -32329,6 +32363,126 @@ fn fmt_push_array_desc_loop(b: &mut FuncBuilder, desc: ValueId, elem_ty: &IrType
     b.store(next, i_addr);
     b.branch(bb_check, vec![]);
     b.set_block(bb_exit);
+}
+
+/// Formatted counterpart of `lower_component_section_write`: push every
+/// element of a strided component array section (`write(*,fmt) a%id`)
+/// through the format engine. Reads the record stride from the section
+/// descriptor built by `projected_scalar_component_local_info` (dim
+/// stride at offset 24+16, in elements). Without this, the item fell to
+/// the scalar push and only the first element was formatted (audit C3).
+fn fmt_push_component_section(b: &mut FuncBuilder, _ctx: &mut LowerCtx, info: &LocalInfo) {
+    let desc = array_descriptor_addr(b, info);
+    let base = array_base_addr(b, info);
+    // See `lower_component_section_write`: spacing follows the descriptor's
+    // stored record element size (offset 8), not `ir_scalar_byte_size`.
+    let elem_bytes_v = load_array_desc_i64_field(b, desc, 8);
+    let rank = info.dims.len().max(1);
+
+    let char_fixed_len: Option<i64> = match info.char_kind {
+        CharKind::Fixed(n) => Some(n),
+        _ => None,
+    };
+    let is_complex_elem = matches!(
+        &info.ty,
+        IrType::Array(inner, 2) if matches!(inner.as_ref(), IrType::Float(_))
+    );
+    let complex_lane_f64 = matches!(
+        &info.ty,
+        IrType::Array(inner, 2) if matches!(inner.as_ref(), IrType::Float(FloatWidth::F64))
+    );
+
+    struct DimW {
+        counter: ValueId,
+        lo: ValueId,
+        hi: ValueId,
+        stride: ValueId,
+    }
+    let mut dims: Vec<DimW> = Vec::with_capacity(rank);
+    for d in 0..rank {
+        let off = 24 + (d as i64) * 24;
+        let lo = load_array_desc_i64_field(b, desc, off);
+        let hi = load_array_desc_i64_field(b, desc, off + 8);
+        let stride = load_array_desc_i64_field(b, desc, off + 16);
+        let counter = b.alloca(IrType::Int(IntWidth::I64));
+        b.store(lo, counter);
+        dims.push(DimW {
+            counter,
+            lo,
+            hi,
+            stride,
+        });
+    }
+
+    let n = rank;
+    let mut checks: Vec<BlockId> = Vec::with_capacity(n);
+    let mut bodies: Vec<BlockId> = Vec::with_capacity(n);
+    let mut incrs: Vec<BlockId> = Vec::with_capacity(n);
+    let mut exits: Vec<BlockId> = Vec::with_capacity(n);
+    for d in 0..n {
+        checks.push(b.create_block(&format!("compsecf_check_d{}", d)));
+        bodies.push(b.create_block(&format!("compsecf_body_d{}", d)));
+        incrs.push(b.create_block(&format!("compsecf_incr_d{}", d)));
+        exits.push(b.create_block(&format!("compsecf_exit_d{}", d)));
+    }
+    let one64 = b.const_i64(1);
+    let outer = n - 1;
+    b.branch(checks[outer], vec![]);
+
+    for d_rev in 0..n {
+        let d = n - 1 - d_rev;
+
+        b.set_block(checks[d]);
+        let cur = b.load(dims[d].counter);
+        let done = b.icmp(CmpOp::Gt, cur, dims[d].hi);
+        b.cond_branch(done, exits[d], vec![], bodies[d], vec![]);
+
+        b.set_block(bodies[d]);
+        if d == 0 {
+            let mut off_elems: Option<ValueId> = None;
+            for dim in &dims {
+                let cnt = b.load(dim.counter);
+                let adj = b.isub(cnt, dim.lo);
+                let term = b.imul(adj, dim.stride);
+                off_elems = Some(match off_elems {
+                    Some(prev) => b.iadd(prev, term),
+                    None => term,
+                });
+            }
+            let off_elems = off_elems.unwrap_or_else(|| b.const_i64(0));
+            let byte_off = b.imul(off_elems, elem_bytes_v);
+            let p = b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
+            if let Some(len) = char_fixed_len {
+                let len_v = b.const_i64(len);
+                b.call(
+                    FuncRef::External("afs_fmt_push_string".into()),
+                    vec![p, len_v],
+                    IrType::Void,
+                );
+            } else if is_complex_elem {
+                fmt_push_emit_complex(b, complex_lane_f64, p);
+            } else {
+                let elem = b.load_typed(p, info.ty.clone());
+                fmt_push_emit_scalar(b, &info.ty, elem);
+            }
+            b.branch(incrs[0], vec![]);
+        } else {
+            b.store(dims[d - 1].lo, dims[d - 1].counter);
+            b.branch(checks[d - 1], vec![]);
+        }
+
+        b.set_block(incrs[d]);
+        let cur2 = b.load(dims[d].counter);
+        let next = b.iadd(cur2, one64);
+        b.store(next, dims[d].counter);
+        b.branch(checks[d], vec![]);
+
+        b.set_block(exits[d]);
+        if d < n - 1 {
+            b.branch(incrs[d + 1], vec![]);
+        }
+    }
+    b.set_block(exits[outer]);
 }
 
 /// Lower a 1-D slice write item: `print *, a(lo:hi[:step])`.
@@ -33870,6 +34024,151 @@ pub(super) fn lower_alloc_section_write_nd(
         }
     }
 
+    b.set_block(exits[outer]);
+}
+
+/// Lower a whole component-array-section write item, e.g. `print *, a%id`
+/// where `a` is an array and `id` a scalar component. The section is a
+/// strided view: consecutive elements are `record_stride` apart, not
+/// contiguous, so neither `lower_whole_array_write` (base + i*elem_size)
+/// nor `lower_alloc_section_write_nd` (offset from packed extents) is
+/// correct — both assume contiguous storage. The descriptor built by
+/// `projected_scalar_component_local_info` records the record stride in
+/// each dim's stride field (offset 24+16, in elements); this reads it and
+/// walks the elements in array order. Without this the item fell through
+/// to the scalar dispatch and only the first element was written (audit
+/// C3): `print *, a%id` printed `10` instead of `10 20 30`.
+pub(super) fn lower_component_section_write(
+    b: &mut FuncBuilder,
+    _ctx: &mut LowerCtx,
+    info: &LocalInfo,
+    unit: ValueId,
+) {
+    let desc = array_descriptor_addr(b, info);
+    let base = array_base_addr(b, info);
+    // Byte multiplier = the record element size the descriptor was built
+    // with (offset 8), NOT `ir_scalar_byte_size(info.ty)`. A default
+    // logical component stores 4 bytes but loads as a 1-byte Bool, so
+    // those disagree; the per-element spacing must follow the descriptor.
+    let elem_bytes_v = load_array_desc_i64_field(b, desc, 8);
+    let rank = info.dims.len().max(1);
+
+    let char_fixed_len: Option<i64> = match info.char_kind {
+        CharKind::Fixed(n) => Some(n),
+        _ => None,
+    };
+    let is_complex_elem = matches!(
+        &info.ty,
+        IrType::Array(inner, 2) if matches!(inner.as_ref(), IrType::Float(_))
+    );
+    let complex_lane_f64 = matches!(
+        &info.ty,
+        IrType::Array(inner, 2) if matches!(inner.as_ref(), IrType::Float(FloatWidth::F64))
+    );
+    let writer = match &info.ty {
+        _ if char_fixed_len.is_some() => "afs_write_string",
+        _ if is_complex_elem && complex_lane_f64 => "afs_write_complex_f64",
+        _ if is_complex_elem => "afs_write_complex_f32",
+        _ => scalar_runtime_write_func(&info.ty),
+    };
+
+    struct DimW {
+        counter: ValueId,
+        lo: ValueId,
+        hi: ValueId,
+        stride: ValueId,
+    }
+    let mut dims: Vec<DimW> = Vec::with_capacity(rank);
+    for d in 0..rank {
+        let off = 24 + (d as i64) * 24;
+        let lo = load_array_desc_i64_field(b, desc, off);
+        let hi = load_array_desc_i64_field(b, desc, off + 8);
+        let stride = load_array_desc_i64_field(b, desc, off + 16);
+        let counter = b.alloca(IrType::Int(IntWidth::I64));
+        b.store(lo, counter);
+        dims.push(DimW {
+            counter,
+            lo,
+            hi,
+            stride,
+        });
+    }
+
+    // Nested loops with dim 0 innermost (Fortran element order). Logical
+    // counters step by 1; the physical spacing comes from each dim's
+    // descriptor stride, so `off_elems = sum_d (counter_d - lo_d)*stride_d`.
+    let n = rank;
+    let mut checks: Vec<BlockId> = Vec::with_capacity(n);
+    let mut bodies: Vec<BlockId> = Vec::with_capacity(n);
+    let mut incrs: Vec<BlockId> = Vec::with_capacity(n);
+    let mut exits: Vec<BlockId> = Vec::with_capacity(n);
+    for d in 0..n {
+        checks.push(b.create_block(&format!("compsecw_check_d{}", d)));
+        bodies.push(b.create_block(&format!("compsecw_body_d{}", d)));
+        incrs.push(b.create_block(&format!("compsecw_incr_d{}", d)));
+        exits.push(b.create_block(&format!("compsecw_exit_d{}", d)));
+    }
+    let one64 = b.const_i64(1);
+    let outer = n - 1;
+    b.branch(checks[outer], vec![]);
+
+    for d_rev in 0..n {
+        let d = n - 1 - d_rev;
+
+        b.set_block(checks[d]);
+        let cur = b.load(dims[d].counter);
+        let done = b.icmp(CmpOp::Gt, cur, dims[d].hi);
+        b.cond_branch(done, exits[d], vec![], bodies[d], vec![]);
+
+        b.set_block(bodies[d]);
+        if d == 0 {
+            let mut off_elems: Option<ValueId> = None;
+            for dim in &dims {
+                let cnt = b.load(dim.counter);
+                let adj = b.isub(cnt, dim.lo);
+                let term = b.imul(adj, dim.stride);
+                off_elems = Some(match off_elems {
+                    Some(prev) => b.iadd(prev, term),
+                    None => term,
+                });
+            }
+            let off_elems = off_elems.unwrap_or_else(|| b.const_i64(0));
+            let byte_off = b.imul(off_elems, elem_bytes_v);
+            let p = b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
+            if let Some(len) = char_fixed_len {
+                let len_v = b.const_i64(len);
+                b.call(
+                    FuncRef::External(writer.into()),
+                    vec![unit, p, len_v],
+                    IrType::Void,
+                );
+            } else if is_complex_elem {
+                b.call(FuncRef::External(writer.into()), vec![unit, p], IrType::Void);
+            } else {
+                let elem = b.load_typed(p, info.ty.clone());
+                b.call(
+                    FuncRef::External(writer.into()),
+                    vec![unit, elem],
+                    IrType::Void,
+                );
+            }
+            b.branch(incrs[0], vec![]);
+        } else {
+            b.store(dims[d - 1].lo, dims[d - 1].counter);
+            b.branch(checks[d - 1], vec![]);
+        }
+
+        b.set_block(incrs[d]);
+        let cur2 = b.load(dims[d].counter);
+        let next = b.iadd(cur2, one64);
+        b.store(next, dims[d].counter);
+        b.branch(checks[d], vec![]);
+
+        b.set_block(exits[d]);
+        if d < n - 1 {
+            b.branch(incrs[d + 1], vec![]);
+        }
+    }
     b.set_block(exits[outer]);
 }
 
