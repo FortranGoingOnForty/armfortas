@@ -336,6 +336,7 @@ impl<'a> Parser<'a> {
         match self.peek() {
             TokenKind::Power => Some(BP_POW),
             TokenKind::Star => Some(BP_MUL),
+            TokenKind::Slash if self.slash_closes_array_constructor() => None,
             TokenKind::Slash => Some(BP_MUL),
             TokenKind::Plus => Some(BP_ADD),
             TokenKind::Minus => Some(BP_ADD),
@@ -357,6 +358,10 @@ impl<'a> Parser<'a> {
             TokenKind::DefinedOp(_) => Some(BP_DEFINED_BINARY),
             _ => None,
         }
+    }
+
+    fn slash_closes_array_constructor(&self) -> bool {
+        self.slash_array_ctor_depth > 0 && self.peek_kind_at(1) == Some(&TokenKind::RParen)
     }
 
     // ---- Literal parsers ----
@@ -655,52 +660,35 @@ impl<'a> Parser<'a> {
 
     fn parse_array_constructor_slash(&mut self, start: Span) -> Result<SpannedExpr, ParseError> {
         // Already consumed ( and /. Parse values until /).
-        // The closing /) is ambiguous with division. We handle this by
-        // checking if / is immediately followed by ) — if so, it's the closer.
-        // Division inside (/ /) (e.g., (/ a/b /) ) is allowed but the / before )
-        // is always the constructor close.
-        // Each value routes through parse_ac_value so implied-do
-        // constructors like `(/ (i, i=1,5) /)` are recognised — the
-        // previous path used parse_expr_bp, which couldn't parse the
-        // parenthesised implied-do form and errored on `=`.
+        // The closing /) is ambiguous with division. While this parser
+        // context is active, infix_bp treats only a slash immediately
+        // followed by ')' as the constructor delimiter; all other slash
+        // tokens remain ordinary division operators.
         let mut values = Vec::new();
-        loop {
-            if matches!(self.peek(), TokenKind::Slash) {
-                break;
+        self.slash_array_ctor_depth += 1;
+        let result = (|| {
+            loop {
+                if matches!(self.peek(), TokenKind::Slash) {
+                    break;
+                }
+                values.push(self.parse_ac_value()?);
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
             }
-            values.push(self.parse_ac_value_bracketed(BP_MUL.right)?);
-            if !self.eat(&TokenKind::Comma) {
-                break;
-            }
-        }
-        self.expect(&TokenKind::Slash)?;
-        self.expect(&TokenKind::RParen)?;
-        let span = span_from_to(start, self.prev_span());
-        Ok(Spanned::new(
-            Expr::ArrayConstructor {
-                type_spec: None,
-                values,
-            },
-            span,
-        ))
-    }
-
-    /// Variant of parse_ac_value that honours a minimum binding
-    /// power. Needed inside the `(/ ... /)` form where plain
-    /// `parse_expr` would greedily consume the closing `/` as
-    /// integer division. Implied-do values nested inside a `(...)`
-    /// still parse their inner expressions at full precedence — the
-    /// minimum BP only applies at the top level of each AcValue.
-    fn parse_ac_value_bracketed(&mut self, min_bp: u8) -> Result<AcValue, ParseError> {
-        if self.peek() == &TokenKind::LParen {
-            let save_pos = self.pos;
-            if let Ok(implied) = self.try_parse_implied_do() {
-                return Ok(implied);
-            }
-            self.pos = save_pos;
-        }
-        let expr = self.parse_expr_bp(min_bp)?;
-        Ok(AcValue::Expr(expr))
+            self.expect(&TokenKind::Slash)?;
+            self.expect(&TokenKind::RParen)?;
+            let span = span_from_to(start, self.prev_span());
+            Ok(Spanned::new(
+                Expr::ArrayConstructor {
+                    type_spec: None,
+                    values,
+                },
+                span,
+            ))
+        })();
+        self.slash_array_ctor_depth -= 1;
+        result
     }
 
     fn try_parse_ac_type_spec(&mut self) -> Option<String> {

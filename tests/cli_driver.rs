@@ -21845,6 +21845,52 @@ fn nested_array_constructor_into_allocatable_rank1_flattens_full_size() {
 }
 
 #[test]
+fn slash_array_constructor_accepts_multiplicative_element_exprs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=slash_array_constructor_accepts_multiplicative_element_exprs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // Surfaced while building an aerosol-kernel checksum probe: the
+    // `(/ ... /)` parser used a high minimum binding power to avoid
+    // consuming the closing `/)`, which also rejected valid top-level
+    // multiplicative element expressions such as `0.05 * real(i)`.
+    // Only `/)` is a constructor delimiter; other `*` and `/` tokens
+    // remain normal infix operators.
+    let src = write_program(
+        "program t\n  implicit none\n  integer :: i\n  real :: a(5)\n  i = 2\n  a = (/ 0.05 * real(i), real(i) / 4.0, (1.0 + real(i)) * 2.0, real(i) / (1.0 + 1.0), 9.0 / 3.0 /)\n  if (abs(a(1) - 0.1) > 1.0e-6) error stop 1\n  if (abs(a(2) - 0.5) > 1.0e-6) error stop 2\n  if (abs(a(3) - 6.0) > 1.0e-6) error stop 3\n  if (abs(a(4) - 1.0) > 1.0e-6) error stop 4\n  if (abs(a(5) - 3.0) > 1.0e-6) error stop 5\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("slash_ac_multiplicative_exprs", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("slash AC multiplicative expression compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "slash AC multiplicative expression should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("slash AC multiplicative expression run failed");
+    assert!(
+        run.status.success(),
+        "slash AC multiplicative expression should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn huge_intrinsic_over_array_actual_folds_at_compile_time() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

@@ -37,6 +37,7 @@ pub struct Parser<'a> {
     tokens: &'a [Token],
     pos: usize,
     expr_depth: usize,
+    slash_array_ctor_depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -45,6 +46,7 @@ impl<'a> Parser<'a> {
             tokens,
             pos: 0,
             expr_depth: 0,
+            slash_array_ctor_depth: 0,
         }
     }
 
