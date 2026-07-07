@@ -2946,11 +2946,11 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
 
             if let Some(ctrl) = controls.first() {
                 // Internal WRITE to a deferred-length allocatable
-                // `character(:), allocatable` scalar: unallocated targets are
-                // allocated to the record length, while allocated targets
-                // behave as fixed internal files. Formatted goes through the
-                // fmt engine's InternalAlloc sink; list-directed collects the
-                // record in the runtime (afs_lst_ia_*) and stores it in one
+                // `character(:), allocatable` scalar: the target is
+                // reallocated to the record length (F2023 §12.4), whether it
+                // was unallocated or already allocated. Formatted goes through
+                // the fmt engine's InternalAlloc sink; list-directed collects
+                // the record in the runtime (afs_lst_ia_*) and stores it in one
                 // shot with the same semantics.
                 if let Some(desc) = internal_io_alloc_target(b, ctx, ctrl) {
                     if is_list_directed {

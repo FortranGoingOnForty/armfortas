@@ -29918,11 +29918,10 @@ pub(super) fn internal_io_array_target(
 
 /// If `control` designates a deferred-length allocatable
 /// `character(:), allocatable` scalar (a bare name — not a substring,
-/// array element, or pointer), return its StringDescriptor address for
-/// formatted internal writes that allocate unallocated targets while
-/// treating allocated targets as fixed internal files.
-/// Substrings and array elements are fixed-length views and stay on the
-/// fixed-buffer path.
+/// array element, or pointer), return its StringDescriptor address for the
+/// reallocating internal-write path (F2023 §12.4 auto-realloc to the record
+/// length). Substrings and array elements are fixed-length views and stay on
+/// the fixed-buffer path.
 pub(super) fn internal_io_alloc_target(
     b: &mut FuncBuilder,
     ctx: &LowerCtx,

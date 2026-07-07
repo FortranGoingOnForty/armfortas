@@ -3782,9 +3782,9 @@ enum FmtSink {
         buf_len: usize,
     },
     /// Internal write whose target is a deferred-length allocatable
-    /// `character(:), allocatable` scalar. An already allocated target is
-    /// treated as a fixed internal file; an unallocated target is allocated
-    /// to the formatted record length.
+    /// `character(:), allocatable` scalar. The target is (re)allocated to the
+    /// formatted record length whether or not it was already allocated
+    /// (F2023 §12.4).
     InternalAlloc {
         desc: *mut u8,
     },
@@ -3918,11 +3918,14 @@ extern "C" {
 /// Store formatted internal-write bytes into a deferred-length
 /// StringDescriptor; returns false on allocation failure.
 ///
-/// If the descriptor is already allocated, a formatted internal WRITE treats
-/// the existing allocation as the fixed internal file: copy/truncate the
-/// record into the current length and space-pad the remainder. If the
-/// descriptor is unallocated, allocate exactly enough storage for the record.
-/// Storage is malloc'd to match `afs_dealloc_string`'s free.
+/// F2023 §12.4: when an internal file is a deferred-length allocatable
+/// character scalar, the record is assigned by intrinsic assignment,
+/// allocating or reallocating the variable to have length equal to the number
+/// of characters written. An already-allocated target is NOT treated as a
+/// fixed internal file (that is the "otherwise" case in §12.4, for
+/// non-deferred-length units) — it is reallocated to the record length,
+/// growing or shrinking as needed. Storage is malloc'd to match
+/// `afs_dealloc_string`'s free.
 fn store_internal_alloc_record(
     desc: *mut crate::descriptor::StringDescriptor,
     bytes: &[u8],
@@ -3933,17 +3936,6 @@ fn store_internal_alloc_record(
     }
     let d = unsafe { &mut *desc };
     let n = bytes.len() as i64;
-    if d.is_allocated() && !d.data.is_null() {
-        write_to_buffer(
-            d.data,
-            d.len.max(0) as usize,
-            0,
-            bytes,
-            std::ptr::null_mut(),
-        );
-        d.flags |= STR_DEFERRED;
-        return true;
-    }
     if n <= 0 {
         d.len = 0;
         d.flags |= STR_ALLOCATED | STR_DEFERRED;
@@ -4035,9 +4027,9 @@ pub extern "C" fn afs_fmt_begin_internal_array(
 /// character scalar. The fixed-buffer writers can't serve this target
 /// (an unallocated descriptor presents a len-0 view), so the record
 /// is collected here and stored in one shot through
-/// `store_internal_alloc_record` — the same allocate-when-absent /
-/// fixed-when-present semantics as the formatted path. Item rendering
-/// matches `afs_write_internal_*` exactly (leading blank + `{}`).
+/// `store_internal_alloc_record` — the same F2023 §12.4 reallocate-to-record-
+/// length semantics as the formatted path. Item rendering matches
+/// `afs_write_internal_*` exactly (leading blank + `{}`).
 struct LstIaContext {
     desc: *mut crate::descriptor::StringDescriptor,
     record: Vec<u8>,
@@ -5756,7 +5748,7 @@ mod tests {
     }
 
     #[test]
-    fn internal_write_allocates_unallocated_and_preserves_allocated_len() {
+    fn internal_write_reallocates_deferred_length_target_to_record_length() {
         use crate::descriptor::StringDescriptor;
         let mut desc = StringDescriptor::zeroed();
         let dptr = &mut desc as *mut StringDescriptor as *mut u8;
@@ -5777,10 +5769,10 @@ mod tests {
         assert_eq!(desc.len, 7);
         let bytes = unsafe { std::slice::from_raw_parts(desc.data, desc.len as usize) };
         assert_eq!(bytes, b"val=42!");
-        let grown_cap = desc.capacity;
 
-        // Already allocated: behave like a fixed internal file, preserving
-        // length and padding the remaining buffer with spaces.
+        // Already allocated (len 7): F2023 §12.4 reallocates to the new record
+        // length. Writing 'x' (1 char) shrinks len to 1 — it is NOT a fixed
+        // internal file that pads to the old length.
         afs_fmt_begin_internal_alloc(
             dptr,
             "(A)".as_ptr(),
@@ -5791,10 +5783,25 @@ mod tests {
         );
         afs_fmt_push_string("x".as_ptr(), 1);
         afs_fmt_end(0);
-        assert_eq!(desc.len, 7);
-        assert_eq!(desc.capacity, grown_cap);
+        assert_eq!(desc.len, 1);
         let bytes = unsafe { std::slice::from_raw_parts(desc.data, desc.len as usize) };
-        assert_eq!(bytes, b"x      ");
+        assert_eq!(bytes, b"x");
+
+        // Re-grow past the current length: 'hello, world #100' (17 chars).
+        afs_fmt_begin_internal_alloc(
+            dptr,
+            "(A,I0)".as_ptr(),
+            6,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        );
+        afs_fmt_push_string("hello, world #".as_ptr(), 14);
+        afs_fmt_push_int(100);
+        afs_fmt_end(0);
+        assert_eq!(desc.len, 17);
+        let bytes = unsafe { std::slice::from_raw_parts(desc.data, desc.len as usize) };
+        assert_eq!(bytes, b"hello, world #100");
 
         crate::string::afs_dealloc_string(dptr as *mut StringDescriptor);
     }

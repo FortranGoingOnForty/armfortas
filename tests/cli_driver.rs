@@ -30451,16 +30451,19 @@ fn formatted_e_huge_real_internal_write_round_trips() {
 }
 
 #[test]
-fn formatted_internal_write_preserves_allocated_deferred_char_length() {
+fn formatted_internal_write_reallocates_allocated_deferred_char() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
-            "\nHARNESS_SKIP suite=cli_driver test=formatted_internal_write_preserves_allocated_deferred_char_length count=1 reason=\"{}\"",
+            "\nHARNESS_SKIP suite=cli_driver test=formatted_internal_write_reallocates_allocated_deferred_char count=1 reason=\"{}\"",
             reason
         );
         return;
     }
+    // F2023 §12.4: writing to an already-allocated deferred-length allocatable
+    // internal file reallocates it to the record length. Here len(s) goes from
+    // 8 to 3 ('S33'); it is NOT preserved at 8 and blank-padded.
     let src = write_program(
-        "program p\n  implicit none\n  character(len=:), allocatable :: s\n  integer :: n\n  n = 33\n  allocate(character(len=8) :: s)\n  s = repeat('?', len(s))\n  write(s, \"('S', i0)\") n\n  if (len(s) /= 8) error stop 1\n  if (s(1:3) /= 'S33') error stop 2\n  if (s(4:8) /= '     ') error stop 3\n  s(4:4) = 'B'\n  s(5:8) = '0000'\n  if (s /= 'S33B0000') error stop 4\n  print *, s\nend program\n",
+        "program p\n  implicit none\n  character(len=:), allocatable :: s\n  integer :: n\n  n = 33\n  allocate(character(len=8) :: s)\n  s = repeat('?', len(s))\n  write(s, \"('S', i0)\") n\n  if (len(s) /= 3) error stop 1\n  if (s /= 'S33') error stop 2\n  print *, s\nend program\n",
         "f90",
     );
     let out = unique_path("formatted_internal_alloc_char_len", "bin");
@@ -30484,8 +30487,8 @@ fn formatted_internal_write_preserves_allocated_deferred_char_length() {
     );
     let stdout = String::from_utf8_lossy(&run.stdout);
     assert!(
-        stdout.contains("S33B0000"),
-        "expected preserved deferred-character buffer, got: {}",
+        stdout.contains("S33"),
+        "expected reallocated deferred-character record 'S33', got: {}",
         stdout
     );
 
