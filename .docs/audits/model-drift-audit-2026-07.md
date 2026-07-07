@@ -215,6 +215,26 @@ version aliasing applies default (`@@`) versions first then by link order
 (never HashMap order). Dynamic path also gained version aliasing + the
 COMMON hard error it lacked. Unit tests incl. a 64-run determinism check.
 
+L3, L4, L6, L7, L8, L9 all **FIXED 2026-07-06 (afs-ld branch
+`elf-audit-l3-l9`)**, each with a regression test; full afs-ld suite +
+clippy green after every fix. L5 stays open — deferred to the dynamic
+arc (#123), which is where the IFUNC/COPY-relocation machinery lands.
+
+- L3: one ordered `link_inputs` list drives archive search left-to-right
+  (`elf_lib_order.rs`).
+- L4: shared `encode_abs32` range-checks `R_X86_64_32/32S` in both paths
+  (`abs32_reloc_tests`).
+- L6: address-taken function imports get a canonical-PLT `st_value`
+  (their own stub) while staying `SHN_UNDEF` (`elf_canonical_plt.rs`).
+- L7: `sym_vaddr` short-circuits the `LINKER_MARK` sentinel before
+  `resolve_def` (`elf_gotpcrel_linker_sym.rs`).
+- L8: `parse_rel`/`parse_shared` bounds-check every section slice and
+  error on a zero/short `.dynsym` entsize instead of assuming 24
+  (`elf_malformed_reject.rs`).
+- L9: static ET_EXEC emits a non-exec PT_GNU_STACK; both paths brand
+  EI_OSABI from a runtime host probe, not a compile-time cfg
+  (`elf_static_gnu_stack_osabi.rs`).
+
 - **L1 — no weak/strong resolution in the dynamic path; first def wins.**
   `src/elf.rs:1629` (`globals.entry(name).or_insert(...)`). Weak `foo=7`
   before strong `foo=42` → exits 7; static path and system ld exit 42. Also
