@@ -92,6 +92,10 @@ fn inline_calls_in_function(
                     if cg.inline_cost(ci) > threshold {
                         continue;
                     }
+                    let callee = &module.functions[ci as usize];
+                    if live_inline_cost(callee) > threshold {
+                        continue;
+                    }
                     // Argument/parameter type agreement.  When a
                     // Fortran OPTIONAL parameter is absent at a call
                     // site, the caller passes `const_i64 0` as a null
@@ -103,7 +107,6 @@ fn inline_calls_in_function(
                     // inline any call whose arg type doesn't match the
                     // callee param type exactly.  The same check also
                     // guards any future call-boundary coercion shims.
-                    let callee = &module.functions[ci as usize];
                     if callee.params.len() != args.len() {
                         continue;
                     }
@@ -286,6 +289,10 @@ fn inline_calls_in_function(
     true
 }
 
+fn live_inline_cost(func: &Function) -> usize {
+    func.blocks.iter().map(|block| block.insts.len()).sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,6 +320,10 @@ mod tests {
             span: dummy_span(),
         });
         id
+    }
+
+    fn function_inst_count(func: &Function) -> usize {
+        func.blocks.iter().map(|block| block.insts.len()).sum()
     }
 
     #[test]
@@ -468,6 +479,68 @@ mod tests {
         assert!(
             post.is_empty(),
             "inliner left invalid IDs when the callee block vector was not in dominance order: {:?}",
+            post
+        );
+    }
+
+    #[test]
+    fn inline_chain_stops_at_live_callee_threshold() {
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
+
+        let mut base = Function::new("p0".into(), vec![], IrType::Int(IntWidth::I32));
+        let zero = push(
+            &mut base,
+            InstKind::ConstInt(0, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        let entry = base.entry;
+        base.block_mut(entry).terminator = Some(Terminator::Return(Some(zero)));
+        m.add_function(base);
+
+        for idx in 1..120u32 {
+            let mut f = Function::new(format!("p{}", idx), vec![], IrType::Int(IntWidth::I32));
+            let call = push(
+                &mut f,
+                InstKind::Call(FuncRef::Internal(idx - 1), vec![]),
+                IrType::Int(IntWidth::I32),
+            );
+            let one = push(
+                &mut f,
+                InstKind::ConstInt(1, IntWidth::I32),
+                IrType::Int(IntWidth::I32),
+            );
+            let sum = push(
+                &mut f,
+                InstKind::IAdd(call, one),
+                IrType::Int(IntWidth::I32),
+            );
+            let entry = f.entry;
+            f.block_mut(entry).terminator = Some(Terminator::Return(Some(sum)));
+            m.add_function(f);
+        }
+
+        let pass = Inline::for_level(OptLevel::O2);
+        assert!(
+            pass.run(&mut m),
+            "expected the chain to inline up to the cap"
+        );
+
+        let max_size = m
+            .functions
+            .iter()
+            .map(function_inst_count)
+            .max()
+            .unwrap_or(0);
+        assert!(
+            max_size <= INLINE_THRESHOLD_O2 + 3,
+            "current callee size should cap chain expansion, max function size was {}",
+            max_size
+        );
+
+        let post = verify_module(&m);
+        assert!(
+            post.is_empty(),
+            "capped chain inlining should leave valid IR: {:?}",
             post
         );
     }
