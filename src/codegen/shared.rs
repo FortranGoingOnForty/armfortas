@@ -66,17 +66,66 @@ pub enum GlobalsDialect {
     Elf,
 }
 
-/// Emit module-level globals as a data section.
+fn zero_global_align_bytes(ty: &IrType, layout: &crate::target::TargetLayout) -> u64 {
+    ty.size_bytes(layout).clamp(1, 16).next_power_of_two()
+}
+
+fn emit_data_section(out: &mut String, dialect: GlobalsDialect, in_data: &mut bool) {
+    if *in_data {
+        return;
+    }
+    match dialect {
+        GlobalsDialect::MachO => writeln!(out, ".section __DATA,__data").unwrap(),
+        GlobalsDialect::Elf => writeln!(out, ".data").unwrap(),
+    }
+    *in_data = true;
+}
+
+fn emit_zero_fill_global(
+    out: &mut String,
+    symbol: &str,
+    ty: &IrType,
+    layout: &crate::target::TargetLayout,
+    dialect: GlobalsDialect,
+    is_module_global: bool,
+) {
+    let size = ty.size_bytes(layout).max(1);
+    let align = zero_global_align_bytes(ty, layout);
+    match dialect {
+        GlobalsDialect::Elf => {
+            if !is_module_global {
+                writeln!(out, ".local {}", symbol).unwrap();
+            }
+            writeln!(out, ".comm {},{},{}", symbol, size, align).unwrap();
+        }
+        GlobalsDialect::MachO => {
+            if is_module_global {
+                writeln!(out, ".globl {}", symbol).unwrap();
+            } else {
+                writeln!(out, ".private_extern {}", symbol).unwrap();
+            }
+            writeln!(
+                out,
+                ".zerofill __DATA,__bss,{},{},{}",
+                symbol,
+                size,
+                align.trailing_zeros()
+            )
+            .unwrap();
+        }
+    }
+}
+
+/// Emit module-level globals as data or zero-fill reservations.
 /// Each global gets a label and a directive matching its type
 /// (`.long`, `.quad`, `.single`, `.double`, etc.) plus the
-/// initializer value. Zero-initialized globals still emit an
-/// explicit zero so the symbol resolves at link time.
+/// initializer value. Zero-initialized globals reserve NOBITS storage
+/// instead of materializing bytes in the output file.
 ///
 /// Array-typed globals: the IR type is `Array<i8, byte_size>` so
 /// the element count isn't directly recoverable from the type.
 /// The caller must use `IntArray`/`FloatArray` initializers that
-/// carry the element count explicitly. Zero-initialized arrays
-/// fall back to `.space byte_size`.
+/// carry the element count explicitly.
 ///
 /// Module globals (`afs_mod_*` and `afs_common_*`) are emitted as
 /// `.globl` so other translation units can reference them via USE.
@@ -95,10 +144,7 @@ pub fn emit_globals(
         return out;
     }
 
-    match dialect {
-        GlobalsDialect::MachO => writeln!(out, ".section __DATA,__data").unwrap(),
-        GlobalsDialect::Elf => writeln!(out, ".data").unwrap(),
-    }
+    let mut in_data = false;
     for g in globals {
         let symbol = match dialect {
             GlobalsDialect::MachO if !g.name.starts_with('_') => format!("_{}", g.name),
@@ -125,7 +171,7 @@ pub fn emit_globals(
         );
         if g.name.starts_with("afs_common_") && zero_init {
             let size = g.ty.size_bytes(layout).max(1);
-            let pow2 = size.min(16).next_power_of_two();
+            let pow2 = zero_global_align_bytes(&g.ty, layout);
             match dialect {
                 GlobalsDialect::Elf => {
                     writeln!(out, ".comm {},{},{}", symbol, size, pow2).unwrap();
@@ -137,6 +183,12 @@ pub fn emit_globals(
             }
             continue;
         }
+        if zero_init {
+            emit_zero_fill_global(&mut out, &symbol, &g.ty, layout, dialect, is_module_global);
+            continue;
+        }
+
+        emit_data_section(&mut out, dialect, &mut in_data);
 
         match (dialect, is_module_global) {
             (GlobalsDialect::MachO, true) => writeln!(out, ".globl {}", symbol).unwrap(),
