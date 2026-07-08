@@ -8,6 +8,7 @@ use crate::ast::decl::ArraySpec;
 use crate::ast::expr::SpannedExpr;
 use crate::lexer::Span;
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 /// Sprint 07: borrow when the input is already canonical lowercase,
@@ -29,6 +30,14 @@ enum LookupMode {
     Normal,
     Exported,
 }
+
+#[derive(Clone, Debug)]
+struct CachedSymbolRef {
+    scope_id: ScopeId,
+    key: String,
+}
+
+type PersistentLookupCache = HashMap<ScopeId, HashMap<String, Option<CachedSymbolRef>>>;
 
 /// Scope identifier — an index into the SymbolTable's scope list.
 pub type ScopeId = usize;
@@ -83,6 +92,8 @@ pub struct StatementFunctionDef {
 pub struct SymbolTable {
     pub(crate) scopes: Vec<Scope>,
     pub(crate) current: ScopeId,
+    normal_lookup_cache: RefCell<PersistentLookupCache>,
+    export_lookup_cache: RefCell<PersistentLookupCache>,
     /// (scope_id, lowercase fname) → statement function definition.
     /// Populated by sema's `detect_statement_functions` pass during
     /// `resolve_unit` for Subroutine/Function/Program arms.
@@ -106,8 +117,80 @@ impl SymbolTable {
         Self {
             scopes: vec![global],
             current: 0,
+            normal_lookup_cache: RefCell::new(HashMap::new()),
+            export_lookup_cache: RefCell::new(HashMap::new()),
             statement_functions: HashMap::new(),
         }
+    }
+
+    fn lookup_cache(&self, mode: LookupMode) -> &RefCell<PersistentLookupCache> {
+        match mode {
+            LookupMode::Normal => &self.normal_lookup_cache,
+            LookupMode::Exported => &self.export_lookup_cache,
+        }
+    }
+
+    fn clear_lookup_caches(&self) {
+        self.normal_lookup_cache.borrow_mut().clear();
+        self.export_lookup_cache.borrow_mut().clear();
+    }
+
+    fn cached_lookup<'a>(
+        &'a self,
+        mode: LookupMode,
+        scope_id: ScopeId,
+        key: &str,
+    ) -> Option<Option<&'a Symbol>> {
+        let cached = self
+            .lookup_cache(mode)
+            .borrow()
+            .get(&scope_id)
+            .and_then(|scope_cache| scope_cache.get(key).cloned());
+        cached.map(|loc| loc.and_then(|loc| self.symbol_at(&loc)))
+    }
+
+    fn remember_lookup(
+        &self,
+        mode: LookupMode,
+        scope_id: ScopeId,
+        key: &str,
+        result: Option<&Symbol>,
+    ) {
+        let cached = match result {
+            Some(sym) => match self.locate_symbol(sym) {
+                Some(loc) => Some(loc),
+                None => return,
+            },
+            None => None,
+        };
+        self.lookup_cache(mode)
+            .borrow_mut()
+            .entry(scope_id)
+            .or_default()
+            .insert(key.to_string(), cached);
+    }
+
+    fn symbol_at(&self, loc: &CachedSymbolRef) -> Option<&Symbol> {
+        self.scopes.get(loc.scope_id)?.symbols.get(&loc.key)
+    }
+
+    fn locate_symbol(&self, sym: &Symbol) -> Option<CachedSymbolRef> {
+        self.locate_symbol_in_scope(sym.scope, sym).or_else(|| {
+            self.scopes
+                .iter()
+                .filter(|scope| scope.id != sym.scope)
+                .find_map(|scope| self.locate_symbol_in_scope(scope.id, sym))
+        })
+    }
+
+    fn locate_symbol_in_scope(&self, scope_id: ScopeId, sym: &Symbol) -> Option<CachedSymbolRef> {
+        let scope = self.scopes.get(scope_id)?;
+        scope.symbols.iter().find_map(|(key, candidate)| {
+            std::ptr::eq(candidate, sym).then(|| CachedSymbolRef {
+                scope_id,
+                key: key.clone(),
+            })
+        })
     }
 
     /// Lookup a statement function by (scope, name). Caller passes
@@ -149,6 +232,7 @@ impl Default for SymbolTable {
 impl SymbolTable {
     /// Create a new child scope of the current scope.
     pub fn push_scope(&mut self, kind: ScopeKind) -> ScopeId {
+        self.clear_lookup_caches();
         let id = self.scopes.len();
         let parent_implicit = self.scopes[self.current].implicit_rules.clone();
         let scope = Scope {
@@ -195,11 +279,13 @@ impl SymbolTable {
 
     /// Get a mutable scope by ID.
     pub fn scope_mut(&mut self, id: ScopeId) -> &mut Scope {
+        self.clear_lookup_caches();
         &mut self.scopes[id]
     }
 
     /// Define a symbol in the current scope.
     pub fn define(&mut self, symbol: Symbol) -> Result<(), SemaError> {
+        self.clear_lookup_caches();
         let key = symbol.name.to_lowercase();
         let scope = &mut self.scopes[self.current];
         if scope.symbols.contains_key(&key) {
@@ -217,6 +303,7 @@ impl SymbolTable {
     }
 
     pub fn define_same_name_generic_interface(&mut self, mut symbol: Symbol) {
+        self.clear_lookup_caches();
         let scope_id = self.current_scope();
         let public_key = symbol.name.to_lowercase();
         let side_key = same_name_generic_interface_key(&public_key);
@@ -254,6 +341,7 @@ impl SymbolTable {
 
     /// Define a symbol in a specific scope.
     pub fn define_in(&mut self, scope_id: ScopeId, symbol: Symbol) -> Result<(), SemaError> {
+        self.clear_lookup_caches();
         let key = symbol.name.to_lowercase();
         let scope = &mut self.scopes[scope_id];
         if scope.symbols.contains_key(&key) {
@@ -297,6 +385,10 @@ impl SymbolTable {
         cache: &mut HashMap<(ScopeId, String, LookupMode), Option<&'a Symbol>>,
     ) -> Option<&'a Symbol> {
         let visit_key = (scope_id, key.to_string(), LookupMode::Normal);
+        if let Some(cached) = self.cached_lookup(LookupMode::Normal, scope_id, key) {
+            cache.insert(visit_key, cached);
+            return cached;
+        }
         if let Some(cached) = cache.get(&visit_key) {
             return *cached;
         }
@@ -385,6 +477,7 @@ impl SymbolTable {
 
         visited.pop();
         cache.insert(visit_key, result);
+        self.remember_lookup(LookupMode::Normal, scope_id, key, result);
         result
     }
 
@@ -428,6 +521,10 @@ impl SymbolTable {
         cache: &mut HashMap<(ScopeId, String, LookupMode), Option<&'a Symbol>>,
     ) -> Option<&'a Symbol> {
         let visit_key = (scope_id, key.to_string(), LookupMode::Exported);
+        if let Some(cached) = self.cached_lookup(LookupMode::Exported, scope_id, key) {
+            cache.insert(visit_key, cached);
+            return cached;
+        }
         if let Some(cached) = cache.get(&visit_key) {
             return *cached;
         }
@@ -436,6 +533,7 @@ impl SymbolTable {
         }
         if !self.scope_exports_key(scope_id, key) {
             cache.insert(visit_key, None);
+            self.remember_lookup(LookupMode::Exported, scope_id, key, None);
             return None;
         }
         visited.push(visit_key.clone());
@@ -498,6 +596,7 @@ impl SymbolTable {
 
         visited.pop();
         cache.insert(visit_key, result);
+        self.remember_lookup(LookupMode::Exported, scope_id, key, result);
         result
     }
 
@@ -664,6 +763,7 @@ impl SymbolTable {
 
     /// Add a USE association to the current scope.
     pub fn add_use_association(&mut self, assoc: UseAssociation) {
+        self.clear_lookup_caches();
         let assoc = UseAssociation {
             local_name: assoc.local_name.to_ascii_lowercase(),
             original_name: assoc.original_name.to_ascii_lowercase(),
@@ -676,12 +776,14 @@ impl SymbolTable {
 
     /// Set the default accessibility for the current scope.
     pub fn set_default_access(&mut self, access: Access) {
+        self.clear_lookup_caches();
         self.scopes[self.current].default_access = access;
     }
 
     /// Set the access level on a specific symbol in the current scope.
     /// Used for `PUBLIC :: name` and `PRIVATE :: name` statements.
     pub fn set_symbol_access(&mut self, name: &str, access: Access) {
+        self.clear_lookup_caches();
         let key = name.to_lowercase();
         self.scopes[self.current]
             .pending_access
@@ -1205,6 +1307,32 @@ mod tests {
         });
 
         assert!(st.lookup("hidden").is_none()); // private, not accessible
+    }
+
+    #[test]
+    fn cached_use_miss_is_invalidated_by_late_definition() {
+        let mut st = SymbolTable::new();
+
+        let mod_scope = st.push_scope(ScopeKind::Module("mymod".into()));
+        st.pop_scope();
+
+        let program_scope = st.push_scope(ScopeKind::Program("main".into()));
+        st.add_use_association(UseAssociation {
+            local_name: "late".into(),
+            original_name: "late".into(),
+            source_scope: mod_scope,
+            is_submodule_access: false,
+            from_bare_use: true,
+        });
+
+        assert!(st.lookup("late").is_none());
+
+        st.enter_scope(mod_scope);
+        st.define(make_symbol("late", SymbolKind::Variable))
+            .unwrap();
+
+        st.enter_scope(program_scope);
+        assert!(st.lookup("late").is_some());
     }
 
     #[test]
