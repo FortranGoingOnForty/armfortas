@@ -1319,8 +1319,41 @@ impl<'a> Parser<'a> {
         Ok(Spanned::new(Decl::CommonBlock { name, vars }, span))
     }
 
+    fn parse_data_object(&mut self) -> Result<crate::ast::expr::SpannedExpr, ParseError> {
+        if self.peek() == &TokenKind::LParen {
+            let save_pos = self.pos;
+            if let Ok(value) = self.try_parse_implied_do() {
+                let span = crate::parser::expr::span_from_to(
+                    self.tokens[save_pos].span,
+                    self.prev_span(),
+                );
+                return Ok(Spanned::new(
+                    crate::ast::expr::Expr::ArrayConstructor {
+                        type_spec: None,
+                        values: vec![value],
+                    },
+                    span,
+                ));
+            }
+            self.pos = save_pos;
+        }
+        self.parse_expr_bp(crate::parser::expr::BP_MUL.right)
+    }
+
+    fn parse_data_value(&mut self) -> Result<DataValue, ParseError> {
+        let count_or_value = self.parse_expr_bp(crate::parser::expr::BP_MUL.right)?;
+        if self.eat(&TokenKind::Star) {
+            let value = self.parse_expr_bp(crate::parser::expr::BP_MUL.right)?;
+            Ok(DataValue::Repeat {
+                count: count_or_value,
+                value,
+            })
+        } else {
+            Ok(DataValue::Expr(count_or_value))
+        }
+    }
+
     pub fn parse_data_stmt(&mut self) -> Result<SpannedDecl, ParseError> {
-        use crate::parser::expr::BP_MUL;
         let start = self.current_span();
         // Already consumed 'data'. Format: obj-list /value-list/ [, obj-list /value-list/]
         // Note: / delimiters conflict with division operator. We parse expressions
@@ -1329,7 +1362,7 @@ impl<'a> Parser<'a> {
         loop {
             let mut objects = Vec::new();
             while self.peek() != &TokenKind::Slash {
-                objects.push(self.parse_expr_bp(BP_MUL.right)?);
+                objects.push(self.parse_data_object()?);
                 if !self.eat(&TokenKind::Comma) {
                     break;
                 }
@@ -1337,7 +1370,7 @@ impl<'a> Parser<'a> {
             self.expect(&TokenKind::Slash)?;
             let mut values = Vec::new();
             while self.peek() != &TokenKind::Slash {
-                values.push(self.parse_expr_bp(BP_MUL.right)?);
+                values.push(self.parse_data_value()?);
                 if !self.eat(&TokenKind::Comma) {
                     break;
                 }
@@ -2006,6 +2039,22 @@ mod tests {
         let d = parse_decl("data x /1.0/, y /2.0/");
         if let Decl::DataStmt { sets } = &d.node {
             assert_eq!(sets.len(), 2);
+            assert!(matches!(sets[0].values[0], DataValue::Expr(_)));
+        } else {
+            panic!("not DataStmt");
+        }
+    }
+
+    #[test]
+    fn data_stmt_repeat_and_implied_do() {
+        let d = parse_decl("data (a(i), i=1,3) / 3*4 /");
+        if let Decl::DataStmt { sets } = &d.node {
+            assert_eq!(sets.len(), 1);
+            assert!(matches!(
+                sets[0].objects[0].node,
+                crate::ast::expr::Expr::ArrayConstructor { .. }
+            ));
+            assert!(matches!(sets[0].values[0], DataValue::Repeat { .. }));
         } else {
             panic!("not DataStmt");
         }

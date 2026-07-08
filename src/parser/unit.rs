@@ -861,7 +861,24 @@ impl<'a> Parser<'a> {
                 decls.push(self.parse_common_block()?);
                 continue;
             }
-            if text == "data" && next_tok.as_ref() == Some(&TokenKind::Identifier) {
+            let data_has_value_delimiter = self
+                .tokens
+                .iter()
+                .skip(self.pos + 1)
+                .take_while(|tok| {
+                    !matches!(
+                        tok.kind,
+                        TokenKind::Newline | TokenKind::Semicolon | TokenKind::Eof
+                    )
+                })
+                .any(|tok| tok.kind == TokenKind::Slash);
+            if text == "data"
+                && data_has_value_delimiter
+                && matches!(
+                    next_tok.as_ref(),
+                    Some(TokenKind::Identifier | TokenKind::LParen)
+                )
+            {
                 self.advance(); // consume 'data'
                 decls.push(self.parse_data_stmt()?);
                 continue;

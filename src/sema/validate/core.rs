@@ -1613,8 +1613,16 @@ fn validate_decl_const_int_exprs(ctx: &mut Ctx<'_>, decl: &crate::ast::decl::Spa
                 for expr in &set.objects {
                     validate_const_int_expr_tree(ctx, expr);
                 }
-                for expr in &set.values {
-                    validate_const_int_expr_tree(ctx, expr);
+                for value in &set.values {
+                    match value {
+                        crate::ast::decl::DataValue::Expr(expr) => {
+                            validate_const_int_expr_tree(ctx, expr);
+                        }
+                        crate::ast::decl::DataValue::Repeat { count, value } => {
+                            validate_const_int_expr_tree(ctx, count);
+                            validate_const_int_expr_tree(ctx, value);
+                        }
+                    }
                 }
             }
         }

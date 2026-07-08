@@ -4194,8 +4194,16 @@ pub(super) fn collect_name_refs_decls(
                     for expr in &set.objects {
                         collect_name_refs_expr(expr, out);
                     }
-                    for expr in &set.values {
-                        collect_name_refs_expr(expr, out);
+                    for value in &set.values {
+                        match value {
+                            crate::ast::decl::DataValue::Expr(expr) => {
+                                collect_name_refs_expr(expr, out);
+                            }
+                            crate::ast::decl::DataValue::Repeat { count, value } => {
+                                collect_name_refs_expr(count, out);
+                                collect_name_refs_expr(value, out);
+                            }
+                        }
                     }
                 }
             }

@@ -5,8 +5,8 @@
 
 use std::collections::HashMap;
 
-use crate::ast::decl::{Attribute, Decl, TypeSpec};
-use crate::ast::expr::Expr;
+use crate::ast::decl::{Attribute, DataValue, Decl, TypeSpec};
+use crate::ast::expr::{AcValue, Argument, Expr, ImpliedDoLoop, SectionSubscript, SpannedExpr};
 use crate::ir::builder::FuncBuilder;
 use crate::ir::inst::*;
 use crate::ir::types::*;
@@ -16,6 +16,253 @@ use super::const_scalar::{eval_const_scalar, materialize_const_scalar, ConstScal
 use super::core::*;
 use super::ctx::{CharKind, LocalInfo};
 use super::helpers::coerce_to_type;
+
+fn data_int_expr(value: i64, span: crate::lexer::Span) -> SpannedExpr {
+    crate::ast::Spanned::new(
+        Expr::IntegerLiteral {
+            text: value.to_string(),
+            kind: None,
+        },
+        span,
+    )
+}
+
+fn eval_data_int(
+    expr: &SpannedExpr,
+    param_consts: &HashMap<String, ConstScalar>,
+    st: &SymbolTable,
+) -> Option<i64> {
+    eval_const_int_in_scope_or_any_scope(expr, param_consts, st)
+        .or_else(|| eval_const_int_in_scope(expr, param_consts))
+        .or_else(|| eval_const_int(expr))
+}
+
+fn substitute_data_ac_value(
+    value: &AcValue,
+    subst: &HashMap<String, &SpannedExpr>,
+) -> AcValue {
+    match value {
+        AcValue::Expr(expr) => AcValue::Expr(super::expr::substitute_names_in_expr(expr, subst)),
+        AcValue::ImpliedDo(ido) => AcValue::ImpliedDo(Box::new(ImpliedDoLoop {
+            values: ido
+                .values
+                .iter()
+                .map(|inner| substitute_data_ac_value(inner, subst))
+                .collect(),
+            var: ido.var.clone(),
+            start: super::expr::substitute_names_in_expr(&ido.start, subst),
+            end: super::expr::substitute_names_in_expr(&ido.end, subst),
+            step: ido
+                .step
+                .as_ref()
+                .map(|expr| super::expr::substitute_names_in_expr(expr, subst)),
+        })),
+    }
+}
+
+fn expand_data_ac_value(
+    value: &AcValue,
+    subst: &HashMap<String, &SpannedExpr>,
+    param_consts: &HashMap<String, ConstScalar>,
+    st: &SymbolTable,
+    out: &mut Vec<SpannedExpr>,
+) {
+    match substitute_data_ac_value(value, subst) {
+        AcValue::Expr(expr) => out.push(expr),
+        AcValue::ImpliedDo(ido) => {
+            let Some(start) = eval_data_int(&ido.start, param_consts, st) else {
+                return;
+            };
+            let Some(end) = eval_data_int(&ido.end, param_consts, st) else {
+                return;
+            };
+            let step = ido
+                .step
+                .as_ref()
+                .and_then(|expr| eval_data_int(expr, param_consts, st))
+                .unwrap_or(1);
+            if step == 0 {
+                return;
+            }
+            let mut i = start;
+            while if step > 0 { i <= end } else { i >= end } {
+                let replacement = data_int_expr(i, ido.start.span);
+                let mut nested = subst.clone();
+                nested.insert(ido.var.to_lowercase(), &replacement);
+                for inner in &ido.values {
+                    expand_data_ac_value(inner, &nested, param_consts, st, out);
+                }
+                let Some(next) = i.checked_add(step) else {
+                    break;
+                };
+                i = next;
+            }
+        }
+    }
+}
+
+fn expand_whole_array_data_object(name: &str, info: &LocalInfo, span: crate::lexer::Span) -> Vec<SpannedExpr> {
+    let total: i64 = info.dims.iter().map(|(_, extent)| (*extent).max(0)).product();
+    if total <= 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(total as usize);
+    for linear in 0..total {
+        let mut rem = linear;
+        let mut args = Vec::with_capacity(info.dims.len());
+        for (lower, extent) in &info.dims {
+            let ext = (*extent).max(1);
+            let idx = *lower + (rem % ext);
+            rem /= ext;
+            args.push(Argument {
+                keyword: None,
+                value: SectionSubscript::Element(data_int_expr(idx, span)),
+            });
+        }
+        out.push(crate::ast::Spanned::new(
+            Expr::FunctionCall {
+                callee: Box::new(crate::ast::Spanned::new(
+                    Expr::Name {
+                        name: name.to_string(),
+                    },
+                    span,
+                )),
+                args,
+            },
+            span,
+        ));
+    }
+    out
+}
+
+fn expand_data_objects(
+    objects: &[SpannedExpr],
+    locals: &HashMap<String, LocalInfo>,
+    param_consts: &HashMap<String, ConstScalar>,
+    st: &SymbolTable,
+) -> Vec<SpannedExpr> {
+    let mut out = Vec::new();
+    let subst = HashMap::new();
+    for object in objects {
+        match &object.node {
+            Expr::ArrayConstructor { values, .. } => {
+                for value in values {
+                    expand_data_ac_value(value, &subst, param_consts, st, &mut out);
+                }
+            }
+            Expr::Name { name } => {
+                let key = name.to_lowercase();
+                if let Some(info) = locals.get(&key) {
+                    if !info.dims.is_empty() && !info.allocatable && !info.by_ref {
+                        out.extend(expand_whole_array_data_object(name, info, object.span));
+                        continue;
+                    }
+                }
+                out.push(object.clone());
+            }
+            _ => out.push(object.clone()),
+        }
+    }
+    out
+}
+
+fn expand_data_values(
+    values: &[DataValue],
+    param_consts: &HashMap<String, ConstScalar>,
+    st: &SymbolTable,
+) -> Vec<SpannedExpr> {
+    let mut out = Vec::new();
+    for value in values {
+        match value {
+            DataValue::Expr(expr) => out.push(expr.clone()),
+            DataValue::Repeat { count, value } => {
+                let repeat = eval_data_int(count, param_consts, st).unwrap_or(0).max(0);
+                out.extend((0..repeat).map(|_| value.clone()));
+            }
+        }
+    }
+    out
+}
+
+fn lower_data_target(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    target: &SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> Option<LocalInfo> {
+    match &target.node {
+        Expr::Name { name } => {
+            let info = locals.get(&name.to_lowercase())?;
+            if !info.dims.is_empty() {
+                return None;
+            }
+            Some(info.clone())
+        }
+        Expr::FunctionCall { callee, args } => {
+            let Expr::Name { name } = &callee.node else {
+                return None;
+            };
+            if args
+                .iter()
+                .any(|arg| !matches!(arg.value, SectionSubscript::Element(_)))
+            {
+                return None;
+            }
+            let info = locals.get(&name.to_lowercase())?.clone();
+            if info.dims.is_empty() {
+                return None;
+            }
+            let addr = lower_array_element_addr(b, locals, &info, args, st, type_layouts);
+            let mut elem_info = info;
+            elem_info.addr = addr;
+            elem_info.dims.clear();
+            elem_info.runtime_dim_upper.clear();
+            elem_info.allocatable = false;
+            elem_info.descriptor_arg = false;
+            elem_info.by_ref = false;
+            Some(elem_info)
+        }
+        _ => None,
+    }
+}
+
+fn store_data_scalar(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    target: &SpannedExpr,
+    value: &SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    global_addr_ids: &std::collections::HashSet<ValueId>,
+) {
+    let Some(info) = lower_data_target(b, locals, target, st, type_layouts) else {
+        return;
+    };
+    if info.allocatable || info.by_ref || info.derived_type.is_some() || info.inline_const.is_some()
+    {
+        return;
+    }
+    if global_addr_ids.contains(&info.addr) {
+        return;
+    }
+    if let CharKind::Fixed(len) = info.char_kind {
+        let (src_ptr, src_len) = lower_string_expr(b, locals, value, st);
+        let dest_len = b.const_i64(len);
+        b.call(
+            FuncRef::External("afs_assign_char_fixed".into()),
+            vec![info.addr, dest_len, src_ptr, src_len],
+            IrType::Void,
+        );
+        return;
+    }
+    if !matches!(info.char_kind, CharKind::None) {
+        return;
+    }
+    let val = super::expr::lower_expr(b, locals, value, st);
+    let coerced = coerce_to_type(b, val, &info.ty);
+    b.store(coerced, info.addr);
+}
 
 /// Lower initializer expressions for declared variables.
 ///
@@ -509,40 +756,22 @@ pub(crate) fn init_decls(
                     b.store(coerced, info.addr);
                 }
             }
-            // Audit MEDIUM-3: DATA statements. Each set pairs
-            // target objects with values. For the simple form
-            // `data x /42/, y /3.14/`, walk objects + values
-            // pairwise and emit a store per scalar Name target.
-            // Implied-do object lists and value-side repetition
-            // (`r*v`) are not yet supported — they fall through
-            // silently and are tracked as future work.
+            // DATA statements: expand repeat values and implied-do
+            // object lists, then store pairwise into scalar targets.
             Decl::DataStmt { sets } => {
                 for set in sets {
-                    let n = set.objects.len().min(set.values.len());
-                    for (target, value) in set.objects.iter().zip(set.values.iter()).take(n) {
-                        let Expr::Name { name } = &target.node else {
-                            continue;
-                        };
-                        let key = name.to_lowercase();
-                        let Some(info) = locals.get(&key) else {
-                            continue;
-                        };
-                        if !info.dims.is_empty()
-                            || info.allocatable
-                            || info.by_ref
-                            || !matches!(info.char_kind, CharKind::None)
-                            || info.derived_type.is_some()
-                        {
-                            continue;
-                        }
-                        // Don't shadow a SAVE-promoted global —
-                        // its initial value is in .data already.
-                        if global_addr_ids.contains(&info.addr) {
-                            continue;
-                        }
-                        let val = super::expr::lower_expr(b, locals, value, st);
-                        let coerced = coerce_to_type(b, val, &info.ty);
-                        b.store(coerced, info.addr);
+                    let objects = expand_data_objects(&set.objects, locals, &param_consts, st);
+                    let values = expand_data_values(&set.values, &param_consts, st);
+                    for (target, value) in objects.iter().zip(values.iter()) {
+                        store_data_scalar(
+                            b,
+                            locals,
+                            target,
+                            value,
+                            st,
+                            type_layouts,
+                            &global_addr_ids,
+                        );
                     }
                 }
             }
