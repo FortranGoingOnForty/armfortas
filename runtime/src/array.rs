@@ -3331,6 +3331,62 @@ pub extern "C" fn afs_array_all_logical(desc: *const ArrayDescriptor) -> i32 {
     }
 }
 
+fn array_logical_dim(src: *const ArrayDescriptor, dim: i32, dst: *mut ArrayDescriptor, is_all: bool) {
+    if src.is_null() || dst.is_null() || dim < 1 {
+        return;
+    }
+    let s = unsafe { &*src };
+    if !descriptor_has_payload_or_zero_size_array(s) || dim as usize > s.rank as usize {
+        return;
+    }
+    if !ensure_reduction_dim_result(s, dim, dst, 1) {
+        return;
+    }
+    let d = unsafe { &mut *dst };
+    let dst_total = d.total_elements() as usize;
+    let out = d.base_addr;
+    if out.is_null() {
+        return;
+    }
+    let init = if is_all { 1u8 } else { 0u8 };
+    for i in 0..dst_total {
+        unsafe {
+            *out.add(i) = init;
+        }
+    }
+    for_each_reduce_along_dim(s, dim, |byte_off, dst_flat| {
+        let truth = unsafe { mask_byte_offset_is_true(s, byte_off as isize) };
+        unsafe {
+            let slot = out.add(dst_flat);
+            if is_all {
+                *slot = u8::from(*slot != 0 && truth);
+            } else {
+                *slot = u8::from(*slot != 0 || truth);
+            }
+        }
+    });
+}
+
+/// ANY(array, DIM=k) for logical arrays.
+#[no_mangle]
+pub extern "C" fn afs_array_any_logical_dim(
+    src: *const ArrayDescriptor,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+) {
+    array_logical_dim(src, dim, dst, false);
+}
+
+/// ALL(array, DIM=k) for logical arrays.
+#[no_mangle]
+pub extern "C" fn afs_array_all_logical_dim(
+    src: *const ArrayDescriptor,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+) {
+    array_logical_dim(src, dim, dst, true);
+}
+
 /// COUNT(array) for logical arrays — number of true elements.
 #[no_mangle]
 pub extern "C" fn afs_array_count_logical(desc: *const ArrayDescriptor) -> i32 {
@@ -3796,6 +3852,51 @@ fn for_each_reduce_along_dim_with_index<F: FnMut(usize, usize, i64)>(
             idx[d] = 0;
         }
     }
+}
+
+fn ensure_reduction_dim_result(
+    src: &ArrayDescriptor,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+    elem_size: i64,
+) -> bool {
+    if dst.is_null() || dim < 1 || dim as usize > src.rank as usize || elem_size <= 0 {
+        return false;
+    }
+    let d = unsafe { &mut *dst };
+    if !d.is_allocated() {
+        let new_rank = (src.rank - 1).max(0);
+        let mut dim_buf: [DimDescriptor; 15] = [DimDescriptor {
+            lower_bound: 0,
+            upper_bound: 0,
+            stride: 0,
+        }; 15];
+        let mut k = 0usize;
+        let mut acc: i64 = 1;
+        for i in 0..src.rank as usize {
+            if i + 1 == dim as usize {
+                continue;
+            }
+            let extent = src.dims[i].extent();
+            dim_buf[k].lower_bound = 1;
+            dim_buf[k].upper_bound = extent;
+            dim_buf[k].stride = acc;
+            acc *= extent;
+            k += 1;
+        }
+        let dim_ptr = if new_rank > 0 {
+            dim_buf.as_ptr()
+        } else {
+            ptr::null()
+        };
+        let mut stat: i32 = 0;
+        afs_allocate_array(dst, elem_size, new_rank, dim_ptr, &mut stat);
+        if stat != 0 {
+            return false;
+        }
+    }
+    let d = unsafe { &*dst };
+    d.is_allocated() && (d.total_elements() == 0 || !d.base_addr.is_null())
 }
 
 fn ensure_location_dim_result(src: &ArrayDescriptor, dim: i32, dst: *mut ArrayDescriptor) -> bool {
@@ -5408,6 +5509,208 @@ pub extern "C" fn afs_array_product_int(desc: *const ArrayDescriptor) -> i64 {
     prod
 }
 
+/// PRODUCT(array, DIM=k) — real version.
+#[no_mangle]
+pub extern "C" fn afs_array_product_real8_dim(
+    src: *const ArrayDescriptor,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+) {
+    if src.is_null() || dst.is_null() || dim < 1 {
+        return;
+    }
+    let s = unsafe { &*src };
+    if !descriptor_has_payload_or_zero_size_array(s) || dim as usize > s.rank as usize {
+        return;
+    }
+    if !ensure_reduction_dim_result(s, dim, dst, s.elem_size) {
+        return;
+    }
+    let d = unsafe { &mut *dst };
+    let dst_total = d.total_elements() as usize;
+    let src_ptr = s.base_addr as *const u8;
+    if s.elem_size == 4 {
+        let buf = d.base_addr as *mut f32;
+        for i in 0..dst_total {
+            unsafe {
+                *buf.add(i) = 1.0;
+            }
+        }
+        for_each_reduce_along_dim(s, dim, |byte_off, dst_flat| {
+            let v = unsafe { *(src_ptr.add(byte_off) as *const f32) };
+            unsafe {
+                *buf.add(dst_flat) *= v;
+            }
+        });
+    } else {
+        let buf = d.base_addr as *mut f64;
+        for i in 0..dst_total {
+            unsafe {
+                *buf.add(i) = 1.0;
+            }
+        }
+        for_each_reduce_along_dim(s, dim, |byte_off, dst_flat| {
+            let v = unsafe { *(src_ptr.add(byte_off) as *const f64) };
+            unsafe {
+                *buf.add(dst_flat) *= v;
+            }
+        });
+    }
+}
+
+/// PRODUCT(array, DIM=k) — integer version.
+#[no_mangle]
+pub extern "C" fn afs_array_product_int_dim(
+    src: *const ArrayDescriptor,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+) {
+    if src.is_null() || dst.is_null() || dim < 1 {
+        return;
+    }
+    let s = unsafe { &*src };
+    if !descriptor_has_payload_or_zero_size_array(s) || dim as usize > s.rank as usize {
+        return;
+    }
+    if !ensure_reduction_dim_result(s, dim, dst, s.elem_size) {
+        return;
+    }
+    let d = unsafe { &mut *dst };
+    let dst_total = d.total_elements() as usize;
+    let src_ptr = s.base_addr as *const u8;
+    macro_rules! product_dim_kind {
+        ($t:ty) => {{
+            let buf = d.base_addr as *mut $t;
+            for i in 0..dst_total {
+                unsafe {
+                    *buf.add(i) = 1;
+                }
+            }
+            for_each_reduce_along_dim(s, dim, |byte_off, dst_flat| {
+                let v = unsafe { *(src_ptr.add(byte_off) as *const $t) };
+                unsafe {
+                    *buf.add(dst_flat) = (*buf.add(dst_flat)).wrapping_mul(v);
+                }
+            });
+        }};
+    }
+    match s.elem_size {
+        1 => product_dim_kind!(i8),
+        2 => product_dim_kind!(i16),
+        8 => product_dim_kind!(i64),
+        _ => product_dim_kind!(i32),
+    }
+}
+
+/// PRODUCT(array, DIM=k, MASK=mask) — real version.
+#[no_mangle]
+pub extern "C" fn afs_array_product_real8_dim_mask(
+    src: *const ArrayDescriptor,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+) {
+    if src.is_null() || dst.is_null() || mask.is_null() || dim < 1 {
+        return;
+    }
+    let s = unsafe { &*src };
+    let m = unsafe { &*mask };
+    if !descriptor_has_payload_or_zero_size_array(s)
+        || !descriptor_has_payload_or_zero_size_array(m)
+        || dim as usize > s.rank as usize
+    {
+        return;
+    }
+    if !ensure_reduction_dim_result(s, dim, dst, s.elem_size) {
+        return;
+    }
+    let d = unsafe { &mut *dst };
+    let dst_total = d.total_elements() as usize;
+    let src_ptr = s.base_addr as *const u8;
+    if s.elem_size == 4 {
+        let buf = d.base_addr as *mut f32;
+        for i in 0..dst_total {
+            unsafe {
+                *buf.add(i) = 1.0;
+            }
+        }
+        for_each_reduce_along_dim_with_mask(s, m, dim, |sb, mb, df| {
+            if unsafe { mask_byte_is_true(m, mb) } {
+                let v = unsafe { *(src_ptr.add(sb) as *const f32) };
+                unsafe {
+                    *buf.add(df) *= v;
+                }
+            }
+        });
+    } else {
+        let buf = d.base_addr as *mut f64;
+        for i in 0..dst_total {
+            unsafe {
+                *buf.add(i) = 1.0;
+            }
+        }
+        for_each_reduce_along_dim_with_mask(s, m, dim, |sb, mb, df| {
+            if unsafe { mask_byte_is_true(m, mb) } {
+                let v = unsafe { *(src_ptr.add(sb) as *const f64) };
+                unsafe {
+                    *buf.add(df) *= v;
+                }
+            }
+        });
+    }
+}
+
+/// PRODUCT(array, DIM=k, MASK=mask) — integer version.
+#[no_mangle]
+pub extern "C" fn afs_array_product_int_dim_mask(
+    src: *const ArrayDescriptor,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+) {
+    if src.is_null() || dst.is_null() || mask.is_null() || dim < 1 {
+        return;
+    }
+    let s = unsafe { &*src };
+    let m = unsafe { &*mask };
+    if !descriptor_has_payload_or_zero_size_array(s)
+        || !descriptor_has_payload_or_zero_size_array(m)
+        || dim as usize > s.rank as usize
+    {
+        return;
+    }
+    if !ensure_reduction_dim_result(s, dim, dst, s.elem_size) {
+        return;
+    }
+    let d = unsafe { &mut *dst };
+    let dst_total = d.total_elements() as usize;
+    let src_ptr = s.base_addr as *const u8;
+    macro_rules! product_dim_mask_kind {
+        ($t:ty) => {{
+            let buf = d.base_addr as *mut $t;
+            for i in 0..dst_total {
+                unsafe {
+                    *buf.add(i) = 1;
+                }
+            }
+            for_each_reduce_along_dim_with_mask(s, m, dim, |sb, mb, df| {
+                if unsafe { mask_byte_is_true(m, mb) } {
+                    let v = unsafe { *(src_ptr.add(sb) as *const $t) };
+                    unsafe {
+                        *buf.add(df) = (*buf.add(df)).wrapping_mul(v);
+                    }
+                }
+            });
+        }};
+    }
+    match s.elem_size {
+        1 => product_dim_mask_kind!(i8),
+        2 => product_dim_mask_kind!(i16),
+        8 => product_dim_mask_kind!(i64),
+        _ => product_dim_mask_kind!(i32),
+    }
+}
+
 /// PRODUCT(array, mask=mask) — masked product (real). Dispatches on
 /// elem_size and reads mask via `mask_at` for any logical kind.
 #[no_mangle]
@@ -5673,6 +5976,242 @@ pub extern "C" fn afs_array_minval_int_mask(
         _ => min_kind!(i32),
     }
     best
+}
+
+/// MAXVAL(array, DIM=k, MASK=mask) — real version.
+#[no_mangle]
+pub extern "C" fn afs_array_maxval_real8_dim_mask(
+    src: *const ArrayDescriptor,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+) {
+    if src.is_null() || dst.is_null() || mask.is_null() || dim < 1 {
+        return;
+    }
+    let s = unsafe { &*src };
+    let m = unsafe { &*mask };
+    if !descriptor_has_payload_or_zero_size_array(s)
+        || !descriptor_has_payload_or_zero_size_array(m)
+        || dim as usize > s.rank as usize
+    {
+        return;
+    }
+    if !ensure_reduction_dim_result(s, dim, dst, s.elem_size) {
+        return;
+    }
+    let d = unsafe { &mut *dst };
+    let dst_total = d.total_elements() as usize;
+    let src_ptr = s.base_addr as *const u8;
+    if s.elem_size == 4 {
+        let buf = d.base_addr as *mut f32;
+        for i in 0..dst_total {
+            unsafe {
+                *buf.add(i) = -f32::MAX;
+            }
+        }
+        for_each_reduce_along_dim_with_mask(s, m, dim, |sb, mb, df| {
+            if unsafe { mask_byte_is_true(m, mb) } {
+                let v = unsafe { *(src_ptr.add(sb) as *const f32) };
+                unsafe {
+                    let slot = buf.add(df);
+                    if v > *slot {
+                        *slot = v;
+                    }
+                }
+            }
+        });
+    } else {
+        let buf = d.base_addr as *mut f64;
+        for i in 0..dst_total {
+            unsafe {
+                *buf.add(i) = -f64::MAX;
+            }
+        }
+        for_each_reduce_along_dim_with_mask(s, m, dim, |sb, mb, df| {
+            if unsafe { mask_byte_is_true(m, mb) } {
+                let v = unsafe { *(src_ptr.add(sb) as *const f64) };
+                unsafe {
+                    let slot = buf.add(df);
+                    if v > *slot {
+                        *slot = v;
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// MINVAL(array, DIM=k, MASK=mask) — real version.
+#[no_mangle]
+pub extern "C" fn afs_array_minval_real8_dim_mask(
+    src: *const ArrayDescriptor,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+) {
+    if src.is_null() || dst.is_null() || mask.is_null() || dim < 1 {
+        return;
+    }
+    let s = unsafe { &*src };
+    let m = unsafe { &*mask };
+    if !descriptor_has_payload_or_zero_size_array(s)
+        || !descriptor_has_payload_or_zero_size_array(m)
+        || dim as usize > s.rank as usize
+    {
+        return;
+    }
+    if !ensure_reduction_dim_result(s, dim, dst, s.elem_size) {
+        return;
+    }
+    let d = unsafe { &mut *dst };
+    let dst_total = d.total_elements() as usize;
+    let src_ptr = s.base_addr as *const u8;
+    if s.elem_size == 4 {
+        let buf = d.base_addr as *mut f32;
+        for i in 0..dst_total {
+            unsafe {
+                *buf.add(i) = f32::MAX;
+            }
+        }
+        for_each_reduce_along_dim_with_mask(s, m, dim, |sb, mb, df| {
+            if unsafe { mask_byte_is_true(m, mb) } {
+                let v = unsafe { *(src_ptr.add(sb) as *const f32) };
+                unsafe {
+                    let slot = buf.add(df);
+                    if v < *slot {
+                        *slot = v;
+                    }
+                }
+            }
+        });
+    } else {
+        let buf = d.base_addr as *mut f64;
+        for i in 0..dst_total {
+            unsafe {
+                *buf.add(i) = f64::MAX;
+            }
+        }
+        for_each_reduce_along_dim_with_mask(s, m, dim, |sb, mb, df| {
+            if unsafe { mask_byte_is_true(m, mb) } {
+                let v = unsafe { *(src_ptr.add(sb) as *const f64) };
+                unsafe {
+                    let slot = buf.add(df);
+                    if v < *slot {
+                        *slot = v;
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// MAXVAL(array, DIM=k, MASK=mask) — integer version.
+#[no_mangle]
+pub extern "C" fn afs_array_maxval_int_dim_mask(
+    src: *const ArrayDescriptor,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+) {
+    if src.is_null() || dst.is_null() || mask.is_null() || dim < 1 {
+        return;
+    }
+    let s = unsafe { &*src };
+    let m = unsafe { &*mask };
+    if !descriptor_has_payload_or_zero_size_array(s)
+        || !descriptor_has_payload_or_zero_size_array(m)
+        || dim as usize > s.rank as usize
+    {
+        return;
+    }
+    if !ensure_reduction_dim_result(s, dim, dst, s.elem_size) {
+        return;
+    }
+    let d = unsafe { &mut *dst };
+    let dst_total = d.total_elements() as usize;
+    let src_ptr = s.base_addr as *const u8;
+    macro_rules! max_dim_mask_kind {
+        ($t:ty, $identity:expr) => {{
+            let buf = d.base_addr as *mut $t;
+            for i in 0..dst_total {
+                unsafe {
+                    *buf.add(i) = $identity;
+                }
+            }
+            for_each_reduce_along_dim_with_mask(s, m, dim, |sb, mb, df| {
+                if unsafe { mask_byte_is_true(m, mb) } {
+                    let v = unsafe { *(src_ptr.add(sb) as *const $t) };
+                    unsafe {
+                        let slot = buf.add(df);
+                        if v > *slot {
+                            *slot = v;
+                        }
+                    }
+                }
+            });
+        }};
+    }
+    match s.elem_size {
+        1 => max_dim_mask_kind!(i8, i8::MIN),
+        2 => max_dim_mask_kind!(i16, i16::MIN),
+        8 => max_dim_mask_kind!(i64, i64::MIN),
+        _ => max_dim_mask_kind!(i32, i32::MIN),
+    }
+}
+
+/// MINVAL(array, DIM=k, MASK=mask) — integer version.
+#[no_mangle]
+pub extern "C" fn afs_array_minval_int_dim_mask(
+    src: *const ArrayDescriptor,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+) {
+    if src.is_null() || dst.is_null() || mask.is_null() || dim < 1 {
+        return;
+    }
+    let s = unsafe { &*src };
+    let m = unsafe { &*mask };
+    if !descriptor_has_payload_or_zero_size_array(s)
+        || !descriptor_has_payload_or_zero_size_array(m)
+        || dim as usize > s.rank as usize
+    {
+        return;
+    }
+    if !ensure_reduction_dim_result(s, dim, dst, s.elem_size) {
+        return;
+    }
+    let d = unsafe { &mut *dst };
+    let dst_total = d.total_elements() as usize;
+    let src_ptr = s.base_addr as *const u8;
+    macro_rules! min_dim_mask_kind {
+        ($t:ty, $identity:expr) => {{
+            let buf = d.base_addr as *mut $t;
+            for i in 0..dst_total {
+                unsafe {
+                    *buf.add(i) = $identity;
+                }
+            }
+            for_each_reduce_along_dim_with_mask(s, m, dim, |sb, mb, df| {
+                if unsafe { mask_byte_is_true(m, mb) } {
+                    let v = unsafe { *(src_ptr.add(sb) as *const $t) };
+                    unsafe {
+                        let slot = buf.add(df);
+                        if v < *slot {
+                            *slot = v;
+                        }
+                    }
+                }
+            });
+        }};
+    }
+    match s.elem_size {
+        1 => min_dim_mask_kind!(i8, i8::MAX),
+        2 => min_dim_mask_kind!(i16, i16::MAX),
+        8 => min_dim_mask_kind!(i64, i64::MAX),
+        _ => min_dim_mask_kind!(i32, i32::MAX),
+    }
 }
 
 /// MAXVAL(array) — maximum element (real version). Dispatches on

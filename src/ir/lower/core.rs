@@ -38525,6 +38525,83 @@ pub(super) fn lower_array_count_dim_descriptor(
     Some((result_desc, IrType::Int(IntWidth::I32)))
 }
 
+pub(super) fn lower_array_logical_dim_descriptor(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    args: &[crate::ast::expr::Argument],
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+    is_all: bool,
+) -> Option<(ValueId, IrType)> {
+    use crate::ast::expr::SectionSubscript;
+    if args.is_empty() {
+        return None;
+    }
+    let SectionSubscript::Element(mask_expr) = &args[0].value else {
+        return None;
+    };
+    if actual_expr_rank(mask_expr, locals, st, type_layouts).is_some_and(|rank| rank <= 1) {
+        return None;
+    }
+
+    let mut dim_expr: Option<&crate::ast::expr::SpannedExpr> = None;
+    for (i, arg) in args.iter().enumerate() {
+        let kw = arg.keyword.as_deref().map(|s| s.to_lowercase());
+        match (i, kw.as_deref()) {
+            (1, None) | (_, Some("dim")) => {
+                if let SectionSubscript::Element(e) = &arg.value {
+                    dim_expr = Some(e);
+                }
+            }
+            _ => {}
+        }
+    }
+    let dim_expr = dim_expr?;
+
+    let (mask_desc, _) = lower_array_expr_descriptor(
+        b,
+        locals,
+        mask_expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    )?;
+
+    let dim_raw =
+        super::expr::lower_expr_with_optional_layouts(b, locals, dim_expr, st, type_layouts);
+    let dim_val = match b.func().value_type(dim_raw) {
+        Some(IrType::Int(IntWidth::I32)) => dim_raw,
+        Some(IrType::Int(_)) => b.int_trunc(dim_raw, IntWidth::I32),
+        _ => dim_raw,
+    };
+
+    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let zero_i32 = b.const_i32(0);
+    let sz384 = b.const_i64(384);
+    b.call(
+        FuncRef::External("memset".into()),
+        vec![result_desc, zero_i32, sz384],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+
+    let helper = if is_all {
+        "afs_array_all_logical_dim"
+    } else {
+        "afs_array_any_logical_dim"
+    };
+    b.call(
+        FuncRef::External(helper.into()),
+        vec![mask_desc, dim_val, result_desc],
+        IrType::Void,
+    );
+    Some((result_desc, IrType::Bool))
+}
+
 pub(super) fn lower_array_norm2_dim_descriptor(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -38736,6 +38813,120 @@ pub(super) fn lower_array_sum_dim_descriptor(
     Some((result_desc, elem_ty))
 }
 
+pub(super) fn lower_array_product_dim_descriptor(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    args: &[crate::ast::expr::Argument],
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) -> Option<(ValueId, IrType)> {
+    use crate::ast::expr::SectionSubscript;
+    if args.is_empty() {
+        return None;
+    }
+    let SectionSubscript::Element(array_expr) = &args[0].value else {
+        return None;
+    };
+    let mut dim_expr: Option<&crate::ast::expr::SpannedExpr> = None;
+    let mut mask_expr: Option<&crate::ast::expr::SpannedExpr> = None;
+    for (i, arg) in args.iter().enumerate() {
+        let kw = arg.keyword.as_deref().map(|s| s.to_lowercase());
+        match (i, kw.as_deref()) {
+            (1, None) => {
+                if let SectionSubscript::Element(e) = &arg.value {
+                    let is_logical = matches!(
+                        generic_actual_expr_type_info(e, locals, st, type_layouts),
+                        Some(crate::sema::symtab::TypeInfo::Logical { .. })
+                    );
+                    if is_logical {
+                        mask_expr = Some(e);
+                    } else {
+                        dim_expr = Some(e);
+                    }
+                }
+            }
+            (_, Some("dim")) => {
+                if let SectionSubscript::Element(e) = &arg.value {
+                    dim_expr = Some(e);
+                }
+            }
+            (_, Some("mask")) | (2, None) => {
+                if let SectionSubscript::Element(e) = &arg.value {
+                    mask_expr = Some(e);
+                }
+            }
+            _ => {}
+        }
+    }
+    let dim_expr = dim_expr?;
+
+    let (src_desc, elem_ty) = lower_array_expr_descriptor(
+        b,
+        locals,
+        array_expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    )?;
+    if is_complex_ty(&elem_ty) {
+        deallocate_array_expr_descriptor_if_temp(b, locals, array_expr, st, src_desc);
+        return None;
+    }
+
+    let mask_desc = if let Some(me) = mask_expr {
+        Some(
+            lower_array_expr_descriptor(
+                b,
+                locals,
+                me,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            )?
+            .0,
+        )
+    } else {
+        None
+    };
+
+    let dim_raw =
+        super::expr::lower_expr_with_optional_layouts(b, locals, dim_expr, st, type_layouts);
+    let dim_val = match b.func().value_type(dim_raw) {
+        Some(IrType::Int(IntWidth::I32)) => dim_raw,
+        Some(IrType::Int(_)) => b.int_trunc(dim_raw, IntWidth::I32),
+        _ => dim_raw,
+    };
+
+    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let zero_i32 = b.const_i32(0);
+    let sz384 = b.const_i64(384);
+    b.call(
+        FuncRef::External("memset".into()),
+        vec![result_desc, zero_i32, sz384],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+
+    let helper = match (mask_desc.is_some(), &elem_ty) {
+        (true, ty) if ty.is_float() => "afs_array_product_real8_dim_mask",
+        (true, _) => "afs_array_product_int_dim_mask",
+        (false, ty) if ty.is_float() => "afs_array_product_real8_dim",
+        (false, _) => "afs_array_product_int_dim",
+    };
+    let mut call_args = vec![src_desc, dim_val, result_desc];
+    if let Some(md) = mask_desc {
+        call_args.push(md);
+    }
+    b.call(FuncRef::External(helper.into()), call_args, IrType::Void);
+    Some((result_desc, elem_ty))
+}
+
 pub(super) fn lower_array_minmax_dim_descriptor(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -38790,9 +38981,6 @@ pub(super) fn lower_array_minmax_dim_descriptor(
         }
     }
     let dim_expr = dim_expr?;
-    if mask_expr.is_some() {
-        return None;
-    }
 
     let (src_desc, elem_ty) = lower_array_expr_descriptor(
         b,
@@ -38804,6 +38992,24 @@ pub(super) fn lower_array_minmax_dim_descriptor(
         contained_host_refs,
         descriptor_params,
     )?;
+
+    let mask_desc = if let Some(me) = mask_expr {
+        Some(
+            lower_array_expr_descriptor(
+                b,
+                locals,
+                me,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            )?
+            .0,
+        )
+    } else {
+        None
+    };
 
     let dim_raw =
         super::expr::lower_expr_with_optional_layouts(b, locals, dim_expr, st, type_layouts);
@@ -38822,18 +39028,22 @@ pub(super) fn lower_array_minmax_dim_descriptor(
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
     );
 
-    let helper = match (is_max, &elem_ty) {
-        (true, ty) if ty.is_float() => "afs_array_maxval_real8_dim",
-        (false, ty) if ty.is_float() => "afs_array_minval_real8_dim",
-        (true, IrType::Int(_)) => "afs_array_maxval_int_dim",
-        (false, IrType::Int(_)) => "afs_array_minval_int_dim",
+    let helper = match (is_max, mask_desc.is_some(), &elem_ty) {
+        (true, true, ty) if ty.is_float() => "afs_array_maxval_real8_dim_mask",
+        (false, true, ty) if ty.is_float() => "afs_array_minval_real8_dim_mask",
+        (true, true, IrType::Int(_)) => "afs_array_maxval_int_dim_mask",
+        (false, true, IrType::Int(_)) => "afs_array_minval_int_dim_mask",
+        (true, false, ty) if ty.is_float() => "afs_array_maxval_real8_dim",
+        (false, false, ty) if ty.is_float() => "afs_array_minval_real8_dim",
+        (true, false, IrType::Int(_)) => "afs_array_maxval_int_dim",
+        (false, false, IrType::Int(_)) => "afs_array_minval_int_dim",
         _ => return None,
     };
-    b.call(
-        FuncRef::External(helper.into()),
-        vec![src_desc, dim_val, result_desc],
-        IrType::Void,
-    );
+    let mut call_args = vec![src_desc, dim_val, result_desc];
+    if let Some(md) = mask_desc {
+        call_args.push(md);
+    }
+    b.call(FuncRef::External(helper.into()), call_args, IrType::Void);
     Some((result_desc, elem_ty))
 }
 
@@ -43116,6 +43326,20 @@ pub(super) fn lower_array_expr_descriptor(
                         return Some(result);
                     }
                 }
+                if name.eq_ignore_ascii_case("product") {
+                    if let Some(result) = lower_array_product_dim_descriptor(
+                        b,
+                        locals,
+                        args,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
+                    ) {
+                        return Some(result);
+                    }
+                }
                 if name.eq_ignore_ascii_case("maxval") || name.eq_ignore_ascii_case("minval") {
                     if let Some(result) = lower_array_minmax_dim_descriptor(
                         b,
@@ -43127,6 +43351,21 @@ pub(super) fn lower_array_expr_descriptor(
                         contained_host_refs,
                         descriptor_params,
                         name.eq_ignore_ascii_case("maxval"),
+                    ) {
+                        return Some(result);
+                    }
+                }
+                if name.eq_ignore_ascii_case("any") || name.eq_ignore_ascii_case("all") {
+                    if let Some(result) = lower_array_logical_dim_descriptor(
+                        b,
+                        locals,
+                        args,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
+                        name.eq_ignore_ascii_case("all"),
                     ) {
                         return Some(result);
                     }
