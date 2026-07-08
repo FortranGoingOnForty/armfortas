@@ -1117,7 +1117,9 @@ fn lower_namelist_read_stmt(
     ctx: &mut LowerCtx,
     controls: &[IoControl],
     iostat_addr: ValueId,
+    end_label: Option<u64>,
     err_label: Option<u64>,
+    user_iostat: bool,
 ) -> bool {
     let Some(nml_ctrl) = io_control_by_keyword(controls, "nml") else {
         return false;
@@ -1144,7 +1146,7 @@ fn lower_namelist_read_stmt(
                 ],
                 IrType::Void,
             );
-            lower_read_err_branch(b, ctx, err_label, iostat_addr);
+            lower_read_status_branches(b, ctx, end_label, err_label, iostat_addr, user_iostat);
             return true;
         }
     }
@@ -1156,7 +1158,7 @@ fn lower_namelist_read_stmt(
         vec![unit, group_ptr, group_len, entries, n_entries, iostat_addr],
         IrType::Void,
     );
-    lower_read_err_branch(b, ctx, err_label, iostat_addr);
+    lower_read_status_branches(b, ctx, end_label, err_label, iostat_addr, user_iostat);
     true
 }
 
@@ -7941,6 +7943,20 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     None
                 }
             });
+            let end_label = controls.iter().find_map(|c| {
+                if c.keyword
+                    .as_deref()
+                    .map(|k| k.eq_ignore_ascii_case("end"))
+                    .unwrap_or(false)
+                {
+                    match &c.value.node {
+                        Expr::IntegerLiteral { text, .. } => text.parse::<u64>().ok(),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            });
             let fmt_control = controls
                 .iter()
                 .skip(1)
@@ -7969,16 +7985,18 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 })
                 .map(|c| lower_arg_by_ref_ctx(b, ctx, &c.value));
 
-            let has_dtio_iostat_addr = explicit_iostat_addr.is_some() || err_label.is_some();
-            let iostat_addr = match (err_label, explicit_iostat_addr) {
-                (_, Some(addr)) => addr,
-                (Some(_), None) => {
+            let user_iostat = explicit_iostat_addr.is_some();
+            let needs_hidden_iostat = end_label.is_some() || err_label.is_some();
+            let has_dtio_iostat_addr = user_iostat || needs_hidden_iostat;
+            let iostat_addr = match explicit_iostat_addr {
+                Some(addr) => addr,
+                None if needs_hidden_iostat => {
                     let tmp = b.alloca(IrType::Int(IntWidth::I32));
                     let zero = b.const_i32(0);
                     b.store(zero, tmp);
                     tmp
                 }
-                (None, None) => b.const_i64(0),
+                None => b.const_i64(0),
             };
             let dtio_iostat_addr = has_dtio_iostat_addr.then_some(iostat_addr);
 
@@ -8017,7 +8035,15 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 (null_char_slot_arg(b), null_iomsg_data, zero_iomsg_len)
             };
 
-            if lower_namelist_read_stmt(b, ctx, controls, iostat_addr, err_label) {
+            if lower_namelist_read_stmt(
+                b,
+                ctx,
+                controls,
+                iostat_addr,
+                end_label,
+                err_label,
+                user_iostat,
+            ) {
                 return;
             }
 
@@ -8050,7 +8076,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             size_addr,
                         );
                     }
-                    lower_read_err_branch(b, ctx, err_label, iostat_addr);
+                    lower_read_status_branches(
+                        b,
+                        ctx,
+                        end_label,
+                        err_label,
+                        iostat_addr,
+                        user_iostat,
+                    );
                     return;
                 }
             }
@@ -8083,7 +8116,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 iomsg_arg_ptr,
                 read_iomsg_len,
             ) {
-                lower_read_err_branch(b, ctx, err_label, iostat_addr);
+                lower_read_status_branches(
+                    b,
+                    ctx,
+                    end_label,
+                    err_label,
+                    iostat_addr,
+                    user_iostat,
+                );
                 return;
             }
             if is_list_directed {
@@ -8118,7 +8158,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     size_addr,
                 );
             }
-            lower_read_err_branch(b, ctx, err_label, iostat_addr);
+            lower_read_status_branches(b, ctx, end_label, err_label, iostat_addr, user_iostat);
         }
 
         Stmt::Inquire { specs, .. } => {

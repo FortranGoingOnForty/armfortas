@@ -31098,6 +31098,68 @@ pub(super) fn lower_read_err_branch(
     b.set_block(ok_bb);
 }
 
+pub(super) fn lower_read_status_branches(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    end_label: Option<u64>,
+    err_label: Option<u64>,
+    iostat_addr: ValueId,
+    user_iostat: bool,
+) {
+    let Some(IrType::Ptr(_)) = b.func().value_type(iostat_addr) else {
+        return;
+    };
+
+    let status = b.load_typed(iostat_addr, IrType::Int(IntWidth::I32));
+    let zero = b.const_i32(0);
+    let iostat_end = b.const_i32(-1);
+    let is_end = b.icmp(CmpOp::Eq, status, iostat_end);
+
+    if let Some((label, target_bb)) =
+        end_label.and_then(|label| ctx.label_blocks.get(&label).copied().map(|bb| (label, bb)))
+    {
+        let ok_bb = b.create_block(&format!("read_not_end_{}", label));
+        b.cond_branch(is_end, target_bb, vec![], ok_bb, vec![]);
+        b.set_block(ok_bb);
+    } else if !user_iostat {
+        let fatal_bb = b.create_block("read_unhandled_end");
+        let ok_bb = b.create_block("read_not_end");
+        b.cond_branch(is_end, fatal_bb, vec![], ok_bb, vec![]);
+        b.set_block(fatal_bb);
+        b.call(
+            FuncRef::External("afs_read_unhandled_iostat".into()),
+            vec![status],
+            IrType::Void,
+        );
+        b.unreachable();
+        b.set_block(ok_bb);
+    }
+
+    let nonzero = b.icmp(CmpOp::Ne, status, zero);
+    let not_end = b.icmp(CmpOp::Ne, status, iostat_end);
+    let is_err = b.and(nonzero, not_end);
+
+    if let Some((label, target_bb)) =
+        err_label.and_then(|label| ctx.label_blocks.get(&label).copied().map(|bb| (label, bb)))
+    {
+        let ok_bb = b.create_block(&format!("read_ok_{}", label));
+        b.cond_branch(is_err, target_bb, vec![], ok_bb, vec![]);
+        b.set_block(ok_bb);
+    } else if !user_iostat {
+        let fatal_bb = b.create_block("read_unhandled_err");
+        let ok_bb = b.create_block("read_ok");
+        b.cond_branch(is_err, fatal_bb, vec![], ok_bb, vec![]);
+        b.set_block(fatal_bb);
+        b.call(
+            FuncRef::External("afs_read_unhandled_iostat".into()),
+            vec![status],
+            IrType::Void,
+        );
+        b.unreachable();
+        b.set_block(ok_bb);
+    }
+}
+
 pub(super) fn lower_read_into_addr(
     b: &mut FuncBuilder,
     mode: ReadMode,

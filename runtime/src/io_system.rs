@@ -1702,32 +1702,25 @@ pub extern "C" fn afs_list_read_begin(unit: i32, iostat: *mut i32, iomsg: *mut u
     match u.read_raw(&mut len_buf) {
         Ok(4) => {}
         Ok(0) => {
-            if !iostat.is_null() {
-                unsafe {
-                    *iostat = IOSTAT_END;
-                }
-            }
+            set_read_status_or_exit(iostat, IOSTAT_END);
             return;
         }
         _ => {
-            if !iostat.is_null() {
-                unsafe {
-                    *iostat = 1;
-                }
-            }
+            set_read_status_or_exit(iostat, 1);
             return;
         }
     }
     let record_len = u32::from_ne_bytes(len_buf) as usize;
     let mut data = vec![0u8; record_len];
-    if record_len > 0 && u.read_raw(&mut data).is_err() && !iostat.is_null() {
-        unsafe {
-            *iostat = 1;
-        }
+    if record_len > 0 && u.read_raw(&mut data).is_err() {
+        set_read_status_or_exit(iostat, 1);
         return;
     }
     let mut trailer = [0u8; 4];
-    let _ = u.read_raw(&mut trailer);
+    if u.read_raw(&mut trailer).is_err() {
+        set_read_status_or_exit(iostat, 1);
+        return;
+    }
     u.pending_read = Some((data, 0));
 }
 
@@ -1788,20 +1781,12 @@ pub extern "C" fn afs_read_skip_record(unit: i32, iostat: *mut i32) {
 pub extern "C" fn afs_read_string(unit: i32, dest: *mut u8, dest_len: i64, iostat: *mut i32) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     let Some(u) = state.get_unit(unit) else {
-        if !iostat.is_null() {
-            unsafe {
-                *iostat = 1;
-            }
-        }
+        set_read_status_or_exit(iostat, 1);
         return;
     };
 
     if dest_len < 0 {
-        if !iostat.is_null() {
-            unsafe {
-                *iostat = 1;
-            }
-        }
+        set_read_status_or_exit(iostat, 1);
         return;
     }
 
@@ -1820,11 +1805,7 @@ pub extern "C" fn afs_read_string(unit: i32, dest: *mut u8, dest_len: i64, iosta
         match u.read_raw(&mut bytes) {
             Ok(0) => {
                 crate::string::afs_assign_char_fixed(dest, dest_len, std::ptr::null(), 0);
-                if !iostat.is_null() {
-                    unsafe {
-                        *iostat = IOSTAT_END;
-                    }
-                }
+                set_read_status_or_exit(iostat, IOSTAT_END);
             }
             Ok(n) => {
                 crate::string::afs_assign_char_fixed(dest, dest_len, bytes.as_ptr(), n as i64);
@@ -1836,11 +1817,7 @@ pub extern "C" fn afs_read_string(unit: i32, dest: *mut u8, dest_len: i64, iosta
             }
             Err(_) => {
                 crate::string::afs_assign_char_fixed(dest, dest_len, std::ptr::null(), 0);
-                if !iostat.is_null() {
-                    unsafe {
-                        *iostat = 1;
-                    }
-                }
+                set_read_status_or_exit(iostat, 1);
             }
         }
         return;
@@ -1862,19 +1839,11 @@ pub extern "C" fn afs_read_string(unit: i32, dest: *mut u8, dest_len: i64, iosta
         }
         Ok(None) => {
             crate::string::afs_assign_char_fixed(dest, dest_len, std::ptr::null(), 0);
-            if !iostat.is_null() {
-                unsafe {
-                    *iostat = IOSTAT_END;
-                }
-            }
+            set_read_status_or_exit(iostat, IOSTAT_END);
         }
         Err(_) => {
             crate::string::afs_assign_char_fixed(dest, dest_len, std::ptr::null(), 0);
-            if !iostat.is_null() {
-                unsafe {
-                    *iostat = 1;
-                }
-            }
+            set_read_status_or_exit(iostat, 1);
         }
     }
 }
@@ -1964,6 +1933,24 @@ fn set_read_iostat_or_exit(iostat: *mut i32, status: i32, message: &str) {
         eprintln!("READ: {}", message);
         std::process::exit(1);
     }
+}
+
+fn read_status_message(status: i32) -> &'static str {
+    match status {
+        IOSTAT_END => "end of file",
+        IOSTAT_EOR => "end of record",
+        _ => "input/output error",
+    }
+}
+
+fn set_read_status_or_exit(iostat: *mut i32, status: i32) {
+    set_read_iostat_or_exit(iostat, status, read_status_message(status));
+}
+
+#[no_mangle]
+pub extern "C" fn afs_read_unhandled_iostat(status: i32) {
+    eprintln!("READ: {}", read_status_message(status));
+    std::process::exit(1);
 }
 
 fn read_stream_unformatted_exact(u: &mut Unit, buf: &mut [u8], iostat: *mut i32) -> Option<bool> {
@@ -4670,7 +4657,13 @@ fn store_formatted_char_result(
     }
 }
 
-fn store_formatted_char_error(dest: *mut u8, dest_len: i64, size_out: *mut i32, code: i32) {
+fn store_formatted_char_error(
+    dest: *mut u8,
+    dest_len: i64,
+    size_out: *mut i32,
+    code: i32,
+    iostat: *mut i32,
+) {
     crate::string::afs_assign_char_fixed(dest, dest_len, std::ptr::null(), 0);
     if !size_out.is_null() {
         unsafe {
@@ -4678,7 +4671,7 @@ fn store_formatted_char_error(dest: *mut u8, dest_len: i64, size_out: *mut i32, 
         }
     }
     if code != 0 {
-        // Caller writes IOSTAT when it passed a non-null pointer.
+        set_read_status_or_exit(iostat, code);
     }
 }
 
@@ -4769,12 +4762,13 @@ pub extern "C" fn afs_fmt_read_string(
                         store_formatted_char_result(&field, dest, dest_len, size_out, iostat);
                     }
                     _ => {
-                        store_formatted_char_error(dest, dest_len, size_out, IOSTAT_EOR);
-                        if !iostat.is_null() {
-                            unsafe {
-                                *iostat = IOSTAT_EOR;
-                            }
-                        }
+                        store_formatted_char_error(
+                            dest,
+                            dest_len,
+                            size_out,
+                            IOSTAT_EOR,
+                            iostat,
+                        );
                     }
                 }
                 return;
@@ -4788,20 +4782,10 @@ pub extern "C" fn afs_fmt_read_string(
             store_formatted_char_result(&field, dest, dest_len, size_out, iostat);
         }
         Ok(_) => {
-            store_formatted_char_error(dest, dest_len, size_out, 1);
-            if !iostat.is_null() {
-                unsafe {
-                    *iostat = 1;
-                }
-            }
+            store_formatted_char_error(dest, dest_len, size_out, 1, iostat);
         }
         Err(code) => {
-            store_formatted_char_error(dest, dest_len, size_out, code);
-            if !iostat.is_null() {
-                unsafe {
-                    *iostat = code;
-                }
-            }
+            store_formatted_char_error(dest, dest_len, size_out, code, iostat);
         }
     }
 }
@@ -4821,12 +4805,7 @@ pub extern "C" fn afs_fmt_read_string_noadvance(
 
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     let Some(u) = state.get_unit(unit) else {
-        store_formatted_char_error(dest, dest_len, size_out, 1);
-        if !iostat.is_null() {
-            unsafe {
-                *iostat = 1;
-            }
-        }
+        store_formatted_char_error(dest, dest_len, size_out, 1, iostat);
         return;
     };
 
@@ -4837,21 +4816,11 @@ pub extern "C" fn afs_fmt_read_string_noadvance(
                 u.formatted_read_cursor = 0;
             }
             Ok(_) => {
-                store_formatted_char_error(dest, dest_len, size_out, IOSTAT_END);
-                if !iostat.is_null() {
-                    unsafe {
-                        *iostat = IOSTAT_END;
-                    }
-                }
+                store_formatted_char_error(dest, dest_len, size_out, IOSTAT_END, iostat);
                 return;
             }
             Err(_) => {
-                store_formatted_char_error(dest, dest_len, size_out, 1);
-                if !iostat.is_null() {
-                    unsafe {
-                        *iostat = 1;
-                    }
-                }
+                store_formatted_char_error(dest, dest_len, size_out, 1, iostat);
                 return;
             }
         }
@@ -4863,12 +4832,7 @@ pub extern "C" fn afs_fmt_read_string_noadvance(
         .map(|line| line.as_bytes().to_vec())
         .unwrap_or_default();
     if u.formatted_read_cursor >= input.len() {
-        store_formatted_char_error(dest, dest_len, size_out, IOSTAT_EOR);
-        if !iostat.is_null() {
-            unsafe {
-                *iostat = IOSTAT_EOR;
-            }
-        }
+        store_formatted_char_error(dest, dest_len, size_out, IOSTAT_EOR, iostat);
         u.formatted_read_record = None;
         u.formatted_read_cursor = 0;
         return;
@@ -4902,20 +4866,10 @@ pub extern "C" fn afs_fmt_read_string_noadvance(
             }
         }
         Some(_) => {
-            store_formatted_char_error(dest, dest_len, size_out, 1);
-            if !iostat.is_null() {
-                unsafe {
-                    *iostat = 1;
-                }
-            }
+            store_formatted_char_error(dest, dest_len, size_out, 1, iostat);
         }
         None => {
-            store_formatted_char_error(dest, dest_len, size_out, IOSTAT_EOR);
-            if !iostat.is_null() {
-                unsafe {
-                    *iostat = IOSTAT_EOR;
-                }
-            }
+            store_formatted_char_error(dest, dest_len, size_out, IOSTAT_EOR, iostat);
             u.formatted_read_record = None;
             u.formatted_read_cursor = 0;
         }
@@ -4948,27 +4902,15 @@ pub extern "C" fn afs_fmt_read_int(
                     }
                 }
                 None => {
-                    if !iostat.is_null() {
-                        unsafe {
-                            *iostat = 1;
-                        }
-                    }
+                    set_read_status_or_exit(iostat, 1);
                 }
             }
         }
         Ok(_) => {
-            if !iostat.is_null() {
-                unsafe {
-                    *iostat = 1;
-                }
-            }
+            set_read_status_or_exit(iostat, 1);
         }
         Err(code) => {
-            if !iostat.is_null() {
-                unsafe {
-                    *iostat = code;
-                }
-            }
+            set_read_status_or_exit(iostat, code);
         }
     }
 }
@@ -4999,27 +4941,15 @@ pub extern "C" fn afs_fmt_read_int64(
                     }
                 }
                 None => {
-                    if !iostat.is_null() {
-                        unsafe {
-                            *iostat = 1;
-                        }
-                    }
+                    set_read_status_or_exit(iostat, 1);
                 }
             }
         }
         Ok(_) => {
-            if !iostat.is_null() {
-                unsafe {
-                    *iostat = 1;
-                }
-            }
+            set_read_status_or_exit(iostat, 1);
         }
         Err(code) => {
-            if !iostat.is_null() {
-                unsafe {
-                    *iostat = code;
-                }
-            }
+            set_read_status_or_exit(iostat, code);
         }
     }
 }
@@ -5050,27 +4980,15 @@ pub extern "C" fn afs_fmt_read_int128(
                     }
                 }
                 None => {
-                    if !iostat.is_null() {
-                        unsafe {
-                            *iostat = 1;
-                        }
-                    }
+                    set_read_status_or_exit(iostat, 1);
                 }
             }
         }
         Ok(_) => {
-            if !iostat.is_null() {
-                unsafe {
-                    *iostat = 1;
-                }
-            }
+            set_read_status_or_exit(iostat, 1);
         }
         Err(code) => {
-            if !iostat.is_null() {
-                unsafe {
-                    *iostat = code;
-                }
-            }
+            set_read_status_or_exit(iostat, code);
         }
     }
 }
@@ -5105,27 +5023,15 @@ pub extern "C" fn afs_fmt_read_real(
                     }
                 }
                 Err(_) => {
-                    if !iostat.is_null() {
-                        unsafe {
-                            *iostat = 1;
-                        }
-                    }
+                    set_read_status_or_exit(iostat, 1);
                 }
             }
         }
         Ok(_) => {
-            if !iostat.is_null() {
-                unsafe {
-                    *iostat = 1;
-                }
-            }
+            set_read_status_or_exit(iostat, 1);
         }
         Err(code) => {
-            if !iostat.is_null() {
-                unsafe {
-                    *iostat = code;
-                }
-            }
+            set_read_status_or_exit(iostat, code);
         }
     }
 }
@@ -5147,20 +5053,10 @@ pub extern "C" fn afs_fmt_read_string_internal(
             store_formatted_char_result(&field, dest, dest_len, size_out, iostat);
         }
         Ok(_) => {
-            store_formatted_char_error(dest, dest_len, size_out, 1);
-            if !iostat.is_null() {
-                unsafe {
-                    *iostat = 1;
-                }
-            }
+            store_formatted_char_error(dest, dest_len, size_out, 1, iostat);
         }
         Err(code) => {
-            store_formatted_char_error(dest, dest_len, size_out, code);
-            if !iostat.is_null() {
-                unsafe {
-                    *iostat = code;
-                }
-            }
+            store_formatted_char_error(dest, dest_len, size_out, code, iostat);
         }
     }
 }
@@ -5190,27 +5086,15 @@ pub extern "C" fn afs_fmt_read_int_internal(
                     }
                 }
                 None => {
-                    if !iostat.is_null() {
-                        unsafe {
-                            *iostat = 1;
-                        }
-                    }
+                    set_read_status_or_exit(iostat, 1);
                 }
             }
         }
         Ok(_) => {
-            if !iostat.is_null() {
-                unsafe {
-                    *iostat = 1;
-                }
-            }
+            set_read_status_or_exit(iostat, 1);
         }
         Err(code) => {
-            if !iostat.is_null() {
-                unsafe {
-                    *iostat = code;
-                }
-            }
+            set_read_status_or_exit(iostat, code);
         }
     }
 }
@@ -5240,27 +5124,15 @@ pub extern "C" fn afs_fmt_read_int64_internal(
                     }
                 }
                 None => {
-                    if !iostat.is_null() {
-                        unsafe {
-                            *iostat = 1;
-                        }
-                    }
+                    set_read_status_or_exit(iostat, 1);
                 }
             }
         }
         Ok(_) => {
-            if !iostat.is_null() {
-                unsafe {
-                    *iostat = 1;
-                }
-            }
+            set_read_status_or_exit(iostat, 1);
         }
         Err(code) => {
-            if !iostat.is_null() {
-                unsafe {
-                    *iostat = code;
-                }
-            }
+            set_read_status_or_exit(iostat, code);
         }
     }
 }
@@ -5290,27 +5162,15 @@ pub extern "C" fn afs_fmt_read_int128_internal(
                     }
                 }
                 None => {
-                    if !iostat.is_null() {
-                        unsafe {
-                            *iostat = 1;
-                        }
-                    }
+                    set_read_status_or_exit(iostat, 1);
                 }
             }
         }
         Ok(_) => {
-            if !iostat.is_null() {
-                unsafe {
-                    *iostat = 1;
-                }
-            }
+            set_read_status_or_exit(iostat, 1);
         }
         Err(code) => {
-            if !iostat.is_null() {
-                unsafe {
-                    *iostat = code;
-                }
-            }
+            set_read_status_or_exit(iostat, code);
         }
     }
 }
@@ -5344,27 +5204,15 @@ pub extern "C" fn afs_fmt_read_real_internal(
                     }
                 }
                 Err(_) => {
-                    if !iostat.is_null() {
-                        unsafe {
-                            *iostat = 1;
-                        }
-                    }
+                    set_read_status_or_exit(iostat, 1);
                 }
             }
         }
         Ok(_) => {
-            if !iostat.is_null() {
-                unsafe {
-                    *iostat = 1;
-                }
-            }
+            set_read_status_or_exit(iostat, 1);
         }
         Err(code) => {
-            if !iostat.is_null() {
-                unsafe {
-                    *iostat = code;
-                }
-            }
+            set_read_status_or_exit(iostat, code);
         }
     }
 }
