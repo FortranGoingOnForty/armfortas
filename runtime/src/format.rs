@@ -692,14 +692,14 @@ impl FormatEngine {
         &mut self,
         values: &[IoValue],
     ) -> Result<Vec<u8>, FormatError> {
-        let mut output = Vec::new();
+        let mut output = FormatOutput::new();
         let mut val_idx = 0;
         let descriptors = self.descriptors.clone();
         self.apply_descriptors(&descriptors, values, &mut val_idx, &mut output)?;
         if !values.is_empty() && !format_has_data_descriptor(&descriptors) {
             return Err(FormatError::InvalidFormat);
         }
-        Ok(output)
+        Ok(output.finish())
     }
 
     /// Format output records using Fortran format reversion. When the I/O list
@@ -717,7 +717,7 @@ impl FormatEngine {
         &mut self,
         values: &[IoValue],
     ) -> Result<Vec<u8>, FormatError> {
-        let mut output = Vec::new();
+        let mut output = FormatOutput::new();
         let mut val_idx = 0;
         let descriptors = self.descriptors.clone();
         if !values.is_empty() && !format_has_data_descriptor(&descriptors) {
@@ -725,13 +725,13 @@ impl FormatEngine {
         }
         if values.is_empty() {
             self.apply_descriptors(&descriptors, values, &mut val_idx, &mut output)?;
-            return Ok(output);
+            return Ok(output.finish());
         }
 
         let mut first_record = true;
         while val_idx < values.len() {
             if !first_record {
-                output.push(b'\n');
+                output.new_record();
             }
             let before = val_idx;
             self.apply_descriptors(&descriptors, values, &mut val_idx, &mut output)?;
@@ -740,7 +740,7 @@ impl FormatEngine {
             }
             first_record = false;
         }
-        Ok(output)
+        Ok(output.finish())
     }
 
     fn apply_descriptors(
@@ -748,18 +748,16 @@ impl FormatEngine {
         descs: &[FormatDesc],
         values: &[IoValue],
         val_idx: &mut usize,
-        output: &mut Vec<u8>,
+        output: &mut FormatOutput,
     ) -> Result<(), FormatError> {
         for desc in descs {
             match desc {
                 // ---- Control descriptors ----
                 FormatDesc::Skip { count } => {
-                    for _ in 0..*count {
-                        output.push(b' ');
-                    }
+                    output.advance(*count);
                 }
                 FormatDesc::Newline => {
-                    output.push(b'\n');
+                    output.new_record();
                 }
                 FormatDesc::Colon => {
                     if *val_idx >= values.len() {
@@ -784,29 +782,16 @@ impl FormatEngine {
                 }
                 FormatDesc::DerivedType { .. } => {} // requires user-defined I/O — no-op for now
                 FormatDesc::TabTo { position } => {
-                    let cur_col = output
-                        .iter()
-                        .rposition(|&b| b == b'\n')
-                        .map(|pos| output.len().saturating_sub(pos + 1))
-                        .unwrap_or(output.len());
-                    if *position > cur_col + 1 {
-                        for _ in 0..(*position - cur_col - 1) {
-                            output.push(b' ');
-                        }
-                    }
+                    output.tab_to(*position);
                 }
                 FormatDesc::TabLeft { count } => {
-                    // Truncate output by `count` characters (simplified).
-                    let new_len = output.len().saturating_sub(*count);
-                    output.truncate(new_len);
+                    output.tab_left(*count);
                 }
                 FormatDesc::TabRight { count } => {
-                    for _ in 0..*count {
-                        output.push(b' ');
-                    }
+                    output.advance(*count);
                 }
                 FormatDesc::LiteralString(s) => {
-                    output.extend_from_slice(s.as_bytes());
+                    output.write(s.as_bytes());
                 }
 
                 // ---- Group repeat ----
@@ -832,7 +817,7 @@ impl FormatEngine {
                     let val = &values[*val_idx];
                     *val_idx += 1;
                     let formatted = self.format_value(desc, val)?;
-                    output.extend_from_slice(&formatted);
+                    output.write(&formatted);
                 }
             }
         }
@@ -1315,6 +1300,67 @@ impl FormatEngine {
     }
 }
 
+struct FormatOutput {
+    bytes: Vec<u8>,
+    record: Vec<u8>,
+    pos: usize,
+    high_water: usize,
+}
+
+impl FormatOutput {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            record: Vec::new(),
+            pos: 0,
+            high_water: 0,
+        }
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let end = self.pos.saturating_add(bytes.len());
+        if self.record.len() < end {
+            self.record.resize(end, b' ');
+        }
+        self.record[self.pos..end].copy_from_slice(bytes);
+        self.pos = end;
+        self.high_water = self.high_water.max(end);
+    }
+
+    fn advance(&mut self, count: usize) {
+        self.pos = self.pos.saturating_add(count);
+    }
+
+    fn tab_to(&mut self, position: usize) {
+        self.pos = position.saturating_sub(1);
+    }
+
+    fn tab_left(&mut self, count: usize) {
+        self.pos = self.pos.saturating_sub(count);
+    }
+
+    fn new_record(&mut self) {
+        self.flush_record();
+        self.bytes.push(b'\n');
+    }
+
+    fn flush_record(&mut self) {
+        self.bytes
+            .extend_from_slice(&self.record[..self.high_water]);
+        self.record.clear();
+        self.pos = 0;
+        self.high_water = 0;
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        self.flush_record();
+        self.bytes
+    }
+}
+
 fn format_radix_integer(
     value: i128,
     min_digits: Option<usize>,
@@ -1666,6 +1712,45 @@ mod tests {
         let mut engine = FormatEngine::new(descs);
         let out = engine.format_values(&[IoValue::Integer(1), IoValue::Integer(2)]);
         assert_eq!(out, "  1     2");
+    }
+
+    #[test]
+    fn format_tab_descriptors_overlay_without_truncation() {
+        let out = FormatEngine::new(parse_format("(A,T3,A)")).format_values(&[
+            IoValue::Character(b"abcdef".to_vec()),
+            IoValue::Character(b"XY".to_vec()),
+        ]);
+        assert_eq!(out, "abXYef");
+
+        let out = FormatEngine::new(parse_format("(A,TL3,A)")).format_values(&[
+            IoValue::Character(b"abcdef".to_vec()),
+            IoValue::Character(b"XY".to_vec()),
+        ]);
+        assert_eq!(out, "abcXYf");
+
+        let out = FormatEngine::new(parse_format("(A,TR3,A)")).format_values(&[
+            IoValue::Character(b"ab".to_vec()),
+            IoValue::Character(b"Z".to_vec()),
+        ]);
+        assert_eq!(out, "ab   Z");
+    }
+
+    #[test]
+    fn format_trailing_x_only_moves_position() {
+        let out =
+            FormatEngine::new(parse_format("(I0,1X)")).format_values(&[IoValue::Integer(5)]);
+        assert_eq!(out, "5");
+
+        let out = FormatEngine::new(parse_format("(I0,1X,I0)"))
+            .format_values(&[IoValue::Integer(5), IoValue::Integer(6)]);
+        assert_eq!(out, "5 6");
+
+        let out = FormatEngine::new(parse_format("(3(I0,1X))")).format_values(&[
+            IoValue::Integer(1),
+            IoValue::Integer(2),
+            IoValue::Integer(3),
+        ]);
+        assert_eq!(out, "1 2 3");
     }
 
     #[test]
