@@ -77,6 +77,265 @@ fn copy_array_result_to_descriptor_dest(
     );
 }
 
+struct WhereSectionTemp {
+    name: String,
+    desc: ValueId,
+}
+
+fn lower_where_section_temp(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    expr: &SpannedExpr,
+    next_temp: &mut usize,
+    temps: &mut Vec<WhereSectionTemp>,
+) -> Option<SpannedExpr> {
+    let Expr::FunctionCall { callee, args } = &expr.node else {
+        return None;
+    };
+    let Expr::Name { name } = &callee.node else {
+        return None;
+    };
+    if !args
+        .iter()
+        .any(|a| matches!(a.value, crate::ast::expr::SectionSubscript::Range { .. }))
+    {
+        return None;
+    }
+    let key = name.to_lowercase();
+    if !ctx.locals.get(&key).is_some_and(local_is_array_like) {
+        return None;
+    }
+
+    let rank = actual_expr_rank(expr, &ctx.locals, ctx.st, Some(ctx.type_layouts))
+        .unwrap_or(1)
+        .max(1);
+    let (source_desc, elem_ty) = lower_array_expr_descriptor(
+        b,
+        &ctx.locals,
+        expr,
+        ctx.st,
+        Some(ctx.type_layouts),
+        Some(ctx.internal_funcs),
+        Some(ctx.contained_host_refs),
+        Some(ctx.descriptor_params),
+    )?;
+    let tmp_desc = allocate_like_array_temp_descriptor_with_elem_type(b, source_desc, &elem_ty);
+    let stat = b.alloca(IrType::Int(IntWidth::I32));
+    let zero = b.const_i32(0);
+    b.store(zero, stat);
+    b.call(
+        FuncRef::External("afs_copy_array_data".into()),
+        vec![tmp_desc, source_desc, stat],
+        IrType::Void,
+    );
+    deallocate_array_expr_descriptor_if_temp(b, &ctx.locals, expr, ctx.st, source_desc);
+
+    let temp_name = fresh_elemental_temp_name(&ctx.locals, "afs_where_section", *next_temp);
+    *next_temp += 1;
+    ctx.locals.insert(
+        temp_name.clone(),
+        LocalInfo {
+            addr: tmp_desc,
+            ty: elem_ty,
+            dims: vec![(1, 0); rank],
+            allocatable: false,
+            descriptor_arg: true,
+            by_ref: false,
+            char_kind: CharKind::None,
+            derived_type: None,
+            inline_const: None,
+            is_pointer: false,
+            runtime_dim_upper: vec![],
+            is_class: false,
+            logical_kind: None,
+            last_dim_assumed_size: false,
+        },
+    );
+    temps.push(WhereSectionTemp {
+        name: temp_name.clone(),
+        desc: tmp_desc,
+    });
+    Some(synth_name_expr(&temp_name, expr.span))
+}
+
+fn rewrite_where_read_sections_to_temps(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    expr: &SpannedExpr,
+    next_temp: &mut usize,
+    temps: &mut Vec<WhereSectionTemp>,
+) -> SpannedExpr {
+    use crate::ast::Spanned;
+
+    if let Some(temp) = lower_where_section_temp(b, ctx, expr, next_temp, temps) {
+        return temp;
+    }
+
+    match &expr.node {
+        Expr::FunctionCall { callee, args } => {
+            let new_callee = Box::new(rewrite_where_read_sections_to_temps(
+                b, ctx, callee, next_temp, temps,
+            ));
+            let new_args = args
+                .iter()
+                .map(|a| crate::ast::expr::Argument {
+                    keyword: a.keyword.clone(),
+                    value: match &a.value {
+                        crate::ast::expr::SectionSubscript::Element(e) => {
+                            crate::ast::expr::SectionSubscript::Element(
+                                rewrite_where_read_sections_to_temps(b, ctx, e, next_temp, temps),
+                            )
+                        }
+                        crate::ast::expr::SectionSubscript::Range { start, end, stride } => {
+                            crate::ast::expr::SectionSubscript::Range {
+                                start: start.as_ref().map(|e| {
+                                    rewrite_where_read_sections_to_temps(
+                                        b, ctx, e, next_temp, temps,
+                                    )
+                                }),
+                                end: end.as_ref().map(|e| {
+                                    rewrite_where_read_sections_to_temps(
+                                        b, ctx, e, next_temp, temps,
+                                    )
+                                }),
+                                stride: stride.as_ref().map(|e| {
+                                    rewrite_where_read_sections_to_temps(
+                                        b, ctx, e, next_temp, temps,
+                                    )
+                                }),
+                            }
+                        }
+                    },
+                })
+                .collect();
+            Spanned::new(
+                Expr::FunctionCall {
+                    callee: new_callee,
+                    args: new_args,
+                },
+                expr.span,
+            )
+        }
+        Expr::BinaryOp { op, left, right } => Spanned::new(
+            Expr::BinaryOp {
+                op: op.clone(),
+                left: Box::new(rewrite_where_read_sections_to_temps(
+                    b, ctx, left, next_temp, temps,
+                )),
+                right: Box::new(rewrite_where_read_sections_to_temps(
+                    b, ctx, right, next_temp, temps,
+                )),
+            },
+            expr.span,
+        ),
+        Expr::UnaryOp { op, operand } => Spanned::new(
+            Expr::UnaryOp {
+                op: op.clone(),
+                operand: Box::new(rewrite_where_read_sections_to_temps(
+                    b, ctx, operand, next_temp, temps,
+                )),
+            },
+            expr.span,
+        ),
+        Expr::ParenExpr { inner } => Spanned::new(
+            Expr::ParenExpr {
+                inner: Box::new(rewrite_where_read_sections_to_temps(
+                    b, ctx, inner, next_temp, temps,
+                )),
+            },
+            expr.span,
+        ),
+        Expr::ComponentAccess { base, component } => Spanned::new(
+            Expr::ComponentAccess {
+                base: Box::new(rewrite_where_read_sections_to_temps(
+                    b, ctx, base, next_temp, temps,
+                )),
+                component: component.clone(),
+            },
+            expr.span,
+        ),
+        Expr::ArrayConstructor { values, type_spec } => {
+            let new_values = values
+                .iter()
+                .map(|value| match value {
+                    crate::ast::expr::AcValue::Expr(e) => crate::ast::expr::AcValue::Expr(
+                        rewrite_where_read_sections_to_temps(b, ctx, e, next_temp, temps),
+                    ),
+                    crate::ast::expr::AcValue::ImpliedDo(ido) => {
+                        crate::ast::expr::AcValue::ImpliedDo(Box::new(
+                            crate::ast::expr::ImpliedDoLoop {
+                                values: ido
+                                    .values
+                                    .iter()
+                                    .map(|inner| match inner {
+                                        crate::ast::expr::AcValue::Expr(e) => {
+                                            crate::ast::expr::AcValue::Expr(
+                                                rewrite_where_read_sections_to_temps(
+                                                    b, ctx, e, next_temp, temps,
+                                                ),
+                                            )
+                                        }
+                                        crate::ast::expr::AcValue::ImpliedDo(nested) => {
+                                            crate::ast::expr::AcValue::ImpliedDo(nested.clone())
+                                        }
+                                    })
+                                    .collect(),
+                                var: ido.var.clone(),
+                                start: rewrite_where_read_sections_to_temps(
+                                    b, ctx, &ido.start, next_temp, temps,
+                                ),
+                                end: rewrite_where_read_sections_to_temps(
+                                    b, ctx, &ido.end, next_temp, temps,
+                                ),
+                                step: ido.step.as_ref().map(|e| {
+                                    rewrite_where_read_sections_to_temps(
+                                        b, ctx, e, next_temp, temps,
+                                    )
+                                }),
+                            },
+                        ))
+                    }
+                })
+                .collect();
+            Spanned::new(
+                Expr::ArrayConstructor {
+                    values: new_values,
+                    type_spec: type_spec.clone(),
+                },
+                expr.span,
+            )
+        }
+        _ => expr.clone(),
+    }
+}
+
+fn rewrite_where_read_sections_to_temps_stmt(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    stmt: &SpannedStmt,
+    next_temp: &mut usize,
+    temps: &mut Vec<WhereSectionTemp>,
+) -> SpannedStmt {
+    use crate::ast::Spanned;
+    match &stmt.node {
+        Stmt::Assignment { target, value } => Spanned::new(
+            Stmt::Assignment {
+                target: target.clone(),
+                value: rewrite_where_read_sections_to_temps(b, ctx, value, next_temp, temps),
+            },
+            stmt.span,
+        ),
+        _ => stmt.clone(),
+    }
+}
+
+fn finish_where_section_temps(b: &mut FuncBuilder, ctx: &mut LowerCtx, temps: &[WhereSectionTemp]) {
+    for temp in temps {
+        deallocate_array_temp_descriptor(b, temp.desc);
+        ctx.locals.remove(&temp.name);
+    }
+}
+
 fn synth_defined_unary_array_result_call(
     ctx: &LowerCtx<'_>,
     value: &crate::ast::expr::SpannedExpr,
@@ -4259,6 +4518,48 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             elsewhere,
             ..
         } => {
+            let mut where_section_temps = Vec::new();
+            let mut next_where_section_temp = 0usize;
+            let prepared_mask = rewrite_where_read_sections_to_temps(
+                b,
+                ctx,
+                mask,
+                &mut next_where_section_temp,
+                &mut where_section_temps,
+            );
+            let prepared_body: Vec<SpannedStmt> = body
+                .iter()
+                .map(|s| {
+                    rewrite_where_read_sections_to_temps_stmt(
+                        b,
+                        ctx,
+                        s,
+                        &mut next_where_section_temp,
+                        &mut where_section_temps,
+                    )
+                })
+                .collect();
+            let prepared_elsewhere: Vec<(Option<SpannedExpr>, Vec<SpannedStmt>)> = elsewhere
+                .iter()
+                .map(|(emask, ebody)| {
+                    (
+                        emask.clone(),
+                        ebody
+                            .iter()
+                            .map(|s| {
+                                rewrite_where_read_sections_to_temps_stmt(
+                                    b,
+                                    ctx,
+                                    s,
+                                    &mut next_where_section_temp,
+                                    &mut where_section_temps,
+                                )
+                            })
+                            .collect(),
+                    )
+                })
+                .collect();
+
             // WHERE(mask) body [ELSEWHERE body] END WHERE
             // Collect ALL array names referenced in mask, body, OR
             // elsewhere body. Missing the elsewhere arm caused a
@@ -4268,11 +4569,11 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             // the scalar path and silently produced 0.0 instead of
             // d(i).
             let mut array_names: Vec<String> = Vec::new();
-            collect_array_names(mask, &ctx.locals, &mut array_names);
-            for s in body {
+            collect_array_names(&prepared_mask, &ctx.locals, &mut array_names);
+            for s in &prepared_body {
                 collect_array_names_stmt(s, &ctx.locals, &mut array_names);
             }
-            if let Some((_emask, ebody)) = elsewhere.first() {
+            if let Some((_emask, ebody)) = prepared_elsewhere.first() {
                 for s in ebody {
                     collect_array_names_stmt(s, &ctx.locals, &mut array_names);
                 }
@@ -4280,9 +4581,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
 
             if array_names.is_empty() {
                 // No arrays — fall back to scalar IF-THEN-ELSE.
-                let cond = super::expr::lower_expr_ctx_tl(b, ctx, mask);
+                let cond = super::expr::lower_expr_ctx_tl(b, ctx, &prepared_mask);
                 let bb_then = b.create_block("where_then");
-                let bb_else = if !elsewhere.is_empty() {
+                let bb_else = if !prepared_elsewhere.is_empty() {
                     Some(b.create_block("where_else"))
                 } else {
                     None
@@ -4291,13 +4592,13 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 b.cond_branch(cond, bb_then, vec![], bb_else.unwrap_or(bb_end), vec![]);
 
                 b.set_block(bb_then);
-                lower_stmts(b, ctx, body);
+                lower_stmts(b, ctx, &prepared_body);
                 if b.func().block(b.current_block()).terminator.is_none() {
                     b.branch(bb_end, vec![]);
                 }
                 if let Some(bb_e) = bb_else {
                     b.set_block(bb_e);
-                    if let Some((_m, else_body)) = elsewhere.first() {
+                    if let Some((_m, else_body)) = prepared_elsewhere.first() {
                         lower_stmts(b, ctx, else_body);
                     }
                     if b.func().block(b.current_block()).terminator.is_none() {
@@ -4305,6 +4606,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     }
                 }
                 b.set_block(bb_end);
+                finish_where_section_temps(b, ctx, &where_section_temps);
                 return;
             }
 
@@ -4357,14 +4659,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 if let Some(orig_info) = ctx.locals.get(arr_name).cloned() {
                     let base = *array_bases.get(arr_name).unwrap();
                     // Compute element address: base + i * elem_bytes.
-                    let elem_bytes_val = match &orig_info.ty {
-                        IrType::Int(IntWidth::I64) | IrType::Float(FloatWidth::F64) => {
-                            b.const_i64(8)
-                        }
-                        IrType::Int(IntWidth::I16) => b.const_i64(2),
-                        IrType::Int(IntWidth::I8) => b.const_i64(1),
-                        _ => b.const_i64(4),
-                    };
+                    let elem_bytes_val = array_elem_size_value(b, &orig_info);
                     let byte_off = b.imul(i_val, elem_bytes_val);
                     let elem_ptr = b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
                     // Replace the local with a scalar pointing to this element.
@@ -4399,12 +4694,12 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             // Stdlib pattern: `where (lambda(1:m) > 0.0_sp) sv(1:m) =
             // sqrt(lambda(1:m) * real(n-1, sp))` — both `lambda(1:m)`
             // and `sv(1:m)` are scalarized to `lambda` / `sv` per iter.
-            let rewritten_mask = rewrite_scalarized_section_refs(mask, &array_names);
-            let rewritten_body: Vec<SpannedStmt> = body
+            let rewritten_mask = rewrite_scalarized_section_refs(&prepared_mask, &array_names);
+            let rewritten_body: Vec<SpannedStmt> = prepared_body
                 .iter()
                 .map(|s| rewrite_scalarized_section_refs_stmt(s, &array_names))
                 .collect();
-            let rewritten_else: Vec<SpannedStmt> = elsewhere
+            let rewritten_else: Vec<SpannedStmt> = prepared_elsewhere
                 .first()
                 .map(|(_m, els)| {
                     els.iter()
@@ -4452,9 +4747,27 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             b.branch(bb_check, vec![]);
 
             b.set_block(bb_exit);
+            finish_where_section_temps(b, ctx, &where_section_temps);
         }
 
         Stmt::WhereStmt { mask, stmt } => {
+            let mut where_section_temps = Vec::new();
+            let mut next_where_section_temp = 0usize;
+            let prepared_mask = rewrite_where_read_sections_to_temps(
+                b,
+                ctx,
+                mask,
+                &mut next_where_section_temp,
+                &mut where_section_temps,
+            );
+            let prepared_stmt = rewrite_where_read_sections_to_temps_stmt(
+                b,
+                ctx,
+                stmt,
+                &mut next_where_section_temp,
+                &mut where_section_temps,
+            );
+
             // Single-line WHERE: where (cond) assignment.
             // F2018 §10.2.3.2: when the mask is an array-valued logical
             // expression, the assignment runs element-wise under the
@@ -4463,20 +4776,21 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             // mask or assignment, evaluate the scalar mask, and run the
             // assignment under it.
             let mut array_names: Vec<String> = Vec::new();
-            collect_array_names(mask, &ctx.locals, &mut array_names);
-            collect_array_names_stmt(stmt, &ctx.locals, &mut array_names);
+            collect_array_names(&prepared_mask, &ctx.locals, &mut array_names);
+            collect_array_names_stmt(&prepared_stmt, &ctx.locals, &mut array_names);
 
             if array_names.is_empty() {
-                let cond = super::expr::lower_expr_ctx_tl(b, ctx, mask);
+                let cond = super::expr::lower_expr_ctx_tl(b, ctx, &prepared_mask);
                 let bb_then = b.create_block("where_stmt");
                 let bb_end = b.create_block("where_stmt_end");
                 b.cond_branch(cond, bb_then, vec![], bb_end, vec![]);
                 b.set_block(bb_then);
-                lower_stmt(b, ctx, stmt);
+                lower_stmt(b, ctx, &prepared_stmt);
                 if b.func().block(b.current_block()).terminator.is_none() {
                     b.branch(bb_end, vec![]);
                 }
                 b.set_block(bb_end);
+                finish_where_section_temps(b, ctx, &where_section_temps);
                 return;
             }
 
@@ -4518,14 +4832,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 saved_locals.push((arr_name.clone(), ctx.locals.get(arr_name).cloned()));
                 if let Some(orig_info) = ctx.locals.get(arr_name).cloned() {
                     let base = *array_bases.get(arr_name).unwrap();
-                    let elem_bytes_val = match &orig_info.ty {
-                        IrType::Int(IntWidth::I64) | IrType::Float(FloatWidth::F64) => {
-                            b.const_i64(8)
-                        }
-                        IrType::Int(IntWidth::I16) => b.const_i64(2),
-                        IrType::Int(IntWidth::I8) => b.const_i64(1),
-                        _ => b.const_i64(4),
-                    };
+                    let elem_bytes_val = array_elem_size_value(b, &orig_info);
                     let byte_off = b.imul(i_val, elem_bytes_val);
                     let elem_ptr = b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
                     ctx.locals.insert(
@@ -4554,8 +4861,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             // mask/stmt would emit undefined externals after the
             // substitution. Fold them to bare `Name` so the per-iter
             // scalar binding picks up.
-            let rewritten_mask = rewrite_scalarized_section_refs(mask, &array_names);
-            let rewritten_stmt = rewrite_scalarized_section_refs_stmt(stmt, &array_names);
+            let rewritten_mask = rewrite_scalarized_section_refs(&prepared_mask, &array_names);
+            let rewritten_stmt = rewrite_scalarized_section_refs_stmt(&prepared_stmt, &array_names);
 
             let cond = super::expr::lower_expr_ctx_tl(b, ctx, &rewritten_mask);
             let bb_then = b.create_block("where_stmt_then");
@@ -4583,6 +4890,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             b.branch(bb_check, vec![]);
 
             b.set_block(bb_exit);
+            finish_where_section_temps(b, ctx, &where_section_temps);
         }
 
         Stmt::ForallConstruct {
