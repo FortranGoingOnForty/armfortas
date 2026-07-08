@@ -4199,7 +4199,7 @@ pub extern "C" fn afs_array_maxval_real8_dim(
         let buf = d.base_addr as *mut f32;
         for i in 0..dst_total {
             unsafe {
-                *buf.add(i) = f32::NEG_INFINITY;
+                *buf.add(i) = -f32::MAX;
             }
         }
         for_each_reduce_along_dim(s, dim, |byte_off, dst_flat| {
@@ -4215,7 +4215,7 @@ pub extern "C" fn afs_array_maxval_real8_dim(
         let buf = d.base_addr as *mut f64;
         for i in 0..dst_total {
             unsafe {
-                *buf.add(i) = f64::NEG_INFINITY;
+                *buf.add(i) = -f64::MAX;
             }
         }
         for_each_reduce_along_dim(s, dim, |byte_off, dst_flat| {
@@ -4283,7 +4283,7 @@ pub extern "C" fn afs_array_minval_real8_dim(
         let buf = d.base_addr as *mut f32;
         for i in 0..dst_total {
             unsafe {
-                *buf.add(i) = f32::INFINITY;
+                *buf.add(i) = f32::MAX;
             }
         }
         for_each_reduce_along_dim(s, dim, |byte_off, dst_flat| {
@@ -4299,7 +4299,7 @@ pub extern "C" fn afs_array_minval_real8_dim(
         let buf = d.base_addr as *mut f64;
         for i in 0..dst_total {
             unsafe {
-                *buf.add(i) = f64::INFINITY;
+                *buf.add(i) = f64::MAX;
             }
         }
         for_each_reduce_along_dim(s, dim, |byte_off, dst_flat| {
@@ -5200,6 +5200,40 @@ unsafe fn mask_at(mask: &ArrayDescriptor, i: usize, stride: usize) -> bool {
     }
 }
 
+fn int_maxval_identity(elem_size: i64) -> i64 {
+    match elem_size {
+        1 => i8::MIN as i64,
+        2 => i16::MIN as i64,
+        8 => i64::MIN,
+        _ => i32::MIN as i64,
+    }
+}
+
+fn int_minval_identity(elem_size: i64) -> i64 {
+    match elem_size {
+        1 => i8::MAX as i64,
+        2 => i16::MAX as i64,
+        8 => i64::MAX,
+        _ => i32::MAX as i64,
+    }
+}
+
+fn real_maxval_identity(elem_size: i64) -> f64 {
+    if elem_size == 4 {
+        -(f32::MAX as f64)
+    } else {
+        -f64::MAX
+    }
+}
+
+fn real_minval_identity(elem_size: i64) -> f64 {
+    if elem_size == 4 {
+        f32::MAX as f64
+    } else {
+        f64::MAX
+    }
+}
+
 /// SUM(array, mask=mask) — sum elements where `mask(i)` is true (real).
 /// Width-dispatched on the array's elem_size; mask is read with its own
 /// kind from `mask.elem_size`.
@@ -5449,28 +5483,31 @@ pub extern "C" fn afs_array_product_int_mask(
     prod
 }
 
-/// MAXVAL(array, mask=mask) — masked max (real). Returns -inf when no
-/// element is selected.
+/// MAXVAL(array, mask=mask) — masked max (real).
 #[no_mangle]
 pub extern "C" fn afs_array_maxval_real8_mask(
     desc: *const ArrayDescriptor,
     mask: *const ArrayDescriptor,
 ) -> f64 {
-    if desc.is_null() || mask.is_null() {
-        return f64::NEG_INFINITY;
+    if desc.is_null() {
+        return -f64::MAX;
     }
     let d = unsafe { &*desc };
+    let identity = real_maxval_identity(d.elem_size);
+    if mask.is_null() {
+        return identity;
+    }
     let m = unsafe { &*mask };
     if d.base_addr.is_null() || m.base_addr.is_null() {
-        return f64::NEG_INFINITY;
+        return identity;
     }
     let n = d.total_elements() as usize;
     if n == 0 {
-        return f64::NEG_INFINITY;
+        return identity;
     }
     let stride_d = d.dims[0].stride.max(1) as usize;
     let stride_m = m.dims[0].stride.max(1) as usize;
-    let mut best = f64::NEG_INFINITY;
+    let mut best = identity;
     if d.elem_size == 4 {
         let ptr = d.base_addr as *const f32;
         for i in 0..n {
@@ -5501,21 +5538,25 @@ pub extern "C" fn afs_array_minval_real8_mask(
     desc: *const ArrayDescriptor,
     mask: *const ArrayDescriptor,
 ) -> f64 {
-    if desc.is_null() || mask.is_null() {
-        return f64::INFINITY;
+    if desc.is_null() {
+        return f64::MAX;
     }
     let d = unsafe { &*desc };
+    let identity = real_minval_identity(d.elem_size);
+    if mask.is_null() {
+        return identity;
+    }
     let m = unsafe { &*mask };
     if d.base_addr.is_null() || m.base_addr.is_null() {
-        return f64::INFINITY;
+        return identity;
     }
     let n = d.total_elements() as usize;
     if n == 0 {
-        return f64::INFINITY;
+        return identity;
     }
     let stride_d = d.dims[0].stride.max(1) as usize;
     let stride_m = m.dims[0].stride.max(1) as usize;
-    let mut best = f64::INFINITY;
+    let mut best = identity;
     if d.elem_size == 4 {
         let ptr = d.base_addr as *const f32;
         for i in 0..n {
@@ -5546,21 +5587,25 @@ pub extern "C" fn afs_array_maxval_int_mask(
     desc: *const ArrayDescriptor,
     mask: *const ArrayDescriptor,
 ) -> i64 {
-    if desc.is_null() || mask.is_null() {
+    if desc.is_null() {
         return i64::MIN;
     }
     let d = unsafe { &*desc };
+    let identity = int_maxval_identity(d.elem_size);
+    if mask.is_null() {
+        return identity;
+    }
     let mk = unsafe { &*mask };
     if d.base_addr.is_null() || mk.base_addr.is_null() {
-        return i64::MIN;
+        return identity;
     }
     let n = d.total_elements() as usize;
     if n == 0 {
-        return i64::MIN;
+        return identity;
     }
     let stride_d = d.dims[0].stride.max(1) as usize;
     let stride_m = mk.dims[0].stride.max(1) as usize;
-    let mut best = i64::MIN;
+    let mut best = identity;
     macro_rules! max_kind {
         ($t:ty) => {{
             let ptr = d.base_addr as *const $t;
@@ -5589,21 +5634,25 @@ pub extern "C" fn afs_array_minval_int_mask(
     desc: *const ArrayDescriptor,
     mask: *const ArrayDescriptor,
 ) -> i64 {
-    if desc.is_null() || mask.is_null() {
+    if desc.is_null() {
         return i64::MAX;
     }
     let d = unsafe { &*desc };
+    let identity = int_minval_identity(d.elem_size);
+    if mask.is_null() {
+        return identity;
+    }
     let mk = unsafe { &*mask };
     if d.base_addr.is_null() || mk.base_addr.is_null() {
-        return i64::MAX;
+        return identity;
     }
     let n = d.total_elements() as usize;
     if n == 0 {
-        return i64::MAX;
+        return identity;
     }
     let stride_d = d.dims[0].stride.max(1) as usize;
     let stride_m = mk.dims[0].stride.max(1) as usize;
-    let mut best = i64::MAX;
+    let mut best = identity;
     macro_rules! min_kind {
         ($t:ty) => {{
             let ptr = d.base_addr as *const $t;
@@ -5632,18 +5681,19 @@ pub extern "C" fn afs_array_minval_int_mask(
 #[no_mangle]
 pub extern "C" fn afs_array_maxval_real8(desc: *const ArrayDescriptor) -> f64 {
     if desc.is_null() {
-        return f64::NEG_INFINITY;
+        return -f64::MAX;
     }
     let d = unsafe { &*desc };
+    let identity = real_maxval_identity(d.elem_size);
     if d.base_addr.is_null() {
-        return f64::NEG_INFINITY;
+        return identity;
     }
     let n = d.total_elements() as usize;
     if n == 0 {
-        return f64::NEG_INFINITY;
+        return identity;
     }
     let src = d.base_addr as *const u8;
-    let mut max = f64::NEG_INFINITY;
+    let mut max = identity;
     for_each_element_byte_offset(d, |byte_off| unsafe {
         let v = read_real_as_f64(src, byte_off, d.elem_size);
         if v > max {
@@ -5659,18 +5709,19 @@ pub extern "C" fn afs_array_maxval_real8(desc: *const ArrayDescriptor) -> f64 {
 #[no_mangle]
 pub extern "C" fn afs_array_minval_real8(desc: *const ArrayDescriptor) -> f64 {
     if desc.is_null() {
-        return f64::INFINITY;
+        return f64::MAX;
     }
     let d = unsafe { &*desc };
+    let identity = real_minval_identity(d.elem_size);
     if d.base_addr.is_null() {
-        return f64::INFINITY;
+        return identity;
     }
     let n = d.total_elements() as usize;
     if n == 0 {
-        return f64::INFINITY;
+        return identity;
     }
     let src = d.base_addr as *const u8;
-    let mut min = f64::INFINITY;
+    let mut min = identity;
     for_each_element_byte_offset(d, |byte_off| unsafe {
         let v = read_real_as_f64(src, byte_off, d.elem_size);
         if v < min {
@@ -5689,15 +5740,16 @@ pub extern "C" fn afs_array_maxval_int(desc: *const ArrayDescriptor) -> i64 {
         return i64::MIN;
     }
     let d = unsafe { &*desc };
+    let identity = int_maxval_identity(d.elem_size);
     if d.base_addr.is_null() {
-        return i64::MIN;
+        return identity;
     }
     let n = d.total_elements() as usize;
     if n == 0 {
-        return i64::MIN;
+        return identity;
     }
     let src = d.base_addr as *const u8;
-    let mut max = i64::MIN;
+    let mut max = identity;
     for_each_element_byte_offset(d, |byte_off| unsafe {
         let v = read_int_as_i64(src, byte_off, d.elem_size);
         if v > max {
@@ -5716,15 +5768,16 @@ pub extern "C" fn afs_array_minval_int(desc: *const ArrayDescriptor) -> i64 {
         return i64::MAX;
     }
     let d = unsafe { &*desc };
+    let identity = int_minval_identity(d.elem_size);
     if d.base_addr.is_null() {
-        return i64::MAX;
+        return identity;
     }
     let n = d.total_elements() as usize;
     if n == 0 {
-        return i64::MAX;
+        return identity;
     }
     let src = d.base_addr as *const u8;
-    let mut min = i64::MAX;
+    let mut min = identity;
     for_each_element_byte_offset(d, |byte_off| unsafe {
         let v = read_int_as_i64(src, byte_off, d.elem_size);
         if v < min {
