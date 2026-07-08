@@ -2430,9 +2430,11 @@ pub(crate) fn lower_expr_full(
                     .map(String::as_str)
                     .unwrap_or(callee_key.as_str());
                 if procptr_target.is_none() {
-                    if let Some(hidden_abi) = first_procedure_lookup(&abi_lookup_keys, |k| {
-                        callee_hidden_result_abi(st, k)
-                    }) {
+                    if let Some(hidden_abi) =
+                        first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
+                            callee_hidden_result_abi(st, k)
+                        })
+                    {
                         if let Some(bytes) = hidden_result_temp_bytes_for_callee(
                             st,
                             type_layouts,
@@ -2490,7 +2492,9 @@ pub(crate) fn lower_expr_full(
                     }
                 }
                 let indirect_hidden_result = if procptr_target.is_some() {
-                    first_procedure_lookup(&abi_lookup_keys, |k| callee_hidden_result_abi(st, k))
+                    first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
+                        callee_hidden_result_abi(st, k)
+                    })
                         .and_then(|hidden_abi| {
                             let bytes = hidden_result_temp_bytes_for_callee(
                                 st,
@@ -2521,26 +2525,44 @@ pub(crate) fn lower_expr_full(
                 } else {
                     None
                 };
-                let callee_value_args =
-                    first_procedure_lookup(&abi_lookup_keys, |k| callee_value_arg_mask(st, k));
-                let callee_descriptor_args = first_procedure_lookup(&abi_lookup_keys, |k| {
-                    descriptor_params.and_then(|m| descriptor_param_mask_for_lookup(st, m, k))
+                let callee_value_args = first_resolved_procedure_lookup(
+                    st,
+                    &abi_lookup_keys,
+                    |k| callee_value_arg_mask(st, k),
+                );
+                let callee_descriptor_args = first_resolved_procedure_lookup(
+                    st,
+                    &abi_lookup_keys,
+                    |k| descriptor_params.and_then(|m| descriptor_param_mask_for_lookup(st, m, k)),
+                );
+                let callee_string_descriptor_args = first_resolved_procedure_lookup(
+                    st,
+                    &abi_lookup_keys,
+                    |k| callee_string_descriptor_arg_mask(st, k),
+                );
+                let callee_bind_c_char_args = first_resolved_procedure_lookup(
+                    st,
+                    &abi_lookup_keys,
+                    |k| callee_bind_c_char_arg_mask(st, k),
+                );
+                let callee_pointer_args = first_resolved_procedure_lookup(
+                    st,
+                    &abi_lookup_keys,
+                    |k| callee_pointer_arg_mask(st, k),
+                );
+                let callee_allocatable_args = first_resolved_procedure_lookup(
+                    st,
+                    &abi_lookup_keys,
+                    |k| callee_allocatable_arg_mask(st, k),
+                );
+                let callee_class_args = first_resolved_procedure_lookup(
+                    st,
+                    &abi_lookup_keys,
+                    |k| callee_class_arg_mask(st, k),
+                );
+                let opt_flags = first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
+                    callee_optional_arg_mask(st, k)
                 });
-                let callee_string_descriptor_args = first_procedure_lookup(&abi_lookup_keys, |k| {
-                    callee_string_descriptor_arg_mask(st, k)
-                });
-                let callee_bind_c_char_args = first_procedure_lookup(&abi_lookup_keys, |k| {
-                    callee_bind_c_char_arg_mask(st, k)
-                });
-                let callee_pointer_args =
-                    first_procedure_lookup(&abi_lookup_keys, |k| callee_pointer_arg_mask(st, k));
-                let callee_allocatable_args = first_procedure_lookup(&abi_lookup_keys, |k| {
-                    callee_allocatable_arg_mask(st, k)
-                });
-                let callee_class_args =
-                    first_procedure_lookup(&abi_lookup_keys, |k| callee_class_arg_mask(st, k));
-                let opt_flags =
-                    first_procedure_lookup(&abi_lookup_keys, |k| callee_optional_arg_mask(st, k));
                 let mut ref_arg_vals: Vec<ValueId> =
                     Vec::with_capacity(arg_slots.len() + indirect_hidden_result.is_some() as usize);
                 let mut call_arg_array_temps = Vec::new();
@@ -2754,7 +2776,9 @@ pub(crate) fn lower_expr_full(
                     }
                 }
                 let callee_char_len_star_args =
-                    first_procedure_lookup(&abi_lookup_keys, |k| callee_char_len_star_mask(st, k));
+                    first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
+                        callee_char_len_star_mask(st, k)
+                    });
 
                 if let Some(cls_flags) = &callee_char_len_star_args {
                     for (i, flag) in cls_flags.iter().enumerate() {
@@ -2827,7 +2851,7 @@ pub(crate) fn lower_expr_full(
                 let ret_ty = if indirect_hidden_result.is_some() {
                     IrType::Void
                 } else {
-                    first_procedure_lookup(&abi_lookup_keys, |k| {
+                    first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
                         callee_return_ir_type_for_call_site(
                             st,
                             b.func().name.as_str(),
@@ -2865,9 +2889,11 @@ pub(crate) fn lower_expr_full(
                     return desc;
                 }
                 if let Some(tl) = type_layouts {
-                    if let Some(type_name) = first_procedure_lookup(&abi_lookup_keys, |k| {
-                        callee_return_stabilized_derived_type_name(st, k)
-                    }) {
+                    if let Some(type_name) =
+                        first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
+                            callee_return_stabilized_derived_type_name(st, k)
+                        })
+                    {
                         return stabilize_derived_call_result(b, tl, &type_name, call_result);
                     }
                 }

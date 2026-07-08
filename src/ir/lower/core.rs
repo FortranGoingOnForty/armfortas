@@ -19393,6 +19393,37 @@ where
     None
 }
 
+pub(super) fn first_resolved_procedure_lookup<T, F>(
+    st: &SymbolTable,
+    lookup_keys: &[String],
+    mut lookup: F,
+) -> Option<T>
+where
+    F: FnMut(&str) -> Option<T>,
+{
+    for key in lookup_keys {
+        if let Some(value) = lookup(key) {
+            return Some(value);
+        }
+        if procedure_lookup_key_is_binding_label_alias(st, key) {
+            return None;
+        }
+    }
+    None
+}
+
+fn procedure_lookup_key_is_binding_label_alias(st: &SymbolTable, key: &str) -> bool {
+    let key = key.to_lowercase();
+    find_linkable_symbol_any_scope(st, &key).is_some_and(|sym| {
+        is_linkable_callable_symbol(sym)
+            && sym
+                .attrs
+                .binding_label
+                .as_ref()
+                .is_some_and(|label| !label.eq_ignore_ascii_case(&sym.name))
+    })
+}
+
 pub(super) fn emit_named_function_call(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -19464,27 +19495,38 @@ pub(super) fn emit_named_function_call(
         .unwrap_or_else(|| reorder_args_by_keyword_slots(args, abi_primary_key, st));
 
     let callee_value_args =
-        first_procedure_lookup(&abi_lookup_keys, |k| callee_value_arg_mask(st, k));
-    let callee_descriptor_args = first_procedure_lookup(&abi_lookup_keys, |k| {
+        first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| callee_value_arg_mask(st, k));
+    let callee_descriptor_args = first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
         descriptor_params.and_then(|m| descriptor_param_mask_for_lookup(st, m, k))
     });
-    let callee_string_descriptor_args = first_procedure_lookup(&abi_lookup_keys, |k| {
-        callee_string_descriptor_arg_mask(st, k)
-    });
+    let callee_string_descriptor_args =
+        first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
+            callee_string_descriptor_arg_mask(st, k)
+        });
     let callee_bind_c_char_args =
-        first_procedure_lookup(&abi_lookup_keys, |k| callee_bind_c_char_arg_mask(st, k));
+        first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
+            callee_bind_c_char_arg_mask(st, k)
+        });
     let callee_pointer_args =
-        first_procedure_lookup(&abi_lookup_keys, |k| callee_pointer_arg_mask(st, k));
+        first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
+            callee_pointer_arg_mask(st, k)
+        });
     let callee_allocatable_args =
-        first_procedure_lookup(&abi_lookup_keys, |k| callee_allocatable_arg_mask(st, k));
+        first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
+            callee_allocatable_arg_mask(st, k)
+        });
     let callee_class_args =
-        first_procedure_lookup(&abi_lookup_keys, |k| callee_class_arg_mask(st, k));
-    let opt_flags = first_procedure_lookup(&abi_lookup_keys, |k| callee_optional_arg_mask(st, k));
+        first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| callee_class_arg_mask(st, k));
+    let opt_flags =
+        first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| callee_optional_arg_mask(st, k));
     let callee_sequence_array_args =
-        first_procedure_lookup(&abi_lookup_keys, |k| callee_sequence_array_arg_mask(st, k));
-    let callee_sequence_array_copy_back_args = first_procedure_lookup(&abi_lookup_keys, |k| {
-        callee_sequence_array_copy_back_mask(st, k)
-    });
+        first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
+            callee_sequence_array_arg_mask(st, k)
+        });
+    let callee_sequence_array_copy_back_args =
+        first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
+            callee_sequence_array_copy_back_mask(st, k)
+        });
 
     let mut call_args = Vec::new();
     let mut call_arg_array_temps = Vec::new();
@@ -19775,7 +19817,9 @@ pub(super) fn emit_named_function_call(
     }
 
     if let Some(cls_flags) =
-        first_procedure_lookup(&abi_lookup_keys, |k| callee_char_len_star_mask(st, k))
+        first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
+            callee_char_len_star_mask(st, k)
+        })
     {
         for (i, flag) in cls_flags.iter().enumerate() {
             if !*flag || i >= arg_slots.len() {
