@@ -44638,9 +44638,12 @@ pub(super) fn lower_array_expr_descriptor(
             });
 
             if expr_is_character_expr(b, locals, first, st, type_layouts) {
-                if let Some(elem_len_const) =
+                let empty_params: HashMap<String, ConstScalar> = HashMap::new();
+                let typed_elem_len_const =
+                    typed_array_constructor_char_len(type_spec.as_deref(), &empty_params, st);
+                if let Some(elem_len_const) = typed_elem_len_const.or_else(|| {
                     fixed_char_array_constructor_len(b, values, locals, st, type_layouts)
-                {
+                }) {
                     let n =
                         const_array_constructor_len_in_scope(values, &HashMap::new(), Some(st))?;
                     let total_bytes = (elem_len_const * n).max(1) as u64;
