@@ -32183,11 +32183,19 @@ pub(super) fn lower_fmt_push(
             IrType::Void,
         );
     } else {
+        let is_logical_item = matches!(
+            operator_expr_type_info(item, Some(&ctx.locals), ctx.st, Some(ctx.type_layouts)),
+            Some(crate::sema::symtab::TypeInfo::Logical { .. })
+        );
         let val = super::expr::lower_expr_ctx(b, ctx, item);
         let ty = b
             .func()
             .value_type(val)
             .unwrap_or(IrType::Int(IntWidth::I32));
+        if is_logical_item {
+            fmt_push_emit_logical(b, &ty, val);
+            return;
+        }
         match &ty {
             IrType::Int(IntWidth::I128) => {
                 let slot = b.alloca(IrType::Int(IntWidth::I128));
@@ -32359,6 +32367,19 @@ fn lower_fmt_push_ac_implied_do(
 /// Emit one afs_fmt_push_* call for a per-element value loaded from
 /// an array, picking the right widening/wrap shape per element type.
 fn fmt_push_emit_scalar(b: &mut FuncBuilder, ty: &IrType, val: ValueId) {
+    fmt_push_emit_scalar_semantic(b, ty, val, false);
+}
+
+fn fmt_push_emit_scalar_semantic(
+    b: &mut FuncBuilder,
+    ty: &IrType,
+    val: ValueId,
+    logical: bool,
+) {
+    if logical {
+        fmt_push_emit_logical(b, ty, val);
+        return;
+    }
     match ty {
         IrType::Int(IntWidth::I128) => {
             let slot = b.alloca(IrType::Int(IntWidth::I128));
@@ -32400,12 +32421,7 @@ fn fmt_push_emit_scalar(b: &mut FuncBuilder, ty: &IrType, val: ValueId) {
             );
         }
         IrType::Bool => {
-            let int_val = b.int_extend(val, IntWidth::I32, false);
-            b.call(
-                FuncRef::External("afs_fmt_push_logical".into()),
-                vec![int_val],
-                IrType::Void,
-            );
+            fmt_push_emit_logical(b, ty, val);
         }
         _ => {
             let widened = b.int_extend(val, IntWidth::I64, true);
@@ -32416,6 +32432,23 @@ fn fmt_push_emit_scalar(b: &mut FuncBuilder, ty: &IrType, val: ValueId) {
             );
         }
     }
+}
+
+fn fmt_push_emit_logical(b: &mut FuncBuilder, ty: &IrType, val: ValueId) {
+    let truth = match ty {
+        IrType::Bool => val,
+        IrType::Int(_) => {
+            let zero = zero_value_for_ir_type(b, ty);
+            b.icmp(CmpOp::Ne, val, zero)
+        }
+        _ => coerce_to_type(b, val, &IrType::Bool),
+    };
+    let int_val = b.int_extend(truth, IntWidth::I32, false);
+    b.call(
+        FuncRef::External("afs_fmt_push_logical".into()),
+        vec![int_val],
+        IrType::Void,
+    );
 }
 
 /// Push a fixed-len CHARACTER element via afs_fmt_push_string.
@@ -32526,7 +32559,7 @@ fn fmt_push_whole_array(b: &mut FuncBuilder, info: &LocalInfo) {
         fmt_push_emit_string_type(b, p);
     } else {
         let elem = b.load_typed(p, info.ty.clone());
-        fmt_push_emit_scalar(b, &info.ty, elem);
+        fmt_push_emit_scalar_semantic(b, &info.ty, elem, info.logical_kind.is_some());
     }
     let one = b.const_i64(1);
     let next = b.iadd(i_val, one);
@@ -32634,7 +32667,7 @@ fn fmt_push_1d_slice(
         fmt_push_emit_string_type(b, p);
     } else {
         let elem = b.load_typed(p, info.ty.clone());
-        fmt_push_emit_scalar(b, &info.ty, elem);
+        fmt_push_emit_scalar_semantic(b, &info.ty, elem, info.logical_kind.is_some());
     }
     let next = b.iadd(i_val, stride_val);
     b.store(next, i_addr);
@@ -32783,7 +32816,7 @@ fn fmt_push_section_nd(
                 fmt_push_emit_string_type(b, p);
             } else {
                 let elem = b.load_typed(p, info.ty.clone());
-                fmt_push_emit_scalar(b, &info.ty, elem);
+                fmt_push_emit_scalar_semantic(b, &info.ty, elem, info.logical_kind.is_some());
             }
             b.branch(incrs[0], vec![]);
         } else {
@@ -32981,7 +33014,7 @@ fn fmt_push_alloc_section_nd(
                 fmt_push_emit_string_type(b, p);
             } else {
                 let elem = b.load_typed(p, info.ty.clone());
-                fmt_push_emit_scalar(b, &info.ty, elem);
+                fmt_push_emit_scalar_semantic(b, &info.ty, elem, info.logical_kind.is_some());
             }
             b.branch(incrs[0], vec![]);
         } else {
@@ -33142,7 +33175,7 @@ fn fmt_push_component_section(b: &mut FuncBuilder, _ctx: &mut LowerCtx, info: &L
                 fmt_push_emit_complex(b, complex_lane_f64, p);
             } else {
                 let elem = b.load_typed(p, info.ty.clone());
-                fmt_push_emit_scalar(b, &info.ty, elem);
+                fmt_push_emit_scalar_semantic(b, &info.ty, elem, info.logical_kind.is_some());
             }
             b.branch(incrs[0], vec![]);
         } else {
@@ -48430,7 +48463,7 @@ pub(super) fn component_intrinsic_local_info(
             is_pointer: field.pointer,
             runtime_dim_upper: vec![],
             is_class: false,
-            logical_kind: None,
+            logical_kind: field_logical_kind(&field),
             last_dim_assumed_size: false,
         });
     }
@@ -48450,7 +48483,7 @@ pub(super) fn component_intrinsic_local_info(
         is_pointer: field.pointer,
         runtime_dim_upper: vec![],
         is_class: false,
-        logical_kind: None,
+        logical_kind: field_logical_kind(&field),
         last_dim_assumed_size: false,
     })
 }
@@ -48476,7 +48509,7 @@ pub(super) fn component_field_local_info(
         is_pointer: field.pointer,
         runtime_dim_upper: vec![],
         is_class: false,
-        logical_kind: None,
+        logical_kind: field_logical_kind(&field),
         last_dim_assumed_size: false,
     })
 }
@@ -48576,10 +48609,7 @@ fn projected_scalar_component_local_info(
         is_pointer: false,
         runtime_dim_upper,
         is_class: false,
-        logical_kind: match &field.type_info {
-            crate::sema::symtab::TypeInfo::Logical { kind } => *kind,
-            _ => None,
-        },
+        logical_kind: field_logical_kind(&field),
         last_dim_assumed_size,
     })
 }
@@ -51890,6 +51920,13 @@ pub(super) fn field_derived_type_name(
     }
 }
 
+pub(super) fn field_logical_kind(field: &crate::sema::type_layout::FieldLayout) -> Option<u8> {
+    match &field.type_info {
+        crate::sema::symtab::TypeInfo::Logical { kind } => *kind,
+        _ => None,
+    }
+}
+
 pub(super) fn field_storage_ir_type(
     field: &crate::sema::type_layout::FieldLayout,
     tl: &crate::sema::type_layout::TypeLayoutRegistry,
@@ -51985,7 +52022,7 @@ pub(super) fn component_array_local_info(
         is_pointer: field.pointer,
         runtime_dim_upper: vec![],
         is_class: false,
-        logical_kind: None,
+        logical_kind: field_logical_kind(&field),
         last_dim_assumed_size: false,
     })
 }
