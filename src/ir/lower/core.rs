@@ -52880,6 +52880,66 @@ pub(super) fn emit_derived_value_copy(
         emit_memcpy_bytes(b, dest_ptr, src_ptr, layout.size as i64);
         return;
     }
+    emit_derived_value_copy_guarded(b, type_layouts, layout, dest_ptr, src_ptr);
+}
+
+fn emit_derived_value_copy_guarded(
+    b: &mut FuncBuilder,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+    layout: &crate::sema::type_layout::TypeLayout,
+    dest_ptr: ValueId,
+    src_ptr: ValueId,
+) {
+    let dest_addr = b.ptr_to_int(dest_ptr);
+    let src_addr = b.ptr_to_int(src_ptr);
+    let same_addr = b.icmp(CmpOp::Eq, dest_addr, src_addr);
+    let snapshot_bb = b.create_block("derived_value_self_copy");
+    let direct_bb = b.create_block("derived_value_direct_copy");
+    let join_bb = b.create_block("derived_value_copy_join");
+    b.cond_branch(same_addr, snapshot_bb, vec![], direct_bb, vec![]);
+
+    b.set_block(snapshot_bb);
+    emit_derived_value_copy_snapshot(b, type_layouts, layout, dest_ptr, src_ptr);
+    b.branch(join_bb, vec![]);
+
+    b.set_block(direct_bb);
+    emit_derived_value_copy_unaliased(b, type_layouts, layout, dest_ptr, src_ptr);
+    b.branch(join_bb, vec![]);
+
+    b.set_block(join_bb);
+}
+
+fn emit_derived_value_copy_snapshot(
+    b: &mut FuncBuilder,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+    layout: &crate::sema::type_layout::TypeLayout,
+    dest_ptr: ValueId,
+    src_ptr: ValueId,
+) {
+    let scratch_ty = IrType::Array(
+        Box::new(IrType::Int(IntWidth::I8)),
+        layout.size.max(1) as u64,
+    );
+    let scratch_slot = b.alloca(scratch_ty);
+    let zero = b.const_i64(0);
+    let scratch = b.gep(scratch_slot, vec![zero], IrType::Int(IntWidth::I8));
+    initialize_derived_storage(b, scratch, layout, type_layouts);
+    emit_derived_value_copy_unaliased(b, type_layouts, layout, scratch, src_ptr);
+    emit_derived_value_copy_unaliased(b, type_layouts, layout, dest_ptr, scratch);
+
+    let stat_addr = b.alloca(IrType::Int(IntWidth::I32));
+    let zero_i32 = b.const_i32(0);
+    b.store(zero_i32, stat_addr);
+    deallocate_derived_storage_components(b, scratch, layout, type_layouts, stat_addr);
+}
+
+fn emit_derived_value_copy_unaliased(
+    b: &mut FuncBuilder,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+    layout: &crate::sema::type_layout::TypeLayout,
+    dest_ptr: ValueId,
+    src_ptr: ValueId,
+) {
     if !derived_memory_helper_available_xmodule(b, layout) {
         emit_derived_value_copy_inline(b, type_layouts, layout, dest_ptr, src_ptr);
         return;
