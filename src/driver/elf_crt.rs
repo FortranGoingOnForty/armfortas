@@ -2,10 +2,10 @@
 //!
 //! The driver owns the whole link line — crt objects, dynamic linker,
 //! library set — and invokes `ld` directly. We deliberately do NOT
-//! shell out to `cc -print-file-name=crt1.o`: that trades a probe list
-//! we control for a dependency on a C compiler being installed and on
-//! its sysroot matching ours. The closed probe list plus the `-B`
-//! override covers the same ground deterministically.
+//! shell out to `cc -print-file-name=crt1.o`: that trades filesystem
+//! discovery we control for a dependency on a C compiler being installed
+//! and on its sysroot matching ours. Built-in FHS probes cover common
+//! distro layouts; `-B` remains the explicit override for non-FHS roots.
 //!
 //! Override (first-class configuration, not an escape hatch):
 //! `-B <dir>` (repeatable) or `AFS_CRT_DIR` (colon-separated) is
@@ -126,12 +126,14 @@ pub fn find_crt(
     match target.os {
         Os::FreeBsd => roots.push(PathBuf::from("/usr/lib")),
         Os::Linux => {
-            // Closed list, first hit wins: Debian/Ubuntu multiarch,
-            // then Fedora/RHEL. Unlisted layouts (NixOS!) use -B; the
-            // answer to a new distro is the override, not another
-            // hardcode.
+            // First hit wins: Debian/Ubuntu multiarch, lib64-style
+            // layouts, then plain /usr/lib used by Arch/CachyOS.
             roots.push(PathBuf::from("/usr/lib/x86_64-linux-gnu"));
             roots.push(PathBuf::from("/usr/lib64"));
+            roots.push(PathBuf::from("/usr/lib"));
+            roots.push(PathBuf::from("/lib/x86_64-linux-gnu"));
+            roots.push(PathBuf::from("/lib64"));
+            roots.push(PathBuf::from("/lib"));
         }
         Os::MacOs => unreachable!(),
     }
@@ -144,23 +146,21 @@ pub fn find_crt(
     let crtn = find_in_roots("crtn.o").ok_or_else(|| missing("crtn.o", &roots))?;
 
     // crtbegin/crtend: same roots on FreeBSD; on Linux/glibc they live
-    // in the GCC dir — probe the two documented layouts, highest
-    // numeric version wins.
+    // in the GCC dir. Probe common triples plus host-like target
+    // directories discovered under /usr/lib/gcc; highest numeric
+    // version wins.
     let (crtbegin, crtend) =
         if let (Some(b), Some(e)) = (find_in_roots(begin_name), find_in_roots(end_name)) {
             (b, e)
         } else if target.os == Os::Linux {
-            let gcc_dir = newest_gcc_dir(&[
-                Path::new("/usr/lib/gcc/x86_64-linux-gnu"),
-                Path::new("/usr/lib/gcc/x86_64-redhat-linux"),
-            ])
-            .ok_or_else(|| {
+            let gcc_roots = linux_gcc_roots();
+            let gcc_dir = newest_gcc_dir(&gcc_roots).ok_or_else(|| {
                 format!(
-                    "cannot find {}: no crt root has it and no GCC dir found under \
-                 /usr/lib/gcc/x86_64-linux-gnu or .../x86_64-redhat-linux; \
-                 pass -B <dir> (or set AFS_CRT_DIR) pointing at a directory \
-                 containing the crt objects",
-                    begin_name
+                    "cannot find {}: no crt root has it and no GCC dir found under {}; \
+                     pass -B <dir> (or set AFS_CRT_DIR) pointing at a directory \
+                     containing the crt objects",
+                    begin_name,
+                    format_roots(&gcc_roots)
                 )
             })?;
             let b = gcc_dir.join(begin_name);
@@ -197,8 +197,45 @@ fn missing(name: &str, roots: &[PathBuf]) -> String {
     )
 }
 
+fn format_roots(roots: &[PathBuf]) -> String {
+    roots
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn linux_gcc_roots() -> Vec<PathBuf> {
+    let mut roots = vec![
+        PathBuf::from("/usr/lib/gcc/x86_64-linux-gnu"),
+        PathBuf::from("/usr/lib/gcc/x86_64-redhat-linux"),
+        PathBuf::from("/usr/lib/gcc/x86_64-pc-linux-gnu"),
+        PathBuf::from("/usr/lib/gcc/x86_64-unknown-linux-gnu"),
+    ];
+
+    if let Ok(entries) = std::fs::read_dir("/usr/lib/gcc") {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if name.starts_with("x86_64-")
+                && name.contains("linux")
+                && !roots.iter().any(|root| root == &path)
+            {
+                roots.push(path);
+            }
+        }
+    }
+
+    roots
+}
+
 /// Highest-numbered version directory under the given GCC lib roots.
-fn newest_gcc_dir(roots: &[&Path]) -> Option<PathBuf> {
+fn newest_gcc_dir(roots: &[PathBuf]) -> Option<PathBuf> {
     let mut best: Option<(u32, PathBuf)> = None;
     for root in roots {
         let Ok(entries) = std::fs::read_dir(root) else {
@@ -370,6 +407,20 @@ mod tests {
         );
         assert!(msg.contains("NixOS"), "error should name NixOS: {}", msg);
         let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    #[test]
+    fn newest_gcc_dir_accepts_pc_linux_layout() {
+        let root = std::env::temp_dir().join(format!("afs_gcc_pc_linux_{}", std::process::id()));
+        let target_root = root.join("x86_64-pc-linux-gnu");
+        let older = target_root.join("15.3.0");
+        let newer = target_root.join("16");
+        std::fs::create_dir_all(&older).unwrap();
+        std::fs::create_dir_all(&newer).unwrap();
+
+        assert_eq!(newest_gcc_dir(&[target_root]).unwrap(), newer);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
