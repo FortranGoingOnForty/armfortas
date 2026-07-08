@@ -28180,6 +28180,211 @@ fn scalar_runtime_write_func(ty: &IrType) -> &'static str {
     }
 }
 
+fn derived_io_layout_for_type(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    type_name: &str,
+) -> Option<crate::sema::type_layout::TypeLayout> {
+    let scope_id = callee_scope_id_for_lookup(ctx.st, b.func().name.as_str());
+    let canonical =
+        canonical_layout_type_name_for_scope(ctx.st, scope_id, type_name, ctx.type_layouts)
+            .unwrap_or_else(|| type_name.to_string());
+    ctx.type_layouts.get(&canonical).cloned()
+}
+
+fn derived_io_field_elem_count(field: &crate::sema::type_layout::FieldLayout) -> i64 {
+    if field.dims.is_empty() {
+        1
+    } else {
+        field
+            .dims
+            .iter()
+            .map(|(_, extent)| (*extent).max(0))
+            .product()
+    }
+}
+
+fn derived_io_field_elem_size(field: &crate::sema::type_layout::FieldLayout) -> i64 {
+    let count = derived_io_field_elem_count(field).max(1);
+    (field.size as i64 / count).max(1)
+}
+
+fn unsupported_derived_io_field(
+    span: crate::lexer::Span,
+    field: &crate::sema::type_layout::FieldLayout,
+) -> ! {
+    lower_stmt_error(
+        span,
+        &format!("unsupported derived-type output component '{}'", field.name),
+    )
+}
+
+fn lower_write_emit_logical(b: &mut FuncBuilder, unit: ValueId, ty: &IrType, val: ValueId) {
+    let truth = match ty {
+        IrType::Bool => val,
+        IrType::Int(_) => {
+            let zero = zero_value_for_ir_type(b, ty);
+            b.icmp(CmpOp::Ne, val, zero)
+        }
+        _ => coerce_to_type(b, val, &IrType::Bool),
+    };
+    let int_val = b.int_extend(truth, IntWidth::I32, false);
+    b.call(
+        FuncRef::External("afs_write_logical".into()),
+        vec![unit, int_val],
+        IrType::Void,
+    );
+}
+
+fn lower_derived_scalar_write(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    type_name: &str,
+    base_addr: ValueId,
+    unit: ValueId,
+    span: crate::lexer::Span,
+) -> bool {
+    let Some(layout) = derived_io_layout_for_type(b, ctx, type_name) else {
+        return false;
+    };
+    lower_derived_layout_write(b, ctx, &layout, base_addr, unit, span);
+    true
+}
+
+fn lower_derived_layout_write(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    layout: &crate::sema::type_layout::TypeLayout,
+    base_addr: ValueId,
+    unit: ValueId,
+    span: crate::lexer::Span,
+) {
+    for field in &layout.fields {
+        let offset = b.const_i64(field.offset as i64);
+        let field_ptr = b.gep(base_addr, vec![offset], IrType::Int(IntWidth::I8));
+        lower_derived_field_write(b, ctx, field, field_ptr, unit, span);
+    }
+}
+
+fn lower_derived_field_write(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    field: &crate::sema::type_layout::FieldLayout,
+    field_ptr: ValueId,
+    unit: ValueId,
+    span: crate::lexer::Span,
+) {
+    let count = derived_io_field_elem_count(field);
+    if count <= 0 {
+        return;
+    }
+    if count > 1 {
+        if field_uses_array_descriptor(field) {
+            unsupported_derived_io_field(span, field);
+        }
+        let elem_size = b.const_i64(derived_io_field_elem_size(field));
+        let count_v = b.const_i64(count);
+        let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+        let zero = b.const_i64(0);
+        b.store(zero, i_addr);
+        let bb_check = b.create_block("derived_io_field_check");
+        let bb_body = b.create_block("derived_io_field_body");
+        let bb_exit = b.create_block("derived_io_field_exit");
+        b.branch(bb_check, vec![]);
+        b.set_block(bb_check);
+        let i = b.load(i_addr);
+        let done = b.icmp(CmpOp::Ge, i, count_v);
+        b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+        b.set_block(bb_body);
+        let i_val = b.load(i_addr);
+        let byte_off = b.imul(i_val, elem_size);
+        let elem_ptr = b.gep(field_ptr, vec![byte_off], IrType::Int(IntWidth::I8));
+        lower_derived_field_scalar_write(b, ctx, field, elem_ptr, unit, span);
+        let one = b.const_i64(1);
+        let next = b.iadd(i_val, one);
+        b.store(next, i_addr);
+        b.branch(bb_check, vec![]);
+        b.set_block(bb_exit);
+        return;
+    }
+    lower_derived_field_scalar_write(b, ctx, field, field_ptr, unit, span);
+}
+
+fn lower_derived_field_scalar_write(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    field: &crate::sema::type_layout::FieldLayout,
+    field_ptr: ValueId,
+    unit: ValueId,
+    span: crate::lexer::Span,
+) {
+    if field.procedure_pointer || field_uses_array_descriptor(field) {
+        unsupported_derived_io_field(span, field);
+    }
+    if let Some(nested_type) = field_derived_type_name(field) {
+        if field.pointer || field.allocatable {
+            unsupported_derived_io_field(span, field);
+        }
+        let Some(layout) = derived_io_layout_for_type(b, ctx, &nested_type) else {
+            unsupported_derived_io_field(span, field);
+        };
+        lower_derived_layout_write(b, ctx, &layout, field_ptr, unit, span);
+        return;
+    }
+    match field_char_kind(field) {
+        CharKind::Fixed(len) => {
+            let len_v = b.const_i64(len);
+            b.call(
+                FuncRef::External("afs_write_string".into()),
+                vec![unit, field_ptr, len_v],
+                IrType::Void,
+            );
+            return;
+        }
+        CharKind::Deferred => {
+            let (ptr, len) = load_string_descriptor_view(b, field_ptr);
+            b.call(
+                FuncRef::External("afs_write_string".into()),
+                vec![unit, ptr, len],
+                IrType::Void,
+            );
+            return;
+        }
+        CharKind::FixedRuntime { .. } | CharKind::AssumedLen { .. } | CharKind::None => {}
+    }
+    if matches!(
+        field.type_info,
+        crate::sema::symtab::TypeInfo::Character { .. }
+    ) {
+        unsupported_derived_io_field(span, field);
+    }
+
+    let ty = field_storage_ir_type(field, ctx.type_layouts);
+    if is_complex_ty(&ty) {
+        let func = if complex_float_width(&ty) == FloatWidth::F64 {
+            "afs_write_complex_f64"
+        } else {
+            "afs_write_complex_f32"
+        };
+        b.call(
+            FuncRef::External(func.into()),
+            vec![unit, field_ptr],
+            IrType::Void,
+        );
+        return;
+    }
+    let val = b.load_typed(field_ptr, ty.clone());
+    if field_logical_kind(field).is_some() {
+        lower_write_emit_logical(b, unit, &ty, val);
+        return;
+    }
+    b.call(
+        FuncRef::External(scalar_runtime_write_func(&ty).into()),
+        vec![unit, val],
+        IrType::Void,
+    );
+}
+
 pub(super) fn descriptor_element_size_bytes(
     info: &LocalInfo,
     layout: crate::target::TargetLayout,
@@ -30232,6 +30437,20 @@ pub(super) fn lower_write_items_adv(
                             IrType::Void,
                         );
                         continue;
+                    }
+                    if let Some(type_name) = info.derived_type.as_deref() {
+                        if info.dims.is_empty()
+                            && !info.allocatable
+                            && !info.is_pointer
+                            && !info.is_class
+                        {
+                            let base_addr = derived_storage_addr(b, &info);
+                            if lower_derived_scalar_write(
+                                b, ctx, type_name, base_addr, unit, item.span,
+                            ) {
+                                continue;
+                            }
+                        }
                     }
                     if local_is_array_like(&info) {
                         lower_whole_array_write(b, ctx, &info, unit);
@@ -32477,6 +32696,14 @@ pub(super) fn lower_fmt_push(
     if let Expr::Name { name } = &item.node {
         let key = name.to_lowercase();
         if let Some(info) = ctx.locals.get(&key).cloned() {
+            if let Some(type_name) = info.derived_type.as_deref() {
+                if info.dims.is_empty() && !info.allocatable && !info.is_pointer && !info.is_class {
+                    let base_addr = derived_storage_addr(b, &info);
+                    if fmt_push_derived_scalar(b, ctx, type_name, base_addr, item.span) {
+                        return;
+                    }
+                }
+            }
             // Outer arm is the array path. Scalar complex formatting is
             // handled separately; this case just needs the array predicate.
             if local_is_array_like(&info) {
@@ -32853,6 +33080,124 @@ fn fmt_push_emit_string_type(b: &mut FuncBuilder, ptr: ValueId) {
         vec![sptr, slen],
         IrType::Void,
     );
+}
+
+fn fmt_push_derived_scalar(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    type_name: &str,
+    base_addr: ValueId,
+    span: crate::lexer::Span,
+) -> bool {
+    let Some(layout) = derived_io_layout_for_type(b, ctx, type_name) else {
+        return false;
+    };
+    fmt_push_derived_layout(b, ctx, &layout, base_addr, span);
+    true
+}
+
+fn fmt_push_derived_layout(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    layout: &crate::sema::type_layout::TypeLayout,
+    base_addr: ValueId,
+    span: crate::lexer::Span,
+) {
+    for field in &layout.fields {
+        let offset = b.const_i64(field.offset as i64);
+        let field_ptr = b.gep(base_addr, vec![offset], IrType::Int(IntWidth::I8));
+        fmt_push_derived_field(b, ctx, field, field_ptr, span);
+    }
+}
+
+fn fmt_push_derived_field(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    field: &crate::sema::type_layout::FieldLayout,
+    field_ptr: ValueId,
+    span: crate::lexer::Span,
+) {
+    let count = derived_io_field_elem_count(field);
+    if count <= 0 {
+        return;
+    }
+    if count > 1 {
+        if field_uses_array_descriptor(field) {
+            unsupported_derived_io_field(span, field);
+        }
+        let elem_size = b.const_i64(derived_io_field_elem_size(field));
+        let count_v = b.const_i64(count);
+        let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+        let zero = b.const_i64(0);
+        b.store(zero, i_addr);
+        let bb_check = b.create_block("fmt_derived_field_check");
+        let bb_body = b.create_block("fmt_derived_field_body");
+        let bb_exit = b.create_block("fmt_derived_field_exit");
+        b.branch(bb_check, vec![]);
+        b.set_block(bb_check);
+        let i = b.load(i_addr);
+        let done = b.icmp(CmpOp::Ge, i, count_v);
+        b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+        b.set_block(bb_body);
+        let i_val = b.load(i_addr);
+        let byte_off = b.imul(i_val, elem_size);
+        let elem_ptr = b.gep(field_ptr, vec![byte_off], IrType::Int(IntWidth::I8));
+        fmt_push_derived_field_scalar(b, ctx, field, elem_ptr, span);
+        let one = b.const_i64(1);
+        let next = b.iadd(i_val, one);
+        b.store(next, i_addr);
+        b.branch(bb_check, vec![]);
+        b.set_block(bb_exit);
+        return;
+    }
+    fmt_push_derived_field_scalar(b, ctx, field, field_ptr, span);
+}
+
+fn fmt_push_derived_field_scalar(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    field: &crate::sema::type_layout::FieldLayout,
+    field_ptr: ValueId,
+    span: crate::lexer::Span,
+) {
+    if field.procedure_pointer || field_uses_array_descriptor(field) {
+        unsupported_derived_io_field(span, field);
+    }
+    if let Some(nested_type) = field_derived_type_name(field) {
+        if field.pointer || field.allocatable {
+            unsupported_derived_io_field(span, field);
+        }
+        let Some(layout) = derived_io_layout_for_type(b, ctx, &nested_type) else {
+            unsupported_derived_io_field(span, field);
+        };
+        fmt_push_derived_layout(b, ctx, &layout, field_ptr, span);
+        return;
+    }
+    match field_char_kind(field) {
+        CharKind::Fixed(len) => {
+            fmt_push_emit_char_fixed(b, field_ptr, len);
+            return;
+        }
+        CharKind::Deferred => {
+            fmt_push_emit_string_type(b, field_ptr);
+            return;
+        }
+        CharKind::FixedRuntime { .. } | CharKind::AssumedLen { .. } | CharKind::None => {}
+    }
+    if matches!(
+        field.type_info,
+        crate::sema::symtab::TypeInfo::Character { .. }
+    ) {
+        unsupported_derived_io_field(span, field);
+    }
+
+    let ty = field_storage_ir_type(field, ctx.type_layouts);
+    if is_complex_ty(&ty) {
+        fmt_push_emit_complex(b, complex_float_width(&ty) == FloatWidth::F64, field_ptr);
+        return;
+    }
+    let val = b.load_typed(field_ptr, ty.clone());
+    fmt_push_emit_scalar_semantic(b, &ty, val, field_logical_kind(field).is_some());
 }
 
 /// Push a complex element by emitting two real pushes for its lanes.
