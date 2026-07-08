@@ -11064,6 +11064,75 @@ pub(super) fn const_array_constructor_len_in_scope(
 /// ADJUSTL, ADJUSTR, TRIM). These need access to `locals` (for CharKind info) and the
 /// original un-lowered argument expressions, so they cannot go through `lower_intrinsic`.
 /// Returns Some(ValueId) if recognized, None otherwise.
+#[allow(clippy::too_many_arguments)]
+fn lower_character_minmax_string_expr(
+    b: &mut FuncBuilder,
+    name: &str,
+    args: &[crate::ast::expr::Argument],
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) -> Option<(ValueId, ValueId)> {
+    if !matches!(name, "max" | "min") || args.len() < 2 {
+        return None;
+    }
+
+    let mut arg_exprs = Vec::with_capacity(args.len());
+    for arg in args {
+        let crate::ast::expr::SectionSubscript::Element(expr) = &arg.value else {
+            return None;
+        };
+        if !expr_is_character_expr(b, locals, expr, st, type_layouts) {
+            return None;
+        }
+        arg_exprs.push(expr);
+    }
+
+    let mut iter = arg_exprs.into_iter();
+    let first = iter.next()?;
+    let (mut best_ptr, mut best_len) = lower_string_expr_full(
+        b,
+        locals,
+        first,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    );
+    let zero = b.const_i32(0);
+
+    for arg_expr in iter {
+        let (arg_ptr, arg_len) = lower_string_expr_full(
+            b,
+            locals,
+            arg_expr,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        );
+        let cmp = b.call(
+            FuncRef::External("afs_compare_char".into()),
+            vec![best_ptr, best_len, arg_ptr, arg_len],
+            IrType::Int(IntWidth::I32),
+        );
+        let keep_best = if name == "max" {
+            b.icmp(CmpOp::Ge, cmp, zero)
+        } else {
+            b.icmp(CmpOp::Le, cmp, zero)
+        };
+        best_ptr = b.select(keep_best, best_ptr, arg_ptr);
+        best_len = b.select(keep_best, best_len, arg_len);
+    }
+
+    Some((best_ptr, best_len))
+}
+
 pub(super) fn lower_char_intrinsic(
     b: &mut FuncBuilder,
     name: &str,
@@ -11102,6 +11171,18 @@ pub(super) fn lower_char_intrinsic(
         };
 
     match name {
+        "max" | "min" => lower_character_minmax_string_expr(
+            b,
+            name,
+            args,
+            locals,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        )
+        .map(|(ptr, _)| ptr),
         "len" => {
             // F2018 §16.9.108: LEN returns default integer. Descriptor
             // length is stored as I64; truncate to I32 so generic
@@ -24936,6 +25017,21 @@ pub(super) fn lower_string_expr_full(
                     key.as_str()
                 };
                 match intrinsic_key {
+                    "max" | "min" => {
+                        if let Some(result) = lower_character_minmax_string_expr(
+                            b,
+                            intrinsic_key,
+                            args,
+                            locals,
+                            st,
+                            type_layouts,
+                            internal_funcs,
+                            contained_host_refs,
+                            descriptor_params,
+                        ) {
+                            return result;
+                        }
+                    }
                     "trim" => {
                         if let Some(arg) = first_char_arg {
                             let (src_ptr, len_val) = lower_string_expr_full(
