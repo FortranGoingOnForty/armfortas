@@ -18474,6 +18474,7 @@ pub(super) fn intrinsic_subroutine_arg_order(callee_key: &str) -> Option<&'stati
         "reshape" => Some(&["source", "shape", "pad", "order"]),
         "pack" => Some(&["array", "mask", "vector"]),
         "findloc" => Some(&["array", "value", "dim", "mask", "kind", "back"]),
+        "maxloc" | "minloc" => Some(&["array", "dim", "mask", "kind", "back"]),
         "spread" => Some(&["source", "dim", "ncopies"]),
         "unpack" => Some(&["vector", "mask", "field"]),
         _ => None,
@@ -48302,6 +48303,181 @@ fn lower_findloc_rank1_scalar(
     Some(b.load(result_addr))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn lower_minmaxloc_rank1_scalar(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    name: &str,
+    first_expr: &crate::ast::expr::SpannedExpr,
+    desc: ValueId,
+    elem_ty: &IrType,
+    args: &[crate::ast::expr::Argument],
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) -> Option<ValueId> {
+    if actual_expr_rank(first_expr, locals, st, type_layouts).is_some_and(|rank| rank != 1) {
+        return None;
+    }
+    if !matches!(elem_ty, IrType::Int(_) | IrType::Float(_)) {
+        return None;
+    }
+
+    let arg_slots = reorder_args_by_keyword_slots(args, name, st);
+    let dim_expr = arg_slots.get(1).and_then(|slot| {
+        slot.as_ref().and_then(|arg| match &arg.value {
+            crate::ast::expr::SectionSubscript::Element(e) => Some(e),
+            _ => None,
+        })
+    });
+    if let Some(dim_expr) = dim_expr {
+        if eval_const_int(dim_expr) != Some(1) {
+            return None;
+        }
+    }
+
+    let mask_expr = arg_slots.get(2).and_then(|slot| {
+        slot.as_ref().and_then(|arg| match &arg.value {
+            crate::ast::expr::SectionSubscript::Element(e) => Some(e),
+            _ => None,
+        })
+    });
+    let back_expr = arg_slots.get(4).and_then(|slot| {
+        slot.as_ref().and_then(|arg| match &arg.value {
+            crate::ast::expr::SectionSubscript::Element(e) => Some(e),
+            _ => None,
+        })
+    });
+
+    let back_i1 = match back_expr {
+        None => b.const_bool(false),
+        Some(e) => {
+            let raw = super::expr::lower_expr_full(
+                b,
+                locals,
+                e,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
+            findloc_truthy_i1(b, raw)
+        }
+    };
+
+    let mut mask_array: Option<(ValueId, IrType)> = None;
+    let mut mask_scalar_i1: Option<ValueId> = None;
+    if let Some(me) = mask_expr {
+        if actual_expr_rank(me, locals, st, type_layouts).is_some_and(|r| r >= 1) {
+            match lower_array_expr_descriptor(
+                b,
+                locals,
+                me,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            ) {
+                Some(md) => mask_array = Some(md),
+                None => return None,
+            }
+        } else {
+            let mv = super::expr::lower_expr_full(
+                b,
+                locals,
+                me,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
+            mask_scalar_i1 = Some(findloc_truthy_i1(b, mv));
+        }
+    }
+
+    let result_addr = b.alloca(IrType::Int(IntWidth::I32));
+    let found_addr = b.alloca(IrType::Bool);
+    let best_addr = b.alloca(elem_ty.clone());
+    let zero32 = b.const_i32(0);
+    b.store(zero32, result_addr);
+    let false_val = b.const_bool(false);
+    b.store(false_val, found_addr);
+    let zero_best = zero_value_for_ir_type(b, elem_ty);
+    b.store(zero_best, best_addr);
+
+    let n = b.call(
+        FuncRef::External("afs_array_size".into()),
+        vec![desc],
+        IrType::Int(IntWidth::I64),
+    );
+    let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let zero64 = b.const_i64(0);
+    b.store(zero64, i_addr);
+
+    let bb_check = b.create_block("minmaxloc_check");
+    let bb_body = b.create_block("minmaxloc_body");
+    let bb_exit = b.create_block("minmaxloc_exit");
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let idx = b.load(i_addr);
+    let past_end = b.icmp(CmpOp::Ge, idx, n);
+    b.cond_branch(past_end, bb_exit, vec![], bb_body, vec![]);
+
+    b.set_block(bb_body);
+    let cur_idx = b.load(i_addr);
+    let elem = load_rank1_array_desc_elem(b, desc, elem_ty, cur_idx);
+    let eligible = if let Some((mask_desc, mask_elem_ty)) = &mask_array {
+        let mv = load_rank1_array_desc_elem(b, *mask_desc, mask_elem_ty, cur_idx);
+        findloc_truthy_i1(b, mv)
+    } else if let Some(mtrue) = mask_scalar_i1 {
+        mtrue
+    } else {
+        b.const_bool(true)
+    };
+
+    let found = b.load(found_addr);
+    let not_found = b.not(found);
+    let best = b.load(best_addr);
+    let strict_better = match (name, elem_ty) {
+        ("maxloc", IrType::Float(_)) => b.fcmp(CmpOp::Gt, elem, best),
+        ("minloc", IrType::Float(_)) => b.fcmp(CmpOp::Lt, elem, best),
+        ("maxloc", _) => b.icmp(CmpOp::Gt, elem, best),
+        ("minloc", _) => b.icmp(CmpOp::Lt, elem, best),
+        _ => return None,
+    };
+    let tied = match elem_ty {
+        IrType::Float(_) => b.fcmp(CmpOp::Eq, elem, best),
+        _ => b.icmp(CmpOp::Eq, elem, best),
+    };
+    let back_tie = b.and(back_i1, tied);
+    let better_or_tie = b.or(strict_better, back_tie);
+    let candidate_value = b.or(not_found, better_or_tie);
+    let update = b.and(eligible, candidate_value);
+
+    let next_best = b.select(update, elem, best);
+    b.store(next_best, best_addr);
+    let one64 = b.const_i64(1);
+    let one_based64 = b.iadd(cur_idx, one64);
+    let one_based32 = b.int_trunc(one_based64, IntWidth::I32);
+    let prev_result = b.load(result_addr);
+    let next_result = b.select(update, one_based32, prev_result);
+    b.store(next_result, result_addr);
+    let next_found = b.or(found, update);
+    b.store(next_found, found_addr);
+    let next_idx = b.iadd(cur_idx, one64);
+    b.store(next_idx, i_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
+    Some(b.load(result_addr))
+}
+
 pub(super) fn lower_array_intrinsic(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -48978,6 +49154,22 @@ pub(super) fn lower_array_intrinsic(
             }
         }
         "maxloc" => {
+            if let Some(v) = lower_minmaxloc_rank1_scalar(
+                b,
+                locals,
+                name,
+                first_expr,
+                desc,
+                &elem_ty,
+                args,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            ) {
+                return Some(v);
+            }
             // F2018 §16.9.130: returns rank-N integer array of indices,
             // or scalar when DIM is supplied for rank-1 input. We support
             // the rank-1 + dim=1 form (or no dim → scalar for rank-1
@@ -48994,6 +49186,22 @@ pub(super) fn lower_array_intrinsic(
             ))
         }
         "minloc" => {
+            if let Some(v) = lower_minmaxloc_rank1_scalar(
+                b,
+                locals,
+                name,
+                first_expr,
+                desc,
+                &elem_ty,
+                args,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            ) {
+                return Some(v);
+            }
             let func = match &elem_ty {
                 IrType::Float(FloatWidth::F32) => "afs_array_minloc_real4",
                 IrType::Float(FloatWidth::F64) => "afs_array_minloc_real8",
