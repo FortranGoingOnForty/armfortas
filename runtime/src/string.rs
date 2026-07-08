@@ -9,11 +9,13 @@
 //! The register allocator only puts the descriptor *pointer* in a register.
 
 use crate::descriptor::*;
+use std::ffi::c_void;
 use std::ptr;
 
 extern "C" {
     fn malloc(size: usize) -> *mut u8;
     fn free(ptr: *mut u8);
+    fn memcmp(a: *const c_void, b: *const c_void, len: usize) -> i32;
 }
 
 // ---- Fixed-length character assignment ----
@@ -231,24 +233,91 @@ pub extern "C" fn afs_concat(result: *mut u8, a: *const u8, a_len: i64, b: *cons
 /// Returns: -1 if a < b, 0 if a == b, 1 if a > b.
 #[no_mangle]
 pub extern "C" fn afs_compare_char(a: *const u8, a_len: i64, b: *const u8, b_len: i64) -> i32 {
-    let max_len = a_len.max(b_len) as usize;
-    for i in 0..max_len {
-        let ac = if i < a_len as usize && !a.is_null() {
-            unsafe { *a.add(i) }
-        } else {
-            b' '
-        };
-        let bc = if i < b_len as usize && !b.is_null() {
-            unsafe { *b.add(i) }
-        } else {
-            b' '
-        };
-        if ac < bc {
-            return -1;
+    let a_len = nonnegative_len(a_len);
+    let b_len = nonnegative_len(b_len);
+    let common_len = a_len.min(b_len);
+
+    if common_len > 0 {
+        let common = unsafe { compare_common_char_prefix(a, b, common_len) };
+        if common != 0 {
+            return common;
         }
-        if ac > bc {
-            return 1;
+    }
+
+    if a_len > common_len {
+        let tail = unsafe { compare_bytes_to_blank_padding(a, common_len, a_len) };
+        if tail != 0 {
+            return tail;
         }
+    }
+    if b_len > common_len {
+        let tail = unsafe { compare_blank_padding_to_bytes(b, common_len, b_len) };
+        if tail != 0 {
+            return tail;
+        }
+    }
+
+    0
+}
+
+#[inline]
+fn nonnegative_len(len: i64) -> usize {
+    if len <= 0 {
+        0
+    } else {
+        len as usize
+    }
+}
+
+#[inline]
+fn normalize_ordering(value: i32) -> i32 {
+    match value.cmp(&0) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    }
+}
+
+#[inline]
+unsafe fn compare_common_char_prefix(a: *const u8, b: *const u8, len: usize) -> i32 {
+    match (a.is_null(), b.is_null()) {
+        (false, false) => normalize_ordering(memcmp(a.cast::<c_void>(), b.cast::<c_void>(), len)),
+        (false, true) => compare_bytes_to_blank_padding(a, 0, len),
+        (true, false) => compare_blank_padding_to_bytes(b, 0, len),
+        (true, true) => 0,
+    }
+}
+
+#[inline]
+unsafe fn compare_bytes_to_blank_padding(ptr: *const u8, start: usize, end: usize) -> i32 {
+    if ptr.is_null() {
+        return 0;
+    }
+
+    let mut i = start;
+    while i < end {
+        let c = *ptr.add(i);
+        if c != b' ' {
+            return if c < b' ' { -1 } else { 1 };
+        }
+        i += 1;
+    }
+    0
+}
+
+#[inline]
+unsafe fn compare_blank_padding_to_bytes(ptr: *const u8, start: usize, end: usize) -> i32 {
+    if ptr.is_null() {
+        return 0;
+    }
+
+    let mut i = start;
+    while i < end {
+        let c = *ptr.add(i);
+        if c != b' ' {
+            return if b' ' < c { -1 } else { 1 };
+        }
+        i += 1;
     }
     0
 }
@@ -262,13 +331,13 @@ pub extern "C" fn afs_len_trim(src: *const u8, src_len: i64) -> i64 {
     if src.is_null() || src_len <= 0 {
         return 0;
     }
-    let slice = unsafe { std::slice::from_raw_parts(src, src_len as usize) };
-    let trimmed = slice
-        .iter()
-        .rposition(|&b| b != b' ')
-        .map(|pos| pos + 1)
-        .unwrap_or(0);
-    trimmed as i64
+    let mut len = src_len as usize;
+    unsafe {
+        while len > 0 && *src.add(len - 1) == b' ' {
+            len -= 1;
+        }
+    }
+    len as i64
 }
 
 /// ADJUSTL: left-justify by removing leading spaces, padding trailing.
@@ -913,6 +982,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn compare_nonblank_tail_against_padding() {
+        assert_eq!(afs_compare_char(b"abc!".as_ptr(), 4, b"abc".as_ptr(), 3), 1);
+        assert_eq!(
+            afs_compare_char(b"abc".as_ptr(), 3, b"abc!".as_ptr(), 4),
+            -1
+        );
+    }
+
+    #[test]
+    fn compare_low_byte_tail_against_padding() {
+        assert_eq!(
+            afs_compare_char(b"abc\0".as_ptr(), 4, b"abc".as_ptr(), 3),
+            -1
+        );
+        assert_eq!(
+            afs_compare_char(b"abc".as_ptr(), 3, b"abc\0".as_ptr(), 4),
+            1
+        );
+    }
+
     // ---- Intrinsics ----
 
     #[test]
@@ -920,6 +1010,7 @@ mod tests {
         assert_eq!(afs_len_trim(b"hello   ".as_ptr(), 8), 5);
         assert_eq!(afs_len_trim(b"   ".as_ptr(), 3), 0);
         assert_eq!(afs_len_trim(b"hello".as_ptr(), 5), 5);
+        assert_eq!(afs_len_trim(b"hello".as_ptr(), -1), 0);
     }
 
     #[test]
