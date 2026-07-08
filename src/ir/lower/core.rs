@@ -28828,6 +28828,72 @@ fn array_constructor_has_implied_do(values: &[crate::ast::expr::AcValue]) -> boo
 }
 
 #[allow(clippy::too_many_arguments)]
+fn lower_runtime_char_array_constructor_elem_len(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    values: &[crate::ast::expr::AcValue],
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) -> Option<ValueId> {
+    let mut result = None;
+    for value in values {
+        let len = match value {
+            crate::ast::expr::AcValue::Expr(expr) => {
+                if let Expr::ArrayConstructor { values: inner, .. } = &expr.node {
+                    lower_runtime_char_array_constructor_elem_len(
+                        b,
+                        locals,
+                        inner,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
+                    )?
+                } else if let Some(desc) = array_constructor_expr_descriptor(
+                    b,
+                    locals,
+                    expr,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                ) {
+                    descriptor_elem_size(b, desc)
+                } else if expr_is_character_expr(b, locals, expr, st, type_layouts) {
+                    let (_, len) = lower_string_expr_full(
+                        b,
+                        locals,
+                        expr,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
+                    );
+                    len
+                } else {
+                    return None;
+                }
+            }
+            crate::ast::expr::AcValue::ImpliedDo(_) => return None,
+        };
+        result = Some(match result {
+            Some(current) => {
+                let keep_current = b.icmp(CmpOp::Ge, current, len);
+                b.select(keep_current, current, len)
+            }
+            None => len,
+        });
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
 fn lower_runtime_char_array_constructor_descriptor(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -46967,6 +47033,47 @@ pub(super) fn lower_array_assign(
         if try_lower_typed_char_allocatable_constructor_assign(b, ctx, dest_info, dest_desc, value)
         {
             return;
+        }
+        if descriptor_backed_runtime_char_array(dest_info) {
+            if let Expr::ArrayConstructor { values, type_spec } = &value.node {
+                if type_spec.is_none() {
+                    if let Some(elem_len) = lower_runtime_char_array_constructor_elem_len(
+                        b,
+                        &ctx.locals,
+                        values,
+                        ctx.st,
+                        Some(ctx.type_layouts),
+                        Some(ctx.internal_funcs),
+                        Some(ctx.contained_host_refs),
+                        Some(ctx.descriptor_params),
+                    ) {
+                        if let Some(src_desc) = lower_runtime_char_array_constructor_descriptor(
+                            b,
+                            &ctx.locals,
+                            values,
+                            elem_len,
+                            ctx.st,
+                            Some(ctx.type_layouts),
+                            Some(ctx.internal_funcs),
+                            Some(ctx.contained_host_refs),
+                            Some(ctx.descriptor_params),
+                        ) {
+                            lower_allocatable_char_array_assign_from_desc(
+                                b, dest_desc, src_desc, None,
+                            );
+                            let tmp_stat = b.alloca(IrType::Int(IntWidth::I32));
+                            let zero32 = b.const_i32(0);
+                            b.store(zero32, tmp_stat);
+                            b.call(
+                                FuncRef::External("afs_deallocate_array".into()),
+                                vec![src_desc, tmp_stat],
+                                IrType::Void,
+                            );
+                            return;
+                        }
+                    }
+                }
+            }
         }
         if let Expr::ArrayConstructor { values, .. } = &value.node {
             if array_constructor_contains_array_expr(
