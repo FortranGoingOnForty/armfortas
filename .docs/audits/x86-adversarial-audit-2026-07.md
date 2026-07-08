@@ -1228,3 +1228,29 @@ underneath — self-assignment-family findings were re-confirmed on rebuilds.
   double compile; O2 asm eyeball sane. NOT covered: signal delivery in raw
   mode, controlling-terminal revocation, PTY exhaustion, valgrind, arm64,
   CMake path.
+
+## Post-audit addendum — re-verification sweep at 3c370b05 (2026-07-07)
+
+All 82 repro dirs re-run serially against a clean worktree build of
+`3c370b05` (the `ar-remediation` branch tip advanced during the sweep, so
+findings targeted by later commits must be re-checked against those):
+**7 FIXED, 4 PARTIAL, 71 OPEN.** Fixed: C14 (secpack), charsec,
+strided-r2 reductions, empty reductions, maxloc-nodim, minmaxloc mask/back,
+where-stride — the report's C14/C15-open framing raced the fix wave for
+C14 only. Notable partials: the bounds-remap no-op is fixed but **C15
+(pointer section stride drop) is still OPEN despite commit e8acbfea
+("Preserve pointer section strides")** — the commit did not fix the
+reported shape, and the same stride loss underlies the remap partial;
+`ar2` default-init covers 8/9 paths (**function-result default-init still
+returns n=0**); the FINAL gaps are closed but an **extra finalization now
+fires at program end** (one call more than gfortran — overshoot, needs its
+own look).
+
+New finding from the sweep itself (**D4 candidate**): parallel compiler
+invocations that share an output basename collide on the temp object path
+`/tmp/armfortas_<out>_<hash>.o` — two concurrent `armfortas x.f90 -o t`
+runs cross-contaminated binaries (observed as impossible repro results
+until the sweep was serialized). The hash evidently keys on the output
+name, not the input path/content/pid. Silent wrong-binary under `make -j`
+shapes; needs per-invocation uniqueness (pid + counter) or the object
+placed beside the output.
