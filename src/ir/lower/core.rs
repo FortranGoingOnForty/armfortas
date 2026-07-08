@@ -10626,21 +10626,25 @@ pub(super) fn fixed_char_expr_len(
 ) -> Option<i64> {
     match &expr.node {
         Expr::StringLiteral { value, .. } => Some(value.len() as i64),
-        Expr::Name { name } => locals
-            .get(&name.to_lowercase())
-            .and_then(|info| match info.char_kind {
-                CharKind::Fixed(len) => Some(len),
-                _ => local_fixed_char_allocatable_scalar_len(info),
+        Expr::Name { name } => {
+            let key = name.to_lowercase();
+            if let Some(info) = locals.get(&key) {
+                return match info.char_kind {
+                    CharKind::Fixed(len) => Some(len),
+                    _ => local_fixed_char_allocatable_scalar_len(info),
+                };
+            }
+            let sym = match callee_scope_id_for_lookup(st, b.func().name.as_str())
+                .or_else(current_proc_scope)
+            {
+                Some(scope_id) => st.lookup_in(scope_id, &key),
+                None => st.find_symbol_any_scope(&key),
+            };
+            sym.and_then(|sym| match sym.type_info.as_ref() {
+                Some(crate::sema::symtab::TypeInfo::Character { len: Some(len), .. }) => Some(*len),
+                _ => None,
             })
-            .or_else(|| {
-                st.find_symbol_any_scope(&name.to_lowercase())
-                    .and_then(|sym| match sym.type_info.as_ref() {
-                        Some(crate::sema::symtab::TypeInfo::Character {
-                            len: Some(len), ..
-                        }) => Some(*len),
-                        _ => None,
-                    })
-            }),
+        }
         Expr::ComponentAccess { .. } => {
             let tl = type_layouts?;
             let (_field_ptr, field) = resolve_component_field_access(b, locals, expr, st, tl)?;
