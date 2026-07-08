@@ -564,6 +564,18 @@ fn derived_memory_helper_available_xmodule(
     derived_memory_helper_available_from_current_func(b, layout)
 }
 
+fn derived_layout_identity_key(layout: &crate::sema::type_layout::TypeLayout) -> String {
+    format!(
+        "{}::{}",
+        layout
+            .owner_module
+            .as_deref()
+            .unwrap_or("<local>")
+            .to_lowercase(),
+        layout.name.to_lowercase()
+    )
+}
+
 fn ptr_i8_ty() -> IrType {
     IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)))
 }
@@ -680,7 +692,16 @@ fn emit_derived_dealloc_storage_helper(
         let base = func.params[0].id;
         let stat = func.params[1].id;
         let mut b = FuncBuilder::new(&mut func, module.layout);
-        emit_deallocate_derived_storage_components_inline(&mut b, base, layout, type_layouts, stat);
+        let mut active = HashSet::new();
+        active.insert(derived_layout_identity_key(layout));
+        emit_deallocate_derived_storage_components_inline(
+            &mut b,
+            base,
+            layout,
+            type_layouts,
+            stat,
+            &mut active,
+        );
         b.ret_void();
     }
     finish_helper_function(module, func);
@@ -705,12 +726,15 @@ fn emit_derived_dealloc_descriptor_helper(
         let desc = func.params[0].id;
         let stat = func.params[1].id;
         let mut b = FuncBuilder::new(&mut func, module.layout);
+        let mut active = HashSet::new();
+        active.insert(derived_layout_identity_key(layout));
         emit_deallocate_derived_descriptor_components_inline(
             &mut b,
             desc,
             layout,
             type_layouts,
             stat,
+            &mut active,
         );
         b.ret_void();
     }
@@ -49814,13 +49838,23 @@ pub(super) fn deallocate_derived_descriptor_components(
     registry: &crate::sema::type_layout::TypeLayoutRegistry,
     stat_addr: ValueId,
 ) {
-    if !derived_layout_needs_component_deallocation(layout, registry) {
-        return;
-    }
-    if !derived_memory_helper_available_xmodule(b, layout) {
-        emit_deallocate_derived_descriptor_components_inline(b, desc, layout, registry, stat_addr);
-        return;
-    }
+    let mut active = HashSet::new();
+    deallocate_derived_descriptor_components_guarded(
+        b,
+        desc,
+        layout,
+        registry,
+        stat_addr,
+        &mut active,
+    );
+}
+
+fn call_derived_descriptor_dealloc_helper(
+    b: &mut FuncBuilder,
+    desc: ValueId,
+    layout: &crate::sema::type_layout::TypeLayout,
+    stat_addr: ValueId,
+) {
     let desc_ptr = ptr_i8_value(b, desc);
     b.call(
         FuncRef::External(derived_memory_helper_symbol(
@@ -49832,12 +49866,61 @@ pub(super) fn deallocate_derived_descriptor_components(
     );
 }
 
+fn call_derived_storage_dealloc_helper(
+    b: &mut FuncBuilder,
+    base_addr: ValueId,
+    layout: &crate::sema::type_layout::TypeLayout,
+    stat_addr: ValueId,
+) {
+    let base = ptr_i8_value(b, base_addr);
+    b.call(
+        FuncRef::External(derived_memory_helper_symbol(
+            layout,
+            DerivedMemoryHelperKind::DeallocStorage,
+        )),
+        vec![base, stat_addr],
+        IrType::Void,
+    );
+}
+
+fn deallocate_derived_descriptor_components_guarded(
+    b: &mut FuncBuilder,
+    desc: ValueId,
+    layout: &crate::sema::type_layout::TypeLayout,
+    registry: &crate::sema::type_layout::TypeLayoutRegistry,
+    stat_addr: ValueId,
+    active_types: &mut HashSet<String>,
+) {
+    if !derived_layout_needs_component_deallocation(layout, registry) {
+        return;
+    }
+    if derived_memory_helper_available_xmodule(b, layout) {
+        call_derived_descriptor_dealloc_helper(b, desc, layout, stat_addr);
+        return;
+    }
+    let key = derived_layout_identity_key(layout);
+    if !active_types.insert(key.clone()) {
+        call_derived_descriptor_dealloc_helper(b, desc, layout, stat_addr);
+        return;
+    }
+    emit_deallocate_derived_descriptor_components_inline(
+        b,
+        desc,
+        layout,
+        registry,
+        stat_addr,
+        active_types,
+    );
+    active_types.remove(&key);
+}
+
 fn emit_deallocate_derived_descriptor_components_inline(
     b: &mut FuncBuilder,
     desc: ValueId,
     layout: &crate::sema::type_layout::TypeLayout,
     registry: &crate::sema::type_layout::TypeLayoutRegistry,
     stat_addr: ValueId,
+    active_types: &mut HashSet<String>,
 ) {
     let flags = load_array_desc_i32_field(b, desc, 20);
     let one_i32 = b.const_i32(1);
@@ -49868,7 +49951,14 @@ fn emit_deallocate_derived_descriptor_components_inline(
     let elem_size = b.const_i64(layout.size as i64);
     let elem_off = b.imul(body_idx, elem_size);
     let elem_ptr = b.gep(base, vec![elem_off], IrType::Int(IntWidth::I8));
-    deallocate_derived_storage_components(b, elem_ptr, layout, registry, stat_addr);
+    deallocate_derived_storage_components_guarded(
+        b,
+        elem_ptr,
+        layout,
+        registry,
+        stat_addr,
+        active_types,
+    );
     let one = b.const_i64(1);
     let next_idx = b.iadd(body_idx, one);
     b.branch(bb_check, vec![next_idx]);
@@ -49886,24 +49976,46 @@ pub(super) fn deallocate_derived_storage_components(
     registry: &crate::sema::type_layout::TypeLayoutRegistry,
     stat_addr: ValueId,
 ) {
+    let mut active = HashSet::new();
+    deallocate_derived_storage_components_guarded(
+        b,
+        base_addr,
+        layout,
+        registry,
+        stat_addr,
+        &mut active,
+    );
+}
+
+fn deallocate_derived_storage_components_guarded(
+    b: &mut FuncBuilder,
+    base_addr: ValueId,
+    layout: &crate::sema::type_layout::TypeLayout,
+    registry: &crate::sema::type_layout::TypeLayoutRegistry,
+    stat_addr: ValueId,
+    active_types: &mut HashSet<String>,
+) {
     if !derived_layout_needs_component_deallocation(layout, registry) {
         return;
     }
-    if !derived_memory_helper_available_xmodule(b, layout) {
-        emit_deallocate_derived_storage_components_inline(
-            b, base_addr, layout, registry, stat_addr,
-        );
+    if derived_memory_helper_available_xmodule(b, layout) {
+        call_derived_storage_dealloc_helper(b, base_addr, layout, stat_addr);
         return;
     }
-    let base = ptr_i8_value(b, base_addr);
-    b.call(
-        FuncRef::External(derived_memory_helper_symbol(
-            layout,
-            DerivedMemoryHelperKind::DeallocStorage,
-        )),
-        vec![base, stat_addr],
-        IrType::Void,
+    let key = derived_layout_identity_key(layout);
+    if !active_types.insert(key.clone()) {
+        call_derived_storage_dealloc_helper(b, base_addr, layout, stat_addr);
+        return;
+    }
+    emit_deallocate_derived_storage_components_inline(
+        b,
+        base_addr,
+        layout,
+        registry,
+        stat_addr,
+        active_types,
     );
+    active_types.remove(&key);
 }
 
 fn emit_deallocate_derived_storage_components_inline(
@@ -49912,6 +50024,7 @@ fn emit_deallocate_derived_storage_components_inline(
     layout: &crate::sema::type_layout::TypeLayout,
     registry: &crate::sema::type_layout::TypeLayoutRegistry,
     stat_addr: ValueId,
+    active_types: &mut HashSet<String>,
 ) {
     for field in &layout.fields {
         let offset = b.const_i64(field.offset as i64);
@@ -49929,12 +50042,13 @@ fn emit_deallocate_derived_storage_components_inline(
         if field.allocatable && field.size == 384 {
             if let Some(nested_name) = field_derived_type_name(field) {
                 if let Some(nested_layout) = registry.get(&nested_name) {
-                    deallocate_derived_descriptor_components(
+                    deallocate_derived_descriptor_components_guarded(
                         b,
                         field_ptr,
                         nested_layout,
                         registry,
                         stat_addr,
+                        active_types,
                     );
                 }
             }
@@ -49958,7 +50072,14 @@ fn emit_deallocate_derived_storage_components_inline(
         };
 
         if field.dims.is_empty() {
-            deallocate_derived_storage_components(b, field_ptr, nested_layout, registry, stat_addr);
+            deallocate_derived_storage_components_guarded(
+                b,
+                field_ptr,
+                nested_layout,
+                registry,
+                stat_addr,
+                active_types,
+            );
             continue;
         }
 
@@ -49970,7 +50091,14 @@ fn emit_deallocate_derived_storage_components_inline(
         for idx in 0..elem_count {
             let byte_off = b.const_i64(idx * elem_bytes);
             let elem_ptr = b.gep(field_ptr, vec![byte_off], IrType::Int(IntWidth::I8));
-            deallocate_derived_storage_components(b, elem_ptr, nested_layout, registry, stat_addr);
+            deallocate_derived_storage_components_guarded(
+                b,
+                elem_ptr,
+                nested_layout,
+                registry,
+                stat_addr,
+                active_types,
+            );
         }
     }
 }
