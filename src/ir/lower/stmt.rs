@@ -1245,7 +1245,7 @@ fn lower_format_expr(
             &format!("FORMAT label {} not defined in this scoping unit", label),
         );
     }
-    lower_string_expr_with_layouts(b, &ctx.locals, expr, ctx.st, Some(ctx.type_layouts))
+    lower_string_expr_ctx(b, ctx, expr)
 }
 
 fn inquire_size_storeback_type(
@@ -3685,13 +3685,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 if matches!(&c.value.node, Expr::StringLiteral { .. }) {
                     None
                 } else {
-                    let (p, l) = lower_string_expr_with_layouts(
-                        b,
-                        &ctx.locals,
-                        &c.value,
-                        ctx.st,
-                        Some(ctx.type_layouts),
-                    );
+                    let (p, l) = lower_string_expr_ctx(b, ctx, &c.value);
                     Some(b.call(
                         FuncRef::External("afs_advance_eval".into()),
                         vec![p, l],
@@ -3736,13 +3730,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             let iostat_ptr = iostat_arg_ptr.unwrap_or(null_i8_ptr);
             let (iomsg_arg_ptr, iomsg_ptr, iomsg_len) = if let Some(c) = iomsg_ctrl {
                 let arg_ptr = lower_arg_by_ref_ctx(b, ctx, &c.value);
-                let (ptr, len) = lower_string_expr_with_layouts(
-                    b,
-                    &ctx.locals,
-                    &c.value,
-                    ctx.st,
-                    Some(ctx.type_layouts),
-                );
+                let (ptr, len) = lower_string_expr_ctx(b, ctx, &c.value);
                 (arg_ptr, ptr, len)
             } else {
                 (null_char_slot_arg(b), null_i8_ptr, zero_i64)
@@ -7522,15 +7510,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         .map(|k| k.eq_ignore_ascii_case("file"))
                         .unwrap_or(false)
                 })
-                .map(|s| {
-                    lower_string_expr_with_layouts(
-                        b,
-                        &ctx.locals,
-                        &s.value,
-                        ctx.st,
-                        Some(ctx.type_layouts),
-                    )
-                })
+                .map(|s| lower_string_expr_ctx(b, ctx, &s.value))
                 .unwrap_or_else(|| {
                     let z = b.const_i64(0);
                     (z, z)
@@ -7545,15 +7525,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         .map(|k| k.eq_ignore_ascii_case("status"))
                         .unwrap_or(false)
                 })
-                .map(|s| {
-                    lower_string_expr_with_layouts(
-                        b,
-                        &ctx.locals,
-                        &s.value,
-                        ctx.st,
-                        Some(ctx.type_layouts),
-                    )
-                })
+                .map(|s| lower_string_expr_ctx(b, ctx, &s.value))
                 .unwrap_or_else(|| {
                     let z = b.const_i64(0);
                     (z, z)
@@ -7568,15 +7540,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         .map(|k| k.eq_ignore_ascii_case("action"))
                         .unwrap_or(false)
                 })
-                .map(|s| {
-                    lower_string_expr_with_layouts(
-                        b,
-                        &ctx.locals,
-                        &s.value,
-                        ctx.st,
-                        Some(ctx.type_layouts),
-                    )
-                })
+                .map(|s| lower_string_expr_ctx(b, ctx, &s.value))
                 .unwrap_or_else(|| {
                     let z = b.const_i64(0);
                     (z, z)
@@ -7591,15 +7555,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         .map(|k| k.eq_ignore_ascii_case("access"))
                         .unwrap_or(false)
                 })
-                .map(|s| {
-                    lower_string_expr_with_layouts(
-                        b,
-                        &ctx.locals,
-                        &s.value,
-                        ctx.st,
-                        Some(ctx.type_layouts),
-                    )
-                })
+                .map(|s| lower_string_expr_ctx(b, ctx, &s.value))
                 .unwrap_or_else(|| {
                     let z = b.const_i64(0);
                     (z, z)
@@ -7614,15 +7570,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         .map(|k| k.eq_ignore_ascii_case("form"))
                         .unwrap_or(false)
                 })
-                .map(|s| {
-                    lower_string_expr_with_layouts(
-                        b,
-                        &ctx.locals,
-                        &s.value,
-                        ctx.st,
-                        Some(ctx.type_layouts),
-                    )
-                })
+                .map(|s| lower_string_expr_ctx(b, ctx, &s.value))
                 .unwrap_or_else(|| {
                     let z = b.const_i64(0);
                     (z, z)
@@ -7718,15 +7666,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             .map(|k| k.eq_ignore_ascii_case("position"))
                             .unwrap_or(false)
                     })
-                    .map(|s| {
-                        lower_string_expr_with_layouts(
-                            b,
-                            &ctx.locals,
-                            &s.value,
-                            ctx.st,
-                            Some(ctx.type_layouts),
-                        )
-                    })
+                    .map(|s| lower_string_expr_ctx(b, ctx, &s.value))
                     .unwrap_or_else(|| {
                         let z = b.const_i64(0);
                         (z, z)
@@ -7741,15 +7681,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             .map(|k| k.eq_ignore_ascii_case("leading_zero"))
                             .unwrap_or(false)
                     })
-                    .map(|s| {
-                        lower_string_expr_with_layouts(
-                            b,
-                            &ctx.locals,
-                            &s.value,
-                            ctx.st,
-                            Some(ctx.type_layouts),
-                        )
-                    })
+                    .map(|s| lower_string_expr_ctx(b, ctx, &s.value))
                     .unwrap_or_else(|| {
                         let z = b.const_i64(0);
                         (z, z)
@@ -7880,15 +7812,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 .map(|spec| lower_arg_by_ref_ctx(b, ctx, &spec.value))
                 .unwrap_or(null);
             let (status_ptr, status_len) = status_spec
-                .map(|spec| {
-                    lower_string_expr_with_layouts(
-                        b,
-                        &ctx.locals,
-                        &spec.value,
-                        ctx.st,
-                        Some(ctx.type_layouts),
-                    )
-                })
+                .map(|spec| lower_string_expr_ctx(b, ctx, &spec.value))
                 .unwrap_or_else(|| (null, null));
             b.call(
                 FuncRef::External("afs_close_ex".into()),
@@ -7923,13 +7847,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 if matches!(&c.value.node, Expr::StringLiteral { .. }) {
                     None
                 } else {
-                    let (p, l) = lower_string_expr_with_layouts(
-                        b,
-                        &ctx.locals,
-                        &c.value,
-                        ctx.st,
-                        Some(ctx.type_layouts),
-                    );
+                    let (p, l) = lower_string_expr_ctx(b, ctx, &c.value);
                     Some(b.call(
                         FuncRef::External("afs_advance_eval".into()),
                         vec![p, l],
@@ -8031,13 +7949,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             let zero_iomsg_len = b.const_i64(0);
             let (iomsg_arg_ptr, read_iomsg_ptr, read_iomsg_len) = if let Some(c) = iomsg_ctrl {
                 let arg_ptr = lower_arg_by_ref_ctx(b, ctx, &c.value);
-                let (ptr, len) = lower_string_expr_with_layouts(
-                    b,
-                    &ctx.locals,
-                    &c.value,
-                    ctx.st,
-                    Some(ctx.type_layouts),
-                );
+                let (ptr, len) = lower_string_expr_ctx(b, ctx, &c.value);
                 (arg_ptr, ptr, len)
             } else {
                 (null_char_slot_arg(b), null_iomsg_data, zero_iomsg_len)
@@ -8206,13 +8118,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             };
             let lower_string_spec = |b: &mut FuncBuilder, needle: &str| -> (ValueId, ValueId) {
                 if let Some(spec) = spec_by_keyword(needle) {
-                    lower_string_expr_with_layouts(
-                        b,
-                        &ctx.locals,
-                        &spec.value,
-                        ctx.st,
-                        Some(ctx.type_layouts),
-                    )
+                    lower_string_expr_ctx(b, ctx, &spec.value)
                 } else {
                     (null, zero_len)
                 }
@@ -8260,13 +8166,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             };
 
             if let Some(fs) = file_spec {
-                let (fptr, flen) = lower_string_expr_with_layouts(
-                    b,
-                    &ctx.locals,
-                    &fs.value,
-                    ctx.st,
-                    Some(ctx.type_layouts),
-                );
+                let (fptr, flen) = lower_string_expr_ctx(b, ctx, &fs.value);
                 b.call(
                     FuncRef::External("afs_inquire_file".into()),
                     vec![
