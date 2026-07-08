@@ -1566,15 +1566,40 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     && info.derived_type.is_some()
                                 {
                                     let desc = array_descriptor_addr(b, &info);
-                                    let assign_type_name = if info.is_class {
+                                    let rhs_scalar_desc = if info.is_class {
+                                        match &value.node {
+                                            Expr::Name { name } => ctx
+                                                .locals
+                                                .get(&name.to_lowercase())
+                                                .filter(|src_info| {
+                                                    src_info.is_class
+                                                        && local_uses_array_descriptor(src_info)
+                                                        && local_declared_rank(src_info) == 0
+                                                })
+                                                .map(|src_info| array_descriptor_addr(b, src_info)),
+                                            _ => None,
+                                        }
+                                    } else {
+                                        None
+                                    };
+                                    let dynamic_source_copy_plan = rhs_scalar_desc.and_then(|_| {
+                                        info.derived_type
+                                            .as_ref()
+                                            .map(|base| {
+                                                ScalarAllocSourceCopyPlan::Dynamic(base.clone())
+                                            })
+                                    });
+                                    let assign_type_name = if info.is_class
+                                        && rhs_scalar_desc.is_none()
+                                    {
                                         expr_type_layout(
                                             value,
                                             Some(&ctx.locals),
                                             ctx.st,
                                             ctx.type_layouts,
                                         )
-                                        .filter(|layout| !layout.is_abstract)
-                                        .map(|layout| layout.name.clone())
+                                            .filter(|layout| !layout.is_abstract)
+                                            .map(|layout| layout.name.clone())
                                     } else {
                                         None
                                     }
@@ -1585,8 +1610,29 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         IrType::Int(IntWidth::I32),
                                     );
                                     let zero32 = b.const_i32(0);
+                                    let assign_stat = b.alloca(IrType::Int(IntWidth::I32));
+                                    b.store(zero32, assign_stat);
                                     let needs_alloc = b.icmp(CmpOp::Eq, allocated, zero32);
-                                    let needs_storage_alloc = if info.is_class {
+                                    let needs_storage_alloc = if let Some(source_desc) =
+                                        rhs_scalar_desc
+                                    {
+                                        let current_elem_size =
+                                            load_array_desc_i64_field(b, desc, 8);
+                                        let source_elem_size =
+                                            load_array_desc_i64_field(b, source_desc, 8);
+                                        let size_mismatch = b.icmp(
+                                            CmpOp::Ne,
+                                            current_elem_size,
+                                            source_elem_size,
+                                        );
+                                        let current_tag = load_array_desc_type_tag(b, desc);
+                                        let source_tag = load_array_desc_type_tag(b, source_desc);
+                                        let tag_mismatch =
+                                            b.icmp(CmpOp::Ne, current_tag, source_tag);
+                                        let storage_mismatch =
+                                            b.or(size_mismatch, tag_mismatch);
+                                        b.or(needs_alloc, storage_mismatch)
+                                    } else if info.is_class {
                                         if let Some(ref tn) = assign_type_name {
                                             if let Some(layout) = ctx.type_layouts.get(tn) {
                                                 let current_elem_size =
@@ -1641,17 +1687,23 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     );
 
                                     b.set_block(dealloc_bb);
-                                    let stat = b.alloca(IrType::Int(IntWidth::I32));
-                                    b.store(zero32, stat);
+                                    b.store(zero32, assign_stat);
                                     b.call(
                                         FuncRef::External("afs_deallocate_array".into()),
-                                        vec![desc, stat],
+                                        vec![desc, assign_stat],
                                         IrType::Void,
                                     );
                                     b.branch(do_alloc_bb, vec![]);
 
                                     b.set_block(do_alloc_bb);
-                                    if let Some(ref tn) = assign_type_name {
+                                    if let Some(source_desc) = rhs_scalar_desc {
+                                        b.store(zero32, assign_stat);
+                                        b.call(
+                                            FuncRef::External("afs_allocate_like".into()),
+                                            vec![desc, source_desc, assign_stat],
+                                            IrType::Void,
+                                        );
+                                    } else if let Some(ref tn) = assign_type_name {
                                         if let Some(layout) = ctx.type_layouts.get(tn) {
                                             let elem_size = b.const_i64(layout.size as i64);
                                             let rank_val = b.const_i32(0);
@@ -1683,28 +1735,48 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     b.branch(copy_bb, vec![]);
 
                                     b.set_block(copy_bb);
-                                    let val = super::expr::lower_expr_ctx_tl(b, ctx, value);
-                                    let dest = derived_storage_addr(b, &info);
-                                    if let Some(ref tn) = assign_type_name {
-                                        emit_derived_value_copy(b, ctx.type_layouts, tn, dest, val);
-                                    }
-                                    // Scalar descriptor-backed TYPE allocatables keep their
-                                    // dynamic type identity in the descriptor sidecar, so
-                                    // constructor/function-result assignment must restamp the
-                                    // concrete metadata after copying the value bytes.
-                                    if let Some(tag) = derived_type_tag_value(
-                                        b,
-                                        assign_type_name.as_deref(),
-                                        ctx.type_layouts,
-                                    ) {
-                                        store_array_desc_type_tag(b, desc, tag);
-                                    }
-                                    if let Some(lookup) = derived_type_vtable_value(
-                                        b,
-                                        assign_type_name.as_deref(),
-                                        ctx.type_layouts,
-                                    ) {
-                                        store_array_desc_vtable_ptr(b, desc, lookup);
+                                    if let Some(source_desc) = rhs_scalar_desc {
+                                        emit_allocatable_source_copy_on_success(
+                                            b,
+                                            assign_stat,
+                                            desc,
+                                            source_desc,
+                                            false,
+                                            None,
+                                            dynamic_source_copy_plan.as_ref(),
+                                            ctx.type_layouts,
+                                            None,
+                                        );
+                                    } else {
+                                        let val = super::expr::lower_expr_ctx_tl(b, ctx, value);
+                                        let dest = derived_storage_addr(b, &info);
+                                        if let Some(ref tn) = assign_type_name {
+                                            emit_derived_value_copy(
+                                                b,
+                                                ctx.type_layouts,
+                                                tn,
+                                                dest,
+                                                val,
+                                            );
+                                        }
+                                        // Scalar descriptor-backed TYPE allocatables keep their
+                                        // dynamic type identity in the descriptor sidecar, so
+                                        // constructor/function-result assignment must restamp the
+                                        // concrete metadata after copying the value bytes.
+                                        if let Some(tag) = derived_type_tag_value(
+                                            b,
+                                            assign_type_name.as_deref(),
+                                            ctx.type_layouts,
+                                        ) {
+                                            store_array_desc_type_tag(b, desc, tag);
+                                        }
+                                        if let Some(lookup) = derived_type_vtable_value(
+                                            b,
+                                            assign_type_name.as_deref(),
+                                            ctx.type_layouts,
+                                        ) {
+                                            store_array_desc_vtable_ptr(b, desc, lookup);
+                                        }
                                     }
                                     b.branch(done_bb, vec![]);
                                     b.set_block(done_bb);
