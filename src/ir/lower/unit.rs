@@ -627,7 +627,17 @@ pub(crate) fn lower_unit(
                     ctx.st,
                     type_layouts,
                 );
-                clear_intent_out_allocatable_array_params(&mut b, &param_info, &ctx.locals, decls);
+                clear_intent_out_allocatable_array_params(
+                    &mut b,
+                    &param_info,
+                    &ctx.locals,
+                    decls,
+                    type_layouts,
+                    ctx.st,
+                    ctx.internal_funcs,
+                    Some(ctx.contained_host_refs),
+                    &ctx.locals,
+                );
                 clear_intent_out_deferred_char_params(&mut b, &param_info, &ctx.locals, decls);
                 clear_intent_out_derived_params(
                     &mut b,
@@ -635,6 +645,10 @@ pub(crate) fn lower_unit(
                     &ctx.locals,
                     decls,
                     type_layouts,
+                    ctx.st,
+                    ctx.internal_funcs,
+                    Some(ctx.contained_host_refs),
+                    &ctx.locals,
                 );
 
                 install_common_locals(&mut b, &mut ctx.locals, decls, ctx.st);
@@ -1157,7 +1171,17 @@ pub(crate) fn lower_unit(
                     ctx.st,
                     type_layouts,
                 );
-                clear_intent_out_allocatable_array_params(&mut b, &param_info, &ctx.locals, decls);
+                clear_intent_out_allocatable_array_params(
+                    &mut b,
+                    &param_info,
+                    &ctx.locals,
+                    decls,
+                    type_layouts,
+                    ctx.st,
+                    ctx.internal_funcs,
+                    Some(ctx.contained_host_refs),
+                    &ctx.locals,
+                );
                 clear_intent_out_deferred_char_params(&mut b, &param_info, &ctx.locals, decls);
                 clear_intent_out_derived_params(
                     &mut b,
@@ -1165,6 +1189,10 @@ pub(crate) fn lower_unit(
                     &ctx.locals,
                     decls,
                     type_layouts,
+                    ctx.st,
+                    ctx.internal_funcs,
+                    Some(ctx.contained_host_refs),
+                    &ctx.locals,
                 );
 
                 let result_name = result.as_deref().unwrap_or(name.as_str()).to_lowercase();

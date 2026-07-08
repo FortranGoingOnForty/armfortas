@@ -79,6 +79,69 @@ fn emit_scalar_class_star_char_source_copy_on_success(
     b.set_block(done_bb);
 }
 
+fn finalize_assignment_lhs(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    type_name: &str,
+    dest: ValueId,
+) {
+    if let Some(layout) = ctx.type_layouts.get(type_name) {
+        finalize_derived_storage(
+            b,
+            ctx.st,
+            ctx.internal_funcs,
+            Some(ctx.contained_host_refs),
+            &ctx.locals,
+            layout,
+            dest,
+        );
+    }
+}
+
+fn stabilize_finalized_assignment_rhs(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    type_name: &str,
+    rhs: ValueId,
+) -> ValueId {
+    if ctx
+        .type_layouts
+        .get(type_name)
+        .is_some_and(|layout| !layout.final_procs.is_empty())
+    {
+        stabilize_derived_call_result(b, ctx.type_layouts, type_name, rhs)
+    } else {
+        rhs
+    }
+}
+
+fn finalizable_function_result_type_name(
+    ctx: &LowerCtx,
+    expr: &SpannedExpr,
+) -> Option<String> {
+    let Expr::FunctionCall { callee, .. } = &expr.node else {
+        return None;
+    };
+    let Expr::Name { name } = &callee.node else {
+        return None;
+    };
+    let key = name.to_lowercase();
+    let abi_lookup_keys =
+        procedure_abi_lookup_keys_for_call_target(ctx.st, name.as_str(), &[&key]);
+    let hidden_abi =
+        first_procedure_lookup(&abi_lookup_keys, |k| callee_hidden_result_abi(ctx.st, k))?;
+    if hidden_abi != HiddenResultAbi::DerivedAggregate {
+        return None;
+    }
+    let type_name = first_procedure_lookup(&abi_lookup_keys, |k| {
+        callee_return_stabilized_derived_type_name(ctx.st, k)
+    })?;
+    ctx.type_layouts
+        .get(&type_name)
+        .filter(|layout| !layout.final_procs.is_empty())
+        .map(|layout| layout.name.clone())
+}
+
 pub(crate) fn lower_stmts(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmts: &[SpannedStmt]) {
     for stmt in stmts {
         // Labeled statements and labeled CONTINUEs create new basic blocks; they must be
@@ -1722,14 +1785,28 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     } else {
                                         needs_alloc
                                     };
+                                    let rhs_result_temp_type =
+                                        finalizable_function_result_type_name(ctx, value);
+                                    let rhs_scalar_value = if rhs_scalar_desc.is_none() {
+                                        let raw = super::expr::lower_expr_ctx_tl(b, ctx, value);
+                                        Some(if let Some(ref tn) = assign_type_name {
+                                            stabilize_finalized_assignment_rhs(b, ctx, tn, raw)
+                                        } else {
+                                            raw
+                                        })
+                                    } else {
+                                        None
+                                    };
                                     let alloc_bb = b.create_block("scalar_derived_assign_alloc");
+                                    let finalize_existing_bb =
+                                        b.create_block("scalar_derived_assign_finalize");
                                     let copy_bb = b.create_block("scalar_derived_assign_copy");
                                     let done_bb = b.create_block("scalar_derived_assign_done");
                                     b.cond_branch(
                                         needs_storage_alloc,
                                         alloc_bb,
                                         vec![],
-                                        copy_bb,
+                                        finalize_existing_bb,
                                         vec![],
                                     );
 
@@ -1748,6 +1825,19 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     );
 
                                     b.set_block(dealloc_bb);
+                                    if let Some(type_name) = info.derived_type.as_ref() {
+                                        if let Some(layout) = ctx.type_layouts.get(type_name) {
+                                            finalize_derived_descriptor_storage_if_allocated(
+                                                b,
+                                                ctx.st,
+                                                ctx.internal_funcs,
+                                                Some(ctx.contained_host_refs),
+                                                &ctx.locals,
+                                                desc,
+                                                layout,
+                                            );
+                                        }
+                                    }
                                     b.store(zero32, assign_stat);
                                     b.call(
                                         FuncRef::External("afs_deallocate_array".into()),
@@ -1795,6 +1885,22 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     }
                                     b.branch(copy_bb, vec![]);
 
+                                    b.set_block(finalize_existing_bb);
+                                    if let Some(type_name) = info.derived_type.as_ref() {
+                                        if let Some(layout) = ctx.type_layouts.get(type_name) {
+                                            finalize_derived_descriptor_storage_if_allocated(
+                                                b,
+                                                ctx.st,
+                                                ctx.internal_funcs,
+                                                Some(ctx.contained_host_refs),
+                                                &ctx.locals,
+                                                desc,
+                                                layout,
+                                            );
+                                        }
+                                    }
+                                    b.branch(copy_bb, vec![]);
+
                                     b.set_block(copy_bb);
                                     if let Some(source_desc) = rhs_scalar_desc {
                                         emit_allocatable_source_copy_on_success(
@@ -1809,7 +1915,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                             None,
                                         );
                                     } else {
-                                        let val = super::expr::lower_expr_ctx_tl(b, ctx, value);
+                                        let val = rhs_scalar_value.expect(
+                                            "scalar derived assignment value lowered before branch",
+                                        );
                                         let dest = derived_storage_addr(b, &info);
                                         if let Some(ref tn) = assign_type_name {
                                             emit_derived_value_copy(
@@ -1819,6 +1927,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                 dest,
                                                 val,
                                             );
+                                        }
+                                        if let Some(ref temp_type) = rhs_result_temp_type {
+                                            finalize_assignment_lhs(b, ctx, temp_type, val);
                                         }
                                         // Scalar descriptor-backed TYPE allocatables keep their
                                         // dynamic type identity in the descriptor sidecar, so
@@ -2414,10 +2525,18 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         lower_array_assign(b, ctx, name, &info, value);
                                     }
                                 } else if info.derived_type.is_some() {
+                                    let result_temp_type =
+                                        finalizable_function_result_type_name(ctx, value);
                                     let val = super::expr::lower_expr_ctx_tl(b, ctx, value);
                                     let dest = derived_storage_addr(b, &info);
                                     if let Some(ref tn) = info.derived_type {
+                                        let val =
+                                            stabilize_finalized_assignment_rhs(b, ctx, tn, val);
+                                        finalize_assignment_lhs(b, ctx, tn, dest);
                                         emit_derived_value_copy(b, ctx.type_layouts, tn, dest, val);
+                                        if let Some(ref temp_type) = result_temp_type {
+                                            finalize_assignment_lhs(b, ctx, temp_type, val);
+                                        }
                                     }
                                 } else if info.is_pointer {
                                     // Plain `=` on a POINTER dereferences:
@@ -3252,8 +3371,17 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     && !field.allocatable
                                     && field.dims.is_empty()
                                 {
+                                    let result_temp_type =
+                                        finalizable_function_result_type_name(ctx, value);
                                     let src_ptr = super::expr::lower_expr_ctx_tl(b, ctx, value);
                                     if let Some(nested_name) = field_derived_type_name(&field) {
+                                        let src_ptr = stabilize_finalized_assignment_rhs(
+                                            b,
+                                            ctx,
+                                            &nested_name,
+                                            src_ptr,
+                                        );
+                                        finalize_assignment_lhs(b, ctx, &nested_name, field_ptr);
                                         emit_derived_value_copy(
                                             b,
                                             ctx.type_layouts,
@@ -3261,6 +3389,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                             field_ptr,
                                             src_ptr,
                                         );
+                                        if let Some(ref temp_type) = result_temp_type {
+                                            finalize_assignment_lhs(b, ctx, temp_type, src_ptr);
+                                        }
                                     }
                                 } else if is_complex_ty(&type_info_to_ir_type(&field.type_info))
                                     && !field.pointer

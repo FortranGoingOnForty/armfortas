@@ -22704,6 +22704,10 @@ pub(super) fn clear_intent_out_derived_params(
     locals: &HashMap<String, LocalInfo>,
     decls: &[crate::ast::decl::SpannedDecl],
     type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+    st: &SymbolTable,
+    internal_funcs: &HashMap<String, u32>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    closure_locals: &HashMap<String, LocalInfo>,
 ) {
     let mut stat_addr: Option<ValueId> = None;
 
@@ -22754,6 +22758,16 @@ pub(super) fn clear_intent_out_derived_params(
             let storage = derived_storage_addr(b, info);
             if is_array_dummy {
                 let elem_count = array_total_elems_value(b, info);
+                finalize_derived_array_storage_dynamic(
+                    b,
+                    st,
+                    internal_funcs,
+                    contained_host_refs,
+                    closure_locals,
+                    layout,
+                    storage,
+                    elem_count,
+                );
                 clear_derived_array_storage_for_intent_out_dynamic(
                     b,
                     storage,
@@ -22763,6 +22777,15 @@ pub(super) fn clear_intent_out_derived_params(
                     stat,
                 );
             } else {
+                finalize_derived_storage(
+                    b,
+                    st,
+                    internal_funcs,
+                    contained_host_refs,
+                    closure_locals,
+                    layout,
+                    storage,
+                );
                 clear_derived_storage_for_intent_out(b, storage, layout, type_layouts, stat);
             }
             b.branch(bb_skip, vec![]);
@@ -22774,6 +22797,16 @@ pub(super) fn clear_intent_out_derived_params(
         let storage = derived_storage_addr(b, info);
         if is_array_dummy {
             let elem_count = array_total_elems_value(b, info);
+            finalize_derived_array_storage_dynamic(
+                b,
+                st,
+                internal_funcs,
+                contained_host_refs,
+                closure_locals,
+                layout,
+                storage,
+                elem_count,
+            );
             clear_derived_array_storage_for_intent_out_dynamic(
                 b,
                 storage,
@@ -22783,6 +22816,15 @@ pub(super) fn clear_intent_out_derived_params(
                 stat,
             );
         } else {
+            finalize_derived_storage(
+                b,
+                st,
+                internal_funcs,
+                contained_host_refs,
+                closure_locals,
+                layout,
+                storage,
+            );
             clear_derived_storage_for_intent_out(b, storage, layout, type_layouts, stat);
         }
     }
@@ -22793,6 +22835,11 @@ pub(super) fn clear_intent_out_allocatable_array_params(
     param_info: &[(String, ValueId, IrType, bool)],
     locals: &HashMap<String, LocalInfo>,
     decls: &[crate::ast::decl::SpannedDecl],
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+    st: &SymbolTable,
+    internal_funcs: &HashMap<String, u32>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    closure_locals: &HashMap<String, LocalInfo>,
 ) {
     let mut stat_addr: Option<ValueId> = None;
 
@@ -22829,6 +22876,19 @@ pub(super) fn clear_intent_out_allocatable_array_params(
 
             b.set_block(bb_clear);
             let desc = array_descriptor_addr(b, info);
+            if let Some(type_name) = info.derived_type.as_ref() {
+                if let Some(layout) = type_layouts.get(type_name) {
+                    finalize_derived_descriptor_storage_if_allocated(
+                        b,
+                        st,
+                        internal_funcs,
+                        contained_host_refs,
+                        closure_locals,
+                        desc,
+                        layout,
+                    );
+                }
+            }
             b.call(
                 FuncRef::External("afs_deallocate_array".into()),
                 vec![desc, stat],
@@ -22841,6 +22901,19 @@ pub(super) fn clear_intent_out_allocatable_array_params(
         }
 
         let desc = array_descriptor_addr(b, info);
+        if let Some(type_name) = info.derived_type.as_ref() {
+            if let Some(layout) = type_layouts.get(type_name) {
+                finalize_derived_descriptor_storage_if_allocated(
+                    b,
+                    st,
+                    internal_funcs,
+                    contained_host_refs,
+                    closure_locals,
+                    desc,
+                    layout,
+                );
+            }
+        }
         b.call(
             FuncRef::External("afs_deallocate_array".into()),
             vec![desc, stat],
@@ -25834,6 +25907,119 @@ pub(super) fn emit_final_proc_call(
     b.call(func_ref, call_args, IrType::Void);
 }
 
+pub(super) fn finalize_derived_storage(
+    b: &mut FuncBuilder,
+    st: &SymbolTable,
+    internal_funcs: &HashMap<String, u32>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    closure_locals: &HashMap<String, LocalInfo>,
+    layout: &crate::sema::type_layout::TypeLayout,
+    finalized_addr: ValueId,
+) {
+    for final_proc in &layout.final_procs {
+        emit_final_proc_call(
+            b,
+            st,
+            internal_funcs,
+            contained_host_refs,
+            closure_locals,
+            final_proc,
+            finalized_addr,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn finalize_derived_array_storage_dynamic(
+    b: &mut FuncBuilder,
+    st: &SymbolTable,
+    internal_funcs: &HashMap<String, u32>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    closure_locals: &HashMap<String, LocalInfo>,
+    layout: &crate::sema::type_layout::TypeLayout,
+    base_addr: ValueId,
+    elem_count: ValueId,
+) {
+    if layout.final_procs.is_empty() {
+        return;
+    }
+
+    let zero = b.const_i64(0);
+    let bb_check = b.create_block("derived_array_final_check");
+    let idx = b.add_block_param(bb_check, IrType::Int(IntWidth::I64));
+    let bb_body = b.create_block("derived_array_final_body");
+    let body_idx = b.add_block_param(bb_body, IrType::Int(IntWidth::I64));
+    let bb_exit = b.create_block("derived_array_final_exit");
+    b.branch(bb_check, vec![zero]);
+
+    b.set_block(bb_check);
+    let done = b.icmp(CmpOp::Ge, idx, elem_count);
+    b.cond_branch(done, bb_exit, vec![], bb_body, vec![idx]);
+
+    b.set_block(bb_body);
+    let elem_bytes = b.const_i64(layout.size as i64);
+    let byte_off = b.imul(body_idx, elem_bytes);
+    let elem_ptr = b.gep(base_addr, vec![byte_off], IrType::Int(IntWidth::I8));
+    finalize_derived_storage(
+        b,
+        st,
+        internal_funcs,
+        contained_host_refs,
+        closure_locals,
+        layout,
+        elem_ptr,
+    );
+
+    let one = b.const_i64(1);
+    let next_idx = b.iadd(body_idx, one);
+    b.branch(bb_check, vec![next_idx]);
+
+    b.set_block(bb_exit);
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn finalize_derived_descriptor_storage_if_allocated(
+    b: &mut FuncBuilder,
+    st: &SymbolTable,
+    internal_funcs: &HashMap<String, u32>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    closure_locals: &HashMap<String, LocalInfo>,
+    desc: ValueId,
+    layout: &crate::sema::type_layout::TypeLayout,
+) {
+    if layout.final_procs.is_empty() {
+        return;
+    }
+
+    let allocated = b.call(
+        FuncRef::External("afs_allocated".into()),
+        vec![desc],
+        IrType::Int(IntWidth::I32),
+    );
+    let zero_i32 = b.const_i32(0);
+    let is_allocated = b.icmp(CmpOp::Ne, allocated, zero_i32);
+    let bb_final = b.create_block("derived_desc_final_present");
+    let bb_done = b.create_block("derived_desc_final_done");
+    b.cond_branch(is_allocated, bb_final, vec![], bb_done, vec![]);
+
+    b.set_block(bb_final);
+    let elem_count = array_descriptor_total_elements_dynamic(b, desc);
+    let base = b.load_typed(desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    finalize_derived_array_storage_dynamic(
+        b,
+        st,
+        internal_funcs,
+        contained_host_refs,
+        closure_locals,
+        layout,
+        base,
+        elem_count,
+    );
+    b.branch(bb_done, vec![]);
+
+    b.set_block(bb_done);
+}
+
 pub(super) fn insert_implicit_dealloc(
     b: &mut FuncBuilder,
     owned_locals: &HashMap<String, LocalInfo>,
@@ -25940,17 +26126,15 @@ pub(super) fn insert_implicit_dealloc(
         if !info.by_ref {
             if let Some(ref type_name) = info.derived_type {
                 if let Some(layout) = type_layouts.get(type_name) {
-                    for final_proc in &layout.final_procs {
-                        emit_final_proc_call(
-                            b,
-                            st,
-                            internal_funcs,
-                            contained_host_refs,
-                            closure_locals,
-                            final_proc,
-                            info.addr,
-                        );
-                    }
+                    finalize_derived_storage(
+                        b,
+                        st,
+                        internal_funcs,
+                        contained_host_refs,
+                        closure_locals,
+                        layout,
+                        info.addr,
+                    );
                 }
             }
         }
