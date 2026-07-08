@@ -7,8 +7,9 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 
-use crate::ast::expr::{Expr, SpannedExpr};
+use crate::ast::expr::{Argument, Expr, SectionSubscript, SpannedExpr};
 use crate::ast::stmt::*;
+use crate::ast::Spanned;
 use crate::ir::builder::FuncBuilder;
 use crate::ir::inst::*;
 use crate::ir::types::*;
@@ -150,6 +151,210 @@ fn finish_where_mask_values(b: &mut FuncBuilder, masks: &[&WhereMaskValue]) {
             deallocate_array_temp_descriptor(b, *desc);
         }
     }
+}
+
+fn simple_array_element_designator(
+    expr: &SpannedExpr,
+) -> Option<(String, Vec<Argument>, crate::lexer::Span)> {
+    let Expr::FunctionCall { callee, args } = &expr.node else {
+        return None;
+    };
+    let Expr::Name { name } = &callee.node else {
+        return None;
+    };
+    if args
+        .iter()
+        .any(|arg| !matches!(arg.value, SectionSubscript::Element(_)))
+    {
+        return None;
+    }
+    Some((name.to_lowercase(), args.clone(), expr.span))
+}
+
+fn synth_array_element_expr(
+    array_name: &str,
+    args: &[Argument],
+    span: crate::lexer::Span,
+) -> SpannedExpr {
+    Spanned::new(
+        Expr::FunctionCall {
+            callee: Box::new(synth_name_expr(array_name, span)),
+            args: args.to_vec(),
+        },
+        span,
+    )
+}
+
+fn forall_temp_supported_element(info: &LocalInfo) -> bool {
+    info.char_kind == CharKind::None && info.derived_type.is_none()
+}
+
+fn insert_forall_temp_local(
+    ctx: &mut LowerCtx,
+    name: String,
+    desc: ValueId,
+    ty: IrType,
+    rank: usize,
+    logical_kind: Option<u8>,
+) {
+    ctx.locals.insert(
+        name,
+        LocalInfo {
+            addr: desc,
+            ty,
+            dims: vec![(1, 0); rank],
+            allocatable: false,
+            descriptor_arg: true,
+            by_ref: false,
+            char_kind: CharKind::None,
+            derived_type: None,
+            inline_const: None,
+            is_pointer: false,
+            runtime_dim_upper: vec![],
+            is_class: false,
+            logical_kind,
+            last_dim_assumed_size: false,
+        },
+    );
+}
+
+fn try_lower_forall_assignment_with_temp(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    specs: &[ForallSpec],
+    mask: Option<&SpannedExpr>,
+    body: &[SpannedStmt],
+) -> bool {
+    if specs.is_empty() || body.len() != 1 {
+        return false;
+    }
+
+    let Stmt::Assignment { target, value } = &body[0].node else {
+        return false;
+    };
+    let Some((target_name, target_args, target_span)) = simple_array_element_designator(target)
+    else {
+        return false;
+    };
+    let Some(target_info) = ctx.locals.get(&target_name).cloned() else {
+        return false;
+    };
+    if !local_is_array_like(&target_info) || !forall_temp_supported_element(&target_info) {
+        return false;
+    }
+    let rank = local_declared_rank(&target_info).max(target_args.len());
+    if rank == 0 || target_args.len() != rank {
+        return false;
+    }
+
+    let source_desc = if local_uses_array_descriptor(&target_info) {
+        array_descriptor_addr(b, &target_info)
+    } else {
+        materialize_array_descriptor_for_info(b, &target_info)
+    };
+    let value_desc =
+        allocate_like_array_temp_descriptor_with_elem_type(b, source_desc, &target_info.ty);
+    let value_temp_name = fresh_elemental_temp_name(&ctx.locals, "afs_forall_value", 0);
+    insert_forall_temp_local(
+        ctx,
+        value_temp_name.clone(),
+        value_desc,
+        target_info.ty.clone(),
+        rank,
+        target_info.logical_kind,
+    );
+
+    let mut temps_to_remove = vec![value_temp_name.clone()];
+    let mut temps_to_deallocate = vec![value_desc];
+
+    let value_temp_target = synth_array_element_expr(&value_temp_name, &target_args, target_span);
+    let fill_value_stmt = Spanned::new(
+        Stmt::Assignment {
+            target: value_temp_target.clone(),
+            value: value.clone(),
+        },
+        body[0].span,
+    );
+
+    if let Some(mask_expr) = mask {
+        let mask_desc =
+            allocate_like_array_temp_descriptor_with_elem_type(b, source_desc, &IrType::Bool);
+        let mask_temp_name = fresh_elemental_temp_name(&ctx.locals, "afs_forall_active", 1);
+        insert_forall_temp_local(
+            ctx,
+            mask_temp_name.clone(),
+            mask_desc,
+            IrType::Bool,
+            rank,
+            None,
+        );
+        temps_to_remove.push(mask_temp_name.clone());
+        temps_to_deallocate.push(mask_desc);
+
+        let mask_temp_target = synth_array_element_expr(&mask_temp_name, &target_args, target_span);
+        let save_mask_stmt = Spanned::new(
+            Stmt::Assignment {
+                target: mask_temp_target.clone(),
+                value: mask_expr.clone(),
+            },
+            mask_expr.span,
+        );
+        let fill_guard_stmt = Spanned::new(
+            Stmt::IfConstruct {
+                name: None,
+                condition: mask_expr.clone(),
+                then_body: vec![fill_value_stmt],
+                else_ifs: vec![],
+                else_body: None,
+            },
+            mask_expr.span,
+        );
+        let first_pass = vec![save_mask_stmt, fill_guard_stmt];
+        lower_forall_nested(b, ctx, specs, None, &first_pass);
+
+        let replay_value = synth_array_element_expr(&value_temp_name, &target_args, target_span);
+        let replay_assignment = Spanned::new(
+            Stmt::Assignment {
+                target: target.clone(),
+                value: replay_value,
+            },
+            body[0].span,
+        );
+        let replay_guard = Spanned::new(
+            Stmt::IfConstruct {
+                name: None,
+                condition: mask_temp_target,
+                then_body: vec![replay_assignment],
+                else_ifs: vec![],
+                else_body: None,
+            },
+            mask_expr.span,
+        );
+        let second_pass = vec![replay_guard];
+        lower_forall_nested(b, ctx, specs, None, &second_pass);
+    } else {
+        let first_pass = vec![fill_value_stmt];
+        lower_forall_nested(b, ctx, specs, None, &first_pass);
+
+        let replay_value = synth_array_element_expr(&value_temp_name, &target_args, target_span);
+        let replay_assignment = Spanned::new(
+            Stmt::Assignment {
+                target: target.clone(),
+                value: replay_value,
+            },
+            body[0].span,
+        );
+        let second_pass = vec![replay_assignment];
+        lower_forall_nested(b, ctx, specs, None, &second_pass);
+    }
+
+    for desc in temps_to_deallocate {
+        deallocate_array_temp_descriptor(b, desc);
+    }
+    for name in temps_to_remove {
+        ctx.locals.remove(&name);
+    }
+    true
 }
 
 fn lower_where_section_temp(
@@ -5090,6 +5295,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
         Stmt::ForallConstruct {
             specs, mask, body, ..
         } => {
+            if try_lower_forall_assignment_with_temp(b, ctx, specs, mask.as_ref(), body) {
+                return;
+            }
             // FORALL: nest loops. The body goes inside the innermost loop.
             // Build the body statements including optional mask as a closure-like pattern.
             // The innermost loop gets the real body; outer loops wrap it.
@@ -5098,6 +5306,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
 
         Stmt::ForallStmt { specs, mask, stmt } => {
             let body_vec = vec![(**stmt).clone()];
+            if try_lower_forall_assignment_with_temp(b, ctx, specs, mask.as_ref(), &body_vec) {
+                return;
+            }
             lower_forall_nested(b, ctx, specs, mask.as_ref(), &body_vec);
         }
 
