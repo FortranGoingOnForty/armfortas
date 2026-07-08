@@ -36672,6 +36672,22 @@ pub(super) fn expr_mentions_name(expr: &crate::ast::expr::SpannedExpr, needle: &
     }
 }
 
+fn call_args_mention_name(args: &[crate::ast::expr::Argument], needle: &str) -> bool {
+    !needle.is_empty()
+        && args.iter().any(|arg| match &arg.value {
+            crate::ast::expr::SectionSubscript::Element(e) => expr_mentions_name(e, needle),
+            crate::ast::expr::SectionSubscript::Range { start, end, stride } => {
+                start
+                    .as_ref()
+                    .is_some_and(|e| expr_mentions_name(e, needle))
+                    || end.as_ref().is_some_and(|e| expr_mentions_name(e, needle))
+                    || stride
+                        .as_ref()
+                        .is_some_and(|e| expr_mentions_name(e, needle))
+            }
+        })
+}
+
 pub(super) fn expr_is_size_of_array(
     expr: &crate::ast::expr::SpannedExpr,
     array_name: &str,
@@ -42440,6 +42456,18 @@ pub(super) fn allocate_like_array_temp_descriptor(
     desc
 }
 
+fn zeroed_array_temp_descriptor(b: &mut FuncBuilder) -> ValueId {
+    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let zero32 = b.const_i32(0);
+    let sz384 = b.const_i64(384);
+    b.call(
+        FuncRef::External("memset".into()),
+        vec![desc, zero32, sz384],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+    desc
+}
+
 pub(super) fn allocate_like_array_temp_descriptor_with_elem_type(
     b: &mut FuncBuilder,
     source_desc: ValueId,
@@ -46729,14 +46757,34 @@ pub(super) fn lower_array_assign(
                 if ctx.alloc_return_funcs.contains(&callee_key)
                     || ctx.alloc_return_funcs.contains(&resolved_key)
                 {
+                    let call_mentions_dest = call_args_mention_name(call_args, dest_name);
                     if descriptor_backed_char_array(dest_info) {
-                        lower_alloc_return_call_into_desc(
-                            b,
-                            ctx,
-                            dest_desc,
-                            callee_name,
-                            call_args,
-                        );
+                        if call_mentions_dest {
+                            let tmp_desc = zeroed_array_temp_descriptor(b);
+                            lower_alloc_return_call_into_desc(
+                                b,
+                                ctx,
+                                tmp_desc,
+                                callee_name,
+                                call_args,
+                            );
+                            let dest_elem_len = fixed_char_allocatable_array_elem_len(b, dest_info);
+                            lower_allocatable_char_array_assign_from_desc(
+                                b,
+                                dest_desc,
+                                tmp_desc,
+                                dest_elem_len,
+                            );
+                            deallocate_array_temp_descriptor(b, tmp_desc);
+                        } else {
+                            lower_alloc_return_call_into_desc(
+                                b,
+                                ctx,
+                                dest_desc,
+                                callee_name,
+                                call_args,
+                            );
+                        }
                         return;
                     }
                     let result_elem_ty = array_function_result_elem_type(
@@ -46789,7 +46837,24 @@ pub(super) fn lower_array_assign(
                             return;
                         }
                     }
-                    lower_alloc_return_call_into_desc(b, ctx, dest_desc, callee_name, call_args);
+                    if call_mentions_dest {
+                        let tmp_desc = zeroed_array_temp_descriptor(b);
+                        lower_alloc_return_call_into_desc(b, ctx, tmp_desc, callee_name, call_args);
+                        b.call(
+                            FuncRef::External("afs_assign_allocatable".into()),
+                            vec![dest_desc, tmp_desc],
+                            IrType::Void,
+                        );
+                        deallocate_array_temp_descriptor(b, tmp_desc);
+                    } else {
+                        lower_alloc_return_call_into_desc(
+                            b,
+                            ctx,
+                            dest_desc,
+                            callee_name,
+                            call_args,
+                        );
+                    }
                     return;
                 }
             }
