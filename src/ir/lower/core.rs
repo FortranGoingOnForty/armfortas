@@ -6794,6 +6794,24 @@ pub(super) fn apply_field_default_init_const_bytes(
             bytes[field_offset..end].copy_from_slice(&encoded);
             true
         }
+        crate::sema::type_layout::FieldDefaultInit::Real(value) => {
+            let ir_ty = type_info_to_ir_type(&field.type_info);
+            let ConstScalar::Float(value) =
+                clamp_const_to_type(ConstScalar::Float(*value), &ir_ty)
+            else {
+                return false;
+            };
+            let IrType::Float(width) = ir_ty else {
+                return false;
+            };
+            let encoded = encode_const_float_bytes(value, width);
+            let end = field_offset + encoded.len();
+            if end > bytes.len() {
+                return false;
+            }
+            bytes[field_offset..end].copy_from_slice(&encoded);
+            true
+        }
         crate::sema::type_layout::FieldDefaultInit::Derived(overrides) => {
             let Some(nested_name) = field_derived_type_name(field) else {
                 return false;
@@ -33235,6 +33253,14 @@ pub(super) fn lower_parameter_derived_component_const(
                 &ir_ty,
             ))
         }
+        crate::sema::type_layout::FieldDefaultInit::Real(value) => {
+            let ir_ty = type_info_to_ir_type(&field.type_info);
+            Some(materialize_const_scalar(
+                b,
+                clamp_const_to_type(ConstScalar::Float(*value), &ir_ty),
+                &ir_ty,
+            ))
+        }
         crate::sema::type_layout::FieldDefaultInit::Character(value) => {
             Some(b.const_string(value.as_bytes()))
         }
@@ -49778,6 +49804,15 @@ pub(super) fn apply_field_default_init_runtime(
             let raw = materialize_const_scalar(
                 b,
                 clamp_const_to_type(ConstScalar::Int(if *value { 1 } else { 0 }), &field_ty),
+                &field_ty,
+            );
+            b.store(raw, field_ptr);
+        }
+        crate::sema::type_layout::FieldDefaultInit::Real(value) => {
+            let field_ty = type_info_to_ir_type(&field.type_info);
+            let raw = materialize_const_scalar(
+                b,
+                clamp_const_to_type(ConstScalar::Float(*value), &field_ty),
                 &field_ty,
             );
             b.store(raw, field_ptr);

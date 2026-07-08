@@ -133,6 +133,7 @@ fn encode_nested_field_default_init(init: &crate::sema::type_layout::FieldDefaul
         FieldDefaultInit::Character(value) => format!("C{}", hex_encode_bytes(value.as_bytes())),
         FieldDefaultInit::Integer(value) => format!("I{}", value),
         FieldDefaultInit::Logical(value) => format!("L{}", if *value { '1' } else { '0' }),
+        FieldDefaultInit::Real(value) => format!("R{:016x}", value.to_bits()),
         FieldDefaultInit::Derived(fields) => {
             let rendered = fields
                 .iter()
@@ -191,6 +192,12 @@ fn decode_nested_field_default_init(
             "0" => Some(FieldDefaultInit::Logical(false)),
             _ => None,
         };
+    }
+    if let Some(value) = encoded.strip_prefix('R') {
+        return u64::from_str_radix(value, 16)
+            .ok()
+            .map(f64::from_bits)
+            .map(FieldDefaultInit::Real);
     }
     if let Some(value) = encoded.strip_prefix("D(").and_then(|s| s.strip_suffix(')')) {
         let mut fields = Vec::new();
@@ -1267,6 +1274,9 @@ fn emit_type(out: &mut String, name: &str, type_layouts: &TypeLayoutRegistry) {
                 crate::sema::type_layout::FieldDefaultInit::Logical(value) => {
                     format!(" @init=logical:{}", if *value { "true" } else { "false" })
                 }
+                crate::sema::type_layout::FieldDefaultInit::Real(value) => {
+                    format!(" @init=realbits:{:016x}", value.to_bits())
+                }
                 crate::sema::type_layout::FieldDefaultInit::Derived(_) => {
                     let encoded = encode_nested_field_default_init(init);
                     format!(" @init=exprhex:{}", hex_encode_bytes(encoded.as_bytes()))
@@ -2099,6 +2109,12 @@ fn parse_type(
                 "false" => Some(FieldDefaultInit::Logical(false)),
                 _ => None,
             };
+        }
+        if let Some(value) = payload.strip_prefix("realbits:") {
+            return u64::from_str_radix(value, 16)
+                .ok()
+                .map(f64::from_bits)
+                .map(FieldDefaultInit::Real);
         }
         if let Some(value) = payload.strip_prefix("charhex:") {
             let decoded = String::from_utf8(hex_decode_bytes(value)?).ok()?;

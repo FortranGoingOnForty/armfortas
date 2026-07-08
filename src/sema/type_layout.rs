@@ -29,6 +29,7 @@ pub enum FieldDefaultInit {
     Character(String),
     Integer(i128),
     Logical(bool),
+    Real(f64),
     Derived(Vec<(String, FieldDefaultInit)>),
     /// Procedure pointer initial association from a derived-type
     /// component declared as `procedure(iface), pointer :: name =>
@@ -459,6 +460,60 @@ fn eval_const_field_logical_expr(
     }
 }
 
+fn eval_const_field_real_expr(
+    expr: &crate::ast::expr::SpannedExpr,
+    const_params: &HashMap<String, i64>,
+    const_derived_field_inits: &HashMap<String, FieldDefaultInit>,
+) -> Option<f64> {
+    use crate::ast::expr::Expr;
+    match &expr.node {
+        Expr::RealLiteral { text, .. } => text
+            .replace('d', "e")
+            .replace('D', "E")
+            .split('_')
+            .next()
+            .unwrap_or(text)
+            .parse::<f64>()
+            .ok(),
+        Expr::IntegerLiteral { .. } => eval_const_int_expr(expr, const_params).map(|v| v as f64),
+        Expr::Name { name } => const_params.get(&name.to_lowercase()).map(|v| *v as f64),
+        Expr::ComponentAccess { base, component } => {
+            let Expr::Name { name } = &base.node else {
+                return None;
+            };
+            match const_derived_field_inits.get(&derived_param_field_lookup_key(name, component)) {
+                Some(FieldDefaultInit::Real(value)) => Some(*value),
+                Some(FieldDefaultInit::Integer(value)) => Some(*value as f64),
+                _ => None,
+            }
+        }
+        Expr::ParenExpr { inner } => {
+            eval_const_field_real_expr(inner, const_params, const_derived_field_inits)
+        }
+        Expr::UnaryOp { op, operand } => {
+            let value =
+                eval_const_field_real_expr(operand, const_params, const_derived_field_inits)?;
+            match op {
+                crate::ast::expr::UnaryOp::Minus => Some(-value),
+                crate::ast::expr::UnaryOp::Plus => Some(value),
+                _ => None,
+            }
+        }
+        Expr::BinaryOp { op, left, right } => {
+            let lhs = eval_const_field_real_expr(left, const_params, const_derived_field_inits)?;
+            let rhs = eval_const_field_real_expr(right, const_params, const_derived_field_inits)?;
+            match op {
+                crate::ast::expr::BinaryOp::Add => Some(lhs + rhs),
+                crate::ast::expr::BinaryOp::Sub => Some(lhs - rhs),
+                crate::ast::expr::BinaryOp::Mul => Some(lhs * rhs),
+                crate::ast::expr::BinaryOp::Div if rhs != 0.0 => Some(lhs / rhs),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 fn eval_const_field_char_expr(
     expr: &crate::ast::expr::SpannedExpr,
     const_params: &HashMap<String, i64>,
@@ -584,6 +639,10 @@ pub fn eval_const_field_default_init_for_layout(
         }
         TypeInfo::Logical { .. } => eval_const_field_logical_expr(expr, const_derived_field_inits)
             .map(FieldDefaultInit::Logical),
+        TypeInfo::Real { .. } | TypeInfo::DoublePrecision => {
+            eval_const_field_real_expr(expr, const_params, const_derived_field_inits)
+                .map(FieldDefaultInit::Real)
+        }
         TypeInfo::Derived(type_name) | TypeInfo::Class(type_name) => {
             eval_const_derived_default_init(
                 type_name,
@@ -1717,6 +1776,14 @@ mod tests {
                 },
             ),
             make_component_with_init(
+                "ratio",
+                crate::ast::decl::TypeSpec::Real(None),
+                crate::ast::expr::Expr::RealLiteral {
+                    text: "1.5".into(),
+                    kind: None,
+                },
+            ),
+            make_component_with_init(
                 "tag",
                 crate::ast::decl::TypeSpec::Character(Some(crate::ast::decl::CharSelector {
                     len: Some(crate::ast::decl::LenSpec::Expr(crate::ast::Spanned::new(
@@ -1762,6 +1829,12 @@ mod tests {
                 .field("enabled")
                 .and_then(|field| field.default_init.clone()),
             Some(FieldDefaultInit::Logical(true))
+        );
+        assert_eq!(
+            layout
+                .field("ratio")
+                .and_then(|field| field.default_init.clone()),
+            Some(FieldDefaultInit::Real(1.5))
         );
         assert_eq!(
             layout
