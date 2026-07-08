@@ -24666,7 +24666,16 @@ pub(super) fn string_expr_lowers_to_owned_heap_temp(
                 .map(|arg| character_expr_type_known(arg, locals, st, type_layouts))
                 .unwrap_or(false);
             match name.to_ascii_lowercase().as_str() {
-                "trim" | "adjustl" | "adjustr" => args.len() == 1 && first_is_char,
+                "trim" => {
+                    args.len() == 1
+                        && first_is_char
+                        && first_arg
+                            .map(|arg| {
+                                string_expr_lowers_to_owned_heap_temp(arg, locals, st, type_layouts)
+                            })
+                            .unwrap_or(false)
+                }
+                "adjustl" | "adjustr" => args.len() == 1 && first_is_char,
                 "f_c_string" => first_is_char,
                 "repeat" => args.len() >= 2 && first_is_char,
                 _ => false,
@@ -25048,30 +25057,12 @@ pub(super) fn lower_string_expr_full(
                                 contained_host_refs,
                                 descriptor_params,
                             );
-                            let buf = b.runtime_call(
-                                RuntimeFunc::Allocate,
-                                vec![len_val],
-                                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                            );
-                            b.call(
-                                FuncRef::External("memcpy".into()),
-                                vec![buf, src_ptr, len_val],
-                                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                            );
                             let trimmed_len = b.call(
                                 FuncRef::External("afs_len_trim".into()),
                                 vec![src_ptr, len_val],
                                 IrType::Int(IntWidth::I64),
                             );
-                            deallocate_owned_string_expr_temp(
-                                b,
-                                locals,
-                                arg,
-                                st,
-                                type_layouts,
-                                src_ptr,
-                            );
-                            return (buf, trimmed_len);
+                            return (src_ptr, trimmed_len);
                         }
                     }
                     "f_c_string" => {
