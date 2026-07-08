@@ -231,6 +231,10 @@ arc (#123), which is where the IFUNC/COPY-relocation machinery lands.
 - L8: `parse_rel`/`parse_shared` bounds-check every section slice and
   error on a zero/short `.dynsym` entsize instead of assuming 24
   (`elf_malformed_reject.rs`).
+  Regression note 2026-07-08: the section-slice sweep missed string-table
+  offsets. A symbol with `st_name` past `.strtab` still panicked inside
+  `cstr`; the same unchecked helper also covered `.dynstr` lookups. Fixed
+  by making `cstr` fallible and extending `elf_malformed_reject.rs`.
 - L9: static ET_EXEC emits a non-exec PT_GNU_STACK; both paths brand
   EI_OSABI from a runtime host probe, not a compile-time cfg
   (`elf_static_gnu_stack_osabi.rs`).
