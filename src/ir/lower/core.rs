@@ -39047,6 +39047,92 @@ pub(super) fn lower_array_minmax_dim_descriptor(
     Some((result_desc, elem_ty))
 }
 
+fn null_array_descriptor_ptr(b: &mut FuncBuilder) -> ValueId {
+    let zero = b.const_i64(0);
+    b.int_to_ptr(
+        zero,
+        IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_location_mask_arg(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    mask_expr: Option<&crate::ast::expr::SpannedExpr>,
+    source_rank: usize,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) -> Option<(ValueId, ValueId)> {
+    let no_array_mask = null_array_descriptor_ptr(b);
+    let no_scalar_mask = b.const_i32(-1);
+    let Some(me) = mask_expr else {
+        return Some((no_array_mask, no_scalar_mask));
+    };
+    let mask_rank = actual_expr_rank(me, locals, st, type_layouts).unwrap_or(0);
+    if mask_rank > 0 {
+        if mask_rank != source_rank {
+            return None;
+        }
+        let (mask_desc, _) = lower_array_expr_descriptor(
+            b,
+            locals,
+            me,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        )?;
+        return Some((mask_desc, no_scalar_mask));
+    }
+
+    let raw = super::expr::lower_expr_full(
+        b,
+        locals,
+        me,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    );
+    let truth = findloc_truthy_i1(b, raw);
+    let scalar_mask = coerce_to_type(b, truth, &IrType::Int(IntWidth::I32));
+    Some((no_array_mask, scalar_mask))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_location_back_arg(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    back_expr: Option<&crate::ast::expr::SpannedExpr>,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) -> ValueId {
+    let Some(e) = back_expr else {
+        return b.const_i32(0);
+    };
+    let raw = super::expr::lower_expr_full(
+        b,
+        locals,
+        e,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    );
+    let truth = findloc_truthy_i1(b, raw);
+    coerce_to_type(b, truth, &IrType::Int(IntWidth::I32))
+}
+
 pub(super) fn lower_array_location_dim_descriptor(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -39065,12 +39151,14 @@ pub(super) fn lower_array_location_dim_descriptor(
     let SectionSubscript::Element(array_expr) = &args[0].value else {
         return None;
     };
-    if actual_expr_rank(array_expr, locals, st, type_layouts).is_some_and(|rank| rank <= 1) {
+    let source_rank = actual_expr_rank(array_expr, locals, st, type_layouts)?;
+    if source_rank <= 1 {
         return None;
     }
 
     let mut dim_expr: Option<&crate::ast::expr::SpannedExpr> = None;
     let mut mask_expr: Option<&crate::ast::expr::SpannedExpr> = None;
+    let mut back_expr: Option<&crate::ast::expr::SpannedExpr> = None;
     for (i, arg) in args.iter().enumerate() {
         let kw = arg.keyword.as_deref().map(|s| s.to_lowercase());
         match (i, kw.as_deref()) {
@@ -39097,13 +39185,15 @@ pub(super) fn lower_array_location_dim_descriptor(
                     mask_expr = Some(e);
                 }
             }
+            (_, Some("back")) | (4, None) => {
+                if let SectionSubscript::Element(e) = &arg.value {
+                    back_expr = Some(e);
+                }
+            }
             _ => {}
         }
     }
     let dim_expr = dim_expr?;
-    if mask_expr.is_some() {
-        return None;
-    }
 
     let (src_desc, elem_ty) = lower_array_expr_descriptor(
         b,
@@ -39115,6 +39205,28 @@ pub(super) fn lower_array_location_dim_descriptor(
         contained_host_refs,
         descriptor_params,
     )?;
+
+    let (mask_desc, mask_scalar) = lower_location_mask_arg(
+        b,
+        locals,
+        mask_expr,
+        source_rank,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    )?;
+    let back_i32 = lower_location_back_arg(
+        b,
+        locals,
+        back_expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    );
 
     let dim_raw =
         super::expr::lower_expr_with_optional_layouts(b, locals, dim_expr, st, type_layouts);
@@ -39134,17 +39246,172 @@ pub(super) fn lower_array_location_dim_descriptor(
     );
 
     let helper = match (is_max, &elem_ty) {
-        (true, IrType::Float(FloatWidth::F32)) => "afs_array_maxloc_real4_dim",
-        (true, ty) if ty.is_float() => "afs_array_maxloc_real8_dim",
-        (true, IrType::Int(_)) => "afs_array_maxloc_int_dim",
-        (false, IrType::Float(FloatWidth::F32)) => "afs_array_minloc_real4_dim",
-        (false, ty) if ty.is_float() => "afs_array_minloc_real8_dim",
-        (false, IrType::Int(_)) => "afs_array_minloc_int_dim",
+        (true, IrType::Float(FloatWidth::F32)) => "afs_array_maxloc_real4_dim_mask_back",
+        (true, ty) if ty.is_float() => "afs_array_maxloc_real8_dim_mask_back",
+        (true, IrType::Int(_)) => "afs_array_maxloc_int_dim_mask_back",
+        (false, IrType::Float(FloatWidth::F32)) => "afs_array_minloc_real4_dim_mask_back",
+        (false, ty) if ty.is_float() => "afs_array_minloc_real8_dim_mask_back",
+        (false, IrType::Int(_)) => "afs_array_minloc_int_dim_mask_back",
         _ => return None,
     };
     b.call(
         FuncRef::External(helper.into()),
-        vec![src_desc, dim_val, result_desc],
+        vec![
+            src_desc,
+            dim_val,
+            result_desc,
+            mask_desc,
+            mask_scalar,
+            back_i32,
+        ],
+        IrType::Void,
+    );
+    Some((result_desc, IrType::Int(IntWidth::I32)))
+}
+
+pub(super) fn lower_array_findloc_dim_descriptor(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    args: &[crate::ast::expr::Argument],
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) -> Option<(ValueId, IrType)> {
+    use crate::ast::expr::SectionSubscript;
+
+    let arg_slots = reorder_args_by_keyword_slots(args, "findloc", st);
+    let array_arg = arg_slots.first().and_then(|slot| slot.as_ref())?;
+    let value_arg = arg_slots.get(1).and_then(|slot| slot.as_ref())?;
+    let dim_arg = arg_slots.get(2).and_then(|slot| slot.as_ref())?;
+    let mask_expr = arg_slots
+        .get(3)
+        .and_then(|slot| slot.as_ref())
+        .and_then(|arg| match &arg.value {
+            SectionSubscript::Element(e) => Some(e),
+            _ => None,
+        });
+    let back_expr = arg_slots
+        .get(5)
+        .and_then(|slot| slot.as_ref())
+        .and_then(|arg| match &arg.value {
+            SectionSubscript::Element(e) => Some(e),
+            _ => None,
+        });
+    let SectionSubscript::Element(array_expr) = &array_arg.value else {
+        return None;
+    };
+    let SectionSubscript::Element(value_expr) = &value_arg.value else {
+        return None;
+    };
+    let SectionSubscript::Element(dim_expr) = &dim_arg.value else {
+        return None;
+    };
+    let source_rank = actual_expr_rank(array_expr, locals, st, type_layouts)?;
+    if source_rank <= 1 {
+        return None;
+    }
+
+    let (src_desc, elem_ty) = lower_array_expr_descriptor(
+        b,
+        locals,
+        array_expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    )?;
+    if !matches!(elem_ty, IrType::Bool | IrType::Int(_) | IrType::Float(_)) {
+        deallocate_array_expr_descriptor_if_temp(b, locals, array_expr, st, src_desc);
+        return None;
+    }
+
+    let raw_value = super::expr::lower_expr_full(
+        b,
+        locals,
+        value_expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    );
+    let (helper, value_arg) = match &elem_ty {
+        IrType::Bool => {
+            let as_bool = coerce_to_type(b, raw_value, &IrType::Bool);
+            (
+                "afs_array_findloc_logical_dim_mask_back",
+                coerce_to_type(b, as_bool, &IrType::Int(IntWidth::I32)),
+            )
+        }
+        IrType::Int(_) => {
+            let same_kind = coerce_to_type(b, raw_value, &elem_ty);
+            (
+                "afs_array_findloc_int_dim_mask_back",
+                coerce_to_type(b, same_kind, &IrType::Int(IntWidth::I64)),
+            )
+        }
+        IrType::Float(_) => {
+            let same_kind = coerce_to_type(b, raw_value, &elem_ty);
+            (
+                "afs_array_findloc_real8_dim_mask_back",
+                coerce_to_type(b, same_kind, &IrType::Float(FloatWidth::F64)),
+            )
+        }
+        _ => return None,
+    };
+
+    let (mask_desc, mask_scalar) = lower_location_mask_arg(
+        b,
+        locals,
+        mask_expr,
+        source_rank,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    )?;
+    let back_i32 = lower_location_back_arg(
+        b,
+        locals,
+        back_expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    );
+
+    let dim_raw =
+        super::expr::lower_expr_with_optional_layouts(b, locals, dim_expr, st, type_layouts);
+    let dim_val = match b.func().value_type(dim_raw) {
+        Some(IrType::Int(IntWidth::I32)) => dim_raw,
+        Some(IrType::Int(_)) => b.int_trunc(dim_raw, IntWidth::I32),
+        _ => dim_raw,
+    };
+
+    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let zero_i32 = b.const_i32(0);
+    let sz384 = b.const_i64(384);
+    b.call(
+        FuncRef::External("memset".into()),
+        vec![result_desc, zero_i32, sz384],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+    b.call(
+        FuncRef::External(helper.into()),
+        vec![
+            src_desc,
+            value_arg,
+            dim_val,
+            result_desc,
+            mask_desc,
+            mask_scalar,
+            back_i32,
+        ],
         IrType::Void,
     );
     Some((result_desc, IrType::Int(IntWidth::I32)))
@@ -43394,6 +43661,20 @@ pub(super) fn lower_array_expr_descriptor(
                         contained_host_refs,
                         descriptor_params,
                         name.eq_ignore_ascii_case("maxloc"),
+                    ) {
+                        return Some(result);
+                    }
+                }
+                if name.eq_ignore_ascii_case("findloc") {
+                    if let Some(result) = lower_array_findloc_dim_descriptor(
+                        b,
+                        locals,
+                        args,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
                     ) {
                         return Some(result);
                     }
@@ -49142,6 +49423,20 @@ pub(super) fn lower_array_intrinsic(
             contained_host_refs,
             descriptor_params,
             name == "maxloc",
+        ) {
+            return Some(result_desc);
+        }
+    }
+    if name == "findloc" {
+        if let Some((result_desc, _)) = lower_array_findloc_dim_descriptor(
+            b,
+            locals,
+            args,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
         ) {
             return Some(result_desc);
         }

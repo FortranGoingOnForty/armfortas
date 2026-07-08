@@ -3854,6 +3854,78 @@ fn for_each_reduce_along_dim_with_index<F: FnMut(usize, usize, i64)>(
     }
 }
 
+fn for_each_reduce_along_dim_optional_mask_with_index<
+    F: FnMut(usize, Option<usize>, usize, i64),
+>(
+    src: &ArrayDescriptor,
+    mask: Option<&ArrayDescriptor>,
+    reduce_dim: i32,
+    mut accum: F,
+) {
+    let rank = src.rank as usize;
+    if rank == 0 {
+        return;
+    }
+    let reduce_dim_idx = reduce_dim as usize - 1;
+    if reduce_dim_idx >= rank {
+        return;
+    }
+    let mut extents: [i64; 15] = [0; 15];
+    let mut s_strides: [i64; 15] = [0; 15];
+    let mut m_strides: [i64; 15] = [0; 15];
+    let mut dst_running_stride: [i64; 15] = [0; 15];
+    let mut k = 0usize;
+    let mut acc = 1i64;
+    for i in 0..rank {
+        extents[i] = src.dims[i].extent();
+        s_strides[i] = src.dims[i].stride.max(1);
+        m_strides[i] = mask
+            .filter(|m| (i as i32) < m.rank)
+            .map_or(1, |m| m.dims[i].stride.max(1));
+        if i == reduce_dim_idx {
+            continue;
+        }
+        dst_running_stride[k] = acc;
+        acc *= extents[i];
+        k += 1;
+    }
+    let total = (0..rank).map(|i| extents[i]).product::<i64>();
+    if total <= 0 {
+        return;
+    }
+    let mask_elem = mask.map_or(1, |m| m.elem_size.max(1));
+    let mut idx: [i64; 15] = [0; 15];
+    for _ in 0..total {
+        let mut s_byte_off: i64 = 0;
+        let mut m_byte_off: i64 = 0;
+        let mut dst_flat: i64 = 0;
+        let mut dk = 0usize;
+        for d in 0..rank {
+            s_byte_off += idx[d] * s_strides[d] * src.elem_size;
+            if mask.is_some() {
+                m_byte_off += idx[d] * m_strides[d] * mask_elem;
+            }
+            if d != reduce_dim_idx {
+                dst_flat += idx[d] * dst_running_stride[dk];
+                dk += 1;
+            }
+        }
+        accum(
+            s_byte_off as usize,
+            mask.map(|_| m_byte_off as usize),
+            dst_flat as usize,
+            idx[reduce_dim_idx] + 1,
+        );
+        for d in 0..rank {
+            idx[d] += 1;
+            if idx[d] < extents[d] {
+                break;
+            }
+            idx[d] = 0;
+        }
+    }
+}
+
 fn ensure_reduction_dim_result(
     src: &ArrayDescriptor,
     dim: i32,
@@ -3945,6 +4017,29 @@ fn array_loc_real_dim(
     dst: *mut ArrayDescriptor,
     is_max: bool,
 ) {
+    array_loc_real_dim_keywords(src, dim, dst, ptr::null(), -1, 0, is_max);
+}
+
+fn location_mask_allows(
+    mask: Option<&ArrayDescriptor>,
+    mask_byte_off: Option<usize>,
+    mask_scalar: i32,
+) -> bool {
+    if let (Some(m), Some(byte_off)) = (mask, mask_byte_off) {
+        return unsafe { mask_byte_is_true(m, byte_off) };
+    }
+    mask_scalar < 0 || mask_scalar != 0
+}
+
+fn array_loc_real_dim_keywords(
+    src: *const ArrayDescriptor,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+    mask_scalar: i32,
+    back: i32,
+    is_max: bool,
+) {
     if src.is_null() || dst.is_null() || dim < 1 {
         return;
     }
@@ -3952,6 +4047,15 @@ fn array_loc_real_dim(
     if !descriptor_has_payload_or_zero_size_array(s) || dim as usize > s.rank as usize {
         return;
     }
+    let mask_desc = if mask.is_null() {
+        None
+    } else {
+        let m = unsafe { &*mask };
+        if !descriptor_has_payload_or_zero_size_array(m) {
+            return;
+        }
+        Some(m)
+    };
     if !ensure_location_dim_result(s, dim, dst) {
         return;
     }
@@ -3971,22 +4075,31 @@ fn array_loc_real_dim(
         ($t:ty) => {{
             let mut seen = vec![false; dst_total];
             let mut best: Vec<$t> = vec![0 as $t; dst_total];
-            for_each_reduce_along_dim_with_index(s, dim, |byte_off, dst_flat, reduce_index| {
-                let v = unsafe { *(src_ptr.add(byte_off) as *const $t) };
-                if !seen[dst_flat]
-                    || (if is_max {
-                        v > best[dst_flat]
-                    } else {
-                        v < best[dst_flat]
-                    })
-                {
-                    seen[dst_flat] = true;
-                    best[dst_flat] = v;
-                    unsafe {
-                        *out.add(dst_flat) = reduce_index as i32;
+            for_each_reduce_along_dim_optional_mask_with_index(
+                s,
+                mask_desc,
+                dim,
+                |byte_off, mask_byte_off, dst_flat, reduce_index| {
+                    if !location_mask_allows(mask_desc, mask_byte_off, mask_scalar) {
+                        return;
                     }
-                }
-            });
+                    let v = unsafe { *(src_ptr.add(byte_off) as *const $t) };
+                    if !seen[dst_flat]
+                        || (if is_max {
+                            v > best[dst_flat]
+                        } else {
+                            v < best[dst_flat]
+                        })
+                        || (back != 0 && v == best[dst_flat])
+                    {
+                        seen[dst_flat] = true;
+                        best[dst_flat] = v;
+                        unsafe {
+                            *out.add(dst_flat) = reduce_index as i32;
+                        }
+                    }
+                },
+            );
         }};
     }
     if s.elem_size == 4 {
@@ -4002,6 +4115,18 @@ fn array_loc_int_dim(
     dst: *mut ArrayDescriptor,
     is_max: bool,
 ) {
+    array_loc_int_dim_keywords(src, dim, dst, ptr::null(), -1, 0, is_max);
+}
+
+fn array_loc_int_dim_keywords(
+    src: *const ArrayDescriptor,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+    mask_scalar: i32,
+    back: i32,
+    is_max: bool,
+) {
     if src.is_null() || dst.is_null() || dim < 1 {
         return;
     }
@@ -4009,6 +4134,15 @@ fn array_loc_int_dim(
     if !descriptor_has_payload_or_zero_size_array(s) || dim as usize > s.rank as usize {
         return;
     }
+    let mask_desc = if mask.is_null() {
+        None
+    } else {
+        let m = unsafe { &*mask };
+        if !descriptor_has_payload_or_zero_size_array(m) {
+            return;
+        }
+        Some(m)
+    };
     if !ensure_location_dim_result(s, dim, dst) {
         return;
     }
@@ -4028,22 +4162,31 @@ fn array_loc_int_dim(
         ($t:ty) => {{
             let mut seen = vec![false; dst_total];
             let mut best: Vec<$t> = vec![0 as $t; dst_total];
-            for_each_reduce_along_dim_with_index(s, dim, |byte_off, dst_flat, reduce_index| {
-                let v = unsafe { *(src_ptr.add(byte_off) as *const $t) };
-                if !seen[dst_flat]
-                    || (if is_max {
-                        v > best[dst_flat]
-                    } else {
-                        v < best[dst_flat]
-                    })
-                {
-                    seen[dst_flat] = true;
-                    best[dst_flat] = v;
-                    unsafe {
-                        *out.add(dst_flat) = reduce_index as i32;
+            for_each_reduce_along_dim_optional_mask_with_index(
+                s,
+                mask_desc,
+                dim,
+                |byte_off, mask_byte_off, dst_flat, reduce_index| {
+                    if !location_mask_allows(mask_desc, mask_byte_off, mask_scalar) {
+                        return;
                     }
-                }
-            });
+                    let v = unsafe { *(src_ptr.add(byte_off) as *const $t) };
+                    if !seen[dst_flat]
+                        || (if is_max {
+                            v > best[dst_flat]
+                        } else {
+                            v < best[dst_flat]
+                        })
+                        || (back != 0 && v == best[dst_flat])
+                    {
+                        seen[dst_flat] = true;
+                        best[dst_flat] = v;
+                        unsafe {
+                            *out.add(dst_flat) = reduce_index as i32;
+                        }
+                    }
+                },
+            );
         }};
     }
     match s.elem_size {
@@ -4052,6 +4195,186 @@ fn array_loc_int_dim(
         8 => loc_int_kind!(i64),
         _ => loc_int_kind!(i32),
     }
+}
+
+fn array_findloc_real_dim_keywords(
+    src: *const ArrayDescriptor,
+    value: f64,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+    mask_scalar: i32,
+    back: i32,
+) {
+    if src.is_null() || dst.is_null() || dim < 1 {
+        return;
+    }
+    let s = unsafe { &*src };
+    if !descriptor_has_payload_or_zero_size_array(s) || dim as usize > s.rank as usize {
+        return;
+    }
+    let mask_desc = if mask.is_null() {
+        None
+    } else {
+        let m = unsafe { &*mask };
+        if !descriptor_has_payload_or_zero_size_array(m) {
+            return;
+        }
+        Some(m)
+    };
+    if !ensure_location_dim_result(s, dim, dst) {
+        return;
+    }
+    let d = unsafe { &mut *dst };
+    let dst_total = d.total_elements() as usize;
+    let out = d.base_addr as *mut i32;
+    if !out.is_null() {
+        unsafe {
+            fill_i32_impl(out, dst_total, 0);
+        }
+    }
+    if dst_total == 0 || s.total_elements() == 0 || s.base_addr.is_null() || out.is_null() {
+        return;
+    }
+    let src_ptr = s.base_addr as *const u8;
+    let mut seen = vec![false; dst_total];
+    for_each_reduce_along_dim_optional_mask_with_index(
+        s,
+        mask_desc,
+        dim,
+        |byte_off, mask_byte_off, dst_flat, reduce_index| {
+            if !location_mask_allows(mask_desc, mask_byte_off, mask_scalar) {
+                return;
+            }
+            let v = unsafe { read_real_as_f64(src_ptr, byte_off as isize, s.elem_size) };
+            if v == value && (!seen[dst_flat] || back != 0) {
+                seen[dst_flat] = true;
+                unsafe {
+                    *out.add(dst_flat) = reduce_index as i32;
+                }
+            }
+        },
+    );
+}
+
+fn array_findloc_int_dim_keywords(
+    src: *const ArrayDescriptor,
+    value: i64,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+    mask_scalar: i32,
+    back: i32,
+) {
+    if src.is_null() || dst.is_null() || dim < 1 {
+        return;
+    }
+    let s = unsafe { &*src };
+    if !descriptor_has_payload_or_zero_size_array(s) || dim as usize > s.rank as usize {
+        return;
+    }
+    let mask_desc = if mask.is_null() {
+        None
+    } else {
+        let m = unsafe { &*mask };
+        if !descriptor_has_payload_or_zero_size_array(m) {
+            return;
+        }
+        Some(m)
+    };
+    if !ensure_location_dim_result(s, dim, dst) {
+        return;
+    }
+    let d = unsafe { &mut *dst };
+    let dst_total = d.total_elements() as usize;
+    let out = d.base_addr as *mut i32;
+    if !out.is_null() {
+        unsafe {
+            fill_i32_impl(out, dst_total, 0);
+        }
+    }
+    if dst_total == 0 || s.total_elements() == 0 || s.base_addr.is_null() || out.is_null() {
+        return;
+    }
+    let src_ptr = s.base_addr as *const u8;
+    let mut seen = vec![false; dst_total];
+    for_each_reduce_along_dim_optional_mask_with_index(
+        s,
+        mask_desc,
+        dim,
+        |byte_off, mask_byte_off, dst_flat, reduce_index| {
+            if !location_mask_allows(mask_desc, mask_byte_off, mask_scalar) {
+                return;
+            }
+            let v = unsafe { read_int_as_i64(src_ptr, byte_off as isize, s.elem_size) };
+            if v == value && (!seen[dst_flat] || back != 0) {
+                seen[dst_flat] = true;
+                unsafe {
+                    *out.add(dst_flat) = reduce_index as i32;
+                }
+            }
+        },
+    );
+}
+
+fn array_findloc_logical_dim_keywords(
+    src: *const ArrayDescriptor,
+    value: i32,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+    mask_scalar: i32,
+    back: i32,
+) {
+    if src.is_null() || dst.is_null() || dim < 1 {
+        return;
+    }
+    let s = unsafe { &*src };
+    if !descriptor_has_payload_or_zero_size_array(s) || dim as usize > s.rank as usize {
+        return;
+    }
+    let mask_desc = if mask.is_null() {
+        None
+    } else {
+        let m = unsafe { &*mask };
+        if !descriptor_has_payload_or_zero_size_array(m) {
+            return;
+        }
+        Some(m)
+    };
+    if !ensure_location_dim_result(s, dim, dst) {
+        return;
+    }
+    let d = unsafe { &mut *dst };
+    let dst_total = d.total_elements() as usize;
+    let out = d.base_addr as *mut i32;
+    if !out.is_null() {
+        unsafe {
+            fill_i32_impl(out, dst_total, 0);
+        }
+    }
+    if dst_total == 0 || s.total_elements() == 0 || s.base_addr.is_null() || out.is_null() {
+        return;
+    }
+    let want = value != 0;
+    let mut seen = vec![false; dst_total];
+    for_each_reduce_along_dim_optional_mask_with_index(
+        s,
+        mask_desc,
+        dim,
+        |byte_off, mask_byte_off, dst_flat, reduce_index| {
+            if !location_mask_allows(mask_desc, mask_byte_off, mask_scalar) {
+                return;
+            }
+            let v = unsafe { mask_byte_offset_is_true(s, byte_off as isize) };
+            if v == want && (!seen[dst_flat] || back != 0) {
+                seen[dst_flat] = true;
+                unsafe {
+                    *out.add(dst_flat) = reduce_index as i32;
+                }
+            }
+        },
+    );
 }
 
 /// SUM(array, DIM=k) — reduce along dimension k, allocate `dst` with
@@ -6617,6 +6940,117 @@ pub extern "C" fn afs_array_minloc_int_dim(
     dst: *mut ArrayDescriptor,
 ) {
     array_loc_int_dim(src, dim, dst, false);
+}
+
+#[no_mangle]
+pub extern "C" fn afs_array_maxloc_real4_dim_mask_back(
+    src: *const ArrayDescriptor,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+    mask_scalar: i32,
+    back: i32,
+) {
+    array_loc_real_dim_keywords(src, dim, dst, mask, mask_scalar, back, true);
+}
+
+#[no_mangle]
+pub extern "C" fn afs_array_maxloc_real8_dim_mask_back(
+    src: *const ArrayDescriptor,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+    mask_scalar: i32,
+    back: i32,
+) {
+    array_loc_real_dim_keywords(src, dim, dst, mask, mask_scalar, back, true);
+}
+
+#[no_mangle]
+pub extern "C" fn afs_array_maxloc_int_dim_mask_back(
+    src: *const ArrayDescriptor,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+    mask_scalar: i32,
+    back: i32,
+) {
+    array_loc_int_dim_keywords(src, dim, dst, mask, mask_scalar, back, true);
+}
+
+#[no_mangle]
+pub extern "C" fn afs_array_minloc_real4_dim_mask_back(
+    src: *const ArrayDescriptor,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+    mask_scalar: i32,
+    back: i32,
+) {
+    array_loc_real_dim_keywords(src, dim, dst, mask, mask_scalar, back, false);
+}
+
+#[no_mangle]
+pub extern "C" fn afs_array_minloc_real8_dim_mask_back(
+    src: *const ArrayDescriptor,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+    mask_scalar: i32,
+    back: i32,
+) {
+    array_loc_real_dim_keywords(src, dim, dst, mask, mask_scalar, back, false);
+}
+
+#[no_mangle]
+pub extern "C" fn afs_array_minloc_int_dim_mask_back(
+    src: *const ArrayDescriptor,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+    mask_scalar: i32,
+    back: i32,
+) {
+    array_loc_int_dim_keywords(src, dim, dst, mask, mask_scalar, back, false);
+}
+
+#[no_mangle]
+pub extern "C" fn afs_array_findloc_real8_dim_mask_back(
+    src: *const ArrayDescriptor,
+    value: f64,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+    mask_scalar: i32,
+    back: i32,
+) {
+    array_findloc_real_dim_keywords(src, value, dim, dst, mask, mask_scalar, back);
+}
+
+#[no_mangle]
+pub extern "C" fn afs_array_findloc_int_dim_mask_back(
+    src: *const ArrayDescriptor,
+    value: i64,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+    mask_scalar: i32,
+    back: i32,
+) {
+    array_findloc_int_dim_keywords(src, value, dim, dst, mask, mask_scalar, back);
+}
+
+#[no_mangle]
+pub extern "C" fn afs_array_findloc_logical_dim_mask_back(
+    src: *const ArrayDescriptor,
+    value: i32,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+    mask: *const ArrayDescriptor,
+    mask_scalar: i32,
+    back: i32,
+) {
+    array_findloc_logical_dim_keywords(src, value, dim, dst, mask, mask_scalar, back);
 }
 
 /// TRANSPOSE(source, result) — matrix transpose (real(8) version).
