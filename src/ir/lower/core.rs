@@ -22715,12 +22715,7 @@ pub(super) fn clear_intent_out_derived_params(
         let Some(info) = locals.get(pname) else {
             continue;
         };
-        if info.is_pointer
-            || info.allocatable
-            || decl_is_allocatable(pname, decls)
-            || (local_uses_array_descriptor(info) && !info.is_class)
-            || !info.dims.is_empty()
-        {
+        if info.is_pointer || info.allocatable || decl_is_allocatable(pname, decls) {
             continue;
         }
 
@@ -22742,6 +22737,11 @@ pub(super) fn clear_intent_out_derived_params(
             }
         };
 
+        let is_array_dummy = !info.is_class
+            && (local_uses_array_descriptor(info)
+                || !info.dims.is_empty()
+                || !info.runtime_dim_upper.is_empty());
+
         if decl_is_optional(pname, decls) && info.by_ref {
             let ptr_val = b.load(info.addr);
             let zero = b.const_i64(0);
@@ -22752,7 +22752,19 @@ pub(super) fn clear_intent_out_derived_params(
 
             b.set_block(bb_clear);
             let storage = derived_storage_addr(b, info);
-            clear_derived_storage_for_intent_out(b, storage, layout, type_layouts, stat);
+            if is_array_dummy {
+                let elem_count = array_total_elems_value(b, info);
+                clear_derived_array_storage_for_intent_out_dynamic(
+                    b,
+                    storage,
+                    layout,
+                    elem_count,
+                    type_layouts,
+                    stat,
+                );
+            } else {
+                clear_derived_storage_for_intent_out(b, storage, layout, type_layouts, stat);
+            }
             b.branch(bb_skip, vec![]);
 
             b.set_block(bb_skip);
@@ -22760,7 +22772,19 @@ pub(super) fn clear_intent_out_derived_params(
         }
 
         let storage = derived_storage_addr(b, info);
-        clear_derived_storage_for_intent_out(b, storage, layout, type_layouts, stat);
+        if is_array_dummy {
+            let elem_count = array_total_elems_value(b, info);
+            clear_derived_array_storage_for_intent_out_dynamic(
+                b,
+                storage,
+                layout,
+                elem_count,
+                type_layouts,
+                stat,
+            );
+        } else {
+            clear_derived_storage_for_intent_out(b, storage, layout, type_layouts, stat);
+        }
     }
 }
 
@@ -49501,6 +49525,40 @@ pub(super) fn clear_derived_storage_for_intent_out(
     initialize_derived_storage(b, base_addr, layout, registry);
 }
 
+pub(super) fn clear_derived_array_storage_for_intent_out_dynamic(
+    b: &mut FuncBuilder,
+    base_addr: ValueId,
+    layout: &crate::sema::type_layout::TypeLayout,
+    elem_count: ValueId,
+    registry: &crate::sema::type_layout::TypeLayoutRegistry,
+    stat_addr: ValueId,
+) {
+    let zero = b.const_i64(0);
+
+    let bb_check = b.create_block("derived_array_intent_out_check");
+    let i = b.add_block_param(bb_check, IrType::Int(IntWidth::I64));
+    let bb_body = b.create_block("derived_array_intent_out_body");
+    let i_val = b.add_block_param(bb_body, IrType::Int(IntWidth::I64));
+    let bb_exit = b.create_block("derived_array_intent_out_exit");
+    b.branch(bb_check, vec![zero]);
+
+    b.set_block(bb_check);
+    let done = b.icmp(CmpOp::Ge, i, elem_count);
+    b.cond_branch(done, bb_exit, vec![], bb_body, vec![i]);
+
+    b.set_block(bb_body);
+    let elem_bytes = b.const_i64(layout.size as i64);
+    let byte_off = b.imul(i_val, elem_bytes);
+    let elem_ptr = b.gep(base_addr, vec![byte_off], IrType::Int(IntWidth::I8));
+    clear_derived_storage_for_intent_out(b, elem_ptr, layout, registry, stat_addr);
+
+    let one = b.const_i64(1);
+    let next_i = b.iadd(i_val, one);
+    b.branch(bb_check, vec![next_i]);
+
+    b.set_block(bb_exit);
+}
+
 pub(super) fn derived_layout_needs_component_deallocation(
     layout: &crate::sema::type_layout::TypeLayout,
     registry: &crate::sema::type_layout::TypeLayoutRegistry,
@@ -52357,6 +52415,41 @@ pub(super) fn emit_allocatable_source_copy_on_success(
                 IrType::Void,
             );
         }
+    }
+    b.branch(done_bb, vec![]);
+    b.set_block(done_bb);
+}
+
+pub(super) fn emit_allocatable_default_init_on_success(
+    b: &mut FuncBuilder,
+    stat_addr: ValueId,
+    dest_desc: ValueId,
+    layout: &crate::sema::type_layout::TypeLayout,
+    initialize_array: bool,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+) {
+    if !derived_layout_needs_runtime_initialization(layout, type_layouts) {
+        return;
+    }
+
+    let stat = b.load_typed(stat_addr, IrType::Int(IntWidth::I32));
+    let zero = b.const_i32(0);
+    let ok = b.icmp(CmpOp::Eq, stat, zero);
+    let init_bb = b.create_block("alloc_default_init");
+    let done_bb = b.create_block("alloc_default_init_done");
+    b.cond_branch(ok, init_bb, vec![], done_bb, vec![]);
+
+    b.set_block(init_bb);
+    let base_ptr = b.load_typed(dest_desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    if initialize_array {
+        let elem_count = b.call(
+            FuncRef::External("afs_array_size".into()),
+            vec![dest_desc],
+            IrType::Int(IntWidth::I64),
+        );
+        initialize_derived_array_storage_dynamic(b, base_ptr, layout, elem_count, type_layouts);
+    } else {
+        initialize_derived_storage(b, base_ptr, layout, type_layouts);
     }
     b.branch(done_bb, vec![]);
     b.set_block(done_bb);

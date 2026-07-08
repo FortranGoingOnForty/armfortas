@@ -6095,7 +6095,6 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             // Polymorphic metadata (tag + vtable) for both
                             // scalars and arrays; a polymorphic array
                             // component's elements share one dynamic type.
-                            // Derived default-init below stays scalar-only.
                             {
                                 let mold_metadata_desc = if source_desc.is_none()
                                     && source_scalar_desc.is_none()
@@ -6207,27 +6206,19 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         b, stat_addr, field_ptr, mold_desc,
                                     );
                                 }
-                                let copied_from_source = source_desc.is_some()
+                                let initialized_from_source = source_desc.is_some()
                                     || source_scalar_desc.is_some()
-                                    || source_expr.is_some()
-                                    || mold_metadata_desc.is_some();
-                                if !copied_from_source && rank == 0 {
+                                    || source_expr.is_some();
+                                if !initialized_from_source {
                                     if let Some(layout) = dynamic_layout {
-                                        let base_ptr = b.load_typed(
+                                        emit_allocatable_default_init_on_success(
+                                            b,
+                                            stat_addr,
                                             field_ptr,
-                                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                                        );
-                                        if derived_layout_needs_runtime_initialization(
                                             layout,
+                                            source_copy_rank > 0,
                                             ctx.type_layouts,
-                                        ) {
-                                            initialize_derived_storage(
-                                                b,
-                                                base_ptr,
-                                                layout,
-                                                ctx.type_layouts,
-                                            );
-                                        }
+                                        );
                                     }
                                 }
                             }
@@ -6510,9 +6501,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             // arrays — a polymorphic array's elements share
                             // one dynamic type, so one tag + table pointer
                             // in the descriptor serves every element-wise
-                            // TBP dispatch. (Derived default-init below
-                            // stays scalar-only; whole-array element init is
-                            // a separate concern.)
+                            // TBP dispatch.
                             {
                                 let mold_metadata_desc = if source_desc.is_none()
                                     && source_scalar_desc.is_none()
@@ -6623,27 +6612,19 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         b, stat_addr, desc, mold_desc,
                                     );
                                 }
-                                let copied_from_source = source_desc.is_some()
+                                let initialized_from_source = source_desc.is_some()
                                     || source_scalar_desc.is_some()
-                                    || source_expr.is_some()
-                                    || mold_metadata_desc.is_some();
-                                if !copied_from_source && rank == 0 {
+                                    || source_expr.is_some();
+                                if !initialized_from_source {
                                     if let Some(layout) = dynamic_layout {
-                                        let base_ptr = b.load_typed(
+                                        emit_allocatable_default_init_on_success(
+                                            b,
+                                            stat_addr,
                                             desc,
-                                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                                        );
-                                        if derived_layout_needs_runtime_initialization(
                                             layout,
+                                            source_copy_rank > 0,
                                             ctx.type_layouts,
-                                        ) {
-                                            initialize_derived_storage(
-                                                b,
-                                                base_ptr,
-                                                layout,
-                                                ctx.type_layouts,
-                                            );
-                                        }
+                                        );
                                     }
                                 }
                             }
