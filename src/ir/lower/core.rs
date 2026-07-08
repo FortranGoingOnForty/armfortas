@@ -12912,12 +12912,15 @@ fn operator_interface_specific_candidates(
     st: &SymbolTable,
     iface_name: &str,
 ) -> Option<Vec<SpecificProcCandidate>> {
+    let iface_key = iface_name.to_ascii_lowercase();
+    if active_block_uses().is_empty() && !st.may_have_named_interface_name(&iface_key) {
+        return None;
+    }
     let mut all_candidates = named_interface_specific_candidates(st, iface_name)?;
     let mut seen_candidates: HashSet<(String, crate::sema::symtab::ScopeId)> = all_candidates
         .iter()
         .map(|candidate| (candidate.name.to_ascii_lowercase(), candidate.owner_scope))
         .collect();
-    let iface_key = iface_name.to_ascii_lowercase();
     for sym in active_block_use_named_interface_symbols(st, &iface_key) {
         append_named_interface_specific_candidates(sym, &mut all_candidates, &mut seen_candidates);
     }
@@ -15321,6 +15324,23 @@ pub(super) fn operator_builtin_intrinsic_operand(
     )
 }
 
+fn intrinsic_binary_operator_fast_path(
+    op: &BinaryOp,
+    left: Option<&crate::sema::symtab::TypeInfo>,
+    right: Option<&crate::sema::symtab::TypeInfo>,
+) -> bool {
+    !matches!(op, BinaryOp::Defined(_))
+        && operator_builtin_intrinsic_operand(left)
+        && operator_builtin_intrinsic_operand(right)
+}
+
+fn intrinsic_unary_operator_fast_path(
+    op: &UnaryOp,
+    operand: Option<&crate::sema::symtab::TypeInfo>,
+) -> bool {
+    !matches!(op, UnaryOp::Defined(_)) && operator_builtin_intrinsic_operand(operand)
+}
+
 pub(super) fn intrinsic_kind_matches(
     declared: Option<u8>,
     actual: Option<u8>,
@@ -16017,6 +16037,9 @@ pub(super) fn defined_binary_operator_result_type_info(
     left_ti: Option<&crate::sema::symtab::TypeInfo>,
     right_ti: Option<&crate::sema::symtab::TypeInfo>,
 ) -> Option<crate::sema::symtab::TypeInfo> {
+    if intrinsic_binary_operator_fast_path(op, left_ti, right_ti) {
+        return None;
+    }
     let iface_name = binary_op_interface_name(op)?;
     let specifics =
         operator_specific_candidates(st, type_layouts, &iface_name, &[left_ti, right_ti])?;
@@ -16085,6 +16108,9 @@ pub(super) fn defined_binary_operator_result_rank(
     left_ti: Option<&crate::sema::symtab::TypeInfo>,
     right_ti: Option<&crate::sema::symtab::TypeInfo>,
 ) -> Option<usize> {
+    if intrinsic_binary_operator_fast_path(op, left_ti, right_ti) {
+        return None;
+    }
     let iface_name = binary_op_interface_name(op)?;
     let specifics =
         operator_specific_candidates(st, type_layouts, &iface_name, &[left_ti, right_ti])?;
@@ -16164,6 +16190,9 @@ pub(super) fn defined_unary_operator_result_type_info(
     operand_expr: &crate::ast::expr::SpannedExpr,
     operand_ti: Option<&crate::sema::symtab::TypeInfo>,
 ) -> Option<crate::sema::symtab::TypeInfo> {
+    if intrinsic_unary_operator_fast_path(op, operand_ti) {
+        return None;
+    }
     let iface_name = unary_op_interface_name(op)?;
     let specifics = operator_interface_specific_candidates(st, &iface_name)?;
 
@@ -16211,13 +16240,12 @@ pub(super) fn resolve_defined_unary_operator_specific_by_semantics(
     op: &UnaryOp,
     operand_expr: &crate::ast::expr::SpannedExpr,
 ) -> Option<String> {
-    let iface_name = unary_op_interface_name(op)?;
-    let specifics = operator_interface_specific_candidates(st, &iface_name)?;
     let operand_ti = operator_expr_type_info(operand_expr, locals, st, type_layouts);
-    if !matches!(op, UnaryOp::Defined(_)) && operator_builtin_intrinsic_operand(operand_ti.as_ref())
-    {
+    if intrinsic_unary_operator_fast_path(op, operand_ti.as_ref()) {
         return None;
     }
+    let iface_name = unary_op_interface_name(op)?;
+    let specifics = operator_interface_specific_candidates(st, &iface_name)?;
 
     for candidate in &specifics {
         let Some(scope) = procedure_scope_for_candidate(st, candidate) else {
@@ -16261,20 +16289,20 @@ pub(super) fn resolve_defined_binary_operator_specific_by_semantics(
     left_expr: &crate::ast::expr::SpannedExpr,
     right_expr: &crate::ast::expr::SpannedExpr,
 ) -> Option<String> {
-    let iface_name = binary_op_interface_name(op)?;
     let left_ti = operator_expr_type_info(left_expr, locals, st, type_layouts);
     let right_ti = operator_expr_type_info(right_expr, locals, st, type_layouts);
+    if operator_builtin_intrinsic_operand(left_ti.as_ref())
+        && operator_builtin_intrinsic_operand(right_ti.as_ref())
+    {
+        return None;
+    }
+    let iface_name = binary_op_interface_name(op)?;
     let specifics = operator_specific_candidates(
         st,
         type_layouts,
         &iface_name,
         &[left_ti.as_ref(), right_ti.as_ref()],
     )?;
-    if operator_builtin_intrinsic_operand(left_ti.as_ref())
-        && operator_builtin_intrinsic_operand(right_ti.as_ref())
-    {
-        return None;
-    }
 
     for candidate in &specifics {
         let Some(scope) = procedure_scope_for_candidate(st, candidate) else {

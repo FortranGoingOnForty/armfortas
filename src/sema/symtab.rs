@@ -94,6 +94,7 @@ pub struct SymbolTable {
     pub(crate) current: ScopeId,
     normal_lookup_cache: RefCell<PersistentLookupCache>,
     export_lookup_cache: RefCell<PersistentLookupCache>,
+    named_interface_presence_cache: RefCell<HashMap<String, bool>>,
     /// (scope_id, lowercase fname) → statement function definition.
     /// Populated by sema's `detect_statement_functions` pass during
     /// `resolve_unit` for Subroutine/Function/Program arms.
@@ -119,6 +120,7 @@ impl SymbolTable {
             current: 0,
             normal_lookup_cache: RefCell::new(HashMap::new()),
             export_lookup_cache: RefCell::new(HashMap::new()),
+            named_interface_presence_cache: RefCell::new(HashMap::new()),
             statement_functions: HashMap::new(),
         }
     }
@@ -133,6 +135,7 @@ impl SymbolTable {
     fn clear_lookup_caches(&self) {
         self.normal_lookup_cache.borrow_mut().clear();
         self.export_lookup_cache.borrow_mut().clear();
+        self.named_interface_presence_cache.borrow_mut().clear();
     }
 
     fn cached_lookup<'a>(
@@ -337,6 +340,30 @@ impl SymbolTable {
             .get(&side_key)
             .filter(|sym| is_named_interface_like_symbol(sym))
             .filter(|sym| sym.name.eq_ignore_ascii_case(key.as_ref()))
+    }
+
+    pub fn may_have_named_interface_name(&self, name: &str) -> bool {
+        let key = ensure_ascii_lowercase(name);
+        if let Some(cached) = self
+            .named_interface_presence_cache
+            .borrow()
+            .get(key.as_ref())
+        {
+            return *cached;
+        }
+
+        let found = self.scopes.iter().any(|scope| {
+            self.named_interface_symbol_in_scope(scope.id, key.as_ref())
+                .is_some()
+                || scope
+                    .use_associations
+                    .iter()
+                    .any(|assoc| assoc.local_name == key.as_ref())
+        });
+        self.named_interface_presence_cache
+            .borrow_mut()
+            .insert(key.into_owned(), found);
+        found
     }
 
     /// Define a symbol in a specific scope.
