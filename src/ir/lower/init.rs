@@ -3,7 +3,7 @@
 //! Extracted from `core.rs` in Sprint 11 Stage E. Pure mechanical
 //! move — behavior unchanged.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ast::decl::{Attribute, DataValue, Decl, TypeSpec};
 use crate::ast::expr::{AcValue, Argument, Expr, ImpliedDoLoop, SectionSubscript, SpannedExpr};
@@ -264,6 +264,20 @@ fn store_data_scalar(
     b.store(coerced, info.addr);
 }
 
+fn collect_static_initializer_global_addr_values(b: &FuncBuilder) -> HashSet<ValueId> {
+    let mut set = HashSet::new();
+    for block in &b.func().blocks {
+        for inst in &block.insts {
+            if let InstKind::GlobalAddr(name) = &inst.kind {
+                if !name.starts_with("afs_common_") {
+                    set.insert(inst.id);
+                }
+            }
+        }
+    }
+    set
+}
+
 /// Lower initializer expressions for declared variables.
 ///
 /// Handles two AST shapes:
@@ -293,9 +307,10 @@ pub(crate) fn init_decls(
     proc_scope_id: Option<ScopeId>,
     type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
 ) {
-    // Pre-collect the set of GlobalAddr-defining ValueIds so the
-    // inner skip check is O(1). Audit Maj-3.
-    let global_addr_ids = collect_global_addr_values(b);
+    // Pre-collect GlobalAddr-backed locals whose initializer is already
+    // in .data. COMMON globals are emitted as .comm until explicitly
+    // initialized, so DATA still needs to store into those slots.
+    let global_addr_ids = collect_static_initializer_global_addr_values(b);
     let param_consts = collect_decl_param_consts_with_scope(decls, &HashMap::new(), st);
     let mut param_array_consts: HashMap<String, Vec<ConstScalar>> = HashMap::new();
     let mut param_array_elem_tys: HashMap<String, IrType> = HashMap::new();
