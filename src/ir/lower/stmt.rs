@@ -18,6 +18,67 @@ use super::core::*;
 use super::ctx::{BlockUseGuard, CharKind, HiddenResultAbi, LocalInfo, LowerCtx};
 use super::helpers::coerce_to_type;
 
+fn is_unlimited_polymorphic_local(info: &LocalInfo) -> bool {
+    info.is_class && info.derived_type.is_none()
+}
+
+fn class_star_intrinsic_source_ir_type(
+    ctx: &LowerCtx,
+    source_expr: &SpannedExpr,
+) -> Option<IrType> {
+    let ti = operator_expr_type_info(
+        source_expr,
+        Some(&ctx.locals),
+        ctx.st,
+        Some(ctx.type_layouts),
+    )?;
+    if matches!(ti, crate::sema::symtab::TypeInfo::Character { .. })
+        || intrinsic_class_star_type_tag_for_type_info(&ti).is_none()
+    {
+        return None;
+    }
+    Some(type_info_to_ir_type(&ti))
+}
+
+fn class_star_intrinsic_source_tag_value(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    source_expr: &SpannedExpr,
+) -> Option<ValueId> {
+    intrinsic_class_star_type_tag_value_for_expr(
+        b,
+        source_expr,
+        Some(&ctx.locals),
+        ctx.st,
+        Some(ctx.type_layouts),
+    )
+}
+
+fn emit_scalar_class_star_char_source_copy_on_success(
+    b: &mut FuncBuilder,
+    stat_addr: ValueId,
+    dest_desc: ValueId,
+    src_ptr: ValueId,
+    src_len: ValueId,
+) {
+    let stat = b.load_typed(stat_addr, IrType::Int(IntWidth::I32));
+    let zero = b.const_i32(0);
+    let ok = b.icmp(CmpOp::Eq, stat, zero);
+    let copy_bb = b.create_block("alloc_class_star_char_source_copy");
+    let done_bb = b.create_block("alloc_class_star_char_source_copy_done");
+    b.cond_branch(ok, copy_bb, vec![], done_bb, vec![]);
+
+    b.set_block(copy_bb);
+    let dest_base = b.load_typed(dest_desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    b.call(
+        FuncRef::External("memcpy".into()),
+        vec![dest_base, src_ptr, src_len],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+    b.branch(done_bb, vec![]);
+    b.set_block(done_bb);
+}
+
 pub(crate) fn lower_stmts(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmts: &[SpannedStmt]) {
     for stmt in stmts {
         // Labeled statements and labeled CONTINUEs create new basic blocks; they must be
@@ -5956,6 +6017,10 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         }
                         if field.size == 384 && (field.allocatable || field.pointer) {
                             let elem_ty = field_storage_ir_type(&field, ctx.type_layouts);
+                            let field_is_class_star = matches!(
+                                &field.type_info,
+                                crate::sema::symtab::TypeInfo::ClassStar
+                            );
                             let bounds = lower_alloc_bounds_list(b, ctx, args);
                             let rank = bounds.len();
                             let field_info = LocalInfo {
@@ -5970,7 +6035,11 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 inline_const: None,
                                 is_pointer: field.pointer,
                                 runtime_dim_upper: vec![],
-                                is_class: false,
+                                is_class: matches!(
+                                    &field.type_info,
+                                    crate::sema::symtab::TypeInfo::Class(_)
+                                        | crate::sema::symtab::TypeInfo::ClassStar
+                                ),
                                 logical_kind: None,
                                 last_dim_assumed_size: false,
                             };
@@ -5988,6 +6057,20 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             } else {
                                 None
                             };
+                            let source_intrinsic_elem_ty =
+                                if field_is_class_star && source_desc.is_none() {
+                                    source_expr.and_then(|expr| {
+                                        class_star_intrinsic_source_ir_type(ctx, expr)
+                                    })
+                                } else {
+                                    None
+                                };
+                            let source_char_elem_size =
+                                if field_is_class_star && rank == 0 && source_char.is_some() {
+                                    char_alloc_len
+                                } else {
+                                    None
+                                };
                             let dynamic_layout = source_scalar_layout
                                 .or(mold_static_layout)
                                 .or(typed_layout)
@@ -6029,15 +6112,22 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             };
                             let elem_size_bytes = dynamic_layout
                                 .map(|layout| layout.size as i64)
+                                .or_else(|| {
+                                    source_intrinsic_elem_ty
+                                        .as_ref()
+                                        .map(|ty| ir_scalar_byte_size(ty, ctx.layout))
+                                })
                                 .unwrap_or_else(|| {
                                     descriptor_element_size_bytes(&field_info, ctx.layout)
                                 });
-                            let es = allocated_array_elem_size(
-                                b,
-                                &field_info,
-                                elem_size_bytes,
-                                char_alloc_len,
-                            );
+                            let es = source_char_elem_size.unwrap_or_else(|| {
+                                allocated_array_elem_size(
+                                    b,
+                                    &field_info,
+                                    elem_size_bytes,
+                                    char_alloc_len,
+                                )
+                            });
                             let one_i64 = b.const_i64(1);
                             let dim_buf = if rank == 0 {
                                 b.const_i64(0)
@@ -6126,21 +6216,29 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         ctx.st,
                                         Some(ctx.type_layouts),
                                     ) {
+                                        let init_ty =
+                                            source_intrinsic_elem_ty.as_ref().unwrap_or(&elem_ty);
                                         let dest_base = b.load_typed(
                                             field_ptr,
-                                            IrType::Ptr(Box::new(elem_ty.clone())),
+                                            IrType::Ptr(Box::new(init_ty.clone())),
                                         );
                                         emit_scalar_allocate_source_init_on_success(
                                             b,
                                             ctx,
                                             stat_addr,
                                             dest_base,
-                                            &elem_ty,
+                                            init_ty,
                                             source_scalar_type
                                                 .as_deref()
                                                 .or(field_derived_type_name(&field).as_deref()),
                                             source_expr,
                                         );
+                                    } else if field_is_class_star {
+                                        if let Some((src_ptr, src_len)) = source_char {
+                                            emit_scalar_class_star_char_source_copy_on_success(
+                                                b, stat_addr, field_ptr, src_ptr, src_len,
+                                            );
+                                        }
                                     }
                                 }
                             } else if let Some(source_expr) = source_expr {
@@ -6151,12 +6249,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     ctx.st,
                                     Some(ctx.type_layouts),
                                 ) {
+                                    let init_ty =
+                                        source_intrinsic_elem_ty.as_ref().unwrap_or(&elem_ty);
                                     emit_array_allocate_scalar_source_init_on_success(
                                         b,
                                         ctx,
                                         stat_addr,
                                         field_ptr,
-                                        &elem_ty,
+                                        init_ty,
                                         source_scalar_type
                                             .as_deref()
                                             .or(field_derived_type_name(&field).as_deref()),
@@ -6184,13 +6284,24 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     if source_desc.is_some() || mold_metadata_desc.is_some() {
                                         None
                                     } else if let Some(source_expr) = source_expr {
-                                        expr_type_tag_value(
-                                            b,
-                                            source_expr,
-                                            Some(&ctx.locals),
-                                            ctx.st,
-                                            ctx.type_layouts,
-                                        )
+                                        (if field_is_class_star {
+                                            class_star_intrinsic_source_tag_value(
+                                                b,
+                                                ctx,
+                                                source_expr,
+                                            )
+                                        } else {
+                                            None
+                                        })
+                                        .or_else(|| {
+                                            expr_type_tag_value(
+                                                b,
+                                                source_expr,
+                                                Some(&ctx.locals),
+                                                ctx.st,
+                                                ctx.type_layouts,
+                                            )
+                                        })
                                         .or_else(|| {
                                             static_alloc_target_type_tag_value(
                                                 b,
@@ -6377,6 +6488,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             local_storage_size_bytes(&info, ctx.type_layouts, ctx.layout);
 
                         if info.allocatable || info.descriptor_arg {
+                            let local_is_class_star = is_unlimited_polymorphic_local(&info);
                             let bounds = lower_alloc_bounds_list(b, ctx, args);
                             let rank = bounds.len();
                             let source_scalar_layout = if source_desc.is_none() {
@@ -6393,6 +6505,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             } else {
                                 None
                             };
+                            let source_intrinsic_elem_ty =
+                                if local_is_class_star && source_desc.is_none() {
+                                    source_expr.and_then(|expr| {
+                                        class_star_intrinsic_source_ir_type(ctx, expr)
+                                    })
+                                } else {
+                                    None
+                                };
                             let dynamic_layout = source_scalar_layout
                                 .or(mold_static_layout)
                                 .or(typed_layout)
@@ -6426,6 +6546,12 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             } else {
                                 None
                             };
+                            let source_char_elem_size =
+                                if local_is_class_star && rank == 0 && source_char.is_some() {
+                                    char_alloc_len
+                                } else {
+                                    None
+                                };
                             // Build a stack DimDescriptor[rank] honoring
                             // each subscript's actual (lower, upper) bounds,
                             // then call afs_allocate_array. Descriptor-backed
@@ -6438,9 +6564,15 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 &info,
                                 dynamic_layout
                                     .map(|layout| layout.size as i64)
+                                    .or_else(|| {
+                                        source_intrinsic_elem_ty
+                                            .as_ref()
+                                            .map(|ty| ir_scalar_byte_size(ty, ctx.layout))
+                                    })
                                     .unwrap_or(elem_size_bytes),
                                 char_alloc_len,
                             );
+                            let es = source_char_elem_size.unwrap_or(es);
                             let desc = array_descriptor_addr(b, &info);
                             let one_i64 = b.const_i64(1);
                             let dim_buf = if rank == 0 {
@@ -6530,21 +6662,29 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         ctx.st,
                                         Some(ctx.type_layouts),
                                     ) {
+                                        let init_ty =
+                                            source_intrinsic_elem_ty.as_ref().unwrap_or(&info.ty);
                                         let dest_base = b.load_typed(
                                             desc,
-                                            IrType::Ptr(Box::new(info.ty.clone())),
+                                            IrType::Ptr(Box::new(init_ty.clone())),
                                         );
                                         emit_scalar_allocate_source_init_on_success(
                                             b,
                                             ctx,
                                             stat_addr,
                                             dest_base,
-                                            &info.ty,
+                                            init_ty,
                                             source_scalar_type
                                                 .as_deref()
                                                 .or(info.derived_type.as_deref()),
                                             source_expr,
                                         );
+                                    } else if local_is_class_star {
+                                        if let Some((src_ptr, src_len)) = source_char {
+                                            emit_scalar_class_star_char_source_copy_on_success(
+                                                b, stat_addr, desc, src_ptr, src_len,
+                                            );
+                                        }
                                     }
                                 }
                             } else if let Some(source_expr) = source_expr {
@@ -6555,12 +6695,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     ctx.st,
                                     Some(ctx.type_layouts),
                                 ) {
+                                    let init_ty =
+                                        source_intrinsic_elem_ty.as_ref().unwrap_or(&info.ty);
                                     emit_array_allocate_scalar_source_init_on_success(
                                         b,
                                         ctx,
                                         stat_addr,
                                         desc,
-                                        &info.ty,
+                                        init_ty,
                                         source_scalar_type
                                             .as_deref()
                                             .or(info.derived_type.as_deref()),
@@ -6590,13 +6732,24 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     if source_desc.is_some() || mold_metadata_desc.is_some() {
                                         None
                                     } else if let Some(source_expr) = source_expr {
-                                        expr_type_tag_value(
-                                            b,
-                                            source_expr,
-                                            Some(&ctx.locals),
-                                            ctx.st,
-                                            ctx.type_layouts,
-                                        )
+                                        (if local_is_class_star {
+                                            class_star_intrinsic_source_tag_value(
+                                                b,
+                                                ctx,
+                                                source_expr,
+                                            )
+                                        } else {
+                                            None
+                                        })
+                                        .or_else(|| {
+                                            expr_type_tag_value(
+                                                b,
+                                                source_expr,
+                                                Some(&ctx.locals),
+                                                ctx.st,
+                                                ctx.type_layouts,
+                                            )
+                                        })
                                         .or_else(|| {
                                             static_alloc_target_type_tag_value(
                                                 b,

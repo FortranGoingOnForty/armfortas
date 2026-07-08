@@ -232,7 +232,7 @@ pub(crate) fn alloc_decls(
                                 .as_ref()
                                 .map(|specs| vec![None; specs.len()])
                                 .unwrap_or_default(),
-                            is_class: false,
+                            is_class: matches!(type_spec, TypeSpec::Class(_) | TypeSpec::ClassStar),
                             logical_kind: None,
                             last_dim_assumed_size: false,
                         },
@@ -278,40 +278,38 @@ pub(crate) fn alloc_decls(
                     }
                 }
                 if is_pointer_attr
-                    && matches!(type_spec, TypeSpec::Class(_))
+                    && matches!(type_spec, TypeSpec::Class(_) | TypeSpec::ClassStar)
                     && array_spec.is_none()
                 {
-                    if let TypeSpec::Class(_) = type_spec {
-                        let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384);
-                        let addr = b.alloca(desc_ty);
-                        let zero = b.const_i32(0);
-                        let size384 = b.const_i64(384);
-                        b.call(
-                            FuncRef::External("memset".into()),
-                            vec![addr, zero, size384],
-                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                        );
-                        locals.insert(
-                            key,
-                            LocalInfo {
-                                addr,
-                                ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                                dims: vec![],
-                                allocatable: false,
-                                descriptor_arg: true,
-                                by_ref: false,
-                                char_kind: CharKind::None,
-                                derived_type: declared_derived_info_name.clone(),
-                                inline_const: None,
-                                is_pointer: true,
-                                runtime_dim_upper: vec![],
-                                is_class: true,
-                                logical_kind: None,
-                                last_dim_assumed_size: false,
-                            },
-                        );
-                        continue;
-                    }
+                    let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384);
+                    let addr = b.alloca(desc_ty);
+                    let zero = b.const_i32(0);
+                    let size384 = b.const_i64(384);
+                    b.call(
+                        FuncRef::External("memset".into()),
+                        vec![addr, zero, size384],
+                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                    );
+                    locals.insert(
+                        key,
+                        LocalInfo {
+                            addr,
+                            ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                            dims: vec![],
+                            allocatable: false,
+                            descriptor_arg: true,
+                            by_ref: false,
+                            char_kind: CharKind::None,
+                            derived_type: declared_derived_info_name.clone(),
+                            inline_const: None,
+                            is_pointer: true,
+                            runtime_dim_upper: vec![],
+                            is_class: true,
+                            logical_kind: None,
+                            last_dim_assumed_size: false,
+                        },
+                    );
+                    continue;
                 }
                 if is_deferred_char && (is_allocatable || is_pointer_attr) && array_spec.is_none() {
                     // Deferred-length allocatable/pointer scalar character:
@@ -876,7 +874,7 @@ pub(crate) fn alloc_decls(
                                 .as_ref()
                                 .map(|specs| vec![None; specs.len()])
                                 .unwrap_or_default(),
-                            is_class: matches!(type_spec, TypeSpec::Class(_)),
+                            is_class: matches!(type_spec, TypeSpec::Class(_) | TypeSpec::ClassStar),
                             logical_kind: if let TypeSpec::Logical(sel) = type_spec {
                                 Some(extract_kind_with_context(
                                     sel,
