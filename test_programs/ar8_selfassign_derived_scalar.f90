@@ -1,5 +1,5 @@
-! CHECK: self= T alpha
-! CHECK: elem= T beta
+! CHECK: self=T alpha
+! CHECK: elem=T beta
 ! CHECK: ok
 ! OPT_EQ: O0,O1,O2,O3,Os,Ofast => stdout|stderr|exit
 program ar8_selfassign_derived_scalar
