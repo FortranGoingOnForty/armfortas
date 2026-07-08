@@ -45664,16 +45664,54 @@ pub(super) fn lower_1d_section_assign(
         None
     };
 
-    if src_desc.is_some()
-        && dest_info.derived_type.is_none()
-        && dest_info.char_kind == CharKind::None
-        && !descriptor_backed_runtime_char_array(dest_info)
-    {
+    let mut src_snapshot: Option<(ValueId, Option<String>)> = None;
+    if let Some((desc, ty)) = src_desc.take() {
         // Assignment evaluates the RHS before defining the LHS. Snapshot array
         // RHS descriptors so overlapping section assignments such as
         // `x(5:2:-1) = x(2:5)` do not stream through clobbered source slots.
-        if let Some((desc, ty)) = src_desc.take() {
-            let tmp_desc = allocate_like_array_temp_descriptor_with_elem_type(b, desc, &ty);
+        let tmp_desc = if dest_info.derived_type.is_some()
+            || dest_info.char_kind != CharKind::None
+            || descriptor_backed_runtime_char_array(dest_info)
+        {
+            allocate_like_array_temp_descriptor(b, desc)
+        } else {
+            allocate_like_array_temp_descriptor_with_elem_type(b, desc, &ty)
+        };
+        if let Some(type_name) = dest_info.derived_type.as_deref() {
+            if let Some(layout) = ctx.type_layouts.get(type_name).cloned() {
+                let tmp_base =
+                    b.load_typed(tmp_desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                let tmp_n = b.call(
+                    FuncRef::External("afs_array_size".into()),
+                    vec![tmp_desc],
+                    IrType::Int(IntWidth::I64),
+                );
+                if derived_layout_needs_runtime_initialization(&layout, ctx.type_layouts) {
+                    initialize_derived_array_storage_dynamic(
+                        b,
+                        tmp_base,
+                        &layout,
+                        tmp_n,
+                        ctx.type_layouts,
+                    );
+                }
+                let tmp_stride = load_array_desc_i64_field(b, tmp_desc, 24 + 16);
+                lower_derived_array_copy_from_desc(
+                    b, ctx, type_name, tmp_base, tmp_n, tmp_stride, desc,
+                );
+                src_snapshot = Some((tmp_desc, Some(type_name.to_string())));
+            } else {
+                let stat = b.alloca(IrType::Int(IntWidth::I32));
+                let zero = b.const_i32(0);
+                b.store(zero, stat);
+                b.call(
+                    FuncRef::External("afs_copy_array_data".into()),
+                    vec![tmp_desc, desc, stat],
+                    IrType::Void,
+                );
+                src_snapshot = Some((tmp_desc, None));
+            }
+        } else {
             let stat = b.alloca(IrType::Int(IntWidth::I32));
             let zero = b.const_i32(0);
             b.store(zero, stat);
@@ -45682,8 +45720,10 @@ pub(super) fn lower_1d_section_assign(
                 vec![tmp_desc, desc, stat],
                 IrType::Void,
             );
-            src_desc = Some((tmp_desc, ty));
+            src_snapshot = Some((tmp_desc, None));
         }
+        deallocate_array_expr_descriptor_if_temp(b, &ctx.locals, value, ctx.st, desc);
+        src_desc = Some((tmp_desc, ty));
     }
 
     let src_n = src_desc.as_ref().map(|(desc, _)| {
@@ -45696,7 +45736,20 @@ pub(super) fn lower_1d_section_assign(
 
     if let Some(type_name) = dest_info.derived_type.as_deref() {
         let dest_base = b.load_typed(dest_desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
-        lower_derived_array_copy_loop(b, ctx, type_name, dest_base, dest_n, dest_stride, value);
+        if let Some((desc, _)) = src_desc {
+            lower_derived_array_copy_from_desc(
+                b,
+                ctx,
+                type_name,
+                dest_base,
+                dest_n,
+                dest_stride,
+                desc,
+            );
+            deallocate_section_snapshot_descriptor(b, ctx.type_layouts, src_snapshot);
+        } else {
+            lower_derived_array_copy_loop(b, ctx, type_name, dest_base, dest_n, dest_stride, value);
+        }
         return true;
     }
 
@@ -45840,7 +45893,34 @@ pub(super) fn lower_1d_section_assign(
     b.branch(bb_check, vec![]);
 
     b.set_block(bb_exit);
+    deallocate_section_snapshot_descriptor(b, ctx.type_layouts, src_snapshot);
     true
+}
+
+fn deallocate_section_snapshot_descriptor(
+    b: &mut FuncBuilder,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+    snapshot: Option<(ValueId, Option<String>)>,
+) {
+    let Some((desc, derived_type)) = snapshot else {
+        return;
+    };
+    if let Some(type_name) = derived_type {
+        if let Some(layout) = type_layouts.get(&type_name) {
+            let stat = b.alloca(IrType::Int(IntWidth::I32));
+            let zero = b.const_i32(0);
+            b.store(zero, stat);
+            deallocate_derived_descriptor_components(b, desc, layout, type_layouts, stat);
+            b.store(zero, stat);
+            b.call(
+                FuncRef::External("afs_deallocate_array".into()),
+                vec![desc, stat],
+                IrType::Void,
+            );
+            return;
+        }
+    }
+    deallocate_array_temp_descriptor(b, desc);
 }
 
 pub(super) fn loop_indexed_array_ref(
