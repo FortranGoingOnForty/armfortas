@@ -2346,6 +2346,15 @@ fn quote_namelist_char(s: &str) -> String {
     format!("'{}'", s.trim_end().replace('\'', "''"))
 }
 
+fn remember_io_status(status: &mut i32, result: io::Result<()>) {
+    if *status != 0 {
+        return;
+    }
+    if let Err(e) = result {
+        *status = e.raw_os_error().unwrap_or(1);
+    }
+}
+
 /// Write a NAMELIST group to a unit.
 /// Format: &GROUPNAME var=val, var=val, ... /
 #[no_mangle]
@@ -2355,11 +2364,13 @@ pub extern "C" fn afs_write_namelist(
     group_name_len: i64,
     entries: *const NamelistEntry,
     n_entries: i32,
+    iostat: *mut i32,
 ) {
     let gname = unsafe_str(group_name, group_name_len);
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+    let mut status = 0;
     if let Some(u) = state.get_unit(unit) {
-        let _ = u.write_str(&format!(" &{}", gname.to_uppercase()));
+        remember_io_status(&mut status, u.write_str(&format!(" &{}", gname.to_uppercase())));
 
         if !entries.is_null() && n_entries > 0 {
             let slice = unsafe { std::slice::from_raw_parts(entries, n_entries as usize) };
@@ -2369,13 +2380,25 @@ pub extern "C" fn afs_write_namelist(
                 let val_str = match entry.data_type {
                     0 => {
                         // integer
-                        let v = unsafe { *(entry.data as *const i32) };
-                        format!("{}", v)
+                        let elem_count = entry.elem_count.max(1) as usize;
+                        let mut values = Vec::with_capacity(elem_count);
+                        for elem in 0..elem_count {
+                            let ptr = unsafe { entry.data.add(elem * std::mem::size_of::<i32>()) };
+                            let v = unsafe { *(ptr as *const i32) };
+                            values.push(format!("{}", v));
+                        }
+                        values.join(",")
                     }
                     1 => {
                         // real
-                        let v = unsafe { *(entry.data as *const f64) };
-                        format!("{}", v)
+                        let elem_count = entry.elem_count.max(1) as usize;
+                        let mut values = Vec::with_capacity(elem_count);
+                        for elem in 0..elem_count {
+                            let ptr = unsafe { entry.data.add(elem * std::mem::size_of::<f64>()) };
+                            let v = unsafe { *(ptr as *const f64) };
+                            values.push(format!("{}", v));
+                        }
+                        values.join(",")
                     }
                     2 => {
                         // string
@@ -2391,8 +2414,14 @@ pub extern "C" fn afs_write_namelist(
                     }
                     3 => {
                         // logical
-                        let v = unsafe { *(entry.data as *const i32) };
-                        (if v != 0 { ".TRUE." } else { ".FALSE." }).to_string()
+                        let elem_count = entry.elem_count.max(1) as usize;
+                        let mut values = Vec::with_capacity(elem_count);
+                        for elem in 0..elem_count {
+                            let ptr = unsafe { entry.data.add(elem * std::mem::size_of::<i32>()) };
+                            let v = unsafe { *(ptr as *const i32) };
+                            values.push((if v != 0 { ".TRUE." } else { ".FALSE." }).to_string());
+                        }
+                        values.join(",")
                     }
                     4 => {
                         // deferred-length string descriptor
@@ -2403,16 +2432,31 @@ pub extern "C" fn afs_write_namelist(
                     }
                     5 => {
                         // bool-backed logical
-                        let v = unsafe { *(entry.data as *const u8) } != 0;
-                        (if v { ".TRUE." } else { ".FALSE." }).to_string()
+                        let elem_count = entry.elem_count.max(1) as usize;
+                        let mut values = Vec::with_capacity(elem_count);
+                        for elem in 0..elem_count {
+                            let v = unsafe { *entry.data.add(elem) } != 0;
+                            values.push((if v { ".TRUE." } else { ".FALSE." }).to_string());
+                        }
+                        values.join(",")
                     }
                     _ => "???".to_string(),
                 };
-                let _ = u.write_str(&format!("{} {}={}", sep, name.to_uppercase(), val_str));
+                remember_io_status(
+                    &mut status,
+                    u.write_str(&format!("{} {}={}", sep, name.to_uppercase(), val_str)),
+                );
             }
         }
-        let _ = u.write_str(" /\n");
-        let _ = u.flush();
+        remember_io_status(&mut status, u.write_str(" /\n"));
+        remember_io_status(&mut status, u.flush());
+    } else {
+        status = 1;
+    }
+    if !iostat.is_null() {
+        unsafe {
+            *iostat = status;
+        }
     }
 }
 
@@ -2602,7 +2646,7 @@ fn namelist_assign_from_text(
                 if ename == var_name {
                     namelist_assign_value(entry, actual_val, array_index, repeat_count);
                     let next_index = array_index.unwrap_or(1).saturating_add(repeat_count);
-                    if entry.data_type == 2 && next_index <= entry.elem_count.max(1) as usize {
+                    if next_index <= entry.elem_count.max(1) as usize {
                         continuation = Some(Continuation::Array {
                             entry_index,
                             next_index,

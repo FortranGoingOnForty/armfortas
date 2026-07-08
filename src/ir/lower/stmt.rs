@@ -1174,6 +1174,14 @@ fn lower_namelist_write_stmt(
     let Some(group_name) = namelist_group_name(nml_ctrl) else {
         lower_stmt_error(nml_ctrl.value.span, "NML= must name a NAMELIST group");
     };
+    if let Some(ctrl) = controls.first() {
+        if namelist_internal_io_buffer(b, ctx, ctrl).is_some() {
+            lower_stmt_error(
+                ctrl.value.span,
+                "internal NAMELIST WRITE is not implemented; write to an external unit",
+            );
+        }
+    }
     let (entries, n_entries) = lower_namelist_entries(b, ctx, &group_name, nml_ctrl.value.span);
     let group_ptr = b.const_string(group_name.as_bytes());
     let group_len = b.const_i64(group_name.len() as i64);
@@ -1181,7 +1189,7 @@ fn lower_namelist_write_stmt(
     lower_external_io_pos_seek(b, ctx, controls, unit, iostat_ptr);
     b.call(
         FuncRef::External("afs_write_namelist".into()),
-        vec![unit, group_ptr, group_len, entries, n_entries],
+        vec![unit, group_ptr, group_len, entries, n_entries, iostat_ptr],
         IrType::Void,
     );
     true
