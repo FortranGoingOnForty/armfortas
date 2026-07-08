@@ -4493,6 +4493,13 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                     }
                 }
             }
+            if io_status != 0 && c.iostat.is_null() {
+                eprintln!(
+                    "Fortran runtime error: {}",
+                    io_msg.unwrap_or("formatted I/O error")
+                );
+                std::process::exit(2);
+            }
         }
     });
 }
