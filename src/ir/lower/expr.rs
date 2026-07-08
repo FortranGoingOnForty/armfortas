@@ -1057,12 +1057,7 @@ pub(crate) fn lower_expr_full(
                 (BinaryOp::Div, IrType::Int(_)) => b.idiv(lhs, rhs),
                 (BinaryOp::Div, IrType::Float(_)) => b.fdiv(lhs, rhs),
                 (BinaryOp::Pow, IrType::Float(_)) => b.fpow(lhs, rhs),
-                (BinaryOp::Pow, IrType::Int(_)) => {
-                    let fl = b.int_to_float(lhs, FloatWidth::F64);
-                    let fr = b.int_to_float(rhs, FloatWidth::F64);
-                    let result = b.fpow(fl, fr);
-                    b.float_to_int(result, IntWidth::I32)
-                }
+                (BinaryOp::Pow, IrType::Int(width)) => lower_integer_pow(b, lhs, rhs, *width),
                 (BinaryOp::Eq, IrType::Int(_)) => b.icmp(CmpOp::Eq, lhs, rhs),
                 (BinaryOp::Eq, IrType::Float(_)) => b.fcmp(CmpOp::Eq, lhs, rhs),
                 (BinaryOp::Ne, IrType::Int(_)) => b.icmp(CmpOp::Ne, lhs, rhs),

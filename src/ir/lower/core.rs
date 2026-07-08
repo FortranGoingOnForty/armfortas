@@ -25817,6 +25817,76 @@ pub(super) fn lower_complex_pow_lanes(
     (b.fmul(magnitude, angle_cos), b.fmul(magnitude, angle_sin))
 }
 
+pub(super) fn lower_integer_pow(
+    b: &mut FuncBuilder,
+    base: ValueId,
+    exponent: ValueId,
+    width: IntWidth,
+) -> ValueId {
+    let ty = IrType::Int(width);
+    let zero = b.const_int(0, width);
+    let one = b.const_int(1, width);
+    let neg_one = b.const_int(-1, width);
+    let two = b.const_int(2, width);
+
+    let result_addr = b.alloca(ty.clone());
+    let base_addr = b.alloca(ty.clone());
+    let counter_addr = b.alloca(ty);
+
+    let is_negative = b.icmp(CmpOp::Lt, exponent, zero);
+    let bb_negative = b.create_block("integer_pow_negative");
+    let bb_nonnegative = b.create_block("integer_pow_nonnegative");
+    let bb_check = b.create_block("integer_pow_check");
+    let bb_body = b.create_block("integer_pow_body");
+    let bb_exit = b.create_block("integer_pow_exit");
+    b.cond_branch(
+        is_negative,
+        bb_negative,
+        vec![],
+        bb_nonnegative,
+        vec![],
+    );
+
+    b.set_block(bb_negative);
+    let is_one = b.icmp(CmpOp::Eq, base, one);
+    let is_neg_one = b.icmp(CmpOp::Eq, base, neg_one);
+    let exp_rem = b.imod(exponent, two);
+    let exp_even = b.icmp(CmpOp::Eq, exp_rem, zero);
+    let neg_one_result = b.select(exp_even, one, neg_one);
+    let unit_result = b.select(is_neg_one, neg_one_result, zero);
+    let negative_result = b.select(is_one, one, unit_result);
+    b.store(negative_result, result_addr);
+    b.branch(bb_exit, vec![]);
+
+    b.set_block(bb_nonnegative);
+    b.store(one, result_addr);
+    b.store(base, base_addr);
+    b.store(exponent, counter_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let counter = b.load(counter_addr);
+    let still_positive = b.icmp(CmpOp::Gt, counter, zero);
+    b.cond_branch(still_positive, bb_body, vec![], bb_exit, vec![]);
+
+    b.set_block(bb_body);
+    let cur_result = b.load(result_addr);
+    let cur_base = b.load(base_addr);
+    let rem = b.imod(counter, two);
+    let is_odd = b.icmp(CmpOp::Ne, rem, zero);
+    let multiplied = b.imul(cur_result, cur_base);
+    let next_result = b.select(is_odd, multiplied, cur_result);
+    b.store(next_result, result_addr);
+    let next_counter = b.idiv(counter, two);
+    b.store(next_counter, counter_addr);
+    let next_base = b.imul(cur_base, cur_base);
+    b.store(next_base, base_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
+    b.load(result_addr)
+}
+
 pub(super) fn lower_complex_integer_pow_lanes(
     b: &mut FuncBuilder,
     fw: FloatWidth,
@@ -42787,16 +42857,7 @@ pub(super) fn lower_rank1_numeric_array_binary_descriptor(
             (IrType::Int(_), BinaryOp::Sub) => b.isub(lhs_val, rhs_val),
             (IrType::Int(_), BinaryOp::Mul) => b.imul(lhs_val, rhs_val),
             (IrType::Int(_), BinaryOp::Div) => b.idiv(lhs_val, rhs_val),
-            (IrType::Int(_), BinaryOp::Pow) => {
-                let fl = b.int_to_float(lhs_val, FloatWidth::F64);
-                let fr = b.int_to_float(rhs_val, FloatWidth::F64);
-                let res = b.fpow(fl, fr);
-                let iw = match &elem_ty {
-                    IrType::Int(w) => *w,
-                    _ => IntWidth::I32,
-                };
-                b.float_to_int(res, iw)
-            }
+            (IrType::Int(width), BinaryOp::Pow) => lower_integer_pow(b, lhs_val, rhs_val, *width),
             (IrType::Float(_), BinaryOp::Add) => b.fadd(lhs_val, rhs_val),
             (IrType::Float(_), BinaryOp::Sub) => b.fsub(lhs_val, rhs_val),
             (IrType::Float(_), BinaryOp::Mul) => b.fmul(lhs_val, rhs_val),
