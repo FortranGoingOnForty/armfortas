@@ -2717,11 +2717,12 @@ pub(super) fn common_slot_symbol(block: &str, slot_idx: usize) -> String {
     format!("afs_common_{}_{}", block, slot_idx)
 }
 
-/// The IR storage type and char kind for a COMMON member. Character
-/// members need inline byte storage (`[i8 x N]`) so storage association
-/// works — a plain `arg_type_from_decls` would give `Ptr<i8>`, i.e. an
-/// 8-byte pointer slot, and every read came back length 0 (silently
-/// empty). Mirrors a normal fixed-length character local.
+/// The IR element storage type and char kind for a COMMON member.
+/// Character members need inline byte storage (`[i8 x N]`) so storage
+/// association works — a plain `arg_type_from_decls` would give
+/// `Ptr<i8>`, i.e. an 8-byte pointer slot, and every read came back
+/// length 0 (silently empty). Mirrors a normal fixed-length character
+/// local.
 pub(super) fn common_member_storage(
     var: &str,
     decls: &[crate::ast::decl::SpannedDecl],
@@ -2731,6 +2732,43 @@ pub(super) fn common_member_storage(
     match arg_char_kind_from_decls(&key, decls, st) {
         CharKind::Fixed(len) => (fixed_char_storage_ir_type(len), CharKind::Fixed(len)),
         _ => (arg_type_from_decls(&key, decls, Some(st)), CharKind::None),
+    }
+}
+
+struct CommonMemberInfo {
+    elem_ty: IrType,
+    storage_ty: IrType,
+    char_kind: CharKind,
+    dims: Vec<(i64, i64)>,
+    logical_kind: Option<u8>,
+}
+
+fn common_member_info(
+    var: &str,
+    decls: &[crate::ast::decl::SpannedDecl],
+    st: &SymbolTable,
+) -> CommonMemberInfo {
+    let key = var.to_lowercase();
+    let (elem_ty, char_kind) = common_member_storage(&key, decls, st);
+    let dims = arg_dims_from_decls(&key, decls, &HashMap::new(), st);
+    let storage_ty = if dims.is_empty() {
+        elem_ty.clone()
+    } else {
+        let total_elems = dims
+            .iter()
+            .map(|(_, extent)| (*extent).max(0))
+            .product::<i64>()
+            .max(1);
+        IrType::Array(Box::new(elem_ty.clone()), total_elems as u64)
+    };
+    let param_consts = collect_decl_param_consts_with_scope(decls, &HashMap::new(), st);
+    let logical_kind = arg_logical_kind_from_decls(&key, decls, Some(&param_consts), st);
+    CommonMemberInfo {
+        elem_ty,
+        storage_ty,
+        char_kind,
+        dims,
+        logical_kind,
     }
 }
 
@@ -2753,10 +2791,10 @@ pub(super) fn collect_and_emit_common_globals(
                         continue;
                     }
                     emitted.insert(symbol.clone());
-                    let (elem_ty, _) = common_member_storage(var, decls, st);
+                    let member = common_member_info(var, decls, st);
                     module.add_global(Global {
                         name: symbol,
-                        ty: elem_ty,
+                        ty: member.storage_ty,
                         initializer: Some(GlobalInit::Zero),
                     });
                 }
@@ -2813,24 +2851,24 @@ pub(super) fn install_common_locals(
                     continue;
                 }
                 let symbol = common_slot_symbol(&block_name, slot_idx);
-                let (elem_ty, char_kind) = common_member_storage(&key, decls, st);
-                let addr = b.global_addr(&symbol, elem_ty.clone());
+                let member = common_member_info(&key, decls, st);
+                let addr = b.global_addr(&symbol, member.elem_ty.clone());
                 locals.insert(
                     key,
                     LocalInfo {
                         addr,
-                        ty: elem_ty,
-                        dims: vec![],
+                        ty: member.elem_ty,
+                        dims: member.dims,
                         allocatable: false,
                         descriptor_arg: false,
                         by_ref: false,
-                        char_kind,
+                        char_kind: member.char_kind,
                         derived_type: None,
                         inline_const: None,
                         is_pointer: false,
                         runtime_dim_upper: vec![],
                         is_class: false,
-                        logical_kind: None,
+                        logical_kind: member.logical_kind,
                         last_dim_assumed_size: false,
                     },
                 );

@@ -619,3 +619,50 @@ end program commontu
         out
     );
 }
+
+/// COMMON array members occupy the full declared storage slot across
+/// translation units. Element access, whole-array reads, and following
+/// members must all agree after the linker merges the .comm symbol.
+#[test]
+fn cross_tu_common_array_member_layout() {
+    let wb = Workbench::new("commonarraytu");
+    let writer = wb.fortran_obj(
+        "writer",
+        r#"
+subroutine fill_shared_array()
+  implicit none
+  integer(4) :: ia(3), tail
+  common /sharedarr/ ia, tail
+  ia(1) = 7
+  ia(2) = 8
+  ia(3) = 9
+  tail = 33
+end subroutine fill_shared_array
+"#,
+    );
+    let reader = wb.fortran_obj(
+        "main",
+        r#"
+program commonarraytu
+  implicit none
+  integer(4) :: nums(3), marker
+  common /sharedarr/ nums, marker
+  call fill_shared_array()
+  print *, nums(1), nums(2), nums(3)
+  print *, sum(nums), marker
+end program commonarraytu
+"#,
+    );
+    let out = wb.link_and_run("commonarraytu_bin", &[&reader, &writer]);
+    let lines: Vec<String> = out
+        .lines()
+        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect();
+    assert_eq!(
+        lines,
+        vec!["7 8 9", "24 33"],
+        "cross-TU COMMON array layout divergence:
+{}",
+        out
+    );
+}
