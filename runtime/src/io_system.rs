@@ -10,8 +10,12 @@
 //! - * in I/O statements → unit 5 (read) or 6 (write)
 
 use std::collections::{HashMap, VecDeque};
+use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 // ---- Global I/O state ----
@@ -23,18 +27,43 @@ fn io_state() -> &'static Mutex<IoState> {
     STATE.get_or_init(|| Mutex::new(IoState::new()))
 }
 
-fn scratch_filename(unit: i32) -> String {
+fn os_string_to_bytes(s: OsString) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        s.into_vec()
+    }
+    #[cfg(not(unix))]
+    {
+        s.to_string_lossy().into_owned().into_bytes()
+    }
+}
+
+fn path_from_filename(bytes: &[u8]) -> PathBuf {
+    #[cfg(unix)]
+    {
+        PathBuf::from(OsString::from_vec(bytes.to_vec()))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+    }
+}
+
+fn display_filename(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+fn scratch_filename(unit: i32) -> Vec<u8> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
     let dir = std::env::temp_dir();
-    dir.join(format!(
+    os_string_to_bytes(dir.join(format!(
         "afs_scratch_{pid}_{}_{seq}.tmp",
         unit.unsigned_abs()
     ))
-    .to_string_lossy()
-    .into_owned()
+    .into_os_string())
 }
 
 #[inline]
@@ -137,7 +166,7 @@ enum UnitStream {
 struct Unit {
     _number: i32,
     stream: UnitStream,
-    filename: String,
+    filename: Vec<u8>,
     _status: UnitStatus,
     access: Access,
     form: Form,
@@ -147,7 +176,7 @@ struct Unit {
     /// Buffered tokens from the current input record for list-directed READ.
     read_tokens: VecDeque<String>,
     /// Cached formatted input record for the current READ statement.
-    formatted_read_record: Option<String>,
+    formatted_read_record: Option<Vec<u8>>,
     /// Cursor within a cached formatted input record for ADVANCE='NO' reads.
     formatted_read_cursor: usize,
     /// True for STATUS='SCRATCH' units: backing file is deleted on close or exit.
@@ -230,14 +259,14 @@ impl Unit {
         self.write_bytes(s.as_bytes())
     }
 
-    fn read_line(&mut self) -> io::Result<String> {
-        let mut line = String::new();
+    fn read_line_bytes(&mut self) -> io::Result<Vec<u8>> {
+        let mut line = Vec::new();
         match &mut self.stream {
             UnitStream::Stdin => {
-                io::stdin().lock().read_line(&mut line)?;
+                io::stdin().lock().read_until(b'\n', &mut line)?;
             }
             UnitStream::FileRead(r) => {
-                r.read_line(&mut line)?;
+                r.read_until(b'\n', &mut line)?;
             }
             UnitStream::FileRaw(f) => {
                 let mut buf = [0u8; 8192];
@@ -247,7 +276,7 @@ impl Unit {
                         n => {
                             let newline_pos = buf[..n].iter().position(|&b| b == b'\n');
                             let take = newline_pos.map_or(n, |pos| pos + 1);
-                            line.extend(buf[..take].iter().map(|&b| b as char));
+                            line.extend_from_slice(&buf[..take]);
                             if let Some(pos) = newline_pos {
                                 let unread = n - (pos + 1);
                                 if unread > 0 {
@@ -267,6 +296,11 @@ impl Unit {
             }
         }
         Ok(line)
+    }
+
+    fn read_line(&mut self) -> io::Result<String> {
+        self.read_line_bytes()
+            .map(|line| String::from_utf8_lossy(&line).into_owned())
     }
 
     /// Get the next token for list-directed READ.
@@ -376,7 +410,7 @@ impl IoState {
             Unit {
                 _number: 5,
                 stream: UnitStream::Stdin,
-                filename: "stdin".into(),
+                filename: b"stdin".to_vec(),
                 _status: UnitStatus::Open,
                 access: Access::Sequential,
                 form: Form::Formatted,
@@ -396,7 +430,7 @@ impl IoState {
             Unit {
                 _number: 6,
                 stream: UnitStream::Stdout,
-                filename: "stdout".into(),
+                filename: b"stdout".to_vec(),
                 _status: UnitStatus::Open,
                 access: Access::Sequential,
                 form: Form::Formatted,
@@ -416,7 +450,7 @@ impl IoState {
             Unit {
                 _number: 0,
                 stream: UnitStream::Stderr,
-                filename: "stderr".into(),
+                filename: b"stderr".to_vec(),
                 _status: UnitStatus::Open,
                 access: Access::Sequential,
                 form: Form::Formatted,
@@ -536,7 +570,7 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
     let recl = cb.recl;
     let iostat = cb.iostat;
     let newunit = cb.newunit;
-    let missing_filename = fname.trim().is_empty();
+    let missing_filename = fname.is_empty();
 
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
 
@@ -689,7 +723,8 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
         // Drop closes the file handle.
     }
 
-    match opts.open(&fname) {
+    let open_path = path_from_filename(&fname);
+    match opts.open(&open_path) {
         Ok(file) => {
             let file_action = match effective_action {
                 "read" => Action::Read,
@@ -805,7 +840,7 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
                 // same mutex (sample-trace: pthread_mutex_firstfit_lock_wait
                 // → __psynch_mutexwait, hangs forever).
                 drop(state);
-                eprintln!("OPEN: {}: {}", fname, e);
+                eprintln!("OPEN: {}: {}", display_filename(&fname), e);
                 std::process::exit(1);
             }
         }
@@ -840,10 +875,10 @@ pub extern "C" fn afs_close_ex(unit: i32, status: *const u8, status_len: i64, io
 
         let mut close_status = 0;
         if delete
-            && !matches!(filename.as_str(), "stdin" | "stdout" | "stderr")
+            && !matches!(filename.as_slice(), b"stdin" | b"stdout" | b"stderr")
             && !filename.is_empty()
         {
-            if let Err(e) = std::fs::remove_file(&filename) {
+            if let Err(e) = std::fs::remove_file(path_from_filename(&filename)) {
                 close_status = e.raw_os_error().unwrap_or(1);
             }
         }
@@ -855,7 +890,7 @@ pub extern "C" fn afs_close_ex(unit: i32, status: *const u8, status_len: i64, io
             drop(state);
             eprintln!(
                 "CLOSE: {}: {}",
-                filename,
+                display_filename(&filename),
                 io::Error::from_raw_os_error(close_status)
             );
             std::process::exit(1);
@@ -1859,8 +1894,17 @@ fn unsafe_str(ptr: *const u8, len: i64) -> String {
     }
 }
 
-fn fortran_file_name(ptr: *const u8, len: i64) -> String {
-    unsafe_str(ptr, len).trim_end_matches(' ').to_string()
+fn fortran_file_name(ptr: *const u8, len: i64) -> Vec<u8> {
+    if ptr.is_null() || len <= 0 {
+        return Vec::new();
+    }
+    let slice = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+    let end = slice
+        .iter()
+        .rposition(|&b| b != b' ')
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    slice[..end].to_vec()
 }
 
 // ---- Direct access helpers ----
@@ -3211,14 +3255,17 @@ pub const IOSTAT_EOR: i32 = -2;
 /// Write a Fortran-style string result into a caller-provided buffer.
 /// Pads with spaces to buf_len (Fortran CHARACTER semantics).
 fn write_inquire_string(buf: *mut u8, buf_len: i64, value: &str) {
+    write_inquire_bytes(buf, buf_len, value.as_bytes());
+}
+
+fn write_inquire_bytes(buf: *mut u8, buf_len: i64, value: &[u8]) {
     if buf.is_null() || buf_len <= 0 {
         return;
     }
     let n = buf_len as usize;
-    let val_bytes = value.as_bytes();
-    let copy_len = val_bytes.len().min(n);
+    let copy_len = value.len().min(n);
     unsafe {
-        std::ptr::copy_nonoverlapping(val_bytes.as_ptr(), buf, copy_len);
+        std::ptr::copy_nonoverlapping(value.as_ptr(), buf, copy_len);
         // Pad remainder with spaces.
         if copy_len < n {
             std::ptr::write_bytes(buf.add(copy_len), b' ', n - copy_len);
@@ -3292,7 +3339,8 @@ pub extern "C" fn afs_inquire_file(
 ) {
     let fname = fortran_file_name(filename, filename_len);
 
-    let file_exists = std::path::Path::new(&fname).exists();
+    let path = path_from_filename(&fname);
+    let file_exists = path.exists();
     if !exist.is_null() {
         unsafe {
             *exist = file_exists as i32;
@@ -3309,7 +3357,7 @@ pub extern "C" fn afs_inquire_file(
         }
     }
 
-    write_inquire_string(name_buf, name_buf_len, &fname);
+    write_inquire_bytes(name_buf, name_buf_len, &fname);
 
     if let Some(u) = connected_unit {
         write_unit_properties(
@@ -3382,7 +3430,7 @@ pub extern "C" fn afs_inquire_file(
 
     // File size via metadata.
     if !size_out.is_null() {
-        let sz = std::fs::metadata(&fname)
+        let sz = std::fs::metadata(&path)
             .map(|m| m.len() as i64)
             .unwrap_or(-1);
         unsafe {
@@ -3455,7 +3503,7 @@ pub extern "C" fn afs_inquire_unit(
     }
 
     if let Some(u) = unit_entry {
-        write_inquire_string(name_buf, name_buf_len, &u.filename);
+        write_inquire_bytes(name_buf, name_buf_len, &u.filename);
         write_unit_properties(
             u,
             access_buf,
@@ -3495,7 +3543,7 @@ pub extern "C" fn afs_inquire_unit(
 
         if !size_out.is_null() {
             let sz = if !u.filename.is_empty() {
-                std::fs::metadata(&u.filename)
+                std::fs::metadata(path_from_filename(&u.filename))
                     .map(|m| m.len() as i64)
                     .unwrap_or(-1)
             } else {
@@ -3741,14 +3789,14 @@ pub extern "C" fn afs_io_finalize() {
             let _ = unit.flush();
         }
         // Delete any STATUS='SCRATCH' backing files left open at exit.
-        let scratch_paths: Vec<String> = state
+        let scratch_paths: Vec<Vec<u8>> = state
             .units
             .values()
             .filter(|u| u.scratch && !u.filename.is_empty())
             .map(|u| u.filename.clone())
             .collect();
         for path in scratch_paths {
-            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(path_from_filename(&path));
         }
     }
 }
@@ -4227,14 +4275,15 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                         .map(|u| u.leading_zero)
                         .unwrap_or(LeadingZeroMode::Default);
                     engine.set_leading_zero(c.stmt_leading_zero.unwrap_or(conn_mode));
-                    match engine.format_values_reverting_checked(&c.values) {
+                    match engine.format_values_reverting_bytes_checked(&c.values) {
                         Ok(output) => {
                             if let Some(u) = state.get_unit(unit) {
-                                if u.write_str(&output).is_err() {
+                                if u.write_bytes(&output).is_err() {
                                     io_status = 1;
                                     io_msg = Some("write failed");
                                 }
-                                if io_status == 0 && advance != 0 && u.write_str("\n").is_err() {
+                                if io_status == 0 && advance != 0 && u.write_bytes(b"\n").is_err()
+                                {
                                     io_status = 1;
                                     io_msg = Some("write failed");
                                 }
@@ -4257,9 +4306,9 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                     // one record, so a second scan (or an explicit '/')
                     // is an overflow — previously the excess values were
                     // silently dropped.
-                    match engine.format_values_reverting_checked(&c.values) {
+                    match engine.format_values_reverting_bytes_checked(&c.values) {
                         Ok(output) => {
-                            if output.contains('\n') {
+                            if output.contains(&b'\n') {
                                 io_status = 1;
                                 io_msg = Some("write exceeds internal file size");
                                 if c.iostat.is_null() {
@@ -4273,7 +4322,7 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                                     buf,
                                     buf_len,
                                     0,
-                                    output.as_bytes(),
+                                    &output,
                                     std::ptr::null_mut(),
                                 );
                             }
@@ -4289,9 +4338,9 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                         engine.set_leading_zero(mode);
                     }
                     // Same one-record rule as FmtSink::Internal.
-                    match engine.format_values_reverting_checked(&c.values) {
+                    match engine.format_values_reverting_bytes_checked(&c.values) {
                         Ok(output) => {
-                            if output.contains('\n') {
+                            if output.contains(&b'\n') {
                                 io_status = 1;
                                 io_msg = Some("write exceeds internal file size");
                                 if c.iostat.is_null() {
@@ -4302,7 +4351,7 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                                 }
                             } else if !store_internal_alloc_record(
                                 desc as *mut crate::descriptor::StringDescriptor,
-                                output.as_bytes(),
+                                &output,
                             ) {
                                 io_status = 1;
                                 io_msg = Some("out of memory");
@@ -4324,7 +4373,7 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                     }
                     // Reverting: each new format scan starts a new record,
                     // i.e. the next array element.
-                    match engine.format_values_reverting_checked(&c.values) {
+                    match engine.format_values_reverting_bytes_checked(&c.values) {
                         Ok(output) => {
                             if buf.is_null() || elem_len <= 0 || nelems <= 0 {
                                 io_status = 1;
@@ -4336,7 +4385,8 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                                     std::process::exit(2);
                                 }
                             } else {
-                                let records: Vec<&str> = output.split('\n').collect();
+                                let records: Vec<&[u8]> =
+                                    output.split(|&b| b == b'\n').collect();
                                 if records.len() as i64 > nelems {
                                     io_status = 1;
                                     io_msg = Some("write exceeds internal file size");
@@ -4354,7 +4404,7 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                                             unsafe { buf.add(i * elem_len as usize) },
                                             elem_len as usize,
                                             0,
-                                            rec.as_bytes(),
+                                            rec,
                                             std::ptr::null_mut(),
                                         );
                                     }
@@ -4418,12 +4468,12 @@ fn advance_formatted_cursor(desc: &FormatDesc, input: &[u8], cursor: &mut usize)
     }
 }
 
-fn read_formatted_field(desc: &FormatDesc, input: &[u8], cursor: &mut usize) -> Option<String> {
+fn read_formatted_field(desc: &FormatDesc, input: &[u8], cursor: &mut usize) -> Option<Vec<u8>> {
     let take_width = |cursor: &mut usize, width: usize| {
         let start = (*cursor).min(input.len());
         let end = start.saturating_add(width).min(input.len());
         *cursor = end;
-        String::from_utf8_lossy(&input[start..end]).into_owned()
+        input[start..end].to_vec()
     };
 
     match desc {
@@ -4443,7 +4493,7 @@ fn read_formatted_field(desc: &FormatDesc, input: &[u8], cursor: &mut usize) -> 
         FormatDesc::Character { width: None } => {
             let start = *cursor;
             *cursor = input.len();
-            Some(String::from_utf8_lossy(&input[start..]).into_owned())
+            Some(input[start..].to_vec())
         }
         _ => None,
     }
@@ -4454,7 +4504,7 @@ fn extract_nth_formatted_field(
     input: &[u8],
     cursor: &mut usize,
     remaining_data_index: &mut usize,
-) -> Option<(FormatDesc, String)> {
+) -> Option<(FormatDesc, Vec<u8>)> {
     for desc in descs {
         match desc {
             FormatDesc::Group {
@@ -4511,14 +4561,14 @@ fn read_nonadvancing_formatted_field(
     input: &[u8],
     cursor: &mut usize,
     dest_len: i64,
-) -> Option<String> {
+) -> Option<Vec<u8>> {
     match desc {
         FormatDesc::Character { width: None } => {
             let start = (*cursor).min(input.len());
             let n = dest_len.max(0) as usize;
             let end = start.saturating_add(n).min(input.len());
             *cursor = end;
-            Some(String::from_utf8_lossy(&input[start..end]).into_owned())
+            Some(input[start..end].to_vec())
         }
         _ => read_formatted_field(desc, input, cursor),
     }
@@ -4530,7 +4580,7 @@ fn extract_nth_nonadvancing_formatted_field(
     cursor: &mut usize,
     remaining_data_index: &mut usize,
     dest_len: i64,
-) -> Option<(FormatDesc, String)> {
+) -> Option<(FormatDesc, Vec<u8>)> {
     for desc in descs {
         match desc {
             FormatDesc::Group {
@@ -4591,7 +4641,7 @@ fn parse_nth_formatted_record(
     fmt_str: *const u8,
     fmt_len: i64,
     data_index: i64,
-) -> Result<(FormatDesc, String), i32> {
+) -> Result<(FormatDesc, Vec<u8>), i32> {
     let fmt = unsafe_str(fmt_str, fmt_len);
     let descs = parse_format(&fmt);
     let mut cursor = 0usize;
@@ -4606,7 +4656,7 @@ fn parse_nth_formatted_internal_field(
     fmt_str: *const u8,
     fmt_len: i64,
     data_index: i64,
-) -> Result<(FormatDesc, String), i32> {
+) -> Result<(FormatDesc, Vec<u8>), i32> {
     if buf.is_null() || buf_len <= 0 {
         return Err(-1);
     }
@@ -4615,14 +4665,21 @@ fn parse_nth_formatted_internal_field(
     parse_nth_formatted_record(input, fmt_str, fmt_len, data_index)
 }
 
-fn formatted_read_record_for_unit(unit: i32, data_index: i64) -> Result<String, i32> {
+fn trim_record_newline(mut line: Vec<u8>) -> Vec<u8> {
+    while matches!(line.last(), Some(b'\n' | b'\r')) {
+        line.pop();
+    }
+    line
+}
+
+fn formatted_read_record_for_unit(unit: i32, data_index: i64) -> Result<Vec<u8>, i32> {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     let Some(u) = state.get_unit(unit) else {
         return Err(1);
     };
 
     if data_index <= 0 || u.formatted_read_record.is_none() {
-        match u.read_line() {
+        match u.read_line_bytes() {
             Ok(line) if !line.is_empty() => {
                 u.formatted_read_record = Some(line);
             }
@@ -4633,12 +4690,12 @@ fn formatted_read_record_for_unit(unit: i32, data_index: i64) -> Result<String, 
 
     u.formatted_read_record
         .as_ref()
-        .map(|line| line.trim_end_matches(['\r', '\n']).to_string())
+        .map(|line| trim_record_newline(line.clone()))
         .ok_or(IOSTAT_END)
 }
 
 fn store_formatted_char_result(
-    field: &str,
+    field: &[u8],
     dest: *mut u8,
     dest_len: i64,
     size_out: *mut i32,
@@ -4675,7 +4732,7 @@ fn store_formatted_char_error(
     }
 }
 
-fn nonadvancing_char_field_hit_eor(desc: &FormatDesc, field: &str, dest_len: i64) -> bool {
+fn nonadvancing_char_field_hit_eor(desc: &FormatDesc, field: &[u8], dest_len: i64) -> bool {
     match desc {
         FormatDesc::Character { width: Some(width) } => field.len() < *width,
         FormatDesc::Character { width: None } => field.len() < dest_len.max(0) as usize,
@@ -4748,7 +4805,7 @@ pub extern "C" fn afs_fmt_read_string(
                 let input = u
                     .formatted_read_record
                     .as_ref()
-                    .map(|l| l.as_bytes().to_vec())
+                    .cloned()
                     .unwrap_or_default();
                 let mut cursor = u.formatted_read_cursor;
                 let mut remaining = 0usize;
@@ -4776,7 +4833,7 @@ pub extern "C" fn afs_fmt_read_string(
         }
     }
     match formatted_read_record_for_unit(unit, data_index)
-        .and_then(|line| parse_nth_formatted_record(line.as_bytes(), fmt_str, fmt_len, data_index))
+        .and_then(|line| parse_nth_formatted_record(&line, fmt_str, fmt_len, data_index))
     {
         Ok((FormatDesc::Character { .. }, field)) => {
             store_formatted_char_result(&field, dest, dest_len, size_out, iostat);
@@ -4810,9 +4867,9 @@ pub extern "C" fn afs_fmt_read_string_noadvance(
     };
 
     if u.formatted_read_record.is_none() {
-        match u.read_line() {
+        match u.read_line_bytes() {
             Ok(line) if !line.is_empty() => {
-                u.formatted_read_record = Some(line.trim_end_matches(['\r', '\n']).to_string());
+                u.formatted_read_record = Some(trim_record_newline(line));
                 u.formatted_read_cursor = 0;
             }
             Ok(_) => {
@@ -4829,7 +4886,7 @@ pub extern "C" fn afs_fmt_read_string_noadvance(
     let input = u
         .formatted_read_record
         .as_ref()
-        .map(|line| line.as_bytes().to_vec())
+        .cloned()
         .unwrap_or_default();
     if u.formatted_read_cursor >= input.len() {
         store_formatted_char_error(dest, dest_len, size_out, IOSTAT_EOR, iostat);
@@ -4886,13 +4943,16 @@ pub extern "C" fn afs_fmt_read_int(
     iostat: *mut i32,
 ) {
     match formatted_read_record_for_unit(unit, data_index)
-        .and_then(|line| parse_nth_formatted_record(line.as_bytes(), fmt_str, fmt_len, data_index))
+        .and_then(|line| parse_nth_formatted_record(&line, fmt_str, fmt_len, data_index))
     {
         Ok((desc @ FormatDesc::IntegerI { .. }, field))
         | Ok((desc @ FormatDesc::IntegerB { .. }, field))
         | Ok((desc @ FormatDesc::IntegerO { .. }, field))
         | Ok((desc @ FormatDesc::IntegerZ { .. }, field)) => {
-            match parse_formatted_integer_field(&desc, &field).and_then(|v| i32::try_from(v).ok()) {
+            let field_text = String::from_utf8_lossy(&field);
+            match parse_formatted_integer_field(&desc, &field_text)
+                .and_then(|v| i32::try_from(v).ok())
+            {
                 Some(v) => {
                     write_i32_ptr(val, v);
                     if !iostat.is_null() {
@@ -4925,13 +4985,16 @@ pub extern "C" fn afs_fmt_read_int64(
     iostat: *mut i32,
 ) {
     match formatted_read_record_for_unit(unit, data_index)
-        .and_then(|line| parse_nth_formatted_record(line.as_bytes(), fmt_str, fmt_len, data_index))
+        .and_then(|line| parse_nth_formatted_record(&line, fmt_str, fmt_len, data_index))
     {
         Ok((desc @ FormatDesc::IntegerI { .. }, field))
         | Ok((desc @ FormatDesc::IntegerB { .. }, field))
         | Ok((desc @ FormatDesc::IntegerO { .. }, field))
         | Ok((desc @ FormatDesc::IntegerZ { .. }, field)) => {
-            match parse_formatted_integer_field(&desc, &field).and_then(|v| i64::try_from(v).ok()) {
+            let field_text = String::from_utf8_lossy(&field);
+            match parse_formatted_integer_field(&desc, &field_text)
+                .and_then(|v| i64::try_from(v).ok())
+            {
                 Some(v) => {
                     write_i64_ptr(val, v);
                     if !iostat.is_null() {
@@ -4964,13 +5027,14 @@ pub extern "C" fn afs_fmt_read_int128(
     iostat: *mut i32,
 ) {
     match formatted_read_record_for_unit(unit, data_index)
-        .and_then(|line| parse_nth_formatted_record(line.as_bytes(), fmt_str, fmt_len, data_index))
+        .and_then(|line| parse_nth_formatted_record(&line, fmt_str, fmt_len, data_index))
     {
         Ok((desc @ FormatDesc::IntegerI { .. }, field))
         | Ok((desc @ FormatDesc::IntegerB { .. }, field))
         | Ok((desc @ FormatDesc::IntegerO { .. }, field))
         | Ok((desc @ FormatDesc::IntegerZ { .. }, field)) => {
-            match parse_formatted_integer_field(&desc, &field) {
+            let field_text = String::from_utf8_lossy(&field);
+            match parse_formatted_integer_field(&desc, &field_text) {
                 Some(v) => {
                     write_i128_ptr(val, v);
                     if !iostat.is_null() {
@@ -5003,7 +5067,7 @@ pub extern "C" fn afs_fmt_read_real(
     iostat: *mut i32,
 ) {
     match formatted_read_record_for_unit(unit, data_index)
-        .and_then(|line| parse_nth_formatted_record(line.as_bytes(), fmt_str, fmt_len, data_index))
+        .and_then(|line| parse_nth_formatted_record(&line, fmt_str, fmt_len, data_index))
     {
         Ok((FormatDesc::RealF { .. }, field))
         | Ok((FormatDesc::RealE { .. }, field))
@@ -5012,7 +5076,8 @@ pub extern "C" fn afs_fmt_read_real(
         | Ok((FormatDesc::RealEX { .. }, field))
         | Ok((FormatDesc::RealD { .. }, field))
         | Ok((FormatDesc::RealG { .. }, field)) => {
-            let normalized = normalize_fortran_real_input(&field, true);
+            let field_text = String::from_utf8_lossy(&field);
+            let normalized = normalize_fortran_real_input(&field_text, true);
             match normalized.parse::<f64>() {
                 Ok(v) => {
                     write_f64_ptr(val, v);
@@ -5076,7 +5141,10 @@ pub extern "C" fn afs_fmt_read_int_internal(
         | Ok((desc @ FormatDesc::IntegerB { .. }, field))
         | Ok((desc @ FormatDesc::IntegerO { .. }, field))
         | Ok((desc @ FormatDesc::IntegerZ { .. }, field)) => {
-            match parse_formatted_integer_field(&desc, &field).and_then(|v| i32::try_from(v).ok()) {
+            let field_text = String::from_utf8_lossy(&field);
+            match parse_formatted_integer_field(&desc, &field_text)
+                .and_then(|v| i32::try_from(v).ok())
+            {
                 Some(v) => {
                     write_i32_ptr(val, v);
                     if !iostat.is_null() {
@@ -5114,7 +5182,10 @@ pub extern "C" fn afs_fmt_read_int64_internal(
         | Ok((desc @ FormatDesc::IntegerB { .. }, field))
         | Ok((desc @ FormatDesc::IntegerO { .. }, field))
         | Ok((desc @ FormatDesc::IntegerZ { .. }, field)) => {
-            match parse_formatted_integer_field(&desc, &field).and_then(|v| i64::try_from(v).ok()) {
+            let field_text = String::from_utf8_lossy(&field);
+            match parse_formatted_integer_field(&desc, &field_text)
+                .and_then(|v| i64::try_from(v).ok())
+            {
                 Some(v) => {
                     write_i64_ptr(val, v);
                     if !iostat.is_null() {
@@ -5152,7 +5223,8 @@ pub extern "C" fn afs_fmt_read_int128_internal(
         | Ok((desc @ FormatDesc::IntegerB { .. }, field))
         | Ok((desc @ FormatDesc::IntegerO { .. }, field))
         | Ok((desc @ FormatDesc::IntegerZ { .. }, field)) => {
-            match parse_formatted_integer_field(&desc, &field) {
+            let field_text = String::from_utf8_lossy(&field);
+            match parse_formatted_integer_field(&desc, &field_text) {
                 Some(v) => {
                     write_i128_ptr(val, v);
                     if !iostat.is_null() {
@@ -5193,7 +5265,8 @@ pub extern "C" fn afs_fmt_read_real_internal(
         | Ok((FormatDesc::RealEX { .. }, field))
         | Ok((FormatDesc::RealD { .. }, field))
         | Ok((FormatDesc::RealG { .. }, field)) => {
-            let normalized = normalize_fortran_real_input(&field, true);
+            let field_text = String::from_utf8_lossy(&field);
+            let normalized = normalize_fortran_real_input(&field_text, true);
             match normalized.parse::<f64>() {
                 Ok(v) => {
                     write_f64_ptr(val, v);

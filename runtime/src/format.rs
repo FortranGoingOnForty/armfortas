@@ -684,7 +684,15 @@ impl FormatEngine {
     }
 
     pub fn format_values_checked(&mut self, values: &[IoValue]) -> Result<String, FormatError> {
-        let mut output = String::new();
+        self.format_values_bytes_checked(values)
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    pub fn format_values_bytes_checked(
+        &mut self,
+        values: &[IoValue],
+    ) -> Result<Vec<u8>, FormatError> {
+        let mut output = Vec::new();
         let mut val_idx = 0;
         let descriptors = self.descriptors.clone();
         self.apply_descriptors(&descriptors, values, &mut val_idx, &mut output)?;
@@ -701,7 +709,15 @@ impl FormatEngine {
         &mut self,
         values: &[IoValue],
     ) -> Result<String, FormatError> {
-        let mut output = String::new();
+        self.format_values_reverting_bytes_checked(values)
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    pub fn format_values_reverting_bytes_checked(
+        &mut self,
+        values: &[IoValue],
+    ) -> Result<Vec<u8>, FormatError> {
+        let mut output = Vec::new();
         let mut val_idx = 0;
         let descriptors = self.descriptors.clone();
         if !values.is_empty() && !format_has_data_descriptor(&descriptors) {
@@ -715,7 +731,7 @@ impl FormatEngine {
         let mut first_record = true;
         while val_idx < values.len() {
             if !first_record {
-                output.push('\n');
+                output.push(b'\n');
             }
             let before = val_idx;
             self.apply_descriptors(&descriptors, values, &mut val_idx, &mut output)?;
@@ -732,18 +748,18 @@ impl FormatEngine {
         descs: &[FormatDesc],
         values: &[IoValue],
         val_idx: &mut usize,
-        output: &mut String,
+        output: &mut Vec<u8>,
     ) -> Result<(), FormatError> {
         for desc in descs {
             match desc {
                 // ---- Control descriptors ----
                 FormatDesc::Skip { count } => {
                     for _ in 0..*count {
-                        output.push(' ');
+                        output.push(b' ');
                     }
                 }
                 FormatDesc::Newline => {
-                    output.push('\n');
+                    output.push(b'\n');
                 }
                 FormatDesc::Colon => {
                     if *val_idx >= values.len() {
@@ -768,10 +784,14 @@ impl FormatEngine {
                 }
                 FormatDesc::DerivedType { .. } => {} // requires user-defined I/O — no-op for now
                 FormatDesc::TabTo { position } => {
-                    let cur_col = output.lines().last().map(|l| l.len()).unwrap_or(0);
+                    let cur_col = output
+                        .iter()
+                        .rposition(|&b| b == b'\n')
+                        .map(|pos| output.len().saturating_sub(pos + 1))
+                        .unwrap_or(output.len());
                     if *position > cur_col + 1 {
                         for _ in 0..(*position - cur_col - 1) {
-                            output.push(' ');
+                            output.push(b' ');
                         }
                     }
                 }
@@ -782,11 +802,11 @@ impl FormatEngine {
                 }
                 FormatDesc::TabRight { count } => {
                     for _ in 0..*count {
-                        output.push(' ');
+                        output.push(b' ');
                     }
                 }
                 FormatDesc::LiteralString(s) => {
-                    output.push_str(s);
+                    output.extend_from_slice(s.as_bytes());
                 }
 
                 // ---- Group repeat ----
@@ -812,7 +832,7 @@ impl FormatEngine {
                     let val = &values[*val_idx];
                     *val_idx += 1;
                     let formatted = self.format_value(desc, val)?;
-                    output.push_str(&formatted);
+                    output.extend_from_slice(&formatted);
                 }
             }
         }
@@ -820,7 +840,39 @@ impl FormatEngine {
         Ok(())
     }
 
-    fn format_value(&self, desc: &FormatDesc, val: &IoValue) -> Result<String, FormatError> {
+    fn format_value(&self, desc: &FormatDesc, val: &IoValue) -> Result<Vec<u8>, FormatError> {
+        match (desc, val) {
+            (FormatDesc::RealG { width, .. }, IoValue::Character(bytes)) => {
+                Ok(fit_bytes(bytes, *width))
+            }
+            (FormatDesc::Character { width }, IoValue::Character(bytes)) => {
+                if let Some(w) = width {
+                    if *w > bytes.len() {
+                        let mut out = vec![b' '; *w - bytes.len()];
+                        out.extend_from_slice(bytes);
+                        Ok(out)
+                    } else {
+                        Ok(bytes[..*w].to_vec())
+                    }
+                } else {
+                    Ok(bytes.clone())
+                }
+            }
+            (FormatDesc::CharTrimmed, IoValue::Character(bytes)) => {
+                let end = bytes
+                    .iter()
+                    .rposition(|&b| b != b' ')
+                    .map(|idx| idx + 1)
+                    .unwrap_or(0);
+                Ok(bytes[..end].to_vec())
+            }
+            _ => self
+                .format_value_text(desc, val)
+                .map(|text| text.into_bytes()),
+        }
+    }
+
+    fn format_value_text(&self, desc: &FormatDesc, val: &IoValue) -> Result<String, FormatError> {
         match (desc, val) {
             // ---- Integer ----
             (FormatDesc::IntegerI { width, min_digits }, IoValue::Integer(v)) => {
@@ -1305,6 +1357,18 @@ fn fit_field(s: &str, width: usize) -> String {
         "*".repeat(width)
     } else {
         format!("{:>width$}", s, width = width)
+    }
+}
+
+fn fit_bytes(bytes: &[u8], width: usize) -> Vec<u8> {
+    if width == 0 {
+        bytes.to_vec()
+    } else if bytes.len() > width {
+        vec![b'*'; width]
+    } else {
+        let mut out = vec![b' '; width - bytes.len()];
+        out.extend_from_slice(bytes);
+        out
     }
 }
 
