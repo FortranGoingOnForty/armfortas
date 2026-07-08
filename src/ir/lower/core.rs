@@ -46623,6 +46623,208 @@ pub(super) fn lower_allocatable_char_array_assign_from_desc(
     b.set_block(bb_exit);
 }
 
+fn char_array_desc_elem_ptr_and_len_from_flat_index(
+    b: &mut FuncBuilder,
+    desc: ValueId,
+    idx: ValueId,
+) -> (ValueId, ValueId) {
+    let src_base = b.load_typed(desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    let src_stride = load_array_desc_i64_field(b, desc, 24 + 16);
+    let src_index = b.imul(idx, src_stride);
+    let src_elem_len = descriptor_elem_size(b, desc);
+
+    let flags = descriptor_flags(b, desc);
+    let slot_flag = b.const_i32(DESC_CHAR_SLOT_TABLE);
+    let slot_bits = b.bit_and(flags, slot_flag);
+    let zero32 = b.const_i32(0);
+    let has_slot_table = b.icmp(CmpOp::Ne, slot_bits, zero32);
+    let src_ptr_slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    let bb_slot = b.create_block("char_array_src_slot");
+    let bb_flat = b.create_block("char_array_src_flat");
+    let bb_join = b.create_block("char_array_src_join");
+    b.cond_branch(has_slot_table, bb_slot, vec![], bb_flat, vec![]);
+
+    b.set_block(bb_slot);
+    let ptr_bytes = b.const_i64(8);
+    let slot_off = b.imul(src_index, ptr_bytes);
+    let slot_ptr = b.gep(src_base, vec![slot_off], IrType::Int(IntWidth::I8));
+    let src_ptr = b.load_typed(slot_ptr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    b.store(src_ptr, src_ptr_slot);
+    b.branch(bb_join, vec![]);
+
+    b.set_block(bb_flat);
+    let src_off = b.imul(src_index, src_elem_len);
+    let src_ptr = b.gep(src_base, vec![src_off], IrType::Int(IntWidth::I8));
+    b.store(src_ptr, src_ptr_slot);
+    b.branch(bb_join, vec![]);
+
+    b.set_block(bb_join);
+    let src_ptr = b.load_typed(
+        src_ptr_slot,
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+    (src_ptr, src_elem_len)
+}
+
+fn descriptor_char_array_elem_ptr_and_len_from_flat_index(
+    b: &mut FuncBuilder,
+    info: &LocalInfo,
+    desc: ValueId,
+    idx: ValueId,
+) -> Option<(ValueId, ValueId)> {
+    let elem_len = match info.char_kind {
+        CharKind::Fixed(n) => b.const_i64(n),
+        CharKind::FixedRuntime { len_addr } | CharKind::AssumedLen { len_addr } => b.load(len_addr),
+        CharKind::Deferred => return None,
+        CharKind::None if descriptor_backed_runtime_char_array(info) => {
+            descriptor_elem_size(b, desc)
+        }
+        CharKind::None => return None,
+    };
+    let base = b.load_typed(desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    let stride = load_array_desc_i64_field(b, desc, 24 + 16);
+    let logical_index = b.imul(idx, stride);
+
+    if matches!(
+        info.char_kind,
+        CharKind::Fixed(_) | CharKind::FixedRuntime { .. } | CharKind::AssumedLen { .. }
+    ) && matches!(
+        info.ty,
+        IrType::Ptr(ref inner) if matches!(inner.as_ref(), IrType::Int(IntWidth::I8))
+    ) {
+        let slot_size = descriptor_elem_size(b, desc);
+        let flags = descriptor_flags(b, desc);
+        let slot_flag = b.const_i32(DESC_CHAR_SLOT_TABLE);
+        let slot_bits = b.bit_and(flags, slot_flag);
+        let zero32 = b.const_i32(0);
+        let has_slot_flag = b.icmp(CmpOp::Ne, slot_bits, zero32);
+        let slot_size_mismatch = b.icmp(CmpOp::Ne, slot_size, elem_len);
+        let use_slot_table = b.or(has_slot_flag, slot_size_mismatch);
+        let ptr_slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+        let slot_bb = b.create_block("char_array_dest_slot");
+        let flat_bb = b.create_block("char_array_dest_flat");
+        let join_bb = b.create_block("char_array_dest_join");
+        b.cond_branch(use_slot_table, slot_bb, vec![], flat_bb, vec![]);
+
+        b.set_block(slot_bb);
+        let slot_off = b.imul(logical_index, slot_size);
+        let slot_ptr = b.gep(base, vec![slot_off], IrType::Int(IntWidth::I8));
+        let elem_ptr = b.load_typed(slot_ptr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+        b.store(elem_ptr, ptr_slot);
+        b.branch(join_bb, vec![]);
+
+        b.set_block(flat_bb);
+        let byte_offset = b.imul(logical_index, elem_len);
+        let elem_ptr = b.gep(base, vec![byte_offset], IrType::Int(IntWidth::I8));
+        b.store(elem_ptr, ptr_slot);
+        b.branch(join_bb, vec![]);
+
+        b.set_block(join_bb);
+        let elem_ptr = b.load_typed(ptr_slot, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+        return Some((elem_ptr, elem_len));
+    }
+
+    let byte_offset = b.imul(logical_index, elem_len);
+    let elem_ptr = b.gep(base, vec![byte_offset], IrType::Int(IntWidth::I8));
+    Some((elem_ptr, elem_len))
+}
+
+fn lower_char_array_copy_from_desc(b: &mut FuncBuilder, dest_info: &LocalInfo, src_desc: ValueId) {
+    let dest_n = array_total_elems_value(b, dest_info);
+    let src_n = b.call(
+        FuncRef::External("afs_array_size".into()),
+        vec![src_desc],
+        IrType::Int(IntWidth::I64),
+    );
+
+    let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let zero = b.const_i64(0);
+    b.store(zero, i_addr);
+
+    let bb_check = b.create_block("char_array_desc_copy_check");
+    let bb_body = b.create_block("char_array_desc_copy_body");
+    let bb_exit = b.create_block("char_array_desc_copy_exit");
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let i = b.load(i_addr);
+    let dest_done = b.icmp(CmpOp::Ge, i, dest_n);
+    let src_done = b.icmp(CmpOp::Ge, i, src_n);
+    let done = b.or(dest_done, src_done);
+    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+    b.set_block(bb_body);
+    let i_val = b.load(i_addr);
+    let (dest_ptr, dest_len) = if local_uses_array_descriptor(dest_info) {
+        let dest_desc = array_descriptor_addr(b, dest_info);
+        descriptor_char_array_elem_ptr_and_len_from_flat_index(b, dest_info, dest_desc, i_val)
+    } else {
+        char_array_elem_ptr_and_len_from_flat_index(b, dest_info, i_val)
+    }
+    .expect("character array descriptor copy should compute destination element address");
+    let (src_ptr, src_len) = char_array_desc_elem_ptr_and_len_from_flat_index(b, src_desc, i_val);
+    b.call(
+        FuncRef::External("afs_assign_char_fixed".into()),
+        vec![dest_ptr, dest_len, src_ptr, src_len],
+        IrType::Void,
+    );
+
+    let one = b.const_i64(1);
+    let next = b.iadd(i_val, one);
+    b.store(next, i_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
+}
+
+fn try_lower_char_array_expr_assign(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    dest_name: &str,
+    dest_info: &LocalInfo,
+    value: &crate::ast::expr::SpannedExpr,
+) -> bool {
+    if dest_info.char_kind == CharKind::None && !descriptor_backed_runtime_char_array(dest_info) {
+        return false;
+    }
+    let Some((src_desc, _)) = lower_array_expr_descriptor(
+        b,
+        &ctx.locals,
+        value,
+        ctx.st,
+        Some(ctx.type_layouts),
+        Some(ctx.internal_funcs),
+        Some(ctx.contained_host_refs),
+        Some(ctx.descriptor_params),
+    ) else {
+        return false;
+    };
+
+    let mut copy_src_desc = src_desc;
+    let tmp_src_desc = if !dest_name.is_empty() && expr_mentions_name(value, dest_name) {
+        let tmp_desc = allocate_like_array_temp_descriptor(b, src_desc);
+        let stat = b.alloca(IrType::Int(IntWidth::I32));
+        let zero32 = b.const_i32(0);
+        b.store(zero32, stat);
+        b.call(
+            FuncRef::External("afs_copy_array_data".into()),
+            vec![tmp_desc, src_desc, stat],
+            IrType::Void,
+        );
+        copy_src_desc = tmp_desc;
+        Some(tmp_desc)
+    } else {
+        None
+    };
+
+    lower_char_array_copy_from_desc(b, dest_info, copy_src_desc);
+    if let Some(tmp_desc) = tmp_src_desc {
+        deallocate_array_temp_descriptor(b, tmp_desc);
+    }
+    deallocate_array_expr_descriptor_if_temp(b, &ctx.locals, value, ctx.st, src_desc);
+    true
+}
+
 /// Lower whole-array assignment: a = b (element-wise copy) or a = scalar (broadcast).
 pub(super) fn lower_array_assign(
     b: &mut FuncBuilder,
@@ -47229,6 +47431,10 @@ pub(super) fn lower_array_assign(
                 Some(ctx.descriptor_params),
             );
         }
+        return;
+    }
+
+    if try_lower_char_array_expr_assign(b, ctx, dest_name, dest_info, value) {
         return;
     }
 
