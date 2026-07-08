@@ -15,7 +15,7 @@ program ar4_namelist_array
   close(unit)
 
   print *, 'wios', wios
-  ! CHECK: wios 0
+  ! CHECK: wios           0
 
   n = 0
   arr = 0
@@ -25,9 +25,9 @@ program ar4_namelist_array
   close(unit)
 
   print *, 'rios', rios
-  ! CHECK: rios 0
+  ! CHECK: rios           0
   print *, 'values', n, arr
-  ! CHECK: values 7 1 2 3
+  ! CHECK: values           7           1           2           3
 
   ! FILE_CHECK: ar4_namelist_array.out => &CFG
   ! FILE_CHECK: ar4_namelist_array.out => N=7

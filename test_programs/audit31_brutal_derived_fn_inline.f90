@@ -9,7 +9,7 @@
 ! its result pointer as the component base when the callee returns a
 ! derived type. Task #481.
 ! CHECK: assigned: 4 6
-! CHECK: inline  : 4 6
+! CHECK: inline  :           4           6
 program audit31_derived_fn_inline
   implicit none
   type :: t

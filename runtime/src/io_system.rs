@@ -906,6 +906,16 @@ pub extern "C" fn afs_close_ex(unit: i32, status: *const u8, status_len: i64, io
 
 // ---- Public C API: List-directed WRITE ----
 
+const LIST_INT8_WIDTH: usize = 5;
+const LIST_INT16_WIDTH: usize = 7;
+const LIST_INT32_WIDTH: usize = 12;
+const LIST_INT64_WIDTH: usize = 21;
+const LIST_INT128_WIDTH: usize = 41;
+
+fn list_directed_integer_field<T: std::fmt::Display>(val: T, width: usize) -> String {
+    format!("{:>width$}", val, width = width)
+}
+
 /// Write an 8-bit integer value (list-directed).
 #[no_mangle]
 pub extern "C" fn afs_write_int8(unit: i32, val: i8) {
@@ -914,7 +924,7 @@ pub extern "C" fn afs_write_int8(unit: i32, val: i8) {
         if u.is_unformatted() {
             u.raw_or_buffer(&val.to_ne_bytes());
         } else {
-            let _ = u.write_str(&format!(" {}", val));
+            let _ = u.write_str(&list_directed_integer_field(val, LIST_INT8_WIDTH));
         }
     }
 }
@@ -927,7 +937,7 @@ pub extern "C" fn afs_write_int16(unit: i32, val: i16) {
         if u.is_unformatted() {
             u.raw_or_buffer(&val.to_ne_bytes());
         } else {
-            let _ = u.write_str(&format!(" {}", val));
+            let _ = u.write_str(&list_directed_integer_field(val, LIST_INT16_WIDTH));
         }
     }
 }
@@ -940,7 +950,7 @@ pub extern "C" fn afs_write_int(unit: i32, val: i32) {
         if u.is_unformatted() {
             u.raw_or_buffer(&val.to_ne_bytes());
         } else {
-            let _ = u.write_str(&format!(" {}", val));
+            let _ = u.write_str(&list_directed_integer_field(val, LIST_INT32_WIDTH));
         }
     }
 }
@@ -953,7 +963,7 @@ pub extern "C" fn afs_write_int64(unit: i32, val: i64) {
         if u.is_unformatted() {
             u.raw_or_buffer(&val.to_ne_bytes());
         } else {
-            let _ = u.write_str(&format!(" {}", val));
+            let _ = u.write_str(&list_directed_integer_field(val, LIST_INT64_WIDTH));
         }
     }
 }
@@ -966,7 +976,7 @@ pub extern "C" fn afs_write_int128(unit: i32, val: i128) {
         if u.is_unformatted() {
             u.raw_or_buffer(&val.to_ne_bytes());
         } else {
-            let _ = u.write_str(&format!(" {}", val));
+            let _ = u.write_str(&list_directed_integer_field(val, LIST_INT128_WIDTH));
         }
     }
 }
@@ -2874,6 +2884,37 @@ fn namelist_assign_value(
 
 // ---- Internal I/O (read/write to character variables) ----
 
+fn write_internal_list_directed_integer<T: std::fmt::Display>(
+    buf: *mut u8,
+    buf_len: i64,
+    val: T,
+    width: usize,
+    pos: *mut i64,
+) {
+    if buf.is_null() || buf_len <= 0 {
+        return;
+    }
+    let s = list_directed_integer_field(val, width);
+    let start = if !pos.is_null() {
+        (unsafe { *pos }) as usize
+    } else {
+        0
+    };
+    write_to_buffer(buf, buf_len as usize, start, s.as_bytes(), pos);
+}
+
+/// Write a formatted i8 to a character buffer (internal I/O).
+#[no_mangle]
+pub extern "C" fn afs_write_internal_int8(buf: *mut u8, buf_len: i64, val: i8, pos: *mut i64) {
+    write_internal_list_directed_integer(buf, buf_len, val, LIST_INT8_WIDTH, pos);
+}
+
+/// Write a formatted i16 to a character buffer (internal I/O).
+#[no_mangle]
+pub extern "C" fn afs_write_internal_int16(buf: *mut u8, buf_len: i64, val: i16, pos: *mut i64) {
+    write_internal_list_directed_integer(buf, buf_len, val, LIST_INT16_WIDTH, pos);
+}
+
 /// Write a formatted integer to a character buffer (internal I/O).
 #[no_mangle]
 pub extern "C" fn afs_write_internal_int(
@@ -2882,46 +2923,19 @@ pub extern "C" fn afs_write_internal_int(
     val: i32,
     pos: *mut i64, // current write position, updated after write
 ) {
-    if buf.is_null() || buf_len <= 0 {
-        return;
-    }
-    let s = format!(" {}", val);
-    let start = if !pos.is_null() {
-        (unsafe { *pos }) as usize
-    } else {
-        0
-    };
-    write_to_buffer(buf, buf_len as usize, start, s.as_bytes(), pos);
+    write_internal_list_directed_integer(buf, buf_len, val, LIST_INT32_WIDTH, pos);
 }
 
 /// Write a formatted i64 to a character buffer (internal I/O).
 #[no_mangle]
 pub extern "C" fn afs_write_internal_int64(buf: *mut u8, buf_len: i64, val: i64, pos: *mut i64) {
-    if buf.is_null() || buf_len <= 0 {
-        return;
-    }
-    let s = format!(" {}", val);
-    let start = if !pos.is_null() {
-        (unsafe { *pos }) as usize
-    } else {
-        0
-    };
-    write_to_buffer(buf, buf_len as usize, start, s.as_bytes(), pos);
+    write_internal_list_directed_integer(buf, buf_len, val, LIST_INT64_WIDTH, pos);
 }
 
 /// Write a formatted integer(16) to a character buffer (internal I/O).
 #[no_mangle]
 pub extern "C" fn afs_write_internal_int128(buf: *mut u8, buf_len: i64, val: i128, pos: *mut i64) {
-    if buf.is_null() || buf_len <= 0 {
-        return;
-    }
-    let s = format!(" {}", val);
-    let start = if !pos.is_null() {
-        (unsafe { *pos }) as usize
-    } else {
-        0
-    };
-    write_to_buffer(buf, buf_len as usize, start, s.as_bytes(), pos);
+    write_internal_list_directed_integer(buf, buf_len, val, LIST_INT128_WIDTH, pos);
 }
 
 /// Write a formatted real to a character buffer (internal I/O).
@@ -5842,6 +5856,36 @@ mod tests {
     }
 
     #[test]
+    fn list_directed_integer_kinds_use_gfortran_widths() {
+        let path = format!("/tmp/afs_list_widths_{}.dat", std::process::id());
+        let expected = format!(
+            "{:>5}{:>7}{:>12}{:>21}{:>41}\n",
+            0i8, 0i16, 0i32, 0i64, 0i128
+        );
+
+        afs_open_simple(
+            909,
+            path.as_ptr(),
+            path.len() as i64,
+            "replace".as_ptr(),
+            7,
+            std::ptr::null(),
+            0,
+        );
+        afs_write_int8(909, 0);
+        afs_write_int16(909, 0);
+        afs_write_int(909, 0);
+        afs_write_int64(909, 0);
+        afs_write_int128(909, 0);
+        afs_write_newline(909);
+        afs_close(909, std::ptr::null_mut());
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content, expected);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn read_i128_from_file() {
         let path = "/tmp/afs_read_i128_test.dat";
         std::fs::write(path, "170141183460469231731687303715884105727\n").unwrap();
@@ -5863,6 +5907,26 @@ mod tests {
 
         assert_eq!(iostat, 0, "expected successful i128 read");
         assert_eq!(value, 170141183460469231731687303715884105727i128);
+    }
+
+    #[test]
+    fn internal_list_directed_integer_kinds_use_gfortran_widths() {
+        let expected = format!(
+            "{:>5}{:>7}{:>12}{:>21}{:>41}",
+            0i8, 0i16, 0i32, 0i64, 0i128
+        );
+        let mut buf = [b'.'; 100];
+        let mut write_pos = 0i64;
+
+        afs_write_internal_int8(buf.as_mut_ptr(), buf.len() as i64, 0, &mut write_pos);
+        afs_write_internal_int16(buf.as_mut_ptr(), buf.len() as i64, 0, &mut write_pos);
+        afs_write_internal_int(buf.as_mut_ptr(), buf.len() as i64, 0, &mut write_pos);
+        afs_write_internal_int64(buf.as_mut_ptr(), buf.len() as i64, 0, &mut write_pos);
+        afs_write_internal_int128(buf.as_mut_ptr(), buf.len() as i64, 0, &mut write_pos);
+
+        assert_eq!(write_pos as usize, expected.len());
+        assert_eq!(&buf[..expected.len()], expected.as_bytes());
+        assert_eq!(buf[expected.len()], b' ');
     }
 
     #[test]

@@ -30513,6 +30513,20 @@ pub(super) fn lower_internal_write_items(
             .value_type(val)
             .unwrap_or(IrType::Int(IntWidth::I32));
         match ty {
+            IrType::Int(IntWidth::I8) => {
+                b.call(
+                    FuncRef::External("afs_write_internal_int8".into()),
+                    vec![buf_ptr, buf_len, val, pos],
+                    IrType::Void,
+                );
+            }
+            IrType::Int(IntWidth::I16) => {
+                b.call(
+                    FuncRef::External("afs_write_internal_int16".into()),
+                    vec![buf_ptr, buf_len, val, pos],
+                    IrType::Void,
+                );
+            }
             IrType::Int(IntWidth::I128) => {
                 b.call(
                     FuncRef::External("afs_write_internal_int128".into()),
@@ -30527,15 +30541,10 @@ pub(super) fn lower_internal_write_items(
                     IrType::Void,
                 );
             }
-            IrType::Int(_) => {
-                let i32_val = if matches!(ty, IrType::Int(IntWidth::I32)) {
-                    val
-                } else {
-                    b.int_extend(val, IntWidth::I32, true)
-                };
+            IrType::Int(IntWidth::I32) => {
                 b.call(
                     FuncRef::External("afs_write_internal_int".into()),
-                    vec![buf_ptr, buf_len, i32_val, pos],
+                    vec![buf_ptr, buf_len, val, pos],
                     IrType::Void,
                 );
             }
@@ -56528,6 +56537,25 @@ end program
 ",
         );
         assert!(ir.contains("afs_write_internal_int128"));
+    }
+
+    #[test]
+    fn lower_internal_write_narrow_integers_use_narrow_buffer_writers() {
+        let (_, ir) = lower_and_verify(
+            "\
+program test
+  implicit none
+  character(len=32) :: buf
+  integer(1) :: a
+  integer(2) :: b
+  a = 1_1
+  b = 2_2
+  write(buf, *) a, b
+end program
+",
+        );
+        assert!(ir.contains("afs_write_internal_int8"));
+        assert!(ir.contains("afs_write_internal_int16"));
     }
 
     #[test]

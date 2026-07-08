@@ -30,6 +30,6 @@ program derived_type_whole_assign
   print *, a%x, a%y, a%v
   print *, b%x, b%y, b%v
 end program derived_type_whole_assign
-! CHECK: 1 2     3.5000000E0
-! CHECK: 100 2     3.5000000E0
+! CHECK: 1           2     3.5000000E0
+! CHECK: 100           2     3.5000000E0
 ! OPT_EQ: O0,O1,O2,O3,Os,Ofast => stdout|stderr|exit

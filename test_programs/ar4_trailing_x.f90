@@ -15,7 +15,7 @@ program ar4_trailing_x
 
   inquire(file=path, size=bytes)
   print *, 'bytes', bytes
-  ! CHECK: bytes 8
+  ! CHECK: bytes           8
 
   raw = '........'
   open(newunit=unit, file=path, status='old', action='read', access='stream', form='unformatted')
@@ -23,7 +23,7 @@ program ar4_trailing_x
   close(unit, status='delete')
 
   print *, 'readios', ios
-  ! CHECK: readios 0
+  ! CHECK: readios           0
   print '(a,8(1x,i0))', 'codes', (iachar(raw(i:i)), i = 1, 8)
   ! CHECK: codes 53 10 49 32 50 32 51 10
 end program

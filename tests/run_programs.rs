@@ -5,7 +5,9 @@
 //! annotations.
 //!
 //! Each `! CHECK:` line specifies a substring that must appear in the output,
-//! in order. Whitespace is trimmed for comparison.
+//! in order. Leading/trailing whitespace is trimmed for comparison; a single
+//! whitespace run in the pattern matches a run of output whitespace, while
+//! explicit repeated whitespace in the pattern remains literal.
 //!
 //! ## XFAIL annotations
 //!
@@ -1802,7 +1804,7 @@ fn match_checks(
     for check in checks {
         let mut found = false;
         while output_idx < output_lines.len() {
-            if output_lines[output_idx].trim().contains(&check.pattern) {
+            if output_line_matches_check(output_lines[output_idx], &check.pattern) {
                 found = true;
                 output_idx += 1;
                 break;
@@ -1819,6 +1821,54 @@ fn match_checks(
     }
 
     Ok(())
+}
+
+fn output_line_matches_check(line: &str, pattern: &str) -> bool {
+    let text = line.trim();
+    if has_repeated_pattern_whitespace(pattern) {
+        text.contains(pattern)
+    } else {
+        text.char_indices()
+            .any(|(idx, _)| flexible_whitespace_match_at(&text[idx..], pattern))
+    }
+}
+
+fn has_repeated_pattern_whitespace(pattern: &str) -> bool {
+    let mut prev_was_space = false;
+    for ch in pattern.chars() {
+        let is_space = ch.is_whitespace();
+        if is_space && prev_was_space {
+            return true;
+        }
+        prev_was_space = is_space;
+    }
+    false
+}
+
+fn flexible_whitespace_match_at(text: &str, pattern: &str) -> bool {
+    let mut text_chars = text.chars().peekable();
+    let mut pattern_chars = pattern.chars().peekable();
+
+    while let Some(pattern_ch) = pattern_chars.next() {
+        if pattern_ch.is_whitespace() {
+            if !text_chars.peek().is_some_and(|ch| ch.is_whitespace()) {
+                return false;
+            }
+            while pattern_chars.peek().is_some_and(|ch| ch.is_whitespace()) {
+                pattern_chars.next();
+            }
+            while text_chars.peek().is_some_and(|ch| ch.is_whitespace()) {
+                text_chars.next();
+            }
+            continue;
+        }
+
+        if text_chars.next() != Some(pattern_ch) {
+            return false;
+        }
+    }
+
+    true
 }
 
 /// Find the armfortas binary.
@@ -3340,6 +3390,37 @@ fn match_checks_reports_stderr_check_failures_by_name() {
     )
     .unwrap_err();
     assert!(err.contains("STDERR_CHECK failed"));
+}
+
+#[test]
+fn match_checks_treats_single_spaces_as_whitespace_runs() {
+    let checks = vec![Check {
+        line_num: 1,
+        pattern: "values 7 1 2 3".into(),
+    }];
+    match_checks(
+        &checks,
+        " values           7           1           2           3\n",
+        "inline.f90 [O0]",
+        "CHECK",
+    )
+    .unwrap();
+}
+
+#[test]
+fn match_checks_keeps_repeated_spaces_literal() {
+    let checks = vec![Check {
+        line_num: 1,
+        pattern: "values  7".into(),
+    }];
+    assert!(match_checks(
+        &checks,
+        " values           7\n",
+        "inline.f90 [O0]",
+        "CHECK",
+    )
+    .is_err());
+    match_checks(&checks, " values  7\n", "inline.f90 [O0]", "CHECK").unwrap();
 }
 
 #[test]
