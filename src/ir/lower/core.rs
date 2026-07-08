@@ -2924,16 +2924,21 @@ pub(super) fn install_equivalence_locals(
                     name: String,
                     elem_ty: IrType,
                     dims: Vec<(i64, i64)>,
+                    char_kind: CharKind,
+                    logical_kind: Option<u8>,
                     byte_off: i64,  // anchor offset within this variable
                     byte_size: i64, // full byte span of this variable
                 }
                 let mut members: Vec<Member> = Vec::new();
+                let param_consts = collect_decl_param_consts_with_host(decls, visible_param_consts);
                 for expr in group {
                     match &expr.node {
                         Expr::Name { name } => {
                             let key = name.to_lowercase();
-                            let ty = arg_type_from_decls(&key, decls, Some(st));
+                            let (ty, char_kind) = common_member_storage(&key, decls, st);
                             let dims = arg_dims_from_decls(&key, decls, visible_param_consts, st);
+                            let logical_kind =
+                                arg_logical_kind_from_decls(&key, decls, Some(&param_consts), st);
                             let elem_size = ir_scalar_byte_size(&ty, b.layout);
                             let nelems: i64 = if dims.is_empty() {
                                 1
@@ -2945,6 +2950,8 @@ pub(super) fn install_equivalence_locals(
                                 name: key,
                                 elem_ty: ty,
                                 dims,
+                                char_kind,
+                                logical_kind,
                                 byte_off: 0,
                                 byte_size,
                             });
@@ -2952,9 +2959,15 @@ pub(super) fn install_equivalence_locals(
                         Expr::FunctionCall { callee, args } => {
                             if let Expr::Name { name } = &callee.node {
                                 let key = name.to_lowercase();
-                                let ty = arg_type_from_decls(&key, decls, Some(st));
+                                let (ty, char_kind) = common_member_storage(&key, decls, st);
                                 let dims =
                                     arg_dims_from_decls(&key, decls, visible_param_consts, st);
+                                let logical_kind = arg_logical_kind_from_decls(
+                                    &key,
+                                    decls,
+                                    Some(&param_consts),
+                                    st,
+                                );
                                 // Column-major linear offset for the subscript.
                                 // For dims [(lo1, ext1), (lo2, ext2), ...] and
                                 // subscripts [s1, s2, ...]:
@@ -2996,6 +3009,8 @@ pub(super) fn install_equivalence_locals(
                                     name: key,
                                     elem_ty: ty,
                                     dims,
+                                    char_kind,
+                                    logical_kind,
                                     byte_off,
                                     byte_size,
                                 });
@@ -3028,14 +3043,14 @@ pub(super) fn install_equivalence_locals(
                         continue;
                     }
                     let first_elem_byte = anchor - m.byte_off;
-                    let elem_size = ir_scalar_byte_size(&m.elem_ty, b.layout);
-                    let gep_idx = if elem_size > 0 {
-                        first_elem_byte / elem_size
+                    let byte_idx = b.const_i64(first_elem_byte);
+                    let byte_addr = b.gep(backing, vec![byte_idx], IrType::Int(IntWidth::I8));
+                    let addr = if matches!(m.elem_ty, IrType::Int(IntWidth::I8)) {
+                        byte_addr
                     } else {
-                        0
+                        let raw = b.ptr_to_int(byte_addr);
+                        b.int_to_ptr(raw, m.elem_ty.clone())
                     };
-                    let idx_val = b.const_i64(gep_idx);
-                    let addr = b.gep(backing, vec![idx_val], m.elem_ty.clone());
                     locals.insert(
                         m.name.clone(),
                         LocalInfo {
@@ -3045,13 +3060,13 @@ pub(super) fn install_equivalence_locals(
                             allocatable: false,
                             descriptor_arg: false,
                             by_ref: false,
-                            char_kind: CharKind::None,
+                            char_kind: m.char_kind.clone(),
                             derived_type: None,
                             inline_const: None,
                             is_pointer: false,
                             runtime_dim_upper: vec![None; m.dims.len()],
                             is_class: false,
-                            logical_kind: None,
+                            logical_kind: m.logical_kind,
                             last_dim_assumed_size: false,
                         },
                     );
