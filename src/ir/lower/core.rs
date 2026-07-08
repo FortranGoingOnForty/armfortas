@@ -28215,7 +28215,7 @@ fn unsupported_derived_io_field(
 ) -> ! {
     lower_stmt_error(
         span,
-        &format!("unsupported derived-type output component '{}'", field.name),
+        &format!("unsupported derived-type I/O component '{}'", field.name),
     )
 }
 
@@ -28383,6 +28383,134 @@ fn lower_derived_field_scalar_write(
         vec![unit, val],
         IrType::Void,
     );
+}
+
+fn lower_derived_scalar_read(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    type_name: &str,
+    base_addr: ValueId,
+    mode: ReadMode,
+    span: crate::lexer::Span,
+) -> bool {
+    let Some(layout) = derived_io_layout_for_type(b, ctx, type_name) else {
+        return false;
+    };
+    lower_derived_layout_read(b, ctx, &layout, base_addr, mode, span);
+    true
+}
+
+fn lower_derived_layout_read(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    layout: &crate::sema::type_layout::TypeLayout,
+    base_addr: ValueId,
+    mode: ReadMode,
+    span: crate::lexer::Span,
+) {
+    for field in &layout.fields {
+        let offset = b.const_i64(field.offset as i64);
+        let field_ptr = b.gep(base_addr, vec![offset], IrType::Int(IntWidth::I8));
+        lower_derived_field_read(b, ctx, field, field_ptr, mode, span);
+    }
+}
+
+fn lower_derived_field_read(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    field: &crate::sema::type_layout::FieldLayout,
+    field_ptr: ValueId,
+    mode: ReadMode,
+    span: crate::lexer::Span,
+) {
+    let count = derived_io_field_elem_count(field);
+    if count <= 0 {
+        return;
+    }
+    if count > 1 {
+        if field_uses_array_descriptor(field) {
+            unsupported_derived_io_field(span, field);
+        }
+        let elem_size = b.const_i64(derived_io_field_elem_size(field));
+        let count_v = b.const_i64(count);
+        let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+        let zero = b.const_i64(0);
+        b.store(zero, i_addr);
+        let bb_check = b.create_block("derived_read_field_check");
+        let bb_body = b.create_block("derived_read_field_body");
+        let bb_exit = b.create_block("derived_read_field_exit");
+        b.branch(bb_check, vec![]);
+        b.set_block(bb_check);
+        let i = b.load(i_addr);
+        let done = b.icmp(CmpOp::Ge, i, count_v);
+        b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+        b.set_block(bb_body);
+        let i_val = b.load(i_addr);
+        let byte_off = b.imul(i_val, elem_size);
+        let elem_ptr = b.gep(field_ptr, vec![byte_off], IrType::Int(IntWidth::I8));
+        lower_derived_field_scalar_read(b, ctx, field, elem_ptr, mode, span);
+        let one = b.const_i64(1);
+        let next = b.iadd(i_val, one);
+        b.store(next, i_addr);
+        b.branch(bb_check, vec![]);
+        b.set_block(bb_exit);
+        return;
+    }
+    lower_derived_field_scalar_read(b, ctx, field, field_ptr, mode, span);
+}
+
+fn lower_derived_field_scalar_read(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    field: &crate::sema::type_layout::FieldLayout,
+    field_ptr: ValueId,
+    mode: ReadMode,
+    span: crate::lexer::Span,
+) {
+    if field.procedure_pointer || field_uses_array_descriptor(field) {
+        unsupported_derived_io_field(span, field);
+    }
+    if let Some(nested_type) = field_derived_type_name(field) {
+        if field.pointer || field.allocatable {
+            unsupported_derived_io_field(span, field);
+        }
+        let Some(layout) = derived_io_layout_for_type(b, ctx, &nested_type) else {
+            unsupported_derived_io_field(span, field);
+        };
+        lower_derived_layout_read(b, ctx, &layout, field_ptr, mode, span);
+        return;
+    }
+    match field_char_kind(field) {
+        CharKind::Fixed(len) => {
+            let _ = lower_read_fixed_char_into_addr(b, mode, field_ptr, len);
+            return;
+        }
+        CharKind::Deferred => {
+            unsupported_derived_io_field(span, field);
+        }
+        CharKind::FixedRuntime { .. } | CharKind::AssumedLen { .. } | CharKind::None => {}
+    }
+    if matches!(
+        field.type_info,
+        crate::sema::symtab::TypeInfo::Character { .. }
+    ) {
+        unsupported_derived_io_field(span, field);
+    }
+    let ty = field_storage_ir_type(field, ctx.type_layouts);
+    if is_complex_ty(&ty) {
+        let lane_ty = if complex_float_width(&ty) == FloatWidth::F64 {
+            IrType::Float(FloatWidth::F64)
+        } else {
+            IrType::Float(FloatWidth::F32)
+        };
+        let real_ptr = field_ptr;
+        let lane_bytes = b.const_i64(ir_scalar_byte_size(&lane_ty, ctx.layout));
+        let imag_ptr = b.gep(field_ptr, vec![lane_bytes], IrType::Int(IntWidth::I8));
+        let _ = lower_read_into_addr(b, mode, &lane_ty, real_ptr);
+        let _ = lower_read_into_addr(b, mode, &lane_ty, imag_ptr);
+        return;
+    }
+    let _ = lower_read_into_addr(b, mode, &ty, field_ptr);
 }
 
 pub(super) fn descriptor_element_size_bytes(
@@ -30453,7 +30581,7 @@ pub(super) fn lower_write_items_adv(
                         }
                     }
                     if local_is_array_like(&info) {
-                        lower_whole_array_write(b, ctx, &info, unit);
+                        lower_whole_array_write(b, ctx, &info, unit, item.span);
                         continue;
                     }
                 }
@@ -30475,7 +30603,7 @@ pub(super) fn lower_write_items_adv(
                         if sec_info.descriptor_arg && !sec_info.allocatable {
                             lower_component_section_write(b, ctx, &sec_info, unit);
                         } else {
-                            lower_whole_array_write(b, ctx, &sec_info, unit);
+                            lower_whole_array_write(b, ctx, &sec_info, unit, item.span);
                         }
                         continue;
                     }
@@ -32212,7 +32340,7 @@ pub(super) fn lower_array_read_item(
             if !local_is_array_like(&info) {
                 return false;
             }
-            lower_whole_array_read(b, &info, mode);
+            lower_whole_array_read(b, ctx, &info, mode, item.span);
             true
         }
         Expr::ComponentAccess { .. } => {
@@ -32226,7 +32354,7 @@ pub(super) fn lower_array_read_item(
             if !local_is_array_like(&info) {
                 return false;
             }
-            lower_whole_array_read(b, &info, mode);
+            lower_whole_array_read(b, ctx, &info, mode, item.span);
             true
         }
         Expr::FunctionCall { callee, args } => {
@@ -32707,7 +32835,7 @@ pub(super) fn lower_fmt_push(
             // Outer arm is the array path. Scalar complex formatting is
             // handled separately; this case just needs the array predicate.
             if local_is_array_like(&info) {
-                fmt_push_whole_array(b, &info);
+                fmt_push_whole_array(b, ctx, &info, item.span);
                 return;
             }
         }
@@ -32725,7 +32853,7 @@ pub(super) fn lower_fmt_push(
                 if sec_info.descriptor_arg && !sec_info.allocatable {
                     fmt_push_component_section(b, ctx, &sec_info);
                 } else {
-                    fmt_push_whole_array(b, &sec_info);
+                    fmt_push_whole_array(b, ctx, &sec_info, item.span);
                 }
                 return;
             }
@@ -33239,7 +33367,12 @@ fn fmt_push_emit_complex(b: &mut FuncBuilder, lane_f64: bool, ptr: ValueId) {
 
 /// Iterate every element of a whole-array Name item and push each via
 /// afs_fmt_push_*. Mirrors `lower_whole_array_write` minus the unit arg.
-fn fmt_push_whole_array(b: &mut FuncBuilder, info: &LocalInfo) {
+fn fmt_push_whole_array(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    info: &LocalInfo,
+    span: crate::lexer::Span,
+) {
     let base = array_base_addr(b, info);
 
     let char_fixed_len: Option<i64> = match info.char_kind {
@@ -33254,6 +33387,11 @@ fn fmt_push_whole_array(b: &mut FuncBuilder, info: &LocalInfo) {
         &info.ty,
         IrType::Array(inner, 2) if matches!(inner.as_ref(), IrType::Float(FloatWidth::F64))
     );
+    let derived_layout = info
+        .derived_type
+        .as_deref()
+        .filter(|name| !name.eq_ignore_ascii_case("string_type"))
+        .and_then(|name| derived_io_layout_for_type(b, ctx, name));
 
     let n = array_total_elems_value(b, info);
     let i_addr = b.alloca(IrType::Int(IntWidth::I64));
@@ -33281,6 +33419,8 @@ fn fmt_push_whole_array(b: &mut FuncBuilder, info: &LocalInfo) {
         fmt_push_emit_complex(b, complex_lane_f64, p);
     } else if info.derived_type.as_deref() == Some("string_type") {
         fmt_push_emit_string_type(b, p);
+    } else if let Some(layout) = derived_layout.as_ref() {
+        fmt_push_derived_layout(b, ctx, layout, p, span);
     } else {
         let elem = b.load_typed(p, info.ty.clone());
         fmt_push_emit_scalar_semantic(b, &info.ty, elem, info.logical_kind.is_some());
@@ -35623,9 +35763,10 @@ pub(super) fn lower_component_section_write(
 /// dispatcher and gets mis-routed to afs_write_string.
 pub(super) fn lower_whole_array_write(
     b: &mut FuncBuilder,
-    _ctx: &mut LowerCtx,
+    ctx: &mut LowerCtx,
     info: &LocalInfo,
     unit: ValueId,
+    span: crate::lexer::Span,
 ) {
     let base = array_base_addr(b, info);
     // Fixed-length CHARACTER arrays must dispatch to afs_write_string
@@ -35660,6 +35801,11 @@ pub(super) fn lower_whole_array_write(
         _ if is_complex_elem => "afs_write_complex_f32",
         _ => scalar_runtime_write_func(&info.ty),
     };
+    let derived_layout = info
+        .derived_type
+        .as_deref()
+        .filter(|name| !name.eq_ignore_ascii_case("string_type"))
+        .and_then(|name| derived_io_layout_for_type(b, ctx, name));
 
     // Compile-time-known size for stack arrays; runtime descriptor
     // call for allocatables.
@@ -35700,6 +35846,8 @@ pub(super) fn lower_whole_array_write(
             vec![unit, ptr],
             IrType::Void,
         );
+    } else if let Some(layout) = derived_layout.as_ref() {
+        lower_derived_layout_write(b, ctx, layout, ptr, unit, span);
     } else {
         let elem = b.load_typed(ptr, info.ty.clone());
         b.call(
@@ -35716,12 +35864,23 @@ pub(super) fn lower_whole_array_write(
     b.set_block(bb_exit);
 }
 
-pub(super) fn lower_whole_array_read(b: &mut FuncBuilder, info: &LocalInfo, mode: ReadMode) {
+pub(super) fn lower_whole_array_read(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    info: &LocalInfo,
+    mode: ReadMode,
+    span: crate::lexer::Span,
+) {
     let base = array_base_addr(b, info);
     let char_fixed_len = match info.char_kind {
         CharKind::Fixed(n) => Some(n),
         _ => None,
     };
+    let derived_layout = info
+        .derived_type
+        .as_deref()
+        .filter(|name| !name.eq_ignore_ascii_case("string_type"))
+        .and_then(|name| derived_io_layout_for_type(b, ctx, name));
     let n = array_total_elems_value(b, info);
 
     let i_addr = b.alloca(IrType::Int(IntWidth::I64));
@@ -35743,7 +35902,11 @@ pub(super) fn lower_whole_array_read(b: &mut FuncBuilder, info: &LocalInfo, mode
     let elem_bytes_v = array_elem_size_value(b, info);
     let byte_off = b.imul(i_val, elem_bytes_v);
     let ptr = b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
-    if char_fixed_len.map(|len| lower_read_fixed_char_into_addr(b, mode, ptr, len)) != Some(true) {
+    if char_fixed_len.map(|len| lower_read_fixed_char_into_addr(b, mode, ptr, len)) == Some(true) {
+        // Handled above.
+    } else if let Some(layout) = derived_layout.as_ref() {
+        lower_derived_layout_read(b, ctx, layout, ptr, mode, span);
+    } else {
         let _ = lower_read_into_addr(b, mode, &info.ty, ptr);
     }
     let one = b.const_i64(1);
