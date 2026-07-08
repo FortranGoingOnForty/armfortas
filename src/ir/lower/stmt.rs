@@ -82,6 +82,76 @@ struct WhereSectionTemp {
     desc: ValueId,
 }
 
+enum WhereMaskValue {
+    Scalar(ValueId),
+    Array {
+        desc: ValueId,
+        elem_ty: IrType,
+        rank: usize,
+    },
+}
+
+fn lower_where_mask_value(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    expr: &SpannedExpr,
+) -> WhereMaskValue {
+    let rank = actual_expr_rank(expr, &ctx.locals, ctx.st, Some(ctx.type_layouts)).unwrap_or(0);
+    if rank > 0 {
+        if let Some((source_desc, elem_ty)) = lower_array_expr_descriptor(
+            b,
+            &ctx.locals,
+            expr,
+            ctx.st,
+            Some(ctx.type_layouts),
+            Some(ctx.internal_funcs),
+            Some(ctx.contained_host_refs),
+            Some(ctx.descriptor_params),
+        ) {
+            let tmp_desc = allocate_like_array_temp_descriptor_with_elem_type(b, source_desc, &elem_ty);
+            let stat = b.alloca(IrType::Int(IntWidth::I32));
+            let zero = b.const_i32(0);
+            b.store(zero, stat);
+            b.call(
+                FuncRef::External("afs_copy_array_data".into()),
+                vec![tmp_desc, source_desc, stat],
+                IrType::Void,
+            );
+            deallocate_array_expr_descriptor_if_temp(b, &ctx.locals, expr, ctx.st, source_desc);
+            return WhereMaskValue::Array {
+                desc: tmp_desc,
+                elem_ty,
+                rank,
+            };
+        }
+    }
+
+    let raw = super::expr::lower_expr_ctx_tl(b, ctx, expr);
+    WhereMaskValue::Scalar(coerce_to_type(b, raw, &IrType::Bool))
+}
+
+fn where_mask_value_at(b: &mut FuncBuilder, mask: &WhereMaskValue, index: ValueId) -> ValueId {
+    match mask {
+        WhereMaskValue::Scalar(value) => *value,
+        WhereMaskValue::Array {
+            desc,
+            elem_ty,
+            rank,
+        } => {
+            let raw = load_array_desc_elem_rank(b, *desc, elem_ty, index, *rank);
+            coerce_to_type(b, raw, &IrType::Bool)
+        }
+    }
+}
+
+fn finish_where_mask_values(b: &mut FuncBuilder, masks: &[&WhereMaskValue]) {
+    for mask in masks {
+        if let WhereMaskValue::Array { desc, .. } = mask {
+            deallocate_array_temp_descriptor(b, *desc);
+        }
+    }
+}
+
 fn lower_where_section_temp(
     b: &mut FuncBuilder,
     ctx: &mut LowerCtx,
@@ -4543,7 +4613,15 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 .iter()
                 .map(|(emask, ebody)| {
                     (
-                        emask.clone(),
+                        emask.as_ref().map(|mask| {
+                            rewrite_where_read_sections_to_temps(
+                                b,
+                                ctx,
+                                mask,
+                                &mut next_where_section_temp,
+                                &mut where_section_temps,
+                            )
+                        }),
                         ebody
                             .iter()
                             .map(|s| {
@@ -4573,7 +4651,10 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             for s in &prepared_body {
                 collect_array_names_stmt(s, &ctx.locals, &mut array_names);
             }
-            if let Some((_emask, ebody)) = prepared_elsewhere.first() {
+            for (emask, ebody) in &prepared_elsewhere {
+                if let Some(emask) = emask {
+                    collect_array_names(emask, &ctx.locals, &mut array_names);
+                }
                 for s in ebody {
                     collect_array_names_stmt(s, &ctx.locals, &mut array_names);
                 }
@@ -4581,12 +4662,22 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
 
             if array_names.is_empty() {
                 // No arrays — fall back to scalar IF-THEN-ELSE.
-                let cond = super::expr::lower_expr_ctx_tl(b, ctx, &prepared_mask);
+                let raw_cond = super::expr::lower_expr_ctx_tl(b, ctx, &prepared_mask);
+                let cond = coerce_to_type(b, raw_cond, &IrType::Bool);
+                let scalar_else_masks: Vec<Option<ValueId>> = prepared_elsewhere
+                    .iter()
+                    .map(|(emask, _)| {
+                        emask.as_ref().map(|emask| {
+                            let raw = super::expr::lower_expr_ctx_tl(b, ctx, emask);
+                            coerce_to_type(b, raw, &IrType::Bool)
+                        })
+                    })
+                    .collect();
                 let bb_then = b.create_block("where_then");
-                let bb_else = if !prepared_elsewhere.is_empty() {
-                    Some(b.create_block("where_else"))
-                } else {
+                let bb_else = if prepared_elsewhere.is_empty() {
                     None
+                } else {
+                    Some(b.create_block("where_else_check"))
                 };
                 let bb_end = b.create_block("where_end");
                 b.cond_branch(cond, bb_then, vec![], bb_else.unwrap_or(bb_end), vec![]);
@@ -4596,15 +4687,38 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 if b.func().block(b.current_block()).terminator.is_none() {
                     b.branch(bb_end, vec![]);
                 }
-                if let Some(bb_e) = bb_else {
-                    b.set_block(bb_e);
-                    if let Some((_m, else_body)) = prepared_elsewhere.first() {
-                        lower_stmts(b, ctx, else_body);
-                    }
-                    if b.func().block(b.current_block()).terminator.is_none() {
-                        b.branch(bb_end, vec![]);
+
+                if let Some(mut bb_check) = bb_else {
+                    for (idx, ((_emask, else_body), scalar_mask)) in prepared_elsewhere
+                        .iter()
+                        .zip(scalar_else_masks.iter())
+                        .enumerate()
+                    {
+                        b.set_block(bb_check);
+                        if let Some(cond) = scalar_mask {
+                            let bb_arm = b.create_block("where_else");
+                            let bb_next = if idx + 1 < prepared_elsewhere.len() {
+                                b.create_block("where_else_check")
+                            } else {
+                                bb_end
+                            };
+                            b.cond_branch(*cond, bb_arm, vec![], bb_next, vec![]);
+                            b.set_block(bb_arm);
+                            lower_stmts(b, ctx, else_body);
+                            if b.func().block(b.current_block()).terminator.is_none() {
+                                b.branch(bb_end, vec![]);
+                            }
+                            bb_check = bb_next;
+                        } else {
+                            lower_stmts(b, ctx, else_body);
+                            if b.func().block(b.current_block()).terminator.is_none() {
+                                b.branch(bb_end, vec![]);
+                            }
+                            break;
+                        }
                     }
                 }
+
                 b.set_block(bb_end);
                 finish_where_section_temps(b, ctx, &where_section_temps);
                 return;
@@ -4633,6 +4747,26 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     array_bases.insert(arr_name.clone(), base);
                 }
             }
+
+            let needs_mask_snapshots =
+                prepared_elsewhere.len() > 1 || prepared_elsewhere.iter().any(|(m, _)| m.is_some());
+            let main_mask_value = if needs_mask_snapshots {
+                Some(lower_where_mask_value(b, ctx, &prepared_mask))
+            } else {
+                None
+            };
+            let elsewhere_mask_values: Vec<Option<WhereMaskValue>> = if needs_mask_snapshots {
+                prepared_elsewhere
+                    .iter()
+                    .map(|(emask, _)| {
+                        emask
+                            .as_ref()
+                            .map(|emask| lower_where_mask_value(b, ctx, emask))
+                    })
+                    .collect()
+            } else {
+                prepared_elsewhere.iter().map(|_| None).collect()
+            };
 
             let i_addr = b.alloca(IrType::Int(IntWidth::I64));
             let i_zero = b.const_i64(0);
@@ -4685,7 +4819,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 }
             }
 
-            // Pre-rewrite mask and body: any residual `name(section)`
+            // Pre-rewrite body arms: any residual `name(section)`
             // FunctionCall AST node referencing a scalarized array name
             // would, after substitution, dispatch through the user-call
             // path on a scalar local and emit an undefined `bl _name` at
@@ -4694,27 +4828,34 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             // Stdlib pattern: `where (lambda(1:m) > 0.0_sp) sv(1:m) =
             // sqrt(lambda(1:m) * real(n-1, sp))` — both `lambda(1:m)`
             // and `sv(1:m)` are scalarized to `lambda` / `sv` per iter.
-            let rewritten_mask = rewrite_scalarized_section_refs(&prepared_mask, &array_names);
             let rewritten_body: Vec<SpannedStmt> = prepared_body
                 .iter()
                 .map(|s| rewrite_scalarized_section_refs_stmt(s, &array_names))
                 .collect();
-            let rewritten_else: Vec<SpannedStmt> = prepared_elsewhere
-                .first()
+            let rewritten_elsewhere: Vec<Vec<SpannedStmt>> = prepared_elsewhere
+                .iter()
                 .map(|(_m, els)| {
                     els.iter()
                         .map(|s| rewrite_scalarized_section_refs_stmt(s, &array_names))
                         .collect()
                 })
-                .unwrap_or_default();
+                .collect();
 
-            // Evaluate mask with element-level bindings.
-            let cond = super::expr::lower_expr_ctx_tl(b, ctx, &rewritten_mask);
+            let cond = if let Some(mask) = main_mask_value.as_ref() {
+                where_mask_value_at(b, mask, i_val)
+            } else {
+                let rewritten_mask = rewrite_scalarized_section_refs(&prepared_mask, &array_names);
+                super::expr::lower_expr_ctx_tl(b, ctx, &rewritten_mask)
+            };
 
             let bb_then = b.create_block("where_then");
-            let bb_else = b.create_block("where_else");
             let bb_incr = b.create_block("where_incr");
-            b.cond_branch(cond, bb_then, vec![], bb_else, vec![]);
+            let bb_first_else = if rewritten_elsewhere.is_empty() {
+                bb_incr
+            } else {
+                b.create_block("where_else_check")
+            };
+            b.cond_branch(cond, bb_then, vec![], bb_first_else, vec![]);
 
             b.set_block(bb_then);
             lower_stmts(b, ctx, &rewritten_body);
@@ -4722,12 +4863,55 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 b.branch(bb_incr, vec![]);
             }
 
-            b.set_block(bb_else);
-            if !rewritten_else.is_empty() {
-                lower_stmts(b, ctx, &rewritten_else);
-            }
-            if b.func().block(b.current_block()).terminator.is_none() {
-                b.branch(bb_incr, vec![]);
+            if !rewritten_elsewhere.is_empty() {
+                let mut bb_check = bb_first_else;
+                for (idx, ((else_body, else_mask), (else_mask_expr, _))) in rewritten_elsewhere
+                    .iter()
+                    .zip(elsewhere_mask_values.iter())
+                    .zip(prepared_elsewhere.iter())
+                    .enumerate()
+                {
+                    b.set_block(bb_check);
+                    if let Some(mask) = else_mask {
+                        let bb_arm = b.create_block("where_else");
+                        let bb_next = if idx + 1 < rewritten_elsewhere.len() {
+                            b.create_block("where_else_check")
+                        } else {
+                            bb_incr
+                        };
+                        let else_cond = where_mask_value_at(b, mask, i_val);
+                        b.cond_branch(else_cond, bb_arm, vec![], bb_next, vec![]);
+                        b.set_block(bb_arm);
+                        lower_stmts(b, ctx, else_body);
+                        if b.func().block(b.current_block()).terminator.is_none() {
+                            b.branch(bb_incr, vec![]);
+                        }
+                        bb_check = bb_next;
+                    } else if let Some(mask_expr) = else_mask_expr {
+                        let bb_arm = b.create_block("where_else");
+                        let bb_next = if idx + 1 < rewritten_elsewhere.len() {
+                            b.create_block("where_else_check")
+                        } else {
+                            bb_incr
+                        };
+                        let rewritten_mask =
+                            rewrite_scalarized_section_refs(mask_expr, &array_names);
+                        let else_cond = super::expr::lower_expr_ctx_tl(b, ctx, &rewritten_mask);
+                        b.cond_branch(else_cond, bb_arm, vec![], bb_next, vec![]);
+                        b.set_block(bb_arm);
+                        lower_stmts(b, ctx, else_body);
+                        if b.func().block(b.current_block()).terminator.is_none() {
+                            b.branch(bb_incr, vec![]);
+                        }
+                        bb_check = bb_next;
+                    } else {
+                        lower_stmts(b, ctx, else_body);
+                        if b.func().block(b.current_block()).terminator.is_none() {
+                            b.branch(bb_incr, vec![]);
+                        }
+                        break;
+                    }
+                }
             }
 
             b.set_block(bb_incr);
@@ -4747,6 +4931,16 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             b.branch(bb_check, vec![]);
 
             b.set_block(bb_exit);
+            let mut mask_values: Vec<&WhereMaskValue> = Vec::new();
+            if let Some(mask) = main_mask_value.as_ref() {
+                mask_values.push(mask);
+            }
+            for mask in &elsewhere_mask_values {
+                if let Some(mask) = mask.as_ref() {
+                    mask_values.push(mask);
+                }
+            }
+            finish_where_mask_values(b, &mask_values);
             finish_where_section_temps(b, ctx, &where_section_temps);
         }
 
