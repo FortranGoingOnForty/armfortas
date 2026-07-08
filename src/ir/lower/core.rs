@@ -21029,18 +21029,59 @@ pub(super) fn lower_alloc_return_call_into_desc(
     b.call(func_ref, call_args, IrType::Void);
 }
 
-pub(super) fn procedure_pointer_signature_key(st: &SymbolTable, key: &str) -> Option<String> {
-    let sym = st.lookup_local_then_any(current_proc_scope(), key)?;
-    if sym.kind != crate::sema::symtab::SymbolKind::ProcedurePointer
-        && !(sym.attrs.external && sym.attrs.procedure_iface.is_some())
+fn procedure_code_ptr_ir_type() -> IrType {
+    IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)))
+}
+
+fn procedure_dummy_symbol_in_scope<'a>(
+    st: &'a SymbolTable,
+    scope_id: crate::sema::symtab::ScopeId,
+    key: &str,
+) -> Option<&'a crate::sema::symtab::Symbol> {
+    let scope = st.scope(scope_id);
+    if !scope
+        .arg_order
+        .iter()
+        .any(|arg| arg.eq_ignore_ascii_case(key))
     {
         return None;
+    }
+    scope
+        .symbols
+        .get(&key.to_lowercase())
+        .filter(|sym| symbol_is_procedure_dummy(sym))
+}
+
+pub(super) fn procedure_dummy_arg_ir_type(
+    arg_name: &str,
+    decls: &[crate::ast::decl::SpannedDecl],
+    st: &SymbolTable,
+    proc_scope_id: Option<crate::sema::symtab::ScopeId>,
+) -> IrType {
+    let key = arg_name.to_lowercase();
+    if proc_scope_id
+        .and_then(|scope_id| procedure_dummy_symbol_in_scope(st, scope_id, &key))
+        .is_some()
+    {
+        return procedure_code_ptr_ir_type();
+    }
+    arg_type_from_decls(arg_name, decls, Some(st))
+}
+
+pub(super) fn procedure_pointer_signature_key(st: &SymbolTable, key: &str) -> Option<String> {
+    let scope_id = current_proc_scope();
+    let key = key.to_lowercase();
+    let sym = st.lookup_local_then_any(scope_id, &key)?;
+    let procedure_pointer_like = sym.kind == crate::sema::symtab::SymbolKind::ProcedurePointer
+        || (sym.attrs.external && sym.attrs.procedure_iface.is_some());
+    if !procedure_pointer_like {
+        scope_id.and_then(|scope_id| procedure_dummy_symbol_in_scope(st, scope_id, &key))?;
     }
     Some(
         sym.attrs
             .procedure_iface
             .as_deref()
-            .unwrap_or(key)
+            .unwrap_or(&key)
             .to_lowercase(),
     )
 }
@@ -21100,10 +21141,7 @@ pub(super) fn procedure_dummy_closure_param_slots_for_scope(
         return false;
     };
     let key = dummy_name.to_lowercase();
-    st.scope(scope_id)
-        .symbols
-        .get(&key)
-        .is_some_and(symbol_is_procedure_dummy)
+    procedure_dummy_symbol_in_scope(st, scope_id, &key).is_some()
 }
 
 pub(super) fn append_procedure_dummy_closure_args_for_call(
@@ -21187,12 +21225,18 @@ fn procedure_actual_closure_args(
 }
 
 fn symbol_is_procedure_dummy(sym: &crate::sema::symtab::Symbol) -> bool {
-    sym.attrs.procedure_iface.is_some()
+    use crate::sema::symtab::SymbolKind;
+
+    (sym.attrs.procedure_iface.is_some()
         && (sym.attrs.external
             || matches!(
                 sym.kind,
-                crate::sema::symtab::SymbolKind::ProcedurePointer
-                    | crate::sema::symtab::SymbolKind::ExternalProc
+                SymbolKind::ProcedurePointer | SymbolKind::ExternalProc
+            )))
+        || (sym.attrs.external
+            && matches!(
+                sym.kind,
+                SymbolKind::Function | SymbolKind::Subroutine | SymbolKind::ExternalProc
             ))
 }
 
@@ -24037,8 +24081,44 @@ pub(super) fn callee_return_ir_type_for_caller(
     internal_funcs: Option<&HashMap<String, u32>>,
 ) -> Option<IrType> {
     let key = callee_name.to_lowercase();
+    if let Some(scope_id) = current_proc_scope() {
+        if let Some(sym) = st.lookup_in(scope_id, &key) {
+            if is_linkable_callable_symbol(sym) {
+                if let Some(ir_ty) = callee_symbol_ir_type(sym) {
+                    return Some(ir_ty);
+                }
+            }
+        }
+    }
     if internal_funcs.is_some_and(|funcs| funcs.contains_key(&key)) {
         let caller_scope = current_proc_scope();
+        if let Some(scope_id) = find_procedure_scope_id_for_caller(st, &key, caller_scope) {
+            if let Some(ir_ty) = callee_return_ir_type_from_scope(st, scope_id) {
+                return Some(ir_ty);
+            }
+        }
+    }
+    callee_return_ir_type(st, callee_name)
+}
+
+pub(super) fn callee_return_ir_type_for_call_site(
+    st: &SymbolTable,
+    caller_link_name: &str,
+    callee_name: &str,
+    internal_funcs: Option<&HashMap<String, u32>>,
+) -> Option<IrType> {
+    let key = callee_name.to_lowercase();
+    let caller_scope = callee_scope_id_for_lookup(st, caller_link_name).or_else(current_proc_scope);
+    if let Some(scope_id) = caller_scope {
+        if let Some(sym) = st.lookup_in(scope_id, &key) {
+            if is_linkable_callable_symbol(sym) {
+                if let Some(ir_ty) = callee_symbol_ir_type(sym) {
+                    return Some(ir_ty);
+                }
+            }
+        }
+    }
+    if internal_funcs.is_some_and(|funcs| funcs.contains_key(&key)) {
         if let Some(scope_id) = find_procedure_scope_id_for_caller(st, &key, caller_scope) {
             if let Some(ir_ty) = callee_return_ir_type_from_scope(st, scope_id) {
                 return Some(ir_ty);

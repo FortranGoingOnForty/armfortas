@@ -340,7 +340,7 @@ pub(crate) fn lower_unit(
                 .enumerate()
                 .filter_map(|(i, arg)| {
                     if let DummyArg::Name(n) = arg {
-                        let elem_ty = arg_type_from_decls(n, decls, Some(st));
+                        let elem_ty = procedure_dummy_arg_ir_type(n, decls, st, proc_scope_id);
                         let fortran_noalias = arg_is_fortran_noalias(n, decls);
                         let uses_descriptor =
                             arg_uses_descriptor_for_lowering(n, decls, st, proc_scope_id);
@@ -485,7 +485,7 @@ pub(crate) fn lower_unit(
                 })
                 .map(|p| {
                     let pname = p.name.to_lowercase();
-                    let elem_ty = arg_type_from_decls(&pname, decls, Some(st));
+                    let elem_ty = procedure_dummy_arg_ir_type(&pname, decls, st, proc_scope_id);
                     let is_value = arg_has_value_attr(&pname, decls);
                     (pname, p.id, elem_ty, is_value)
                 })
@@ -854,7 +854,7 @@ pub(crate) fn lower_unit(
                     .enumerate()
                     .filter_map(|(i, arg)| {
                         if let DummyArg::Name(n) = arg {
-                            let elem_ty = arg_type_from_decls(n, decls, Some(st));
+                            let elem_ty = procedure_dummy_arg_ir_type(n, decls, st, proc_scope_id);
                             let fortran_noalias = arg_is_fortran_noalias(n, decls);
                             let uses_descriptor =
                                 arg_uses_descriptor_for_lowering(n, decls, st, proc_scope_id);
@@ -1044,7 +1044,7 @@ pub(crate) fn lower_unit(
                 })
                 .map(|p| {
                     let pname = p.name.to_lowercase();
-                    let elem_ty = arg_type_from_decls(&pname, decls, Some(st));
+                    let elem_ty = procedure_dummy_arg_ir_type(&pname, decls, st, proc_scope_id);
                     let is_value = arg_has_value_attr(&pname, decls);
                     (pname, p.id, elem_ty, is_value)
                 })

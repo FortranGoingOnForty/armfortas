@@ -2828,7 +2828,12 @@ pub(crate) fn lower_expr_full(
                     IrType::Void
                 } else {
                     first_procedure_lookup(&abi_lookup_keys, |k| {
-                        callee_return_ir_type_for_caller(st, k, internal_funcs)
+                        callee_return_ir_type_for_call_site(
+                            st,
+                            b.func().name.as_str(),
+                            k,
+                            internal_funcs,
+                        )
                     })
                     .unwrap_or(IrType::Int(IntWidth::I32))
                 };
