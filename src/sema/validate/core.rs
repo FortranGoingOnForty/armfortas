@@ -2859,7 +2859,19 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
             }
         }
         Stmt::IfStmt { action, .. } => validate_stmt(ctx, action),
-        Stmt::DoLoop { body, .. } => validate_stmts(ctx, body),
+        Stmt::DoLoop {
+            body,
+            shared_terminating_label,
+            ..
+        } => {
+            if *shared_terminating_label && (ctx.warn_pedantic || ctx.warn_deprecated) {
+                ctx.warning(
+                    stmt.span,
+                    "shared DO termination label is a deleted feature",
+                );
+            }
+            validate_stmts(ctx, body);
+        }
         Stmt::DoWhile { body, .. } => validate_stmts(ctx, body),
         Stmt::DoConcurrent { body, .. } => {
             ctx.require_std(stmt.span, FortranStandard::F2008, "DO CONCURRENT");

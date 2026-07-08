@@ -4991,6 +4991,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             end,
             step,
             body,
+            ..
         } => {
             lower_do_loop(
                 b,
