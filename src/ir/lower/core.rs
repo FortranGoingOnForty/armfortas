@@ -29883,7 +29883,11 @@ pub(super) fn lower_write_items_adv(
                     if local_is_array_like(&sec_info)
                         && !matches!(sec_info.char_kind, CharKind::Deferred)
                     {
-                        lower_component_section_write(b, ctx, &sec_info, unit);
+                        if sec_info.descriptor_arg && !sec_info.allocatable {
+                            lower_component_section_write(b, ctx, &sec_info, unit);
+                        } else {
+                            lower_whole_array_write(b, ctx, &sec_info, unit);
+                        }
                         continue;
                     }
                 }
@@ -30094,16 +30098,8 @@ pub(super) fn lower_write_items_adv(
                         );
                         continue;
                     }
-                    // Other pointer — likely a string. Use write_string with literal length.
                     let _ = inner; // suppress unused warning
-                    let len = string_literal_len(item);
-                    let len_val = b.const_i64(len);
-                    b.call(
-                        FuncRef::External("afs_write_string".into()),
-                        vec![unit, val, len_val],
-                        IrType::Void,
-                    );
-                    continue;
+                    lower_stmt_error(item.span, "unsupported output item");
                 }
                 _ => scalar_runtime_write_func(&ty),
             };
@@ -32120,7 +32116,11 @@ pub(super) fn lower_fmt_push(
             component_intrinsic_local_info(b, &ctx.locals, item, ctx.st, ctx.type_layouts)
         {
             if local_is_array_like(&sec_info) && !matches!(sec_info.char_kind, CharKind::Deferred) {
-                fmt_push_component_section(b, ctx, &sec_info);
+                if sec_info.descriptor_arg && !sec_info.allocatable {
+                    fmt_push_component_section(b, ctx, &sec_info);
+                } else {
+                    fmt_push_whole_array(b, &sec_info);
+                }
                 return;
             }
         }
@@ -32240,14 +32240,12 @@ pub(super) fn lower_fmt_push(
                 );
             }
             IrType::Ptr(_) => {
-                // Pointer type — likely a string.
-                let len = string_literal_len(item);
-                let len_val = b.const_i64(len);
-                b.call(
-                    FuncRef::External("afs_fmt_push_string".into()),
-                    vec![val, len_val],
-                    IrType::Void,
-                );
+                if is_complex_ty(&ty) {
+                    let lane_f64 = complex_float_width(&ty) == FloatWidth::F64;
+                    fmt_push_emit_complex(b, lane_f64, val);
+                } else {
+                    lower_stmt_error(item.span, "unsupported output item");
+                }
             }
             _ => {
                 let widened = b.int_extend(val, IntWidth::I64, true);
