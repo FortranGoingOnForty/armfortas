@@ -1098,7 +1098,12 @@ impl FormatEngine {
     /// Format a fixed-point number (for F and G-as-F).
     fn format_fixed(&self, v: f64, decimals: usize) -> String {
         let sign = self.real_sign(v);
-        format!("{}{:.*}", sign, decimals, v.abs())
+        let digits = if decimals == 0 {
+            format!("{:.0}.", v.abs())
+        } else {
+            format!("{:.*}", decimals, v.abs())
+        };
+        format!("{sign}{digits}")
     }
 
     fn real_sign(&self, v: f64) -> &'static str {
@@ -1648,6 +1653,14 @@ mod tests {
         let mut engine = FormatEngine::new(descs);
         let out = engine.format_values(&[IoValue::Real(1.23456)]);
         assert_eq!(out, "   1.235");
+    }
+
+    #[test]
+    fn format_real_f_zero_decimals_keeps_decimal_point() {
+        let descs = parse_format("(F4.0)");
+        let mut engine = FormatEngine::new(descs);
+        let out = engine.format_values(&[IoValue::Real(1.0)]);
+        assert_eq!(out, "  1.");
     }
 
     #[test]
