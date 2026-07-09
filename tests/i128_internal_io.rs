@@ -25,6 +25,11 @@ fn capture_text(request: CaptureRequest, stage: Stage) -> String {
     }
 }
 
+fn stdout_has_fields(stdout: &str, expected: &[&str]) -> bool {
+    let fields: Vec<_> = stdout.split_whitespace().collect();
+    fields.windows(expected.len()).any(|window| window == expected)
+}
+
 #[test]
 fn integer16_internal_io_uses_wide_internal_symbols() {
     let source = program("integer16_internal_io.f90");
@@ -94,12 +99,14 @@ fn integer16_internal_io_runs_across_all_opt_levels() {
             "expected successful internal integer(16) I/O run at {:?}:\n{:#?}",
             level, run
         );
-        assert!(run
-            .stdout
-            .contains("170141183460469231731687303715884105727"));
-        assert!(run
-            .stdout
-            .contains("-170141183460469231731687303715884105727"));
+        assert!(stdout_has_fields(
+            &run.stdout,
+            &["170141183460469231731687303715884105727"]
+        ));
+        assert!(stdout_has_fields(
+            &run.stdout,
+            &["-170141183460469231731687303715884105727"]
+        ));
     }
 }
 
@@ -198,9 +205,10 @@ fn integer16_internal_format_runs_across_all_opt_levels() {
             "expected successful formatted internal integer(16) write run at {:?}:\n{:#?}",
             level, run
         );
-        assert!(run
-            .stdout
-            .contains("170141183460469231731687303715884105727"));
+        assert!(stdout_has_fields(
+            &run.stdout,
+            &["170141183460469231731687303715884105727"]
+        ));
     }
 }
 
@@ -297,9 +305,10 @@ fn integer16_internal_format_read_runs_across_all_opt_levels() {
             "expected successful formatted internal integer(16) read run at {:?}:\n{:#?}",
             level, run
         );
-        assert!(run
-            .stdout
-            .contains("170141183460469231731687303715884105727"));
+        assert!(stdout_has_fields(
+            &run.stdout,
+            &["170141183460469231731687303715884105727"]
+        ));
     }
 }
 
@@ -406,13 +415,7 @@ fn integer16_internal_format_read_targets_run_across_all_opt_levels() {
             "170141183460469231731687303715884105727",
             "7",
         ] {
-            assert!(
-                run.stdout.contains(needle),
-                "expected stdout to contain '{}' at {:?}:\n{:#?}",
-                needle,
-                level,
-                run
-            );
+            assert!(stdout_has_fields(&run.stdout, &[needle]));
         }
     }
 }
@@ -510,12 +513,14 @@ fn integer16_internal_format_read_arrays_run_across_all_opt_levels() {
             "expected successful formatted internal integer(16) array read run at {:?}:\n{:#?}",
             level, run
         );
-        assert!(run
-            .stdout
-            .contains("11 170141183460469231731687303715884105727 33"));
-        assert!(run
-            .stdout
-            .contains("66 -170141183460469231731687303715884105727 44"));
+        assert!(stdout_has_fields(
+            &run.stdout,
+            &["11", "170141183460469231731687303715884105727", "33"]
+        ));
+        assert!(stdout_has_fields(
+            &run.stdout,
+            &["66", "-170141183460469231731687303715884105727", "44"]
+        ));
     }
 }
 
@@ -612,8 +617,11 @@ fn integer16_internal_format_read_sections_run_across_all_opt_levels() {
             "expected successful formatted internal integer(16) section read run at {:?}:\n{:#?}",
             level, run
         );
-        assert!(run.stdout.contains("101 202"));
-        assert!(run.stdout.contains("606 505 404 303"));
+        assert!(stdout_has_fields(&run.stdout, &["101", "202"]));
+        assert!(stdout_has_fields(
+            &run.stdout,
+            &["606", "505", "404", "303"]
+        ));
     }
 }
 
@@ -710,7 +718,7 @@ fn integer16_internal_format_read_alloc_section_runs_across_all_opt_levels() {
             "expected successful allocatable internal section read run at {:?}:\n{:#?}",
             level, run
         );
-        assert!(run.stdout.contains("11"));
+        assert!(stdout_has_fields(&run.stdout, &["11"]));
     }
 }
 
@@ -801,7 +809,7 @@ fn integer16_internal_format_read_alloc_reverse_section_runs_across_all_opt_leve
             "expected successful allocatable internal reverse section read run at {:?}:\n{:#?}",
             level, run
         );
-        assert!(run.stdout.contains("8"));
+        assert!(stdout_has_fields(&run.stdout, &["8"]));
     }
 }
 

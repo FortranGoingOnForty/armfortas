@@ -173,13 +173,27 @@ fn multifile_test_flags(
     let output = run_binary(&binary);
 
     assert!(
-        output.contains(expected_substring),
+        output_contains_expected(&output, expected_substring),
         "expected '{}' in output, got:\n{}",
         expected_substring,
         output
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn output_contains_expected(output: &str, expected: &str) -> bool {
+    if output.contains(expected) {
+        return true;
+    }
+    let expected_fields: Vec<_> = expected.split_whitespace().collect();
+    if expected_fields.len() <= 1 {
+        return false;
+    }
+    let output_fields: Vec<_> = output.split_whitespace().collect();
+    output_fields
+        .windows(expected_fields.len())
+        .any(|window| window == expected_fields.as_slice())
 }
 
 // ---- Tests ----

@@ -27,6 +27,10 @@ fn capture_run_stdout(request: CaptureRequest) -> String {
     }
 }
 
+fn line_fields(line: &str) -> Vec<&str> {
+    line.split_whitespace().collect()
+}
+
 #[test]
 fn o0_scalar_minmax_binary_fixture_runs_correctly() {
     if let Err(reason) = armfortas::testing::native_vectorizer_support() {
@@ -49,8 +53,18 @@ fn o0_scalar_minmax_binary_fixture_runs_correctly() {
         .filter(|l| !l.is_empty())
         .collect();
     assert_eq!(trimmed.len(), 6, "expected six output lines:\n{}", stdout);
-    assert_eq!(trimmed[0], "32 17 17 32", "i32 max wrong: {:?}", trimmed[0]);
-    assert_eq!(trimmed[1], "1 16 16 1", "i32 min wrong: {:?}", trimmed[1]);
+    assert_eq!(
+        line_fields(trimmed[0]),
+        ["32", "17", "17", "32"],
+        "i32 max wrong: {:?}",
+        trimmed[0]
+    );
+    assert_eq!(
+        line_fields(trimmed[1]),
+        ["1", "16", "16", "1"],
+        "i32 min wrong: {:?}",
+        trimmed[1]
+    );
     assert!(
         trimmed[2].contains("1.7000000E1"),
         "f32 max center lane wrong: {:?}",
@@ -119,8 +133,18 @@ fn o3_vectorizes_elementwise_minmax_binary() {
         .collect();
     assert_eq!(trimmed.len(), 6, "expected six output lines:\n{}", stdout);
     // i32 max @ {1,16,17,32} => {32,17,17,32}; i32 min => {1,16,16,1}.
-    assert_eq!(trimmed[0], "32 17 17 32", "i32 max wrong: {:?}", trimmed[0]);
-    assert_eq!(trimmed[1], "1 16 16 1", "i32 min wrong: {:?}", trimmed[1]);
+    assert_eq!(
+        line_fields(trimmed[0]),
+        ["32", "17", "17", "32"],
+        "i32 max wrong: {:?}",
+        trimmed[0]
+    );
+    assert_eq!(
+        line_fields(trimmed[1]),
+        ["1", "16", "16", "1"],
+        "i32 min wrong: {:?}",
+        trimmed[1]
+    );
     // f32 / f64 max start "3.2"; min start "1.".
     for max_line in [trimmed[2], trimmed[4]] {
         assert!(max_line.starts_with("3.2"), "fp max wrong: {:?}", max_line);

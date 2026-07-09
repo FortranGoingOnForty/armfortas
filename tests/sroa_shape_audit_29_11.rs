@@ -28,6 +28,11 @@ fn capture_run(request: CaptureRequest) -> RunCapture {
     }
 }
 
+fn stdout_has_fields(stdout: &str, expected: &[&str]) -> bool {
+    let fields: Vec<_> = stdout.split_whitespace().collect();
+    fields.windows(expected.len()).any(|window| window == expected)
+}
+
 fn function_section<'a>(ir: &'a str, name: &str) -> &'a str {
     let header = format!("  func @{}", name);
     let start = ir
@@ -172,7 +177,7 @@ fn realworld_shape_guard_uses_runtime_shape_queries_and_stays_deterministic() {
             level, run
         );
         assert!(
-            run.stdout.contains("6 0 5 12 36"),
+            stdout_has_fields(&run.stdout, &["6", "0", "5", "12", "36"]),
             "runtime-shape guard should preserve the descriptor-backed query results at {:?}:\n{:#?}",
             level, run
         );
