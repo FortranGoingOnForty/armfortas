@@ -2938,6 +2938,15 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
                     validate_system_clock_args(ctx, args, stmt.span);
                 }
             }
+            if let Some(name) = call_target_function_name(ctx, callee) {
+                ctx.error(
+                    callee.span,
+                    format!(
+                        "function '{}' cannot be invoked with CALL; reference it in an expression",
+                        name
+                    ),
+                );
+            }
             if ctx.in_pure {
                 validate_pure_call(ctx, callee, stmt.span);
             }
@@ -3288,6 +3297,17 @@ fn validate_system_clock_args(ctx: &mut Ctx, args: &[crate::ast::expr::Argument]
             "SYSTEM_CLOCK integer arguments must all have the same kind (F2023 16.9.202)",
         );
     }
+}
+
+fn call_target_function_name(
+    ctx: &Ctx<'_>,
+    callee: &crate::ast::expr::SpannedExpr,
+) -> Option<String> {
+    let Expr::Name { name } = &callee.node else {
+        return None;
+    };
+    let sym = ctx.lookup(name)?;
+    matches!(sym.kind, SymbolKind::Function).then(|| sym.name.clone())
 }
 
 /// Validate call-site argument intent constraints.
