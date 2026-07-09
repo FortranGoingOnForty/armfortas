@@ -46,6 +46,33 @@ Verification gates run during the closeout pass:
   CRT flags, afs-ld archive/link tests, and afs-as `.space`/`\a`
   differential tests.
 
+PR #113 CI follow-up, also on 2026-07-09: local reproduction of the red
+Linux/end-to-end jobs found the remaining failures were in the current
+branch, not the preserved repro directories. The fixes landed in this
+follow-up checkpoint:
+
+- Descriptor-backed component arrays now keep their declared rank, fixing
+  contained proc-pointer component forwarding and stream unformatted
+  character-array reads.
+- Nonadvancing terminal/stdin reads now use the bounded read path and return
+  EOR for a final unterminated chunk, preserving embedded NUL bytes.
+- Parent component type resolution now recognizes inherited parent views,
+  so parent-component actuals and allocatable character fields validate.
+- `.amod` export now records hidden character-length ABI metadata without
+  adding hidden lengths to `bind(C)` character buffers.
+- Driver assertions that depended on list-directed spacing now compare
+  fields instead of exact spacing.
+- Character conditional expressions in print/write item classification now
+  route through string lowering; `conditional_2.f90` passes in the
+  gfortran-dg fixture.
+
+Verification for the CI follow-up:
+
+- `cargo test -p armfortas --test cli_driver`: 923 passed.
+- `cargo test -p armfortas-rt --lib`: 210 passed.
+- `cargo clippy --workspace --exclude bencch-core --exclude afs-tests -- -D warnings -A clippy::too_many_arguments`: passed.
+- `cargo test --release --test run_programs -- --nocapture`: 123 passed.
+
 The repo-root `verify-*` directories and `verify-audit-scratch/**` are
 preserved intentionally for audit traceability until the branch PR lands
 and CI confirms the committed state.
