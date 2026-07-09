@@ -293,6 +293,11 @@ impl<'a> Parser<'a> {
         }
         let name_tok = self.advance().clone();
         let name = name_tok.text;
+        if self.peek() == &TokenKind::LParen {
+            return Err(
+                self.error("parameterized derived types (PDTs) are not supported".to_string())
+            );
+        }
         self.expect(&TokenKind::RParen)?;
         Ok(if is_class {
             TypeSpec::Class(name)
@@ -949,6 +954,11 @@ impl<'a> Parser<'a> {
 
         self.eat(&TokenKind::ColonColon);
         let name = self.advance().clone().text;
+        if self.peek() == &TokenKind::LParen {
+            return Err(
+                self.error("parameterized derived types (PDTs) are not supported".to_string())
+            );
+        }
         self.skip_newlines();
 
         // Parse components until 'contains' or 'end type'.
@@ -1628,6 +1638,23 @@ mod tests {
         panic!("could not parse as declaration: {}", src);
     }
 
+    fn parse_decl_err(src: &str) -> ParseError {
+        let tokens = Lexer::tokenize(src, 0).unwrap();
+        let mut parser = Parser::new(&tokens);
+        if let Some(ts_result) = parser.try_parse_type_spec() {
+            let ts = match ts_result {
+                Ok(ts) => ts,
+                Err(err) => return err,
+            };
+            return parser.parse_type_decl(ts).unwrap_err();
+        }
+        if parser.peek_text().eq_ignore_ascii_case("type") {
+            parser.advance();
+            return parser.parse_derived_type_def().unwrap_err();
+        }
+        panic!("could not parse as declaration error: {}", src);
+    }
+
     // ---- Type declarations ----
 
     #[test]
@@ -1808,6 +1835,26 @@ mod tests {
         } else {
             panic!("not TypeDecl");
         }
+    }
+
+    #[test]
+    fn parameterized_derived_type_use_is_rejected_clearly() {
+        let err = parse_decl_err("type(vec(n=3)) :: obj");
+        assert!(
+            err.msg.contains("parameterized derived types (PDTs)"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn parameterized_derived_type_definition_is_rejected_clearly() {
+        let err = parse_decl_err("type :: vec(k, n)");
+        assert!(
+            err.msg.contains("parameterized derived types (PDTs)"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
