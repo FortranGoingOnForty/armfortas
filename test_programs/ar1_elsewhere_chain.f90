@@ -1,5 +1,5 @@
 ! CHECK: chain=99 -2 -3 40 50 60
-! CHECK: original=10 20 0 0
+! CHECK: original=77 77 0 0
 ! REPRO_CHECK: run
 ! OPT_EQ: O0,O1,O2,O3,Os,Ofast => stdout|stderr|exit
 program ar1_elsewhere_chain

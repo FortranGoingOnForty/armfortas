@@ -277,6 +277,216 @@ fn finish_where_mask_values(b: &mut FuncBuilder, masks: &[&WhereMaskValue]) {
     }
 }
 
+fn where_pending_mask_at(
+    b: &mut FuncBuilder,
+    index: ValueId,
+    main_mask: &WhereMaskValue,
+    elsewhere_masks: &[WhereMaskValue],
+) -> ValueId {
+    let main = where_mask_value_at(b, main_mask, index);
+    let mut pending = b.not(main);
+    for mask in elsewhere_masks {
+        let masked = where_mask_value_at(b, mask, index);
+        let not_mask = b.not(masked);
+        pending = b.and(pending, not_mask);
+    }
+    pending
+}
+
+fn lower_where_array_pass<F>(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    array_names: &[String],
+    array_bases: &HashMap<String, ValueId>,
+    n: ValueId,
+    body: &[SpannedStmt],
+    mut cond_for_index: F,
+) where
+    F: FnMut(&mut FuncBuilder, &mut LowerCtx, ValueId) -> ValueId,
+{
+    let rewritten_body: Vec<SpannedStmt> = body
+        .iter()
+        .map(|s| rewrite_scalarized_section_refs_stmt(s, array_names))
+        .collect();
+
+    let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let i_zero = b.const_i64(0);
+    b.store(i_zero, i_addr);
+
+    let bb_check = b.create_block("where_check");
+    let bb_body = b.create_block("where_body");
+    let bb_then = b.create_block("where_then");
+    let bb_incr = b.create_block("where_incr");
+    let bb_exit = b.create_block("where_exit");
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let i = b.load(i_addr);
+    let done = b.icmp(CmpOp::Ge, i, n);
+    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+    b.set_block(bb_body);
+    let i_val = b.load(i_addr);
+    let mut saved_locals: Vec<(String, Option<LocalInfo>)> = Vec::new();
+    for arr_name in array_names {
+        saved_locals.push((arr_name.clone(), ctx.locals.get(arr_name).cloned()));
+        if let Some(orig_info) = ctx.locals.get(arr_name).cloned() {
+            let base = *array_bases.get(arr_name).unwrap();
+            let elem_bytes_val = array_elem_size_value(b, &orig_info);
+            let byte_off = b.imul(i_val, elem_bytes_val);
+            let elem_ptr = b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
+            ctx.locals.insert(
+                arr_name.clone(),
+                LocalInfo {
+                    addr: elem_ptr,
+                    ty: orig_info.ty.clone(),
+                    dims: vec![],
+                    allocatable: false,
+                    descriptor_arg: false,
+                    by_ref: false,
+                    char_kind: CharKind::None,
+                    derived_type: None,
+                    inline_const: None,
+                    is_pointer: false,
+                    runtime_dim_upper: vec![],
+                    is_class: false,
+                    logical_kind: None,
+                    last_dim_assumed_size: false,
+                },
+            );
+        }
+    }
+
+    let cond = cond_for_index(b, ctx, i_val);
+    b.cond_branch(cond, bb_then, vec![], bb_incr, vec![]);
+
+    b.set_block(bb_then);
+    lower_stmts(b, ctx, &rewritten_body);
+    if b.func().block(b.current_block()).terminator.is_none() {
+        b.branch(bb_incr, vec![]);
+    }
+
+    b.set_block(bb_incr);
+    for (name, orig) in saved_locals {
+        if let Some(info) = orig {
+            ctx.locals.insert(name, info);
+        } else {
+            ctx.locals.remove(&name);
+        }
+    }
+
+    let i_cur = b.load(i_addr);
+    let one = b.const_i64(1);
+    let next = b.iadd(i_cur, one);
+    b.store(next, i_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
+}
+
+fn lower_where_array_if_else_pass<F>(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    array_names: &[String],
+    array_bases: &HashMap<String, ValueId>,
+    n: ValueId,
+    then_body: &[SpannedStmt],
+    else_body: &[SpannedStmt],
+    mut cond_for_index: F,
+) where
+    F: FnMut(&mut FuncBuilder, &mut LowerCtx, ValueId) -> ValueId,
+{
+    let rewritten_then: Vec<SpannedStmt> = then_body
+        .iter()
+        .map(|s| rewrite_scalarized_section_refs_stmt(s, array_names))
+        .collect();
+    let rewritten_else: Vec<SpannedStmt> = else_body
+        .iter()
+        .map(|s| rewrite_scalarized_section_refs_stmt(s, array_names))
+        .collect();
+
+    let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let i_zero = b.const_i64(0);
+    b.store(i_zero, i_addr);
+
+    let bb_check = b.create_block("where_check");
+    let bb_body = b.create_block("where_body");
+    let bb_then = b.create_block("where_then");
+    let bb_else = b.create_block("where_else");
+    let bb_incr = b.create_block("where_incr");
+    let bb_exit = b.create_block("where_exit");
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let i = b.load(i_addr);
+    let done = b.icmp(CmpOp::Ge, i, n);
+    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+    b.set_block(bb_body);
+    let i_val = b.load(i_addr);
+    let mut saved_locals: Vec<(String, Option<LocalInfo>)> = Vec::new();
+    for arr_name in array_names {
+        saved_locals.push((arr_name.clone(), ctx.locals.get(arr_name).cloned()));
+        if let Some(orig_info) = ctx.locals.get(arr_name).cloned() {
+            let base = *array_bases.get(arr_name).unwrap();
+            let elem_bytes_val = array_elem_size_value(b, &orig_info);
+            let byte_off = b.imul(i_val, elem_bytes_val);
+            let elem_ptr = b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
+            ctx.locals.insert(
+                arr_name.clone(),
+                LocalInfo {
+                    addr: elem_ptr,
+                    ty: orig_info.ty.clone(),
+                    dims: vec![],
+                    allocatable: false,
+                    descriptor_arg: false,
+                    by_ref: false,
+                    char_kind: CharKind::None,
+                    derived_type: None,
+                    inline_const: None,
+                    is_pointer: false,
+                    runtime_dim_upper: vec![],
+                    is_class: false,
+                    logical_kind: None,
+                    last_dim_assumed_size: false,
+                },
+            );
+        }
+    }
+
+    let cond = cond_for_index(b, ctx, i_val);
+    b.cond_branch(cond, bb_then, vec![], bb_else, vec![]);
+
+    b.set_block(bb_then);
+    lower_stmts(b, ctx, &rewritten_then);
+    if b.func().block(b.current_block()).terminator.is_none() {
+        b.branch(bb_incr, vec![]);
+    }
+
+    b.set_block(bb_else);
+    lower_stmts(b, ctx, &rewritten_else);
+    if b.func().block(b.current_block()).terminator.is_none() {
+        b.branch(bb_incr, vec![]);
+    }
+
+    b.set_block(bb_incr);
+    for (name, orig) in saved_locals {
+        if let Some(info) = orig {
+            ctx.locals.insert(name, info);
+        } else {
+            ctx.locals.remove(&name);
+        }
+    }
+
+    let i_cur = b.load(i_addr);
+    let one = b.const_i64(1);
+    let next = b.iadd(i_cur, one);
+    b.store(next, i_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
+}
+
 fn simple_array_element_designator(
     expr: &SpannedExpr,
 ) -> Option<(String, Vec<Argument>, crate::lexer::Span)> {
@@ -5083,15 +5293,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 .iter()
                 .map(|(emask, ebody)| {
                     (
-                        emask.as_ref().map(|mask| {
-                            rewrite_where_read_sections_to_temps(
-                                b,
-                                ctx,
-                                mask,
-                                &mut next_where_section_temp,
-                                &mut where_section_temps,
-                            )
-                        }),
+                        emask.clone(),
                         ebody
                             .iter()
                             .map(|s| {
@@ -5218,197 +5420,100 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 }
             }
 
-            let needs_mask_snapshots =
-                prepared_elsewhere.len() > 1 || prepared_elsewhere.iter().any(|(m, _)| m.is_some());
-            let main_mask_value = if needs_mask_snapshots {
-                Some(lower_where_mask_value(b, ctx, &prepared_mask))
-            } else {
-                None
-            };
-            let elsewhere_mask_values: Vec<Option<WhereMaskValue>> = if needs_mask_snapshots {
-                prepared_elsewhere
-                    .iter()
-                    .map(|(emask, _)| {
-                        emask
-                            .as_ref()
-                            .map(|emask| lower_where_mask_value(b, ctx, emask))
-                    })
-                    .collect()
-            } else {
-                prepared_elsewhere.iter().map(|_| None).collect()
-            };
+            if prepared_elsewhere.is_empty() {
+                lower_where_array_pass(
+                    b,
+                    ctx,
+                    &array_names,
+                    &array_bases,
+                    n,
+                    &prepared_body,
+                    |b, ctx, _i_val| {
+                        let rewritten_mask =
+                            rewrite_scalarized_section_refs(&prepared_mask, &array_names);
+                        super::expr::lower_expr_ctx_tl(b, ctx, &rewritten_mask)
+                    },
+                );
+                finish_where_section_temps(b, ctx, &where_section_temps);
+                return;
+            }
 
-            let i_addr = b.alloca(IrType::Int(IntWidth::I64));
-            let i_zero = b.const_i64(0);
-            b.store(i_zero, i_addr);
+            if prepared_elsewhere.len() == 1 && prepared_elsewhere[0].0.is_none() {
+                lower_where_array_if_else_pass(
+                    b,
+                    ctx,
+                    &array_names,
+                    &array_bases,
+                    n,
+                    &prepared_body,
+                    &prepared_elsewhere[0].1,
+                    |b, ctx, _i_val| {
+                        let rewritten_mask =
+                            rewrite_scalarized_section_refs(&prepared_mask, &array_names);
+                        super::expr::lower_expr_ctx_tl(b, ctx, &rewritten_mask)
+                    },
+                );
+                finish_where_section_temps(b, ctx, &where_section_temps);
+                return;
+            }
 
-            let bb_check = b.create_block("where_check");
-            let bb_body = b.create_block("where_body");
-            let bb_exit = b.create_block("where_exit");
-            b.branch(bb_check, vec![]);
+            let main_mask_value = lower_where_mask_value(b, ctx, &prepared_mask);
+            lower_where_array_pass(
+                b,
+                ctx,
+                &array_names,
+                &array_bases,
+                n,
+                &prepared_body,
+                |b, _ctx, i_val| where_mask_value_at(b, &main_mask_value, i_val),
+            );
 
-            b.set_block(bb_check);
-            let i = b.load(i_addr);
-            let done = b.icmp(CmpOp::Ge, i, n);
-            b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
-
-            b.set_block(bb_body);
-            let i_val = b.load(i_addr);
-
-            // Substitute each array variable with a scalar local bound to element i.
-            // Save original locals for restoration.
-            let mut saved_locals: Vec<(String, Option<LocalInfo>)> = Vec::new();
-            for arr_name in &array_names {
-                saved_locals.push((arr_name.clone(), ctx.locals.get(arr_name).cloned()));
-                if let Some(orig_info) = ctx.locals.get(arr_name).cloned() {
-                    let base = *array_bases.get(arr_name).unwrap();
-                    // Compute element address: base + i * elem_bytes.
-                    let elem_bytes_val = array_elem_size_value(b, &orig_info);
-                    let byte_off = b.imul(i_val, elem_bytes_val);
-                    let elem_ptr = b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
-                    // Replace the local with a scalar pointing to this element.
-                    ctx.locals.insert(
-                        arr_name.clone(),
-                        LocalInfo {
-                            addr: elem_ptr,
-                            ty: orig_info.ty.clone(),
-                            dims: vec![],
-                            allocatable: false,
-                            descriptor_arg: false,
-                            by_ref: false,
-                            char_kind: CharKind::None,
-                            derived_type: None,
-                            inline_const: None,
-                            is_pointer: false,
-                            runtime_dim_upper: vec![],
-                            is_class: false,
-                            logical_kind: None,
-                            last_dim_assumed_size: false,
+            let mut elsewhere_mask_values: Vec<WhereMaskValue> = Vec::new();
+            for (else_mask_expr, else_body) in &prepared_elsewhere {
+                if let Some(mask_expr) = else_mask_expr {
+                    let prepared_else_mask = rewrite_where_read_sections_to_temps(
+                        b,
+                        ctx,
+                        mask_expr,
+                        &mut next_where_section_temp,
+                        &mut where_section_temps,
+                    );
+                    let else_mask = lower_where_mask_value(b, ctx, &prepared_else_mask);
+                    lower_where_array_pass(
+                        b,
+                        ctx,
+                        &array_names,
+                        &array_bases,
+                        n,
+                        else_body,
+                        |b, _ctx, i_val| {
+                            let pending =
+                                where_pending_mask_at(b, i_val, &main_mask_value, &elsewhere_mask_values);
+                            let masked = where_mask_value_at(b, &else_mask, i_val);
+                            b.and(pending, masked)
                         },
                     );
-                }
-            }
-
-            // Pre-rewrite body arms: any residual `name(section)`
-            // FunctionCall AST node referencing a scalarized array name
-            // would, after substitution, dispatch through the user-call
-            // path on a scalar local and emit an undefined `bl _name` at
-            // link time. Folding it to bare `Name` makes the substituted
-            // per-iter scalar binding pick up at the element index.
-            // Stdlib pattern: `where (lambda(1:m) > 0.0_sp) sv(1:m) =
-            // sqrt(lambda(1:m) * real(n-1, sp))` — both `lambda(1:m)`
-            // and `sv(1:m)` are scalarized to `lambda` / `sv` per iter.
-            let rewritten_body: Vec<SpannedStmt> = prepared_body
-                .iter()
-                .map(|s| rewrite_scalarized_section_refs_stmt(s, &array_names))
-                .collect();
-            let rewritten_elsewhere: Vec<Vec<SpannedStmt>> = prepared_elsewhere
-                .iter()
-                .map(|(_m, els)| {
-                    els.iter()
-                        .map(|s| rewrite_scalarized_section_refs_stmt(s, &array_names))
-                        .collect()
-                })
-                .collect();
-
-            let cond = if let Some(mask) = main_mask_value.as_ref() {
-                where_mask_value_at(b, mask, i_val)
-            } else {
-                let rewritten_mask = rewrite_scalarized_section_refs(&prepared_mask, &array_names);
-                super::expr::lower_expr_ctx_tl(b, ctx, &rewritten_mask)
-            };
-
-            let bb_then = b.create_block("where_then");
-            let bb_incr = b.create_block("where_incr");
-            let bb_first_else = if rewritten_elsewhere.is_empty() {
-                bb_incr
-            } else {
-                b.create_block("where_else_check")
-            };
-            b.cond_branch(cond, bb_then, vec![], bb_first_else, vec![]);
-
-            b.set_block(bb_then);
-            lower_stmts(b, ctx, &rewritten_body);
-            if b.func().block(b.current_block()).terminator.is_none() {
-                b.branch(bb_incr, vec![]);
-            }
-
-            if !rewritten_elsewhere.is_empty() {
-                let mut bb_check = bb_first_else;
-                for (idx, ((else_body, else_mask), (else_mask_expr, _))) in rewritten_elsewhere
-                    .iter()
-                    .zip(elsewhere_mask_values.iter())
-                    .zip(prepared_elsewhere.iter())
-                    .enumerate()
-                {
-                    b.set_block(bb_check);
-                    if let Some(mask) = else_mask {
-                        let bb_arm = b.create_block("where_else");
-                        let bb_next = if idx + 1 < rewritten_elsewhere.len() {
-                            b.create_block("where_else_check")
-                        } else {
-                            bb_incr
-                        };
-                        let else_cond = where_mask_value_at(b, mask, i_val);
-                        b.cond_branch(else_cond, bb_arm, vec![], bb_next, vec![]);
-                        b.set_block(bb_arm);
-                        lower_stmts(b, ctx, else_body);
-                        if b.func().block(b.current_block()).terminator.is_none() {
-                            b.branch(bb_incr, vec![]);
-                        }
-                        bb_check = bb_next;
-                    } else if let Some(mask_expr) = else_mask_expr {
-                        let bb_arm = b.create_block("where_else");
-                        let bb_next = if idx + 1 < rewritten_elsewhere.len() {
-                            b.create_block("where_else_check")
-                        } else {
-                            bb_incr
-                        };
-                        let rewritten_mask =
-                            rewrite_scalarized_section_refs(mask_expr, &array_names);
-                        let else_cond = super::expr::lower_expr_ctx_tl(b, ctx, &rewritten_mask);
-                        b.cond_branch(else_cond, bb_arm, vec![], bb_next, vec![]);
-                        b.set_block(bb_arm);
-                        lower_stmts(b, ctx, else_body);
-                        if b.func().block(b.current_block()).terminator.is_none() {
-                            b.branch(bb_incr, vec![]);
-                        }
-                        bb_check = bb_next;
-                    } else {
-                        lower_stmts(b, ctx, else_body);
-                        if b.func().block(b.current_block()).terminator.is_none() {
-                            b.branch(bb_incr, vec![]);
-                        }
-                        break;
-                    }
-                }
-            }
-
-            b.set_block(bb_incr);
-            // Restore original locals.
-            for (name, orig) in saved_locals {
-                if let Some(info) = orig {
-                    ctx.locals.insert(name, info);
+                    elsewhere_mask_values.push(else_mask);
                 } else {
-                    ctx.locals.remove(&name);
+                    lower_where_array_pass(
+                        b,
+                        ctx,
+                        &array_names,
+                        &array_bases,
+                        n,
+                        else_body,
+                        |b, _ctx, i_val| {
+                            where_pending_mask_at(b, i_val, &main_mask_value, &elsewhere_mask_values)
+                        },
+                    );
+                    break;
                 }
             }
 
-            let i_cur = b.load(i_addr);
-            let one = b.const_i64(1);
-            let next = b.iadd(i_cur, one);
-            b.store(next, i_addr);
-            b.branch(bb_check, vec![]);
-
-            b.set_block(bb_exit);
             let mut mask_values: Vec<&WhereMaskValue> = Vec::new();
-            if let Some(mask) = main_mask_value.as_ref() {
-                mask_values.push(mask);
-            }
+            mask_values.push(&main_mask_value);
             for mask in &elsewhere_mask_values {
-                if let Some(mask) = mask.as_ref() {
-                    mask_values.push(mask);
-                }
+                mask_values.push(mask);
             }
             finish_where_mask_values(b, &mask_values);
             finish_where_section_temps(b, ctx, &where_section_temps);
