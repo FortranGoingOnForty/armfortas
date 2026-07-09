@@ -93,12 +93,20 @@ impl<'a> Parser<'a> {
             }
             "associate" => self.parse_associate(start),
             "exit" => {
-                self.advance();
-                self.parse_exit(start)
+                if self.looks_like_optional_name_stmt() {
+                    self.advance();
+                    self.parse_exit(start)
+                } else {
+                    self.parse_assignment_or_call(start)
+                }
             }
             "cycle" => {
-                self.advance();
-                self.parse_cycle(start)
+                if self.looks_like_optional_name_stmt() {
+                    self.advance();
+                    self.parse_cycle(start)
+                } else {
+                    self.parse_assignment_or_call(start)
+                }
             }
             "stop" => {
                 self.advance();
@@ -761,6 +769,11 @@ impl<'a> Parser<'a> {
         };
         let span = span_from_to(start, self.prev_span());
         Ok(Spanned::new(Stmt::Cycle { name }, span))
+    }
+
+    fn looks_like_optional_name_stmt(&self) -> bool {
+        self.at_stmt_end_after(1)
+            || (self.peek_kind_at(1) == Some(&TokenKind::Identifier) && self.at_stmt_end_after(2))
     }
 
     fn parse_stop(
@@ -2109,9 +2122,31 @@ mod tests {
     }
 
     #[test]
+    fn exit_name_can_start_component_assignment() {
+        let s = parse_one("exit%code = 0\n");
+        assert!(matches!(s.node, Stmt::Assignment { .. }));
+    }
+
+    #[test]
     fn cycle_stmt() {
         let s = parse_one("cycle\n");
         assert!(matches!(s.node, Stmt::Cycle { name: None }));
+    }
+
+    #[test]
+    fn cycle_named() {
+        let s = parse_one("cycle outer\n");
+        if let Stmt::Cycle { name } = &s.node {
+            assert_eq!(name.as_deref(), Some("outer"));
+        } else {
+            panic!("not Cycle");
+        }
+    }
+
+    #[test]
+    fn cycle_name_can_start_component_assignment() {
+        let s = parse_one("cycle%id = 0\n");
+        assert!(matches!(s.node, Stmt::Assignment { .. }));
     }
 
     #[test]

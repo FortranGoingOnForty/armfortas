@@ -171,6 +171,18 @@ fn lower_trimmed_character_compare(
     Some(emit_char_compare_predicate(b, op, cmp))
 }
 
+pub(super) fn try_lower_float_square_power(
+    b: &mut FuncBuilder,
+    base: ValueId,
+    exponent: &SpannedExpr,
+) -> Option<ValueId> {
+    if eval_const_int(exponent) == Some(2) {
+        Some(b.fmul(base, base))
+    } else {
+        None
+    }
+}
+
 pub(super) fn lower_short_circuit_logical_expr(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -1144,7 +1156,9 @@ pub(crate) fn lower_expr_full(
                 (BinaryOp::Mul, IrType::Float(_)) => b.fmul(lhs, rhs),
                 (BinaryOp::Div, IrType::Int(_)) => b.idiv(lhs, rhs),
                 (BinaryOp::Div, IrType::Float(_)) => b.fdiv(lhs, rhs),
-                (BinaryOp::Pow, IrType::Float(_)) => b.fpow(lhs, rhs),
+                (BinaryOp::Pow, IrType::Float(_)) => {
+                    try_lower_float_square_power(b, lhs, right).unwrap_or_else(|| b.fpow(lhs, rhs))
+                }
                 (BinaryOp::Pow, IrType::Int(width)) => lower_integer_pow(b, lhs, rhs, *width),
                 (BinaryOp::Eq, IrType::Int(_)) => b.icmp(CmpOp::Eq, lhs, rhs),
                 (BinaryOp::Eq, IrType::Float(_)) => b.fcmp(CmpOp::Eq, lhs, rhs),
@@ -2583,71 +2597,64 @@ pub(crate) fn lower_expr_full(
                     first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
                         callee_hidden_result_abi(st, k)
                     })
-                        .and_then(|hidden_abi| {
-                            let bytes = hidden_result_temp_bytes_for_callee(
-                                st,
-                                type_layouts,
-                                &abi_lookup_keys,
-                                hidden_abi,
-                            )?;
-                            let alloca_ty = if hidden_abi == HiddenResultAbi::ComplexBuffer {
-                                let fw = if bytes == 16 {
-                                    FloatWidth::F64
-                                } else {
-                                    FloatWidth::F32
-                                };
-                                IrType::Array(Box::new(IrType::Float(fw)), 2)
+                    .and_then(|hidden_abi| {
+                        let bytes = hidden_result_temp_bytes_for_callee(
+                            st,
+                            type_layouts,
+                            &abi_lookup_keys,
+                            hidden_abi,
+                        )?;
+                        let alloca_ty = if hidden_abi == HiddenResultAbi::ComplexBuffer {
+                            let fw = if bytes == 16 {
+                                FloatWidth::F64
                             } else {
-                                IrType::Array(Box::new(IrType::Int(IntWidth::I8)), bytes)
+                                FloatWidth::F32
                             };
-                            let desc = b.alloca(alloca_ty);
-                            let zero_i32 = b.const_i32(0);
-                            let size = b.const_i64(bytes as i64);
-                            b.call(
-                                FuncRef::External("memset".into()),
-                                vec![desc, zero_i32, size],
-                                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                            );
-                            Some(desc)
-                        })
+                            IrType::Array(Box::new(IrType::Float(fw)), 2)
+                        } else {
+                            IrType::Array(Box::new(IrType::Int(IntWidth::I8)), bytes)
+                        };
+                        let desc = b.alloca(alloca_ty);
+                        let zero_i32 = b.const_i32(0);
+                        let size = b.const_i64(bytes as i64);
+                        b.call(
+                            FuncRef::External("memset".into()),
+                            vec![desc, zero_i32, size],
+                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                        );
+                        Some(desc)
+                    })
                 } else {
                     None
                 };
-                let callee_value_args = first_resolved_procedure_lookup(
-                    st,
-                    &abi_lookup_keys,
-                    |k| callee_value_arg_mask(st, k),
-                );
-                let callee_descriptor_args = first_resolved_procedure_lookup(
-                    st,
-                    &abi_lookup_keys,
-                    |k| descriptor_params.and_then(|m| descriptor_param_mask_for_lookup(st, m, k)),
-                );
-                let callee_string_descriptor_args = first_resolved_procedure_lookup(
-                    st,
-                    &abi_lookup_keys,
-                    |k| callee_string_descriptor_arg_mask(st, k),
-                );
-                let callee_bind_c_char_args = first_resolved_procedure_lookup(
-                    st,
-                    &abi_lookup_keys,
-                    |k| callee_bind_c_char_arg_mask(st, k),
-                );
-                let callee_pointer_args = first_resolved_procedure_lookup(
-                    st,
-                    &abi_lookup_keys,
-                    |k| callee_pointer_arg_mask(st, k),
-                );
-                let callee_allocatable_args = first_resolved_procedure_lookup(
-                    st,
-                    &abi_lookup_keys,
-                    |k| callee_allocatable_arg_mask(st, k),
-                );
-                let callee_class_args = first_resolved_procedure_lookup(
-                    st,
-                    &abi_lookup_keys,
-                    |k| callee_class_arg_mask(st, k),
-                );
+                let callee_value_args =
+                    first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
+                        callee_value_arg_mask(st, k)
+                    });
+                let callee_descriptor_args =
+                    first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
+                        descriptor_params.and_then(|m| descriptor_param_mask_for_lookup(st, m, k))
+                    });
+                let callee_string_descriptor_args =
+                    first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
+                        callee_string_descriptor_arg_mask(st, k)
+                    });
+                let callee_bind_c_char_args =
+                    first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
+                        callee_bind_c_char_arg_mask(st, k)
+                    });
+                let callee_pointer_args =
+                    first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
+                        callee_pointer_arg_mask(st, k)
+                    });
+                let callee_allocatable_args =
+                    first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
+                        callee_allocatable_arg_mask(st, k)
+                    });
+                let callee_class_args =
+                    first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
+                        callee_class_arg_mask(st, k)
+                    });
                 let opt_flags = first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
                     callee_optional_arg_mask(st, k)
                 });

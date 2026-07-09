@@ -2021,17 +2021,40 @@ fn do_partial_unroll_runtime(func: &mut Function, shape: PartialRuntimeShape) {
     func.block_mut(latch_remain).terminator =
         Some(Terminator::Branch(header_remain, latch_remain_args));
 
-    // ---- 8. When the original exit references acc_param via dominance
-    //         (rather than via false_args), the head loop's acc value
-    //         that flows out of `header` is now the U-way unrolled head
-    //         result — but the remainder loop continues the
-    //         accumulation. Rewrite uses of acc_param outside the loop
-    //         body to use `remain_acc_id` (the final acc from
-    //         header_remain). header_remain dominates everything that
-    //         used to be dominated by header (along the false branch).
+    // ---- 8. Values read after the source DO loop must come from the
+    //         generated remainder loop. The original header IV only carries
+    //         the value after the U-way head loop; the scalar remainder may
+    //         advance it further before control reaches the original exit.
+    //         Rewrite post-loop IV uses to the remainder-header IV param.
+    //         Accumulators lowered through dominance use the same forwarding
+    //         rule below.
+    let body_set: HashSet<BlockId> = [shape.header, shape.latch].iter().copied().collect();
+    for block in func.blocks.iter_mut() {
+        if body_set.contains(&block.id)
+            || block.id == shape.preheader
+            || block.id == header_remain
+            || block.id == latch_remain
+        {
+            continue;
+        }
+        for inst in block.insts.iter_mut() {
+            inst.kind = remap_kind_single(&inst.kind, shape.iv_param, remain_iv_id);
+        }
+        if let Some(term) = block.terminator.as_mut() {
+            remap_term_single(term, shape.iv_param, remain_iv_id);
+        }
+    }
+
+    // When the original exit references acc_param via dominance
+    // (rather than via false_args), the head loop's acc value
+    // that flows out of `header` is now the U-way unrolled head
+    // result — but the remainder loop continues the accumulation.
+    // Rewrite uses of acc_param outside the loop body to use
+    // `remain_acc_id` (the final acc from header_remain).
+    // header_remain dominates everything that used to be dominated by
+    // header (along the false branch).
     if let (Some(r), Some(remain_acc)) = (shape.reduction.as_ref(), remain_acc_id) {
         if !r.exit_takes_acc {
-            let body_set: HashSet<BlockId> = [shape.header, shape.latch].iter().copied().collect();
             for block in func.blocks.iter_mut() {
                 if body_set.contains(&block.id) || block.id == shape.preheader {
                     continue;
@@ -2445,6 +2468,7 @@ fn do_partial_unroll_multiblock(func: &mut Function, shape: PartialMultiBlockSha
 mod tests {
     use super::*;
     use crate::ir::types::{IntWidth, IrType};
+    use crate::ir::verify::verify_module;
     use crate::lexer::Span;
     use crate::opt::pass::Pass;
 
@@ -2569,6 +2593,14 @@ mod tests {
     /// (1 store keeps the multi-store regalloc-pressure heuristic
     /// happy) and increments by 1 in the latch.
     fn build_runtime_counted_loop(lo: i64) -> Module {
+        build_runtime_counted_loop_impl(lo, false)
+    }
+
+    fn build_runtime_counted_loop_returning_final_iv(lo: i64) -> Module {
+        build_runtime_counted_loop_impl(lo, true)
+    }
+
+    fn build_runtime_counted_loop_impl(lo: i64, return_final_iv: bool) -> Module {
         let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         // Reserve %0 for the n_param so the function params line up.
         let n_param = ValueId(0);
@@ -2578,7 +2610,12 @@ mod tests {
             id: n_param,
             fortran_noalias: false,
         }];
-        let mut f = Function::new("loop_runtime".into(), params, IrType::Void);
+        let ret_ty = if return_final_iv {
+            IrType::Int(IntWidth::I64)
+        } else {
+            IrType::Void
+        };
+        let mut f = Function::new("loop_runtime".into(), params, ret_ty);
 
         let header_id = f.create_block("do_check");
         let latch_id = f.create_block("do_body");
@@ -2655,7 +2692,11 @@ mod tests {
         f.block_mut(latch_id).terminator = Some(Terminator::Branch(header_id, vec![iv_next]));
 
         // ---- exit ----
-        f.block_mut(exit_id).terminator = Some(Terminator::Return(None));
+        f.block_mut(exit_id).terminator = if return_final_iv {
+            Some(Terminator::Return(Some(iv_param)))
+        } else {
+            Some(Terminator::Return(None))
+        };
 
         m.add_function(f);
         m
@@ -2831,6 +2872,38 @@ mod tests {
         let kinds: Vec<&InstKind> = preheader.insts.iter().map(|i| &i.kind).collect();
         let has_imod = kinds.iter().any(|k| matches!(k, InstKind::IMod(..)));
         assert!(has_imod, "preheader should compute head_bound via IMod");
+    }
+
+    #[test]
+    fn runtime_partial_unroll_forwards_final_iv_to_post_loop_uses() {
+        let mut m = build_runtime_counted_loop_returning_final_iv(1);
+        let pass = LoopUnroll;
+        let changed = pass.run(&mut m);
+        assert!(changed, "runtime-trip loop should partial-unroll");
+
+        let f = &m.functions[0];
+        let remain_iv = f
+            .blocks
+            .iter()
+            .find(|b| b.name.starts_with("partial_remain_header"))
+            .and_then(|b| b.params.first())
+            .map(|p| p.id)
+            .expect("remainder loop should carry an IV block parameter");
+        let returned = f
+            .blocks
+            .iter()
+            .find_map(|b| match &b.terminator {
+                Some(Terminator::Return(Some(v))) => Some(*v),
+                _ => None,
+            })
+            .expect("transformed loop should still return the final IV");
+        assert_eq!(
+            returned, remain_iv,
+            "post-loop final-IV use must read the remainder-loop IV"
+        );
+
+        let errs = verify_module(&m);
+        assert!(errs.is_empty(), "transformed IR should verify: {:?}", errs);
     }
 
     #[test]

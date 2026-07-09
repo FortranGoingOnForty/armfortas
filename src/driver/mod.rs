@@ -127,6 +127,7 @@ pub enum ParsedCli {
 enum CliInputKind {
     FortranSource,
     LinkArtifact,
+    UnsupportedSource,
 }
 
 /// Compilation options.
@@ -166,6 +167,7 @@ pub struct Options {
     pub force_implicit_none: bool,
     pub recursive_default: bool,
     pub backslash_escapes: bool,
+    pub free_line_length_limit: Option<usize>,
     pub free_line_length_none_compat: bool,
     pub max_stack_var_size: Option<u64>,
     pub max_errors_compat: Option<u64>,
@@ -259,6 +261,7 @@ impl Default for Options {
             force_implicit_none: false,
             recursive_default: false,
             backslash_escapes: false,
+            free_line_length_limit: None,
             free_line_length_none_compat: false,
             max_stack_var_size: None,
             max_errors_compat: None,
@@ -559,7 +562,20 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
             }
             "-ffree-form" => opts.source_form_override = Some(SourceFormOverride::Free),
             "-ffixed-form" => opts.source_form_override = Some(SourceFormOverride::Fixed),
-            "-ffree-line-length-none" => opts.free_line_length_none_compat = true,
+            "-ffree-line-length-none" => {
+                opts.free_line_length_limit = None;
+                opts.free_line_length_none_compat = true;
+            }
+            arg if arg.starts_with("-ffree-line-length-") => {
+                opts.free_line_length_limit =
+                    Some(parse_free_line_length(&arg["-ffree-line-length-".len()..])?);
+                opts.free_line_length_none_compat = false;
+            }
+            arg if arg.starts_with("-ffree-line-length=") => {
+                opts.free_line_length_limit =
+                    Some(parse_free_line_length(&arg["-ffree-line-length=".len()..])?);
+                opts.free_line_length_none_compat = false;
+            }
             "-fdefault-integer-8" => opts.default_integer_8 = true,
             "-fdefault-real-8" => opts.default_real_8 = true,
             "-fimplicit-none" => opts.force_implicit_none = true,
@@ -877,6 +893,16 @@ fn set_output_path(opts: &mut Options, value: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn parse_free_line_length(value: &str) -> Result<usize, String> {
+    let limit: usize = value
+        .parse()
+        .map_err(|_| format!("invalid -ffree-line-length value: {}", value))?;
+    if limit == 0 {
+        return Err("-ffree-line-length requires a positive value".into());
+    }
+    Ok(limit)
+}
+
 fn collect_cli_warnings(opts: &mut Options, unknown_warning_flags: &[String]) {
     if opts.cpp_compat {
         opts.cli_warnings.push(
@@ -1016,6 +1042,7 @@ LANGUAGE:
   --std=<standard>            Fortran standard (f77, f90, f95, f2003, f2008, f2018, f2023)
   -ffree-form                 Force free-form source
   -ffixed-form                Force fixed-form source
+  -ffree-line-length-<n>      Override free-form line conformance warning limit
   -ffree-line-length-none     GNU-compatible alias; free-form inputs are already unlimited
   -fdefault-integer-8         Make default integer kind 8 bytes
   -fdefault-real-8            Make default real kind 8 bytes
@@ -1201,8 +1228,24 @@ fn classify_cli_input(path: &Path) -> CliInputKind {
         .map(|ext| ext.to_ascii_lowercase());
     match ext.as_deref() {
         Some("o" | "obj" | "a" | "dylib" | "so") => CliInputKind::LinkArtifact,
+        Some("c" | "cc" | "cpp" | "cxx" | "c++" | "h" | "hh" | "hpp" | "hxx" | "m" | "mm") => {
+            CliInputKind::UnsupportedSource
+        }
         _ => CliInputKind::FortranSource,
     }
+}
+
+fn unsupported_source_diagnostic(path: &Path) -> String {
+    let ext = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| format!(".{}", ext))
+        .unwrap_or_else(|| "this extension".to_string());
+    format!(
+        "unsupported source file '{}': {} is not a Fortran source; armfortas only compiles Fortran sources. Compile C/C++/Objective-C inputs with the matching compiler, or pass --c-compiler/--cxx-compiler through the build system.",
+        path.display(),
+        ext
+    )
 }
 
 fn validate_link_only_inputs(opts: &Options) -> Result<(), String> {
@@ -1237,6 +1280,12 @@ fn validate_link_only_inputs(opts: &Options) -> Result<(), String> {
 /// compilation and pure link steps based on the positional inputs.
 pub fn execute(opts: &Options) -> Result<(), String> {
     let inputs = all_input_paths(opts);
+    if let Some(input) = inputs
+        .iter()
+        .find(|path| classify_cli_input(path) == CliInputKind::UnsupportedSource)
+    {
+        return Err(unsupported_source_diagnostic(input));
+    }
     let has_source = inputs
         .iter()
         .any(|path| classify_cli_input(path) == CliInputKind::FortranSource);
@@ -1337,6 +1386,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
             std,
             source_form,
             opts.free_line_length_none_compat,
+            opts.free_line_length_limit,
         ) {
             diag::render(&file_str, &source, w.span, diag::Level::Warning, &w.msg, 1);
         }
@@ -1728,6 +1778,18 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     let local_char_len_star_params =
         crate::ir::lower::collect_char_len_star_params_for_units(&units);
 
+    let module_artifact_dir: std::path::PathBuf =
+        opts.module_output_dir.clone().unwrap_or_else(|| {
+            if opts.emit_obj {
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+            } else {
+                opts.output_path()
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .to_path_buf()
+            }
+        });
+
     // Emit module interface files for each MODULE in the compilation unit.
     // -J <dir> overrides where they go. For compile-only (-c) builds
     // without -J, keep the traditional compiler behavior of writing
@@ -1750,29 +1812,52 @@ pub fn compile(opts: &Options) -> Result<(), String> {
                     &local_descriptor_params,
                     &local_char_len_star_params,
                 );
-                let amod_dir: std::path::PathBuf =
-                    opts.module_output_dir.clone().unwrap_or_else(|| {
-                        if opts.emit_obj {
-                            std::env::current_dir()
-                                .unwrap_or_else(|_| std::path::PathBuf::from("."))
-                        } else {
-                            opts.output_path()
-                                .parent()
-                                .unwrap_or_else(|| std::path::Path::new("."))
-                                .to_path_buf()
-                        }
-                    });
-                let amod_path = amod_dir.join(format!("{}.amod", mod_key));
+                let amod_path = module_artifact_dir.join(format!("{}.amod", mod_key));
                 write_module_file_atomic(&amod_path, &amod_text)?;
                 // `.amod` remains the ARMFORTAS module ABI file. A
                 // byte-identical `.mod` alias keeps conventional Fortran
                 // build systems such as CMake able to track module
                 // dependencies for unknown compilers.
-                let mod_path = amod_dir.join(format!("{}.mod", mod_key));
+                let mod_path = module_artifact_dir.join(format!("{}.mod", mod_key));
                 write_module_file_atomic(&mod_path, &amod_text)?;
                 if opts.verbose {
                     eprintln!(" amod: {}", amod_path.display());
                 }
+            }
+        }
+    }
+    for unit in &units {
+        if let crate::ast::unit::ProgramUnit::Submodule {
+            parent,
+            ancestor,
+            name,
+            ..
+        } = &unit.node
+        {
+            let parent_key = parent.to_lowercase();
+            let name_key = name.to_lowercase();
+            let parent_spec = if let Some(ancestor) = ancestor {
+                format!("{}:{}", parent_key, ancestor.to_lowercase())
+            } else {
+                parent_key.clone()
+            };
+            let smod_stem = if let Some(ancestor) = ancestor {
+                format!("{}@{}@{}", parent_key, ancestor.to_lowercase(), name_key)
+            } else {
+                format!("{}@{}", parent_key, name_key)
+            };
+            let smod_text = format!(
+                "#!smod 1\n# compiler: armfortas {}\n# source: {}\n@parent {}\n@submodule {}\n",
+                env!("CARGO_PKG_VERSION"),
+                opts.input.to_str().unwrap_or(""),
+                parent_spec,
+                name_key
+            );
+            let smod_path = module_artifact_dir.join(format!("{}.smod", smod_stem));
+            fs::write(&smod_path, &smod_text)
+                .map_err(|e| format!("cannot write '{}': {}", smod_path.display(), e))?;
+            if opts.verbose {
+                eprintln!(" smod: {}", smod_path.display());
             }
         }
     }
@@ -2062,7 +2147,7 @@ pub(crate) fn link_inputs_elf(
     // afs_ld_override() was consulted only for Mach-O.
     let linker = linker_override.unwrap_or_else(|| "ld".into());
     if opts.verbose {
-        eprintln!(" linking: {} {}", linker, args.join(" "));
+        print_verbose_command_line(&linker, &args);
     }
     let result = Command::new(&linker)
         .args(&args)
@@ -2111,6 +2196,10 @@ fn link_inputs(inputs: &[PathBuf], output: &Path, opts: &Options) -> Result<(), 
     }
     push_link_flags(&mut args, opts);
 
+    if opts.verbose {
+        print_verbose_command_line("ld", &args);
+    }
+
     let ld_result = Command::new("ld")
         .args(&args)
         .output()
@@ -2149,6 +2238,10 @@ fn link_inputs_with_afs_ld(
     args.push(rt_path);
     args.push(libsystem_tbd);
     push_afs_ld_link_flags(&mut args, opts);
+
+    if opts.verbose {
+        print_verbose_command_line(linker, &args);
+    }
 
     let output = Command::new(linker)
         .args(&args)
@@ -2189,6 +2282,14 @@ fn push_link_flags(args: &mut Vec<String>, opts: &Options) {
         // -search_paths_first to bias toward .a archives.  Keep the
         // intent visible without breaking link.
         args.push("-search_paths_first".into());
+    }
+}
+
+fn print_verbose_command_line(program: &str, args: &[String]) {
+    if args.is_empty() {
+        eprintln!("{}", program);
+    } else {
+        eprintln!("{} {}", program, args.join(" "));
     }
 }
 
@@ -2820,6 +2921,22 @@ mod tests {
             "expected a compatibility warning for -ffree-line-length-none, got {:?}",
             opts.cli_warnings
         );
+    }
+
+    #[test]
+    fn parse_cli_accepts_numeric_ffree_line_length_flag() {
+        let args = vec![
+            "-ffree-line-length-132".to_string(),
+            "hello.f90".to_string(),
+        ];
+        let ParsedCli::Compile(opts) =
+            parse_cli(&args).expect("driver should accept -ffree-line-length-132")
+        else {
+            panic!("expected compile options");
+        };
+        assert_eq!(opts.free_line_length_limit, Some(132));
+        assert!(!opts.free_line_length_none_compat);
+        assert!(opts.cli_warnings.is_empty());
     }
 
     #[test]

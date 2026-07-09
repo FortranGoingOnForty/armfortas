@@ -544,19 +544,20 @@ fn derived_memory_helper_available_from_current_func(
         || func.starts_with(&format!("afs_derived_{}_", owner))
 }
 
-/// Extended gate for dealloc/copy walks: also callable from ANY function
-/// in this unit when the type's owner module is compiled locally, because
-/// `emit_derived_memory_helpers` emits a helper for every local-module
-/// type. This is what stops a routine that assembles derived types from
-/// many modules (fpm's `build_model`) from inlining every dealloc/copy
-/// walk and ballooning to 140k+ blocks. For separate compilation the only
-/// local module is the current one, so it collapses to the strict check.
-/// Not used for init (see the strict gate's note on the -O2 miscompile).
+/// Extended gate for dealloc/copy walks: owner-module helpers are external
+/// ABI helpers, so separate consumers may call them just like module
+/// procedures. This is what stops imported recursive derived layouts from
+/// being expanded inline forever (`type(node_t), allocatable :: children(:)`).
+/// For ownerless local layouts, fall back to the strict current-function
+/// check. Not used for init (see the strict gate's note on the -O2 miscompile).
 fn derived_memory_helper_available_xmodule(
     b: &FuncBuilder,
     layout: &crate::sema::type_layout::TypeLayout,
 ) -> bool {
     if let Some(owner) = layout.owner_module.as_ref() {
+        if !owner.is_empty() {
+            return true;
+        }
         if b.owner_module_is_local(&owner.to_lowercase()) {
             return true;
         }
@@ -42866,6 +42867,8 @@ pub(super) fn lower_rank1_elemental_call_descriptor(
         Vec::new();
     let mut control_desc = None;
     let mut control_rank = None;
+    let mut fallback_control_desc = None;
+    let mut fallback_control_rank = None;
     let mut mapped_callee = callee.clone();
 
     match &callee.node {
@@ -42993,8 +42996,13 @@ pub(super) fn lower_rank1_elemental_call_descriptor(
                 expr_is_character_expr(b, locals, actual_expr, st, type_layouts);
             let pass_optional_element_by_ref =
                 !actual_is_character && elemental_actual_may_be_absent(actual_expr, locals, st);
-            control_desc.get_or_insert(actual_desc);
-            control_rank.get_or_insert(actual_rank);
+            if pass_optional_element_by_ref {
+                fallback_control_desc.get_or_insert(actual_desc);
+                fallback_control_rank.get_or_insert(actual_rank);
+            } else {
+                control_desc.get_or_insert(actual_desc);
+                control_rank.get_or_insert(actual_rank);
+            }
             let temp_name = fresh_elemental_temp_name(&loop_locals, "afs_elem_arg", idx);
             let mut char_kind = CharKind::None;
             let temp_addr = if pass_optional_element_by_ref {
@@ -43153,8 +43161,8 @@ pub(super) fn lower_rank1_elemental_call_descriptor(
         }
     }
 
-    let control_desc = control_desc?;
-    let control_rank = control_rank.unwrap_or(1).max(1);
+    let control_desc = control_desc.or(fallback_control_desc)?;
+    let control_rank = control_rank.or(fallback_control_rank).unwrap_or(1).max(1);
     let result_type = operator_expr_type_info(expr, Some(locals), st, type_layouts)?;
     let (result_elem_ty, result_char_len) = match result_type {
         crate::sema::symtab::TypeInfo::Character { len: Some(len), .. } => {
@@ -44746,7 +44754,8 @@ pub(super) fn lower_rank1_numeric_array_binary_descriptor(
             (IrType::Float(_), BinaryOp::Div) => b.fdiv(lhs_val, rhs_val),
             (IrType::Float(_), BinaryOp::Pow) => {
                 let r = coerce_to_type(b, rhs_val, &elem_ty);
-                b.fpow(lhs_val, r)
+                super::expr::try_lower_float_square_power(b, lhs_val, right)
+                    .unwrap_or_else(|| b.fpow(lhs_val, r))
             }
             (IrType::Bool, BinaryOp::And) => b.and(lhs_val, rhs_val),
             (IrType::Bool, BinaryOp::Or) => b.or(lhs_val, rhs_val),
@@ -50173,6 +50182,15 @@ pub(super) fn lower_scalar_allocated_intrinsic(
     let crate::ast::expr::SectionSubscript::Element(expr) = &first.value else {
         return None;
     };
+    if let Some(value) = lower_allocated_component_through_descriptor_array_element(
+        b,
+        locals,
+        expr,
+        st,
+        type_layouts,
+    ) {
+        return Some(value);
+    }
     let (desc, is_string) = match &expr.node {
         Expr::Name { name } => {
             let info = locals.get(&name.to_lowercase())?;
@@ -50211,6 +50229,98 @@ pub(super) fn lower_scalar_allocated_intrinsic(
     );
     let zero = b.const_i32(0);
     Some(b.icmp(CmpOp::Ne, raw, zero))
+}
+
+fn lower_allocated_component_through_descriptor_array_element(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> Option<ValueId> {
+    let tl = type_layouts?;
+    let Expr::ComponentAccess { base, component } = &expr.node else {
+        return None;
+    };
+    let Expr::FunctionCall { callee, args } = &base.node else {
+        return None;
+    };
+    if args
+        .iter()
+        .any(|arg| !matches!(arg.value, crate::ast::expr::SectionSubscript::Element(_)))
+    {
+        return None;
+    }
+
+    let parent_info = match &callee.node {
+        Expr::Name { name } => {
+            let info = locals.get(&name.to_lowercase())?;
+            if !local_uses_array_descriptor(info) || info.derived_type.is_none() {
+                return None;
+            }
+            info.clone()
+        }
+        Expr::ComponentAccess { .. } => {
+            let info = component_array_local_info(b, locals, callee, st, tl)?;
+            info.derived_type.as_ref()?;
+            info
+        }
+        _ => return None,
+    };
+
+    let raw_type_name = parent_info.derived_type.as_ref()?.clone();
+    let scope_id =
+        callee_scope_id_for_lookup(st, b.func().name.as_str()).or_else(current_proc_scope);
+    let type_name = canonical_layout_type_name_for_scope(st, scope_id, &raw_type_name, tl)
+        .unwrap_or(raw_type_name);
+    let layout = tl.get(&type_name)?;
+    let field = layout_component_field_or_parent_view(layout, component, tl)?.clone();
+    let is_string = if matches!(field_char_kind(&field), CharKind::Deferred) && field.size == 32 {
+        true
+    } else if field.allocatable && field.size == 384 {
+        false
+    } else {
+        return None;
+    };
+
+    let parent_desc = array_descriptor_addr(b, &parent_info);
+    let parent_raw = b.call(
+        FuncRef::External("afs_array_allocated".into()),
+        vec![parent_desc],
+        IrType::Int(IntWidth::I32),
+    );
+    let zero = b.const_i32(0);
+    let parent_allocated = b.icmp(CmpOp::Ne, parent_raw, zero);
+    let present_bb = b.create_block("allocated_parent_present");
+    let absent_bb = b.create_block("allocated_parent_absent");
+    let merge_bb = b.create_block("allocated_parent_merge");
+    let result = b.add_block_param(merge_bb, IrType::Bool);
+    b.cond_branch(parent_allocated, present_bb, vec![], absent_bb, vec![]);
+
+    b.set_block(absent_bb);
+    let false_val = b.const_bool(false);
+    b.branch(merge_bb, vec![false_val]);
+
+    b.set_block(present_bb);
+    let elem_addr = lower_array_element(b, locals, &parent_info, args, st, Some(tl));
+    let offset = b.const_i64(field.offset as i64);
+    let desc = b.gep(elem_addr, vec![offset], IrType::Int(IntWidth::I8));
+    let runtime = if is_string {
+        "afs_string_allocated"
+    } else {
+        "afs_array_allocated"
+    };
+    let raw = b.call(
+        FuncRef::External(runtime.into()),
+        vec![desc],
+        IrType::Int(IntWidth::I32),
+    );
+    let zero = b.const_i32(0);
+    let child_allocated = b.icmp(CmpOp::Ne, raw, zero);
+    b.branch(merge_bb, vec![child_allocated]);
+
+    b.set_block(merge_bb);
+    Some(result)
 }
 
 pub(super) fn component_intrinsic_local_info(

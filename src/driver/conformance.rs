@@ -107,18 +107,22 @@ pub fn find_over_cap_statement(source: &str, form: SourceForm) -> Option<(Span, 
 /// `suppress_line_limit` is `-ffree-line-length-none`: gfortran's
 /// meaning of that flag is "no line-length conformance concern", so it
 /// silences the line warning (the statement limit still applies).
+/// `line_limit_override` is numeric `-ffree-line-length-N`: armfortas
+/// still compiles the full line, but conformance warnings use the
+/// requested GNU-compatible limit.
 /// Fixed form is untouched — F2023's new limits are free-form.
 pub fn check_source_limits(
     source: &str,
     std: FortranStandard,
     form: SourceForm,
     suppress_line_limit: bool,
+    line_limit_override: Option<usize>,
 ) -> Vec<LimitWarning> {
     if form != SourceForm::FreeForm {
         return Vec::new();
     }
     let mut warnings = Vec::new();
-    let limit = line_limit(std);
+    let limit = line_limit_override.unwrap_or_else(|| line_limit(std));
 
     // Statement tracking: in_string carries across continued lines;
     // stmt_start/stmt_chars accumulate until a non-continued line ends
@@ -145,7 +149,14 @@ pub fn check_source_limits(
             };
             warnings.push(LimitWarning {
                 span: at,
-                msg: if limit == 132 {
+                msg: if let Some(limit) = line_limit_override {
+                    format!(
+                        "line is {} characters long; -ffree-line-length-{} limits \
+                         free-form lines to {} (conformance warning; the line is \
+                         compiled in full)",
+                        len, limit, limit
+                    )
+                } else if limit == 132 {
                     format!(
                         "line is {} characters long; {:?} limits free-form lines to 132 \
                          (F2023 raises the limit to 10,000 — this is a conformance \
@@ -296,7 +307,7 @@ y = 2
     }
 
     fn check(src: &str, std: FortranStandard) -> Vec<LimitWarning> {
-        check_source_limits(src, std, SourceForm::FreeForm, false)
+        check_source_limits(src, std, SourceForm::FreeForm, false, None)
     }
 
     #[test]
@@ -323,14 +334,40 @@ y = 2
     #[test]
     fn line_limit_suppressed_by_compat_flag() {
         let src = format!("print *, {}\n", "1".repeat(200));
-        let w = check_source_limits(&src, FortranStandard::F2018, SourceForm::FreeForm, true);
+        let w = check_source_limits(
+            &src,
+            FortranStandard::F2018,
+            SourceForm::FreeForm,
+            true,
+            None,
+        );
         assert!(w.is_empty());
+    }
+
+    #[test]
+    fn numeric_free_line_limit_overrides_std_warning_threshold() {
+        let src = format!("print *, {}\n", "1".repeat(200));
+        let w = check_source_limits(
+            &src,
+            FortranStandard::F2023,
+            SourceForm::FreeForm,
+            false,
+            Some(132),
+        );
+        assert_eq!(w.len(), 1);
+        assert!(w[0].msg.contains("-ffree-line-length-132"));
     }
 
     #[test]
     fn fixed_form_is_exempt() {
         let src = format!("      x = {}\n", "1".repeat(200));
-        let w = check_source_limits(&src, FortranStandard::F2018, SourceForm::FixedForm, false);
+        let w = check_source_limits(
+            &src,
+            FortranStandard::F2018,
+            SourceForm::FixedForm,
+            false,
+            None,
+        );
         assert!(w.is_empty());
     }
 
