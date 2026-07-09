@@ -14228,7 +14228,7 @@ pub(super) fn actual_expr_rank(
                                     &first_arg.value
                                 {
                                     return actual_expr_rank(first_expr, locals, st, type_layouts)
-                                        .map(|rank| if rank > 1 { 1 } else { 0 });
+                                        .map(|rank| if rank > 0 { 1 } else { 0 });
                                 }
                             }
                         }
@@ -40430,7 +40430,7 @@ pub(super) fn lower_array_location_nodim_descriptor(
         return None;
     };
     let source_rank = actual_expr_rank(array_expr, locals, st, type_layouts)?;
-    if source_rank <= 1 {
+    if source_rank == 0 {
         return None;
     }
 
