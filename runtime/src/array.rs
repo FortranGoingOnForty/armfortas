@@ -2701,9 +2701,7 @@ mod tests {
         assert!(!max_result.base_addr.is_null());
         let max_values =
             unsafe { core::slice::from_raw_parts(max_result.base_addr as *const f64, 6) };
-        assert!(max_values
-            .iter()
-            .all(|value| value.is_infinite() && value.is_sign_negative()));
+        assert!(max_values.iter().all(|value| *value == -f64::MAX));
 
         let mut min_result = ArrayDescriptor::zeroed();
         afs_array_minval_real8_dim(&source, 2, &mut min_result);
@@ -2713,9 +2711,7 @@ mod tests {
         assert!(!min_result.base_addr.is_null());
         let min_values =
             unsafe { core::slice::from_raw_parts(min_result.base_addr as *const f64, 6) };
-        assert!(min_values
-            .iter()
-            .all(|value| value.is_infinite() && value.is_sign_positive()));
+        assert!(min_values.iter().all(|value| *value == f64::MAX));
 
         let mut sum_result = ArrayDescriptor::zeroed();
         afs_array_sum_real8_dim(&source, 2, &mut sum_result);
@@ -3827,65 +3823,6 @@ fn for_each_reduce_along_dim<F: FnMut(usize, usize)>(
         }
         accum(byte_off as usize, dst_flat as usize);
         // Increment idx in column-major order (innermost = idx[0]).
-        for d in 0..rank {
-            idx[d] += 1;
-            if idx[d] < extents[d] {
-                break;
-            }
-            idx[d] = 0;
-        }
-    }
-}
-
-fn for_each_reduce_along_dim_with_index<F: FnMut(usize, usize, i64)>(
-    src: &ArrayDescriptor,
-    reduce_dim: i32,
-    mut accum: F,
-) {
-    let rank = src.rank as usize;
-    if rank == 0 {
-        return;
-    }
-    let reduce_dim_idx = reduce_dim as usize - 1;
-    if reduce_dim_idx >= rank {
-        return;
-    }
-    let mut extents: [i64; 15] = [0; 15];
-    let mut strides: [i64; 15] = [0; 15];
-    let mut dst_running_stride: [i64; 15] = [0; 15];
-    let mut k = 0usize;
-    let mut acc = 1i64;
-    for i in 0..rank {
-        extents[i] = src.dims[i].extent();
-        strides[i] = src.dims[i].stride.max(1);
-        if i == reduce_dim_idx {
-            continue;
-        }
-        dst_running_stride[k] = acc;
-        acc *= extents[i];
-        k += 1;
-    }
-    let total = (0..rank).map(|i| extents[i]).product::<i64>();
-    if total <= 0 {
-        return;
-    }
-    let mut idx: [i64; 15] = [0; 15];
-    for _ in 0..total {
-        let mut byte_off: i64 = 0;
-        let mut dst_flat: i64 = 0;
-        let mut dk = 0usize;
-        for d in 0..rank {
-            byte_off += idx[d] * strides[d] * src.elem_size;
-            if d != reduce_dim_idx {
-                dst_flat += idx[d] * dst_running_stride[dk];
-                dk += 1;
-            }
-        }
-        accum(
-            byte_off as usize,
-            dst_flat as usize,
-            idx[reduce_dim_idx] + 1,
-        );
         for d in 0..rank {
             idx[d] += 1;
             if idx[d] < extents[d] {

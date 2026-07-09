@@ -1370,7 +1370,7 @@ fn add_integrity_headers(mut content: String) -> String {
     let body = &content[body_start..];
     let integrity = format!(
         "# content-length: {}\n# content-checksum: fnv1a:{}\n",
-        body.as_bytes().len(),
+        body.len(),
         fnv1a_hex(body)
     );
     let insert_at = content.find('\n').map(|idx| idx + 1).unwrap_or(0);
@@ -1625,7 +1625,7 @@ fn validate_amod_integrity(content: &str, path: &Path) -> Result<(), String> {
         )
     })?;
 
-    let actual_len = body.as_bytes().len();
+    let actual_len = body.len();
     if actual_len != expected_len {
         return Err(format!(
             "{}: corrupt .amod file (content length {}, expected {}); rebuild the provider module",

@@ -3979,7 +3979,7 @@ pub extern "C" fn afs_io_finalize() {
     // unwound or process::exit released their mutex first; in the rare case where
     // the lock is genuinely contested, skip flush rather than hang the program.
     if let Ok(mut state) = io_state().try_lock() {
-        for (_, unit) in state.units.iter_mut() {
+        for unit in state.units.values_mut() {
             let _ = unit.flush();
         }
         // Delete any STATUS='SCRATCH' backing files left open at exit.
