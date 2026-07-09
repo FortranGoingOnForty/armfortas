@@ -85,6 +85,51 @@ fn should_skip(source_text: &str) -> bool {
     false
 }
 
+fn assert_repeated_asm_identical(compiler: &Path, source: &Path, opt: &str, runs: usize) {
+    assert!(runs >= 2, "determinism checks need at least two runs");
+    let baseline = compile_to_asm(compiler, source, opt)
+        .unwrap_or_else(|| panic!("{} {} compile failed", source.display(), opt));
+    for run in 2..=runs {
+        let current = compile_to_asm(compiler, source, opt).unwrap_or_else(|| {
+            panic!(
+                "{} {} compile failed on run {}",
+                source.display(),
+                opt,
+                run
+            )
+        });
+        assert_eq!(
+            baseline,
+            current,
+            "{} {} assembly differs on run {} of {}",
+            source.display(),
+            opt,
+            run,
+            runs
+        );
+    }
+}
+
+#[test]
+fn audit_shaped_programs_deterministic_eight_runs_at_o2() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=determinism_sweep test=audit_shaped_programs_deterministic_eight_runs_at_o2 count=2 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    for name in [
+        "ar13_unswitch_deterministic.f90",
+        "ar13_fgof_watch_deterministic.f90",
+    ] {
+        assert_repeated_asm_identical(&compiler, &test_dir.join(name), "-O2", 8);
+    }
+}
+
 #[test]
 fn all_programs_deterministic_at_o2() {
     let test_dir = find_test_programs();
