@@ -2026,7 +2026,11 @@ pub(crate) fn link_inputs_elf(
         );
     }
 
-    let pie = !opts.no_pie;
+    let linker_override = afs_ld_override();
+    // afs-ld's ELF backend currently emits ET_EXEC, not PIE. Route its
+    // links through the matching crt1/crtbegin pair instead of combining
+    // Scrt1/crtbeginS with a non-PIE output.
+    let pie = !opts.no_pie && linker_override.is_none();
     let mut override_dirs = opts.crt_search_dirs.clone();
     // Colon-separated, PATH-style: NixOS needs two crt roots (crt1/
     // crti/crtn from glibc, crtbegin/crtend from the gcc store path).
@@ -2055,10 +2059,8 @@ pub(crate) fn link_inputs_elf(
 
     // x16: honor the AFS_LD routing on ELF targets too — previously
     // this path went straight to the system linker and
-    // afs_ld_override() was consulted only for Mach-O. The substitute
-    // linker receives the same ld-compatible argument list (that flag
-    // surface IS the drop-in contract afs-ld's ELF support targets).
-    let linker = afs_ld_override().unwrap_or_else(|| "ld".into());
+    // afs_ld_override() was consulted only for Mach-O.
+    let linker = linker_override.unwrap_or_else(|| "ld".into());
     if opts.verbose {
         eprintln!(" linking: {} {}", linker, args.join(" "));
     }

@@ -30,6 +30,21 @@ fn compiler() -> PathBuf {
     panic!("armfortas binary not built — run cargo build first");
 }
 
+fn afs_ld() -> Option<PathBuf> {
+    for dir in [
+        "target/debug",
+        "../target/debug",
+        "target/release",
+        "../target/release",
+    ] {
+        let p = Path::new(dir).join("afs-ld");
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
+}
+
 fn programs_dir() -> PathBuf {
     for dir in ["test_programs", "../test_programs"] {
         if Path::new(dir).exists() {
@@ -73,6 +88,17 @@ fn skip(test: &str, count: usize) -> bool {
         test, count
     );
     true
+}
+
+fn host_can_link_without_overrides() -> bool {
+    let host = TargetSpec::host();
+    if host.arch != Arch::X86_64
+        || host.object_format() != ObjectFormat::Elf
+        || host.libc == Libc::Musl
+    {
+        return false;
+    }
+    armfortas::driver::elf_crt::find_crt(&host, &[], false).is_ok()
 }
 
 fn build(program: &str, tag: &str, extra: &[&str]) -> PathBuf {
@@ -196,6 +222,52 @@ fn no_pie_links_a_position_dependent_executable_that_runs() {
         text
     );
     let _ = std::fs::remove_file(&bin);
+}
+
+#[test]
+fn afs_ld_route_links_without_explicit_crt_dir() {
+    if !host_can_link_without_overrides() {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_e2e test=afs_ld_route_links_without_explicit_crt_dir count=1 reason=\"needs an x86_64 ELF glibc or FreeBSD host with built-in crt discovery\"");
+        return;
+    }
+    let Some(afs_ld) = afs_ld() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_e2e test=afs_ld_route_links_without_explicit_crt_dir count=1 reason=\"afs-ld binary not built\"");
+        return;
+    };
+    let src = programs_dir().join("hello.f90");
+    let out = std::env::temp_dir().join(format!("afs_elfe2e_afsld_{}", std::process::id()));
+    let r = Command::new(compiler())
+        .env_remove("AFS_CRT_DIR")
+        .env("AFS_LD_PATH", &afs_ld)
+        .arg(&src)
+        .arg("-o")
+        .arg(&out)
+        .output()
+        .expect("cannot run armfortas");
+    assert!(
+        r.status.success(),
+        "AFS_LD_PATH={} failed:\n{}",
+        afs_ld.display(),
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let run = Command::new(&out).output().expect("cannot run binary");
+    assert!(run.status.success(), "AFS_LD binary exited nonzero");
+    assert!(String::from_utf8_lossy(&run.stdout).contains("Hello, World!"));
+
+    let readelf =
+        armfortas::testing::find_inspection_tool("AFS_READELF_BIN", &["llvm-readelf", "readelf"]);
+    let hdr = Command::new(&readelf)
+        .arg("-h")
+        .arg(&out)
+        .output()
+        .expect("cannot run readelf");
+    let text = String::from_utf8_lossy(&hdr.stdout);
+    assert!(
+        text.contains("EXEC"),
+        "afs-ld ELF route should use non-PIE ET_EXEC until PIE lands:\n{}",
+        text
+    );
+    let _ = std::fs::remove_file(&out);
 }
 
 /// Out-of-scope link paths fail with diagnostics that name the sprint
