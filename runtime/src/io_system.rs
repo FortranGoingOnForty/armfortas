@@ -5680,6 +5680,50 @@ mod tests {
         assert!(msg.contains(&path), "expected filename in iomsg: {msg:?}");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn open_preserves_non_utf8_filename_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "afs_latin1_open_{}_{}",
+            std::process::id(),
+            line!()
+        ));
+        let parent = root.join(std::ffi::OsString::from_vec(b"d_\xe9".to_vec()));
+        std::fs::create_dir_all(&parent).expect("create non-UTF8 parent");
+        let filename = os_string_to_bytes(parent.join("f.txt").into_os_string());
+
+        let mut iostat = -99i32;
+        let cb = OpenControlBlock {
+            unit: 789,
+            filename: filename.as_ptr(),
+            filename_len: filename.len() as i64,
+            status: "replace".as_ptr(),
+            status_len: 7,
+            action: "write".as_ptr(),
+            action_len: 5,
+            access: std::ptr::null(),
+            access_len: 0,
+            form: std::ptr::null(),
+            form_len: 0,
+            recl: 0,
+            iostat: &mut iostat,
+            newunit: std::ptr::null_mut(),
+            position: std::ptr::null(),
+            position_len: 0,
+            leading_zero: std::ptr::null(),
+            leading_zero_len: 0,
+            iomsg: std::ptr::null_mut(),
+            iomsg_len: 0,
+        };
+
+        afs_open(&cb);
+        assert_eq!(iostat, 0, "OPEN should preserve raw filename bytes");
+        afs_close_ex(789, "delete".as_ptr(), 6, &mut iostat);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn direct_access_open_reports_iostat_without_creating() {
         let path = format!(
