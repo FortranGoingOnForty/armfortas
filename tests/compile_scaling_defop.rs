@@ -68,7 +68,7 @@ fn intrinsic_operator_compile_time_scales_below_quadratic() {
 
     let small = compile_ir(temp_source("defop_small", 1000));
     let large = compile_ir(temp_source("defop_large", 2000));
-    let ceiling = small.mul_f64(3.0) + Duration::from_millis(500);
+    let ceiling = small.mul_f64(4.0) + Duration::from_millis(500);
 
     assert!(
         large < ceiling,

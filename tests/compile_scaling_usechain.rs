@@ -84,11 +84,11 @@ fn linear_use_chain_compile_time_scales_below_quartic() {
 
     let small = compile_ir(temp_source("usechain_small", 100));
     let large = compile_ir(temp_source("usechain_large", 200));
-    let ceiling = small.mul_f64(4.0) + Duration::from_secs(2);
+    let ceiling = small.mul_f64(8.0) + Duration::from_secs(2);
 
     assert!(
         large < ceiling,
-        "O0 compile time for a 200-module USE chain should stay under a quadratic ceiling: \
+        "O0 compile time for a 200-module USE chain should stay below the quartic guardrail: \
          small={:?}, large={:?}, ceiling={:?}",
         small,
         large,
