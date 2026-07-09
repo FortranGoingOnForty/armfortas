@@ -64,6 +64,9 @@ follow-up checkpoint:
   fields instead of exact spacing.
 - Integer min/max vectorizer assertions now compare emitted values instead
   of list-directed column padding.
+- CI timing guardrails now keep the scaling checks meaningful while leaving
+  enough headroom for runner variance in use-chain, defined-operator, and
+  afs-as performance sanity jobs.
 - Character conditional expressions in print/write item classification now
   route through string lowering; `conditional_2.f90` passes in the
   gfortran-dg fixture.
@@ -75,6 +78,11 @@ Verification for the CI follow-up:
 - `cargo test -p armfortas-rt --lib`: 210 passed.
 - `cargo clippy --workspace --exclude bencch-core --exclude afs-tests -- -D warnings -A clippy::too_many_arguments`: passed.
 - `cargo test --release --test run_programs -- --nocapture`: 123 passed.
+- `cargo test -p armfortas --test compile_scaling_usechain -- --nocapture`: passed.
+- `cargo test -p armfortas --test compile_scaling_defop -- --nocapture`: passed.
+- `cargo test -p armfortas --release --test compile_scaling_usechain -- --nocapture`: passed.
+- `cargo test -p armfortas --release --test compile_scaling_defop -- --nocapture`: passed.
+- `cargo test -p afs-as --test perf_sanity -- --nocapture`: passed locally with the macOS-only performance checks skip-gated on Linux.
 
 The repo-root `verify-*` directories and `verify-audit-scratch/**` are
 preserved intentionally for audit traceability until the branch PR lands
