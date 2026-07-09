@@ -572,6 +572,17 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
     let newunit = cb.newunit;
     let missing_filename = fname.is_empty();
 
+    if access_str.trim() == "direct" {
+        if !iostat.is_null() {
+            unsafe {
+                *iostat = 1;
+            }
+            return;
+        }
+        eprintln!("OPEN: ACCESS='DIRECT' is not implemented");
+        std::process::exit(1);
+    }
+
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
 
     // NEWUNIT: allocate a new unit number.
@@ -5488,6 +5499,45 @@ mod tests {
 
         afs_open(&cb);
         assert_ne!(iostat, 0, "STATUS='old' read must fail for missing files");
+    }
+
+    #[test]
+    fn direct_access_open_reports_iostat_without_creating() {
+        let path = format!(
+            "/tmp/afs_direct_access_reject_{}_{}.dat",
+            std::process::id(),
+            line!()
+        );
+        let _ = std::fs::remove_file(&path);
+
+        let mut iostat = -99i32;
+        let cb = OpenControlBlock {
+            unit: 783,
+            filename: path.as_ptr(),
+            filename_len: path.len() as i64,
+            status: "replace".as_ptr(),
+            status_len: 7,
+            action: "readwrite".as_ptr(),
+            action_len: 9,
+            access: "direct".as_ptr(),
+            access_len: 6,
+            form: "unformatted".as_ptr(),
+            form_len: 11,
+            recl: 4,
+            iostat: &mut iostat,
+            newunit: std::ptr::null_mut(),
+            position: std::ptr::null(),
+            position_len: 0,
+            leading_zero: std::ptr::null(),
+            leading_zero_len: 0,
+        };
+
+        afs_open(&cb);
+        assert_ne!(iostat, 0, "direct access OPEN must be rejected");
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "rejected direct access OPEN must not create a file"
+        );
     }
 
     #[test]
