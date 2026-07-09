@@ -9832,6 +9832,7 @@ pub(super) fn descriptor_backed_runtime_char_array(info: &LocalInfo) -> bool {
             || info.descriptor_arg
             || (info.allocatable
                 && info.char_kind == CharKind::None
+                && local_declared_rank(info) > 0
                 && local_fixed_char_allocatable_scalar_len(info).is_none()))
 }
 
@@ -24431,7 +24432,7 @@ pub(super) fn local_is_string_scalar(info: &LocalInfo) -> bool {
 }
 
 pub(super) fn local_is_array_like(info: &LocalInfo) -> bool {
-    (local_declared_rank(info) > 0 || info.allocatable) && !local_is_string_scalar(info)
+    local_declared_rank(info) > 0
 }
 
 pub(super) fn resolved_named_character_return_abi_for_call(
@@ -45405,10 +45406,10 @@ pub(super) fn lower_array_expr_descriptor(
                             let symbol_rank = current_proc_scope()
                                 .and_then(|sid| st.lookup_in(sid, &key))
                                 .and_then(value_symbol_declared_rank);
+                            let declared_rank = local_declared_rank(info);
                             (info.char_kind != CharKind::None
                                 || descriptor_backed_runtime_char_array(info))
-                                && (local_declared_rank(info) > 0
-                                    || local_uses_array_descriptor(info)
+                                && (declared_rank > 0
                                     || descriptor_backed_runtime_char_array(info)
                                     || symbol_rank.is_some_and(|rank| rank > 0))
                         }
@@ -56457,7 +56458,6 @@ pub(super) fn actual_is_character_array_section_designator(
                     || descriptor_backed_runtime_char_array(info)
                     || local_fixed_char_allocatable_scalar_len(info).is_some();
                 let has_array_shape = local_declared_rank(info) > 0
-                    || local_uses_array_descriptor(info)
                     || descriptor_backed_runtime_char_array(info)
                     || symbol_rank.is_some_and(|rank| rank > 0);
                 has_character_elements && has_array_shape

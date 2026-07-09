@@ -1,8 +1,8 @@
 ! CHECK: ok
 ! IR_CHECK: call @afs_list_write_begin
-! IR_CHECK: call @afs_list_read_begin
 ! IR_CHECK: call @afs_write_int
 ! IR_CHECK: call @afs_write_string
+! IR_CHECK: call @afs_list_read_begin
 ! REPRO_CHECK: run
 ! OPT_EQ: O0,O1,O2,O3,Os,Ofast => stdout|stderr|exit
 program ar10_unformatted_derived

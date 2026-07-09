@@ -39,5 +39,5 @@ end program char_substring
 ! CHECK: world
 ! CHECK: helloworld
 ! CHECK: hello
-! CHECK: [  ]
+! CHECK: []
 ! OPT_EQ: O0,O1,O2,O3,Os,Ofast => stdout|stderr|exit

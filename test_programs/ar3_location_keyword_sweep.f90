@@ -17,3 +17,10 @@ program ar3_location_keyword_sweep
   print '(a,3(1x,i0))', 'findloc_logical_dim_back', findloc(m, .true., dim=1, back=.true.)
   print '(a,3(1x,i0))', 'findloc_scalar_false', findloc(a, 7, dim=1, mask=.false.)
 end program
+! CHECK: maxloc_dim_mask 2 1 1
+! CHECK: maxloc_dim_mask_back 2 1 2
+! CHECK: minloc_dim_mask_back 2 1 2
+! CHECK: findloc_dim_mask_back 0 0 2
+! CHECK: findloc_real_dim_mask_back 0 0 2
+! CHECK: findloc_logical_dim_back 2 1 2
+! CHECK: findloc_scalar_false 0 0 0

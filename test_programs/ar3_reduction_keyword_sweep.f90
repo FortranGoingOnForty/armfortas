@@ -24,3 +24,12 @@ program ar3_reduction_keyword_sweep
   if (any(abs(minval(r, dim=1, mask=m) - [9.0_8, 8.0_8, 7.0_8]) > 1.0e-9_8)) error stop 4
   print '(a)', 'real_dim_mask ok'
 end program
+! CHECK: sum_dim_mask 9 8 14
+! CHECK: product_dim 9 40 49
+! CHECK: product_dim_mask 9 8 49
+! CHECK: maxval_dim_mask 9 8 7
+! CHECK: minval_dim_mask 9 8 7
+! CHECK: any_dim T T T
+! CHECK: all_dim F F T
+! CHECK: count_dim 1 1 2
+! CHECK: real_dim_mask ok

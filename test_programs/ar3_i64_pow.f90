@@ -61,3 +61,14 @@ program ar3_i64_pow
   y4 = a4 ** x4
   print '(a,4(1x,i0))', 'array32', y4
 end program
+! CHECK: i64_100000_2 10000000000
+! CHECK: i64_2_40 1099511627776
+! CHECK: i64_big_1 123456789012345678
+! CHECK: i64_3_39 4052555153018976267
+! CHECK: i64_neg_zero 0
+! CHECK: i64_neg_one_odd -1
+! CHECK: i64_neg_one_even 1
+! CHECK: i32_12_5 248832
+! CHECK: i32_neg_zero 0
+! CHECK: array64 10000000000 1099511627776 4052555153018976267 -1
+! CHECK: array32 248832 1024 -1 1
