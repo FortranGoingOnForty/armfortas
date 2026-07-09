@@ -528,12 +528,22 @@ impl SymbolTable {
         if saw_symbol {
             return exports;
         }
-        match scope
-            .pending_access
-            .get(key)
-            .copied()
-            .unwrap_or(Access::Default)
-        {
+        if let Some(access) = scope.pending_access.get(key).copied() {
+            return match access {
+                Access::Public => true,
+                Access::Private => false,
+                Access::Default => !matches!(scope.default_access, Access::Private),
+            };
+        }
+
+        let has_import_edge = scope.use_associations.iter().any(|assoc| {
+            assoc.local_name == key || (assoc.from_bare_use && assoc.local_name.is_empty())
+        });
+        if !has_import_edge {
+            return false;
+        }
+
+        match scope.default_access {
             Access::Public => true,
             Access::Private => false,
             Access::Default => !matches!(scope.default_access, Access::Private),
@@ -1334,6 +1344,41 @@ mod tests {
         });
 
         assert!(st.lookup("hidden").is_none()); // private, not accessible
+    }
+
+    #[test]
+    fn default_public_scope_does_not_export_unknown_name() {
+        let mut st = SymbolTable::new();
+
+        let mod_scope = st.push_scope(ScopeKind::Module("mymod".into()));
+        assert!(
+            !st.scope_exports_name(mod_scope, "missing"),
+            "default PUBLIC governs declared or imported names, not arbitrary misses"
+        );
+    }
+
+    #[test]
+    fn default_public_scope_exports_imported_name() {
+        let mut st = SymbolTable::new();
+
+        let source_scope = st.push_scope(ScopeKind::Module("source".into()));
+        st.define(make_symbol("exported", SymbolKind::Variable))
+            .unwrap();
+        st.pop_scope();
+
+        let mod_scope = st.push_scope(ScopeKind::Module("mymod".into()));
+        st.add_use_association(UseAssociation {
+            local_name: "exported".into(),
+            original_name: "exported".into(),
+            source_scope,
+            is_submodule_access: false,
+            from_bare_use: true,
+        });
+
+        assert!(
+            st.scope_exports_name(mod_scope, "exported"),
+            "default PUBLIC should still re-export imported names"
+        );
     }
 
     #[test]
