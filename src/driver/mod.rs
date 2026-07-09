@@ -1254,9 +1254,11 @@ pub fn execute(opts: &Options) -> Result<(), String> {
             let output = opts.output.clone().unwrap_or_else(|| PathBuf::from("a.out"));
             link_inputs(&inputs, &output, opts)
         }
-        (true, true) => Err(
-            "mixing Fortran sources with prebuilt object/archive inputs is not yet supported; compile the sources first and then link the resulting objects".into(),
-        ),
+        // Mixed `foo.f90 bar.o libbaz.a -o prog`: gfortran/flang accept it:
+        // compile the sources, then link the resulting objects together with
+        // the prebuilt artifacts (in command order). compile_multi handles the
+        // partition.
+        (true, true) => compile_multi(opts),
         (false, false) => unreachable!("parse_cli guarantees at least one input"),
     }
 }
@@ -2242,8 +2244,23 @@ pub fn compile_multi(opts: &Options) -> Result<(), String> {
         return Err("-o cannot be used with -c and multiple input files".into());
     }
 
-    // Scan dependencies.
-    let file_deps: Vec<dep_scan::FileDeps> = all_inputs
+    // Partition into Fortran sources (to compile) and prebuilt link
+    // artifacts (objects/archives to pass straight to the linker). gfortran
+    // accepts them mixed on one command line, e.g. the unit-test rule
+    // `fc test.f90 build/foo.o build/bar.o -o test`.
+    let source_inputs: Vec<PathBuf> = all_inputs
+        .iter()
+        .filter(|p| classify_cli_input(p) == CliInputKind::FortranSource)
+        .cloned()
+        .collect();
+    let artifact_inputs: Vec<PathBuf> = all_inputs
+        .iter()
+        .filter(|p| classify_cli_input(p) == CliInputKind::LinkArtifact)
+        .cloned()
+        .collect();
+
+    // Scan dependencies (sources only).
+    let file_deps: Vec<dep_scan::FileDeps> = source_inputs
         .iter()
         .map(|p| dep_scan::scan_file(p))
         .collect::<Result<Vec<_>, _>>()?;
@@ -2261,6 +2278,7 @@ pub fn compile_multi(opts: &Options) -> Result<(), String> {
     };
 
     let mut object_files: Vec<PathBuf> = Vec::new();
+    let mut src_to_obj: Vec<(PathBuf, PathBuf)> = Vec::new();
     for &idx in &order {
         let src = &file_deps[idx].path;
         let obj_path = if opts.emit_obj {
@@ -2315,7 +2333,8 @@ pub fn compile_multi(opts: &Options) -> Result<(), String> {
         };
         compile(&sub_opts)?;
         if !opts.emit_obj {
-            object_files.push(obj_path);
+            object_files.push(obj_path.clone());
+            src_to_obj.push((src.clone(), obj_path));
         }
     }
 
@@ -2323,12 +2342,34 @@ pub fn compile_multi(opts: &Options) -> Result<(), String> {
         return Ok(());
     }
 
+    // Assemble the link list in original command order: each source becomes
+    // its compiled object; prebuilt artifacts pass straight through. This
+    // preserves the ordering callers rely on (objects before archives).
+    let link_list: Vec<PathBuf> = if artifact_inputs.is_empty() {
+        object_files
+    } else {
+        all_inputs
+            .iter()
+            .map(|input| {
+                if classify_cli_input(input) == CliInputKind::LinkArtifact {
+                    input.clone()
+                } else {
+                    src_to_obj
+                        .iter()
+                        .find(|(src, _)| src == input)
+                        .map(|(_, obj)| obj.clone())
+                        .unwrap_or_else(|| input.clone())
+                }
+            })
+            .collect()
+    };
+
     // Link all object files.
     let output = opts
         .output
         .clone()
         .unwrap_or_else(|| PathBuf::from("a.out"));
-    link_multi(&object_files, &output, opts)?;
+    link_multi(&link_list, &output, opts)?;
 
     // Cleanup.
     if let Some(tmp_dir) = tmp_dir {
