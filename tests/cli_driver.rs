@@ -9162,13 +9162,14 @@ fn pointer_dummy_deallocate_and_nullify_write_back_to_actual_slot() {
         String::from_utf8_lossy(&run.stderr)
     );
     let stdout = String::from_utf8_lossy(&run.stdout);
+    let fields: Vec<&str> = stdout.split_whitespace().collect();
     assert!(
-        stdout.contains("COUNT 1"),
+        fields.windows(2).any(|w| w == ["COUNT", "1"]),
         "pointer dummy deallocate should run exactly once: {}",
         stdout
     );
     assert!(
-        stdout.contains("CACHED -1"),
+        fields.windows(2).any(|w| w == ["CACHED", "-1"]),
         "pointer dummy deallocate/nullify should disassociate the caller slot: {}",
         stdout
     );
@@ -10930,8 +10931,9 @@ fn allocatable_two_dimensional_element_actuals_update_storage() {
         String::from_utf8_lossy(&run.stderr)
     );
     let stdout = String::from_utf8_lossy(&run.stdout);
+    let fields: Vec<&str> = stdout.split_whitespace().collect();
     assert!(
-        stdout.contains("11 22") || stdout.contains("11  22"),
+        fields == ["11", "22"],
         "unexpected allocatable 2d element-actual output: {}",
         stdout
     );
@@ -28680,13 +28682,14 @@ fn fixed_len_allocatable_char_array_dummy_round_trips_through_amod_import_and_ru
         String::from_utf8_lossy(&run.stderr)
     );
     let stdout = String::from_utf8_lossy(&run.stdout);
+    let fields: Vec<&str> = stdout.split_whitespace().collect();
     assert!(
-        stdout.contains("COUNT= 2") || stdout.contains("COUNT=2"),
+        fields.windows(2).any(|w| w == ["COUNT=", "2"]),
         "expected element count to survive round-trip: {}",
         stdout
     );
     assert!(
-        stdout.contains("TOK1=<echo>") && stdout.contains("TOK2=<foo[1]>"),
+        fields.contains(&"TOK1=<echo>") && fields.contains(&"TOK2=<foo[1]>"),
         "fixed-length allocatable char array dummy should preserve element text across .amod import: {}",
         stdout
     );
@@ -31711,8 +31714,9 @@ fn saved_derived_global_after_small_globals_keeps_descriptor_alignment() {
         String::from_utf8_lossy(&run.stderr)
     );
     let stdout = String::from_utf8_lossy(&run.stdout);
+    let fields: Vec<&str> = stdout.split_whitespace().collect();
     assert!(
-        stdout.contains("1 4") || stdout.contains("1  4"),
+        fields == ["1", "4"],
         "unexpected saved derived global alignment output: {}",
         stdout
     );
@@ -32854,13 +32858,14 @@ fn sibling_extensions_keep_distinct_runtime_tags_across_tus() {
         String::from_utf8_lossy(&run.stderr)
     );
     let stdout = String::from_utf8_lossy(&run.stdout);
+    let fields: Vec<&str> = stdout.split_whitespace().collect();
     assert!(
-        stdout.contains("ASSOC F"),
+        fields.windows(2).any(|w| w == ["ASSOC", "F"]),
         "sibling extensions should not share runtime tags: {}",
         stdout
     );
     assert!(
-        stdout.contains("ORIGIN 7"),
+        fields.windows(2).any(|w| w == ["ORIGIN", "7"]),
         "unexpected sibling type-tag output: {}",
         stdout
     );
@@ -47247,8 +47252,9 @@ fn array_result_local_passed_to_by_ref_dummy_uses_base_addr() {
         .output()
         .expect("array result by-ref dummy run failed");
     let stdout = String::from_utf8_lossy(&run.stdout);
+    let fields: Vec<&str> = stdout.split_whitespace().collect();
     assert!(
-        run.status.success() && stdout.contains("12 20"),
+        run.status.success() && fields == ["12", "20"],
         "array result by-ref dummy run failed: status={:?} stdout={} stderr={}",
         run.status,
         stdout,
