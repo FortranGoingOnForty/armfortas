@@ -1672,7 +1672,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     //   (1) `ld` embeds the .o path in the linked binary's symbol
     //       table (the OSO debug stab), so two back-to-back compiles
     //       of the same source to the same output path must use the
-    //       same .o name — otherwise the embedded string varies and
+    //       same .o name; otherwise the embedded string varies and
     //       reproducible-build tests fail.  PID is unsafe here
     //       because each compile_binary call spawns a fresh
     //       subprocess with a different PID.
@@ -1680,20 +1680,27 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     //       same basename (e.g. both writing `mod.o` to different
     //       unique-dir test outputs) must NOT race on the same temp
     //       file.  Output stem alone is therefore not enough.
-    // The cheap fix that satisfies both: derive a stable hash of the
-    // full output path with FNV-1a and use it in the temp basename.
-    // Same output path → same hash → same .o (deterministic across
-    // subprocesses).  Different output paths → different hashes → no
-    // collision.  std::collections::hash_map::DefaultHasher uses a
-    // per-process random seed and would defeat (1).
+    // Hash the absolute output identity with FNV-1a and use it in the
+    // temp basename. Same output path means same hash and deterministic
+    // OSO strings; same relative `-o t` from different directories means
+    // different hashes and no cross-process temp-object collision.
+    // std::collections::hash_map::DefaultHasher uses a per-process random
+    // seed and would defeat (1).
     let out_path = opts.output_path();
+    let temp_identity_path = if out_path.is_absolute() {
+        out_path.clone()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("cannot determine current directory for temp output: {}", e))?
+            .join(&out_path)
+    };
     let stem = out_path
         .file_stem()
         .and_then(|s| s.to_str())
         .map(|s| s.to_string())
         .unwrap_or_else(|| "afs".to_string());
     let token = {
-        let bytes = out_path.as_os_str().as_encoded_bytes();
+        let bytes = temp_identity_path.as_os_str().as_encoded_bytes();
         let mut h: u64 = 0xcbf29ce484222325;
         for &b in bytes {
             h ^= b as u64;
