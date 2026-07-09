@@ -3141,6 +3141,9 @@ fn resolve_component_access_type(
         return Ok(None);
     };
     let Some(field) = layout.field(component) else {
+        if layout.bound_proc(component).is_some() {
+            return Ok(None);
+        }
         return Err((expr.span, component.clone(), base_type));
     };
     Ok(derived_type_name_from_type_info(&field.type_info))

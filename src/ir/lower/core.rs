@@ -12892,11 +12892,16 @@ fn specific_candidate_is_elemental(st: &SymbolTable, candidate: &SpecificProcCan
     })
 }
 
+fn is_defined_operator_interface_name(name: &str) -> bool {
+    name.starts_with("operator(") || name.starts_with("assignment(")
+}
+
 pub(super) fn named_interface_specific_candidates(
     st: &SymbolTable,
     name: &str,
 ) -> Option<Vec<SpecificProcCandidate>> {
     let key = name.to_ascii_lowercase();
+    let defined_operator = is_defined_operator_interface_name(&key);
     let mut specifics = Vec::new();
     let mut seen = HashSet::new();
 
@@ -12917,7 +12922,7 @@ pub(super) fn named_interface_specific_candidates(
         append_named_interface_specific_candidates(sym, &mut specifics, &mut seen);
     }
 
-    if specifics.is_empty() {
+    if specifics.is_empty() && !defined_operator {
         if let Some(sym) = st.lookup(&key) {
             if is_named_interface_like(sym) {
                 append_named_interface_specific_candidates(sym, &mut specifics, &mut seen);
@@ -12925,8 +12930,10 @@ pub(super) fn named_interface_specific_candidates(
         }
     }
 
-    for sym in use_associated_named_interface_symbols(st, &key) {
-        append_named_interface_specific_candidates(sym, &mut specifics, &mut seen);
+    if !defined_operator {
+        for sym in use_associated_named_interface_symbols(st, &key) {
+            append_named_interface_specific_candidates(sym, &mut specifics, &mut seen);
+        }
     }
     if !specifics.is_empty() {
         return Some(specifics);
@@ -12967,7 +12974,7 @@ pub(super) fn named_interface_specific_candidates(
     if function_exists {
         return None;
     }
-    if specifics.is_empty() {
+    if specifics.is_empty() && !defined_operator {
         for scope in st.all_scopes() {
             if !matches!(scope.kind, crate::sema::symtab::ScopeKind::Submodule(_)) {
                 continue;

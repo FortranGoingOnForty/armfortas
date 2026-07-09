@@ -265,6 +265,99 @@ fn use_only_filtering() {
 }
 
 #[test]
+fn use_only_excludes_defined_assignment_from_amod() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=use_only_excludes_defined_assignment_from_amod count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let t_f90 = dir.join("t.f90");
+    let e_f90 = dir.join("e.f90");
+    let main_f90 = dir.join("main.f90");
+    let t_o = dir.join("t.o");
+    let e_o = dir.join("e.o");
+    let main_o = dir.join("main.o");
+    let binary = dir.join("test_bin");
+
+    std::fs::write(
+        &t_f90,
+        r#"module t
+  implicit none
+  type :: v
+    integer, allocatable :: a(:)
+  end type
+  interface assignment(=)
+    module procedure asn
+  end interface
+contains
+  function mk() result(r)
+    type(v) :: r
+    allocate(r%a(1))
+    r%a(1) = 9
+  end function
+
+  subroutine asn(lhs, rhs)
+    type(v), intent(out) :: lhs
+    type(v), intent(in) :: rhs
+    if (allocated(rhs%a)) print '(a)', 'defined assignment fired'
+  end subroutine
+end module
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &e_f90,
+        r#"module e
+  use t, only: v, mk
+  implicit none
+contains
+  function go() result(r)
+    type(v) :: r
+    r = mk()
+  end function
+end module
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &main_f90,
+        r#"program p
+  use t, only: v
+  use e, only: go
+  implicit none
+  type(v) :: x
+  x = go()
+  print '(a,l1)', 'alloc=', allocated(x%a)
+  if (.not. allocated(x%a)) stop 1
+end program
+"#,
+    )
+    .unwrap();
+
+    compile_file(&compiler, &t_f90, &t_o, None);
+    compile_file(&compiler, &e_f90, &e_o, Some(&dir));
+    compile_file(&compiler, &main_f90, &main_o, Some(&dir));
+    link_files(&[&t_o, &e_o, &main_o], &binary);
+    let output = run_binary(&binary);
+    assert!(
+        output.contains("alloc=T"),
+        "expected intrinsic assignment to preserve allocatable component, got:\n{}",
+        output
+    );
+    assert!(
+        !output.contains("defined assignment fired"),
+        "defined assignment leaked through USE ONLY:\n{}",
+        output
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn use_rename() {
     if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
         eprintln!(
