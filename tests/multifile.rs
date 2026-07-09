@@ -364,6 +364,11 @@ fn amod_omits_stale_abi_stamp() {
         ".amod should not stamp a non-authoritative ABI line:\n{}",
         amod
     );
+    assert!(
+        !amod.contains("cc=aapcs64") && !amod.contains("@abi pass="),
+        ".amod should not stamp target-specific procedure ABI annotations:\n{}",
+        amod
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

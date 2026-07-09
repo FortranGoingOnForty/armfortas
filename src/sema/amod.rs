@@ -7,7 +7,6 @@
 //! enough information for full ABI-correct separate compilation.
 //!
 //! Innovations over gfortran/flang/ifort:
-//!   - Explicit ABI annotations (@abi with register assignments)
 //!   - Optimization hints (@hint leaf, no_globals, cost)
 //!   - Linker symbol names (@ir) for direct FFI
 //!   - Source checksum for staleness detection
@@ -970,31 +969,6 @@ fn emit_procedure(
     let declared_descriptor_params = descriptor_params.get(&name.to_lowercase());
     let declared_char_len_star_params = char_len_star_params.get(&name_lc);
 
-    let hidden_count = declared_char_len_star_params
-        .map(|flags| flags.iter().filter(|flag| **flag).count())
-        .unwrap_or_else(|| {
-            let mut count = 0usize;
-            if let Some(pscope) = proc_scope {
-                for arg_name in &pscope.arg_order {
-                    if let Some(arg_sym) = pscope.symbols.get(&arg_name.to_lowercase()) {
-                        if matches!(
-                            arg_sym.type_info,
-                            Some(TypeInfo::Character { len: None, .. })
-                        ) && !arg_sym.attrs.allocatable
-                            && !is_bind_c
-                        {
-                            count += 1;
-                        }
-                    }
-                }
-            }
-            count
-        });
-
-    // @abi line for the procedure.
-    writeln!(out, "  @abi cc=aapcs64 hidden_char_lens={}", hidden_count).unwrap();
-
-    let mut reg_idx = 0usize;
     if let Some(pscope) = proc_scope {
         for (arg_idx, arg_name) in pscope.arg_order.iter().enumerate() {
             if let Some(arg_sym) = pscope.symbols.get(&arg_name.to_lowercase()) {
@@ -1079,24 +1053,14 @@ fn emit_procedure(
                     write!(out, ", {}", arg_attrs.join(", ")).unwrap();
                 }
                 writeln!(out).unwrap();
-                // @abi per arg — ARM64 AAPCS64: first 8 int/ptr args in x0-x7.
-                let reg = if reg_idx < 8 {
-                    format!("x{}", reg_idx)
-                } else {
-                    format!("stack+{}", (reg_idx - 8) * 8)
-                };
-                writeln!(out, "    @abi pass={} width=8", reg).unwrap();
-                reg_idx += 1;
             } else {
                 writeln!(out, "  @arg {}", arg_name).unwrap();
-                reg_idx += 1;
             }
         }
     } else {
         // Fallback: use arg_names from the symbol (no type info).
         for arg_name in &sym.arg_names {
             writeln!(out, "  @arg {}", arg_name).unwrap();
-            reg_idx += 1;
         }
     }
 
@@ -1117,14 +1081,7 @@ fn emit_procedure(
                             && !is_bind_c
                     });
                 if is_assumed_len {
-                    let reg = if reg_idx < 8 {
-                        format!("x{}", reg_idx)
-                    } else {
-                        format!("stack+{}", (reg_idx - 8) * 8)
-                    };
                     writeln!(out, "  @arg {}@len : integer(8)", arg_name).unwrap();
-                    writeln!(out, "    @abi pass={} width=8 hidden", reg).unwrap();
-                    reg_idx += 1;
                 }
             }
         }
