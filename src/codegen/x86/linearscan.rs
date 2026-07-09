@@ -337,17 +337,15 @@ pub fn linear_scan(f: &mut X86Function) -> AllocResult {
                     e.0 = e.0.min(p);
                     e.1 = e.1.max(p);
                 };
-                if let Some(X86Operand::VReg(d)) = inst.def {
+                if let Some(d) = inst.def_vreg() {
                     vreg_def_blocks.entry(d.id).or_default().insert(bi);
                     vreg_ref_blocks.entry(d.id).or_default().insert(bi);
                     touch(d.id, &mut vreg_actual_range);
                 }
-                for op in &inst.operands {
-                    if let X86Operand::VReg(v) = op {
-                        vreg_ref_blocks.entry(v.id).or_default().insert(bi);
-                        touch(v.id, &mut vreg_actual_range);
-                    }
-                }
+                inst.for_each_use_vreg(|v| {
+                    vreg_ref_blocks.entry(v.id).or_default().insert(bi);
+                    touch(v.id, &mut vreg_actual_range);
+                });
                 p += 2;
             }
         }
@@ -809,12 +807,8 @@ pub fn apply_allocation(f: &mut X86Function, result: &AllocResult) {
             }
 
             if !tied {
+                let is_fp_store_addr = inst.fp_store_addr_vreg().is_some();
                 if let Some(X86Operand::VReg(v)) = inst.def.clone() {
-                    let is_fp_store_addr = matches!(
-                        inst.opcode,
-                        X86Opcode::Movss | X86Opcode::Movsd | X86Opcode::Movups
-                    ) && v.class != X86RegClass::Xmm
-                        && v.class != X86RegClass::Xmm128;
                     match resolve(&v, cur_pos) {
                         Resolved::Reg(phys) => {
                             inst.def = Some(if is_fp_store_addr {

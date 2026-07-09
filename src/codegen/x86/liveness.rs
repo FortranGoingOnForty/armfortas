@@ -38,15 +38,6 @@ pub struct LivenessResult {
     pub num_positions: u32,
 }
 
-/// Extract the virtual register id from an operand, if it is one.
-fn operand_vreg(op: &X86Operand) -> Option<X86VReg> {
-    if let X86Operand::VReg(v) = op {
-        Some(*v)
-    } else {
-        None
-    }
-}
-
 #[derive(Clone, PartialEq, Eq)]
 struct LiveSet {
     words: Vec<u64>,
@@ -118,14 +109,12 @@ fn vreg_capacity(f: &X86Function) -> usize {
     let mut max_idx = 0usize;
     for block in &f.blocks {
         for inst in &block.insts {
-            if let Some(def) = inst.def.as_ref().and_then(operand_vreg) {
+            if let Some(def) = inst.def_vreg() {
                 max_idx = max_idx.max(def.id.0 as usize + 1);
             }
-            for op in &inst.operands {
-                if let Some(v) = operand_vreg(op) {
-                    max_idx = max_idx.max(v.id.0 as usize + 1);
-                }
-            }
+            inst.for_each_use_vreg(|v| {
+                max_idx = max_idx.max(v.id.0 as usize + 1);
+            });
         }
     }
     max_idx
@@ -211,14 +200,10 @@ pub fn compute_liveness(f: &X86Function) -> LivenessResult {
             }
             scratch_in.copy_from(&scratch_out);
             for inst in block.insts.iter().rev() {
-                if let Some(def) = inst.def.as_ref().and_then(operand_vreg) {
+                if let Some(def) = inst.def_vreg() {
                     scratch_in.remove(&def.id);
                 }
-                for op in &inst.operands {
-                    if let Some(v) = operand_vreg(op) {
-                        scratch_in.insert(v.id);
-                    }
-                }
+                inst.for_each_use_vreg(|v| scratch_in.insert(v.id));
             }
             if live_in[block_idx] != scratch_in {
                 live_in[block_idx].copy_from(&scratch_in);
@@ -252,20 +237,18 @@ pub fn compute_liveness(f: &X86Function) -> LivenessResult {
         }
         for (i, inst) in block.insts.iter().enumerate() {
             let p = inst_positions[block_idx][i];
-            if let Some(def) = inst.def.as_ref().and_then(operand_vreg) {
+            if let Some(def) = inst.def_vreg() {
                 let idx = def.id.0 as usize;
                 starts[idx] = Some(starts[idx].map_or(p, |s| s.min(p)));
                 ends[idx] = Some(ends[idx].map_or(p, |e| e.max(p)));
                 classes[idx] = def.class;
             }
-            for op in &inst.operands {
-                if let Some(v) = operand_vreg(op) {
-                    let idx = v.id.0 as usize;
-                    ends[idx] = Some(ends[idx].map_or(p, |e| e.max(p)));
-                    starts[idx] = Some(starts[idx].map_or(p, |s| s.min(p)));
-                    classes[idx] = v.class;
-                }
-            }
+            inst.for_each_use_vreg(|v| {
+                let idx = v.id.0 as usize;
+                ends[idx] = Some(ends[idx].map_or(p, |e| e.max(p)));
+                starts[idx] = Some(starts[idx].map_or(p, |s| s.min(p)));
+                classes[idx] = v.class;
+            });
         }
     }
 
@@ -291,6 +274,9 @@ pub fn compute_liveness(f: &X86Function) -> LivenessResult {
     let mut hints: HashMap<VRegId, X86Reg> = HashMap::new();
     for block in &f.blocks {
         for inst in &block.insts {
+            if inst.fp_store_addr_vreg().is_some() {
+                continue;
+            }
             if !matches!(
                 inst.opcode,
                 X86Opcode::MovRR | X86Opcode::Movss | X86Opcode::Movsd | X86Opcode::Movaps
@@ -386,6 +372,51 @@ mod tests {
                 .iter()
                 .any(|i| matches!(i.class, X86RegClass::Xmm | X86RegClass::Xmm128)),
             "should have an Xmm interval"
+        );
+    }
+
+    #[test]
+    fn fp_store_address_vreg_is_a_use() {
+        let mut mf = X86Function::new("fp_store_addr".into());
+        let addr = mf.new_vreg(X86RegClass::Gp64);
+        let value = mf.new_vreg(X86RegClass::Xmm);
+        mf.blocks[0].insts.push(X86Inst {
+            opcode: X86Opcode::MovRI,
+            size: OpSize::Q,
+            operands: vec![X86Operand::Imm(16)],
+            def: Some(X86Operand::VReg(addr)),
+        });
+        mf.blocks[0].insts.push(X86Inst {
+            opcode: X86Opcode::Movsd,
+            size: OpSize::Q,
+            operands: vec![X86Operand::Reg(X86Reg::Xmm0)],
+            def: Some(X86Operand::VReg(value)),
+        });
+        mf.blocks[0].insts.push(X86Inst {
+            opcode: X86Opcode::Movsd,
+            size: OpSize::Q,
+            operands: vec![X86Operand::VReg(value)],
+            def: Some(X86Operand::VReg(addr)),
+        });
+
+        let store = &mf.blocks[0].insts[2];
+        assert_eq!(store.fp_store_addr_vreg(), Some(addr));
+        assert_eq!(store.def_vreg(), None);
+        let mut uses = Vec::new();
+        store.for_each_use_vreg(|v| uses.push(v.id));
+        assert!(uses.contains(&addr.id), "store address must be a use");
+        assert!(uses.contains(&value.id), "store value must remain a use");
+
+        let result = compute_liveness(&mf);
+        let addr_interval = result
+            .intervals
+            .iter()
+            .find(|i| i.vreg == addr.id)
+            .expect("address interval");
+        assert_eq!(addr_interval.class, X86RegClass::Gp64);
+        assert_eq!(
+            addr_interval.hint, None,
+            "store address must not inherit an FP move hint"
         );
     }
 

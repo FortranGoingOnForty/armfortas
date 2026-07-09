@@ -443,6 +443,54 @@ pub struct X86Inst {
     pub def: Option<X86Operand>,
 }
 
+impl X86Inst {
+    /// Scalar/packed FP stores encode the memory destination in `def`
+    /// because the printer's two-address shape is `src -> def`.
+    /// Pre-regalloc, a GP-class VReg in that slot is the address being
+    /// used, not a value defined by the store.
+    pub fn fp_store_addr_vreg(&self) -> Option<X86VReg> {
+        if !matches!(
+            self.opcode,
+            X86Opcode::Movss | X86Opcode::Movsd | X86Opcode::Movups
+        ) {
+            return None;
+        }
+        match self.def {
+            Some(X86Operand::VReg(v))
+                if v.class != X86RegClass::Xmm && v.class != X86RegClass::Xmm128 =>
+            {
+                Some(v)
+            }
+            _ => None,
+        }
+    }
+
+    /// The virtual register this instruction defines, excluding FP
+    /// store destination addresses which are uses.
+    pub fn def_vreg(&self) -> Option<X86VReg> {
+        if self.fp_store_addr_vreg().is_some() {
+            return None;
+        }
+        match self.def {
+            Some(X86Operand::VReg(v)) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Visit every virtual register this instruction reads, including
+    /// FP store destination addresses carried in `def`.
+    pub fn for_each_use_vreg(&self, mut visit: impl FnMut(X86VReg)) {
+        if let Some(v) = self.fp_store_addr_vreg() {
+            visit(v);
+        }
+        for op in &self.operands {
+            if let X86Operand::VReg(v) = op {
+                visit(*v);
+            }
+        }
+    }
+}
+
 /// A machine basic block. Labels print as `.L{fn}_{n}` — the `.L`
 /// prefix keeps them out of the ELF symbol table (bare `L` is a Mach-O
 /// convention that becomes a real symbol on ELF).
