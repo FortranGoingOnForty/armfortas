@@ -1360,6 +1360,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     let mut pp_config = crate::preprocess::PreprocConfig {
         filename: opts.input.to_str().unwrap_or("<input>").to_string(),
         fixed_form: matches!(source_form, SourceForm::FixedForm),
+        cpp_compat: opts.cpp_compat,
         // Share `-I` paths with the preprocessor so `#include "foo.inc"`
         // can find headers (e.g. stdlib's `include/macros.inc`).  The
         // resolver searches relative-to-current-file first, then this
