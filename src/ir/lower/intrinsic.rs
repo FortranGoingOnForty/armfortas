@@ -512,7 +512,7 @@ pub(crate) fn lower_intrinsic(
             }
         }
         "sign" | "dsign" | "isign" => {
-            // sign(a, b) = abs(a) * sign_of(b) = b >= 0 ? abs(a) : -abs(a)
+            // Real SIGN follows B's sign bit so negative zero remains negative.
             if args.len() >= 2 {
                 let ty = b
                     .func()
@@ -529,23 +529,23 @@ pub(crate) fn lower_intrinsic(
                     let neg = b.ineg(args[0]);
                     b.select(is_pos, args[0], neg)
                 };
-                let neg_abs = if ty.is_float() {
-                    b.fneg(abs_a)
+                if ty.is_float() {
+                    let suffix = ieee_float_suffix(b, args[0]);
+                    let sign_source = coerce_to_type(b, args[1], &ty);
+                    Some(b.call(
+                        FuncRef::External(format!("afs_ieee_copy_sign_{}", suffix)),
+                        vec![abs_a, sign_source],
+                        ty,
+                    ))
                 } else {
-                    b.ineg(abs_a)
-                };
-                let zero = match &ty {
-                    IrType::Float(FloatWidth::F32) => b.const_f32(0.0),
-                    IrType::Float(_) => b.const_f64(0.0),
-                    IrType::Int(IntWidth::I64) => b.const_i64(0),
-                    _ => b.const_i32(0),
-                };
-                let b_pos = if ty.is_float() {
-                    b.fcmp(CmpOp::Ge, args[1], zero)
-                } else {
-                    b.icmp(CmpOp::Ge, args[1], zero)
-                };
-                Some(b.select(b_pos, abs_a, neg_abs))
+                    let zero = match &ty {
+                        IrType::Int(IntWidth::I64) => b.const_i64(0),
+                        _ => b.const_i32(0),
+                    };
+                    let b_neg = b.icmp(CmpOp::Lt, args[1], zero);
+                    let neg_abs = b.ineg(abs_a);
+                    Some(b.select(b_neg, neg_abs, abs_a))
+                }
             } else {
                 None
             }
