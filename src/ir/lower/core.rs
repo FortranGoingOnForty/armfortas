@@ -32957,11 +32957,12 @@ pub(super) fn lower_fmt_push(
                 );
             }
             IrType::Float(FloatWidth::F32) => {
-                // afs_fmt_push_real takes f64; explicitly widen f32 → f64.
+                // The push API receives f64 at the ABI boundary; keep the
+                // original real(4) kind for G0 precision decisions.
                 // AArch64 does NOT auto-promote floats across the call boundary.
                 let widened = b.float_extend(val, FloatWidth::F64);
                 b.call(
-                    FuncRef::External("afs_fmt_push_real".into()),
+                    FuncRef::External("afs_fmt_push_real32".into()),
                     vec![widened],
                     IrType::Void,
                 );
@@ -33149,7 +33150,7 @@ fn fmt_push_emit_scalar_semantic(
         IrType::Float(_) => {
             let widened = b.float_extend(val, FloatWidth::F64);
             b.call(
-                FuncRef::External("afs_fmt_push_real".into()),
+                FuncRef::External("afs_fmt_push_real32".into()),
                 vec![widened],
                 IrType::Void,
             );
@@ -33345,11 +33346,12 @@ fn fmt_push_emit_complex(b: &mut FuncBuilder, lane_f64: bool, ptr: ValueId) {
     } else {
         b.float_extend(v0, FloatWidth::F64)
     };
-    b.call(
-        FuncRef::External("afs_fmt_push_real".into()),
-        vec![v0w],
-        IrType::Void,
-    );
+    let push = if lane_f64 {
+        "afs_fmt_push_real"
+    } else {
+        "afs_fmt_push_real32"
+    };
+    b.call(FuncRef::External(push.into()), vec![v0w], IrType::Void);
     let off = b.const_i64(lane_bytes);
     let p1 = b.gep(ptr, vec![off], IrType::Int(IntWidth::I8));
     let v1 = b.load_typed(p1, lane_ty);
@@ -33358,11 +33360,7 @@ fn fmt_push_emit_complex(b: &mut FuncBuilder, lane_f64: bool, ptr: ValueId) {
     } else {
         b.float_extend(v1, FloatWidth::F64)
     };
-    b.call(
-        FuncRef::External("afs_fmt_push_real".into()),
-        vec![v1w],
-        IrType::Void,
-    );
+    b.call(FuncRef::External(push.into()), vec![v1w], IrType::Void);
 }
 
 /// Iterate every element of a whole-array Name item and push each via

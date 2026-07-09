@@ -625,6 +625,7 @@ fn parse_real_desc(
 pub enum IoValue {
     Integer(i128),
     Real(f64),
+    Real32(f64),
     Logical(bool),
     Character(Vec<u8>),
 }
@@ -888,7 +889,7 @@ impl FormatEngine {
             }
 
             // ---- Real ----
-            (FormatDesc::RealF { width, decimals }, IoValue::Real(v)) => {
+            (FormatDesc::RealF { width, decimals }, IoValue::Real(v) | IoValue::Real32(v)) => {
                 if let Some(s) = self.format_nonfinite(*v) {
                     return Ok(self.apply_decimal_sep(&fit_field(&s, *width)));
                 }
@@ -904,7 +905,7 @@ impl FormatEngine {
                     decimals,
                     exp_width,
                 },
-                IoValue::Real(v),
+                IoValue::Real(v) | IoValue::Real32(v),
             ) => {
                 if let Some(s) = self.format_nonfinite(*v) {
                     return Ok(self.apply_decimal_sep(&fit_field(&s, *width)));
@@ -919,7 +920,7 @@ impl FormatEngine {
                     decimals,
                     exp_width,
                 },
-                IoValue::Real(v),
+                IoValue::Real(v) | IoValue::Real32(v),
             ) => {
                 if let Some(s) = self.format_nonfinite(*v) {
                     return Ok(self.apply_decimal_sep(&fit_field(&s, *width)));
@@ -932,7 +933,7 @@ impl FormatEngine {
                 FormatDesc::RealEN {
                     width, decimals, ..
                 },
-                IoValue::Real(v),
+                IoValue::Real(v) | IoValue::Real32(v),
             ) => {
                 if let Some(s) = self.format_nonfinite(*v) {
                     return Ok(self.apply_decimal_sep(&fit_field(&s, *width)));
@@ -949,7 +950,7 @@ impl FormatEngine {
                 );
                 Ok(self.apply_decimal_sep(&fit_field(&s, *width)))
             }
-            (FormatDesc::RealD { width, decimals }, IoValue::Real(v)) => {
+            (FormatDesc::RealD { width, decimals }, IoValue::Real(v) | IoValue::Real32(v)) => {
                 if let Some(s) = self.format_nonfinite(*v) {
                     return Ok(self.apply_decimal_sep(&fit_field(&s, *width)));
                 }
@@ -962,25 +963,16 @@ impl FormatEngine {
                     decimals,
                     exp_width,
                 },
+                IoValue::Real32(v),
+            ) => self.format_g_text(*v, 9, *width, *decimals, *exp_width),
+            (
+                FormatDesc::RealG {
+                    width,
+                    decimals,
+                    exp_width,
+                },
                 IoValue::Real(v),
-            ) => {
-                if let Some(s) = self.format_nonfinite(*v) {
-                    return Ok(self.apply_decimal_sep(&fit_field(&s, *width)));
-                }
-                if *width == 0 && *decimals == 0 {
-                    return Ok(self.apply_decimal_sep(&self.format_g0(*v)));
-                }
-                // G format: use F if magnitude fits, else E.
-                let abs_v = v.abs();
-                if abs_v == 0.0 || (abs_v >= 0.1 && abs_v < 10f64.powi(*decimals as i32)) {
-                    let rounded = self.apply_explicit_rounding(*v, *decimals);
-                    let s = self.apply_leading_zero(&self.format_fixed(rounded, *decimals));
-                    Ok(self.apply_decimal_sep(&fit_field(&s, *width)))
-                } else {
-                    let s = self.format_e_style(*v, *decimals, *exp_width, 'E');
-                    Ok(self.apply_decimal_sep(&fit_exponential_field(&s, *width)))
-                }
-            }
+            ) => self.format_g_text(*v, 17, *width, *decimals, *exp_width),
             (FormatDesc::RealG { width, .. }, IoValue::Integer(v)) => {
                 let s = if *v < 0 {
                     format!("-{}", v.unsigned_abs())
@@ -1001,7 +993,7 @@ impl FormatEngine {
                 FormatDesc::RealEX {
                     width, decimals, ..
                 },
-                IoValue::Real(v),
+                IoValue::Real(v) | IoValue::Real32(v),
             ) => {
                 if let Some(s) = self.format_nonfinite(*v) {
                     return Ok(self.apply_decimal_sep(&fit_field(&s, *width)));
@@ -1116,18 +1108,51 @@ impl FormatEngine {
         }
     }
 
-    fn format_g0(&self, v: f64) -> String {
+    fn format_g_text(
+        &self,
+        v: f64,
+        significant_digits: usize,
+        width: usize,
+        decimals: usize,
+        exp_width: Option<usize>,
+    ) -> Result<String, FormatError> {
+        if let Some(s) = self.format_nonfinite(v) {
+            return Ok(self.apply_decimal_sep(&fit_field(&s, width)));
+        }
+        if width == 0 && decimals == 0 {
+            return Ok(self.apply_decimal_sep(&self.format_g0(v, significant_digits)));
+        }
+        // G format: use F if magnitude fits, else E.
+        let abs_v = v.abs();
+        if abs_v == 0.0 || (abs_v >= 0.1 && abs_v < 10f64.powi(decimals as i32)) {
+            let rounded = self.apply_explicit_rounding(v, decimals);
+            let s = self.apply_leading_zero(&self.format_fixed(rounded, decimals));
+            Ok(self.apply_decimal_sep(&fit_field(&s, width)))
+        } else {
+            let s = self.format_e_style(v, decimals, exp_width, 'E');
+            Ok(self.apply_decimal_sep(&fit_exponential_field(&s, width)))
+        }
+    }
+
+    fn format_g0(&self, v: f64, significant_digits: usize) -> String {
         if v == 0.0 {
-            return format!("{}0.00000000", self.real_sign(v));
+            let decimals = significant_digits.saturating_sub(1);
+            return self.format_fixed(v, decimals);
         }
 
         let abs_v = v.abs();
         if (0.1..1.0e6).contains(&abs_v) {
-            let digits_before_decimal = abs_v.log10().floor().max(0.0) as usize + 1;
-            let decimals = 9usize.saturating_sub(digits_before_decimal).max(1);
+            let decimals = if abs_v < 1.0 {
+                significant_digits
+            } else {
+                let digits_before_decimal = abs_v.log10().floor().max(0.0) as usize + 1;
+                significant_digits
+                    .saturating_sub(digits_before_decimal)
+                    .max(1)
+            };
             self.format_fixed(v, decimals)
         } else {
-            self.format_e_style(v, 8, Some(2), 'E')
+            self.format_e_style(v, significant_digits.saturating_sub(1), Some(2), 'E')
         }
     }
 
@@ -2131,10 +2156,30 @@ mod tests {
 
     #[test]
     fn format_g0_finite_reals() {
-        let descs = parse_format("(G0,1X,G0)");
+        let descs = parse_format("(G0,1X,G0,1X,G0,1X,G0)");
         let mut engine = FormatEngine::new(descs);
-        let out = engine.format_values(&[IoValue::Real(100.0), IoValue::Real(1.0)]);
-        assert_eq!(out, "100.000000 1.00000000");
+        let out = engine.format_values(&[
+            IoValue::Real32(100.0),
+            IoValue::Real32(1.0),
+            IoValue::Real(100.0),
+            IoValue::Real(1.0),
+        ]);
+        assert_eq!(
+            out,
+            "100.000000 1.00000000 100.00000000000000 1.0000000000000000"
+        );
+    }
+
+    #[test]
+    fn format_g0_real_kinds_use_kind_precision() {
+        let descs = parse_format("(G0,1X,G0,1X,G0)");
+        let mut engine = FormatEngine::new(descs);
+        let out = engine.format_values(&[
+            IoValue::Real32((1.0f32 / 3.0f32) as f64),
+            IoValue::Real(1.0f64 / 3.0f64),
+            IoValue::Real(std::f64::consts::PI),
+        ]);
+        assert_eq!(out, "0.333333343 0.33333333333333331 3.1415926535897931");
     }
 
     #[test]

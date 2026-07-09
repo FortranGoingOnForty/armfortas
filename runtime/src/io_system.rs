@@ -3949,7 +3949,7 @@ pub extern "C" fn afs_io_finalize() {
 //
 // Usage from codegen:
 //   afs_fmt_begin(unit, fmt_str, fmt_len)
-//   afs_fmt_push_int(val) / afs_fmt_push_int128(&val) / afs_fmt_push_real(val) / ...
+//   afs_fmt_push_int(val) / afs_fmt_push_int128(&val) / afs_fmt_push_real*(val) / ...
 //   afs_fmt_end()
 
 use crate::format::{parse_format, FormatDesc, FormatEngine, IoValue, LeadingZeroMode};
@@ -4353,6 +4353,16 @@ pub extern "C" fn afs_fmt_push_real(val: f64) {
     FMT_CTX.with(|ctx| {
         if let Some(c) = ctx.borrow_mut().last_mut() {
             c.values.push(IoValue::Real(val));
+        }
+    });
+}
+
+/// Push a widened real(4) value for formatted output.
+#[no_mangle]
+pub extern "C" fn afs_fmt_push_real32(val: f64) {
+    FMT_CTX.with(|ctx| {
+        if let Some(c) = ctx.borrow_mut().last_mut() {
+            c.values.push(IoValue::Real32(val));
         }
     });
 }
