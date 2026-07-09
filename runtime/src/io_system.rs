@@ -690,7 +690,7 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
     }
 
     // Determine action. Default depends on status:
-    // old → read, new/replace → write, scratch/unknown → readwrite.
+    // old -> read, new/replace/scratch/unknown -> readwrite.
     let effective_action = match action_str.trim() {
         "read" => "read",
         "write" => "write",
@@ -704,7 +704,6 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
             })
             .unwrap_or_else(|| match status {
                 "old" => "read",
-                "new" | "replace" => "write",
                 _ => "readwrite",
             }),
         _ => "readwrite",
@@ -5538,6 +5537,51 @@ mod tests {
             !std::path::Path::new(&path).exists(),
             "rejected direct access OPEN must not create a file"
         );
+    }
+
+    #[test]
+    fn status_replace_defaults_to_readwrite() {
+        let path = format!(
+            "/tmp/afs_replace_readwrite_{}_{}.dat",
+            std::process::id(),
+            line!()
+        );
+        let _ = std::fs::remove_file(&path);
+
+        let mut iostat = -99i32;
+        let cb = OpenControlBlock {
+            unit: 787,
+            filename: path.as_ptr(),
+            filename_len: path.len() as i64,
+            status: "replace".as_ptr(),
+            status_len: 7,
+            action: std::ptr::null(),
+            action_len: 0,
+            access: std::ptr::null(),
+            access_len: 0,
+            form: std::ptr::null(),
+            form_len: 0,
+            recl: 0,
+            iostat: &mut iostat,
+            newunit: std::ptr::null_mut(),
+            position: std::ptr::null(),
+            position_len: 0,
+            leading_zero: std::ptr::null(),
+            leading_zero_len: 0,
+        };
+
+        afs_open(&cb);
+        assert_eq!(iostat, 0, "expected replace OPEN to succeed");
+        {
+            let state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+            let unit = state.units.get(&787).expect("unit must be connected");
+            assert_eq!(unit.action, Action::ReadWrite);
+            assert!(matches!(unit.stream, UnitStream::FileRaw(_)));
+        }
+
+        afs_close_ex(787, "delete".as_ptr(), 6, &mut iostat);
+        assert_eq!(iostat, 0, "expected close/delete to succeed");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
