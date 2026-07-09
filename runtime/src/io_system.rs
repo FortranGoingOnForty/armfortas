@@ -2861,7 +2861,7 @@ fn split_namelist_fields(content: &str) -> Vec<&str> {
             }
         } else if ch == '\'' || ch == '"' {
             quote = Some(ch);
-        } else if ch == ',' {
+        } else if ch == ',' || ch == '\n' || ch == '\r' {
             fields.push(&content[start..idx]);
             start = idx + ch.len_utf8();
         }
