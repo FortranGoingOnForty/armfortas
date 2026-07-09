@@ -322,32 +322,49 @@ unsafe fn compare_blank_padding_to_bytes(ptr: *const u8, start: usize, end: usiz
     0
 }
 
-// ---- String intrinsics ----
-
-/// TRIM: return length of string without trailing spaces.
-/// The data pointer is unchanged (TRIM returns a view, not a copy).
-#[no_mangle]
-pub extern "C" fn afs_len_trim(src: *const u8, src_len: i64) -> i64 {
+#[inline]
+unsafe fn len_trim_bytes(src: *const u8, src_len: i64) -> usize {
     if src.is_null() || src_len <= 0 {
         return 0;
     }
     let mut len = src_len as usize;
     let word_len = std::mem::size_of::<usize>();
     let space_word = usize::from_ne_bytes([b' '; std::mem::size_of::<usize>()]);
-    unsafe {
-        while len >= word_len {
-            let start = len - word_len;
-            let word = std::ptr::read_unaligned(src.add(start) as *const usize);
-            if word != space_word {
-                break;
-            }
-            len = start;
+    while len >= word_len {
+        let start = len - word_len;
+        let word = std::ptr::read_unaligned(src.add(start) as *const usize);
+        if word != space_word {
+            break;
         }
-        while len > 0 && *src.add(len - 1) == b' ' {
-            len -= 1;
-        }
+        len = start;
     }
-    len as i64
+    while len > 0 && *src.add(len - 1) == b' ' {
+        len -= 1;
+    }
+    len
+}
+
+// ---- String intrinsics ----
+
+/// TRIM: return length of string without trailing spaces.
+/// The data pointer is unchanged (TRIM returns a view, not a copy).
+#[no_mangle]
+pub extern "C" fn afs_len_trim(src: *const u8, src_len: i64) -> i64 {
+    unsafe { len_trim_bytes(src, src_len) as i64 }
+}
+
+/// Compare two character strings after applying TRIM to both operands.
+/// This is the hot path for `trim(a) == trim(b)` style predicates.
+#[no_mangle]
+pub extern "C" fn afs_compare_char_trimmed(
+    a: *const u8,
+    a_len: i64,
+    b: *const u8,
+    b_len: i64,
+) -> i32 {
+    let a_len = unsafe { len_trim_bytes(a, a_len) } as i64;
+    let b_len = unsafe { len_trim_bytes(b, b_len) } as i64;
+    afs_compare_char(a, a_len, b, b_len)
 }
 
 /// ADJUSTL: left-justify by removing leading spaces, padding trailing.

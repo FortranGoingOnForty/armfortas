@@ -88,6 +88,89 @@ pub(crate) fn lower_expr_ctx_tl(
     )
 }
 
+fn trim_intrinsic_arg(expr: &SpannedExpr) -> Option<&SpannedExpr> {
+    match &expr.node {
+        Expr::ParenExpr { inner } => trim_intrinsic_arg(inner),
+        Expr::FunctionCall { callee, args } => {
+            let Expr::Name { name } = &callee.node else {
+                return None;
+            };
+            if !name.eq_ignore_ascii_case("trim") || args.len() != 1 {
+                return None;
+            }
+            match &args[0].value {
+                crate::ast::expr::SectionSubscript::Element(arg) => Some(arg),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn emit_char_compare_predicate(b: &mut FuncBuilder, op: &BinaryOp, cmp: ValueId) -> ValueId {
+    let zero = b.const_i32(0);
+    match op {
+        BinaryOp::Eq => b.icmp(CmpOp::Eq, cmp, zero),
+        BinaryOp::Ne => b.icmp(CmpOp::Ne, cmp, zero),
+        BinaryOp::Lt => b.icmp(CmpOp::Lt, cmp, zero),
+        BinaryOp::Le => b.icmp(CmpOp::Le, cmp, zero),
+        BinaryOp::Gt => b.icmp(CmpOp::Gt, cmp, zero),
+        BinaryOp::Ge => b.icmp(CmpOp::Ge, cmp, zero),
+        _ => unreachable!(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_trimmed_character_compare(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+    op: &BinaryOp,
+    left: &SpannedExpr,
+    right: &SpannedExpr,
+) -> Option<ValueId> {
+    let lhs_expr = trim_intrinsic_arg(left)?;
+    let rhs_expr = trim_intrinsic_arg(right)?;
+    if !expr_is_character_expr(b, locals, lhs_expr, st, type_layouts)
+        || !expr_is_character_expr(b, locals, rhs_expr, st, type_layouts)
+    {
+        return None;
+    }
+
+    let (lhs_ptr, lhs_len) = lower_string_expr_full(
+        b,
+        locals,
+        lhs_expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    );
+    let (rhs_ptr, rhs_len) = lower_string_expr_full(
+        b,
+        locals,
+        rhs_expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    );
+    let cmp = b.call(
+        FuncRef::External("afs_compare_char_trimmed".into()),
+        vec![lhs_ptr, lhs_len, rhs_ptr, rhs_len],
+        IrType::Int(IntWidth::I32),
+    );
+    deallocate_owned_string_expr_temp(b, locals, lhs_expr, st, type_layouts, lhs_ptr);
+    deallocate_owned_string_expr_temp(b, locals, rhs_expr, st, type_layouts, rhs_ptr);
+    Some(emit_char_compare_predicate(b, op, cmp))
+}
+
 pub(super) fn lower_short_circuit_logical_expr(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -815,6 +898,20 @@ pub(crate) fn lower_expr_full(
             ) && (expr_is_character_expr(b, locals, left, st, type_layouts)
                 || expr_is_character_expr(b, locals, right, st, type_layouts))
             {
+                if let Some(result) = lower_trimmed_character_compare(
+                    b,
+                    locals,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                    op,
+                    left,
+                    right,
+                ) {
+                    return result;
+                }
                 let (lhs_ptr, lhs_len) = lower_string_expr_full(
                     b,
                     locals,
@@ -842,16 +939,7 @@ pub(crate) fn lower_expr_full(
                 );
                 deallocate_owned_string_expr_temp(b, locals, left, st, type_layouts, lhs_ptr);
                 deallocate_owned_string_expr_temp(b, locals, right, st, type_layouts, rhs_ptr);
-                let zero = b.const_i32(0);
-                return match op {
-                    BinaryOp::Eq => b.icmp(CmpOp::Eq, cmp, zero),
-                    BinaryOp::Ne => b.icmp(CmpOp::Ne, cmp, zero),
-                    BinaryOp::Lt => b.icmp(CmpOp::Lt, cmp, zero),
-                    BinaryOp::Le => b.icmp(CmpOp::Le, cmp, zero),
-                    BinaryOp::Gt => b.icmp(CmpOp::Gt, cmp, zero),
-                    BinaryOp::Ge => b.icmp(CmpOp::Ge, cmp, zero),
-                    _ => unreachable!(),
-                };
+                return emit_char_compare_predicate(b, op, cmp);
             }
             if matches!(op, BinaryOp::And | BinaryOp::Or) {
                 return lower_short_circuit_logical_expr(
