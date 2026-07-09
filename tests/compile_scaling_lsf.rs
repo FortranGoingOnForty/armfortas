@@ -1,94 +1,101 @@
-use std::collections::BTreeSet;
 use std::fs;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use armfortas::driver::OptLevel;
-use armfortas::testing::{capture_from_path, CaptureRequest, CapturedStage, Stage};
-
-static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-
-fn temp_source(name: &str, lines: usize) -> PathBuf {
-    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!(
-        "afs_{}_{}_{}_{}.f90",
-        name,
-        std::process::id(),
-        id,
-        lines
-    ));
-    fs::write(&path, lsf_stress_source(lines)).expect("write generated source");
-    path
+fn compiler() -> PathBuf {
+    option_env!("CARGO_BIN_EXE_armfortas")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            p.push("target/debug/armfortas");
+            p
+        })
 }
 
-fn lsf_stress_source(lines: usize) -> String {
-    let bound = lines.next_power_of_two().max(16);
-    let mut src = String::new();
-    src.push_str("module lsf_stress_m\ncontains\n");
-    src.push_str("  subroutine kernel(x)\n");
-    src.push_str(&format!("    integer, intent(inout) :: x({})\n", bound));
-    src.push_str("    x(1) = x(1) + 1\n");
+fn unique_dir(stem: &str) -> PathBuf {
+    let mut dir = std::env::temp_dir();
+    dir.push(format!(
+        "armfortas_compile_scaling_lsf_{}_{}_{}",
+        stem,
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before epoch")
+            .as_nanos()
+    ));
+    fs::create_dir_all(&dir).expect("create scaling test dir");
+    dir
+}
 
-    for k in 0..lines {
-        let dst = k + 1;
-        let lhs = (k * 17 + 3) % lines + 1;
-        let rhs = (k * 31 + 7) % lines + 1;
+fn lsf_source(assignments: usize) -> String {
+    let extent = (assignments * 4).next_power_of_two().max(1024);
+    let mut src = String::new();
+    src.push_str("subroutine kernel(x)\n");
+    src.push_str("  implicit none\n");
+    src.push_str(&format!("  integer, intent(inout) :: x({extent})\n"));
+    src.push_str("  integer :: k\n");
+    src.push_str("  x = 1\n");
+    for i in 1..=assignments {
+        let a = (i % extent) + 1;
+        let b = ((i * 7) % extent) + 1;
+        let c = ((i * 13) % extent) + 1;
         src.push_str(&format!(
-            "    x({}) = mod(x({}) * 3 + x({}) + {}, 104729)\n",
-            dst, lhs, rhs, k
+            "  x({a}) = mod(x({b}) * 3 + x({c}) + {i}, 1000003)\n"
         ));
     }
-
-    src.push_str("  end subroutine kernel\nend module lsf_stress_m\n");
+    src.push_str("  k = x(1)\n");
+    src.push_str("  if (k == -1) print *, k\n");
+    src.push_str("end subroutine kernel\n");
     src
 }
 
-fn compile_opt_ir(path: PathBuf) -> Duration {
+fn compile_timed(compiler: &Path, src: &Path, asm: &Path, timeout: Duration) -> Duration {
     let start = Instant::now();
-    let result = capture_from_path(&CaptureRequest {
-        input: path.clone(),
-        requested: BTreeSet::from([Stage::OptIr]),
-        opt_level: OptLevel::O2,
-    })
-    .unwrap_or_else(|err| {
-        panic!(
-            "optimized IR capture failed for {}: {}",
-            path.display(),
-            err
-        )
-    });
-    let elapsed = start.elapsed();
+    let mut child = Command::new(compiler)
+        .arg(src)
+        .args(["-O2", "-S", "-o"])
+        .arg(asm)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn armfortas");
 
-    match result.get(Stage::OptIr) {
-        Some(CapturedStage::Text(ir)) if ir.contains("func @") => {}
-        Some(other) => panic!(
-            "unexpected optimized IR capture for {}: {:?}",
-            path.display(),
-            other
-        ),
-        None => panic!("missing optimized IR capture for {}", path.display()),
+    loop {
+        if let Some(status) = child.try_wait().expect("poll armfortas") {
+            assert!(status.success(), "armfortas compile failed with {status}");
+            return start.elapsed();
+        }
+        if start.elapsed() > timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "armfortas compile exceeded {timeout:?} for {}",
+                src.display()
+            );
+        }
+        thread::sleep(Duration::from_millis(20));
     }
+}
 
-    let _ = fs::remove_file(path);
+fn measure(assignments: usize) -> Duration {
+    let dir = unique_dir(&assignments.to_string());
+    let src = dir.join("lsf.f90");
+    let asm = dir.join("lsf.s");
+    fs::write(&src, lsf_source(assignments)).expect("write scaling source");
+    let elapsed = compile_timed(&compiler(), &src, &asm, Duration::from_secs(30));
+    let _ = fs::remove_dir_all(dir);
     elapsed
 }
 
 #[test]
-fn array_store_lsf_compile_time_scales_below_quadratic() {
-    let warmup = temp_source("lsf_warmup", 32);
-    let _ = compile_opt_ir(warmup);
-
-    let small = compile_opt_ir(temp_source("lsf_small", 250));
-    let large = compile_opt_ir(temp_source("lsf_large", 500));
+fn array_element_store_forwarding_stays_below_quadratic_ceiling() {
+    let small = measure(250);
+    let large = measure(500);
     let ceiling = small.mul_f64(4.0) + Duration::from_secs(2);
-
     assert!(
         large < ceiling,
-        "O2 compile time for 500 array-element stores should stay under a quadratic ceiling: \
-         small={:?}, large={:?}, ceiling={:?}",
-        small,
-        large,
-        ceiling
+        "LSF compile-time growth exceeded ceiling: 250={small:?}, 500={large:?}, ceiling={ceiling:?}"
     );
 }

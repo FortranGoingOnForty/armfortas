@@ -52,6 +52,8 @@ use std::collections::HashMap;
 
 pub struct LocalLsf;
 
+const LOCAL_LSF_AVAILABLE_LIMIT: usize = 256;
+
 impl Pass for LocalLsf {
     fn name(&self) -> &'static str {
         "load-store-fwd"
@@ -90,6 +92,9 @@ fn lsf_in_function(func: &mut Function, layout: crate::target::TargetLayout) -> 
                         available.retain(|entry| {
                             matches!(alias_oracle.query(entry.ptr, eff_ptr), AliasResult::NoAlias)
                         });
+                        if available.len() == LOCAL_LSF_AVAILABLE_LIMIT {
+                            available.remove(0);
+                        }
                         available.push(AvailableStore {
                             ptr: eff_ptr,
                             val: eff_val,
