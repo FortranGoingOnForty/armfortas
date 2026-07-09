@@ -1440,7 +1440,7 @@ pub(crate) fn lower_unit(
                         if !info.allocatable || info.is_pointer {
                             // Already handled above by attribute exclusion.
                         }
-                        allocate_runtime_shape_array_result(
+                        let allocated_result = allocate_runtime_shape_array_result(
                             &mut b,
                             &ctx.locals,
                             &result_name,
@@ -1451,6 +1451,33 @@ pub(crate) fn lower_unit(
                             ctx.st,
                             type_layouts,
                         );
+                        if allocated_result {
+                            if let Some(dt_name) = info.derived_type.as_deref() {
+                                if let Some(layout) = type_layouts.get(dt_name) {
+                                    if derived_layout_needs_runtime_initialization(
+                                        layout,
+                                        type_layouts,
+                                    ) {
+                                        let base_ptr = b.load_typed(
+                                            ValueId(0),
+                                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                                        );
+                                        let elem_count = b.call(
+                                            FuncRef::External("afs_array_size".into()),
+                                            vec![ValueId(0)],
+                                            IrType::Int(IntWidth::I64),
+                                        );
+                                        initialize_derived_array_storage_dynamic(
+                                            &mut b,
+                                            base_ptr,
+                                            layout,
+                                            elem_count,
+                                            type_layouts,
+                                        );
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 super::alloc::alloc_decls(

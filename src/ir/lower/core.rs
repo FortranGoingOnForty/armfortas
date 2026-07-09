@@ -22525,7 +22525,7 @@ pub(super) fn allocate_runtime_shape_array_result(
     _visible_param_consts: &HashMap<String, ConstScalar>,
     st: &SymbolTable,
     type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
-) {
+) -> bool {
     use crate::ast::decl::{ArraySpec, Attribute};
 
     let key = result_name.to_lowercase();
@@ -22561,17 +22561,17 @@ pub(super) fn allocate_runtime_shape_array_result(
         }
     }
     let Some(specs) = chosen_specs else {
-        return;
+        return false;
     };
     if specs.is_empty() {
-        return;
+        return false;
     }
 
     // Bail on non-Explicit specs (assumed-shape, deferred, etc.) — those
     // shapes aren't a function result we can size in the prologue.
     for spec in &specs {
         let ArraySpec::Explicit { .. } = spec else {
-            return;
+            return false;
         };
     }
     // Both runtime-shape (`integer :: n; real :: r(n)`) AND fixed-shape
@@ -22647,6 +22647,7 @@ pub(super) fn allocate_runtime_shape_array_result(
         vec![result_desc, elem_size, rank_v, bounds, stat],
         IrType::Void,
     );
+    true
 }
 
 /// Check if a dummy argument is a derived type, returning the type name if so.
