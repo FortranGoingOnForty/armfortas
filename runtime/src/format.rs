@@ -1153,6 +1153,16 @@ impl FormatEngine {
     /// Fortran kP with E format: the mantissa is multiplied by 10^k,
     /// and the exponent is decreased by k. With 0P (default), the mantissa
     /// is in [0.1, 1.0) — Fortran's convention, not C's.
+    fn e_fractional_digits(&self, decimals: usize) -> usize {
+        if self.scale_factor > 0 {
+            decimals
+                .saturating_add(1)
+                .saturating_sub(self.scale_factor as usize)
+        } else {
+            decimals
+        }
+    }
+
     fn format_e_style(
         &self,
         v: f64,
@@ -1168,14 +1178,19 @@ impl FormatEngine {
             return self.format_e_style_default(v, decimals, exp_width, exp_char);
         }
 
+        let fractional_digits = self.e_fractional_digits(decimals);
         if v == 0.0 {
             let ew = exp_width.unwrap_or(2);
+            let sign = self.real_sign(v);
+            let zeros_before_decimal = "0".repeat((self.scale_factor.max(1)) as usize);
+            let zeros_after_decimal = "0".repeat(fractional_digits);
             return format!(
-                "0.{:0>d$}{}{:+0ew$}",
-                "",
+                "{}{}.{}{}{:+0ew$}",
+                sign,
+                zeros_before_decimal,
+                zeros_after_decimal,
                 exp_char,
                 0,
-                d = decimals,
                 ew = ew + 1
             );
         }
@@ -1183,9 +1198,15 @@ impl FormatEngine {
         let abs_v = v.abs();
         let base_exp = abs_v.log10().floor() as i32;
         // Fortran default (0P): mantissa in [0.1, 1.0), so exponent = base_exp + 1.
-        let fort_exp = base_exp + 1 - self.scale_factor;
+        let mut fort_exp = base_exp + 1 - self.scale_factor;
         let mantissa = abs_v / 10f64.powi(base_exp + 1 - self.scale_factor);
-        let rounded = self.apply_explicit_rounding(mantissa, decimals);
+        let mut rounded = self.apply_explicit_rounding(mantissa, fractional_digits);
+        let carry_threshold =
+            10f64.powi(self.scale_factor) - 0.5 * 10f64.powi(-(fractional_digits as i32));
+        if self.scale_factor > 0 && rounded >= carry_threshold {
+            rounded /= 10.0;
+            fort_exp += 1;
+        }
 
         let ew = exp_width.unwrap_or(2);
         let sign = if v < 0.0 {
@@ -1198,7 +1219,7 @@ impl FormatEngine {
         format!(
             "{}{:.*}{}{:+0ew$}",
             sign,
-            decimals,
+            fractional_digits,
             rounded,
             exp_char,
             fort_exp,
@@ -2082,6 +2103,18 @@ mod tests {
         let out = engine.format_values(&[IoValue::Real(1.5)]);
         // 1.5 * 100 = 150.00
         assert_eq!(out.trim(), "150.00");
+    }
+
+    #[test]
+    fn format_scale_factor_e_reduces_fractional_digits() {
+        let descs = parse_format("(2P,E12.4,1X,E12.4,1X,E12.4)");
+        let mut engine = FormatEngine::new(descs);
+        let out = engine.format_values(&[
+            IoValue::Real(12345.678),
+            IoValue::Real(0.0),
+            IoValue::Real(99999.99),
+        ]);
+        assert_eq!(out, "  12.346E+03   00.000E+00   10.000E+04");
     }
 
     #[test]
