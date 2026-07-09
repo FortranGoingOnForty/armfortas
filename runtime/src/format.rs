@@ -1435,7 +1435,9 @@ impl FormatOutput {
     }
 
     fn write_fitted(&mut self, bytes: &[u8], width: usize) {
-        if width > bytes.len() {
+        if width == 0 {
+            self.write(bytes);
+        } else if width > bytes.len() {
             self.write_spaces(width - bytes.len());
             self.write(bytes);
         } else {
@@ -1813,6 +1815,13 @@ mod tests {
         let out = FormatEngine::new(parse_format("(A5)"))
             .format_values(&[IoValue::Character(Vec::new())]);
         assert_eq!(out, "     ");
+    }
+
+    #[test]
+    fn format_g0_character_uses_unlimited_width() {
+        let out = FormatEngine::new(parse_format("(G0)"))
+            .format_values(&[IoValue::Character(b"txt".to_vec())]);
+        assert_eq!(out, "txt");
     }
 
     #[test]
