@@ -243,7 +243,6 @@ pub fn write_amod(
     writeln!(out, "# checksum: fnv1a:{}", fnv1a_hex(source_content)).unwrap();
     writeln!(out, "# compiled: {}", compile_timestamp()).unwrap();
     writeln!(out, "# compiler: armfortas 0.1.0").unwrap();
-    writeln!(out, "# abi: arm64-apple-darwin").unwrap();
     writeln!(out).unwrap();
 
     // ---- Dependencies ----

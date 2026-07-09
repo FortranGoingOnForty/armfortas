@@ -337,6 +337,38 @@ fn truncated_amod_is_rejected_loudly() {
 }
 
 #[test]
+fn amod_omits_stale_abi_stamp() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=amod_omits_stale_abi_stamp count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let module_f90 = dir.join("target_stamp.f90");
+    let module_o = dir.join("target_stamp.o");
+
+    std::fs::write(
+        &module_f90,
+        "module target_stamp\n  implicit none\n  integer, parameter :: answer = 42\nend module\n",
+    )
+    .unwrap();
+    compile_file(&compiler, &module_f90, &module_o, None);
+
+    let amod =
+        std::fs::read_to_string(dir.join("target_stamp.amod")).expect("missing target_stamp.amod");
+    assert!(
+        !amod.lines().any(|line| line.starts_with("# abi:")),
+        ".amod should not stamp a non-authoritative ABI line:\n{}",
+        amod
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn module_with_derived_type() {
     if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
         eprintln!(
