@@ -252,8 +252,8 @@ impl Unit {
 
     /// Consume `n` bytes from the in-flight unformatted read record
     /// (advancing the cursor). Returns `Some(slice)` when the record
-    /// has enough bytes; `None` when the record is exhausted, when no
-    /// pending record is open, or when fewer than `n` bytes remain.
+    /// has enough bytes. When this returns `None` and `pending_read`
+    /// is still open, the active record is too short for the item.
     fn read_buffer_take(&mut self, n: usize) -> Option<Vec<u8>> {
         let (buf, cur) = self.pending_read.as_mut()?;
         if *cur + n > buf.len() {
@@ -1344,6 +1344,9 @@ pub extern "C" fn afs_read_int8(unit: i32, val: *mut i8, iostat: *mut i32) {
             }
             return;
         }
+        if report_short_pending_read_record(u, iostat) {
+            return;
+        }
         if u.form == Form::Unformatted && u.access == Access::Stream {
             let mut b = [0u8; 1];
             if read_stream_unformatted_exact(u, &mut b, iostat) == Some(true) {
@@ -1410,6 +1413,9 @@ pub extern "C" fn afs_read_int16(unit: i32, val: *mut i16, iostat: *mut i32) {
                     *iostat = 0;
                 }
             }
+            return;
+        }
+        if report_short_pending_read_record(u, iostat) {
             return;
         }
         if u.form == Form::Unformatted && u.access == Access::Stream {
@@ -1481,6 +1487,9 @@ pub extern "C" fn afs_read_int(unit: i32, val: *mut i32, iostat: *mut i32) {
             }
             return;
         }
+        if report_short_pending_read_record(u, iostat) {
+            return;
+        }
         if u.form == Form::Unformatted && u.access == Access::Stream {
             let mut b = [0u8; 4];
             if read_stream_unformatted_exact(u, &mut b, iostat) == Some(true) {
@@ -1549,6 +1558,9 @@ pub extern "C" fn afs_read_int64(unit: i32, val: *mut i64, iostat: *mut i32) {
             }
             return;
         }
+        if report_short_pending_read_record(u, iostat) {
+            return;
+        }
         if u.form == Form::Unformatted && u.access == Access::Stream {
             let mut b = [0u8; 8];
             if read_stream_unformatted_exact(u, &mut b, iostat) == Some(true) {
@@ -1611,6 +1623,9 @@ pub extern "C" fn afs_read_int128(unit: i32, val: *mut i128, iostat: *mut i32) {
             }
             return;
         }
+        if report_short_pending_read_record(u, iostat) {
+            return;
+        }
         if u.form == Form::Unformatted && u.access == Access::Stream {
             let mut b = [0u8; 16];
             if read_stream_unformatted_exact(u, &mut b, iostat) == Some(true) {
@@ -1671,6 +1686,9 @@ pub extern "C" fn afs_read_real(unit: i32, val: *mut f32, iostat: *mut i32) {
                     *iostat = 0;
                 }
             }
+            return;
+        }
+        if report_short_pending_read_record(u, iostat) {
             return;
         }
         if u.form == Form::Unformatted && u.access == Access::Stream {
@@ -1739,6 +1757,9 @@ pub extern "C" fn afs_read_real64(unit: i32, val: *mut f64, iostat: *mut i32) {
                     *iostat = 0;
                 }
             }
+            return;
+        }
+        if report_short_pending_read_record(u, iostat) {
             return;
         }
         if u.form == Form::Unformatted && u.access == Access::Stream {
@@ -1927,6 +1948,10 @@ pub extern "C" fn afs_read_string(unit: i32, dest: *mut u8, dest_len: i64, iosta
         return;
     }
 
+    if report_short_pending_read_record(u, iostat) {
+        return;
+    }
+
     if u.form == Form::Unformatted && u.access == Access::Stream {
         let mut bytes = vec![b' '; dest_len as usize];
         match u.read_raw(&mut bytes) {
@@ -2081,6 +2106,14 @@ fn read_status_message(status: i32) -> &'static str {
 
 fn set_read_status_or_exit(iostat: *mut i32, status: i32) {
     set_read_iostat_or_exit(iostat, status, read_status_message(status));
+}
+
+fn report_short_pending_read_record(u: &Unit, iostat: *mut i32) -> bool {
+    if u.pending_read.is_none() {
+        return false;
+    }
+    set_read_iostat_or_exit(iostat, 1, "unexpected end of unformatted record");
+    true
 }
 
 #[no_mangle]

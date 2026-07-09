@@ -31816,6 +31816,9 @@ pub(super) fn lower_list_read_items(
         if lower_array_read_item(b, ctx, item, mode) {
             continue;
         }
+        if lower_derived_unit_read_item(b, ctx, item, mode) {
+            continue;
+        }
         if lower_list_char_read_item(b, ctx, item, unit, iostat) {
             continue;
         }
@@ -32506,6 +32509,49 @@ pub(super) fn lower_array_read_item(
             } else {
                 false
             }
+        }
+        _ => false,
+    }
+}
+
+fn lower_derived_unit_read_item(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    item: &crate::ast::expr::SpannedExpr,
+    mode: ReadMode,
+) -> bool {
+    match &item.node {
+        Expr::Name { name } => {
+            let Some(info) = ctx.locals.get(&name.to_lowercase()).cloned() else {
+                return false;
+            };
+            if local_is_array_like(&info) || info.allocatable || info.is_pointer || info.is_class {
+                return false;
+            }
+            let Some(type_name) = info.derived_type.as_deref() else {
+                return false;
+            };
+            let base_addr = derived_storage_addr(b, &info);
+            lower_derived_scalar_read(b, ctx, type_name, base_addr, mode, item.span)
+        }
+        Expr::ComponentAccess { .. } => {
+            let Some((field_ptr, field)) =
+                resolve_component_field_access(b, &ctx.locals, item, ctx.st, ctx.type_layouts)
+            else {
+                return false;
+            };
+            if !field.dims.is_empty()
+                || field_uses_array_descriptor(&field)
+                || field.allocatable
+                || field.pointer
+                || field.procedure_pointer
+            {
+                return false;
+            }
+            let Some(type_name) = field_derived_type_name(&field) else {
+                return false;
+            };
+            lower_derived_scalar_read(b, ctx, &type_name, field_ptr, mode, item.span)
         }
         _ => false,
     }
