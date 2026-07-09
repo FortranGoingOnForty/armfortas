@@ -5,6 +5,8 @@
 //! Fortran standard set including repeat counts, group repeat,
 //! unlimited repeat, scale factors, and all data/control descriptors.
 
+use std::sync::Arc;
+
 /// A parsed format descriptor.
 #[derive(Debug, Clone)]
 pub enum FormatDesc {
@@ -632,7 +634,7 @@ pub enum IoValue {
 
 /// Format engine state for applying descriptors to values.
 pub struct FormatEngine {
-    descriptors: Vec<FormatDesc>,
+    descriptors: Arc<[FormatDesc]>,
     sign_mode: SignMode,
     scale_factor: i32,
     round_mode: RoundMode,
@@ -642,6 +644,10 @@ pub struct FormatEngine {
 
 impl FormatEngine {
     pub fn new(descriptors: Vec<FormatDesc>) -> Self {
+        Self::from_shared(Arc::from(descriptors.into_boxed_slice()))
+    }
+
+    pub fn from_shared(descriptors: Arc<[FormatDesc]>) -> Self {
         Self {
             descriptors,
             sign_mode: SignMode::Default,
@@ -695,9 +701,9 @@ impl FormatEngine {
     ) -> Result<Vec<u8>, FormatError> {
         let mut output = FormatOutput::new();
         let mut val_idx = 0;
-        let descriptors = self.descriptors.clone();
-        self.apply_descriptors(&descriptors, values, &mut val_idx, &mut output)?;
-        if !values.is_empty() && !format_has_data_descriptor(&descriptors) {
+        let descriptors = Arc::clone(&self.descriptors);
+        self.apply_descriptors(descriptors.as_ref(), values, &mut val_idx, &mut output)?;
+        if !values.is_empty() && !format_has_data_descriptor(descriptors.as_ref()) {
             return Err(FormatError::InvalidFormat);
         }
         Ok(output.finish())
@@ -720,12 +726,12 @@ impl FormatEngine {
     ) -> Result<Vec<u8>, FormatError> {
         let mut output = FormatOutput::new();
         let mut val_idx = 0;
-        let descriptors = self.descriptors.clone();
-        if !values.is_empty() && !format_has_data_descriptor(&descriptors) {
+        let descriptors = Arc::clone(&self.descriptors);
+        if !values.is_empty() && !format_has_data_descriptor(descriptors.as_ref()) {
             return Err(FormatError::InvalidFormat);
         }
         if values.is_empty() {
-            self.apply_descriptors(&descriptors, values, &mut val_idx, &mut output)?;
+            self.apply_descriptors(descriptors.as_ref(), values, &mut val_idx, &mut output)?;
             return Ok(output.finish());
         }
 
@@ -735,7 +741,7 @@ impl FormatEngine {
                 output.new_record();
             }
             let before = val_idx;
-            self.apply_descriptors(&descriptors, values, &mut val_idx, &mut output)?;
+            self.apply_descriptors(descriptors.as_ref(), values, &mut val_idx, &mut output)?;
             if val_idx == before {
                 return Err(FormatError::InvalidFormat);
             }
@@ -817,13 +823,48 @@ impl FormatEngine {
                     }
                     let val = &values[*val_idx];
                     *val_idx += 1;
-                    let formatted = self.format_value(desc, val)?;
-                    output.write(&formatted);
+                    self.write_value(desc, val, output)?;
                 }
             }
         }
 
         Ok(())
+    }
+
+    fn write_value(
+        &self,
+        desc: &FormatDesc,
+        val: &IoValue,
+        output: &mut FormatOutput,
+    ) -> Result<(), FormatError> {
+        match (desc, val) {
+            (FormatDesc::RealG { width, .. }, IoValue::Character(bytes)) => {
+                output.write_fitted(bytes, *width);
+                Ok(())
+            }
+            (FormatDesc::Character { width }, IoValue::Character(bytes)) => {
+                if let Some(w) = width {
+                    output.write_fitted(bytes, *w);
+                } else {
+                    output.write(bytes);
+                }
+                Ok(())
+            }
+            (FormatDesc::CharTrimmed, IoValue::Character(bytes)) => {
+                let end = bytes
+                    .iter()
+                    .rposition(|&b| b != b' ')
+                    .map(|idx| idx + 1)
+                    .unwrap_or(0);
+                output.write(&bytes[..end]);
+                Ok(())
+            }
+            _ => {
+                let formatted = self.format_value(desc, val)?;
+                output.write(&formatted);
+                Ok(())
+            }
+        }
     }
 
     fn format_value(&self, desc: &FormatDesc, val: &IoValue) -> Result<Vec<u8>, FormatError> {
@@ -1381,6 +1422,27 @@ impl FormatOutput {
         self.high_water = self.high_water.max(end);
     }
 
+    fn write_spaces(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let end = self.pos.saturating_add(count);
+        if self.record.len() < end {
+            self.record.resize(end, b' ');
+        }
+        self.pos = end;
+        self.high_water = self.high_water.max(end);
+    }
+
+    fn write_fitted(&mut self, bytes: &[u8], width: usize) {
+        if width > bytes.len() {
+            self.write_spaces(width - bytes.len());
+            self.write(bytes);
+        } else {
+            self.write(&bytes[..width]);
+        }
+    }
+
     fn advance(&mut self, count: usize) {
         self.pos = self.pos.saturating_add(count);
     }
@@ -1747,6 +1809,10 @@ mod tests {
         let mut engine = FormatEngine::new(descs);
         let out = engine.format_values(&[IoValue::Character(b"hi".to_vec())]);
         assert_eq!(out, "   hi");
+
+        let out = FormatEngine::new(parse_format("(A5)"))
+            .format_values(&[IoValue::Character(Vec::new())]);
+        assert_eq!(out, "     ");
     }
 
     #[test]

@@ -18,7 +18,7 @@ use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 #[cfg(unix)]
 extern "C" {
@@ -4000,8 +4000,28 @@ struct FmtContext {
 // pointers are written by the same thread that begins the I/O.
 unsafe impl Send for FmtContext {}
 
+const FORMAT_CACHE_LIMIT: usize = 128;
+
 thread_local! {
     static FMT_CTX: RefCell<Vec<FmtContext>> = const { RefCell::new(Vec::new()) };
+    static FORMAT_CACHE: RefCell<HashMap<String, Arc<[FormatDesc]>>> =
+        RefCell::new(HashMap::new());
+}
+
+fn cached_format_descriptors(fmt: &str) -> Arc<[FormatDesc]> {
+    FORMAT_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(descriptors) = cache.get(fmt) {
+            return Arc::clone(descriptors);
+        }
+
+        let descriptors = Arc::from(parse_format(fmt).into_boxed_slice());
+        if cache.len() >= FORMAT_CACHE_LIMIT {
+            cache.clear();
+        }
+        cache.insert(fmt.to_owned(), Arc::clone(&descriptors));
+        descriptors
+    })
 }
 
 /// Begin a formatted write operation. Parses the format string and prepares
@@ -4034,7 +4054,7 @@ pub extern "C" fn afs_fmt_begin_ex(
         ctx.borrow_mut().push(FmtContext {
             sink: FmtSink::Unit(unit),
             format_str: fmt,
-            values: Vec::new(),
+            values: Vec::with_capacity(1),
             iostat,
             iomsg,
             iomsg_len,
@@ -4081,7 +4101,7 @@ pub extern "C" fn afs_fmt_begin_internal_ex(
                 buf_len: buf_len.max(0) as usize,
             },
             format_str: fmt,
-            values: Vec::new(),
+            values: Vec::with_capacity(1),
             iostat,
             iomsg,
             iomsg_len,
@@ -4163,7 +4183,7 @@ pub extern "C" fn afs_fmt_begin_internal_alloc(
         ctx.borrow_mut().push(FmtContext {
             sink: FmtSink::InternalAlloc { desc },
             format_str: fmt,
-            values: Vec::new(),
+            values: Vec::with_capacity(1),
             iostat,
             iomsg,
             iomsg_len,
@@ -4194,7 +4214,7 @@ pub extern "C" fn afs_fmt_begin_internal_array(
                 nelems,
             },
             format_str: fmt,
-            values: Vec::new(),
+            values: Vec::with_capacity(1),
             iostat,
             iomsg,
             iomsg_len,
@@ -4392,6 +4412,16 @@ pub extern "C" fn afs_fmt_push_string(ptr: *const u8, len: i64) {
     });
 }
 
+fn is_simple_character_format(fmt: &str) -> bool {
+    let trimmed = fmt.trim();
+    let inner = trimmed
+        .strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+        .unwrap_or(trimmed)
+        .trim();
+    inner.eq_ignore_ascii_case("A")
+}
+
 /// End the formatted write: apply the format engine and write the result.
 /// If advance is true (nonzero), appends a newline. If false (zero), no newline.
 #[no_mangle]
@@ -4399,9 +4429,6 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
     FMT_CTX.with(|ctx| {
         let context = ctx.borrow_mut().pop();
         if let Some(c) = context {
-            let descriptors = parse_format(&c.format_str);
-            let mut engine = FormatEngine::new(descriptors);
-
             // Track success across the sink branches. List-directed and
             // scalar formatted writes both leave `iostat` untouched on
             // older builds; stdlib's savetxt loops `if (ios/=0) error_stop`
@@ -4415,40 +4442,66 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
             match c.sink {
                 FmtSink::Unit(unit) => {
                     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-                    // Seed the leading-zero mode: the statement override
-                    // (LEADING_ZERO= on WRITE) beats the connection mode
-                    // (LEADING_ZERO= on OPEN); format LZ/LZS/LZP descriptors
-                    // still override mid-string via apply_descriptors.
-                    let conn_mode = state
-                        .units
-                        .get(&unit)
-                        .map(|u| u.leading_zero)
-                        .unwrap_or(LeadingZeroMode::Default);
-                    engine.set_leading_zero(c.stmt_leading_zero.unwrap_or(conn_mode));
-                    match engine.format_values_reverting_bytes_checked(&c.values) {
-                        Ok(output) => {
-                            if let Some(u) = state.get_unit(unit) {
-                                if u.write_bytes(&output).is_err() {
-                                    io_status = 1;
-                                    io_msg = Some("write failed");
-                                }
-                                if io_status == 0 && advance != 0 && u.write_bytes(b"\n").is_err()
-                                {
-                                    io_status = 1;
-                                    io_msg = Some("write failed");
-                                }
-                            } else {
-                                io_status = 1;
-                                io_msg = Some("unit not connected");
-                            }
+                    let fast_character = if c.stmt_leading_zero.is_none()
+                        && is_simple_character_format(&c.format_str)
+                    {
+                        match c.values.as_slice() {
+                            [IoValue::Character(bytes)] => Some(bytes.as_slice()),
+                            _ => None,
                         }
-                        Err(_) => {
+                    } else {
+                        None
+                    };
+                    if let Some(bytes) = fast_character {
+                        if let Some(u) = state.get_unit(unit) {
+                            if u.write_bytes(bytes).is_err()
+                                || (advance != 0 && u.write_bytes(b"\n").is_err())
+                            {
+                                io_status = 1;
+                                io_msg = Some("write failed");
+                            }
+                        } else {
                             io_status = 1;
-                            io_msg = Some("format error");
+                            io_msg = Some("unit not connected");
+                        }
+                    } else {
+                        let descriptors = cached_format_descriptors(&c.format_str);
+                        let mut engine = FormatEngine::from_shared(descriptors);
+                        // Seed the leading-zero mode: the statement override
+                        // (LEADING_ZERO= on WRITE) beats the connection mode
+                        // (LEADING_ZERO= on OPEN); format LZ/LZS/LZP descriptors
+                        // still override mid-string via apply_descriptors.
+                        let conn_mode = state
+                            .units
+                            .get(&unit)
+                            .map(|u| u.leading_zero)
+                            .unwrap_or(LeadingZeroMode::Default);
+                        engine.set_leading_zero(c.stmt_leading_zero.unwrap_or(conn_mode));
+                        match engine.format_values_reverting_bytes_checked(&c.values) {
+                            Ok(mut output) => {
+                                if advance != 0 {
+                                    output.push(b'\n');
+                                }
+                                if let Some(u) = state.get_unit(unit) {
+                                    if u.write_bytes(&output).is_err() {
+                                        io_status = 1;
+                                        io_msg = Some("write failed");
+                                    }
+                                } else {
+                                    io_status = 1;
+                                    io_msg = Some("unit not connected");
+                                }
+                            }
+                            Err(_) => {
+                                io_status = 1;
+                                io_msg = Some("format error");
+                            }
                         }
                     }
                 }
                 FmtSink::Internal { buf, buf_len } => {
+                    let descriptors = cached_format_descriptors(&c.format_str);
+                    let mut engine = FormatEngine::from_shared(descriptors);
                     if let Some(mode) = c.stmt_leading_zero {
                         engine.set_leading_zero(mode);
                     }
@@ -4484,6 +4537,8 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                     }
                 }
                 FmtSink::InternalAlloc { desc } => {
+                    let descriptors = cached_format_descriptors(&c.format_str);
+                    let mut engine = FormatEngine::from_shared(descriptors);
                     if let Some(mode) = c.stmt_leading_zero {
                         engine.set_leading_zero(mode);
                     }
@@ -4518,6 +4573,8 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                     elem_len,
                     nelems,
                 } => {
+                    let descriptors = cached_format_descriptors(&c.format_str);
+                    let mut engine = FormatEngine::from_shared(descriptors);
                     if let Some(mode) = c.stmt_leading_zero {
                         engine.set_leading_zero(mode);
                     }

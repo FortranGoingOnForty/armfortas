@@ -332,7 +332,17 @@ pub extern "C" fn afs_len_trim(src: *const u8, src_len: i64) -> i64 {
         return 0;
     }
     let mut len = src_len as usize;
+    let word_len = std::mem::size_of::<usize>();
+    let space_word = usize::from_ne_bytes([b' '; std::mem::size_of::<usize>()]);
     unsafe {
+        while len >= word_len {
+            let start = len - word_len;
+            let word = std::ptr::read_unaligned(src.add(start) as *const usize);
+            if word != space_word {
+                break;
+            }
+            len = start;
+        }
         while len > 0 && *src.add(len - 1) == b' ' {
             len -= 1;
         }
@@ -1011,6 +1021,13 @@ mod tests {
         assert_eq!(afs_len_trim(b"   ".as_ptr(), 3), 0);
         assert_eq!(afs_len_trim(b"hello".as_ptr(), 5), 5);
         assert_eq!(afs_len_trim(b"hello".as_ptr(), -1), 0);
+
+        let mut padded = b"hello".to_vec();
+        padded.extend(std::iter::repeat(b' ').take(257));
+        assert_eq!(afs_len_trim(padded.as_ptr(), padded.len() as i64), 5);
+
+        let spaces = vec![b' '; 257];
+        assert_eq!(afs_len_trim(spaces.as_ptr(), spaces.len() as i64), 0);
     }
 
     #[test]
