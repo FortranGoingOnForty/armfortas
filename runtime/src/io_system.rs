@@ -104,6 +104,23 @@ fn write_i32_ptr(dst: *mut i32, value: i32) {
     }
 }
 
+fn assign_iomsg(dst: *mut u8, dst_len: i64, msg: &str) {
+    if dst.is_null() || dst_len <= 0 {
+        return;
+    }
+    let cap = dst_len as usize;
+    let bytes = msg.as_bytes();
+    let copy = bytes.len().min(cap);
+    unsafe {
+        if copy > 0 {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, copy);
+        }
+        if copy < cap {
+            std::ptr::write_bytes(dst.add(copy), b' ', cap - copy);
+        }
+    }
+}
+
 #[inline]
 fn write_i16_ptr(dst: *mut i16, value: i16) {
     if !dst.is_null() {
@@ -532,6 +549,8 @@ pub struct OpenControlBlock {
     /// (null/0) when the OPEN carried no LEADING_ZERO=.
     pub leading_zero: *const u8,
     pub leading_zero_len: i64,
+    pub iomsg: *mut u8,
+    pub iomsg_len: i64,
 }
 
 /// Simple OPEN with the most common specifiers (fits in 8 registers).
@@ -565,6 +584,8 @@ pub extern "C" fn afs_open_simple(
         position_len: 0,
         leading_zero: std::ptr::null(),
         leading_zero_len: 0,
+        iomsg: std::ptr::null_mut(),
+        iomsg_len: 0,
     };
     afs_open(&cb);
 }
@@ -592,16 +613,20 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
     let recl = cb.recl;
     let iostat = cb.iostat;
     let newunit = cb.newunit;
+    let iomsg = cb.iomsg;
+    let iomsg_len = cb.iomsg_len;
     let missing_filename = fname.is_empty();
 
     if access_str.trim() == "direct" {
+        let message = "OPEN: ACCESS='DIRECT' is not implemented";
+        assign_iomsg(iomsg, iomsg_len, message);
         if !iostat.is_null() {
             unsafe {
                 *iostat = 1;
             }
             return;
         }
-        eprintln!("OPEN: ACCESS='DIRECT' is not implemented");
+        eprintln!("{message}");
         std::process::exit(1);
     }
 
@@ -688,6 +713,7 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
                 *iostat = 0;
             }
         }
+        assign_iomsg(iomsg, iomsg_len, "");
         return;
     }
 
@@ -860,12 +886,15 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
                     *iostat = 0;
                 }
             }
+            assign_iomsg(iomsg, iomsg_len, "");
         }
         Err(e) => {
+            let message = format!("OPEN: {}: {}", display_filename(&fname), e);
             if !iostat.is_null() {
                 unsafe {
                     *iostat = e.raw_os_error().unwrap_or(1);
                 }
+                assign_iomsg(iomsg, iomsg_len, &message);
             } else {
                 // Release the io_state mutex before exit. process::exit invokes
                 // libc atexit handlers — including afs_io_finalize, which locks
@@ -874,7 +903,7 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
                 // same mutex (sample-trace: pthread_mutex_firstfit_lock_wait
                 // → __psynch_mutexwait, hangs forever).
                 drop(state);
-                eprintln!("OPEN: {}: {}", display_filename(&fname), e);
+                eprintln!("{message}");
                 std::process::exit(1);
             }
         }
@@ -5571,6 +5600,8 @@ mod tests {
             position_len: 6,
             leading_zero: std::ptr::null(),
             leading_zero_len: 0,
+            iomsg: std::ptr::null_mut(),
+            iomsg_len: 0,
         };
 
         afs_open(&cb);
@@ -5593,6 +5624,50 @@ mod tests {
 
         afs_open(&cb);
         assert_ne!(iostat, 0, "STATUS='old' read must fail for missing files");
+    }
+
+    #[test]
+    fn failed_open_assigns_iomsg() {
+        let path = format!(
+            "/tmp/afs_open_iomsg_missing_{}_{}.dat",
+            std::process::id(),
+            line!()
+        );
+        let _ = std::fs::remove_file(&path);
+
+        let mut iostat = -99i32;
+        let mut iomsg = [b'X'; 128];
+        let cb = OpenControlBlock {
+            unit: 788,
+            filename: path.as_ptr(),
+            filename_len: path.len() as i64,
+            status: "old".as_ptr(),
+            status_len: 3,
+            action: "read".as_ptr(),
+            action_len: 4,
+            access: std::ptr::null(),
+            access_len: 0,
+            form: std::ptr::null(),
+            form_len: 0,
+            recl: 0,
+            iostat: &mut iostat,
+            newunit: std::ptr::null_mut(),
+            position: std::ptr::null(),
+            position_len: 0,
+            leading_zero: std::ptr::null(),
+            leading_zero_len: 0,
+            iomsg: iomsg.as_mut_ptr(),
+            iomsg_len: iomsg.len() as i64,
+        };
+
+        afs_open(&cb);
+        let msg = String::from_utf8_lossy(&iomsg);
+        assert_ne!(iostat, 0, "missing file OPEN must fail");
+        assert!(
+            msg.contains("OPEN:"),
+            "expected OPEN context in iomsg: {msg:?}"
+        );
+        assert!(msg.contains(&path), "expected filename in iomsg: {msg:?}");
     }
 
     #[test]
@@ -5624,6 +5699,8 @@ mod tests {
             position_len: 0,
             leading_zero: std::ptr::null(),
             leading_zero_len: 0,
+            iomsg: std::ptr::null_mut(),
+            iomsg_len: 0,
         };
 
         afs_open(&cb);
@@ -5663,6 +5740,8 @@ mod tests {
             position_len: 0,
             leading_zero: std::ptr::null(),
             leading_zero_len: 0,
+            iomsg: std::ptr::null_mut(),
+            iomsg_len: 0,
         };
 
         afs_open(&cb);
@@ -5709,6 +5788,8 @@ mod tests {
             position_len: 0,
             leading_zero: std::ptr::null(),
             leading_zero_len: 0,
+            iomsg: std::ptr::null_mut(),
+            iomsg_len: 0,
         };
 
         afs_open(&cb);
@@ -5751,6 +5832,8 @@ mod tests {
             position_len: 0,
             leading_zero: std::ptr::null(),
             leading_zero_len: 0,
+            iomsg: std::ptr::null_mut(),
+            iomsg_len: 0,
         };
         afs_open(&write_cb);
         assert_eq!(iostat, 0, "expected stream OPEN for writing to succeed");
@@ -5821,6 +5904,8 @@ mod tests {
             position_len: 0,
             leading_zero: std::ptr::null(),
             leading_zero_len: 0,
+            iomsg: std::ptr::null_mut(),
+            iomsg_len: 0,
         };
 
         afs_open(&cb);
@@ -5863,6 +5948,8 @@ mod tests {
             position_len: 0,
             leading_zero: "SUPPRESS".as_ptr(),
             leading_zero_len: 8,
+            iomsg: std::ptr::null_mut(),
+            iomsg_len: 0,
         };
         afs_open(&cb);
         assert_eq!(iostat, 0, "expected formatted OPEN to succeed");

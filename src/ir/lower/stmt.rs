@@ -7480,6 +7480,12 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     .map(|k| k.eq_ignore_ascii_case("iostat"))
                     .unwrap_or(false)
             });
+            let iomsg_spec = specs.iter().find(|s| {
+                s.keyword
+                    .as_deref()
+                    .map(|k| k.eq_ignore_ascii_case("iomsg"))
+                    .unwrap_or(false)
+            });
             let err_label = specs.iter().find_map(|s| {
                 if s.keyword
                     .as_deref()
@@ -7590,6 +7596,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 .unwrap_or_else(|| b.const_i64(0));
 
             let null = b.const_i64(0);
+            let null_i8_ptr = b.int_to_ptr(null, IrType::Int(IntWidth::I8));
             let unit_i32 = coerce_to_type(b, unit, &IrType::Int(IntWidth::I32));
             let recl_i64 = coerce_to_type(b, recl_val, &IrType::Int(IntWidth::I64));
             let open_iostat_ptr = match (iostat_spec, err_label) {
@@ -7602,6 +7609,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 }
                 (None, None) => null,
             };
+            let (open_iomsg_ptr, open_iomsg_len) = iomsg_spec
+                .map(|spec| lower_string_expr_ctx(b, ctx, &spec.value))
+                .unwrap_or((null_i8_ptr, null));
 
             // Check if we have any extended specifiers beyond the basic 7-arg set.
             let has_access = specs.iter().any(|s| {
@@ -7635,6 +7645,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     .unwrap_or(false)
             });
             let has_iostat = iostat_spec.is_some();
+            let has_iomsg = iomsg_spec.is_some();
             let has_newunit = newunit_spec.is_some();
             let has_err = err_label.is_some();
 
@@ -7644,6 +7655,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 && !has_position
                 && !has_leading_zero
                 && !has_iostat
+                && !has_iomsg
                 && !has_newunit
                 && !has_err
             {
@@ -7688,14 +7700,15 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         (z, z)
                     });
 
-                // Layout matches repr(C) OpenControlBlock (144 bytes):
+                // Layout matches repr(C) OpenControlBlock (160 bytes):
                 //   0: unit(i32) + 4 pad, 8: filename(ptr), 16: filename_len(i64),
                 //  24: status(ptr), 32: status_len(i64), 40: action(ptr), 48: action_len(i64),
                 //  56: access(ptr), 64: access_len(i64), 72: form(ptr), 80: form_len(i64),
                 //  88: recl(i64), 96: iostat(ptr), 104: newunit(ptr),
                 // 112: position(ptr), 120: position_len(i64),
-                // 128: leading_zero(ptr), 136: leading_zero_len(i64)
-                let cb_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 144);
+                // 128: leading_zero(ptr), 136: leading_zero_len(i64),
+                // 144: iomsg(ptr), 152: iomsg_len(i64)
+                let cb_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 160);
                 let cb = b.alloca(cb_ty);
 
                 let store_at = |b: &mut crate::ir::builder::FuncBuilder,
@@ -7744,6 +7757,10 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     .func()
                     .value_type(leading_zero_ptr)
                     .unwrap_or(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                let iomsg_ptr_ty = b
+                    .func()
+                    .value_type(open_iomsg_ptr)
+                    .unwrap_or(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
                 let newunit_ptr = newunit_spec
                     .map(|spec| lower_arg_by_ref_ctx(b, ctx, &spec.value))
                     .unwrap_or(null);
@@ -7774,6 +7791,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 store_at(b, cb, 120, IrType::Int(IntWidth::I64), position_len);
                 store_at(b, cb, 128, leading_zero_ptr_ty, leading_zero_ptr);
                 store_at(b, cb, 136, IrType::Int(IntWidth::I64), leading_zero_len);
+                store_at(b, cb, 144, iomsg_ptr_ty, open_iomsg_ptr);
+                store_at(b, cb, 152, IrType::Int(IntWidth::I64), open_iomsg_len);
 
                 b.call(FuncRef::External("afs_open".into()), vec![cb], IrType::Void);
             }
