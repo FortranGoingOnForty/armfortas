@@ -26,7 +26,7 @@ program implied_do_list_directed_output
   ! CHECK: 11          12          21          22
   ! character implied-do
   print *, (cs(i), i=1,2)
-  ! CHECK: abc def
+  ! CHECK: abcdef
   ! plain array constructor in an output list
   write(*,*) [7, 8, 9]
   ! CHECK: 7           8           9

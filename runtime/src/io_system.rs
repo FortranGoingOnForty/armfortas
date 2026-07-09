@@ -191,6 +191,10 @@ struct Unit {
     /// a newline. If the next stdin read hits EOF, report EOR once for that
     /// open record before reporting END.
     stdin_nonadvancing_open_record: bool,
+    /// True when the most recent formatted list-directed output item was
+    /// character. Adjacent character items concatenate without another
+    /// separator; any non-character item breaks the run.
+    last_list_output_char: bool,
     /// True for STATUS='SCRATCH' units: backing file is deleted on close or exit.
     scratch: bool,
     /// Connection-level LEADING_ZERO= mode (F2023). Seeds the format
@@ -432,6 +436,7 @@ impl IoState {
                 formatted_read_record: None,
                 formatted_read_cursor: 0,
                 stdin_nonadvancing_open_record: false,
+                last_list_output_char: false,
                 scratch: false,
                 leading_zero: LeadingZeroMode::Default,
                 pending_record: None,
@@ -453,6 +458,7 @@ impl IoState {
                 formatted_read_record: None,
                 formatted_read_cursor: 0,
                 stdin_nonadvancing_open_record: false,
+                last_list_output_char: false,
                 scratch: false,
                 leading_zero: LeadingZeroMode::Default,
                 pending_record: None,
@@ -474,6 +480,7 @@ impl IoState {
                 formatted_read_record: None,
                 formatted_read_cursor: 0,
                 stdin_nonadvancing_open_record: false,
+                last_list_output_char: false,
                 scratch: false,
                 leading_zero: LeadingZeroMode::Default,
                 pending_record: None,
@@ -811,6 +818,7 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
                     formatted_read_record: None,
                     formatted_read_cursor: 0,
                     stdin_nonadvancing_open_record: false,
+                    last_list_output_char: false,
                     scratch: is_scratch,
                     leading_zero: leading_zero_mode,
                     pending_record: None,
@@ -942,6 +950,10 @@ fn list_directed_integer_field<T: std::fmt::Display>(val: T, width: usize) -> St
     format!("{:>width$}", val, width = width)
 }
 
+fn mark_list_output_nonchar(u: &mut Unit) {
+    u.last_list_output_char = false;
+}
+
 /// Write an 8-bit integer value (list-directed).
 #[no_mangle]
 pub extern "C" fn afs_write_int8(unit: i32, val: i8) {
@@ -950,6 +962,7 @@ pub extern "C" fn afs_write_int8(unit: i32, val: i8) {
         if u.is_unformatted() {
             u.raw_or_buffer(&val.to_ne_bytes());
         } else {
+            mark_list_output_nonchar(u);
             let _ = u.write_str(&list_directed_integer_field(val, LIST_INT8_WIDTH));
         }
     }
@@ -963,6 +976,7 @@ pub extern "C" fn afs_write_int16(unit: i32, val: i16) {
         if u.is_unformatted() {
             u.raw_or_buffer(&val.to_ne_bytes());
         } else {
+            mark_list_output_nonchar(u);
             let _ = u.write_str(&list_directed_integer_field(val, LIST_INT16_WIDTH));
         }
     }
@@ -976,6 +990,7 @@ pub extern "C" fn afs_write_int(unit: i32, val: i32) {
         if u.is_unformatted() {
             u.raw_or_buffer(&val.to_ne_bytes());
         } else {
+            mark_list_output_nonchar(u);
             let _ = u.write_str(&list_directed_integer_field(val, LIST_INT32_WIDTH));
         }
     }
@@ -989,6 +1004,7 @@ pub extern "C" fn afs_write_int64(unit: i32, val: i64) {
         if u.is_unformatted() {
             u.raw_or_buffer(&val.to_ne_bytes());
         } else {
+            mark_list_output_nonchar(u);
             let _ = u.write_str(&list_directed_integer_field(val, LIST_INT64_WIDTH));
         }
     }
@@ -1002,6 +1018,7 @@ pub extern "C" fn afs_write_int128(unit: i32, val: i128) {
         if u.is_unformatted() {
             u.raw_or_buffer(&val.to_ne_bytes());
         } else {
+            mark_list_output_nonchar(u);
             let _ = u.write_str(&list_directed_integer_field(val, LIST_INT128_WIDTH));
         }
     }
@@ -1015,6 +1032,7 @@ pub extern "C" fn afs_write_real(unit: i32, val: f32) {
         if u.is_unformatted() {
             u.raw_or_buffer(&val.to_ne_bytes());
         } else {
+            mark_list_output_nonchar(u);
             let _ = u.write_str(&format!("  {:14.7E}", val));
         }
     }
@@ -1028,6 +1046,7 @@ pub extern "C" fn afs_write_real64(unit: i32, val: f64) {
         if u.is_unformatted() {
             u.raw_or_buffer(&val.to_ne_bytes());
         } else {
+            mark_list_output_nonchar(u);
             let _ = u.write_str(&format!("  {:22.15E}", val));
         }
     }
@@ -1044,6 +1063,7 @@ pub extern "C" fn afs_write_complex_f32(unit: i32, ptr: *const f32) {
             u.raw_or_buffer(&re.to_ne_bytes());
             u.raw_or_buffer(&im.to_ne_bytes());
         } else {
+            mark_list_output_nonchar(u);
             let _ = u.write_str(&format!(" ({:14.7E},{:14.7E})", re, im));
         }
     }
@@ -1060,6 +1080,7 @@ pub extern "C" fn afs_write_complex_f64(unit: i32, ptr: *const f64) {
             u.raw_or_buffer(&re.to_ne_bytes());
             u.raw_or_buffer(&im.to_ne_bytes());
         } else {
+            mark_list_output_nonchar(u);
             let _ = u.write_str(&format!(" ({:22.15E},{:22.15E})", re, im));
         }
     }
@@ -1076,11 +1097,14 @@ pub extern "C" fn afs_write_string(unit: i32, ptr: *const u8, len: i64) {
                 u.raw_or_buffer(slice);
             }
         } else {
-            let _ = u.write_str(" ");
+            if !u.last_list_output_char {
+                let _ = u.write_str(" ");
+            }
             if !ptr.is_null() && len > 0 {
                 let slice = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
                 let _ = u.write_bytes(slice);
             }
+            u.last_list_output_char = true;
         }
     }
 }
@@ -1093,6 +1117,7 @@ pub extern "C" fn afs_write_logical(unit: i32, val: i32) {
         if u.is_unformatted() {
             u.raw_or_buffer(&val.to_ne_bytes());
         } else {
+            mark_list_output_nonchar(u);
             let _ = u.write_str(if val != 0 { " T" } else { " F" });
         }
     }
@@ -1112,6 +1137,7 @@ pub extern "C" fn afs_write_newline(unit: i32) {
         }
         let _ = u.write_str("\n");
         let _ = u.flush();
+        u.last_list_output_char = false;
     }
 }
 
@@ -1205,6 +1231,7 @@ pub extern "C" fn afs_list_write_begin(
     }
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
+        u.last_list_output_char = false;
         if u.form == Form::Unformatted && u.access == Access::Sequential {
             u.pending_record = Some(Vec::new());
         }
