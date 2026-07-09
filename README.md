@@ -95,6 +95,7 @@ Value-class inquiry and construction (`ieee_is_nan/finite/normal`, `ieee_class`,
 ### I/O
 
 - `PRINT` and `WRITE` with format strings and list-directed I/O
+- List-directed integer output uses gfortran-compatible field widths by kind
 - `READ` from stdin and files
 - `OPEN`, `CLOSE`, `INQUIRE`, `REWIND`, `BACKSPACE`, `ENDFILE`, `FLUSH`
 - Unformatted (binary) I/O
