@@ -5249,7 +5249,6 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             controls,
             mask,
             body,
-            locality: _,
             ..
         } => {
             lower_do_concurrent(b, ctx, name, controls, mask.as_ref(), body, stmt.span);

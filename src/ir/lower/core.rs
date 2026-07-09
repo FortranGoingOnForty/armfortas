@@ -41466,14 +41466,13 @@ pub(super) fn lower_rank1_shift_array_expr_descriptor(
                 vec![dest_ptr, elem_size, ptr, len],
                 IrType::Void,
             );
-        } else if let Some(boundary_ptr) = boundary_scalar_ptr {
+        } else {
+            let boundary_ptr = boundary_scalar_ptr?;
             b.call(
                 FuncRef::External("memcpy".into()),
                 vec![dest_ptr, boundary_ptr, elem_size],
                 IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
             );
-        } else {
-            return None;
         }
         b.branch(bb_join, vec![]);
 
@@ -51052,7 +51051,7 @@ fn lower_findloc_rank1_scalar(
     let mut mask_scalar_i1: Option<ValueId> = None;
     if let Some(me) = mask_expr {
         if actual_expr_rank(me, locals, st, type_layouts).is_some_and(|r| r >= 1) {
-            match lower_array_expr_descriptor(
+            let md = lower_array_expr_descriptor(
                 b,
                 locals,
                 me,
@@ -51061,10 +51060,8 @@ fn lower_findloc_rank1_scalar(
                 internal_funcs,
                 contained_host_refs,
                 descriptor_params,
-            ) {
-                Some(md) => mask_array = Some(md),
-                None => return None,
-            }
+            )?;
+            mask_array = Some(md);
         } else {
             let mv = super::expr::lower_expr_full(
                 b,
@@ -51205,7 +51202,7 @@ fn lower_minmaxloc_rank1_scalar(
     let mut mask_scalar_i1: Option<ValueId> = None;
     if let Some(me) = mask_expr {
         if actual_expr_rank(me, locals, st, type_layouts).is_some_and(|r| r >= 1) {
-            match lower_array_expr_descriptor(
+            let md = lower_array_expr_descriptor(
                 b,
                 locals,
                 me,
@@ -51214,10 +51211,8 @@ fn lower_minmaxloc_rank1_scalar(
                 internal_funcs,
                 contained_host_refs,
                 descriptor_params,
-            ) {
-                Some(md) => mask_array = Some(md),
-                None => return None,
-            }
+            )?;
+            mask_array = Some(md);
         } else {
             let mv = super::expr::lower_expr_full(
                 b,
