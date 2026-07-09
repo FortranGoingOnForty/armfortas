@@ -1,26 +1,28 @@
-! FINAL procedure test: cleanup called when variable goes out of scope.
-! This is where gfortran crashes on ARM64 (automatic finalization bug).
+! FINAL procedure test: cleanup called when a block local goes out of scope.
 !
 ! CHECK: alive: 42
 ! CHECK: cleanup: 42
-program test_final
+module derived_type_final_mod
     implicit none
     type :: resource
         integer :: handle
     contains
         final :: cleanup
     end type
-    type(resource) :: r
-    r%handle = 42
-    print *, 'alive:', r%handle
-    ! r goes out of scope here — cleanup should be called.
-end program
 
+contains
 subroutine cleanup(self)
-    implicit none
-    type :: resource
-        integer :: handle
-    end type
-    type(resource) :: self
+    type(resource), intent(inout) :: self
     print *, 'cleanup:', self%handle
 end subroutine
+end module
+
+program test_final
+    use derived_type_final_mod, only: resource
+    implicit none
+    block
+        type(resource) :: r
+        r%handle = 42
+        print *, 'alive:', r%handle
+    end block
+end program

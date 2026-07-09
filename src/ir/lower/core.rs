@@ -26460,6 +26460,7 @@ pub(super) fn insert_implicit_dealloc(
     internal_funcs: &HashMap<String, u32>,
     contained_host_refs: Option<&HashMap<String, Vec<String>>>,
     skip_addr: Option<ValueId>,
+    finalize_owned_locals: bool,
 ) {
     // Audit Med-2: only allocate the stat_addr scratch slot if we
     // actually need it for an `afs_deallocate_array` call. Without
@@ -26477,16 +26478,16 @@ pub(super) fn insert_implicit_dealloc(
     let needs_stat = owned_locals
         .values()
         .any(|info| !info.by_ref && info.allocatable);
-    if !needs_dealloc
-        && !owned_locals.values().any(|info| {
+    let needs_finalization = finalize_owned_locals
+        && owned_locals.values().any(|info| {
             !info.by_ref
                 && info
                     .derived_type
                     .as_ref()
                     .and_then(|tn| type_layouts.get(tn))
                     .is_some_and(|l| !l.final_procs.is_empty())
-        })
-    {
+        });
+    if !needs_dealloc && !needs_finalization {
         return;
     }
 
@@ -26554,7 +26555,7 @@ pub(super) fn insert_implicit_dealloc(
         }
         // Finalization: call FINAL procedures for locally-owned derived type variables.
         // Skip by-ref params (they're owned by the caller, not the callee).
-        if !info.by_ref {
+        if finalize_owned_locals && !info.by_ref {
             if let Some(ref type_name) = info.derived_type {
                 if let Some(layout) = type_layouts.get(type_name) {
                     finalize_derived_storage(

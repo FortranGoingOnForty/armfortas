@@ -5974,6 +5974,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 ctx.internal_funcs,
                 Some(ctx.contained_host_refs),
                 skip,
+                true,
             );
             if ctx.hidden_result_abi != HiddenResultAbi::None {
                 // sret convention: result was written into the hidden first param.
@@ -6051,6 +6052,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     ctx.internal_funcs,
                     Some(ctx.contained_host_refs),
                     skip,
+                    true,
                 );
             }
             match stop_code {
@@ -6150,6 +6152,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     ctx.internal_funcs,
                     Some(ctx.contained_host_refs),
                     skip,
+                    true,
                 );
             }
 
@@ -7176,6 +7179,15 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             if field.allocatable {
                                 if let Some(type_name) = field_derived_type_name(&field) {
                                     if let Some(layout) = ctx.type_layouts.get(&type_name) {
+                                        finalize_derived_descriptor_storage_if_allocated(
+                                            b,
+                                            ctx.st,
+                                            ctx.internal_funcs,
+                                            Some(ctx.contained_host_refs),
+                                            &ctx.locals,
+                                            field_ptr,
+                                            layout,
+                                        );
                                         deallocate_derived_descriptor_components(
                                             b,
                                             field_ptr,
@@ -7234,6 +7246,15 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             let desc = array_descriptor_addr(b, info);
                             if let Some(type_name) = &info.derived_type {
                                 if let Some(layout) = ctx.type_layouts.get(type_name) {
+                                    finalize_derived_descriptor_storage_if_allocated(
+                                        b,
+                                        ctx.st,
+                                        ctx.internal_funcs,
+                                        Some(ctx.contained_host_refs),
+                                        &ctx.locals,
+                                        desc,
+                                        layout,
+                                    );
                                     deallocate_derived_descriptor_components(
                                         b,
                                         desc,
@@ -7453,6 +7474,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         ctx.internal_funcs,
                         Some(ctx.contained_host_refs),
                         None,
+                        true,
                     );
                 }
             }

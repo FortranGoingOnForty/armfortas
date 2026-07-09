@@ -210,6 +210,7 @@ pub(crate) fn lower_unit(
                         ctx.internal_funcs,
                         Some(ctx.contained_host_refs),
                         None,
+                        false,
                     );
                 }
                 ensure_termination(&mut b, None);
@@ -723,6 +724,7 @@ pub(crate) fn lower_unit(
                         ctx.internal_funcs,
                         Some(ctx.contained_host_refs),
                         None,
+                        true,
                     );
                 }
                 ensure_termination(&mut b, None);
@@ -1565,6 +1567,7 @@ pub(crate) fn lower_unit(
                         ctx.internal_funcs,
                         Some(ctx.contained_host_refs),
                         skip,
+                        true,
                     );
                     if uses_hidden_result {
                         b.ret(None);
