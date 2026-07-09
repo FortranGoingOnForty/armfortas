@@ -23,6 +23,45 @@ Ladder (smallest dependency surface first):
 No divergences in state "observed but unclassified". (Empty so far —
 test-drive matched gfortran exactly.)
 
+## FIXED ledger ancestry rule
+
+As of 2026-07-09, a `FIXED` ledger entry must point at landed history.
+For superproject fixes, the recorded commit must satisfy:
+
+```
+git merge-base --is-ancestor <commit> trunk
+```
+
+For submodule fixes, the recorded submodule commit must be an ancestor of
+the submodule commit pinned by `trunk`; once known, the ledger entry
+should also name the superproject pin. Branch-only work is a candidate or
+branch fix, not a trunk `FIXED` entry.
+
+Ancestry audit scope: `.docs/audits/*.md` plus `noted_items.md`, checking
+entries that named a commit-like hash against local `trunk` at
+`163cf0c5`.
+
+- Superproject FIXED entries verified as ancestors of `trunk`:
+  `06e94f3c`, `c04476c2`, `531d19dd`, `ba67c10f`, `7a05e240`,
+  `567ed0ee`, `91420e2f`.
+- Submodule FIXED entries verified through the `trunk` submodule pin:
+  afs-ld `b46543a` and `44ba4af` are both ancestors of the afs-ld
+  commit `11831ef` pinned by superproject `trunk`.
+- Stale FIXED entries that name commits present only on
+  `origin/x12-campaign-x86`, not on `trunk`: `af214426`, `b3819f9a`,
+  `5610f607`, `53c78f32`, `82c947e5`, `b1f0b796`, `3f177c24`,
+  `9034c488`, `8de4188f`, `975fe776`. The mixed source/object driver
+  fix from `82c947e5` was cherry-picked onto this remediation branch as
+  `974f281f`; it is not trunk-FIXED until this branch lands.
+- Unresolved short hashes referenced by FIXED entries but absent from the
+  current superproject object database and the checked submodules:
+  `36a51ad`, `b113ba3`, `9b50a7e`, `99cdc2d`, `267c8ce`, `cd6bbe9`,
+  `3e15d80`. Resolve these to landed commits or downgrade the entries
+  before relying on them as trunk-FIXED.
+- FIXED entries that do not record a commit hash were not machine-checkable
+  by the ancestry rule; add landed commits or pin commits to those entries
+  when they are touched.
+
 ---
 
 ## test-drive (FreeBSD x86_64)
