@@ -14,7 +14,7 @@ use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, IsTerminal, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
@@ -204,10 +204,10 @@ struct Unit {
     formatted_read_record: Option<Vec<u8>>,
     /// Cursor within a cached formatted input record for ADVANCE='NO' reads.
     formatted_read_cursor: usize,
-    /// True after a non-advancing stdin read returned bytes without seeing
-    /// a newline. If the next stdin read hits EOF, report EOR once for that
-    /// open record before reporting END.
-    stdin_nonadvancing_open_record: bool,
+    /// True after a non-advancing terminal read returned bytes without
+    /// seeing a newline. If the next terminal read hits EOF, report EOR
+    /// once for that open record before reporting END.
+    terminal_nonadvancing_open_record: bool,
     /// True when the most recent formatted list-directed output item was
     /// character. Adjacent character items concatenate without another
     /// separator; any non-character item breaks the run.
@@ -336,6 +336,27 @@ impl Unit {
             .map(|line| String::from_utf8_lossy(&line).into_owned())
     }
 
+    fn is_terminal(&self) -> bool {
+        match &self.stream {
+            UnitStream::Stdin => io::stdin().is_terminal(),
+            UnitStream::FileRead(r) => r.get_ref().is_terminal(),
+            UnitStream::FileRaw(f) => f.is_terminal(),
+            _ => false,
+        }
+    }
+
+    fn read_nonadvancing_bytes(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match &mut self.stream {
+            UnitStream::Stdin => read_stdin_unbuffered(buf),
+            UnitStream::FileRead(r) => r.read(buf),
+            UnitStream::FileRaw(f) => f.read(buf),
+            _ => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "unit not open for reading",
+            )),
+        }
+    }
+
     /// Get the next token for list-directed READ.
     /// Reads a new line if the token buffer is empty.
     fn next_read_token(&mut self) -> io::Result<Option<String>> {
@@ -452,7 +473,7 @@ impl IoState {
                 read_tokens: VecDeque::new(),
                 formatted_read_record: None,
                 formatted_read_cursor: 0,
-                stdin_nonadvancing_open_record: false,
+                terminal_nonadvancing_open_record: false,
                 last_list_output_char: false,
                 scratch: false,
                 leading_zero: LeadingZeroMode::Default,
@@ -474,7 +495,7 @@ impl IoState {
                 read_tokens: VecDeque::new(),
                 formatted_read_record: None,
                 formatted_read_cursor: 0,
-                stdin_nonadvancing_open_record: false,
+                terminal_nonadvancing_open_record: false,
                 last_list_output_char: false,
                 scratch: false,
                 leading_zero: LeadingZeroMode::Default,
@@ -496,7 +517,7 @@ impl IoState {
                 read_tokens: VecDeque::new(),
                 formatted_read_record: None,
                 formatted_read_cursor: 0,
-                stdin_nonadvancing_open_record: false,
+                terminal_nonadvancing_open_record: false,
                 last_list_output_char: false,
                 scratch: false,
                 leading_zero: LeadingZeroMode::Default,
@@ -843,7 +864,7 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
                     read_tokens: VecDeque::new(),
                     formatted_read_record: None,
                     formatted_read_cursor: 0,
-                    stdin_nonadvancing_open_record: false,
+                    terminal_nonadvancing_open_record: false,
                     last_list_output_char: false,
                     scratch: is_scratch,
                     leading_zero: leading_zero_mode,
@@ -4919,7 +4940,7 @@ fn trim_record_newline(mut line: Vec<u8>) -> Vec<u8> {
     line
 }
 
-fn nonadvancing_stdin_read_len(descs: &[FormatDesc], dest_len: i64) -> usize {
+fn nonadvancing_read_len(descs: &[FormatDesc], dest_len: i64) -> usize {
     for desc in descs {
         if let FormatDesc::Character { width } = desc {
             return width.unwrap_or_else(|| dest_len.max(1) as usize).max(1);
@@ -4943,9 +4964,13 @@ fn read_stdin_unbuffered(buf: &mut [u8]) -> io::Result<usize> {
     io::stdin().read(buf)
 }
 
-fn read_stdin_nonadvancing_chunk(descs: &[FormatDesc], dest_len: i64) -> io::Result<Vec<u8>> {
-    let mut buf = vec![0u8; nonadvancing_stdin_read_len(descs, dest_len)];
-    let n = read_stdin_unbuffered(&mut buf)?;
+fn read_nonadvancing_chunk(
+    unit: &mut Unit,
+    descs: &[FormatDesc],
+    dest_len: i64,
+) -> io::Result<Vec<u8>> {
+    let mut buf = vec![0u8; nonadvancing_read_len(descs, dest_len)];
+    let n = unit.read_nonadvancing_bytes(&mut buf)?;
     buf.truncate(n);
     Ok(buf)
 }
@@ -5144,27 +5169,27 @@ pub extern "C" fn afs_fmt_read_string_noadvance(
         return;
     };
 
-    let mut stdin_chunk_without_newline = false;
+    let mut terminal_chunk_without_newline = false;
     if u.formatted_read_record.is_none() {
-        let from_stdin = matches!(u.stream, UnitStream::Stdin);
-        let read_result = if from_stdin {
-            read_stdin_nonadvancing_chunk(&descs, dest_len)
+        let from_terminal = u.is_terminal();
+        let read_result = if from_terminal {
+            read_nonadvancing_chunk(u, &descs, dest_len)
         } else {
             u.read_line_bytes()
         };
         match read_result {
             Ok(line) if !line.is_empty() => {
-                stdin_chunk_without_newline =
-                    from_stdin && !line.iter().any(|&b| matches!(b, b'\n' | b'\r'));
-                if from_stdin {
-                    u.stdin_nonadvancing_open_record = stdin_chunk_without_newline;
+                terminal_chunk_without_newline =
+                    from_terminal && !line.iter().any(|&b| matches!(b, b'\n' | b'\r'));
+                if from_terminal {
+                    u.terminal_nonadvancing_open_record = terminal_chunk_without_newline;
                 }
                 u.formatted_read_record = Some(trim_record_newline(line));
                 u.formatted_read_cursor = 0;
             }
             Ok(_) => {
-                let code = if from_stdin && u.stdin_nonadvancing_open_record {
-                    u.stdin_nonadvancing_open_record = false;
+                let code = if from_terminal && u.terminal_nonadvancing_open_record {
+                    u.terminal_nonadvancing_open_record = false;
                     IOSTAT_EOR
                 } else {
                     IOSTAT_END
@@ -5211,7 +5236,7 @@ pub extern "C" fn afs_fmt_read_string_noadvance(
                     }
                     u.formatted_read_record = None;
                     u.formatted_read_cursor = 0;
-                } else if stdin_chunk_without_newline {
+                } else if terminal_chunk_without_newline {
                     u.formatted_read_record = None;
                     u.formatted_read_cursor = 0;
                 } else {
