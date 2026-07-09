@@ -10,6 +10,8 @@
 //! - * in I/O statements → unit 5 (read) or 6 (write)
 
 use std::collections::{HashMap, VecDeque};
+#[cfg(unix)]
+use std::ffi::c_void;
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -17,6 +19,12 @@ use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 use std::sync::Mutex;
+
+#[cfg(unix)]
+extern "C" {
+    #[link_name = "read"]
+    fn libc_read(fd: i32, buf: *mut c_void, count: usize) -> isize;
+}
 
 // ---- Global I/O state ----
 
@@ -179,6 +187,10 @@ struct Unit {
     formatted_read_record: Option<Vec<u8>>,
     /// Cursor within a cached formatted input record for ADVANCE='NO' reads.
     formatted_read_cursor: usize,
+    /// True after a non-advancing stdin read returned bytes without seeing
+    /// a newline. If the next stdin read hits EOF, report EOR once for that
+    /// open record before reporting END.
+    stdin_nonadvancing_open_record: bool,
     /// True for STATUS='SCRATCH' units: backing file is deleted on close or exit.
     scratch: bool,
     /// Connection-level LEADING_ZERO= mode (F2023). Seeds the format
@@ -419,6 +431,7 @@ impl IoState {
                 read_tokens: VecDeque::new(),
                 formatted_read_record: None,
                 formatted_read_cursor: 0,
+                stdin_nonadvancing_open_record: false,
                 scratch: false,
                 leading_zero: LeadingZeroMode::Default,
                 pending_record: None,
@@ -439,6 +452,7 @@ impl IoState {
                 read_tokens: VecDeque::new(),
                 formatted_read_record: None,
                 formatted_read_cursor: 0,
+                stdin_nonadvancing_open_record: false,
                 scratch: false,
                 leading_zero: LeadingZeroMode::Default,
                 pending_record: None,
@@ -459,6 +473,7 @@ impl IoState {
                 read_tokens: VecDeque::new(),
                 formatted_read_record: None,
                 formatted_read_cursor: 0,
+                stdin_nonadvancing_open_record: false,
                 scratch: false,
                 leading_zero: LeadingZeroMode::Default,
                 pending_record: None,
@@ -795,6 +810,7 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
                     read_tokens: VecDeque::new(),
                     formatted_read_record: None,
                     formatted_read_cursor: 0,
+                    stdin_nonadvancing_open_record: false,
                     scratch: is_scratch,
                     leading_zero: leading_zero_mode,
                     pending_record: None,
@@ -4747,6 +4763,37 @@ fn trim_record_newline(mut line: Vec<u8>) -> Vec<u8> {
     line
 }
 
+fn nonadvancing_stdin_read_len(descs: &[FormatDesc], dest_len: i64) -> usize {
+    for desc in descs {
+        if let FormatDesc::Character { width } = desc {
+            return width.unwrap_or_else(|| dest_len.max(1) as usize).max(1);
+        }
+    }
+    dest_len.max(1) as usize
+}
+
+#[cfg(unix)]
+fn read_stdin_unbuffered(buf: &mut [u8]) -> io::Result<usize> {
+    let n = unsafe { libc_read(0, buf.as_mut_ptr().cast::<c_void>(), buf.len()) };
+    if n < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(n as usize)
+    }
+}
+
+#[cfg(not(unix))]
+fn read_stdin_unbuffered(buf: &mut [u8]) -> io::Result<usize> {
+    io::stdin().read(buf)
+}
+
+fn read_stdin_nonadvancing_chunk(descs: &[FormatDesc], dest_len: i64) -> io::Result<Vec<u8>> {
+    let mut buf = vec![0u8; nonadvancing_stdin_read_len(descs, dest_len)];
+    let n = read_stdin_unbuffered(&mut buf)?;
+    buf.truncate(n);
+    Ok(buf)
+}
+
 fn formatted_read_record_for_unit(unit: i32, data_index: i64) -> Result<Vec<u8>, i32> {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     let Some(u) = state.get_unit(unit) else {
@@ -4941,14 +4988,32 @@ pub extern "C" fn afs_fmt_read_string_noadvance(
         return;
     };
 
+    let mut stdin_chunk_without_newline = false;
     if u.formatted_read_record.is_none() {
-        match u.read_line_bytes() {
+        let from_stdin = matches!(u.stream, UnitStream::Stdin);
+        let read_result = if from_stdin {
+            read_stdin_nonadvancing_chunk(&descs, dest_len)
+        } else {
+            u.read_line_bytes()
+        };
+        match read_result {
             Ok(line) if !line.is_empty() => {
+                stdin_chunk_without_newline =
+                    from_stdin && !line.iter().any(|&b| matches!(b, b'\n' | b'\r'));
+                if from_stdin {
+                    u.stdin_nonadvancing_open_record = stdin_chunk_without_newline;
+                }
                 u.formatted_read_record = Some(trim_record_newline(line));
                 u.formatted_read_cursor = 0;
             }
             Ok(_) => {
-                store_formatted_char_error(dest, dest_len, size_out, IOSTAT_END, iostat);
+                let code = if from_stdin && u.stdin_nonadvancing_open_record {
+                    u.stdin_nonadvancing_open_record = false;
+                    IOSTAT_EOR
+                } else {
+                    IOSTAT_END
+                };
+                store_formatted_char_error(dest, dest_len, size_out, code, iostat);
                 return;
             }
             Err(_) => {
@@ -4988,6 +5053,9 @@ pub extern "C" fn afs_fmt_read_string_noadvance(
                             *iostat = IOSTAT_EOR;
                         }
                     }
+                    u.formatted_read_record = None;
+                    u.formatted_read_cursor = 0;
+                } else if stdin_chunk_without_newline {
                     u.formatted_read_record = None;
                     u.formatted_read_cursor = 0;
                 } else {
