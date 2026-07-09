@@ -362,8 +362,8 @@ pub extern "C" fn afs_compare_char_trimmed(
     b: *const u8,
     b_len: i64,
 ) -> i32 {
-    let a_len = unsafe { len_trim_bytes(a, a_len) } as i64;
-    let b_len = unsafe { len_trim_bytes(b, b_len) } as i64;
+    // Fortran character comparison already blank-pads the shorter operand.
+    // Removing trailing blanks from either side cannot change the ordering.
     afs_compare_char(a, a_len, b, b_len)
 }
 
@@ -1026,6 +1026,26 @@ mod tests {
         );
         assert_eq!(
             afs_compare_char(b"abc".as_ptr(), 3, b"abc\0".as_ptr(), 4),
+            1
+        );
+    }
+
+    #[test]
+    fn compare_trimmed_matches_blank_padded_compare() {
+        assert_eq!(
+            afs_compare_char_trimmed(b"abc   ".as_ptr(), 6, b"abc".as_ptr(), 3),
+            0
+        );
+        assert_eq!(
+            afs_compare_char_trimmed(b"a b   ".as_ptr(), 6, b"a".as_ptr(), 1),
+            1
+        );
+        assert_eq!(
+            afs_compare_char_trimmed(b"a".as_ptr(), 1, b"a b   ".as_ptr(), 6),
+            -1
+        );
+        assert_eq!(
+            afs_compare_char_trimmed(b"ab9   ".as_ptr(), 6, b"ab1   ".as_ptr(), 6),
             1
         );
     }
