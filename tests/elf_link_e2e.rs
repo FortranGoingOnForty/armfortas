@@ -235,39 +235,49 @@ fn afs_ld_route_links_without_explicit_crt_dir() {
         return;
     };
     let src = programs_dir().join("hello.f90");
-    let out = std::env::temp_dir().join(format!("afs_elfe2e_afsld_{}", std::process::id()));
-    let r = Command::new(compiler())
-        .env_remove("AFS_CRT_DIR")
-        .env("AFS_LD_PATH", &afs_ld)
-        .arg(&src)
-        .arg("-o")
-        .arg(&out)
-        .output()
-        .expect("cannot run armfortas");
-    assert!(
-        r.status.success(),
-        "AFS_LD_PATH={} failed:\n{}",
-        afs_ld.display(),
-        String::from_utf8_lossy(&r.stderr)
-    );
-    let run = Command::new(&out).output().expect("cannot run binary");
-    assert!(run.status.success(), "AFS_LD binary exited nonzero");
-    assert!(String::from_utf8_lossy(&run.stdout).contains("Hello, World!"));
-
     let readelf =
         armfortas::testing::find_inspection_tool("AFS_READELF_BIN", &["llvm-readelf", "readelf"]);
-    let hdr = Command::new(&readelf)
-        .arg("-h")
-        .arg(&out)
-        .output()
-        .expect("cannot run readelf");
-    let text = String::from_utf8_lossy(&hdr.stdout);
-    assert!(
-        text.contains("EXEC"),
-        "afs-ld ELF route should use non-PIE ET_EXEC until PIE lands:\n{}",
-        text
-    );
-    let _ = std::fs::remove_file(&out);
+    let afs_ld_path = afs_ld.to_string_lossy().into_owned();
+    for (tag, env_name, env_value) in [
+        ("path", "AFS_LD_PATH", afs_ld_path.as_str()),
+        ("flag", "AFS_LD", "1"),
+    ] {
+        let out =
+            std::env::temp_dir().join(format!("afs_elfe2e_afsld_{}_{}", tag, std::process::id()));
+        let r = Command::new(compiler())
+            .env_remove("AFS_CRT_DIR")
+            .env_remove("AFS_LD")
+            .env_remove("AFS_LD_PATH")
+            .env(env_name, env_value)
+            .arg(&src)
+            .arg("-o")
+            .arg(&out)
+            .output()
+            .expect("cannot run armfortas");
+        assert!(
+            r.status.success(),
+            "{}={} failed:\n{}",
+            env_name,
+            env_value,
+            String::from_utf8_lossy(&r.stderr)
+        );
+        let run = Command::new(&out).output().expect("cannot run binary");
+        assert!(run.status.success(), "{env_name} binary exited nonzero");
+        assert!(String::from_utf8_lossy(&run.stdout).contains("Hello, World!"));
+
+        let hdr = Command::new(&readelf)
+            .arg("-h")
+            .arg(&out)
+            .output()
+            .expect("cannot run readelf");
+        let text = String::from_utf8_lossy(&hdr.stdout);
+        assert!(
+            text.contains("EXEC"),
+            "afs-ld ELF route should use non-PIE ET_EXEC until PIE lands:\n{}",
+            text
+        );
+        let _ = std::fs::remove_file(&out);
+    }
 }
 
 /// Out-of-scope link paths fail with diagnostics that name the sprint
@@ -280,11 +290,9 @@ fn out_of_scope_link_paths_diagnose_cleanly() {
     let src = programs_dir().join("hello.f90");
     let out = std::env::temp_dir().join(format!("afs_elfe2e_diag_{}", std::process::id()));
 
-    // x16 arc: AFS_LD routing is honored on ELF now. AFS_LD=1
-    // resolves the sibling afs-ld, which has no ELF support yet, so
-    // the failure comes from the substitute linker rejecting the
-    // input — not from a guard. AFS_LD_PATH at a real GNU ld must
-    // link successfully through the routed contract.
+    // AFS_LD routing is honored on ELF now: a missing substitute linker
+    // must be reported as a tool lookup failure, not hidden behind an
+    // ELF path guard.
     let r = Command::new(compiler())
         .env("AFS_LD_PATH", "/nonexistent/afs-ld")
         .arg(&src)
