@@ -14212,6 +14212,17 @@ pub(super) fn actual_expr_rank(
                             _ => None,
                         });
                 }
+                if key == "cshift" || key == "eoshift" {
+                    return reorder_args_by_keyword_slots(args, &key, st)
+                        .first()
+                        .and_then(|slot| slot.as_ref())
+                        .and_then(|arg| match &arg.value {
+                            crate::ast::expr::SectionSubscript::Element(source_expr) => {
+                                actual_expr_rank(source_expr, locals, st, type_layouts)
+                            }
+                            _ => None,
+                        });
+                }
                 if key == "shape" {
                     return Some(1);
                 }
@@ -16888,7 +16899,7 @@ pub(super) fn array_expr_elem_type_only(
                 // emit IR side-effects per probe).
                 let lname = name.to_ascii_lowercase();
                 match lname.as_str() {
-                    "reshape" | "transpose" => {
+                    "reshape" | "transpose" | "cshift" | "eoshift" => {
                         if let Some(arg) = args.first() {
                             if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
                                 return array_expr_elem_type_only(locals, e, st, type_layouts);
@@ -18668,6 +18679,8 @@ pub(super) fn intrinsic_subroutine_arg_order(callee_key: &str) -> Option<&'stati
         "maxloc" | "minloc" => Some(&["array", "dim", "mask", "kind", "back"]),
         "spread" => Some(&["source", "dim", "ncopies"]),
         "unpack" => Some(&["vector", "mask", "field"]),
+        "cshift" => Some(&["array", "shift", "dim"]),
+        "eoshift" => Some(&["array", "shift", "boundary", "dim"]),
         _ => None,
     }
 }
@@ -28580,7 +28593,7 @@ pub(super) fn transformational_intrinsic_call_descriptor(
     };
     if !matches!(
         name.to_ascii_lowercase().as_str(),
-        "pack" | "reshape" | "transpose" | "matmul" | "spread" | "unpack"
+        "pack" | "reshape" | "transpose" | "matmul" | "spread" | "unpack" | "cshift" | "eoshift"
     ) {
         return None;
     }
@@ -28606,6 +28619,8 @@ fn constructor_intrinsic_materializes_array(name: &str) -> bool {
             | "matmul"
             | "spread"
             | "unpack"
+            | "cshift"
+            | "eoshift"
             | "shape"
             | "transfer"
             | "norm2"
@@ -30487,6 +30502,49 @@ pub(super) fn lower_write_items(
     lower_write_items_adv(b, ctx, items, unit, true);
 }
 
+fn array_desc_elem_is_fixed_char(elem_ty: &IrType) -> bool {
+    matches!(
+        elem_ty,
+        IrType::Array(inner, _) if matches!(inner.as_ref(), IrType::Int(IntWidth::I8))
+    )
+}
+
+fn lower_write_char_array_desc_loop(b: &mut FuncBuilder, desc: ValueId, unit: ValueId) {
+    let n = b.call(
+        FuncRef::External("afs_array_size".into()),
+        vec![desc],
+        IrType::Int(IntWidth::I64),
+    );
+    let elem_len = descriptor_elem_size(b, desc);
+    let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let zero = b.const_i64(0);
+    b.store(zero, i_addr);
+    let bb_check = b.create_block("write_char_arr_expr_check");
+    let bb_body = b.create_block("write_char_arr_expr_body");
+    let bb_exit = b.create_block("write_char_arr_expr_exit");
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let i = b.load(i_addr);
+    let done = b.icmp(CmpOp::Ge, i, n);
+    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+    b.set_block(bb_body);
+    let i_val = b.load(i_addr);
+    let elem_ptr = rank1_desc_element_byte_ptr(b, desc, i_val, elem_len);
+    b.call(
+        FuncRef::External("afs_write_string".into()),
+        vec![unit, elem_ptr, elem_len],
+        IrType::Void,
+    );
+    let one = b.const_i64(1);
+    let next = b.iadd(i_val, one);
+    b.store(next, i_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
+}
+
 pub(super) fn lower_write_items_adv(
     b: &mut FuncBuilder,
     ctx: &mut LowerCtx,
@@ -30675,6 +30733,32 @@ pub(super) fn lower_write_items_adv(
                             }
                         }
                     }
+                }
+            }
+        }
+
+        if is_char
+            && matches!(
+                item.node,
+                Expr::BinaryOp { .. }
+                    | Expr::UnaryOp { .. }
+                    | Expr::ParenExpr { .. }
+                    | Expr::FunctionCall { .. }
+            )
+        {
+            if let Some((desc, elem_ty)) = lower_array_expr_descriptor(
+                b,
+                &ctx.locals,
+                item,
+                ctx.st,
+                Some(ctx.type_layouts),
+                Some(ctx.internal_funcs),
+                Some(ctx.contained_host_refs),
+                Some(ctx.descriptor_params),
+            ) {
+                if array_desc_elem_is_fixed_char(&elem_ty) {
+                    lower_write_char_array_desc_loop(b, desc, unit);
+                    continue;
                 }
             }
         }
@@ -32889,18 +32973,17 @@ pub(super) fn lower_fmt_push(
         }
     }
 
-    // Non-character array expressions: descriptor-materializing
-    // expressions are walked by descriptor. Character arrays produced
-    // by simple local names/sections have already been handled above.
-    if !is_char
-        && matches!(
-            item.node,
-            Expr::BinaryOp { .. }
-                | Expr::UnaryOp { .. }
-                | Expr::ParenExpr { .. }
-                | Expr::FunctionCall { .. }
-        )
-    {
+    // Descriptor-materializing array expressions are walked by descriptor.
+    // Character arrays produced by simple local names/sections have already
+    // been handled above; character function-call results need this path so
+    // fixed-length elements are pushed as strings, not loaded as [i8 x len].
+    if matches!(
+        item.node,
+        Expr::BinaryOp { .. }
+            | Expr::UnaryOp { .. }
+            | Expr::ParenExpr { .. }
+            | Expr::FunctionCall { .. }
+    ) {
         if let Some((desc, elem_ty)) = lower_array_expr_descriptor(
             b,
             &ctx.locals,
@@ -33911,6 +33994,7 @@ fn fmt_push_alloc_section_nd(
 /// transpose, …) and arithmetic on array operands inside formatted I/O.
 fn fmt_push_array_desc_loop(b: &mut FuncBuilder, desc: ValueId, elem_ty: &IrType) {
     let is_complex_elem = is_complex_ty(elem_ty);
+    let is_char_elem = array_desc_elem_is_fixed_char(elem_ty);
     let complex_lane_f64 = is_complex_elem && complex_float_width(elem_ty) == FloatWidth::F64;
 
     let n = b.call(
@@ -33931,7 +34015,15 @@ fn fmt_push_array_desc_loop(b: &mut FuncBuilder, desc: ValueId, elem_ty: &IrType
     b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
     b.set_block(bb_body);
     let i_val = b.load(i_addr);
-    if is_complex_elem {
+    if is_char_elem {
+        let elem_len = descriptor_elem_size(b, desc);
+        let elem_ptr = rank1_desc_element_byte_ptr(b, desc, i_val, elem_len);
+        b.call(
+            FuncRef::External("afs_fmt_push_string".into()),
+            vec![elem_ptr, elem_len],
+            IrType::Void,
+        );
+    } else if is_complex_elem {
         let elem_size = b.const_i64(ir_scalar_byte_size(elem_ty, b.layout));
         let elem_ptr = rank1_desc_element_byte_ptr(b, desc, i_val, elem_size);
         fmt_push_emit_complex(b, complex_lane_f64, elem_ptr);
@@ -37581,7 +37673,9 @@ pub(super) fn is_array_reducing_intrinsic(name: &str) -> bool {
 pub(super) fn is_whole_array_transformational_call(name: &str) -> bool {
     matches!(
         name.to_lowercase().as_str(),
-        "transpose" | "matmul" | "reshape" | "shape" | "pack" | "spread" | "unpack" | "diag"
+        "transpose" | "matmul" | "reshape" | "shape" | "pack" | "spread" | "unpack"
+            | "cshift" | "eoshift"
+            | "diag"
     )
 }
 
@@ -41133,6 +41227,207 @@ pub(super) fn lower_scalar_spread_array_expr_descriptor(
     Some((result_desc, elem_ty))
 }
 
+pub(super) fn lower_rank1_shift_array_expr_descriptor(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    args: &[crate::ast::expr::Argument],
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+    circular: bool,
+) -> Option<(ValueId, IrType)> {
+    let intrinsic = if circular { "cshift" } else { "eoshift" };
+    let arg_slots = reorder_args_by_keyword_slots(args, intrinsic, st);
+    let array_arg = arg_slots.first().and_then(|slot| slot.as_ref())?;
+    let shift_arg = arg_slots.get(1).and_then(|slot| slot.as_ref())?;
+    let boundary_arg = (!circular)
+        .then(|| arg_slots.get(2).and_then(|slot| slot.as_ref()))
+        .flatten();
+    let dim_arg = arg_slots
+        .get(if circular { 2 } else { 3 })
+        .and_then(|slot| slot.as_ref());
+
+    let crate::ast::expr::SectionSubscript::Element(array_expr) = &array_arg.value else {
+        return None;
+    };
+    let crate::ast::expr::SectionSubscript::Element(shift_expr) = &shift_arg.value else {
+        return None;
+    };
+    if let Some(arg) = dim_arg {
+        let crate::ast::expr::SectionSubscript::Element(dim_expr) = &arg.value else {
+            return None;
+        };
+        if eval_const_int(dim_expr) != Some(1) {
+            return None;
+        }
+    }
+    if actual_expr_rank(array_expr, locals, st, type_layouts)? != 1 {
+        return None;
+    }
+
+    let (source_desc, elem_ty) = lower_array_expr_descriptor(
+        b,
+        locals,
+        array_expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    )?;
+    let result_desc = allocate_like_array_temp_descriptor(b, source_desc);
+    let elem_size = descriptor_elem_size(b, source_desc);
+    let n = b.call(
+        FuncRef::External("afs_array_size".into()),
+        vec![source_desc],
+        IrType::Int(IntWidth::I64),
+    );
+    let zero64 = b.const_i64(0);
+    let one64 = b.const_i64(1);
+    let shift_raw = super::expr::lower_expr_full(
+        b,
+        locals,
+        shift_expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    );
+    let shift = widen_idx_to_i64(b, shift_raw);
+    let source_ti = operator_expr_type_info(array_expr, Some(locals), st, type_layouts);
+    let char_elements = matches!(
+        source_ti,
+        Some(crate::sema::symtab::TypeInfo::Character { .. })
+    );
+
+    let boundary_scalar_ptr = if !circular && !char_elements {
+        let slot = b.alloca(elem_ty.clone());
+        let value = if let Some(arg) = boundary_arg {
+            let crate::ast::expr::SectionSubscript::Element(boundary_expr) = &arg.value else {
+                return None;
+            };
+            let raw = super::expr::lower_expr_full(
+                b,
+                locals,
+                boundary_expr,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
+            coerce_to_type(b, raw, &elem_ty)
+        } else {
+            zero_value_for_ir_type(b, &elem_ty)
+        };
+        b.store(value, slot);
+        Some(slot)
+    } else {
+        None
+    };
+    let boundary_char = if !circular && char_elements {
+        if let Some(arg) = boundary_arg {
+            let crate::ast::expr::SectionSubscript::Element(boundary_expr) = &arg.value else {
+                return None;
+            };
+            let (ptr, len) = lower_string_expr_full(
+                b,
+                locals,
+                boundary_expr,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
+            Some((ptr, len))
+        } else {
+            let null = b.int_to_ptr(zero64, IrType::Int(IntWidth::I8));
+            Some((null, zero64))
+        }
+    } else {
+        None
+    };
+
+    let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+    b.store(zero64, i_addr);
+    let bb_check = b.create_block("array_shift_check");
+    let bb_body = b.create_block("array_shift_body");
+    let bb_exit = b.create_block("array_shift_exit");
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let i = b.load(i_addr);
+    let done = b.icmp(CmpOp::Ge, i, n);
+    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+    b.set_block(bb_body);
+    let i_val = b.load(i_addr);
+    let dest_ptr = rank1_desc_element_byte_ptr(b, result_desc, i_val, elem_size);
+    if circular {
+        let rem = b.imod(shift, n);
+        let rem_neg = b.icmp(CmpOp::Lt, rem, zero64);
+        let rem_plus_n = b.iadd(rem, n);
+        let norm_shift = b.select(rem_neg, rem_plus_n, rem);
+        let shifted = b.iadd(i_val, norm_shift);
+        let src_i = b.imod(shifted, n);
+        let src_ptr = rank1_desc_element_byte_ptr(b, source_desc, src_i, elem_size);
+        b.call(
+            FuncRef::External("memcpy".into()),
+            vec![dest_ptr, src_ptr, elem_size],
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        );
+    } else {
+        let src_i = b.iadd(i_val, shift);
+        let below = b.icmp(CmpOp::Lt, src_i, zero64);
+        let past = b.icmp(CmpOp::Ge, src_i, n);
+        let out_of_range = b.or(below, past);
+        let bb_copy = b.create_block("array_eoshift_copy");
+        let bb_boundary = b.create_block("array_eoshift_boundary");
+        let bb_join = b.create_block("array_eoshift_join");
+        b.cond_branch(out_of_range, bb_boundary, vec![], bb_copy, vec![]);
+
+        b.set_block(bb_copy);
+        let src_ptr = rank1_desc_element_byte_ptr(b, source_desc, src_i, elem_size);
+        b.call(
+            FuncRef::External("memcpy".into()),
+            vec![dest_ptr, src_ptr, elem_size],
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        );
+        b.branch(bb_join, vec![]);
+
+        b.set_block(bb_boundary);
+        if let Some((ptr, len)) = boundary_char {
+            b.call(
+                FuncRef::External("afs_assign_char_fixed".into()),
+                vec![dest_ptr, elem_size, ptr, len],
+                IrType::Void,
+            );
+        } else if let Some(boundary_ptr) = boundary_scalar_ptr {
+            b.call(
+                FuncRef::External("memcpy".into()),
+                vec![dest_ptr, boundary_ptr, elem_size],
+                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+            );
+        } else {
+            return None;
+        }
+        b.branch(bb_join, vec![]);
+
+        b.set_block(bb_join);
+    }
+    let next = b.iadd(i_val, one64);
+    b.store(next, i_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
+    deallocate_array_expr_descriptor_if_temp(b, locals, array_expr, st, source_desc);
+    Some((result_desc, elem_ty))
+}
+
 pub(super) fn array_function_result_elem_type(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -44546,6 +44841,21 @@ pub(super) fn lower_array_expr_descriptor(
                         return Some(result);
                     }
                 }
+                if name.eq_ignore_ascii_case("cshift") || name.eq_ignore_ascii_case("eoshift") {
+                    if let Some(result) = lower_rank1_shift_array_expr_descriptor(
+                        b,
+                        locals,
+                        args,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
+                        name.eq_ignore_ascii_case("cshift"),
+                    ) {
+                        return Some(result);
+                    }
+                }
                 if name.eq_ignore_ascii_case("reshape") {
                     return lower_reshape_array_expr_descriptor(
                         b,
@@ -45447,7 +45757,10 @@ pub(super) fn expr_returns_array(
                         return true;
                     }
                 }
-                if matches!(key.as_str(), "pack" | "spread" | "unpack") {
+                if matches!(
+                    key.as_str(),
+                    "pack" | "spread" | "unpack" | "cshift" | "eoshift"
+                ) {
                     return true;
                 }
                 if matches!(
@@ -48919,6 +49232,8 @@ fn array_arg_elem_ty<'a>(
                         | "reshape"
                         | "pack"
                         | "spread"
+                        | "cshift"
+                        | "eoshift"
                         | "merge"
                         | "conjg"
                         | "matmul"

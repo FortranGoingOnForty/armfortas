@@ -4166,11 +4166,12 @@ fn intrinsic_arity(name: &str) -> Option<(usize, Option<usize>)> {
         "atan" | "atand" | "atanpi" | "aint" | "anint" | "nint" | "int" | "real"
         | "logical" | "char" | "ichar" | "achar" | "iachar" | "len" | "len_trim"
         | "floor" | "ceiling" | "maskl" | "maskr" | "shape" | "storage_size"
-        | "associated" | "any" | "all" | "norm2" | "f_c_string" => (1, Some(2)),
+        | "associated" | "any" | "all" | "norm2" | "f_c_string" | "iall" | "iany"
+        | "iparity" | "parity" => (1, Some(2)),
         "cmplx" | "size" | "lbound" | "ubound" | "sum" | "product" | "maxval"
         | "minval" | "count" | "selected_real_kind" => (1, Some(3)),
-        "ishftc" | "pack" | "transfer" | "c_f_strpointer" => (2, Some(3)),
-        "index" | "scan" | "verify" | "reshape" => (2, Some(4)),
+        "ishftc" | "pack" | "transfer" | "c_f_strpointer" | "cshift" => (2, Some(3)),
+        "index" | "scan" | "verify" | "reshape" | "eoshift" => (2, Some(4)),
         "null" => (0, Some(1)),
         "mvbits" => (5, Some(5)),
         "max" | "min" | "max0" | "min0" | "max1" | "min1" | "amax0" | "amin0"
@@ -4216,6 +4217,10 @@ fn intrinsic_is_subroutine(name: &str) -> bool {
     )
 }
 
+fn intrinsic_not_implemented(name: &str) -> bool {
+    matches!(name, "iall" | "iany" | "iparity" | "parity")
+}
+
 /// Reject a reference to an intrinsic with the wrong form (subroutine
 /// in function position or vice versa) or an argument count outside
 /// the standard's bounds (`atan2(1.0)` used to compile silently and
@@ -4248,6 +4253,13 @@ pub(super) fn check_intrinsic_call_arity(
                 "intrinsic '{}' is a function; reference it in an expression, not a CALL",
                 key
             ),
+        );
+        return;
+    }
+    if intrinsic_not_implemented(&key) {
+        ctx.error(
+            span,
+            format!("intrinsic '{}' is recognized but not implemented", key),
         );
         return;
     }
@@ -4290,8 +4302,9 @@ pub fn is_intrinsic_name(name: &str) -> bool {
         "index" | "scan" | "verify" | "repeat" | "lge" | "lgt" | "lle" | "llt" |
         "kind" | "selected_int_kind" | "selected_real_kind" | "selected_char_kind" |
         "size" | "shape" | "rank" | "lbound" | "ubound" | "allocated" | "associated" |
-        "present" | "same_type_as" | "merge" | "pack" | "unpack" | "spread" | "reshape" |
+        "present" | "same_type_as" | "merge" | "pack" | "unpack" | "spread" | "reshape" | "cshift" | "eoshift" |
         "sum" | "product" | "maxval" | "minval" | "maxloc" | "minloc" | "findloc" | "count" | "any" | "all" |
+        "iall" | "iany" | "iparity" | "parity" |
         "ieee_support_inf" | "ieee_support_nan" | "ieee_support_subnormal" |
         "ieee_support_divide" | "ieee_support_sqrt" | "ieee_support_io" |
         "ieee_support_rounding" | "ieee_support_flag" | "ieee_support_halting" |

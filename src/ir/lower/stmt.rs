@@ -2114,6 +2114,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                         | "shape"
                                                         | "pack"
                                                         | "spread"
+                                                        | "cshift"
+                                                        | "eoshift"
                                                         | "transfer"
                                                         // cmplx(re, im, kind) over real
                                                         // arrays: lower_array_expr_descriptor
