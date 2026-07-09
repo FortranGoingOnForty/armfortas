@@ -33509,6 +33509,7 @@ fn fmt_push_whole_array(
     span: crate::lexer::Span,
 ) {
     let base = array_base_addr(b, info);
+    let desc = local_uses_array_descriptor(info).then(|| array_descriptor_addr(b, info));
 
     let char_fixed_len: Option<i64> = match info.char_kind {
         CharKind::Fixed(n) => Some(n),
@@ -33546,8 +33547,12 @@ fn fmt_push_whole_array(
     b.set_block(bb_body);
     let i_val = b.load(i_addr);
     let elem_bytes_v = array_elem_size_value(b, info);
-    let byte_off = b.imul(i_val, elem_bytes_v);
-    let p = b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
+    let p = if let Some(desc) = desc {
+        desc_element_byte_ptr_rank(b, desc, i_val, elem_bytes_v, local_declared_rank(info).max(1))
+    } else {
+        let byte_off = b.imul(i_val, elem_bytes_v);
+        b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8))
+    };
     if let Some(len) = char_fixed_len {
         fmt_push_emit_char_fixed(b, p, len);
     } else if is_complex_elem {
@@ -35913,6 +35918,7 @@ pub(super) fn lower_whole_array_write(
     span: crate::lexer::Span,
 ) {
     let base = array_base_addr(b, info);
+    let desc = local_uses_array_descriptor(info).then(|| array_descriptor_addr(b, info));
     // Fixed-length CHARACTER arrays must dispatch to afs_write_string
     // with (ptr, len). Without this, the element load was treated as a
     // packed-integer chunk and fed to afs_write_int — `print *, c` for
@@ -35973,8 +35979,12 @@ pub(super) fn lower_whole_array_write(
     b.set_block(bb_body);
     let i_val = b.load(i_addr);
     let elem_bytes_v = array_elem_size_value(b, info);
-    let byte_off = b.imul(i_val, elem_bytes_v);
-    let ptr = b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
+    let ptr = if let Some(desc) = desc {
+        desc_element_byte_ptr_rank(b, desc, i_val, elem_bytes_v, local_declared_rank(info).max(1))
+    } else {
+        let byte_off = b.imul(i_val, elem_bytes_v);
+        b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8))
+    };
     if let Some(len) = char_fixed_len {
         let len_v = b.const_i64(len);
         b.call(
@@ -41954,6 +41964,44 @@ pub(super) fn rank1_desc_element_byte_ptr(
     let stride = load_array_desc_i64_field(b, desc, 24 + 16);
     let logical_index = b.imul(index, stride);
     let byte_off = b.imul(logical_index, elem_size);
+    b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8))
+}
+
+pub(super) fn desc_element_byte_ptr_rank(
+    b: &mut FuncBuilder,
+    desc: ValueId,
+    index: ValueId,
+    elem_size: ValueId,
+    rank: usize,
+) -> ValueId {
+    if rank <= 1 {
+        return rank1_desc_element_byte_ptr(b, desc, index, elem_size);
+    }
+
+    let base = b.load_typed(desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    let one = b.const_i64(1);
+    let mut rem = index;
+    let mut byte_off = b.const_i64(0);
+
+    for k in 0..rank {
+        let dim_off = 24 + (k as i64) * 24;
+        let lo = load_array_desc_i64_field(b, desc, dim_off);
+        let up = load_array_desc_i64_field(b, desc, dim_off + 8);
+        let stride = load_array_desc_i64_field(b, desc, dim_off + 16);
+        let span = b.isub(up, lo);
+        let extent = b.iadd(span, one);
+        let coord = if k + 1 < rank {
+            let c = b.imod(rem, extent);
+            rem = b.idiv(rem, extent);
+            c
+        } else {
+            rem
+        };
+        let stride_elems = b.imul(coord, stride);
+        let stride_bytes = b.imul(stride_elems, elem_size);
+        byte_off = b.iadd(byte_off, stride_bytes);
+    }
+
     b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8))
 }
 

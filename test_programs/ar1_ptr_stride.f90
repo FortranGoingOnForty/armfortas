@@ -1,4 +1,6 @@
 ! CHECK: first=3 6 9 sum=18
+! CHECK: whole=3 6 9
+! CHECK: list= 3 6 9
 ! CHECK: after=1 2 3 4 5 100 7 8 9 10 11 12
 ! CHECK: neg=10 7 4 total=21
 ! CHECK: after_neg=1 2 3 333 5 100 7 8 9 10 11 12
@@ -27,6 +29,8 @@ program ar1_ptr_stride
   v = [(i, i = 1, 12)]
   q => v(3:9:3)
   print '(a,3(i0,1x),a,i0)', 'first=', q(1), q(2), q(3), 'sum=', sum(q)
+  print '(a,3(i0,1x))', 'whole=', q
+  print *, 'list=', q
   q(2) = 100
   print '(a,12(i0,1x))', 'after=', v
 
