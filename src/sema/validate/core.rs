@@ -3119,6 +3119,7 @@ fn derived_type_name_for_expr(
             .and_then(|sym| sym.type_info.as_ref())
             .and_then(derived_type_name_from_type_info),
         Expr::ParenExpr { inner } => derived_type_name_for_expr(ctx, inner),
+        Expr::FunctionCall { callee, .. } => derived_type_name_for_expr(ctx, callee),
         Expr::ComponentAccess { .. } => resolve_component_access_type(ctx, expr).ok().flatten(),
         _ => None,
     }
