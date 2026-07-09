@@ -54,6 +54,16 @@ fn class_star_intrinsic_source_tag_value(
     )
 }
 
+fn root_object_name(expr: &SpannedExpr) -> Option<String> {
+    match &expr.node {
+        Expr::Name { name } => Some(name.clone()),
+        Expr::FunctionCall { callee, .. } => root_object_name(callee),
+        Expr::ComponentAccess { base, .. } => root_object_name(base),
+        Expr::ParenExpr { inner } => root_object_name(inner),
+        _ => None,
+    }
+}
+
 fn emit_scalar_class_star_char_source_copy_on_success(
     b: &mut FuncBuilder,
     stat_addr: ValueId,
@@ -3285,7 +3295,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         ) {
                             if local_is_array_like(&info) && is_full_rank1_whole_slice(args) {
                                 let whole_view = descriptor_backed_whole_array_view(&info);
-                                lower_array_assign(b, ctx, "", &whole_view, value);
+                                let alias_name = root_object_name(callee);
+                                lower_array_assign(
+                                    b,
+                                    ctx,
+                                    alias_name.as_deref().unwrap_or(""),
+                                    &whole_view,
+                                    value,
+                                );
                                 return;
                             }
                             if local_is_array_like(&info)
@@ -3425,7 +3442,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         ctx.type_layouts,
                     ) {
                         if local_is_array_like(&info) {
-                            lower_array_assign(b, ctx, "", &info, value);
+                            let alias_name = root_object_name(base);
+                            lower_array_assign(
+                                b,
+                                ctx,
+                                alias_name.as_deref().unwrap_or(""),
+                                &info,
+                                value,
+                            );
                             return;
                         }
                     }

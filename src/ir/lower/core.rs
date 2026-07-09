@@ -47908,6 +47908,78 @@ fn try_lower_char_array_expr_assign(
     true
 }
 
+fn copy_array_result_to_descriptor_view(b: &mut FuncBuilder, info: &LocalInfo, src_desc: ValueId) {
+    let dest_desc = array_descriptor_addr(b, info);
+    let null_stat = b.const_i64(0);
+    b.call(
+        FuncRef::External("afs_copy_array_data_no_realloc".into()),
+        vec![dest_desc, src_desc, null_stat],
+        IrType::Void,
+    );
+}
+
+fn try_lower_alloc_return_call_into_descriptor_view(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    dest_info: &LocalInfo,
+    value: &crate::ast::expr::SpannedExpr,
+) -> bool {
+    if dest_info.allocatable || !local_uses_array_descriptor(dest_info) {
+        return false;
+    }
+    let Expr::FunctionCall {
+        callee,
+        args: call_args,
+    } = &value.node
+    else {
+        return false;
+    };
+    let Expr::Name { name: callee_name } = &callee.node else {
+        return false;
+    };
+    let callee_key = callee_name.to_lowercase();
+    let intrinsic_arg_vals: Vec<ValueId> = call_args
+        .iter()
+        .map(|arg| match &arg.value {
+            crate::ast::expr::SectionSubscript::Element(e) => generic_dispatch_probe_value(
+                b,
+                &ctx.locals,
+                e,
+                ctx.st,
+                Some(ctx.type_layouts),
+                Some(ctx.internal_funcs),
+                Some(ctx.contained_host_refs),
+                Some(ctx.descriptor_params),
+            ),
+            _ => b.const_i32(0),
+        })
+        .collect();
+    let resolved = resolve_generic_call_actuals(
+        ctx.st,
+        b,
+        Some(&ctx.locals),
+        &callee_key,
+        call_args,
+        &intrinsic_arg_vals,
+        Some(ctx.type_layouts),
+    );
+    let resolved_key = resolved
+        .as_ref()
+        .map(|candidate| candidate.name.to_lowercase())
+        .unwrap_or_else(|| callee_key.clone());
+    if !ctx.alloc_return_funcs.contains(&callee_key)
+        && !ctx.alloc_return_funcs.contains(&resolved_key)
+    {
+        return false;
+    }
+
+    let tmp_desc = zeroed_array_temp_descriptor(b);
+    lower_alloc_return_call_into_desc(b, ctx, tmp_desc, callee_name, call_args);
+    copy_array_result_to_descriptor_view(b, dest_info, tmp_desc);
+    deallocate_array_temp_descriptor(b, tmp_desc);
+    true
+}
+
 /// Lower whole-array assignment: a = b (element-wise copy) or a = scalar (broadcast).
 pub(super) fn lower_array_assign(
     b: &mut FuncBuilder,
@@ -48467,6 +48539,10 @@ pub(super) fn lower_array_assign(
                 }
             }
         }
+    }
+
+    if try_lower_alloc_return_call_into_descriptor_view(b, ctx, dest_info, value) {
+        return;
     }
 
     // a = [v0, v1, v2, ...] — element-wise store of an array
