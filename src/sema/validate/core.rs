@@ -1473,7 +1473,10 @@ fn validate_const_int_expr_tree(ctx: &mut Ctx<'_>, expr: &crate::ast::expr::Span
                 validate_const_int_ac_value(ctx, value);
             }
         }
-        Expr::ComponentAccess { base, .. } => validate_const_int_expr_tree(ctx, base),
+        Expr::ComponentAccess { base, .. } => {
+            validate_component_access(ctx, expr);
+            validate_const_int_expr_tree(ctx, base);
+        }
         Expr::ComplexLiteral { real, imag } => {
             validate_const_int_expr_tree(ctx, real);
             validate_const_int_expr_tree(ctx, imag);
@@ -3089,6 +3092,62 @@ fn validate_select_case_arms(ctx: &mut Ctx<'_>, stmt_span: Span, cases: &[CaseBl
 }
 
 // ---- Specific validation checks ----
+
+fn derived_type_name_from_type_info(info: &TypeInfo) -> Option<String> {
+    match info {
+        TypeInfo::Derived(name) | TypeInfo::Class(name) => Some(name.clone()),
+        _ => None,
+    }
+}
+
+fn derived_type_name_for_expr(
+    ctx: &Ctx<'_>,
+    expr: &crate::ast::expr::SpannedExpr,
+) -> Option<String> {
+    match &expr.node {
+        Expr::Name { name } => ctx
+            .lookup(name)
+            .and_then(|sym| sym.type_info.as_ref())
+            .and_then(derived_type_name_from_type_info),
+        Expr::ParenExpr { inner } => derived_type_name_for_expr(ctx, inner),
+        Expr::ComponentAccess { .. } => resolve_component_access_type(ctx, expr).ok().flatten(),
+        _ => None,
+    }
+}
+
+fn resolve_component_access_type(
+    ctx: &Ctx<'_>,
+    expr: &crate::ast::expr::SpannedExpr,
+) -> Result<Option<String>, (Span, String, String)> {
+    let Expr::ComponentAccess { base, component } = &expr.node else {
+        return Ok(None);
+    };
+    let Some(base_type) = derived_type_name_for_expr(ctx, base) else {
+        return Ok(None);
+    };
+    let Some(layouts) = ctx.type_layouts else {
+        return Ok(None);
+    };
+    let Some(layout) = layouts.get(&base_type) else {
+        return Ok(None);
+    };
+    let Some(field) = layout.field(component) else {
+        return Err((expr.span, component.clone(), base_type));
+    };
+    Ok(derived_type_name_from_type_info(&field.type_info))
+}
+
+fn validate_component_access(ctx: &mut Ctx<'_>, expr: &crate::ast::expr::SpannedExpr) {
+    if let Err((span, component, base_type)) = resolve_component_access_type(ctx, expr) {
+        ctx.error(
+            span,
+            format!(
+                "unknown component '{}' for derived type '{}'",
+                component, base_type
+            ),
+        );
+    }
+}
 
 /// Check that an assignment target is modifiable (not intent(in), not parameter).
 /// Handles component access (x%field) and array elements (a(i)) — the base
