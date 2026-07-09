@@ -5895,6 +5895,11 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
         }
 
         Stmt::Stop { code, .. } => {
+            enum StopCode {
+                Msg(ValueId, ValueId),
+                Int(ValueId),
+                None,
+            }
             let stop_code = if let Some(code_expr) = code {
                 let is_char = expr_is_character_expr(
                     b,
@@ -5904,48 +5909,61 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     Some(ctx.type_layouts),
                 ) || matches!(code_expr.node, Expr::StringLiteral { .. });
                 if is_char {
-                    None
+                    let (ptr, len) = lower_string_expr_ctx(b, ctx, code_expr);
+                    StopCode::Msg(ptr, len)
                 } else {
                     let val = super::expr::lower_expr_ctx(b, ctx, code_expr);
                     let val_ty = b
                         .func()
                         .value_type(val)
                         .unwrap_or(IrType::Int(IntWidth::I64));
-                    Some(match val_ty {
+                    StopCode::Int(match val_ty {
                         IrType::Int(IntWidth::I64) => val,
                         IrType::Int(_) => b.int_extend(val, IntWidth::I64, true),
                         _ => val,
                     })
                 }
             } else {
-                None
+                StopCode::None
             };
-            let skip = if matches!(
-                ctx.hidden_result_abi,
-                HiddenResultAbi::ArrayDescriptor | HiddenResultAbi::DerivedAggregate
-            ) {
-                Some(ValueId(0))
-            } else {
-                None
-            };
-            insert_implicit_dealloc(
-                b,
-                &ctx.locals,
-                &ctx.locals,
-                ctx.type_layouts,
-                ctx.st,
-                ctx.internal_funcs,
-                Some(ctx.contained_host_refs),
-                skip,
-            );
-            if let Some(widened) = stop_code {
-                b.call(
-                    FuncRef::External("afs_stop_int".into()),
-                    vec![widened],
-                    IrType::Void,
+            if !matches!(stop_code, StopCode::Msg(..)) {
+                let skip = if matches!(
+                    ctx.hidden_result_abi,
+                    HiddenResultAbi::ArrayDescriptor | HiddenResultAbi::DerivedAggregate
+                ) {
+                    Some(ValueId(0))
+                } else {
+                    None
+                };
+                insert_implicit_dealloc(
+                    b,
+                    &ctx.locals,
+                    &ctx.locals,
+                    ctx.type_layouts,
+                    ctx.st,
+                    ctx.internal_funcs,
+                    Some(ctx.contained_host_refs),
+                    skip,
                 );
-            } else {
-                b.runtime_call(RuntimeFunc::Stop, vec![], IrType::Void);
+            }
+            match stop_code {
+                StopCode::Msg(ptr, len) => {
+                    b.call(
+                        FuncRef::External("afs_stop_msg".into()),
+                        vec![ptr, len],
+                        IrType::Void,
+                    );
+                }
+                StopCode::Int(widened) => {
+                    b.call(
+                        FuncRef::External("afs_stop_int".into()),
+                        vec![widened],
+                        IrType::Void,
+                    );
+                }
+                StopCode::None => {
+                    b.runtime_call(RuntimeFunc::Stop, vec![], IrType::Void);
+                }
             }
             b.unreachable();
         }

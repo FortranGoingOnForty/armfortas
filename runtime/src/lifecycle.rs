@@ -55,6 +55,20 @@ pub extern "C" fn afs_stop_int(code: i64) {
     process::exit(exit_code);
 }
 
+/// Fortran `STOP "message"` (character stop-code).
+#[no_mangle]
+pub extern "C" fn afs_stop_msg(ptr: *const u8, len: i64) {
+    if !ptr.is_null() && len > 0 {
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+        let msg = String::from_utf8_lossy(bytes);
+        eprintln!("STOP {}", msg);
+    } else {
+        eprintln!("STOP");
+    }
+    afs_program_finalize();
+    process::exit(0);
+}
+
 /// Fortran ERROR STOP statement.
 #[no_mangle]
 pub extern "C" fn afs_error_stop() {
