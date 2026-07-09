@@ -23,6 +23,33 @@ Ladder (smallest dependency surface first):
 No divergences in state "observed but unclassified". (Empty so far —
 test-drive matched gfortran exactly.)
 
+## Audit remediation branch checkpoint
+
+Status as of 2026-07-09 on `ar-remediation`: the ordered AR sprint pass
+has been worked through `AR14.md`, which is the last sprint file in
+`.docs/sprints/`. There is no `AR15.md`, and there is no known unfixed AR
+target remaining on this branch after the current verification pass.
+
+Verification gates run during the closeout pass:
+
+- Full `test_programs_end_to_end*` at `-O0`, `-O1`, `-O2`, `-O3`, `-Os`,
+  and `-Ofast`: all six levels passed with the two existing XFAILs.
+- AR8-AR12 direct fixture/repro matrices across all six optimization
+  levels, including project reductions for character, I/O, sema, and
+  validation findings.
+- AR13 optimizer and determinism gates: unswitch and unroll unit tests,
+  plus the 8-run O2 assembly determinism sweep for the audit-shaped
+  modules.
+- AR14 driver/toolchain gates: mixed source/object invocation,
+  concurrent same-basename output temps, truncated `.amod` rejection,
+  `.amod` integrity header check, AFS_LD ELF e2e routing without manual
+  CRT flags, afs-ld archive/link tests, and afs-as `.space`/`\a`
+  differential tests.
+
+The repo-root `verify-*` directories and `verify-audit-scratch/**` are
+preserved intentionally for audit traceability until the branch PR lands
+and CI confirms the committed state.
+
 ## FIXED ledger ancestry rule
 
 As of 2026-07-09, a `FIXED` ledger entry must point at landed history.
