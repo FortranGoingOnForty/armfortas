@@ -968,6 +968,34 @@ fn emit_procedure(
     let is_bind_c = sym.attrs.binding_label.is_some();
     let declared_descriptor_params = descriptor_params.get(&name.to_lowercase());
     let declared_char_len_star_params = char_len_star_params.get(&name_lc);
+    let hidden_char_len_args: Vec<String> = proc_scope
+        .map(|pscope| {
+            pscope
+                .arg_order
+                .iter()
+                .enumerate()
+                .filter_map(|(arg_idx, arg_name)| {
+                    let arg_sym = pscope.symbols.get(&arg_name.to_lowercase())?;
+                    let is_assumed_len = declared_char_len_star_params
+                        .and_then(|flags| flags.get(arg_idx).copied())
+                        .unwrap_or({
+                            matches!(
+                                arg_sym.type_info,
+                                Some(TypeInfo::Character { len: None, .. })
+                            ) && !arg_sym.attrs.allocatable
+                                && !is_bind_c
+                        });
+                    is_assumed_len.then(|| arg_name.clone())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    writeln!(
+        out,
+        "  @abi cc=aapcs64 hidden_char_lens={}",
+        hidden_char_len_args.len()
+    )
+    .unwrap();
 
     if let Some(pscope) = proc_scope {
         for (arg_idx, arg_name) in pscope.arg_order.iter().enumerate() {
@@ -1068,23 +1096,8 @@ fn emit_procedure(
     // TypeInfo cannot distinguish `len=*` from `len=:` once sema has lowered
     // both to `len: None`; this matters for allocatable assumed-length
     // character-array dummies.
-    if let Some(pscope) = proc_scope {
-        for (arg_idx, arg_name) in pscope.arg_order.iter().enumerate() {
-            if let Some(arg_sym) = pscope.symbols.get(&arg_name.to_lowercase()) {
-                let is_assumed_len = declared_char_len_star_params
-                    .and_then(|flags| flags.get(arg_idx).copied())
-                    .unwrap_or({
-                        matches!(
-                            arg_sym.type_info,
-                            Some(TypeInfo::Character { len: None, .. })
-                        ) && !arg_sym.attrs.allocatable
-                            && !is_bind_c
-                    });
-                if is_assumed_len {
-                    writeln!(out, "  @arg {}@len : integer(8)", arg_name).unwrap();
-                }
-            }
-        }
+    for arg_name in &hidden_char_len_args {
+        writeln!(out, "  @arg {}@len : integer(8)", arg_name).unwrap();
     }
 
     // @hint line.

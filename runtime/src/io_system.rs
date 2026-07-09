@@ -5171,8 +5171,8 @@ pub extern "C" fn afs_fmt_read_string_noadvance(
 
     let mut terminal_chunk_without_newline = false;
     if u.formatted_read_record.is_none() {
-        let from_terminal = u.is_terminal();
-        let read_result = if from_terminal {
+        let bounded_nonadvancing = matches!(&u.stream, UnitStream::Stdin) || u.is_terminal();
+        let read_result = if bounded_nonadvancing {
             read_nonadvancing_chunk(u, &descs, dest_len)
         } else {
             u.read_line_bytes()
@@ -5180,15 +5180,15 @@ pub extern "C" fn afs_fmt_read_string_noadvance(
         match read_result {
             Ok(line) if !line.is_empty() => {
                 terminal_chunk_without_newline =
-                    from_terminal && !line.iter().any(|&b| matches!(b, b'\n' | b'\r'));
-                if from_terminal {
+                    bounded_nonadvancing && !line.iter().any(|&b| matches!(b, b'\n' | b'\r'));
+                if bounded_nonadvancing {
                     u.terminal_nonadvancing_open_record = terminal_chunk_without_newline;
                 }
                 u.formatted_read_record = Some(trim_record_newline(line));
                 u.formatted_read_cursor = 0;
             }
             Ok(_) => {
-                let code = if from_terminal && u.terminal_nonadvancing_open_record {
+                let code = if bounded_nonadvancing && u.terminal_nonadvancing_open_record {
                     u.terminal_nonadvancing_open_record = false;
                     IOSTAT_EOR
                 } else {

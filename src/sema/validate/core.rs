@@ -3125,6 +3125,29 @@ fn derived_type_name_for_expr(
     }
 }
 
+fn layout_component_type_info(
+    layout: &crate::sema::type_layout::TypeLayout,
+    component: &str,
+    layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+) -> Option<TypeInfo> {
+    if let Some(field) = layout.field(component) {
+        return Some(field.type_info.clone());
+    }
+
+    let mut parent = layout.parent.as_deref();
+    while let Some(parent_name) = parent {
+        let parent_layout = layouts.get(parent_name)?;
+        if parent_name.eq_ignore_ascii_case(component)
+            || parent_layout.name.eq_ignore_ascii_case(component)
+        {
+            return Some(TypeInfo::Derived(parent_layout.name.clone()));
+        }
+        parent = parent_layout.parent.as_deref();
+    }
+
+    None
+}
+
 fn resolve_component_access_type(
     ctx: &Ctx<'_>,
     expr: &crate::ast::expr::SpannedExpr,
@@ -3141,13 +3164,13 @@ fn resolve_component_access_type(
     let Some(layout) = layouts.get(&base_type) else {
         return Ok(None);
     };
-    let Some(field) = layout.field(component) else {
+    let Some(type_info) = layout_component_type_info(layout, component, layouts) else {
         if layout.bound_proc(component).is_some() {
             return Ok(None);
         }
         return Err((expr.span, component.clone(), base_type));
     };
-    Ok(derived_type_name_from_type_info(&field.type_info))
+    Ok(derived_type_name_from_type_info(&type_info))
 }
 
 fn validate_component_access(ctx: &mut Ctx<'_>, expr: &crate::ast::expr::SpannedExpr) {

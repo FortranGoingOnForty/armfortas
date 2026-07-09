@@ -31235,63 +31235,68 @@ pub(super) fn internal_io_alloc_target(
 /// two render identically.
 fn internal_write_item_is_char(ctx: &LowerCtx, item: &crate::ast::expr::SpannedExpr) -> bool {
     match &item.node {
-            Expr::Name { name } => ctx
-                .locals
-                .get(&name.to_lowercase())
-                .map(|i| i.char_kind != CharKind::None)
-                .unwrap_or(false),
-            Expr::FunctionCall { callee, args } => {
-                if let Expr::Name { name } = &callee.node {
+        Expr::StringLiteral { .. } => true,
+        Expr::ParenExpr { inner } => internal_write_item_is_char(ctx, inner),
+        Expr::ConditionalExpr { .. } => matches!(
+            operator_expr_type_info(item, Some(&ctx.locals), ctx.st, Some(ctx.type_layouts)),
+            Some(crate::sema::symtab::TypeInfo::Character { .. })
+        ),
+        Expr::Name { name } => ctx
+            .locals
+            .get(&name.to_lowercase())
+            .map(|i| i.char_kind != CharKind::None)
+            .unwrap_or(false),
+        Expr::FunctionCall { callee, args } => {
+            if let Expr::Name { name } = &callee.node {
+                let key = name.to_lowercase();
+                matches!(
+                    key.as_str(),
+                    "trim"
+                        | "adjustl"
+                        | "adjustr"
+                        | "char"
+                        | "achar"
+                        | "compiler_version"
+                        | "compiler_options"
+                ) || ctx
+                    .locals
+                    .get(&key)
+                    .map(|i| {
+                        i.char_kind != CharKind::None
+                            && (i.dims.is_empty()
+                                || args.iter().all(|a| {
+                                    matches!(
+                                        a.value,
+                                        crate::ast::expr::SectionSubscript::Element(_)
+                                    )
+                                }))
+                    })
+                    .unwrap_or(false)
+            } else if let Expr::FunctionCall { callee: inner, .. } = &callee.node {
+                // Nested: arr(i)(lo:hi) — substring of char array element.
+                if let Expr::Name { name } = &inner.node {
                     let key = name.to_lowercase();
-                    matches!(
-                        key.as_str(),
-                        "trim"
-                            | "adjustl"
-                            | "adjustr"
-                            | "char"
-                            | "achar"
-                            | "compiler_version"
-                            | "compiler_options"
-                    ) || ctx
-                        .locals
+                    ctx.locals
                         .get(&key)
                         .map(|i| {
-                            i.char_kind != CharKind::None
-                                && (i.dims.is_empty()
-                                    || args.iter().all(|a| {
-                                        matches!(
-                                            a.value,
-                                            crate::ast::expr::SectionSubscript::Element(_)
-                                        )
-                                    }))
+                            i.char_kind != CharKind::None && (!i.dims.is_empty() || i.allocatable)
                         })
                         .unwrap_or(false)
-                } else if let Expr::FunctionCall { callee: inner, .. } = &callee.node {
-                    // Nested: arr(i)(lo:hi) — substring of char array element.
-                    if let Expr::Name { name } = &inner.node {
-                        let key = name.to_lowercase();
-                        ctx.locals
-                            .get(&key)
-                            .map(|i| {
-                                i.char_kind != CharKind::None
-                                    && (!i.dims.is_empty() || i.allocatable)
-                            })
-                            .unwrap_or(false)
-                            && args.iter().any(|a| {
-                                matches!(a.value, crate::ast::expr::SectionSubscript::Range { .. })
-                            })
-                    } else {
-                        false
-                    }
+                        && args.iter().any(|a| {
+                            matches!(a.value, crate::ast::expr::SectionSubscript::Range { .. })
+                        })
                 } else {
                     false
                 }
+            } else {
+                false
             }
-            Expr::BinaryOp {
-                op: BinaryOp::Concat,
-                ..
-            } => true,
-            _ => false,
+        }
+        Expr::BinaryOp {
+            op: BinaryOp::Concat,
+            ..
+        } => true,
+        _ => false,
     }
 }
 
@@ -53889,10 +53894,15 @@ pub(super) fn component_array_local_info(
     if !field_uses_array_descriptor(&field) {
         return None;
     }
+    let dims = if field.dims.is_empty() && field.declared_array {
+        vec![(1, 0)]
+    } else {
+        field.dims.clone()
+    };
     Some(LocalInfo {
         addr: field_ptr,
         ty: field_storage_ir_type(&field, tl),
-        dims: vec![],
+        dims,
         allocatable: true,
         descriptor_arg: false,
         by_ref: false,
@@ -54044,6 +54054,10 @@ pub(super) fn expr_is_character_expr(
     match &expr.node {
         Expr::StringLiteral { .. } => true,
         Expr::ParenExpr { inner } => expr_is_character_expr(b, locals, inner, st, type_layouts),
+        Expr::ConditionalExpr { .. } => matches!(
+            operator_expr_type_info(expr, Some(locals), st, type_layouts),
+            Some(crate::sema::symtab::TypeInfo::Character { .. })
+        ),
         Expr::BinaryOp { op, left, right } => {
             let left_ti = operator_expr_type_info(left, Some(locals), st, type_layouts);
             let right_ti = operator_expr_type_info(right, Some(locals), st, type_layouts);
