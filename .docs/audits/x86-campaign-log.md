@@ -62,12 +62,15 @@ follow-up checkpoint:
   adding hidden lengths to `bind(C)` character buffers.
 - Driver assertions that depended on list-directed spacing now compare
   fields instead of exact spacing.
+- Integer min/max vectorizer assertions now compare emitted values instead
+  of list-directed column padding.
 - Character conditional expressions in print/write item classification now
   route through string lowering; `conditional_2.f90` passes in the
   gfortran-dg fixture.
 
 Verification for the CI follow-up:
 
+- `cargo test -p armfortas --tests --release -- --nocapture`: passed.
 - `cargo test -p armfortas --test cli_driver`: 923 passed.
 - `cargo test -p armfortas-rt --lib`: 210 passed.
 - `cargo clippy --workspace --exclude bencch-core --exclude afs-tests -- -D warnings -A clippy::too_many_arguments`: passed.
