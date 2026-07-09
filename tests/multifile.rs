@@ -278,6 +278,65 @@ fn mixed_source_and_object_in_one_invocation() {
 }
 
 #[test]
+fn truncated_amod_is_rejected_loudly() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=truncated_amod_is_rejected_loudly count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let provider_f90 = dir.join("provider.f90");
+    let provider_o = dir.join("provider.o");
+    let consumer_f90 = dir.join("consumer.f90");
+    let consumer_o = dir.join("consumer.o");
+
+    std::fs::write(
+        &provider_f90,
+        "module provider\n  implicit none\n  integer, parameter :: answer = 41\nend module\n",
+    )
+    .unwrap();
+    compile_file(&compiler, &provider_f90, &provider_o, None);
+
+    let amod_path = dir.join("provider.amod");
+    let mut amod_text = std::fs::read_to_string(&amod_path).expect("missing provider.amod");
+    let truncate_at = amod_text
+        .find("@param answer")
+        .expect("provider.amod should contain answer parameter");
+    amod_text.truncate(truncate_at);
+    std::fs::write(&amod_path, amod_text).expect("cannot corrupt provider.amod");
+
+    std::fs::write(
+        &consumer_f90,
+        "program p\n  use provider\n  implicit none\n  print *, answer\nend program\n",
+    )
+    .unwrap();
+    let result = Command::new(&compiler)
+        .current_dir(&dir)
+        .arg(&consumer_f90)
+        .arg("-c")
+        .arg("-o")
+        .arg(&consumer_o)
+        .arg(format!("-I{}", dir.display()))
+        .output()
+        .expect("consumer compile failed to spawn");
+    assert!(
+        !result.status.success(),
+        "consumer unexpectedly accepted a corrupt .amod"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("corrupt .amod file"),
+        "expected corrupt .amod diagnostic, got:\n{}",
+        stderr
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn module_with_derived_type() {
     if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
         eprintln!(

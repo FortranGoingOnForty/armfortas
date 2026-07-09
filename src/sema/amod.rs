@@ -535,7 +535,7 @@ pub fn write_amod(
         emit_interface(&mut out, name, sym, scope);
     }
 
-    out
+    add_integrity_headers(out)
 }
 
 fn is_public(sym: &Symbol, scope: &Scope) -> bool {
@@ -1393,13 +1393,33 @@ fn type_info_to_string(info: Option<&TypeInfo>) -> String {
 }
 
 fn fnv1a_hex(content: &str) -> String {
-    // FNV-1a 64-bit hash for source content fingerprinting.
+    fnv1a_hex_bytes(content.as_bytes())
+}
+
+fn fnv1a_hex_bytes(content: &[u8]) -> String {
+    // FNV-1a 64-bit hash for source and .amod content fingerprinting.
     let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in content.bytes() {
+    for &byte in content {
         hash ^= byte as u64;
         hash = hash.wrapping_mul(0x100000001b3);
     }
     format!("{:016x}", hash)
+}
+
+fn add_integrity_headers(mut content: String) -> String {
+    let body_start = content
+        .find("\n\n")
+        .map(|idx| idx + 2)
+        .unwrap_or(content.len());
+    let body = &content[body_start..];
+    let integrity = format!(
+        "# content-length: {}\n# content-checksum: fnv1a:{}\n",
+        body.as_bytes().len(),
+        fnv1a_hex(body)
+    );
+    let insert_at = content.find('\n').map(|idx| idx + 1).unwrap_or(0);
+    content.insert_str(insert_at, &integrity);
+    content
 }
 
 fn compile_timestamp() -> String {
@@ -1587,6 +1607,7 @@ pub fn read_amod(path: &Path) -> Result<ModuleInterface, String> {
 
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
+    validate_amod_integrity(&content, path)?;
     let iface = parse_amod(&content, path)?;
 
     if let Some(stored) = mtime {
@@ -1597,6 +1618,78 @@ pub fn read_amod(path: &Path) -> Result<ModuleInterface, String> {
     }
 
     Ok(iface)
+}
+
+fn validate_amod_integrity(content: &str, path: &Path) -> Result<(), String> {
+    let magic = content
+        .lines()
+        .next()
+        .ok_or_else(|| format!("{}: empty .amod file", path.display()))?;
+    if !magic.starts_with("#!amod ") {
+        return Err(format!(
+            "{}: not an .amod file (missing #!amod magic)",
+            path.display()
+        ));
+    }
+
+    let body_start = content.find("\n\n").map(|idx| idx + 2).ok_or_else(|| {
+        format!(
+            "{}: corrupt .amod file (missing header terminator); rebuild the provider module",
+            path.display()
+        )
+    })?;
+    let header = &content[..body_start];
+    let body = &content[body_start..];
+
+    let mut expected_len: Option<usize> = None;
+    let mut expected_checksum: Option<&str> = None;
+    for line in header.lines() {
+        if let Some(value) = line.strip_prefix("# content-length: ") {
+            expected_len = Some(value.trim().parse::<usize>().map_err(|_| {
+                format!(
+                    "{}: corrupt .amod file (invalid content-length); rebuild the provider module",
+                    path.display()
+                )
+            })?);
+        } else if let Some(value) = line.strip_prefix("# content-checksum: fnv1a:") {
+            expected_checksum = Some(value.trim());
+        }
+    }
+
+    let expected_len = expected_len.ok_or_else(|| {
+        format!(
+            "{}: corrupt .amod file (missing content-length); rebuild the provider module",
+            path.display()
+        )
+    })?;
+    let expected_checksum = expected_checksum.ok_or_else(|| {
+        format!(
+            "{}: corrupt .amod file (missing content-checksum); rebuild the provider module",
+            path.display()
+        )
+    })?;
+
+    let actual_len = body.as_bytes().len();
+    if actual_len != expected_len {
+        return Err(format!(
+            "{}: corrupt .amod file (content length {}, expected {}); rebuild the provider module",
+            path.display(),
+            actual_len,
+            expected_len
+        ));
+    }
+
+    let actual_checksum = fnv1a_hex(body);
+    if actual_checksum != expected_checksum {
+        return Err(format!(
+            "{}: corrupt .amod file (content checksum {}, expected {}); rebuild the provider module",
+            path.display(),
+            actual_checksum,
+            expected_checksum
+        ));
+    }
+
+    Ok(())
 }
 
 /// Clear the per-thread amod cache. Tests use this to start fresh
@@ -2796,16 +2889,16 @@ mod tests {
         clear_amod_cache();
         let dir = std::env::temp_dir();
         let path = dir.join(format!("amod_cache_test_{}.amod", std::process::id()));
-        std::fs::write(
-            &path,
+        let text = add_integrity_headers(
             r#"#!amod 2
 # module: cache_test
 # source: cache_test.f90
 
 @param k : integer = 7
-"#,
-        )
-        .unwrap();
+"#
+            .to_string(),
+        );
+        std::fs::write(&path, text).unwrap();
 
         let _ = read_amod(&path).expect("first read");
         let hits_after_first = AMOD_CACHE_HITS.with(|h| *h.borrow());
@@ -2818,6 +2911,38 @@ mod tests {
         assert_eq!(
             hits_after_second, 1,
             "second read must hit the cache (no reparse)"
+        );
+    }
+
+    #[test]
+    fn read_amod_rejects_truncated_integrity_body() {
+        clear_amod_cache();
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("amod_truncated_test_{}.amod", std::process::id()));
+        let text = add_integrity_headers(
+            r#"#!amod 2
+# module: truncated_test
+# source: truncated_test.f90
+
+@param k : integer = 7
+@param answer : integer = 42
+"#
+            .to_string(),
+        )
+        .replace("@param answer : integer = 42\n", "");
+        std::fs::write(&path, text).unwrap();
+
+        let err = read_amod(&path).expect_err("truncated .amod must be rejected");
+
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            AMOD_CACHE_HITS.with(|h| *h.borrow()),
+            0,
+            "rejected .amod must not populate the cache"
+        );
+        assert!(
+            err.contains("corrupt .amod file") && err.contains("content length"),
+            "unexpected error: {err}"
         );
     }
 }

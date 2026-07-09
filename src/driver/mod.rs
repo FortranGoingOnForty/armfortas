@@ -12,6 +12,7 @@ pub mod elf_crt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use crate::ir::inst::{InstKind, Module, RuntimeFunc};
@@ -19,6 +20,8 @@ use crate::ir::{lower, printer as ir_printer, verify};
 use crate::lexer::{detect_source_form, tokenize, SourceForm};
 use crate::parser::Parser;
 use crate::sema::{resolve, validate};
+
+static NEXT_ATOMIC_WRITE_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Optimization level requested at the CLI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1251,7 +1254,10 @@ pub fn execute(opts: &Options) -> Result<(), String> {
         }
         (false, true) => {
             validate_link_only_inputs(opts)?;
-            let output = opts.output.clone().unwrap_or_else(|| PathBuf::from("a.out"));
+            let output = opts
+                .output
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("a.out"));
             link_inputs(&inputs, &output, opts)
         }
         // Mixed `foo.f90 bar.o libbaz.a -o prog`: gfortran/flang accept it:
@@ -1757,15 +1763,13 @@ pub fn compile(opts: &Options) -> Result<(), String> {
                         }
                     });
                 let amod_path = amod_dir.join(format!("{}.amod", mod_key));
-                fs::write(&amod_path, &amod_text)
-                    .map_err(|e| format!("cannot write '{}': {}", amod_path.display(), e))?;
+                write_module_file_atomic(&amod_path, &amod_text)?;
                 // `.amod` remains the ARMFORTAS module ABI file. A
                 // byte-identical `.mod` alias keeps conventional Fortran
                 // build systems such as CMake able to track module
                 // dependencies for unknown compilers.
                 let mod_path = amod_dir.join(format!("{}.mod", mod_key));
-                fs::write(&mod_path, &amod_text)
-                    .map_err(|e| format!("cannot write '{}': {}", mod_path.display(), e))?;
+                write_module_file_atomic(&mod_path, &amod_text)?;
                 if opts.verbose {
                     eprintln!(" amod: {}", amod_path.display());
                 }
@@ -1897,6 +1901,28 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     let _ = fs::remove_file(&obj_path);
 
     phases.report();
+    Ok(())
+}
+
+fn write_module_file_atomic(path: &Path, contents: &str) -> Result<(), String> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("module");
+    let id = NEXT_ATOMIC_WRITE_ID.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!(".{}.{}.{}.tmp", file_name, std::process::id(), id));
+
+    fs::write(&tmp, contents)
+        .map_err(|e| format!("cannot write temporary '{}': {}", tmp.display(), e))?;
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!(
+            "cannot replace '{}' atomically: {}",
+            path.display(),
+            e
+        ));
+    }
     Ok(())
 }
 
