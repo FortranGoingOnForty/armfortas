@@ -165,7 +165,9 @@ fn find_unswitch_candidate(
     lp: &crate::ir::walk::NaturalLoop,
     loop_defs: &HashSet<ValueId>,
 ) -> Option<UnswitchCandidate> {
-    for &bid in &lp.body {
+    let mut body: Vec<BlockId> = lp.body.iter().copied().collect();
+    body.sort_by_key(|bid| bid.0);
+    for bid in body {
         let block = func.block(bid);
         if let Some(Terminator::CondBranch {
             cond,
@@ -393,6 +395,62 @@ mod tests {
             matches!(&preheader.terminator, Some(Terminator::CondBranch { .. })),
             "preheader should now have a CondBranch: {:?}",
             preheader.terminator
+        );
+    }
+
+    #[test]
+    fn candidate_selection_uses_stable_block_order() {
+        let mut f = Function::new("test".into(), vec![], IrType::Void);
+        let header = f.create_block("header");
+        let low = f.create_block("low_candidate");
+        let high = f.create_block("high_candidate");
+        let low_t = f.create_block("low_t");
+        let low_f = f.create_block("low_f");
+        let high_t = f.create_block("high_t");
+        let high_f = f.create_block("high_f");
+
+        let flag_low = f.next_value_id();
+        f.register_type(flag_low, IrType::Bool);
+        f.block_mut(f.entry).insts.push(Inst {
+            id: flag_low,
+            ty: IrType::Bool,
+            span: span(),
+            kind: InstKind::ConstBool(true),
+        });
+        let flag_high = f.next_value_id();
+        f.register_type(flag_high, IrType::Bool);
+        f.block_mut(f.entry).insts.push(Inst {
+            id: flag_high,
+            ty: IrType::Bool,
+            span: span(),
+            kind: InstKind::ConstBool(false),
+        });
+
+        f.block_mut(low).terminator = Some(Terminator::CondBranch {
+            cond: flag_low,
+            true_dest: low_t,
+            true_args: vec![],
+            false_dest: low_f,
+            false_args: vec![],
+        });
+        f.block_mut(high).terminator = Some(Terminator::CondBranch {
+            cond: flag_high,
+            true_dest: high_t,
+            true_args: vec![],
+            false_dest: high_f,
+            false_args: vec![],
+        });
+
+        let lp = crate::ir::walk::NaturalLoop {
+            header,
+            body: HashSet::from([high, high_t, high_f, low, low_t, low_f, header]),
+            latches: vec![],
+        };
+        let candidate = find_unswitch_candidate(&f, &lp, &HashSet::new())
+            .expect("expected invariant candidate");
+        assert_eq!(
+            candidate.0, low,
+            "candidate search must not depend on HashSet iteration order"
         );
     }
 
