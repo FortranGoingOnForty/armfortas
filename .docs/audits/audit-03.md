@@ -24,6 +24,19 @@ cargo test --lib ir::
 The focused IR test run passed 108 tests with no failures. That passing result
 does not exercise the discrepancies below.
 
+## Severity summary
+
+| ID | Severity | Finding |
+|---|---|---|
+| A03-01 | Critical | Allocatable derived local is finalized after its storage is destroyed |
+| A03-02 | Critical | Rank-specific FINAL receives inline storage instead of a descriptor |
+| A03-03 | High | EXIT from a named ASSOCIATE construct is ignored |
+| A03-04 | High | GOTO leaving a BLOCK bypasses cleanup |
+| A03-05 | High | Ordinary derived locals leak allocatable components |
+| A03-06 | High | Deferred-length character function results are not released |
+| A03-07 | Medium | Imported LOGICAL(kind) arrays lose logical metadata |
+| A03-08 | Medium | Nondefault LOGICAL conditions violate the typed-IR contract |
+
 ## Confirmed discrepancies
 
 ### 1. Allocatable derived local is finalized after its components and allocation are destroyed
