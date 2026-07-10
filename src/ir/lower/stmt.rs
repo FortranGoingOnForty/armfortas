@@ -54,6 +54,24 @@ fn class_star_intrinsic_source_tag_value(
     )
 }
 
+fn class_star_descriptor_source(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx<'_>,
+    source_expr: &SpannedExpr,
+) -> ValueId {
+    lower_arg_descriptor_full(
+        b,
+        &ctx.locals,
+        source_expr,
+        ctx.st,
+        Some(ctx.type_layouts),
+        Some(ctx.internal_funcs),
+        Some(ctx.contained_host_refs),
+        Some(ctx.descriptor_params),
+        true,
+    )
+}
+
 fn root_object_name(expr: &SpannedExpr) -> Option<String> {
     match &expr.node {
         Expr::Name { name } => Some(name.clone()),
@@ -2238,47 +2256,21 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     }
                                     b.branch(done_bb, vec![]);
                                     b.set_block(done_bb);
-                                } else if info.is_class
+                                } else if is_unlimited_polymorphic_local(&info)
                                     && local_declared_rank(&info) == 0
                                     && ctx
                                         .st
                                         .find_symbol_any_scope(&key)
                                         .map(|s| s.attrs.allocatable)
                                         .unwrap_or(info.allocatable)
-                                    && matches!(value.node, Expr::ComponentAccess { .. })
                                 {
-                                    // Scalar polymorphic allocatable assign:
-                                    // `class(*), allocatable :: out; out = h%poly_field`
-                                    // — copy the 392-byte descriptor verbatim
-                                    // when the RHS is a polymorphic component
-                                    // access. This must run before the general
-                                    // allocatable branch below; otherwise scalar
-                                    // CLASS(*) dummies are mistaken for arrays
-                                    // and their payload is loaded through a
-                                    // bogus concrete element type.
                                     let dst = array_descriptor_addr(b, &info);
-                                    let src_desc_opt: Option<ValueId> =
-                                        resolve_component_field_access(
-                                            b,
-                                            &ctx.locals,
-                                            value,
-                                            ctx.st,
-                                            ctx.type_layouts,
-                                        )
-                                        .map(|(p, _)| p);
-                                    if let Some(src) = src_desc_opt {
-                                        let sz = b.const_i64(392);
-                                        b.call(
-                                            FuncRef::External("memcpy".into()),
-                                            vec![dst, src, sz],
-                                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                                        );
-                                    } else {
-                                        let val = super::expr::lower_expr_ctx_tl(b, ctx, value);
-                                        let coerced = coerce_to_type(b, val, &info.ty);
-                                        let ptr = b.load(info.addr);
-                                        b.store(coerced, ptr);
-                                    }
+                                    let src = class_star_descriptor_source(b, ctx, value);
+                                    b.call(
+                                        FuncRef::External("afs_assign_allocatable".into()),
+                                        vec![dst, src],
+                                        IrType::Void,
+                                    );
                                 } else if !info.dims.is_empty() || info.allocatable {
                                     if try_lower_elemental_array_assign(b, ctx, name, &info, value)
                                     {
@@ -2873,46 +2865,21 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                             IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
                                         );
                                     }
-                                } else if info.is_class
+                                } else if is_unlimited_polymorphic_local(&info)
                                     && info.dims.is_empty()
                                     && ctx
                                         .st
                                         .find_symbol_any_scope(&key)
                                         .map(|s| s.attrs.allocatable)
                                         .unwrap_or(false)
-                                    && matches!(value.node, Expr::ComponentAccess { .. })
                                 {
-                                    // Scalar polymorphic allocatable assign:
-                                    // `class(*), allocatable :: out; out = h%poly_field`
-                                    // — copy the 392-byte descriptor verbatim
-                                    // when the RHS is a polymorphic component
-                                    // access.  Avoids the scalar-store
-                                    // fallback that would truncate the source
-                                    // descriptor's payload to a single i32.
                                     let dst = array_descriptor_addr(b, &info);
-                                    let src_desc_opt: Option<ValueId> =
-                                        resolve_component_field_access(
-                                            b,
-                                            &ctx.locals,
-                                            value,
-                                            ctx.st,
-                                            ctx.type_layouts,
-                                        )
-                                        .map(|(p, _)| p);
-                                    if let Some(src) = src_desc_opt {
-                                        let sz = b.const_i64(392);
-                                        b.call(
-                                            FuncRef::External("memcpy".into()),
-                                            vec![dst, src, sz],
-                                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                                        );
-                                    } else {
-                                        // Fall through if we can't resolve.
-                                        let val = super::expr::lower_expr_ctx_tl(b, ctx, value);
-                                        let coerced = coerce_to_type(b, val, &info.ty);
-                                        let ptr = b.load(info.addr);
-                                        b.store(coerced, ptr);
-                                    }
+                                    let src = class_star_descriptor_source(b, ctx, value);
+                                    b.call(
+                                        FuncRef::External("afs_assign_allocatable".into()),
+                                        vec![dst, src],
+                                        IrType::Void,
+                                    );
                                 } else if info.by_ref {
                                     let val = super::expr::lower_expr_ctx_tl(b, ctx, value);
                                     let coerced = coerce_to_type(b, val, &info.ty);
@@ -3781,42 +3748,12 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 ) && field.allocatable
                                     && field.dims.is_empty()
                                 {
-                                    // Polymorphic component target:
-                                    // `derived%poly_field = expr` where
-                                    // `poly_field` is class(*), allocatable.
-                                    // Memcpy the source descriptor.  RHS is
-                                    // expected to be a polymorphic local or
-                                    // another class(*) component access.
-                                    let src_desc_opt: Option<ValueId> = match &value.node {
-                                        Expr::ComponentAccess { .. } => {
-                                            resolve_component_field_access(
-                                                b,
-                                                &ctx.locals,
-                                                value,
-                                                ctx.st,
-                                                ctx.type_layouts,
-                                            )
-                                            .map(|(p, _)| p)
-                                        }
-                                        Expr::Name { name } => ctx
-                                            .locals
-                                            .get(&name.to_lowercase())
-                                            .filter(|info| info.is_class && info.dims.is_empty())
-                                            .map(|info| array_descriptor_addr(b, info)),
-                                        _ => None,
-                                    };
-                                    if let Some(src) = src_desc_opt {
-                                        let sz = b.const_i64(392);
-                                        b.call(
-                                            FuncRef::External("memcpy".into()),
-                                            vec![field_ptr, src, sz],
-                                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                                        );
-                                    } else {
-                                        // Last-resort: skip the assignment
-                                        // rather than emit invalid IR.
-                                        // Better than truncating to i32.
-                                    }
+                                    let src = class_star_descriptor_source(b, ctx, value);
+                                    b.call(
+                                        FuncRef::External("afs_assign_allocatable".into()),
+                                        vec![field_ptr, src],
+                                        IrType::Void,
+                                    );
                                 } else if field.allocatable
                                     && !field.pointer
                                     && !field.declared_array

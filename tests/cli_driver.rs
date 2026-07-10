@@ -49703,6 +49703,43 @@ fn scalar_class_star_allocatable_component_assignment_copies_descriptor() {
 }
 
 #[test]
+fn class_star_assignment_boxes_concrete_scalar_expressions() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=class_star_assignment_boxes_concrete_scalar_expressions count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  type :: holder_t\n    class(*), allocatable :: value\n  end type\n  type(holder_t) :: holder\n  class(*), allocatable :: local\n  integer :: base\n  base = 40\n  holder%value = base + 2\n  select type (item => holder%value)\n  type is (integer)\n    if (item /= 42) error stop 1\n  class default\n    error stop 2\n  end select\n  local = base + 3\n  select type (item => local)\n  type is (integer)\n    if (item /= 43) error stop 3\n  class default\n    error stop 4\n  end select\n  local = 1.25\n  select type (item => local)\n  type is (real)\n    if (abs(item - 1.25) > 1.0e-6) error stop 5\n  class default\n    error stop 6\n  end select\n  deallocate(local)\n  deallocate(holder%value)\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("class_star_concrete_scalar_assign", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("concrete scalar class(*) assignment compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "concrete scalar class(*) assignment compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("concrete scalar class(*) assignment run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "concrete scalar class(*) assignment run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn optional_fixed_char_array_default_assign_uses_declared_len() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
