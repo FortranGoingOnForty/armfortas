@@ -26526,6 +26526,17 @@ pub(super) fn insert_implicit_dealloc(
             }
             if let Some(type_name) = &info.derived_type {
                 if let Some(layout) = type_layouts.get(type_name) {
+                    if finalize_owned_locals {
+                        finalize_derived_descriptor_storage_if_allocated(
+                            b,
+                            st,
+                            internal_funcs,
+                            contained_host_refs,
+                            closure_locals,
+                            info.addr,
+                            layout,
+                        );
+                    }
                     deallocate_derived_descriptor_components(
                         b,
                         info.addr,
@@ -26542,8 +26553,9 @@ pub(super) fn insert_implicit_dealloc(
             );
         }
         // Finalization: call FINAL procedures for locally-owned derived type variables.
-        // Skip by-ref params (they're owned by the caller, not the callee).
-        if finalize_owned_locals && !info.by_ref {
+        // Allocatable payloads were finalized above while their descriptor and
+        // components were still live. By-ref params remain caller-owned.
+        if finalize_owned_locals && !info.by_ref && !info.allocatable {
             if let Some(ref type_name) = info.derived_type {
                 if let Some(layout) = type_layouts.get(type_name) {
                     finalize_derived_storage(
