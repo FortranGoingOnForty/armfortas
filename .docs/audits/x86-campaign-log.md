@@ -70,6 +70,9 @@ follow-up checkpoint:
 - Character conditional expressions in print/write item classification now
   route through string lowering; `conditional_2.f90` passes in the
   gfortran-dg fixture.
+- `ar4_char_bytes.f90` remains active on ELF targets; macOS is
+  target-qualified XFAIL because Darwin rejects raw `0xe9` filename bytes
+  before runtime I/O begins.
 
 Verification for the CI follow-up:
 
