@@ -115,7 +115,8 @@ jobs:
       # test files; building all of them inside `cargo test` previously
       # consumed the bulk of the timed step on macos-latest.
       - run: cargo test -p armfortas --tests --release --no-run
-      - run: cargo test -p armfortas --tests --release -- --nocapture
+      - run: ci/run_logged.sh /tmp/tests.log cargo test -p armfortas --tests --release -- --nocapture
+      - run: ci/check_skips.sh /tmp/tests.log macos
 
   test-afs-as-unit:
     name: "Tests: afs-as unit"

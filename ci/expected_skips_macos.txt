@@ -3,5 +3,6 @@
 x86_emit_golden
 abi_differential
 x86_object_smoke
+x86_afs_as_differential
 elf_link_e2e
 elf_static_link
