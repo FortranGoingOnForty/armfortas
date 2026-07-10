@@ -21,28 +21,13 @@ const PROGRAMS: &[&str] = &[
 ];
 
 fn compiler() -> PathBuf {
-    for dir in ["target/debug", "../target/debug"] {
-        let p = Path::new(dir).join("armfortas");
-        if p.exists() {
-            return p;
-        }
-    }
-    panic!("armfortas binary not built — run cargo build first");
+    armfortas::testing::built_binary("armfortas")
+        .expect("armfortas binary not built for this test profile")
 }
 
-fn afs_ld() -> Option<PathBuf> {
-    for dir in [
-        "target/debug",
-        "../target/debug",
-        "target/release",
-        "../target/release",
-    ] {
-        let p = Path::new(dir).join("afs-ld");
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    None
+fn afs_ld() -> PathBuf {
+    armfortas::testing::built_binary("afs-ld")
+        .expect("afs-ld binary not built for this test profile")
 }
 
 fn programs_dir() -> PathBuf {
@@ -83,9 +68,11 @@ fn skip(test: &str, count: usize) -> bool {
     if host_can_link() {
         return false;
     }
-    eprintln!(
-        "\nHARNESS_SKIP suite=elf_link_e2e test={} count={} reason=\"needs an x86_64 ELF glibc or FreeBSD host with discoverable crt objects (musl: x11; NixOS: set AFS_CRT_DIR and LIBRARY_PATH)\"",
-        test, count
+    armfortas::testing::report_harness_skip(
+        "elf_link_e2e",
+        test,
+        count,
+        "needs an x86_64 ELF glibc or FreeBSD host with discoverable crt objects (musl: x11; NixOS: set AFS_CRT_DIR and LIBRARY_PATH)",
     );
     true
 }
@@ -230,10 +217,7 @@ fn afs_ld_route_links_without_explicit_crt_dir() {
         eprintln!("\nHARNESS_SKIP suite=elf_link_e2e test=afs_ld_route_links_without_explicit_crt_dir count=1 reason=\"needs an x86_64 ELF glibc or FreeBSD host with built-in crt discovery\"");
         return;
     }
-    let Some(afs_ld) = afs_ld() else {
-        eprintln!("\nHARNESS_SKIP suite=elf_link_e2e test=afs_ld_route_links_without_explicit_crt_dir count=1 reason=\"afs-ld binary not built\"");
-        return;
-    };
+    let afs_ld = afs_ld();
     let src = programs_dir().join("hello.f90");
     let readelf =
         armfortas::testing::find_inspection_tool("AFS_READELF_BIN", &["llvm-readelf", "readelf"]);

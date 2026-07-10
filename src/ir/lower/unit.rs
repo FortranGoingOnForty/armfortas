@@ -184,7 +184,13 @@ pub(crate) fn lower_unit(
                     ctx.st,
                     &ctx.ambiguous_use_warnings,
                 );
-                ctx.filtered_names = compute_filtered_names(globals, &combined_uses, decls, ctx.st, ctx.proc_scope_id);
+                ctx.filtered_names = compute_filtered_names(
+                    globals,
+                    &combined_uses,
+                    decls,
+                    ctx.st,
+                    ctx.proc_scope_id,
+                );
                 check_no_filtered_refs(body, &ctx.filtered_names);
                 collect_implicit_locals(&mut b, &mut ctx, body, UnitScope::Program(&fname));
                 super::init::init_decls(
@@ -697,7 +703,13 @@ pub(crate) fn lower_unit(
                     ctx.st,
                     &ctx.ambiguous_use_warnings,
                 );
-                ctx.filtered_names = compute_filtered_names(globals, &combined_uses, decls, ctx.st, ctx.proc_scope_id);
+                ctx.filtered_names = compute_filtered_names(
+                    globals,
+                    &combined_uses,
+                    decls,
+                    ctx.st,
+                    ctx.proc_scope_id,
+                );
                 check_no_filtered_refs(body, &ctx.filtered_names);
                 collect_implicit_locals(&mut b, &mut ctx, body, UnitScope::Subroutine(name));
                 super::init::init_decls(
@@ -1516,7 +1528,13 @@ pub(crate) fn lower_unit(
                     ctx.st,
                     &ctx.ambiguous_use_warnings,
                 );
-                ctx.filtered_names = compute_filtered_names(globals, &combined_uses, decls, ctx.st, ctx.proc_scope_id);
+                ctx.filtered_names = compute_filtered_names(
+                    globals,
+                    &combined_uses,
+                    decls,
+                    ctx.st,
+                    ctx.proc_scope_id,
+                );
                 check_no_filtered_refs(body, &ctx.filtered_names);
                 collect_implicit_locals(&mut b, &mut ctx, body, UnitScope::Function(name));
                 super::init::init_decls(

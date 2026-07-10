@@ -21,46 +21,33 @@ fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-fn binary(name: &str) -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os(format!("CARGO_BIN_EXE_{name}")) {
-        return Some(PathBuf::from(path));
-    }
-    let root = workspace_root();
-    for candidate in [
-        root.join("target/debug").join(name),
-        root.join("target/release").join(name),
-    ] {
-        if candidate.exists() {
-            return Some(fs::canonicalize(candidate).expect("canonicalize sibling binary path"));
-        }
-    }
-    None
+fn binary(name: &str) -> PathBuf {
+    armfortas::testing::built_binary(name)
+        .unwrap_or_else(|| panic!("{name} not built for this test profile"))
 }
 
-fn runtime_archive() -> Option<PathBuf> {
-    let root = workspace_root();
-    for candidate in [
-        root.join("target/debug/libarmfortas_rt.a"),
-        root.join("target/release/libarmfortas_rt.a"),
-    ] {
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-    None
+fn runtime_archive() -> PathBuf {
+    armfortas::testing::built_runtime_archive()
+        .expect("libarmfortas_rt.a not built for this test profile")
 }
 
-fn libsystem_tbd() -> Option<PathBuf> {
+fn libsystem_tbd() -> PathBuf {
     let output = Command::new("xcrun")
         .args(["--sdk", "macosx", "--show-sdk-path"])
         .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let sdk = String::from_utf8(output.stdout).ok()?;
+        .expect("run xcrun to locate the macOS SDK");
+    assert!(
+        output.status.success(),
+        "xcrun could not locate the macOS SDK"
+    );
+    let sdk = String::from_utf8(output.stdout).expect("xcrun output is utf-8");
     let path = PathBuf::from(sdk.trim()).join("usr/lib/libSystem.tbd");
-    path.exists().then_some(path)
+    assert!(
+        path.is_file(),
+        "libSystem.tbd missing at {}",
+        path.display()
+    );
+    path
 }
 
 fn run_command(cmd: &mut Command, context: &str) -> Output {
@@ -147,26 +134,11 @@ fn hello_world_runs_through_afs_as_and_afs_ld() {
         );
         return;
     }
-    let Some(armfortas) = binary("armfortas") else {
-        eprintln!("skipping: armfortas binary not built");
-        return;
-    };
-    let Some(afs_as) = binary("afs-as") else {
-        eprintln!("skipping: afs-as binary not built");
-        return;
-    };
-    let Some(afs_ld) = binary("afs-ld") else {
-        eprintln!("skipping: afs-ld binary not built");
-        return;
-    };
-    let Some(runtime) = runtime_archive() else {
-        eprintln!("skipping: libarmfortas_rt.a not built");
-        return;
-    };
-    let Some(libsystem) = libsystem_tbd() else {
-        eprintln!("skipping: libSystem.tbd not found");
-        return;
-    };
+    let armfortas = binary("armfortas");
+    let afs_as = binary("afs-as");
+    let afs_ld = binary("afs-ld");
+    let runtime = runtime_archive();
+    let libsystem = libsystem_tbd();
 
     let source = workspace_root().join("test_programs/hello.f90");
     assert!(source.exists(), "hello.f90 missing at {}", source.display());
@@ -250,26 +222,11 @@ fn hello_world_runs_through_driver_with_standalone_tool_overrides() {
         );
         return;
     }
-    let Some(armfortas) = binary("armfortas") else {
-        eprintln!("skipping: armfortas binary not built");
-        return;
-    };
-    let Some(afs_as) = binary("afs-as") else {
-        eprintln!("skipping: afs-as binary not built");
-        return;
-    };
-    let Some(afs_ld) = binary("afs-ld") else {
-        eprintln!("skipping: afs-ld binary not built");
-        return;
-    };
-    let Some(runtime) = runtime_archive() else {
-        eprintln!("skipping: libarmfortas_rt.a not built");
-        return;
-    };
-    let Some(libsystem) = libsystem_tbd() else {
-        eprintln!("skipping: libSystem.tbd not found");
-        return;
-    };
+    let armfortas = binary("armfortas");
+    let afs_as = binary("afs-as");
+    let afs_ld = binary("afs-ld");
+    let runtime = runtime_archive();
+    let libsystem = libsystem_tbd();
 
     let source = workspace_root().join("test_programs/hello.f90");
     assert!(source.exists(), "hello.f90 missing at {}", source.display());
@@ -328,26 +285,11 @@ fn hello_world_runs_through_driver_with_afs_ld_enable_flag() {
         );
         return;
     }
-    let Some(armfortas) = binary("armfortas") else {
-        eprintln!("skipping: armfortas binary not built");
-        return;
-    };
-    let Some(afs_as) = binary("afs-as") else {
-        eprintln!("skipping: afs-as binary not built");
-        return;
-    };
-    let Some(_afs_ld) = binary("afs-ld") else {
-        eprintln!("skipping: afs-ld binary not built");
-        return;
-    };
-    let Some(runtime) = runtime_archive() else {
-        eprintln!("skipping: libarmfortas_rt.a not built");
-        return;
-    };
-    let Some(libsystem) = libsystem_tbd() else {
-        eprintln!("skipping: libSystem.tbd not found");
-        return;
-    };
+    let armfortas = binary("armfortas");
+    let afs_as = binary("afs-as");
+    let _afs_ld = binary("afs-ld");
+    let runtime = runtime_archive();
+    let libsystem = libsystem_tbd();
 
     let source = workspace_root().join("test_programs/hello.f90");
     assert!(source.exists(), "hello.f90 missing at {}", source.display());
@@ -383,18 +325,9 @@ fn hello_world_keeps_apple_ld_path_with_afs_ld_zero() {
         );
         return;
     }
-    let Some(armfortas) = binary("armfortas") else {
-        eprintln!("skipping: armfortas binary not built");
-        return;
-    };
-    let Some(afs_as) = binary("afs-as") else {
-        eprintln!("skipping: afs-as binary not built");
-        return;
-    };
-    let Some(runtime) = runtime_archive() else {
-        eprintln!("skipping: libarmfortas_rt.a not built");
-        return;
-    };
+    let armfortas = binary("armfortas");
+    let afs_as = binary("afs-as");
+    let runtime = runtime_archive();
 
     let source = workspace_root().join("test_programs/hello.f90");
     assert!(source.exists(), "hello.f90 missing at {}", source.display());
@@ -426,26 +359,11 @@ fn shared_library_runs_through_driver_with_standalone_linker_override() {
         );
         return;
     }
-    let Some(armfortas) = binary("armfortas") else {
-        eprintln!("skipping: armfortas binary not built");
-        return;
-    };
-    let Some(afs_as) = binary("afs-as") else {
-        eprintln!("skipping: afs-as binary not built");
-        return;
-    };
-    let Some(afs_ld) = binary("afs-ld") else {
-        eprintln!("skipping: afs-ld binary not built");
-        return;
-    };
-    let Some(runtime) = runtime_archive() else {
-        eprintln!("skipping: libarmfortas_rt.a not built");
-        return;
-    };
-    let Some(libsystem) = libsystem_tbd() else {
-        eprintln!("skipping: libSystem.tbd not found");
-        return;
-    };
+    let armfortas = binary("armfortas");
+    let afs_as = binary("afs-as");
+    let afs_ld = binary("afs-ld");
+    let runtime = runtime_archive();
+    let libsystem = libsystem_tbd();
 
     let dir = unique_dir("driver_standalone_shared");
     let lib_src = dir.join("mylib.f90");
@@ -522,18 +440,9 @@ fn hello_world_compiles_to_object_with_standalone_assembler_override() {
         );
         return;
     }
-    let Some(armfortas) = binary("armfortas") else {
-        eprintln!("skipping: armfortas binary not built");
-        return;
-    };
-    let Some(afs_as) = binary("afs-as") else {
-        eprintln!("skipping: afs-as binary not built");
-        return;
-    };
-    let Some(afs_ld) = binary("afs-ld") else {
-        eprintln!("skipping: afs-ld binary not built");
-        return;
-    };
+    let armfortas = binary("armfortas");
+    let afs_as = binary("afs-as");
+    let afs_ld = binary("afs-ld");
 
     let source = workspace_root().join("test_programs/hello.f90");
     assert!(source.exists(), "hello.f90 missing at {}", source.display());
@@ -593,26 +502,11 @@ fn sprint18_program_matrix_runs_through_driver_standalone_overrides() {
         );
         return;
     }
-    let Some(armfortas) = binary("armfortas") else {
-        eprintln!("skipping: armfortas binary not built");
-        return;
-    };
-    let Some(afs_as) = binary("afs-as") else {
-        eprintln!("skipping: afs-as binary not built");
-        return;
-    };
-    let Some(afs_ld) = binary("afs-ld") else {
-        eprintln!("skipping: afs-ld binary not built");
-        return;
-    };
-    let Some(runtime) = runtime_archive() else {
-        eprintln!("skipping: libarmfortas_rt.a not built");
-        return;
-    };
-    let Some(libsystem) = libsystem_tbd() else {
-        eprintln!("skipping: libSystem.tbd not found");
-        return;
-    };
+    let armfortas = binary("armfortas");
+    let afs_as = binary("afs-as");
+    let afs_ld = binary("afs-ld");
+    let runtime = runtime_archive();
+    let libsystem = libsystem_tbd();
 
     let root = workspace_root();
 

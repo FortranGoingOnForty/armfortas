@@ -12,7 +12,7 @@
 # Usage: ci/check_isa_ceiling.sh [path-to-armfortas]
 set -eu
 
-afs="${1:-target/debug/armfortas}"
+afs="${1:-${CARGO_TARGET_DIR:-target}/debug/armfortas}"
 if [ ! -x "$afs" ]; then
     echo "check_isa_ceiling: compiler not found at $afs" >&2
     exit 2

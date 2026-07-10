@@ -1308,27 +1308,24 @@ mod tests {
         // would have TWO per arm.
         let f = &m.functions[0];
         let entry_block = f.block(f.entry);
-        match entry_block.terminator.as_ref().unwrap() {
-            Terminator::CondBranch {
-                true_args,
-                false_args,
-                ..
-            } => {
-                assert!(
-                    true_args.len() <= 1,
-                    "true_args double-appended: {:?}",
-                    true_args
-                );
-                assert!(
-                    false_args.len() <= 1,
-                    "false_args double-appended: {:?}",
-                    false_args
-                );
-            }
-            // mem2reg may have collapsed the cond_branch to a
-            // direct branch if the cond was constant; that's
-            // fine — verifier-clean is what we care about.
-            _ => {}
+        // mem2reg may have collapsed the conditional to a direct branch if
+        // the condition was constant; verifier-clean is what matters then.
+        if let Terminator::CondBranch {
+            true_args,
+            false_args,
+            ..
+        } = entry_block.terminator.as_ref().unwrap()
+        {
+            assert!(
+                true_args.len() <= 1,
+                "true_args double-appended: {:?}",
+                true_args
+            );
+            assert!(
+                false_args.len() <= 1,
+                "false_args double-appended: {:?}",
+                false_args
+            );
         }
     }
 

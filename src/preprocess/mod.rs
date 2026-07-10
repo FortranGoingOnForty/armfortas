@@ -1587,8 +1587,10 @@ mod tests {
     }
 
     fn pp_cpp(src: &str) -> String {
-        let mut config = PreprocConfig::default();
-        config.cpp_compat = true;
+        let config = PreprocConfig {
+            cpp_compat: true,
+            ..PreprocConfig::default()
+        };
         preprocess(src, &config).unwrap().text
     }
 
@@ -1798,6 +1800,8 @@ mod tests {
         // On macOS, should get "apple".
         #[cfg(target_os = "macos")]
         assert!(lines(&out).contains(&"apple"));
+        #[cfg(not(target_os = "macos"))]
+        assert!(lines(&out).contains(&"other"));
     }
 
     #[test]
@@ -1959,6 +1963,11 @@ end module
             assert!(out.contains("call macos_specific()"));
             assert!(!out.contains("call linux_specific()"));
         }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(!out.contains("call macos_specific()"));
+            assert!(out.contains("call linux_specific()"));
+        }
     }
 
     #[test]
@@ -2055,7 +2064,7 @@ end program
     // Arithmetic
     #[test]
     fn eval_addition() {
-        assert_eq!(eval_expr("3 + 4").unwrap(), true); // 7 != 0
+        assert!(eval_expr("3 + 4").unwrap()); // 7 != 0
         assert!(eval_expr("100 + 200 > 250").unwrap());
     }
 
@@ -2382,8 +2391,10 @@ deep
 
     #[test]
     fn fixed_form_comment_not_expanded() {
-        let mut config = PreprocConfig::default();
-        config.fixed_form = true;
+        let mut config = PreprocConfig {
+            fixed_form: true,
+            ..PreprocConfig::default()
+        };
         config.defines.insert("FOO".into(), MacroDef::object("BAR"));
         let result = preprocess("C     FOO is a comment\n      x = FOO\n", &config).unwrap();
         // C-line should not have FOO expanded.
@@ -2398,8 +2409,10 @@ deep
 
     #[test]
     fn fixed_form_star_comment() {
-        let mut config = PreprocConfig::default();
-        config.fixed_form = true;
+        let mut config = PreprocConfig {
+            fixed_form: true,
+            ..PreprocConfig::default()
+        };
         config.defines.insert("FOO".into(), MacroDef::object("BAR"));
         let result = preprocess("*     FOO is a comment\n", &config).unwrap();
         assert!(
@@ -2473,8 +2486,10 @@ deep
 
     #[test]
     fn file_macro() {
-        let mut config = PreprocConfig::default();
-        config.filename = "test.f90".into();
+        let config = PreprocConfig {
+            filename: "test.f90".into(),
+            ..PreprocConfig::default()
+        };
         let result = preprocess("x = __FILE__\n", &config).unwrap();
         assert!(
             result.text.contains("\"test.f90\""),

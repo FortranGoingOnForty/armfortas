@@ -1,5 +1,5 @@
 ! CHECK: char_bytes_ok
-! XFAIL(macos): Darwin rejects raw 0xe9 filename bytes before runtime I/O starts
+! XFAIL(macos): XFAIL-001 Darwin rejects raw 0xe9 filename bytes before runtime I/O starts
 ! REPRO_CHECK: run_same_sandbox
 program ar4_char_bytes
   implicit none

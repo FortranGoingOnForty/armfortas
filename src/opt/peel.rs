@@ -332,7 +332,6 @@ fn do_peel(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::inst::*;
     use crate::ir::types::{IntWidth, IrType};
     use crate::ir::verify::verify_module;
     use crate::lexer::{Position, Span};

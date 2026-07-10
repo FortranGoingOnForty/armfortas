@@ -13,13 +13,8 @@ struct CompileStats {
 }
 
 fn compiler() -> PathBuf {
-    option_env!("CARGO_BIN_EXE_armfortas")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-            p.push("target/debug/armfortas");
-            p
-        })
+    armfortas::testing::built_binary("armfortas")
+        .expect("armfortas binary not built for this test profile")
 }
 
 fn unique_dir(stem: &str, size: usize) -> PathBuf {

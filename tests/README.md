@@ -55,8 +55,8 @@ compiling anything and, on hosts without the native toolchain, print
 one machine-readable line per `#[test]` —
 `HARNESS_SKIP suite=<s> test=<t> count=<n> reason="..."` — with `count`
 computed from discovery, never a literal. `ci/check_skips.sh` gates CI
-on these lines: zero allowed on macOS, exactly the expected set on ELF
-hosts.
+on these lines: the closed platform-only set on macOS and exactly the
+expected set on ELF hosts. Missing, zero-count, or unexpected skips fail.
 
 That source comment language is meant to converge with `bencch`, not drift from
 it. (`! FLAGS:` and target qualifiers are not consumed by bencch yet —

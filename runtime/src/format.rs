@@ -1871,8 +1871,7 @@ mod tests {
 
     #[test]
     fn format_trailing_x_only_moves_position() {
-        let out =
-            FormatEngine::new(parse_format("(I0,1X)")).format_values(&[IoValue::Integer(5)]);
+        let out = FormatEngine::new(parse_format("(I0,1X)")).format_values(&[IoValue::Integer(5)]);
         assert_eq!(out, "5");
 
         let out = FormatEngine::new(parse_format("(I0,1X,I0)"))

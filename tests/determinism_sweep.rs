@@ -16,13 +16,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
 
 fn find_compiler() -> PathBuf {
-    for c in &["target/release/armfortas", "target/debug/armfortas"] {
-        let p = PathBuf::from(c);
-        if p.exists() {
-            return fs::canonicalize(&p).unwrap();
-        }
-    }
-    panic!("armfortas binary not found — run `cargo build` first");
+    armfortas::testing::built_binary("armfortas")
+        .expect("armfortas binary not built for this test profile")
 }
 
 fn find_test_programs() -> PathBuf {
@@ -79,7 +74,10 @@ fn should_skip(source_text: &str) -> bool {
         return true;
     }
     // Skip XFAIL tests (they have known failures).
-    if source_text.contains("! XFAIL:") {
+    if source_text
+        .lines()
+        .any(|line| line.trim_start().starts_with("! XFAIL"))
+    {
         return true;
     }
     false
@@ -91,12 +89,7 @@ fn assert_repeated_asm_identical(compiler: &Path, source: &Path, opt: &str, runs
         .unwrap_or_else(|| panic!("{} {} compile failed", source.display(), opt));
     for run in 2..=runs {
         let current = compile_to_asm(compiler, source, opt).unwrap_or_else(|| {
-            panic!(
-                "{} {} compile failed on run {}",
-                source.display(),
-                opt,
-                run
-            )
+            panic!("{} {} compile failed on run {}", source.display(), opt, run)
         });
         assert_eq!(
             baseline,

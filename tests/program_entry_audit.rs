@@ -28,7 +28,7 @@ fn capture_run(request: CaptureRequest) -> RunCapture {
     }
 }
 
-fn main_section<'a>(asm: &'a str) -> &'a str {
+fn main_section(asm: &str) -> &str {
     // ELF entry symbol is bare "main"; Mach-O keeps "_main".
     if cfg!(target_arch = "x86_64") {
         let start = asm

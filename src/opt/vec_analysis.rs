@@ -2161,7 +2161,8 @@ pub(crate) fn detect_reduction_plan(
             continue;
         };
         let dest = classify_array_access(func, dest_ptr, iv_param)?;
-        if !covers_full_array(&synthetic_shape, &dest) || lane_count_for(&dest.elem_ty) != Some(lanes)
+        if !covers_full_array(&synthetic_shape, &dest)
+            || lane_count_for(&dest.elem_ty) != Some(lanes)
         {
             return None;
         }
@@ -2175,10 +2176,7 @@ pub(crate) fn detect_reduction_plan(
             &loop_defs,
             isa,
         )?;
-        elementwise_stores.push(Statement {
-            op,
-            store: inst.id,
-        });
+        elementwise_stores.push(Statement { op, store: inst.id });
     }
 
     Some(ReductionPlan {

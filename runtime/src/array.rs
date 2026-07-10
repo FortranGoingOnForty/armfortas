@@ -3369,7 +3369,12 @@ pub extern "C" fn afs_array_all_logical(desc: *const ArrayDescriptor) -> i32 {
     }
 }
 
-fn array_logical_dim(src: *const ArrayDescriptor, dim: i32, dst: *mut ArrayDescriptor, is_all: bool) {
+fn array_logical_dim(
+    src: *const ArrayDescriptor,
+    dim: i32,
+    dst: *mut ArrayDescriptor,
+    is_all: bool,
+) {
     if src.is_null() || dst.is_null() || dim < 1 {
         return;
     }

@@ -43,14 +43,12 @@ fn function_sections(ir: &str) -> Vec<&str> {
         .collect()
 }
 
-fn function_name<'a>(func_section: &'a str) -> &'a str {
+fn function_name(func_section: &str) -> &str {
     let header = func_section.lines().next().expect("function header").trim();
     let rest = header
         .strip_prefix("func @")
         .expect("function header prefix");
-    let end = rest
-        .find(|ch: char| ch == ' ' || ch == '(')
-        .unwrap_or(rest.len());
+    let end = rest.find([' ', '(']).unwrap_or(rest.len());
     &rest[..end]
 }
 
@@ -206,7 +204,6 @@ fn o2_removes_dead_seed_store_across_noalias_call() {
     let raw_fill = function_section(&raw_ir, worker_name);
     let opt_fill = function_section(&opt_ir, worker_name);
     let raw_body = block_section(raw_fill, "do_body_");
-    let opt_body = block_section(opt_fill, "do_body_");
 
     assert!(
         raw_body.matches("store ").count() >= 2,

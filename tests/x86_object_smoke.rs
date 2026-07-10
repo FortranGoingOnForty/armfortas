@@ -21,13 +21,8 @@ const PROGRAMS: &[&str] = &[
 ];
 
 fn compiler() -> PathBuf {
-    for dir in ["target/debug", "../target/debug"] {
-        let p = Path::new(dir).join("armfortas");
-        if p.exists() {
-            return p;
-        }
-    }
-    panic!("armfortas binary not built — run cargo build first");
+    armfortas::testing::built_binary("armfortas")
+        .expect("armfortas binary not built for this test profile")
 }
 
 fn programs_dir() -> PathBuf {
@@ -48,9 +43,11 @@ fn skip(test: &str, count: usize) -> bool {
     if host_is_x86_elf() {
         return false;
     }
-    eprintln!(
-        "\nHARNESS_SKIP suite=x86_object_smoke test={} count={} reason=\"needs an x86_64 ELF host with system as\"",
-        test, count
+    armfortas::testing::report_harness_skip(
+        "x86_object_smoke",
+        test,
+        count,
+        "needs an x86_64 ELF host with system as",
     );
     true
 }

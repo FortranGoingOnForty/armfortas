@@ -27,7 +27,9 @@ fn capture_text(request: CaptureRequest, stage: Stage) -> String {
 
 fn stdout_has_fields(stdout: &str, expected: &[&str]) -> bool {
     let fields: Vec<_> = stdout.split_whitespace().collect();
-    fields.windows(expected.len()).any(|window| window == expected)
+    fields
+        .windows(expected.len())
+        .any(|window| window == expected)
 }
 
 #[test]

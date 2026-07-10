@@ -1021,11 +1021,11 @@ mod tests {
     #[test]
     fn compare_low_byte_tail_against_padding() {
         assert_eq!(
-            afs_compare_char(b"abc\0".as_ptr(), 4, b"abc".as_ptr(), 3),
+            afs_compare_char(c"abc".as_ptr().cast(), 4, b"abc".as_ptr(), 3),
             -1
         );
         assert_eq!(
-            afs_compare_char(b"abc".as_ptr(), 3, b"abc\0".as_ptr(), 4),
+            afs_compare_char(b"abc".as_ptr(), 3, c"abc".as_ptr().cast(), 4),
             1
         );
     }
@@ -1060,7 +1060,7 @@ mod tests {
         assert_eq!(afs_len_trim(b"hello".as_ptr(), -1), 0);
 
         let mut padded = b"hello".to_vec();
-        padded.extend(std::iter::repeat(b' ').take(257));
+        padded.extend(std::iter::repeat_n(b' ', 257));
         assert_eq!(afs_len_trim(padded.as_ptr(), padded.len() as i64), 5);
 
         let spaces = vec![b' '; 257];

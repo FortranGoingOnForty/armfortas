@@ -733,7 +733,7 @@ mod tests {
                 IrType::Float(FloatWidth::F64),
             ),
             (
-                InstKind::ConstFloat(3.14, FloatWidth::F64),
+                InstKind::ConstFloat(std::f64::consts::PI, FloatWidth::F64),
                 IrType::Float(FloatWidth::F64),
             ),
             (
@@ -744,7 +744,9 @@ mod tests {
         assert!(ConstFold.run(&mut m));
         let kinds = first_block_kinds(&m);
         match kinds[2] {
-            InstKind::ConstFloat(v, FloatWidth::F64) => assert!((v - 6.28).abs() < 1e-12),
+            InstKind::ConstFloat(v, FloatWidth::F64) => {
+                assert!((v - std::f64::consts::TAU).abs() < 1e-12)
+            }
             _ => panic!("expected ConstFloat"),
         }
     }

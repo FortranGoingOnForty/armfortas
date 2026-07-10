@@ -11,10 +11,10 @@
 //!
 //! ## XFAIL annotations
 //!
-//! A program may carry one or more `! XFAIL: <reason>` lines anywhere in
-//! the source. An XFAIL'd program is *expected* to fail at compile or
-//! runtime (or to mismatch its CHECKs) — it's tracking a known bug. The
-//! harness reports:
+//! A program may carry one or more `! XFAIL: XFAIL-NNN <reason>` lines
+//! anywhere in the source. `X64-O0-NNN` sweep findings are also accepted.
+//! An XFAIL'd program is *expected* to fail at compile or runtime (or to
+//! mismatch its CHECKs) — it's tracking a known bug. The harness reports:
 //!
 //!   * `XFAIL`  — the program failed as expected. Counted as a pass.
 //!   * `XPASS`  — the program unexpectedly succeeded. Counted as a
@@ -24,7 +24,7 @@
 //! XFAIL'd programs are how we capture audit findings as living
 //! regression tests *before* the underlying bug is fixed. Each finding
 //! gets a program in `test_programs/` whose annotation references the
-//! audit ID (`! XFAIL: audit BLOCKING-1 (implied-do negative step)`),
+//! tracked debt ID (`! XFAIL: XFAIL-001 implied-do negative step`),
 //! so a future audit can grep `test_programs/` for the finding ID and
 //! immediately see whether the bug class is covered.
 //!
@@ -193,7 +193,7 @@
 //! This keeps pipeline oracles from checking only "exists" when what we really
 //! need is "exists, stays clean, and stays deterministic".
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -358,37 +358,10 @@ fn extract_multifile_link(source: &str) -> Option<Vec<String>> {
     None
 }
 
-fn candidate_target_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        for ancestor in exe.ancestors() {
-            let Some(name) = ancestor.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            if matches!(name, "debug" | "release") {
-                dirs.push(ancestor.to_path_buf());
-                break;
-            }
-        }
-    }
-    for dir in ["target/release", "target/debug"] {
-        let candidate = PathBuf::from(dir);
-        if !dirs.iter().any(|existing| existing == &candidate) {
-            dirs.push(candidate);
-        }
-    }
-    dirs
-}
-
 /// Find the static runtime library.
 fn find_runtime() -> PathBuf {
-    for dir in candidate_target_dirs() {
-        let p = dir.join("libarmfortas_rt.a");
-        if p.exists() {
-            return p;
-        }
-    }
-    panic!("libarmfortas_rt.a not found — run `cargo build` first");
+    armfortas::testing::built_runtime_archive()
+        .expect("libarmfortas_rt.a not built for this test profile")
 }
 
 /// Get the macOS SDK path for linking. Only reachable behind the
@@ -536,14 +509,10 @@ fn extract_prefixed_checks(source: &str, prefix: &str) -> Vec<Check> {
         .enumerate()
         .filter_map(|(i, line)| {
             let trimmed = line.trim();
-            if let Some(rest) = trimmed.strip_prefix(prefix) {
-                Some(Check {
-                    line_num: i + 1,
-                    pattern: rest.trim().to_string(),
-                })
-            } else {
-                None
-            }
+            trimmed.strip_prefix(prefix).map(|rest| Check {
+                line_num: i + 1,
+                pattern: rest.trim().to_string(),
+            })
         })
         .collect()
 }
@@ -729,6 +698,19 @@ fn match_qualified_directive<'a>(
 /// lines. A qualified line whose selectors do not match the active
 /// target behaves as if absent (the program must pass), but its
 /// selector spelling is validated regardless.
+fn xfail_reference_ids(text: &str) -> BTreeSet<String> {
+    text.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-'))
+        .filter(|token| {
+            ["XFAIL-", "X64-O0-"].iter().any(|prefix| {
+                token.strip_prefix(prefix).is_some_and(|suffix| {
+                    suffix.len() >= 3 && suffix.bytes().all(|b| b.is_ascii_digit())
+                })
+            })
+        })
+        .map(str::to_string)
+        .collect()
+}
+
 fn extract_xfail(
     source: &str,
     filename: &str,
@@ -740,6 +722,13 @@ fn extract_xfail(
         if let Some((is_active, rest)) =
             match_qualified_directive(line, "XFAIL", active, Some(opt_flag), filename, i + 1)?
         {
+            if xfail_reference_ids(rest).is_empty() {
+                return Err(format!(
+                    "{}:{}: XFAIL reason must cite a durable XFAIL-NNN or X64-O0-NNN reference",
+                    filename,
+                    i + 1,
+                ));
+            }
             if is_active && first_active.is_none() {
                 first_active = Some(rest.trim().to_string());
             }
@@ -1332,14 +1321,12 @@ fn extract_shape_checks(source: &str, pos_prefix: &str, neg_prefix: &str) -> Vec
                     pattern: rest.trim().to_string(),
                     negative: false,
                 })
-            } else if let Some(rest) = trimmed.strip_prefix(neg_prefix) {
-                Some(ShapeCheck {
+            } else {
+                trimmed.strip_prefix(neg_prefix).map(|rest| ShapeCheck {
                     line_num: i + 1,
                     pattern: rest.trim().to_string(),
                     negative: true,
                 })
-            } else {
-                None
             }
         })
         .collect()
@@ -1873,15 +1860,8 @@ fn flexible_whitespace_match_at(text: &str, pattern: &str) -> bool {
 
 /// Find the armfortas binary.
 fn find_compiler() -> PathBuf {
-    for dir in candidate_target_dirs() {
-        let p = dir.join("armfortas");
-        if p.exists() {
-            return fs::canonicalize(&p).unwrap_or_else(|e| {
-                panic!("cannot canonicalize compiler path {}: {}", p.display(), e)
-            });
-        }
-    }
-    panic!("cannot find armfortas binary — run `cargo build` first");
+    armfortas::testing::built_binary("armfortas")
+        .expect("armfortas binary not built for this test profile")
 }
 
 /// Find the test_programs directory.
@@ -2678,12 +2658,12 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
 
         let stdout = &snapshot.stdout;
         let label = format!("{} [{}]", filename, opt_flag);
-        if let Err(e) = match_checks(&checks, &stdout, &label, "CHECK") {
+        if let Err(e) = match_checks(&checks, stdout, &label, "CHECK") {
             let _ = fs::remove_file(&binary);
             let _ = fs::remove_dir_all(&sandbox);
             return Err(e);
         }
-        if let Err(e) = match_checks(&stderr_checks, &stderr, &label, "STDERR_CHECK") {
+        if let Err(e) = match_checks(&stderr_checks, stderr, &label, "STDERR_CHECK") {
             let _ = fs::remove_file(&binary);
             let _ = fs::remove_dir_all(&sandbox);
             return Err(e);
@@ -3024,6 +3004,89 @@ fn test_programs_end_to_end_ofast() {
     }
 }
 
+fn find_audit_file(name: &str) -> PathBuf {
+    for dir in [".docs/audits", "../.docs/audits"] {
+        let path = Path::new(dir).join(name);
+        if path.is_file() {
+            return path;
+        }
+    }
+    panic!("{} not found in tracked audit documents", name);
+}
+
+#[test]
+fn xfail_annotations_reference_tracked_debt() {
+    let registry_path = find_audit_file("xfail-debt.md");
+    let registry = fs::read_to_string(&registry_path).expect("read XFAIL debt registry");
+    let registry_ids: BTreeSet<_> = xfail_reference_ids(&registry)
+        .into_iter()
+        .filter(|id| id.starts_with("XFAIL-"))
+        .collect();
+    assert!(!registry_ids.is_empty(), "XFAIL debt registry has no IDs");
+
+    let sweep_path = find_audit_file("x86_64-o0-sweep.md");
+    let sweep = fs::read_to_string(&sweep_path).expect("read x86 sweep log");
+    let sweep_ids: BTreeSet<_> = xfail_reference_ids(&sweep)
+        .into_iter()
+        .filter(|id| id.starts_with("X64-O0-"))
+        .collect();
+    let tracked_ids: BTreeSet<_> = registry_ids.union(&sweep_ids).cloned().collect();
+
+    let mut referenced_registry_ids = BTreeSet::new();
+    for source_dir in [find_test_programs(), find_gfortran_dg_fixtures()] {
+        for entry in fs::read_dir(&source_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+        {
+            let path = entry.path();
+            if !is_test_program_source(&path) {
+                continue;
+            }
+            let source = fs::read_to_string(&path).unwrap_or_default();
+            for (line_index, line) in source.lines().enumerate() {
+                let trimmed = line.trim();
+                if !trimmed.starts_with("! XFAIL:") && !trimmed.starts_with("! XFAIL(") {
+                    continue;
+                }
+                let ids = xfail_reference_ids(trimmed);
+                assert!(
+                    !ids.is_empty(),
+                    "{}:{}: XFAIL has no durable debt reference",
+                    path.display(),
+                    line_index + 1,
+                );
+                for id in ids {
+                    assert!(
+                        tracked_ids.contains(&id),
+                        "{}:{}: XFAIL references unknown debt ID {}",
+                        path.display(),
+                        line_index + 1,
+                        id,
+                    );
+                    if registry_ids.contains(&id) {
+                        referenced_registry_ids.insert(id);
+                    }
+                }
+            }
+        }
+    }
+
+    let fixed_registry_ids: BTreeSet<_> = registry
+        .lines()
+        .filter(|line| line.contains("[FIXED"))
+        .flat_map(xfail_reference_ids)
+        .collect();
+    let orphan_registry_ids: Vec<_> = registry_ids
+        .difference(&referenced_registry_ids)
+        .filter(|id| !fixed_registry_ids.contains(*id))
+        .collect();
+    assert!(
+        orphan_registry_ids.is_empty(),
+        "active XFAIL debt IDs have no annotation: {:?}",
+        orphan_registry_ids,
+    );
+}
+
 /// x07 DoD: every `XFAIL(x86_64*): X64-O0-NNN` annotation in
 /// test_programs/ must reference a finding ID present in the sweep
 /// log, and every finding ID in the log must still have at least one
@@ -3031,18 +3094,7 @@ fn test_programs_end_to_end_ofast() {
 /// only reads text.
 #[test]
 fn xfail_findings_cross_check() {
-    use std::collections::BTreeSet;
-    let log_path = {
-        let mut found = None;
-        for dir in [".docs/audits", "../.docs/audits"] {
-            let p = Path::new(dir).join("x86_64-o0-sweep.md");
-            if p.exists() {
-                found = Some(p);
-                break;
-            }
-        }
-        found.expect("x86_64-o0-sweep.md not found (tracked via .gitignore exception)")
-    };
+    let log_path = find_audit_file("x86_64-o0-sweep.md");
     let log = fs::read_to_string(&log_path).unwrap();
     let id_re = |text: &str| -> BTreeSet<String> {
         let mut out = BTreeSet::new();
@@ -3413,13 +3465,7 @@ fn match_checks_keeps_repeated_spaces_literal() {
         line_num: 1,
         pattern: "values  7".into(),
     }];
-    assert!(match_checks(
-        &checks,
-        " values           7\n",
-        "inline.f90 [O0]",
-        "CHECK",
-    )
-    .is_err());
+    assert!(match_checks(&checks, " values           7\n", "inline.f90 [O0]", "CHECK",).is_err());
     match_checks(&checks, " values  7\n", "inline.f90 [O0]", "CHECK").unwrap();
 }
 
@@ -5421,7 +5467,7 @@ fn flags_annotation_rejects_harness_owned_flags() {
 #[test]
 fn flags_annotation_rejects_multiple_lines() {
     let src = "! FLAGS: --std=f2023\n! FLAGS: -fbackslash\nprogram t\nend\n";
-    let err = extract_flags(src, "t.f90").err().expect("must reject");
+    let err = extract_flags(src, "t.f90").expect_err("must reject");
     assert!(err.contains("multiple FLAGS"), "got: {}", err);
 }
 
@@ -5602,16 +5648,31 @@ fn qualifier_unknown_selector_is_loud_even_when_inactive() {
 #[test]
 fn qualifier_first_active_xfail_wins() {
     let mac = TargetSpec::parse("arm64-macos").unwrap();
-    let src = "! XFAIL(x86_64-linux): linux reason\n! XFAIL: everywhere reason\nprogram t\nend\n";
+    let src = "! XFAIL(x86_64-linux): XFAIL-001 linux reason\n! XFAIL: XFAIL-002 everywhere reason\nprogram t\nend\n";
     assert_eq!(
         extract_xfail(src, "t.f90", &mac, "-O2").unwrap().as_deref(),
-        Some("everywhere reason")
+        Some("XFAIL-002 everywhere reason")
     );
     let musl = TargetSpec::parse("x86_64-linux-musl").unwrap();
     assert_eq!(
-        extract_xfail(src, "t.f90", &musl, "-O2").unwrap().as_deref(),
-        Some("linux reason")
+        extract_xfail(src, "t.f90", &musl, "-O2")
+            .unwrap()
+            .as_deref(),
+        Some("XFAIL-001 linux reason")
     );
+}
+
+#[test]
+fn xfail_requires_debt_reference_even_when_selector_is_inactive() {
+    let mac = TargetSpec::parse("arm64-macos").unwrap();
+    for source in [
+        "! XFAIL: untracked reason\nprogram t\nend\n",
+        "! XFAIL(x86_64-linux-musl): inactive untracked reason\nprogram t\nend\n",
+        "! XFAIL: XFAIL-01 malformed reference\nprogram t\nend\n",
+    ] {
+        let error = extract_xfail(source, "t.f90", &mac, "-O2").expect_err("must reject");
+        assert!(error.contains("durable XFAIL-NNN or X64-O0-NNN"));
+    }
 }
 
 /// Sprint T2: opt-level XFAIL qualifiers. `O2+` fires at -O2 and above
@@ -5626,7 +5687,7 @@ fn qualifier_opt_level_matching() {
     };
 
     // Bare opt selector: level-scoped, target-agnostic.
-    let o2plus = "! XFAIL(O2+): opt bug\nprogram t\nend\n";
+    let o2plus = "! XFAIL(O2+): XFAIL-001 opt bug\nprogram t\nend\n";
     assert!(xf(o2plus, &mac, "-O0").is_none(), "O2+ inactive at -O0");
     assert!(xf(o2plus, &mac, "-O1").is_none(), "O2+ inactive at -O1");
     assert!(xf(o2plus, &mac, "-O2").is_some(), "O2+ active at -O2");
@@ -5635,13 +5696,13 @@ fn qualifier_opt_level_matching() {
     assert!(xf(o2plus, &mac, "-Os").is_some(), "O2+ includes -Os");
 
     // Exact level.
-    let o3 = "! XFAIL(O3): only O3\nprogram t\nend\n";
+    let o3 = "! XFAIL(O3): XFAIL-001 only O3\nprogram t\nend\n";
     assert!(xf(o3, &mac, "-O2").is_none());
     assert!(xf(o3, &mac, "-O3").is_some());
     assert!(xf(o3, &mac, "-Ofast").is_none(), "exact O3 excludes Ofast");
 
     // Target AND opt: arm64 AND -O2-or-above.
-    let both = "! XFAIL(arm64,O2+): arm64 opt bug\nprogram t\nend\n";
+    let both = "! XFAIL(arm64,O2+): XFAIL-001 arm64 opt bug\nprogram t\nend\n";
     assert!(xf(both, &mac, "-O2").is_some(), "arm64 + O2 fires");
     assert!(xf(both, &mac, "-O1").is_none(), "arm64 but -O1: inactive");
     assert!(xf(both, &fbsd, "-O2").is_none(), "x86 at -O2: inactive");

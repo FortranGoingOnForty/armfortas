@@ -12,7 +12,7 @@
 ! re-word the expectation to its actual diagnostic.
 ! FLAGS: --std=f2023
 ! ERROR_EXPECTED: must be scalar
-! XFAIL: armfortas diagnostic wording differs from gfortran's dg-error substrings (deliberate; revisit if dg wording alignment becomes a goal)
+! XFAIL: XFAIL-004 armfortas diagnostic wording differs from gfortran's dg-error substrings (deliberate; revisit if dg wording alignment becomes a goal)
 program conditional_resolve
   implicit none
   integer :: i = 42

@@ -9,24 +9,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn compiler() -> PathBuf {
-    // CARGO_BIN_EXE_armfortas points at the profile-correct binary
-    // (release on CI); the path probes are the fallback for direct
-    // `cargo test --test source_limits` runs.
-    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_armfortas") {
-        return PathBuf::from(path);
-    }
-    for dir in [
-        "target/debug",
-        "../target/debug",
-        "target/release",
-        "../target/release",
-    ] {
-        let p = Path::new(dir).join("armfortas");
-        if p.exists() {
-            return p;
-        }
-    }
-    panic!("armfortas binary not built — run cargo build first");
+    armfortas::testing::built_binary("armfortas")
+        .expect("armfortas binary not built for this test profile")
 }
 
 /// One statement totalling just over a million characters, spread over

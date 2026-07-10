@@ -7,10 +7,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use std::fs;
+use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::SystemTime;
 
 use crate::codegen::mir::{
     ArmCond, ConstPoolEntry, MBlockId, MachineFunction, MachineInst, MachineOperand, PhysReg,
@@ -23,7 +23,77 @@ use crate::lexer::{detect_source_form, tokenize, SourceForm, Token};
 use crate::opt::pipeline::OptLevel as IrOptLevel;
 use crate::opt::{build_i128_pipeline, build_pipeline};
 use crate::parser::Parser;
+use crate::runtime::artifact::{fresh_runtime_lib, runtime_lib_candidate, RuntimeProfile};
 use crate::sema::{resolve, validate};
+
+/// Return the profile directory that contains the running Cargo test.
+///
+/// Integration tests live in `<profile>/deps`; workspace binaries and static
+/// libraries are siblings of that directory. Deriving this from the running
+/// executable also handles custom target directories and Cargo configuration.
+pub fn cargo_profile_dir() -> Option<PathBuf> {
+    cargo_profile_dir_for_executable(&std::env::current_exe().ok()?)
+}
+
+fn cargo_profile_dir_for_executable(executable: &Path) -> Option<PathBuf> {
+    let parent = executable.parent()?;
+    if parent.file_name() == Some(std::ffi::OsStr::new("deps")) {
+        parent.parent().map(Path::to_path_buf)
+    } else {
+        Some(parent.to_path_buf())
+    }
+}
+
+/// Find a workspace binary built in the same Cargo profile as this test.
+pub fn built_binary(name: &str) -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os(format!("CARGO_BIN_EXE_{name}")) {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    let file_name = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+    built_artifact(&file_name)
+}
+
+/// Find a workspace artifact built in the same Cargo profile as this test.
+pub fn built_artifact(file_name: &str) -> Option<PathBuf> {
+    let candidate = cargo_profile_dir()?.join(file_name);
+    candidate.is_file().then_some(candidate)
+}
+
+/// Find the runtime archive built in the same Cargo profile as this test.
+pub fn built_runtime_archive() -> Option<PathBuf> {
+    built_artifact("libarmfortas_rt.a")
+}
+
+fn harness_skip_line(suite: &str, test: &str, count: usize, reason: &str) -> String {
+    format!("\nHARNESS_SKIP suite={suite} test={test} count={count} reason=\"{reason}\"\n")
+}
+
+/// Report a platform-gated test as one write so parallel libtest output cannot
+/// split the machine-readable accounting record.
+pub fn report_harness_skip(suite: &str, test: &str, count: usize, reason: &str) {
+    assert!(count > 0, "HARNESS_SKIP counts must be positive");
+    let line = harness_skip_line(suite, test, count, reason);
+    std::io::stderr()
+        .lock()
+        .write_all(line.as_bytes())
+        .expect("write HARNESS_SKIP record");
+}
+
+#[cfg(test)]
+mod harness_skip_tests {
+    use super::harness_skip_line;
+
+    #[test]
+    fn record_is_rendered_as_one_complete_line() {
+        assert_eq!(
+            harness_skip_line("suite", "case", 7, "platform gate"),
+            "\nHARNESS_SKIP suite=suite test=case count=7 reason=\"platform gate\"\n"
+        );
+    }
+}
 
 /// Whether this host can assemble, link, and run armfortas-produced
 /// binaries natively (sprint x01). arm64-macos always; x86_64 ELF
@@ -1057,7 +1127,7 @@ fn link_with_runtime(obj: &Path, output: &Path) -> Result<(), String> {
         // Refresh the runtime staticlib the same way the Mach-O path
         // does before delegating to the driver's link line.
         if let Some(workspace_root) = find_workspace_root() {
-            maybe_refresh_runtime_lib(&workspace_root)?;
+            maybe_refresh_runtime_lib(&workspace_root, RuntimeProfile::current())?;
         }
         let opts = crate::driver::Options::default();
         return crate::driver::link_inputs_elf(&[obj.to_path_buf()], output, &opts);
@@ -1105,14 +1175,14 @@ fn link_with_runtime_macho(obj: &Path, output: &Path) -> Result<(), String> {
 
 fn find_runtime_lib() -> Result<String, String> {
     if let Some(workspace_root) = find_workspace_root() {
-        if let Some(candidate) = fresh_runtime_lib(&workspace_root) {
+        let profile = RuntimeProfile::current();
+        if let Some(candidate) = fresh_runtime_lib(&workspace_root, profile) {
             return Ok(candidate.to_string_lossy().into_owned());
         }
-        maybe_refresh_runtime_lib(&workspace_root)?;
-        for candidate in runtime_lib_candidates(&workspace_root) {
-            if candidate.exists() {
-                return Ok(candidate.to_string_lossy().into_owned());
-            }
+        maybe_refresh_runtime_lib(&workspace_root, profile)?;
+        let candidate = runtime_lib_candidate(&workspace_root, profile);
+        if candidate.exists() {
+            return Ok(candidate.to_string_lossy().into_owned());
         }
     }
 
@@ -1128,20 +1198,20 @@ fn find_runtime_lib() -> Result<String, String> {
     Err("cannot find libarmfortas_rt.a — build with 'cargo build -p armfortas-rt'".into())
 }
 
-fn maybe_refresh_runtime_lib(workspace_root: &Path) -> Result<(), String> {
+fn maybe_refresh_runtime_lib(workspace_root: &Path, profile: RuntimeProfile) -> Result<(), String> {
     let runtime_dir = workspace_root.join("runtime");
     if !runtime_dir.join("Cargo.toml").exists() {
         return Ok(());
     }
 
-    if fresh_runtime_lib(workspace_root).is_some() {
+    if fresh_runtime_lib(workspace_root, profile).is_some() {
         return Ok(());
     }
 
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
     let output = Command::new(cargo)
         .current_dir(workspace_root)
-        .args(["build", "-p", "armfortas-rt"])
+        .args(profile.cargo_build_args())
         .output()
         .map_err(|e| format!("cannot rebuild libarmfortas_rt.a: {}", e))?;
     if output.status.success() {
@@ -1152,41 +1222,6 @@ fn maybe_refresh_runtime_lib(workspace_root: &Path) -> Result<(), String> {
             String::from_utf8_lossy(&output.stderr)
         ))
     }
-}
-
-fn runtime_lib_candidates(workspace_root: &Path) -> [PathBuf; 2] {
-    [
-        workspace_root.join("target/debug/libarmfortas_rt.a"),
-        workspace_root.join("target/release/libarmfortas_rt.a"),
-    ]
-}
-
-fn fresh_runtime_lib(workspace_root: &Path) -> Option<PathBuf> {
-    let runtime_dir = workspace_root.join("runtime");
-    let source_mtime = newest_mtime(&runtime_dir)?;
-    runtime_lib_candidates(workspace_root)
-        .into_iter()
-        .find(|candidate| {
-            fs::metadata(candidate)
-                .ok()
-                .and_then(|meta| meta.modified().ok())
-                .is_some_and(|mtime| mtime >= source_mtime)
-        })
-}
-
-fn newest_mtime(path: &Path) -> Option<SystemTime> {
-    let meta = fs::metadata(path).ok()?;
-    let mut newest = meta.modified().ok()?;
-    if meta.is_dir() {
-        for entry in fs::read_dir(path).ok()? {
-            let entry = entry.ok()?;
-            let child = newest_mtime(&entry.path())?;
-            if child > newest {
-                newest = child;
-            }
-        }
-    }
-    Some(newest)
 }
 
 fn find_workspace_root() -> Option<PathBuf> {

@@ -359,7 +359,7 @@ mod tests {
         let mut func = Function::new("test".into(), vec![], IrType::Void);
         {
             let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
-            let a = b.const_f64(3.14);
+            let a = b.const_f64(std::f64::consts::PI);
             let c = b.const_f64(2.0);
             let _d = b.fadd(a, c);
             b.ret_void();

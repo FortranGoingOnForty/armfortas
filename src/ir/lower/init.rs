@@ -37,10 +37,7 @@ fn eval_data_int(
         .or_else(|| eval_const_int(expr))
 }
 
-fn substitute_data_ac_value(
-    value: &AcValue,
-    subst: &HashMap<String, &SpannedExpr>,
-) -> AcValue {
+fn substitute_data_ac_value(value: &AcValue, subst: &HashMap<String, &SpannedExpr>) -> AcValue {
     match value {
         AcValue::Expr(expr) => AcValue::Expr(super::expr::substitute_names_in_expr(expr, subst)),
         AcValue::ImpliedDo(ido) => AcValue::ImpliedDo(Box::new(ImpliedDoLoop {
@@ -101,8 +98,16 @@ fn expand_data_ac_value(
     }
 }
 
-fn expand_whole_array_data_object(name: &str, info: &LocalInfo, span: crate::lexer::Span) -> Vec<SpannedExpr> {
-    let total: i64 = info.dims.iter().map(|(_, extent)| (*extent).max(0)).product();
+fn expand_whole_array_data_object(
+    name: &str,
+    info: &LocalInfo,
+    span: crate::lexer::Span,
+) -> Vec<SpannedExpr> {
+    let total: i64 = info
+        .dims
+        .iter()
+        .map(|(_, extent)| (*extent).max(0))
+        .product();
     if total <= 0 {
         return Vec::new();
     }

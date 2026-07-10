@@ -461,7 +461,6 @@ mod tests {
         let mut f = Function::new("test".into(), vec![], IrType::Void);
 
         let header = f.create_block("header");
-        let cmp_blk = f.create_block("cmp");
         let body = f.create_block("body");
         let latch = f.create_block("latch");
         let exit = f.create_block("exit");

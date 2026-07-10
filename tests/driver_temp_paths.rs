@@ -5,14 +5,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 static NEXT_TEMP_ID: AtomicUsize = AtomicUsize::new(0);
 
 fn compiler() -> PathBuf {
-    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_armfortas") {
-        return PathBuf::from(path);
-    }
-    let candidate = PathBuf::from("target/debug/armfortas");
-    if candidate.exists() {
-        return std::fs::canonicalize(candidate).expect("cannot canonicalize debug compiler path");
-    }
-    panic!("armfortas binary not built - run `cargo build --bins` first");
+    armfortas::testing::built_binary("armfortas")
+        .expect("armfortas binary not built for this test profile")
 }
 
 fn unique_dir(stem: &str) -> PathBuf {

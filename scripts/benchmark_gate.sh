@@ -28,7 +28,7 @@ set -euo pipefail
 # tree arrives by rsync) and already runs from the root.
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 
-COMPILER="./target/release/armfortas"
+COMPILER="${CARGO_TARGET_DIR:-target}/release/armfortas"
 PROGRAMS=(
     test_programs/array_bulk_kernels.f90
     test_programs/module_init.f90
@@ -39,6 +39,13 @@ PROGRAMS=(
 OPT="-O2"
 BSS_SENTINEL="test_programs/ar6_bss_module_data.f90"
 BSS_SENTINEL_MAX_BYTES=$((32 * 1024 * 1024))
+
+for fixture in "${PROGRAMS[@]}" "$BSS_SENTINEL"; do
+    if [ ! -f "$fixture" ]; then
+        echo "FAIL: missing mandatory benchmark fixture: $fixture" >&2
+        exit 1
+    fi
+done
 
 if [ ! -x "$COMPILER" ]; then
     echo "Build the compiler first: cargo build --release"
@@ -125,10 +132,6 @@ check_bss_size_guard() {
 echo "Benchmarking ${#PROGRAMS[@]} programs at $OPT..."
 RESULTS=""
 for prog in "${PROGRAMS[@]}"; do
-    if [ ! -f "$prog" ]; then
-        echo "  SKIP: $prog (not found)"
-        continue
-    fi
     result=$(compile_and_measure "$prog")
     echo "  $result"
     RESULTS="$RESULTS$result"$'\n'
