@@ -50,8 +50,8 @@ fn scan_file(path: &Path) -> (Vec<String>, Vec<String>) {
             continue;
         }
 
-        if trimmed.starts_with("module ") {
-            let rest = trimmed[7..].trim();
+        if let Some(rest) = trimmed.strip_prefix("module ") {
+            let rest = rest.trim();
             if rest.starts_with("procedure")
                 || rest.starts_with("function")
                 || rest.starts_with("subroutine")
@@ -67,14 +67,14 @@ fn scan_file(path: &Path) -> (Vec<String>, Vec<String>) {
         }
 
         if trimmed.starts_with("use ") || trimmed.starts_with("use,") {
-            let rest = if trimmed.starts_with("use,") {
+            let rest = if let Some(stripped) = trimmed.strip_prefix("use,") {
                 if let Some(idx) = trimmed.find("::") {
                     trimmed[idx + 2..].trim()
                 } else {
-                    &trimmed[4..]
+                    stripped
                 }
             } else {
-                trimmed[4..].trim()
+                trimmed.strip_prefix("use ").unwrap().trim()
             };
             if let Some(name) = rest
                 .split(|c: char| c == ',' || c == ':' || c.is_whitespace())
@@ -187,8 +187,8 @@ fn fortsh_module_graph_resolves() {
 
     // Kahn's topo sort.
     let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
-    for i in 0..n {
-        if in_degree[i] == 0 {
+    for (i, &degree) in in_degree.iter().enumerate() {
+        if degree == 0 {
             queue.push_back(i);
         }
     }

@@ -30,7 +30,9 @@ fn capture_run(request: CaptureRequest) -> RunCapture {
 
 fn stdout_has_fields(stdout: &str, expected: &[&str]) -> bool {
     let fields: Vec<_> = stdout.split_whitespace().collect();
-    fields.windows(expected.len()).any(|window| window == expected)
+    fields
+        .windows(expected.len())
+        .any(|window| window == expected)
 }
 
 fn function_section<'a>(ir: &'a str, name: &str) -> &'a str {
@@ -57,14 +59,12 @@ fn function_sections(ir: &str) -> Vec<&str> {
         .collect()
 }
 
-fn function_name<'a>(func_section: &'a str) -> &'a str {
+fn function_name(func_section: &str) -> &str {
     let header = func_section.lines().next().expect("function header").trim();
     let rest = header
         .strip_prefix("func @")
         .expect("function header prefix");
-    let end = rest
-        .find(|ch: char| ch == ' ' || ch == '(')
-        .unwrap_or(rest.len());
+    let end = rest.find([' ', '(']).unwrap_or(rest.len());
     &rest[..end]
 }
 

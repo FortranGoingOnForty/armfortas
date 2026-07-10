@@ -509,14 +509,10 @@ fn extract_prefixed_checks(source: &str, prefix: &str) -> Vec<Check> {
         .enumerate()
         .filter_map(|(i, line)| {
             let trimmed = line.trim();
-            if let Some(rest) = trimmed.strip_prefix(prefix) {
-                Some(Check {
-                    line_num: i + 1,
-                    pattern: rest.trim().to_string(),
-                })
-            } else {
-                None
-            }
+            trimmed.strip_prefix(prefix).map(|rest| Check {
+                line_num: i + 1,
+                pattern: rest.trim().to_string(),
+            })
         })
         .collect()
 }
@@ -1305,14 +1301,12 @@ fn extract_shape_checks(source: &str, pos_prefix: &str, neg_prefix: &str) -> Vec
                     pattern: rest.trim().to_string(),
                     negative: false,
                 })
-            } else if let Some(rest) = trimmed.strip_prefix(neg_prefix) {
-                Some(ShapeCheck {
+            } else {
+                trimmed.strip_prefix(neg_prefix).map(|rest| ShapeCheck {
                     line_num: i + 1,
                     pattern: rest.trim().to_string(),
                     negative: true,
                 })
-            } else {
-                None
             }
         })
         .collect()
@@ -2644,12 +2638,12 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
 
         let stdout = &snapshot.stdout;
         let label = format!("{} [{}]", filename, opt_flag);
-        if let Err(e) = match_checks(&checks, &stdout, &label, "CHECK") {
+        if let Err(e) = match_checks(&checks, stdout, &label, "CHECK") {
             let _ = fs::remove_file(&binary);
             let _ = fs::remove_dir_all(&sandbox);
             return Err(e);
         }
-        if let Err(e) = match_checks(&stderr_checks, &stderr, &label, "STDERR_CHECK") {
+        if let Err(e) = match_checks(&stderr_checks, stderr, &label, "STDERR_CHECK") {
             let _ = fs::remove_file(&binary);
             let _ = fs::remove_dir_all(&sandbox);
             return Err(e);
@@ -5381,7 +5375,7 @@ fn flags_annotation_rejects_harness_owned_flags() {
 #[test]
 fn flags_annotation_rejects_multiple_lines() {
     let src = "! FLAGS: --std=f2023\n! FLAGS: -fbackslash\nprogram t\nend\n";
-    let err = extract_flags(src, "t.f90").err().expect("must reject");
+    let err = extract_flags(src, "t.f90").expect_err("must reject");
     assert!(err.contains("multiple FLAGS"), "got: {}", err);
 }
 

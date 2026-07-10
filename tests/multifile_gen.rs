@@ -124,7 +124,7 @@ fn gen_chain(depth: usize) -> (Vec<(String, String)>, String, &'static str) {
     // Main program uses mod_1 and prints the accumulated value.
     let expected: usize = (1..=depth).sum();
     let main_src =
-        format!("program p\n  use mod_1\n  implicit none\n  print *, val_1\nend program\n");
+        "program p\n  use mod_1\n  implicit none\n  print *, val_1\nend program\n".to_string();
 
     // Files are already in compilation order: leaf first, then towards root.
     let expected_str = Box::leak(format!("{}", expected).into_boxed_str());
