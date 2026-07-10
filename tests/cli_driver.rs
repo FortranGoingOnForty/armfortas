@@ -49666,6 +49666,43 @@ fn optional_allocatable_intent_out_array_assignment_reallocates() {
 }
 
 #[test]
+fn explicit_class_star_deallocation_uses_dynamic_finalizers() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=explicit_class_star_deallocation_uses_dynamic_finalizers count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  integer :: calls = 0\n  type :: payload_t\n    integer :: marker = 0\n  contains\n    final :: finish\n  end type\n  type :: holder_t\n    class(*), allocatable :: payload\n  end type\ncontains\n  subroutine finish(item)\n    type(payload_t) :: item\n    calls = calls + item%marker\n  end subroutine\n  subroutine exercise()\n    class(*), allocatable :: value\n    type(holder_t) :: holder\n    allocate(payload_t :: value)\n    select type (item => value)\n    type is (payload_t)\n      item%marker = 2\n    class default\n      error stop 1\n    end select\n    allocate(payload_t :: holder%payload)\n    select type (item => holder%payload)\n    type is (payload_t)\n      item%marker = 3\n    class default\n      error stop 2\n    end select\n    deallocate(value)\n    deallocate(holder%payload)\n  end subroutine\nend module\nprogram p\n  use m, only: calls, exercise\n  implicit none\n  call exercise()\n  if (calls /= 5) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("explicit_class_star_dynamic_final", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("class(*) dynamic finalization compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "class(*) dynamic finalization compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("class(*) dynamic finalization run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "class(*) dynamic finalization run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn derived_assignment_deep_copies_nested_class_star_allocatable_state() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

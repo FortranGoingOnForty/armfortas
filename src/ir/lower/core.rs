@@ -55736,7 +55736,7 @@ fn emit_derived_value_copy_inline(
     }
 }
 
-fn release_unlimited_polymorphic_allocatable_descriptor(
+pub(super) fn release_unlimited_polymorphic_allocatable_descriptor(
     b: &mut FuncBuilder,
     desc: ValueId,
     stat_addr: ValueId,

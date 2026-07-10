@@ -7205,6 +7205,23 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         }
                         if field.size == 392 && (field.allocatable || field.pointer) {
                             if field.allocatable {
+                                if matches!(
+                                    &field.type_info,
+                                    crate::sema::symtab::TypeInfo::ClassStar
+                                        | crate::sema::symtab::TypeInfo::TypeStar
+                                ) {
+                                    let finalize = b.const_i32(1);
+                                    release_unlimited_polymorphic_allocatable_descriptor(
+                                        b, field_ptr, stat_addr, finalize,
+                                    );
+                                    emit_runtime_errmsg_on_failure(
+                                        b,
+                                        stat_addr,
+                                        errmsg_target.as_ref(),
+                                        "DEALLOCATE failed",
+                                    );
+                                    continue;
+                                }
                                 if let Some(type_name) = field_derived_type_name(&field) {
                                     if let Some(layout) = ctx.type_layouts.get(&type_name) {
                                         finalize_derived_descriptor_storage_if_allocated(
@@ -7273,32 +7290,39 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             );
                         } else if info.allocatable || info.descriptor_arg {
                             let desc = array_descriptor_addr(b, info);
-                            if let Some(type_name) = &info.derived_type {
-                                if let Some(layout) = ctx.type_layouts.get(type_name) {
-                                    finalize_derived_descriptor_storage_if_allocated(
-                                        b,
-                                        ctx.st,
-                                        ctx.internal_funcs,
-                                        Some(ctx.contained_host_refs),
-                                        &ctx.locals,
-                                        desc,
-                                        layout,
-                                        ctx.type_layouts,
-                                    );
-                                    deallocate_derived_descriptor_components(
-                                        b,
-                                        desc,
-                                        layout,
-                                        ctx.type_layouts,
-                                        stat_addr,
-                                    );
+                            if is_unlimited_polymorphic_local(info) {
+                                let finalize = b.const_i32(1);
+                                release_unlimited_polymorphic_allocatable_descriptor(
+                                    b, desc, stat_addr, finalize,
+                                );
+                            } else {
+                                if let Some(type_name) = &info.derived_type {
+                                    if let Some(layout) = ctx.type_layouts.get(type_name) {
+                                        finalize_derived_descriptor_storage_if_allocated(
+                                            b,
+                                            ctx.st,
+                                            ctx.internal_funcs,
+                                            Some(ctx.contained_host_refs),
+                                            &ctx.locals,
+                                            desc,
+                                            layout,
+                                            ctx.type_layouts,
+                                        );
+                                        deallocate_derived_descriptor_components(
+                                            b,
+                                            desc,
+                                            layout,
+                                            ctx.type_layouts,
+                                            stat_addr,
+                                        );
+                                    }
                                 }
+                                b.call(
+                                    FuncRef::External("afs_deallocate_array".into()),
+                                    vec![desc, stat_addr],
+                                    IrType::Void,
+                                );
                             }
-                            b.call(
-                                FuncRef::External("afs_deallocate_array".into()),
-                                vec![desc, stat_addr],
-                                IrType::Void,
-                            );
                             emit_runtime_errmsg_on_failure(
                                 b,
                                 stat_addr,
