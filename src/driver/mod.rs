@@ -1866,7 +1866,8 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     // ELF assembly routing (x14): the in-process afs-as x86 pipeline
     // is the default. AFS_AS_PATH substitutes a subprocess assembler
     // (invoked `<as> --64 -o obj asm`); AFS_AS=0 forces the system
-    // `as`. Mach-O keeps the existing as/AFS_AS routing below.
+    // `as`. Mach-O uses the embedded ARM64 assembler when crossing
+    // host architecture or object format, and keeps native overrides below.
     if opts.target.object_format() == crate::target::ObjectFormat::Elf {
         let route = elf_assembler_override();
         let host = crate::target::TargetSpec::host();
@@ -1944,25 +1945,31 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     }
 
     let phase = phases.start("assemble");
-    let as_result = if let Some(assembler) = env_override("AFS_AS_PATH") {
-        Command::new(assembler)
+    let host = crate::target::TargetSpec::host();
+    let cross =
+        host.arch != opts.target.arch || host.object_format() != crate::target::ObjectFormat::MachO;
+    let assembler = env_override("AFS_AS_PATH");
+    let assemble_result = if cross && assembler.is_none() {
+        afs_as::assemble::assemble_file(&asm_path, &obj_path).map_err(|e| format!("afs-as: {}", e))
+    } else {
+        let assembler = assembler.unwrap_or_else(|| "as".into());
+        let result = Command::new(assembler)
             .arg(&asm_path)
             .arg("-o")
             .arg(&obj_path)
             .output()
-            .map_err(|e| format!("cannot run assembler: {}", e))?
-    } else {
-        Command::new("as")
-            .args(["-o", obj_path.to_str().unwrap(), asm_path.to_str().unwrap()])
-            .output()
-            .map_err(|e| format!("cannot run assembler: {}", e))?
+            .map_err(|e| format!("cannot run assembler: {}", e))?;
+        if result.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "assembler failed:\n{}",
+                String::from_utf8_lossy(&result.stderr)
+            ))
+        }
     };
     phase.end(&mut phases);
-
-    if !as_result.status.success() {
-        let stderr = String::from_utf8_lossy(&as_result.stderr);
-        return Err(format!("assembler failed:\n{}", stderr));
-    }
+    assemble_result?;
     if opts.verbose {
         eprintln!(" assembled: {}", obj_path.display());
     }

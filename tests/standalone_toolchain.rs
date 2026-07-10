@@ -487,6 +487,42 @@ fn hello_world_compiles_to_object_with_standalone_assembler_override() {
 }
 
 #[test]
+fn arm64_macho_cross_target_compiles_to_object() {
+    let armfortas = binary("armfortas");
+    let dir = unique_dir("arm64_macho_cross_object");
+    let source = dir.join("one.f90");
+    let object = dir.join("one.o");
+    fs::write(&source, "subroutine one()\nend subroutine\n").unwrap();
+
+    let compile = run_command(
+        Command::new(&armfortas)
+            .env_remove("AFS_AS_PATH")
+            .env_remove("AFS_AS")
+            .args(["--target", "arm64-macos", "-c"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&object),
+        "arm64 Mach-O cross-target compile",
+    );
+    assert_success(&compile, "arm64 Mach-O cross-target compile");
+
+    let bytes = fs::read(&object).expect("cross-target compile omitted object");
+    assert!(bytes.len() >= 8, "Mach-O object header is truncated");
+    assert_eq!(
+        u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+        0xfeed_facf,
+        "cross-target output is not a 64-bit Mach-O object"
+    );
+    assert_eq!(
+        u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+        0x0100_000c,
+        "cross-target output is not ARM64"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn sprint18_program_matrix_runs_through_driver_standalone_overrides() {
     let cases = [
         ("arithmetic.f90", "30"),
