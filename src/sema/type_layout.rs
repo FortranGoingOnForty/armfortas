@@ -5,9 +5,9 @@
 //! alignments come from `TargetLayout`, identical across the LP64
 //! targets we support).
 
-use super::symtab::TypeInfo;
+use super::symtab::{ScopeId, TypeInfo};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Procedure-pointer components carry a code pointer followed by a small
 /// fixed closure payload for contained-procedure host references.
@@ -88,6 +88,12 @@ pub struct FinalProc {
 pub struct TypeLayout {
     pub name: String,
     pub owner_module: Option<String>,
+    /// Resolver scope that owns this declaration. This is compilation-local
+    /// metadata and is intentionally not serialized into `.amod` files.
+    pub owner_scope: Option<ScopeId>,
+    /// Stable lexical path for the owner scope. Module-owned types use the
+    /// lowercase module name; local types append their lexical scopes.
+    pub owner_path: Option<String>,
     pub size: usize,
     pub align: usize,
     pub fields: Vec<FieldLayout>,
@@ -135,17 +141,44 @@ impl TypeLayout {
 #[derive(Debug, Default)]
 pub struct TypeLayoutRegistry {
     pub layouts: HashMap<String, TypeLayout>,
+    layout_aliases: HashMap<(ScopeId, String), (ScopeId, String)>,
+    bare_use_scopes: HashMap<ScopeId, Vec<ScopeId>>,
+    scope_parents: HashMap<ScopeId, Option<ScopeId>>,
+    scope_paths: HashMap<ScopeId, String>,
+    unique_scoped_names: HashMap<String, Option<String>>,
+    unique_aliases: HashMap<String, Option<String>>,
     next_tag: u64,
 }
 
 fn stable_type_tag_key(layout: &TypeLayout) -> String {
-    match &layout.owner_module {
-        Some(owner_module) => format!(
-            "{}::{}",
-            owner_module.to_lowercase(),
-            layout.name.to_lowercase()
-        ),
-        None => layout.name.to_lowercase(),
+    layout_identity_key(layout)
+}
+
+fn layout_identity_key(layout: &TypeLayout) -> String {
+    let name = layout.name.to_lowercase();
+    if let Some(owner_path) = layout.owner_path.as_deref() {
+        return format!("{}::{}", owner_path.to_lowercase(), name);
+    }
+    if let Some(owner_module) = layout.owner_module.as_deref() {
+        return format!("{}::{}", owner_module.to_lowercase(), name);
+    }
+    name
+}
+
+fn record_unique_binding(
+    index: &mut HashMap<String, Option<String>>,
+    name: String,
+    canonical: String,
+) {
+    match index.entry(name) {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(Some(canonical));
+        }
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            if entry.get().as_deref() != Some(canonical.as_str()) {
+                entry.insert(None);
+            }
+        }
     }
 }
 
@@ -166,6 +199,12 @@ impl TypeLayoutRegistry {
     pub fn new() -> Self {
         Self {
             layouts: HashMap::new(),
+            layout_aliases: HashMap::new(),
+            bare_use_scopes: HashMap::new(),
+            scope_parents: HashMap::new(),
+            scope_paths: HashMap::new(),
+            unique_scoped_names: HashMap::new(),
+            unique_aliases: HashMap::new(),
             next_tag: 1,
         }
     }
@@ -178,11 +217,228 @@ impl TypeLayoutRegistry {
 
     pub fn get(&self, type_name: &str) -> Option<&TypeLayout> {
         let key = ensure_ascii_lowercase(type_name);
-        self.layouts.get(key.as_ref())
+        if let Some(layout) = self.layouts.get(key.as_ref()) {
+            return Some(layout);
+        }
+        let canonical = self
+            .unique_aliases
+            .get(key.as_ref())
+            .or_else(|| self.unique_scoped_names.get(key.as_ref()))?
+            .as_deref()?;
+        self.layouts.get(canonical)
+    }
+
+    pub fn get_in_module(&self, module: &str, type_name: &str) -> Option<&TypeLayout> {
+        let key = format!(
+            "{}::{}",
+            module.to_ascii_lowercase(),
+            type_name.to_ascii_lowercase()
+        );
+        self.layouts.get(&key)
+    }
+
+    pub fn canonical_name_for_scope(&self, scope: ScopeId, type_name: &str) -> Option<String> {
+        let mut seen = HashSet::new();
+        self.resolve_name_in_scope(scope, &type_name.to_ascii_lowercase(), &mut seen)
+            .or_else(|| {
+                let key = type_name.to_ascii_lowercase();
+                self.layouts
+                    .contains_key(&key)
+                    .then_some(key.clone())
+                    .or_else(|| {
+                        self.unique_aliases
+                            .get(&key)
+                            .or_else(|| self.unique_scoped_names.get(&key))
+                            .and_then(Clone::clone)
+                    })
+            })
+    }
+
+    pub fn get_for_scope(&self, scope: ScopeId, type_name: &str) -> Option<&TypeLayout> {
+        let canonical = self.canonical_name_for_scope(scope, type_name)?;
+        self.layouts.get(&canonical)
+    }
+
+    pub fn get_related(&self, owner: &TypeLayout, type_name: &str) -> Option<&TypeLayout> {
+        owner
+            .owner_scope
+            .and_then(|scope| self.get_for_scope(scope, type_name))
+            .or_else(|| {
+                owner
+                    .owner_module
+                    .as_deref()
+                    .and_then(|module| self.get_in_module(module, type_name))
+            })
+            .or_else(|| self.get(type_name))
+    }
+
+    pub fn canonical_key_for_layout(&self, layout: &TypeLayout) -> String {
+        layout_identity_key(layout)
+    }
+
+    pub fn scope_path(&self, scope: ScopeId) -> Option<&str> {
+        self.scope_paths.get(&scope).map(String::as_str)
     }
 
     pub fn iter_layouts(&self) -> impl Iterator<Item = &TypeLayout> {
         self.layouts.values()
+    }
+
+    pub fn iter_layouts_mut(&mut self) -> impl Iterator<Item = &mut TypeLayout> {
+        self.layouts.values_mut()
+    }
+
+    pub fn register_scope(&mut self, scope: ScopeId, parent: Option<ScopeId>, stable_path: String) {
+        self.scope_parents.insert(scope, parent);
+        self.scope_paths
+            .insert(scope, stable_path.to_ascii_lowercase());
+    }
+
+    pub fn bind_layout(
+        &mut self,
+        scope: ScopeId,
+        local_name: &str,
+        source_scope: ScopeId,
+        original_name: &str,
+    ) {
+        if local_name.is_empty() || original_name.is_empty() {
+            return;
+        }
+        self.layout_aliases.insert(
+            (scope, local_name.to_ascii_lowercase()),
+            (source_scope, original_name.to_ascii_lowercase()),
+        );
+    }
+
+    pub fn bind_bare_use_scope(&mut self, scope: ScopeId, source_scope: ScopeId) {
+        let sources = self.bare_use_scopes.entry(scope).or_default();
+        if !sources.contains(&source_scope) {
+            sources.push(source_scope);
+        }
+    }
+
+    pub fn rebuild_alias_index(&mut self) {
+        self.unique_aliases.clear();
+        let bindings: Vec<_> = self
+            .layout_aliases
+            .iter()
+            .map(|((scope, local), (source_scope, original))| {
+                (*scope, local.clone(), *source_scope, original.clone())
+            })
+            .collect();
+        for (_scope, local, source_scope, original) in bindings {
+            let mut seen = HashSet::new();
+            if let Some(canonical) = self.resolve_name_in_scope(source_scope, &original, &mut seen)
+            {
+                record_unique_binding(&mut self.unique_aliases, local, canonical);
+            }
+        }
+    }
+
+    pub fn has_inline_storage_cycle(&self, layout: &TypeLayout) -> bool {
+        fn walk(
+            registry: &TypeLayoutRegistry,
+            layout: &TypeLayout,
+            visiting: &mut HashSet<String>,
+            complete: &mut HashSet<String>,
+        ) -> bool {
+            let key = registry.canonical_key_for_layout(layout);
+            if visiting.contains(&key) {
+                return true;
+            }
+            if complete.contains(&key) {
+                return false;
+            }
+            visiting.insert(key.clone());
+
+            let parent_cycle = layout
+                .parent
+                .as_deref()
+                .and_then(|name| registry.get_related(layout, name))
+                .is_some_and(|parent| walk(registry, parent, visiting, complete));
+            let field_cycle = layout.fields.iter().any(|field| {
+                if field.pointer || field.allocatable {
+                    return false;
+                }
+                let TypeInfo::Derived(name) = &field.type_info else {
+                    return false;
+                };
+                let nested =
+                    if name.eq_ignore_ascii_case(&layout.name) || name.eq_ignore_ascii_case(&key) {
+                        Some(layout)
+                    } else {
+                        registry.get_related(layout, name)
+                    };
+                nested.is_some_and(|nested| walk(registry, nested, visiting, complete))
+            });
+
+            visiting.remove(&key);
+            complete.insert(key);
+            parent_cycle || field_cycle
+        }
+
+        walk(self, layout, &mut HashSet::new(), &mut HashSet::new())
+    }
+
+    fn resolve_name_in_scope(
+        &self,
+        scope: ScopeId,
+        name: &str,
+        seen: &mut HashSet<(ScopeId, String)>,
+    ) -> Option<String> {
+        let visit = (scope, name.to_string());
+        if !seen.insert(visit.clone()) {
+            return None;
+        }
+
+        if let Some(path) = self.scope_paths.get(&scope) {
+            let canonical = format!("{}::{}", path, name);
+            if self.layouts.contains_key(&canonical) {
+                seen.remove(&visit);
+                return Some(canonical);
+            }
+        }
+
+        if let Some((source_scope, original_name)) =
+            self.layout_aliases.get(&(scope, name.to_string()))
+        {
+            let resolved = self.resolve_name_in_scope(*source_scope, original_name, seen);
+            seen.remove(&visit);
+            return resolved;
+        }
+
+        let mut imported = None;
+        if let Some(source_scopes) = self.bare_use_scopes.get(&scope) {
+            for source_scope in source_scopes {
+                let mut branch_seen = seen.clone();
+                let Some(candidate) =
+                    self.resolve_name_in_scope(*source_scope, name, &mut branch_seen)
+                else {
+                    continue;
+                };
+                match imported.as_deref() {
+                    None => imported = Some(candidate),
+                    Some(existing) if existing == candidate => {}
+                    Some(_) => {
+                        seen.remove(&visit);
+                        return None;
+                    }
+                }
+            }
+        }
+        if imported.is_some() {
+            seen.remove(&visit);
+            return imported;
+        }
+
+        let resolved = self
+            .scope_parents
+            .get(&scope)
+            .copied()
+            .flatten()
+            .and_then(|parent| self.resolve_name_in_scope(parent, name, seen));
+        seen.remove(&visit);
+        resolved
     }
 
     pub fn insert(&mut self, mut layout: TypeLayout) {
@@ -191,7 +447,10 @@ impl TypeLayoutRegistry {
         } else if layout.type_tag >= self.next_tag {
             self.next_tag = layout.type_tag + 1;
         }
-        self.layouts.insert(layout.name.to_lowercase(), layout);
+        let name = layout.name.to_lowercase();
+        let canonical = layout_identity_key(&layout);
+        self.layouts.insert(canonical.clone(), layout);
+        record_unique_binding(&mut self.unique_scoped_names, name, canonical);
     }
 }
 
@@ -875,6 +1134,41 @@ pub fn compute_layout_with_attrs(
     const_derived_field_inits: &HashMap<String, FieldDefaultInit>,
     layout: crate::target::TargetLayout,
 ) -> TypeLayout {
+    compute_layout_with_attrs_in_scope(
+        type_name,
+        host_module,
+        None,
+        None,
+        type_bound_procs,
+        final_proc_names,
+        components,
+        parent_layout,
+        is_abstract,
+        registry,
+        const_params,
+        const_char_params,
+        const_derived_field_inits,
+        layout,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_layout_with_attrs_in_scope(
+    type_name: &str,
+    host_module: Option<&str>,
+    owner_scope: Option<ScopeId>,
+    owner_path: Option<&str>,
+    type_bound_procs: &[crate::ast::decl::TypeBoundProc],
+    final_proc_names: &[String],
+    components: &[crate::ast::decl::SpannedDecl],
+    parent_layout: Option<&TypeLayout>,
+    is_abstract: bool,
+    registry: &TypeLayoutRegistry,
+    const_params: &HashMap<String, i64>,
+    const_char_params: &HashMap<String, String>,
+    const_derived_field_inits: &HashMap<String, FieldDefaultInit>,
+    layout: crate::target::TargetLayout,
+) -> TypeLayout {
     let mut offset: usize = 0;
     let mut max_align: usize = 1;
     let mut fields = Vec::new();
@@ -958,8 +1252,9 @@ pub fn compute_layout_with_attrs(
                     } else if is_allocatable || is_pointer {
                         layout.array_descriptor() // allocatable/pointer array component
                     } else if let TypeInfo::Derived(ref dname) = ti {
-                        registry
-                            .get(dname)
+                        owner_scope
+                            .and_then(|scope| registry.get_for_scope(scope, dname))
+                            .or_else(|| registry.get(dname))
                             .map(|l| (l.size, l.align))
                             .unwrap_or((layout.ptr_bytes, layout.ptr_align))
                     } else {
@@ -1168,13 +1463,15 @@ pub fn compute_layout_with_attrs(
     TypeLayout {
         name: type_name.to_string(),
         owner_module: host_module.map(str::to_string),
+        owner_scope,
+        owner_path: owner_path.map(str::to_string),
         size: offset,
         align: max_align,
         fields,
         bound_procs,
         final_procs,
         type_tag: 0, // assigned by registry after insertion
-        parent: parent_layout.map(|p| p.name.clone()),
+        parent: parent_layout.map(|p| registry.canonical_key_for_layout(p)),
         is_abstract,
     }
 }
@@ -1251,6 +1548,8 @@ mod tests {
         let layout = TypeLayout {
             name: "point".into(),
             owner_module: None,
+            owner_scope: None,
+            owner_path: None,
             size: 8,
             align: 4,
             fields: vec![
@@ -1307,6 +1606,8 @@ mod tests {
         let layout = TypeLayout {
             name: "mixed".into(),
             owner_module: None,
+            owner_scope: None,
+            owner_path: None,
             size: 24,
             align: 8,
             fields: vec![
@@ -1376,6 +1677,8 @@ mod tests {
         reg.insert(TypeLayout {
             name: "MyType".into(),
             owner_module: None,
+            owner_scope: None,
+            owner_path: None,
             size: 16,
             align: 8,
             fields: vec![],
@@ -1395,6 +1698,8 @@ mod tests {
         let alpha = TypeLayout {
             name: "child_t".into(),
             owner_module: Some("alpha_m".into()),
+            owner_scope: None,
+            owner_path: Some("alpha_m".into()),
             size: 8,
             align: 8,
             fields: vec![],
@@ -1407,6 +1712,8 @@ mod tests {
         let beta = TypeLayout {
             name: "child_t".into(),
             owner_module: Some("beta_m".into()),
+            owner_scope: None,
+            owner_path: Some("beta_m".into()),
             size: 8,
             align: 8,
             fields: vec![],
@@ -1418,6 +1725,57 @@ mod tests {
         };
 
         assert_ne!(stable_type_tag(&alpha), stable_type_tag(&beta));
+    }
+
+    #[test]
+    fn registry_resolves_same_named_layouts_through_scoped_renames() {
+        let mut reg = TypeLayoutRegistry::new();
+        reg.register_scope(1, Some(0), "alpha_m".into());
+        reg.register_scope(2, Some(0), "beta_m".into());
+        reg.register_scope(3, Some(0), "program:p".into());
+        reg.insert(TypeLayout {
+            name: "item_t".into(),
+            owner_module: Some("alpha_m".into()),
+            owner_scope: Some(1),
+            owner_path: Some("alpha_m".into()),
+            size: 4,
+            align: 4,
+            fields: vec![],
+            bound_procs: vec![],
+            final_procs: vec![],
+            type_tag: 0,
+            parent: None,
+            is_abstract: false,
+        });
+        reg.insert(TypeLayout {
+            name: "item_t".into(),
+            owner_module: Some("beta_m".into()),
+            owner_scope: Some(2),
+            owner_path: Some("beta_m".into()),
+            size: 8,
+            align: 8,
+            fields: vec![],
+            bound_procs: vec![],
+            final_procs: vec![],
+            type_tag: 0,
+            parent: None,
+            is_abstract: false,
+        });
+        reg.bind_layout(3, "alpha_item", 1, "item_t");
+        reg.bind_layout(3, "beta_item", 2, "item_t");
+        reg.rebuild_alias_index();
+
+        assert!(reg.get("item_t").is_none());
+        assert_eq!(reg.get_for_scope(3, "alpha_item").unwrap().size, 4);
+        assert_eq!(reg.get_for_scope(3, "beta_item").unwrap().size, 8);
+        assert_eq!(
+            reg.get("alpha_item").unwrap().owner_module.as_deref(),
+            Some("alpha_m")
+        );
+        assert_eq!(
+            reg.get("beta_item").unwrap().owner_module.as_deref(),
+            Some("beta_m")
+        );
     }
 
     /// Helper: build a component declaration for testing compute_layout.
@@ -1624,6 +1982,8 @@ mod tests {
         reg.insert(TypeLayout {
             name: "node_t".into(),
             owner_module: None,
+            owner_scope: None,
+            owner_path: None,
             size: 16,
             align: 8,
             fields: vec![],

@@ -612,6 +612,12 @@ pub(super) fn load_external_module(
 
     // Register type layouts.
     for layout in &iface.types {
+        let mut layout = layout.clone();
+        layout
+            .owner_module
+            .get_or_insert_with(|| module_name.to_string());
+        layout.owner_scope = Some(scope_id);
+        layout.owner_path = Some(module_name.to_ascii_lowercase());
         type_layouts.insert(layout.clone());
         // Also add a DerivedType symbol.
         let attrs = SymbolAttrs {

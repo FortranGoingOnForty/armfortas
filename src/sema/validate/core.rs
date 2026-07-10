@@ -272,7 +272,14 @@ pub fn validate_file_with_warning_groups(
     warn_pedantic: bool,
     warn_deprecated: bool,
 ) -> Vec<Diagnostic> {
-    let mut ctx = Ctx::new(st, std, warn_pedantic, warn_deprecated);
+    let mut type_layouts = crate::sema::type_layout::TypeLayoutRegistry::new();
+    crate::sema::resolve::compute_all_layouts(
+        crate::target::TargetLayout::LP64,
+        units,
+        st,
+        &mut type_layouts,
+    );
+    let mut ctx = Ctx::new_with_layouts(st, std, &type_layouts, warn_pedantic, warn_deprecated);
     for unit in units {
         validate_unit(&mut ctx, unit);
     }
@@ -2728,6 +2735,21 @@ fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
                 components,
                 decl.span,
             );
+            let has_inline_cycle = ctx.type_layouts.is_some_and(|layouts| {
+                layouts
+                    .get_for_scope(ctx.scope_id, name)
+                    .or_else(|| layouts.get(name))
+                    .is_some_and(|layout| layouts.has_inline_storage_cycle(layout))
+            });
+            if has_inline_cycle {
+                ctx.error(
+                    decl.span,
+                    format!(
+                        "derived type '{}' has a recursive component that requires infinite inline storage; make the recursive component POINTER or ALLOCATABLE",
+                        name
+                    ),
+                );
+            }
         }
     }
 }
@@ -4496,6 +4518,48 @@ end program
 ",
         );
         assert!(!errs.iter().any(|e| e.contains("expected")), "{:?}", errs);
+    }
+
+    #[test]
+    fn rejects_recursive_inline_storage_cycles() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  type :: node_t
+    type(node_t) :: child
+  end type
+end program
+",
+        );
+        assert!(
+            errs.iter()
+                .any(|err| err.contains("infinite inline storage")),
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn accepts_pointer_and_allocatable_recursive_components() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  type :: node_t
+    type(node_t), pointer :: next
+    type(node_t), allocatable :: children(:)
+  end type
+end program
+",
+        );
+        assert!(
+            !errs
+                .iter()
+                .any(|err| err.contains("infinite inline storage")),
+            "{:?}",
+            errs
+        );
     }
 
     #[test]

@@ -508,8 +508,12 @@ pub fn write_amod(
         }
     }
     for key in &type_exports {
-        if let Some(layout) = type_layouts.get(key) {
-            emit_type(&mut out, &layout.name, type_layouts);
+        if let Some(layout) = type_layouts
+            .get_for_scope(mod_scope_id, key)
+            .or_else(|| type_layouts.get(key))
+        {
+            let canonical = type_layouts.canonical_key_for_layout(layout);
+            emit_type(&mut out, &canonical, type_layouts);
         }
     }
 
@@ -1146,8 +1150,8 @@ fn touches_globals(func: &Function) -> bool {
 }
 
 fn emit_type(out: &mut String, name: &str, type_layouts: &TypeLayoutRegistry) {
-    writeln!(out, "@type {}", name).unwrap();
     if let Some(layout) = type_layouts.get(&name.to_lowercase()) {
+        writeln!(out, "@type {}", layout.name).unwrap();
         writeln!(out, "  @layout size={} align={}", layout.size, layout.align).unwrap();
         if let Some(ref parent) = layout.parent {
             writeln!(out, "  @extends {}", parent).unwrap();
@@ -2381,9 +2385,14 @@ fn parse_type(
         }
     }
 
+    let owner_path = owner_module
+        .as_ref()
+        .map(|owner| owner.to_ascii_lowercase());
     TypeLayout {
         name,
         owner_module,
+        owner_scope: None,
+        owner_path,
         size,
         align,
         fields,

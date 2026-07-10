@@ -610,6 +610,52 @@ fn use_rename() {
     );
 }
 
+#[test]
+fn same_named_imported_types_keep_module_owned_layouts() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=same_named_imported_types_keep_module_owned_layouts count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let alpha_f90 = dir.join("alpha_m.f90");
+    let beta_f90 = dir.join("beta_m.f90");
+    let main_f90 = dir.join("main.f90");
+    let alpha_o = dir.join("alpha_m.o");
+    let beta_o = dir.join("beta_m.o");
+    let main_o = dir.join("main.o");
+    let binary = dir.join("test_bin");
+
+    std::fs::write(
+        &alpha_f90,
+        "module alpha_m\n  implicit none\n  type :: item_t\n    integer :: value = 0\n  end type\nend module\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &beta_f90,
+        "module beta_m\n  implicit none\n  type :: item_t\n    integer :: pad = -1\n    integer(8) :: value = 0\n  end type\nend module\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &main_f90,
+        "program p\n  use alpha_m, only: alpha_item => item_t\n  use beta_m, only: beta_item => item_t\n  implicit none\n  type(alpha_item) :: alpha\n  type(beta_item) :: beta\n  alpha%value = 17\n  beta%pad = 23\n  beta%value = 5000000000_8\n  if (alpha%value /= 17) error stop 1\n  if (beta%pad /= 23) error stop 2\n  if (beta%value /= 5000000000_8) error stop 3\n  print *, 'ok'\nend program\n",
+    )
+    .unwrap();
+
+    compile_file(&compiler, &alpha_f90, &alpha_o, None);
+    compile_file(&compiler, &beta_f90, &beta_o, None);
+    compile_file(&compiler, &main_f90, &main_o, Some(&dir));
+    link_files(&[&alpha_o, &beta_o, &main_o], &binary);
+    let output = run_binary(&binary);
+    assert!(output.contains("ok"), "unexpected output:\n{}", output);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Generic interface resolved across .amod boundaries: the consumer
 /// reconstructs the NamedInterface from the @interface block and
 /// dispatches each specific at the call site.

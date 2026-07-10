@@ -20811,8 +20811,13 @@ pub(super) fn canonical_layout_type_name_for_scope(
     raw_name: &str,
     tl: &crate::sema::type_layout::TypeLayoutRegistry,
 ) -> Option<String> {
-    if tl.get(raw_name).is_some() {
-        return Some(raw_name.to_string());
+    if let Some(scope_id) = scope_id {
+        if let Some(canonical) = tl.canonical_name_for_scope(scope_id, raw_name) {
+            return Some(canonical);
+        }
+    }
+    if let Some(layout) = tl.get(raw_name) {
+        return Some(tl.canonical_key_for_layout(layout));
     }
     let key = raw_name.to_lowercase();
     let sym = scope_id
@@ -20822,7 +20827,12 @@ pub(super) fn canonical_layout_type_name_for_scope(
     if sym.kind != crate::sema::symtab::SymbolKind::DerivedType {
         return None;
     }
-    tl.get(&sym.name).map(|_| sym.name.clone())
+    scope_id
+        .and_then(|scope_id| tl.canonical_name_for_scope(scope_id, &sym.name))
+        .or_else(|| {
+            tl.get(&sym.name)
+                .map(|layout| tl.canonical_key_for_layout(layout))
+        })
 }
 
 pub(super) fn resolve_polymorphic_component_method_base_for_dispatch(
