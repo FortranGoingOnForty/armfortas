@@ -371,7 +371,10 @@ fn is_c_interop_pointer_typespec(ts: &crate::ast::decl::TypeSpec) -> bool {
 /// Returns None when the kind can't be determined statically — the
 /// caller must not reject on an unknown kind. `real*16` (the old-style
 /// `Star` selector) is evaluated the same way.
-fn eval_real_complex_kind(ctx: &Ctx<'_>, sel: &Option<crate::ast::decl::KindSelector>) -> Option<u8> {
+fn eval_real_complex_kind(
+    ctx: &Ctx<'_>,
+    sel: &Option<crate::ast::decl::KindSelector>,
+) -> Option<u8> {
     use crate::ast::decl::KindSelector;
     use crate::ast::expr::Expr;
     let (KindSelector::Expr(e) | KindSelector::Star(e)) = sel.as_ref()?;
@@ -2240,7 +2243,9 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
                     result_ts,
                     Some(crate::ast::decl::TypeSpec::Type(_))
                         | Some(crate::ast::decl::TypeSpec::Class(_))
-                ) && !result_ts.as_ref().is_some_and(is_c_interop_pointer_typespec)
+                ) && !result_ts
+                    .as_ref()
+                    .is_some_and(is_c_interop_pointer_typespec)
                 {
                     ctx.error(
                         unit.span,
@@ -4163,43 +4168,114 @@ fn check_expr_names(
 fn intrinsic_arity(name: &str) -> Option<(usize, Option<usize>)> {
     Some(match name {
         // Exactly one argument.
-        "abs" | "iabs" | "dabs" | "cabs" | "conjg" | "aimag" | "dimag" | "acos" | "asin"
-        | "acosh" | "asinh" | "atanh" | "cos" | "sin" | "tan" | "cosh" | "sinh" | "tanh"
-        | "exp" | "log" | "log10" | "sqrt" | "dsqrt" | "gamma" | "log_gamma" | "erf"
-        | "erfc" | "fraction" | "exponent" | "trim" | "adjustl" | "adjustr" | "allocated"
-        | "present" | "kind" | "precision" | "range" | "radix" | "digits" | "huge"
-        | "tiny" | "epsilon" | "maxexponent" | "minexponent" | "bit_size" | "popcnt"
-        | "poppar" | "leadz" | "trailz" | "not" | "sngl" | "float" | "dfloat" | "idint"
-        | "ifix" | "idnint" | "dnint" | "dint" | "acosd" | "asind" | "cosd" | "sind"
-        | "tand" | "acospi" | "asinpi" | "cospi" | "sinpi" | "tanpi"
-        | "selected_logical_kind" | "selected_int_kind" | "selected_char_kind"
-        | "is_iostat_end" | "is_iostat_eor" | "c_loc" | "c_funloc" | "c_sizeof"
-        | "new_line" | "transpose" | "dble" | "random_number" | "cpu_time"
-        | "ieee_is_nan" | "ieee_is_finite" | "ieee_is_normal" => (1, Some(1)),
+        "abs"
+        | "iabs"
+        | "dabs"
+        | "cabs"
+        | "conjg"
+        | "aimag"
+        | "dimag"
+        | "acos"
+        | "asin"
+        | "acosh"
+        | "asinh"
+        | "atanh"
+        | "cos"
+        | "sin"
+        | "tan"
+        | "cosh"
+        | "sinh"
+        | "tanh"
+        | "exp"
+        | "log"
+        | "log10"
+        | "sqrt"
+        | "dsqrt"
+        | "gamma"
+        | "log_gamma"
+        | "erf"
+        | "erfc"
+        | "fraction"
+        | "exponent"
+        | "trim"
+        | "adjustl"
+        | "adjustr"
+        | "allocated"
+        | "present"
+        | "kind"
+        | "precision"
+        | "range"
+        | "radix"
+        | "digits"
+        | "huge"
+        | "tiny"
+        | "epsilon"
+        | "maxexponent"
+        | "minexponent"
+        | "bit_size"
+        | "popcnt"
+        | "poppar"
+        | "leadz"
+        | "trailz"
+        | "not"
+        | "sngl"
+        | "float"
+        | "dfloat"
+        | "idint"
+        | "ifix"
+        | "idnint"
+        | "dnint"
+        | "dint"
+        | "acosd"
+        | "asind"
+        | "cosd"
+        | "sind"
+        | "tand"
+        | "acospi"
+        | "asinpi"
+        | "cospi"
+        | "sinpi"
+        | "tanpi"
+        | "selected_logical_kind"
+        | "selected_int_kind"
+        | "selected_char_kind"
+        | "is_iostat_end"
+        | "is_iostat_eor"
+        | "c_loc"
+        | "c_funloc"
+        | "c_sizeof"
+        | "new_line"
+        | "transpose"
+        | "dble"
+        | "random_number"
+        | "cpu_time"
+        | "ieee_is_nan"
+        | "ieee_is_finite"
+        | "ieee_is_normal" => (1, Some(1)),
         // Exactly two.
-        "atan2" | "atan2d" | "atan2pi" | "hypot" | "mod" | "modulo" | "sign" | "dim"
-        | "dprod" | "lge" | "lgt" | "lle" | "llt" | "bge" | "bgt" | "ble" | "blt"
-        | "ishft" | "shiftl" | "shiftr" | "shifta" | "ibset" | "ibclr" | "btest"
-        | "iand" | "ior" | "ieor" | "matmul" | "dot_product" | "scale" | "repeat"
-        | "ieee_copy_sign" | "ieee_unordered" => (2, Some(2)),
+        "atan2" | "atan2d" | "atan2pi" | "hypot" | "mod" | "modulo" | "sign" | "dim" | "dprod"
+        | "lge" | "lgt" | "lle" | "llt" | "bge" | "bgt" | "ble" | "blt" | "ishft" | "shiftl"
+        | "shiftr" | "shifta" | "ibset" | "ibclr" | "btest" | "iand" | "ior" | "ieor"
+        | "matmul" | "dot_product" | "scale" | "repeat" | "ieee_copy_sign" | "ieee_unordered" => {
+            (2, Some(2))
+        }
         // Exactly three.
         "ibits" | "merge" | "merge_bits" | "dshiftl" | "dshiftr" | "unpack" | "spread" => {
             (3, Some(3))
         }
         // Optional-argument ranges (F2023 16.9 per-procedure).
-        "atan" | "atand" | "atanpi" | "aint" | "anint" | "nint" | "int" | "real"
-        | "logical" | "char" | "ichar" | "achar" | "iachar" | "len" | "len_trim"
-        | "floor" | "ceiling" | "maskl" | "maskr" | "shape" | "storage_size"
-        | "associated" | "any" | "all" | "norm2" | "f_c_string" | "iall" | "iany"
-        | "iparity" | "parity" => (1, Some(2)),
-        "cmplx" | "size" | "lbound" | "ubound" | "sum" | "product" | "maxval"
-        | "minval" | "count" | "selected_real_kind" => (1, Some(3)),
+        "atan" | "atand" | "atanpi" | "aint" | "anint" | "nint" | "int" | "real" | "logical"
+        | "char" | "ichar" | "achar" | "iachar" | "len" | "len_trim" | "floor" | "ceiling"
+        | "maskl" | "maskr" | "shape" | "storage_size" | "associated" | "any" | "all" | "norm2"
+        | "f_c_string" | "iall" | "iany" | "iparity" | "parity" => (1, Some(2)),
+        "cmplx" | "size" | "lbound" | "ubound" | "sum" | "product" | "maxval" | "minval"
+        | "count" | "selected_real_kind" => (1, Some(3)),
         "ishftc" | "pack" | "transfer" | "c_f_strpointer" | "cshift" => (2, Some(3)),
         "index" | "scan" | "verify" | "reshape" | "eoshift" => (2, Some(4)),
         "null" => (0, Some(1)),
         "mvbits" => (5, Some(5)),
-        "max" | "min" | "max0" | "min0" | "max1" | "min1" | "amax0" | "amin0"
-        | "amax1" | "amin1" | "dmax1" | "dmin1" => (2, None),
+        "max" | "min" | "max0" | "min0" | "max1" | "min1" | "amax0" | "amin0" | "amax1"
+        | "amin1" | "dmax1" | "dmin1" => (2, None),
         "maxloc" | "minloc" => (1, Some(5)),
         "findloc" => (2, Some(6)),
         "move_alloc" => (2, Some(4)),
@@ -4298,7 +4374,11 @@ pub(super) fn check_intrinsic_call_arity(
         (a, Some(b)) => format!("{} to {}", a, b),
         (a, None) => format!("at least {}", a),
     };
-    let noun = if expect == "1" { "argument" } else { "arguments" };
+    let noun = if expect == "1" {
+        "argument"
+    } else {
+        "arguments"
+    };
     ctx.error(
         span,
         format!(

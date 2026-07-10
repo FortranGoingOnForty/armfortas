@@ -67,11 +67,13 @@ fn scratch_filename(unit: i32) -> Vec<u8> {
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
     let dir = std::env::temp_dir();
-    os_string_to_bytes(dir.join(format!(
-        "afs_scratch_{pid}_{}_{seq}.tmp",
-        unit.unsigned_abs()
-    ))
-    .into_os_string())
+    os_string_to_bytes(
+        dir.join(format!(
+            "afs_scratch_{pid}_{}_{seq}.tmp",
+            unit.unsigned_abs()
+        ))
+        .into_os_string(),
+    )
 }
 
 #[inline]
@@ -2516,7 +2518,10 @@ pub extern "C" fn afs_write_namelist(
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     let mut status = 0;
     if let Some(u) = state.get_unit(unit) {
-        remember_io_status(&mut status, u.write_str(&format!(" &{}", gname.to_uppercase())));
+        remember_io_status(
+            &mut status,
+            u.write_str(&format!(" &{}", gname.to_uppercase())),
+        );
 
         if !entries.is_null() && n_entries > 0 {
             let slice = unsafe { std::slice::from_raw_parts(entries, n_entries as usize) };
@@ -5122,13 +5127,7 @@ pub extern "C" fn afs_fmt_read_string(
                         store_formatted_char_result(&field, dest, dest_len, size_out, iostat);
                     }
                     _ => {
-                        store_formatted_char_error(
-                            dest,
-                            dest_len,
-                            size_out,
-                            IOSTAT_EOR,
-                            iostat,
-                        );
+                        store_formatted_char_error(dest, dest_len, size_out, IOSTAT_EOR, iostat);
                     }
                 }
                 return;
@@ -6363,10 +6362,7 @@ mod tests {
 
     #[test]
     fn internal_list_directed_integer_kinds_use_gfortran_widths() {
-        let expected = format!(
-            "{:>5}{:>7}{:>12}{:>21}{:>41}",
-            0i8, 0i16, 0i32, 0i64, 0i128
-        );
+        let expected = format!("{:>5}{:>7}{:>12}{:>21}{:>41}", 0i8, 0i16, 0i32, 0i64, 0i128);
         let mut buf = [b'.'; 100];
         let mut write_pos = 0i64;
 

@@ -2612,10 +2612,7 @@ fn find_libsystem_tbd() -> Result<String, String> {
     }
 }
 
-fn maybe_refresh_runtime_lib(
-    workspace_root: &Path,
-    profile: RuntimeProfile,
-) -> Result<(), String> {
+fn maybe_refresh_runtime_lib(workspace_root: &Path, profile: RuntimeProfile) -> Result<(), String> {
     let runtime_dir = workspace_root.join("runtime");
     if !runtime_dir.join("Cargo.toml").exists() {
         return Ok(());

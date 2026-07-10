@@ -366,7 +366,7 @@ impl<'a> Parser<'a> {
 
                 // ELSE (no IF)
                 self.advance(); // else
-                // Optional construct name on the same line (`else blk`).
+                                // Optional construct name on the same line (`else blk`).
                 if self.peek() == &TokenKind::Identifier && !self.at_stmt_end() {
                     self.advance();
                 }
@@ -2028,14 +2028,15 @@ mod tests {
         assert_eq!(inner_var.as_deref(), Some("j"));
         assert!(*shared_terminating_label);
         assert_eq!(inner_body.len(), 1);
-        assert!(matches!(inner_body[0].node, Stmt::Labeled { label: 10, .. }));
+        assert!(matches!(
+            inner_body[0].node,
+            Stmt::Labeled { label: 10, .. }
+        ));
     }
 
     #[test]
     fn do_shared_terminating_label_three_deep() {
-        let s = parse_one(
-            "do 10 i = 1, 2\n  do 10 j = 1, 2\n    do 10 k = 1, 2\n10 continue\n",
-        );
+        let s = parse_one("do 10 i = 1, 2\n  do 10 j = 1, 2\n    do 10 k = 1, 2\n10 continue\n");
         let Stmt::DoLoop {
             body: outer_body, ..
         } = &s.node
@@ -2061,7 +2062,10 @@ mod tests {
         assert!(*middle_shared);
         assert!(*inner_shared);
         assert_eq!(inner_body.len(), 1);
-        assert!(matches!(inner_body[0].node, Stmt::Labeled { label: 10, .. }));
+        assert!(matches!(
+            inner_body[0].node,
+            Stmt::Labeled { label: 10, .. }
+        ));
     }
 
     #[test]

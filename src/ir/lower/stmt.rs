@@ -89,12 +89,7 @@ fn emit_scalar_class_star_char_source_copy_on_success(
     b.set_block(done_bb);
 }
 
-fn finalize_assignment_lhs(
-    b: &mut FuncBuilder,
-    ctx: &LowerCtx,
-    type_name: &str,
-    dest: ValueId,
-) {
+fn finalize_assignment_lhs(b: &mut FuncBuilder, ctx: &LowerCtx, type_name: &str, dest: ValueId) {
     if let Some(layout) = ctx.type_layouts.get(type_name) {
         finalize_derived_storage(
             b,
@@ -125,10 +120,7 @@ fn stabilize_finalized_assignment_rhs(
     }
 }
 
-fn finalizable_function_result_type_name(
-    ctx: &LowerCtx,
-    expr: &SpannedExpr,
-) -> Option<String> {
+fn finalizable_function_result_type_name(ctx: &LowerCtx, expr: &SpannedExpr) -> Option<String> {
     let Expr::FunctionCall { callee, .. } = &expr.node else {
         return None;
     };
@@ -136,8 +128,7 @@ fn finalizable_function_result_type_name(
         return None;
     };
     let key = name.to_lowercase();
-    let abi_lookup_keys =
-        procedure_abi_lookup_keys_for_call_target(ctx.st, name.as_str(), &[&key]);
+    let abi_lookup_keys = procedure_abi_lookup_keys_for_call_target(ctx.st, name.as_str(), &[&key]);
     let hidden_abi =
         first_procedure_lookup(&abi_lookup_keys, |k| callee_hidden_result_abi(ctx.st, k))?;
     if hidden_abi != HiddenResultAbi::DerivedAggregate {
@@ -198,11 +189,7 @@ fn copy_array_result_to_fixed_dest(
     );
 }
 
-fn copy_array_result_to_descriptor_dest(
-    b: &mut FuncBuilder,
-    info: &LocalInfo,
-    src_desc: ValueId,
-) {
+fn copy_array_result_to_descriptor_dest(b: &mut FuncBuilder, info: &LocalInfo, src_desc: ValueId) {
     let dest_desc = array_descriptor_addr(b, info);
     let null_stat = b.const_i64(0);
     b.call(
@@ -243,7 +230,8 @@ fn lower_where_mask_value(
             Some(ctx.contained_host_refs),
             Some(ctx.descriptor_params),
         ) {
-            let tmp_desc = allocate_like_array_temp_descriptor_with_elem_type(b, source_desc, &elem_ty);
+            let tmp_desc =
+                allocate_like_array_temp_descriptor_with_elem_type(b, source_desc, &elem_ty);
             let stat = b.alloca(IrType::Int(IntWidth::I32));
             let zero = b.const_i32(0);
             b.store(zero, stat);
@@ -1937,27 +1925,24 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         None
                                     };
                                     let dynamic_source_copy_plan = rhs_scalar_desc.and_then(|_| {
-                                        info.derived_type
-                                            .as_ref()
-                                            .map(|base| {
-                                                ScalarAllocSourceCopyPlan::Dynamic(base.clone())
-                                            })
+                                        info.derived_type.as_ref().map(|base| {
+                                            ScalarAllocSourceCopyPlan::Dynamic(base.clone())
+                                        })
                                     });
-                                    let assign_type_name = if info.is_class
-                                        && rhs_scalar_desc.is_none()
-                                    {
-                                        expr_type_layout(
-                                            value,
-                                            Some(&ctx.locals),
-                                            ctx.st,
-                                            ctx.type_layouts,
-                                        )
+                                    let assign_type_name =
+                                        if info.is_class && rhs_scalar_desc.is_none() {
+                                            expr_type_layout(
+                                                value,
+                                                Some(&ctx.locals),
+                                                ctx.st,
+                                                ctx.type_layouts,
+                                            )
                                             .filter(|layout| !layout.is_abstract)
                                             .map(|layout| layout.name.clone())
-                                    } else {
-                                        None
-                                    }
-                                    .or_else(|| info.derived_type.clone());
+                                        } else {
+                                            None
+                                        }
+                                        .or_else(|| info.derived_type.clone());
                                     let allocated = b.call(
                                         FuncRef::External("afs_allocated".into()),
                                         vec![desc],
@@ -1974,17 +1959,13 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                             load_array_desc_i64_field(b, desc, 8);
                                         let source_elem_size =
                                             load_array_desc_i64_field(b, source_desc, 8);
-                                        let size_mismatch = b.icmp(
-                                            CmpOp::Ne,
-                                            current_elem_size,
-                                            source_elem_size,
-                                        );
+                                        let size_mismatch =
+                                            b.icmp(CmpOp::Ne, current_elem_size, source_elem_size);
                                         let current_tag = load_array_desc_type_tag(b, desc);
                                         let source_tag = load_array_desc_type_tag(b, source_desc);
                                         let tag_mismatch =
                                             b.icmp(CmpOp::Ne, current_tag, source_tag);
-                                        let storage_mismatch =
-                                            b.or(size_mismatch, tag_mismatch);
+                                        let storage_mismatch = b.or(size_mismatch, tag_mismatch);
                                         b.or(needs_alloc, storage_mismatch)
                                     } else if info.is_class {
                                         if let Some(ref tn) = assign_type_name {
@@ -3999,8 +3980,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         );
                         return;
                     }
-                    let (fmt_ptr, fmt_len) =
-                        lower_format_expr(b, ctx, &fmt_control.unwrap().value);
+                    let (fmt_ptr, fmt_len) = lower_format_expr(b, ctx, &fmt_control.unwrap().value);
                     b.call(
                         FuncRef::External("afs_fmt_begin_internal_alloc".into()),
                         vec![desc, fmt_ptr, fmt_len, iostat_ptr, iomsg_ptr, iomsg_len],
@@ -4010,8 +3990,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     for item in items {
                         lower_fmt_push(b, ctx, item);
                     }
-                    let adv = advance_runtime
-                        .unwrap_or_else(|| b.const_i32(if advance { 1 } else { 0 }));
+                    let adv =
+                        advance_runtime.unwrap_or_else(|| b.const_i32(if advance { 1 } else { 0 }));
                     b.call(
                         FuncRef::External("afs_fmt_end".into()),
                         vec![adv],
@@ -4030,8 +4010,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         lower_internal_write_items(b, ctx, items, base, elem_len);
                         return;
                     }
-                    let (fmt_ptr, fmt_len) =
-                        lower_format_expr(b, ctx, &fmt_control.unwrap().value);
+                    let (fmt_ptr, fmt_len) = lower_format_expr(b, ctx, &fmt_control.unwrap().value);
                     b.call(
                         FuncRef::External("afs_fmt_begin_internal_array".into()),
                         vec![
@@ -4044,8 +4023,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     for item in items {
                         lower_fmt_push(b, ctx, item);
                     }
-                    let adv = advance_runtime
-                        .unwrap_or_else(|| b.const_i32(if advance { 1 } else { 0 }));
+                    let adv =
+                        advance_runtime.unwrap_or_else(|| b.const_i32(if advance { 1 } else { 0 }));
                     b.call(
                         FuncRef::External("afs_fmt_end".into()),
                         vec![adv],
@@ -5510,8 +5489,12 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         n,
                         else_body,
                         |b, _ctx, i_val| {
-                            let pending =
-                                where_pending_mask_at(b, i_val, &main_mask_value, &elsewhere_mask_values);
+                            let pending = where_pending_mask_at(
+                                b,
+                                i_val,
+                                &main_mask_value,
+                                &elsewhere_mask_values,
+                            );
                             let masked = where_mask_value_at(b, &else_mask, i_val);
                             b.and(pending, masked)
                         },
@@ -5526,7 +5509,12 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         n,
                         else_body,
                         |b, _ctx, i_val| {
-                            where_pending_mask_at(b, i_val, &main_mask_value, &elsewhere_mask_values)
+                            where_pending_mask_at(
+                                b,
+                                i_val,
+                                &main_mask_value,
+                                &elsewhere_mask_values,
+                            )
                         },
                     );
                     break;
@@ -6338,14 +6326,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             } else {
                                 None
                             };
-                            let source_intrinsic_elem_ty =
-                                if field_is_class_star && source_desc.is_none() {
-                                    source_expr.and_then(|expr| {
-                                        class_star_intrinsic_source_ir_type(ctx, expr)
-                                    })
-                                } else {
-                                    None
-                                };
+                            let source_intrinsic_elem_ty = if field_is_class_star
+                                && source_desc.is_none()
+                            {
+                                source_expr
+                                    .and_then(|expr| class_star_intrinsic_source_ir_type(ctx, expr))
+                            } else {
+                                None
+                            };
                             let source_char_elem_size =
                                 if field_is_class_star && rank == 0 && source_char.is_some() {
                                     char_alloc_len
@@ -6561,55 +6549,52 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     None
                                 };
                                 let field_type_name = field_derived_type_name(&field);
-                                let type_tag =
-                                    if source_desc.is_some() || mold_metadata_desc.is_some() {
-                                        None
-                                    } else if let Some(source_expr) = source_expr {
-                                        (if field_is_class_star {
-                                            class_star_intrinsic_source_tag_value(
-                                                b,
-                                                ctx,
-                                                source_expr,
-                                            )
-                                        } else {
-                                            None
-                                        })
-                                        .or_else(|| {
-                                            expr_type_tag_value(
-                                                b,
-                                                source_expr,
-                                                Some(&ctx.locals),
-                                                ctx.st,
-                                                ctx.type_layouts,
-                                            )
-                                        })
-                                        .or_else(|| {
-                                            static_alloc_target_type_tag_value(
-                                                b,
-                                                item,
-                                                ctx.st,
-                                                ctx.type_layouts,
-                                            )
-                                        })
-                                    } else if let Some(tag) = mold_static_type_tag {
-                                        Some(tag)
-                                    } else if let Some(tag) = typed_type_tag {
-                                        Some(tag)
+                                let type_tag = if source_desc.is_some()
+                                    || mold_metadata_desc.is_some()
+                                {
+                                    None
+                                } else if let Some(source_expr) = source_expr {
+                                    (if field_is_class_star {
+                                        class_star_intrinsic_source_tag_value(b, ctx, source_expr)
                                     } else {
-                                        derived_type_tag_value(
+                                        None
+                                    })
+                                    .or_else(|| {
+                                        expr_type_tag_value(
                                             b,
-                                            field_type_name.as_deref(),
+                                            source_expr,
+                                            Some(&ctx.locals),
+                                            ctx.st,
                                             ctx.type_layouts,
                                         )
-                                        .or_else(|| {
-                                            static_alloc_target_type_tag_value(
-                                                b,
-                                                item,
-                                                ctx.st,
-                                                ctx.type_layouts,
-                                            )
-                                        })
-                                    };
+                                    })
+                                    .or_else(|| {
+                                        static_alloc_target_type_tag_value(
+                                            b,
+                                            item,
+                                            ctx.st,
+                                            ctx.type_layouts,
+                                        )
+                                    })
+                                } else if let Some(tag) = mold_static_type_tag {
+                                    Some(tag)
+                                } else if let Some(tag) = typed_type_tag {
+                                    Some(tag)
+                                } else {
+                                    derived_type_tag_value(
+                                        b,
+                                        field_type_name.as_deref(),
+                                        ctx.type_layouts,
+                                    )
+                                    .or_else(|| {
+                                        static_alloc_target_type_tag_value(
+                                            b,
+                                            item,
+                                            ctx.st,
+                                            ctx.type_layouts,
+                                        )
+                                    })
+                                };
                                 let vtable =
                                     if source_desc.is_some() || mold_metadata_desc.is_some() {
                                         None
@@ -6786,14 +6771,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             } else {
                                 None
                             };
-                            let source_intrinsic_elem_ty =
-                                if local_is_class_star && source_desc.is_none() {
-                                    source_expr.and_then(|expr| {
-                                        class_star_intrinsic_source_ir_type(ctx, expr)
-                                    })
-                                } else {
-                                    None
-                                };
+                            let source_intrinsic_elem_ty = if local_is_class_star
+                                && source_desc.is_none()
+                            {
+                                source_expr
+                                    .and_then(|expr| class_star_intrinsic_source_ir_type(ctx, expr))
+                            } else {
+                                None
+                            };
                             let dynamic_layout = source_scalar_layout
                                 .or(mold_static_layout)
                                 .or(typed_layout)
@@ -7009,55 +6994,52 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 } else {
                                     None
                                 };
-                                let type_tag =
-                                    if source_desc.is_some() || mold_metadata_desc.is_some() {
-                                        None
-                                    } else if let Some(source_expr) = source_expr {
-                                        (if local_is_class_star {
-                                            class_star_intrinsic_source_tag_value(
-                                                b,
-                                                ctx,
-                                                source_expr,
-                                            )
-                                        } else {
-                                            None
-                                        })
-                                        .or_else(|| {
-                                            expr_type_tag_value(
-                                                b,
-                                                source_expr,
-                                                Some(&ctx.locals),
-                                                ctx.st,
-                                                ctx.type_layouts,
-                                            )
-                                        })
-                                        .or_else(|| {
-                                            static_alloc_target_type_tag_value(
-                                                b,
-                                                item,
-                                                ctx.st,
-                                                ctx.type_layouts,
-                                            )
-                                        })
-                                    } else if let Some(tag) = mold_static_type_tag {
-                                        Some(tag)
-                                    } else if let Some(tag) = typed_type_tag {
-                                        Some(tag)
+                                let type_tag = if source_desc.is_some()
+                                    || mold_metadata_desc.is_some()
+                                {
+                                    None
+                                } else if let Some(source_expr) = source_expr {
+                                    (if local_is_class_star {
+                                        class_star_intrinsic_source_tag_value(b, ctx, source_expr)
                                     } else {
-                                        derived_type_tag_value(
+                                        None
+                                    })
+                                    .or_else(|| {
+                                        expr_type_tag_value(
                                             b,
-                                            info.derived_type.as_deref(),
+                                            source_expr,
+                                            Some(&ctx.locals),
+                                            ctx.st,
                                             ctx.type_layouts,
                                         )
-                                        .or_else(|| {
-                                            static_alloc_target_type_tag_value(
-                                                b,
-                                                item,
-                                                ctx.st,
-                                                ctx.type_layouts,
-                                            )
-                                        })
-                                    };
+                                    })
+                                    .or_else(|| {
+                                        static_alloc_target_type_tag_value(
+                                            b,
+                                            item,
+                                            ctx.st,
+                                            ctx.type_layouts,
+                                        )
+                                    })
+                                } else if let Some(tag) = mold_static_type_tag {
+                                    Some(tag)
+                                } else if let Some(tag) = typed_type_tag {
+                                    Some(tag)
+                                } else {
+                                    derived_type_tag_value(
+                                        b,
+                                        info.derived_type.as_deref(),
+                                        ctx.type_layouts,
+                                    )
+                                    .or_else(|| {
+                                        static_alloc_target_type_tag_value(
+                                            b,
+                                            item,
+                                            ctx.st,
+                                            ctx.type_layouts,
+                                        )
+                                    })
+                                };
                                 let vtable =
                                     if source_desc.is_some() || mold_metadata_desc.is_some() {
                                         None
@@ -8226,14 +8208,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 iomsg_arg_ptr,
                 read_iomsg_len,
             ) {
-                lower_read_status_branches(
-                    b,
-                    ctx,
-                    end_label,
-                    err_label,
-                    iostat_addr,
-                    user_iostat,
-                );
+                lower_read_status_branches(b, ctx, end_label, err_label, iostat_addr, user_iostat);
                 return;
             }
             if is_list_directed {
@@ -8997,14 +8972,12 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             && (!arr_info.dims.is_empty()
                                 || arr_info.allocatable
                                 || arr_info.descriptor_arg)
-                            && val_args
-                                .iter()
-                                .any(|arg| {
-                                    matches!(
-                                        arg.value,
-                                        crate::ast::expr::SectionSubscript::Range { .. }
-                                    )
-                                })
+                            && val_args.iter().any(|arg| {
+                                matches!(
+                                    arg.value,
+                                    crate::ast::expr::SectionSubscript::Range { .. }
+                                )
+                            })
                         {
                             let src_desc = lower_array_section(
                                 b,
