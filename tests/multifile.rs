@@ -172,6 +172,48 @@ fn output_contains_expected(output: &str, expected: &str) -> bool {
 // ---- Tests ----
 
 #[test]
+fn combined_compile_preserves_target_and_preprocessor_options() {
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    for name in ["one.F90", "two.F90"] {
+        std::fs::write(
+            dir.join(name),
+            format!(
+                "#ifndef AUDIT_FLAG\n#error AUDIT_FLAG was dropped\n#endif\nsubroutine {}()\nend subroutine\n",
+                name.trim_end_matches(".F90")
+            ),
+        )
+        .unwrap();
+    }
+
+    let result = Command::new(&compiler)
+        .current_dir(&dir)
+        .args([
+            "--target",
+            "x86_64-freebsd",
+            "-DAUDIT_FLAG",
+            "-c",
+            "one.F90",
+            "two.F90",
+        ])
+        .output()
+        .expect("compiler launch failed");
+    assert!(
+        result.status.success(),
+        "combined compile failed:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    for name in ["one.o", "two.o"] {
+        let bytes = std::fs::read(dir.join(name)).expect("combined compile omitted object");
+        assert_eq!(&bytes[..4], b"\x7fELF", "{name} is not an ELF object");
+        assert_eq!(bytes[7], 9, "{name} did not preserve the FreeBSD target");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn basic_module_variable_and_subroutine() {
     if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
         eprintln!(

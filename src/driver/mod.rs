@@ -131,6 +131,7 @@ enum CliInputKind {
 }
 
 /// Compilation options.
+#[derive(Clone)]
 pub struct Options {
     // ---- I/O ----
     pub input: PathBuf,
@@ -2429,37 +2430,18 @@ pub fn compile_multi(opts: &Options) -> Result<(), String> {
             tmp_dir.join(format!("{}.o", stem))
         };
 
-        // Build a single-file Options for this source by inheriting
-        // the user-facing flags and overriding only the per-file bits.
-        let mut sub_opts = Options {
-            input: src.clone(),
-            extra_inputs: vec![],
-            output: Some(obj_path.clone()),
-            emit_obj: true,
-            ..Options::default()
-        };
-        sub_opts.opt_level = opts.opt_level;
-        sub_opts.std = opts.std;
-        sub_opts.source_form_override = opts.source_form_override;
-        sub_opts.default_integer_8 = opts.default_integer_8;
-        sub_opts.default_real_8 = opts.default_real_8;
-        sub_opts.force_implicit_none = opts.force_implicit_none;
-        sub_opts.recursive_default = opts.recursive_default;
-        sub_opts.backslash_escapes = opts.backslash_escapes;
-        sub_opts.max_stack_var_size = opts.max_stack_var_size;
-        sub_opts.warn_all = opts.warn_all;
-        sub_opts.warn_extra = opts.warn_extra;
-        sub_opts.warn_pedantic = opts.warn_pedantic;
-        sub_opts.warn_deprecated = opts.warn_deprecated;
-        sub_opts.warn_as_error = opts.warn_as_error;
-        sub_opts.disabled_warnings = opts.disabled_warnings.clone();
-        sub_opts.debug_info = opts.debug_info;
-        sub_opts.verbose = opts.verbose;
-        sub_opts.time_report = opts.time_report;
-        sub_opts.diagnostics_format = opts.diagnostics_format;
-        sub_opts.check_bounds = opts.check_bounds;
-        sub_opts.check_all = opts.check_all;
-        sub_opts.module_output_dir = opts.module_output_dir.clone();
+        // Preserve every compilation-affecting option. Only orchestration
+        // fields and mutually exclusive output modes differ for a child job.
+        let mut sub_opts = opts.clone();
+        sub_opts.input = src.clone();
+        sub_opts.extra_inputs.clear();
+        sub_opts.output = Some(obj_path.clone());
+        sub_opts.emit_asm = false;
+        sub_opts.emit_obj = true;
+        sub_opts.emit_ir = false;
+        sub_opts.emit_ast = false;
+        sub_opts.emit_tokens = false;
+        sub_opts.preprocess_only = false;
         sub_opts.module_search_paths = {
             let mut paths = opts.module_search_paths.clone();
             if let Some(tmp_dir) = tmp_dir.as_ref() {
