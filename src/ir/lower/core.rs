@@ -52980,7 +52980,7 @@ pub(super) fn derived_layout_needs_deep_copy(
         if field.allocatable && field.size == 384 {
             return true;
         }
-        if !field.pointer && !field.allocatable && field.dims.is_empty() {
+        if !field.pointer && !field.allocatable {
             if let Some(nested_name) = field_derived_type_name(field) {
                 return registry
                     .get(&nested_name)
@@ -54955,8 +54955,7 @@ fn emit_derived_value_copy_inline(
             continue;
         }
 
-        if field.dims.is_empty()
-            && !field.pointer
+        if !field.pointer
             && !field.allocatable
             && matches!(field.type_info, crate::sema::symtab::TypeInfo::Derived(_))
         {
@@ -54964,7 +54963,42 @@ fn emit_derived_value_copy_inline(
                 emit_memcpy_bytes(b, dest_field, src_field, field.size as i64);
                 continue;
             };
-            emit_derived_value_copy(b, type_layouts, &nested_name, dest_field, src_field);
+            if field.dims.is_empty() {
+                emit_derived_value_copy(b, type_layouts, &nested_name, dest_field, src_field);
+                continue;
+            }
+            let Some(nested_layout) = type_layouts.get(&nested_name) else {
+                emit_memcpy_bytes(b, dest_field, src_field, field.size as i64);
+                continue;
+            };
+            let elem_count: i64 = field.dims.iter().map(|(_, extent)| *extent).product();
+            if elem_count <= 0 {
+                continue;
+            }
+            let zero = b.const_i64(0);
+            let count = b.const_i64(elem_count);
+            let elem_bytes = b.const_i64(nested_layout.size as i64);
+            let check_bb = b.create_block("derived_fixed_array_copy_check");
+            let check_idx = b.add_block_param(check_bb, IrType::Int(IntWidth::I64));
+            let body_bb = b.create_block("derived_fixed_array_copy_body");
+            let body_idx = b.add_block_param(body_bb, IrType::Int(IntWidth::I64));
+            let done_bb = b.create_block("derived_fixed_array_copy_done");
+            b.branch(check_bb, vec![zero]);
+
+            b.set_block(check_bb);
+            let done = b.icmp(CmpOp::Ge, check_idx, count);
+            b.cond_branch(done, done_bb, vec![], body_bb, vec![check_idx]);
+
+            b.set_block(body_bb);
+            let elem_offset = b.imul(body_idx, elem_bytes);
+            let dest_elem = b.gep(dest_field, vec![elem_offset], IrType::Int(IntWidth::I8));
+            let src_elem = b.gep(src_field, vec![elem_offset], IrType::Int(IntWidth::I8));
+            emit_derived_value_copy(b, type_layouts, &nested_name, dest_elem, src_elem);
+            let one = b.const_i64(1);
+            let next_idx = b.iadd(body_idx, one);
+            b.branch(check_bb, vec![next_idx]);
+
+            b.set_block(done_bb);
             continue;
         }
 
