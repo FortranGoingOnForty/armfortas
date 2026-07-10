@@ -345,7 +345,8 @@ jobs:
             # (assembler spawns started failing). The full matrix
             # belongs to the ubuntu/macOS jobs; this VM smoke-tests
             # FreeBSD at -O0.
-            cargo test --test run_programs test_programs_end_to_end -- --exact --nocapture 2>&1 | tee /tmp/sweep.log
+            ci/run_logged.sh /tmp/sweep.log \
+              cargo test --test run_programs test_programs_end_to_end -- --exact --nocapture
             grep -E '\[-O0\] .* passed' /tmp/sweep.log
             # x10: per-target benchmark gate (size-only in CI).
             cargo build --release -p armfortas -p armfortas-rt
