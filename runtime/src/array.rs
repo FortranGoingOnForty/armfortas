@@ -1568,6 +1568,45 @@ fn descriptor_has_payload_or_zero_size_array(desc: &ArrayDescriptor) -> bool {
     !desc.base_addr.is_null() || descriptor_is_zero_size_array(desc)
 }
 
+/// Return nonzero when character-array assignment must replace `dest`'s
+/// allocation to conform to `source` and the destination element length.
+#[no_mangle]
+pub extern "C" fn afs_char_array_assignment_requires_reallocation(
+    dest: *const ArrayDescriptor,
+    source: *const ArrayDescriptor,
+    dest_elem_size: i64,
+) -> i32 {
+    if dest.is_null() || source.is_null() || dest_elem_size < 0 {
+        return 1;
+    }
+
+    let dest = unsafe { &*dest };
+    let source = unsafe { &*source };
+    let source_rank_is_valid = source.rank >= 0 && source.rank as usize <= MAX_RANK;
+    let dest_rank_is_valid = dest.rank >= 0 && dest.rank as usize <= MAX_RANK;
+    let known_flags = DESC_ALLOCATED | DESC_CONTIGUOUS | DESC_POINTER | DESC_TYPE_TAG_MASK;
+    let dest_has_zero_byte_payload = dest_rank_is_valid
+        && dest.rank > 0
+        && (dest.elem_size == 0 || (0..dest.rank as usize).any(|i| dest.dims[i].extent() == 0));
+    let dest_has_valid_storage = !dest.base_addr.is_null() || dest_has_zero_byte_payload;
+    let dest_is_valid = dest.flags & !known_flags == 0
+        && dest_rank_is_valid
+        && dest.elem_size >= 0
+        && dest.is_allocated()
+        && dest_has_valid_storage;
+    let conforms = source_rank_is_valid
+        && dest_is_valid
+        && dest.elem_size == dest_elem_size
+        && dest.rank == source.rank
+        && (0..dest.rank as usize).all(|i| dest.dims[i].extent() == source.dims[i].extent());
+
+    if conforms {
+        0
+    } else {
+        1
+    }
+}
+
 /// Assign one array to another with automatic reallocation (F2003).
 ///
 /// If dest's shape doesn't match source's shape, deallocate dest and
@@ -2675,6 +2714,148 @@ mod tests {
             }
         }
 
+        afs_deallocate_array(&mut source, ptr::null_mut());
+        afs_deallocate_array(&mut dest, ptr::null_mut());
+    }
+
+    #[test]
+    fn character_assignment_reallocates_only_when_allocation_does_not_conform() {
+        let dest_dims = [
+            DimDescriptor {
+                lower_bound: 0,
+                upper_bound: 1,
+                stride: 1,
+            },
+            DimDescriptor {
+                lower_bound: -1,
+                upper_bound: 0,
+                stride: 2,
+            },
+        ];
+        let source_dims = [
+            DimDescriptor {
+                lower_bound: 5,
+                upper_bound: 6,
+                stride: 1,
+            },
+            DimDescriptor {
+                lower_bound: 7,
+                upper_bound: 8,
+                stride: 2,
+            },
+        ];
+        let mut dest = ArrayDescriptor::zeroed();
+        let mut source = ArrayDescriptor::zeroed();
+        afs_allocate_array(&mut dest, 3, 2, dest_dims.as_ptr(), ptr::null_mut());
+        afs_allocate_array(&mut source, 3, 2, source_dims.as_ptr(), ptr::null_mut());
+
+        assert_eq!(
+            afs_char_array_assignment_requires_reallocation(&dest, &source, 3),
+            0
+        );
+        assert_eq!(
+            afs_char_array_assignment_requires_reallocation(&dest, &source, 4),
+            1
+        );
+
+        source.dims[1].upper_bound = 9;
+        assert_eq!(
+            afs_char_array_assignment_requires_reallocation(&dest, &source, 3),
+            1
+        );
+        let unallocated = ArrayDescriptor::zeroed();
+        assert_eq!(
+            afs_char_array_assignment_requires_reallocation(&unallocated, &source, 3),
+            1
+        );
+
+        let mut zero_len_dest = ArrayDescriptor::zeroed();
+        let mut zero_len_source = ArrayDescriptor::zeroed();
+        afs_allocate_array(
+            &mut zero_len_dest,
+            0,
+            2,
+            dest_dims.as_ptr(),
+            ptr::null_mut(),
+        );
+        afs_allocate_array(
+            &mut zero_len_source,
+            0,
+            2,
+            source_dims.as_ptr(),
+            ptr::null_mut(),
+        );
+        let zero_len_requires_reallocation =
+            afs_char_array_assignment_requires_reallocation(&zero_len_dest, &zero_len_source, 0);
+        assert_eq!(zero_len_requires_reallocation, 0);
+
+        let empty_dest_dims = [DimDescriptor {
+            lower_bound: -4,
+            upper_bound: -5,
+            stride: 1,
+        }];
+        let empty_source_dims = [DimDescriptor {
+            lower_bound: 2,
+            upper_bound: 1,
+            stride: 1,
+        }];
+        let mut empty_dest = ArrayDescriptor::zeroed();
+        let mut empty_source = ArrayDescriptor::zeroed();
+        afs_allocate_array(
+            &mut empty_dest,
+            3,
+            1,
+            empty_dest_dims.as_ptr(),
+            ptr::null_mut(),
+        );
+        afs_allocate_array(
+            &mut empty_source,
+            3,
+            1,
+            empty_source_dims.as_ptr(),
+            ptr::null_mut(),
+        );
+        assert_eq!(
+            afs_char_array_assignment_requires_reallocation(&empty_dest, &empty_source, 3),
+            0
+        );
+        empty_source.dims[0].upper_bound = 2;
+        assert_eq!(
+            afs_char_array_assignment_requires_reallocation(&empty_dest, &empty_source, 3),
+            1
+        );
+
+        let mut empty_zero_len_dest = ArrayDescriptor::zeroed();
+        let mut empty_zero_len_source = ArrayDescriptor::zeroed();
+        afs_allocate_array(
+            &mut empty_zero_len_dest,
+            0,
+            1,
+            empty_dest_dims.as_ptr(),
+            ptr::null_mut(),
+        );
+        afs_allocate_array(
+            &mut empty_zero_len_source,
+            0,
+            1,
+            empty_source_dims.as_ptr(),
+            ptr::null_mut(),
+        );
+        assert_eq!(
+            afs_char_array_assignment_requires_reallocation(
+                &empty_zero_len_dest,
+                &empty_zero_len_source,
+                0,
+            ),
+            0
+        );
+
+        afs_deallocate_array(&mut empty_zero_len_source, ptr::null_mut());
+        afs_deallocate_array(&mut empty_zero_len_dest, ptr::null_mut());
+        afs_deallocate_array(&mut empty_source, ptr::null_mut());
+        afs_deallocate_array(&mut empty_dest, ptr::null_mut());
+        afs_deallocate_array(&mut zero_len_source, ptr::null_mut());
+        afs_deallocate_array(&mut zero_len_dest, ptr::null_mut());
         afs_deallocate_array(&mut source, ptr::null_mut());
         afs_deallocate_array(&mut dest, ptr::null_mut());
     }

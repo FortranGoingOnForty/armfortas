@@ -48342,8 +48342,29 @@ pub(super) fn lower_allocatable_char_array_assign_from_desc(
     src_desc: ValueId,
     dest_elem_len_override: Option<ValueId>,
 ) {
-    let stat = b.alloca(IrType::Int(IntWidth::I32));
+    let (src_desc, snapshot_desc) = stabilize_char_array_assignment_source(b, dest_desc, src_desc);
+    let allocate_with_elem_size = dest_elem_len_override.is_some();
+    let allocation_elem_len =
+        dest_elem_len_override.unwrap_or_else(|| descriptor_elem_size(b, src_desc));
+    let requires_reallocation = b.call(
+        FuncRef::External("afs_char_array_assignment_requires_reallocation".into()),
+        vec![dest_desc, src_desc, allocation_elem_len],
+        IrType::Int(IntWidth::I32),
+    );
     let zero32 = b.const_i32(0);
+    let needs_reallocation = b.icmp(CmpOp::Ne, requires_reallocation, zero32);
+    let bb_reallocate = b.create_block("alloc_char_assign_reallocate");
+    let bb_allocated = b.create_block("alloc_char_assign_allocated");
+    b.cond_branch(
+        needs_reallocation,
+        bb_reallocate,
+        vec![],
+        bb_allocated,
+        vec![],
+    );
+
+    b.set_block(bb_reallocate);
+    let stat = b.alloca(IrType::Int(IntWidth::I32));
     b.store(zero32, stat);
     b.call(
         FuncRef::External("afs_deallocate_array".into()),
@@ -48351,10 +48372,10 @@ pub(super) fn lower_allocatable_char_array_assign_from_desc(
         IrType::Void,
     );
     b.store(zero32, stat);
-    if let Some(dest_elem_len) = dest_elem_len_override {
+    if allocate_with_elem_size {
         b.call(
             FuncRef::External("afs_allocate_like_with_elem_size".into()),
-            vec![dest_desc, src_desc, dest_elem_len, stat],
+            vec![dest_desc, src_desc, allocation_elem_len, stat],
             IrType::Void,
         );
     } else {
@@ -48364,6 +48385,9 @@ pub(super) fn lower_allocatable_char_array_assign_from_desc(
             IrType::Void,
         );
     }
+    b.branch(bb_allocated, vec![]);
+
+    b.set_block(bb_allocated);
 
     let dest_base = b.load_typed(dest_desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
     let src_base = b.load_typed(src_desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
@@ -48446,6 +48470,51 @@ pub(super) fn lower_allocatable_char_array_assign_from_desc(
     b.branch(bb_check, vec![]);
 
     b.set_block(bb_exit);
+    deallocate_array_temp_descriptor(b, snapshot_desc);
+}
+
+fn stabilize_char_array_assignment_source(
+    b: &mut FuncBuilder,
+    dest_desc: ValueId,
+    source_desc: ValueId,
+) -> (ValueId, ValueId) {
+    let snapshot_desc = zeroed_array_temp_descriptor(b);
+    let overlaps = b.call(
+        FuncRef::External("afs_descriptors_overlap".into()),
+        vec![dest_desc, source_desc],
+        IrType::Int(IntWidth::I32),
+    );
+    let zero32 = b.const_i32(0);
+    let needs_snapshot = b.icmp(CmpOp::Ne, overlaps, zero32);
+    let snapshot_bb = b.create_block("char_assign_snapshot_source");
+    let direct_bb = b.create_block("char_assign_direct_source");
+    let done_bb = b.create_block("char_assign_source_done");
+    let effective_source = b.add_block_param(done_bb, ptr_i8_ty());
+    b.cond_branch(needs_snapshot, snapshot_bb, vec![], direct_bb, vec![]);
+
+    b.set_block(snapshot_bb);
+    let stat = b.alloca(IrType::Int(IntWidth::I32));
+    b.store(zero32, stat);
+    b.call(
+        FuncRef::External("afs_allocate_like".into()),
+        vec![snapshot_desc, source_desc, stat],
+        IrType::Void,
+    );
+    b.store(zero32, stat);
+    b.call(
+        FuncRef::External("afs_copy_array_data".into()),
+        vec![snapshot_desc, source_desc, stat],
+        IrType::Void,
+    );
+    let snapshot_arg = ptr_i8_value(b, snapshot_desc);
+    b.branch(done_bb, vec![snapshot_arg]);
+
+    b.set_block(direct_bb);
+    let source_arg = ptr_i8_value(b, source_desc);
+    b.branch(done_bb, vec![source_arg]);
+
+    b.set_block(done_bb);
+    (effective_source, snapshot_desc)
 }
 
 fn char_array_desc_elem_ptr_and_len_from_flat_index(
@@ -49140,32 +49209,16 @@ pub(super) fn lower_array_assign(
                 {
                     let call_mentions_dest = call_args_mention_name(call_args, dest_name);
                     if descriptor_backed_char_array(dest_info) {
-                        if call_mentions_dest {
-                            let tmp_desc = zeroed_array_temp_descriptor(b);
-                            lower_alloc_return_call_into_desc(
-                                b,
-                                ctx,
-                                tmp_desc,
-                                callee_name,
-                                call_args,
-                            );
-                            let dest_elem_len = fixed_char_allocatable_array_elem_len(b, dest_info);
-                            lower_allocatable_char_array_assign_from_desc(
-                                b,
-                                dest_desc,
-                                tmp_desc,
-                                dest_elem_len,
-                            );
-                            deallocate_array_temp_descriptor(b, tmp_desc);
-                        } else {
-                            lower_alloc_return_call_into_desc(
-                                b,
-                                ctx,
-                                dest_desc,
-                                callee_name,
-                                call_args,
-                            );
-                        }
+                        let tmp_desc = zeroed_array_temp_descriptor(b);
+                        lower_alloc_return_call_into_desc(b, ctx, tmp_desc, callee_name, call_args);
+                        let dest_elem_len = fixed_char_allocatable_array_elem_len(b, dest_info);
+                        lower_allocatable_char_array_assign_from_desc(
+                            b,
+                            dest_desc,
+                            tmp_desc,
+                            dest_elem_len,
+                        );
+                        deallocate_array_temp_descriptor(b, tmp_desc);
                         return;
                     }
                     let result_elem_ty = array_function_result_elem_type(
